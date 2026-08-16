@@ -421,6 +421,9 @@ MSG
 足した瞬間に上限を破る。あわせて、モデルが 1 ターン使って調べる環境の事実も
 先に渡す。
 
+読む対象はグローバル規則 `~/.apsis/AGENTS.md` とプロジェクト規則
+`<project-root>/AGENTS.md` の 2 つ。この順に連結し、合算してから上限で切り詰める。
+
 **Files:**
 - Create: `crates/apsis-core/src/constitution.rs`
 - Modify: `crates/apsis-core/src/prompt.rs`
@@ -430,7 +433,7 @@ MSG
 
 **Interfaces:**
 - Consumes: `apsis_core::budget::{count_tokens, always_on_tokens, BUDGET_LIMIT}`、`apsis_core::prompt::SYSTEM_PROMPT`
-- Produces: `apsis_core::constitution::CONSTITUTION_LIMIT: usize`、`constitution::extract_always_on(&str) -> String`、`constitution::load(project_root: &std::path::Path) -> String`、`constitution::environment_block(cwd: &std::path::Path, branch: Option<&str>) -> String`、`apsis_core::prompt::build_system(constitution: &str, environment: &str) -> String`
+- Produces: `apsis_core::constitution::CONSTITUTION_LIMIT: usize`、`constitution::extract_always_on(&str) -> String`、`constitution::load(project_root: &std::path::Path) -> String`、`constitution::load_from(global_agents: Option<&std::path::Path>, project_root: &std::path::Path) -> String`、`constitution::environment_block(cwd: &std::path::Path, branch: Option<&str>) -> String`、`apsis_core::prompt::build_system(constitution: &str, environment: &str) -> String`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -486,6 +489,29 @@ main へ直接 push しない。
     }
 
     #[test]
+    fn merges_global_then_project_rules() {
+        let g = tempfile::tempdir().expect("一時ディレクトリ");
+        let pj = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::write(
+            g.path().join("AGENTS.md"),
+            "## Always on\n\n日本語で応答する。\n",
+        )
+        .expect("書けない");
+        std::fs::write(
+            pj.path().join("AGENTS.md"),
+            "## Always on\n\nmain へ直接 push しない。\n",
+        )
+        .expect("書けない");
+
+        let got = load_from(Some(&g.path().join("AGENTS.md")), pj.path());
+        assert!(got.contains("日本語で応答する。"), "グローバル規則が落ちている");
+        assert!(got.contains("main へ直接 push しない。"), "プロジェクト規則が落ちている");
+        let gi = got.find("日本語").expect("グローバルが無い");
+        let pi = got.find("main へ").expect("プロジェクトが無い");
+        assert!(gi < pi, "グローバルが先に来ていない");
+    }
+
+    #[test]
     fn caps_oversized_constitution() {
         let mut body = String::from("<!-- apsis:always-on -->\n");
         for i in 0..500 {
@@ -506,9 +532,9 @@ main へ直接 push しない。
     }
 
     #[test]
-    fn load_returns_empty_when_agents_md_is_absent() {
+    fn returns_empty_when_neither_file_exists() {
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
-        assert_eq!(load(dir.path()), "");
+        assert_eq!(load_from(None, dir.path()), "");
     }
 
     #[test]
@@ -619,13 +645,34 @@ fn cap(text: &str, limit: usize) -> String {
     kept.join("\n")
 }
 
-/// プロジェクト直下の AGENTS.md から憲法ブロックを読む。
-/// 存在しないことは失敗ではない。読めなければ空文字列を返す。
+fn read_block(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .map(|b| extract_always_on(&b))
+        .unwrap_or_default()
+}
+
+/// グローバル規則とプロジェクト規則をこの順に読み、合算して上限で切り詰める。
+/// どちらが欠けていても失敗ではない。テストから経路を固定できるよう、
+/// グローバル側のパスは引数で受ける。
+pub fn load_from(global_agents: Option<&Path>, project_root: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(g) = global_agents {
+        let b = read_block(g);
+        if !b.is_empty() {
+            parts.push(b);
+        }
+    }
+    let b = read_block(&project_root.join("AGENTS.md"));
+    if !b.is_empty() {
+        parts.push(b);
+    }
+    cap(&parts.join("\n"), CONSTITUTION_LIMIT)
+}
+
+/// `~/.apsis/AGENTS.md` をグローバル規則として解決してから読む。
 pub fn load(project_root: &Path) -> String {
-    let Ok(body) = std::fs::read_to_string(project_root.join("AGENTS.md")) else {
-        return String::new();
-    };
-    cap(&extract_always_on(&body), CONSTITUTION_LIMIT)
+    let global = std::env::var_os("HOME").map(|h| Path::new(&h).join(".apsis").join("AGENTS.md"));
+    load_from(global.as_deref(), project_root)
 }
 
 /// 環境情報。モデルが 1 ターン使って調べる事実を先に渡す。

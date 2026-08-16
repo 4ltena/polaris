@@ -1,14 +1,22 @@
-# apsis 設計仕様
+# polaris 設計仕様
 
 - 状態: ドラフト（レビュー待ち）
 - 日付: 2026-08-16
-- 対象: `/Users/kn/File/projects/codex/apsis/`
+- 対象: `/Users/kn/File/projects/codex/polaris/`
 
 ## 概要
 
-apsis は Rust で書くコーディングエージェントのハーネスである。常時コンテキストを 990 トークン以下に抑えたまま、subagent による並列実行を備え、対話型の日常ドライバとして Codex CLI を置き換える。
+polaris は Rust で書くコーディングエージェントのハーネスである。常時コンテキストを 990 トークン以下に抑えたまま、subagent による並列実行を備え、対話型の日常ドライバとして Codex CLI を置き換える。
 
 主張は二つに集約される。第一に、subagent の契約は呼び出しごとに書き下すのではなく型定義へ畳み込む。第二に、常時載せる文脈をツール定義と憲法に限り、それ以外はローカルのルータが必要な回だけ添付する。
+
+## リリース方針
+
+システム名は polaris であり、初版のコードネームは hamar とする。
+
+`v1.0.0`（hamar）は M1 と M2 が両方完了した時点で付与する。編集、コマンド実行、カーネルレベルのサンドボックスがすべて揃う地点である。M1 単体は読み取り専用のヘッドレスエージェントにとどまり、この時点で 1.0.0 を打てば、コードがまだ持たない安全性の水準を約束することになる。
+
+M3 以降は 1.x として出す。
 
 ## 背景
 
@@ -39,17 +47,17 @@ Cargo workspace とし、クレートを9個に固定する。増やすことは
 
 | クレート | 責務 |
 | --- | --- |
-| `apsis-core` | エージェントループ、セッション、圧縮、監査ログ |
-| `apsis-provider` | プロバイダ抽象、フォールバック連鎖 |
-| `apsis-tools` | 組込みツール6本 |
-| `apsis-sandbox` | 方針の定義と OS 機構への委譲 |
-| `apsis-skills` | Agent Skills のローダと検証 |
-| `apsis-router` | 埋め込み索引と分類による文脈選択 |
-| `apsis-agents` | subagent 型レジストリ、スケジューラ、波と継続波 |
-| `apsis-tui` | Ratatui による対話画面 |
-| `apsis-cli` | バイナリ |
+| `polaris-core` | エージェントループ、セッション、圧縮、監査ログ |
+| `polaris-provider` | プロバイダ抽象、フォールバック連鎖 |
+| `polaris-tools` | 組込みツール6本 |
+| `polaris-sandbox` | 方針の定義と OS 機構への委譲 |
+| `polaris-skills` | Agent Skills のローダと検証 |
+| `polaris-router` | 埋め込み索引と分類による文脈選択 |
+| `polaris-agents` | subagent 型レジストリ、スケジューラ、波と継続波 |
+| `polaris-tui` | Ratatui による対話画面 |
+| `polaris-cli` | バイナリ |
 
-`apsis-router` は `apsis-sandbox` にも `apsis-agents` の権限にも依存しない。依存グラフの上で、ルータが権限へ影響できないことを保証する。
+`polaris-router` は `polaris-sandbox` にも `polaris-agents` の権限にも依存しない。依存グラフの上で、ルータが権限へ影響できないことを保証する。
 
 ## 常時コンテキスト予算
 
@@ -144,25 +152,25 @@ name: file-inspector
 description: 単一ファイルを読み取り専用で棚卸しし、責務、入出力、対応するテストを返す。
 allowed-tools: read grep
 metadata:
-  apsis-access: read
-  apsis-tier: low
-  apsis-wall-seconds: "360"
-  apsis-max-turns: "12"
-  apsis-continuation: "denied"
-  apsis-output: references/result.schema.json
+  polaris-access: read
+  polaris-tier: low
+  polaris-wall-seconds: "360"
+  polaris-max-turns: "12"
+  polaris-continuation: "denied"
+  polaris-output: references/result.schema.json
 ---
 
 本文がそのまま subagent のシステムプロンプトとなる。
 ```
 
-`allowed-tools` は仕様の実験的フィールドであり、事前承認されたツールを空白区切りで並べる用途に合致する。`metadata` は文字列から文字列への写像と規定されているため、数値も引用符付きで書く。キー名の衝突を避ける推奨に従い `apsis-` を前置する。
+`allowed-tools` は仕様の実験的フィールドであり、事前承認されたツールを空白区切りで並べる用途に合致する。`metadata` は文字列から文字列への写像と規定されているため、数値も引用符付きで書く。キー名の衝突を避ける推奨に従い `polaris-` を前置する。
 
 ### 呼び出し
 
 ```
 spawn([
-  {"type": "file-inspector", "task": "crates/apsis-core/src/loop.rs"},
-  {"type": "file-inspector", "task": "crates/apsis-router/src/select.rs"}
+  {"type": "file-inspector", "task": "crates/polaris-core/src/loop.rs"},
+  {"type": "file-inspector", "task": "crates/polaris-router/src/select.rs"}
 ])
 ```
 
@@ -209,7 +217,7 @@ spawn([
 
 ### 階層とモデル
 
-型が宣言する `apsis-tier` を、設定がプロバイダとモデルへ割り当てる。
+型が宣言する `polaris-tier` を、設定がプロバイダとモデルへ割り当てる。
 
 ```toml
 [tier.low]
@@ -235,7 +243,7 @@ subagent の中間過程は親のコンテキストへ入れない。12ターン
 
 `sandbox_mode` が技術的境界を、`approval_policy` が停止して確認する条件を定める。二つは直交する。
 
-`sandbox_mode` は `read-only`、`workspace-write`、`full-access` の3値をとる。強制は macOS では `sandbox-exec` のプロファイル、Linux では landlock と seccomp へ委譲する。`apsis-sandbox` は方針と書込可能ルートのみを保持する。
+`sandbox_mode` は `read-only`、`workspace-write`、`full-access` の3値をとる。強制は macOS では `sandbox-exec` のプロファイル、Linux では landlock と seccomp へ委譲する。`polaris-sandbox` は方針と書込可能ルートのみを保持する。
 
 subagent の実効権限は、型の `allowed-tools` と親の現在権限の積とする。subagent が親より強い権限を得る経路は存在しない。
 
@@ -279,7 +287,7 @@ subagent ではフォールバック連鎖を有効にする。タスクが有�
 
 ### 停止条件
 
-同一のエラーが3回続いた場合に停止する。ルートと subagent の双方に適用する。加えて subagent には `apsis-wall-seconds` と `apsis-max-turns` の超過、出力スキーマの不一致2回を停止条件とする。
+同一のエラーが3回続いた場合に停止する。ルートと subagent の双方に適用する。加えて subagent には `polaris-wall-seconds` と `polaris-max-turns` の超過、出力スキーマの不一致2回を停止条件とする。
 
 自動修復は実行しない。失敗は失敗として返し、判断をルートへ戻す。
 
@@ -289,7 +297,7 @@ subagent ではフォールバック連鎖を有効にする。タスクが有�
 
 ## 監査
 
-追記専用の JSONL に、ツール呼び出し1回を1行として記録する。型、解決後のサンドボックス方針、書込先、結果を含める。監査は subagent に限らず全ツール呼び出しを対象とするため、`apsis-agents` ではなく `apsis-core` に置く。
+追記専用の JSONL に、ツール呼び出し1回を1行として記録する。型、解決後のサンドボックス方針、書込先、結果を含める。監査は subagent に限らず全ツール呼び出しを対象とするため、`polaris-agents` ではなく `polaris-core` に置く。
 
 記録する文字列は、書く直前に必ずシークレット伏字化を通す。`bash` のコマンド文字列を残す以上、生の資格情報がログへ落ちる経路を塞ぐ必要がある。
 

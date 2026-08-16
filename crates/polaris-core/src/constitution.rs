@@ -8,8 +8,8 @@ use crate::budget::count_tokens;
 /// 憲法ブロックに許すトークン数の上限。
 pub const CONSTITUTION_LIMIT: usize = 150;
 
-const BEGIN: &str = "<!-- apsis:always-on -->";
-const END: &str = "<!-- /apsis:always-on -->";
+const BEGIN: &str = "<!-- polaris:always-on -->";
+const END: &str = "<!-- /polaris:always-on -->";
 
 /// AGENTS.md から常時載せる部分だけを取り出す。
 ///
@@ -132,9 +132,9 @@ pub fn load_from(global_agents: Option<&Path>, project_root: &Path) -> String {
     }
 }
 
-/// `~/.apsis/AGENTS.md` をグローバル規則として解決してから読む。
+/// `~/.polaris/AGENTS.md` をグローバル規則として解決してから読む。
 pub fn load(project_root: &Path) -> String {
-    let global = std::env::var_os("HOME").map(|h| Path::new(&h).join(".apsis").join("AGENTS.md"));
+    let global = std::env::var_os("HOME").map(|h| Path::new(&h).join(".polaris").join("AGENTS.md"));
     load_from(global.as_deref(), project_root)
 }
 
@@ -157,9 +157,9 @@ mod tests {
 
 前置き。ここは載せない。
 
-<!-- apsis:always-on -->
+<!-- polaris:always-on -->
 main へ直接 push しない。
-<!-- /apsis:always-on -->
+<!-- /polaris:always-on -->
 
 ## 詳細
 長い手続き。ここも載せない。
@@ -226,11 +226,11 @@ main へ直接 push しない。
 
     #[test]
     fn caps_oversized_constitution() {
-        let mut body = String::from("<!-- apsis:always-on -->\n");
+        let mut body = String::from("<!-- polaris:always-on -->\n");
         for i in 0..500 {
             body.push_str(&format!("規則 {i}: 長い行をここに書き連ねる。\n"));
         }
-        body.push_str("<!-- /apsis:always-on -->\n");
+        body.push_str("<!-- /polaris:always-on -->\n");
 
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
         std::fs::write(dir.path().join("AGENTS.md"), &body).expect("書けない");
@@ -272,11 +272,11 @@ main へ直接 push しない。
         let g = tempfile::tempdir().expect("一時ディレクトリ");
         let pj = tempfile::tempdir().expect("一時ディレクトリ");
 
-        let mut global_body = String::from("<!-- apsis:always-on -->\n");
+        let mut global_body = String::from("<!-- polaris:always-on -->\n");
         for i in 0..500 {
             global_body.push_str(&format!("全域規則 {i}: 長い行をここに書き連ねる。\n"));
         }
-        global_body.push_str("<!-- /apsis:always-on -->\n");
+        global_body.push_str("<!-- /polaris:always-on -->\n");
         std::fs::write(g.path().join("AGENTS.md"), &global_body).expect("書けない");
 
         std::fs::write(
@@ -303,11 +303,11 @@ main へ直接 push しない。
         // グローバル側が無い場合、プロジェクト側だけで CONSTITUTION_LIMIT の
         // 全量を使ってよい。半分に予約されていないことを、上限の半分を
         // 超える量が実際に残ることで確認する。
-        let mut body = String::from("<!-- apsis:always-on -->\n");
+        let mut body = String::from("<!-- polaris:always-on -->\n");
         for i in 0..500 {
             body.push_str(&format!("規則 {i}: 長い行をここに書き連ねる。\n"));
         }
-        body.push_str("<!-- /apsis:always-on -->\n");
+        body.push_str("<!-- /polaris:always-on -->\n");
 
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
         std::fs::write(dir.path().join("AGENTS.md"), &body).expect("書けない");
@@ -329,8 +329,8 @@ main へ直接 push しない。
 
     #[test]
     fn environment_block_carries_cwd_and_branch() {
-        let got = environment_block(Path::new("/w/apsis"), Some("feat/x"));
-        assert!(got.contains("/w/apsis"));
+        let got = environment_block(Path::new("/w/polaris"), Some("feat/x"));
+        assert!(got.contains("/w/polaris"));
         assert!(got.contains("feat/x"));
     }
 
@@ -338,10 +338,10 @@ main へ直接 push しない。
     fn full_always_on_context_stays_within_budget() {
         let constitution = "a".repeat(2000);
         let capped = cap(&constitution, CONSTITUTION_LIMIT);
-        let env = environment_block(Path::new("/w/apsis"), Some("feat/m1-headless-loop"));
+        let env = environment_block(Path::new("/w/polaris"), Some("feat/m1-headless-loop"));
         let system = crate::prompt::build_system(&capped, &env);
 
-        let n = crate::budget::always_on_tokens(&system, &apsis_tools::all_specs());
+        let n = crate::budget::always_on_tokens(&system, &polaris_tools::all_specs());
         assert!(
             n <= crate::budget::BUDGET_LIMIT,
             "憲法と環境を含めた常時コンテキストが {n} トークン。上限を超えている"

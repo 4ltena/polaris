@@ -86,7 +86,7 @@ mod tests {
     fn allows_benign_keychain_named_source() {
         // `keychain` を含むだけの通常のソースファイルを部分一致で巻き込まない。
         assert!(!is_denied(Path::new(
-            "/home/u/proj/crates/apsis-tools/src/keychain_helpers.rs"
+            "/home/u/proj/crates/polaris-tools/src/keychain_helpers.rs"
         )));
     }
 

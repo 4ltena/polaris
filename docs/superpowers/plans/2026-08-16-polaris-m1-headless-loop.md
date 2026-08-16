@@ -1,14 +1,14 @@
-# apsis M1 ヘッドレス最小ループ Implementation Plan
+# polaris M1 ヘッドレス最小ループ Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `read` ツールだけを持つヘッドレスエージェントを動かし、常時コンテキスト 990 トークン以下という不変条件をテストで固定する。
 
-**Architecture:** Cargo workspace に `apsis-tools` / `apsis-provider` / `apsis-core` / `apsis-cli` の 4 クレートを置く。ツール定義は JSON Schema として直列化し、その実バイト列をトークナイザで数えて予算テストに掛ける。プロバイダは非同期のトレイトとし、SSE の解析は commons の `sse-decoder` を取り込む。全ツール呼び出しは追記専用 JSONL へ記録し、記録前に commons の `secret-screen` を通す。
+**Architecture:** Cargo workspace に `polaris-tools` / `polaris-provider` / `polaris-core` / `polaris-cli` の 4 クレートを置く。ツール定義は JSON Schema として直列化し、その実バイト列をトークナイザで数えて予算テストに掛ける。プロバイダは非同期のトレイトとし、SSE の解析は commons の `sse-decoder` を取り込む。全ツール呼び出しは追記専用 JSONL へ記録し、記録前に commons の `secret-screen` を通す。
 
 **Tech Stack:** Rust 1.96.0 / edition 2024、tokio、reqwest、serde、tiktoken-rs 0.12、clap、thiserror、async-trait、wiremock(dev)、tempfile(dev)
 
-**Spec:** `docs/superpowers/specs/2026-08-16-apsis-harness-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`
 
 ## Global Constraints
 
@@ -17,14 +17,14 @@
 - 常時提供するツールは 6 本を超えない
 - 憲法ブロックは 150 トークンを超えない。AGENTS.md の全文は常時コンテキストへ載せない
 - 常時コンテキストの合計は AGENTS.md の大きさに左右されない。超過分は切り詰める
-- クレート名の接頭辞は `apsis-`
+- クレート名の接頭辞は `polaris-`
 - 監査ログへ書く文字列は、書く直前に必ず `secret_screen::screen_text` を通す
 - commons から取り込んだファイルは取り込み後に改変してよい。改変は元へ戻さない
 - コミットのタイトルは英語、本文は日本語可。末尾に空行 1 行を挟んで `Co-Authored-By: Claude <noreply@anthropic.com>` を付ける
 
 ## 仕様からの逸脱
 
-仕様では監査ログを `apsis-agents` の責務としているが、監査ログは subagent に限らず全ツール呼び出しを対象とする。M1 には `apsis-agents` が存在しないため、`apsis-core` の `audit` モジュールへ置く。仕様側もこの配置へ改める。
+仕様では監査ログを `polaris-agents` の責務としているが、監査ログは subagent に限らず全ツール呼び出しを対象とする。M1 には `polaris-agents` が存在しないため、`polaris-core` の `audit` モジュールへ置く。仕様側もこの配置へ改める。
 
 ## マイルストーン地図
 
@@ -33,32 +33,32 @@
 | | 内容 | 単体で動くもの |
 | --- | --- | --- |
 | M1 | 本計画。read ツール、1 プロバイダ、予算テスト、監査ログ、停止条件 | ファイルを読んで答えるヘッドレスエージェント |
-| M2 | `write` / `edit` / `bash` と `apsis-sandbox`。宣言外書き込みの実サンドボックス拒否テスト | 編集とコマンド実行ができる |
-| M3 | `apsis-skills` と `apsis-router`。`atomic-file-replace` の取り込み | skill が自動で添付される |
-| M4 | `apsis-agents`。`spawn`、波、継続波、path claim | subagent の並列実行 |
-| M5 | `apsis-tui` と圧縮、マルチプロバイダとフォールバック、セッションの追記永続化と再開 | 対話型の日常ドライバ |
+| M2 | `write` / `edit` / `bash` と `polaris-sandbox`。宣言外書き込みの実サンドボックス拒否テスト。M1 と本 M2 の完了をもって `v1.0.0`（hamar）とする | 編集とコマンド実行ができる |
+| M3 | `polaris-skills` と `polaris-router`。`atomic-file-replace` の取り込み | skill が自動で添付される |
+| M4 | `polaris-agents`。`spawn`、波、継続波、path claim | subagent の並列実行 |
+| M5 | `polaris-tui` と圧縮、マルチプロバイダとフォールバック、セッションの追記永続化と再開 | 対話型の日常ドライバ |
 
 ## ファイル構成
 
 ```
-apsis/
+polaris/
 ├── Cargo.toml                              workspace 定義と共通依存
 ├── rust-toolchain.toml                     1.96.0 固定
 ├── .gitignore
 └── crates/
-    ├── apsis-tools/
+    ├── polaris-tools/
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs                      ToolSpec、ToolError、all_specs
     │       ├── path_policy.rs              読み取り拒否パスの判定
     │       └── read.rs                     read ツールの実装
-    ├── apsis-provider/
+    ├── polaris-provider/
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs                      Provider トレイトと要求・応答の型
     │       ├── sse.rs                      commons/sse-decoder を取り込む
     │       └── openai.rs                   OpenAI 互換の実装
-    ├── apsis-core/
+    ├── polaris-core/
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs                      モジュール宣言
@@ -70,7 +70,7 @@ apsis/
     │       ├── stop.rs                     停止条件
     │       ├── session.rs                  メッセージ履歴
     │       └── agent.rs                    エージェントループ
-    └── apsis-cli/
+    └── polaris-cli/
         ├── Cargo.toml
         └── src/main.rs                     一発実行の入口
 ```
@@ -83,18 +83,18 @@ apsis/
 - Create: `Cargo.toml`
 - Create: `rust-toolchain.toml`
 - Create: `.gitignore`
-- Create: `crates/apsis-tools/Cargo.toml`
-- Create: `crates/apsis-tools/src/lib.rs`
-- Test: `crates/apsis-tools/src/lib.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-tools/Cargo.toml`
+- Create: `crates/polaris-tools/src/lib.rs`
+- Test: `crates/polaris-tools/src/lib.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
 - Consumes: なし
-- Produces: `apsis_tools::ToolSpec { name: &'static str, description: &'static str, parameters: serde_json::Value }`、`apsis_tools::all_specs() -> Vec<ToolSpec>`、`apsis_tools::ToolError`
+- Produces: `polaris_tools::ToolSpec { name: &'static str, description: &'static str, parameters: serde_json::Value }`、`polaris_tools::all_specs() -> Vec<ToolSpec>`、`polaris_tools::ToolError`
 
 - [ ] **Step 1: workspace とクレートの骨格を作る**
 
 テストを走らせるには workspace が読める状態である必要がある。先に骨格を置く。
-この時点で `crates/apsis-tools/src/lib.rs` は空のファイルとして作る。
+この時点で `crates/polaris-tools/src/lib.rs` は空のファイルとして作る。
 
 `Cargo.toml`
 
@@ -140,11 +140,11 @@ AGENTS.md
 .codex/
 ```
 
-`crates/apsis-tools/Cargo.toml`
+`crates/polaris-tools/Cargo.toml`
 
 ```toml
 [package]
-name = "apsis-tools"
+name = "polaris-tools"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -156,7 +156,7 @@ thiserror = { workspace = true }
 ```
 - [ ] **Step 2: 失敗するテストを書く**
 
-`crates/apsis-tools/src/lib.rs` の末尾に置く。
+`crates/polaris-tools/src/lib.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -187,15 +187,15 @@ mod tests {
 
 - [ ] **Step 3: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-tools`
+Run: `cargo test -p polaris-tools`
 Expected: コンパイルエラー。`all_specs` と `ToolSpec` が未定義
 
 - [ ] **Step 4: 最小の実装を書く**
 
-`crates/apsis-tools/src/lib.rs` の先頭に置く。
+`crates/polaris-tools/src/lib.rs` の先頭に置く。
 
 ```rust
-//! apsis の組込みツール。常時提供するツールは 6 本を超えない。
+//! polaris の組込みツール。常時提供するツールは 6 本を超えない。
 
 use serde::Serialize;
 
@@ -239,17 +239,17 @@ fn read_spec() -> ToolSpec {
 
 - [ ] **Step 5: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-tools`
+Run: `cargo test -p polaris-tools`
 Expected: 2 件とも PASS
 
 - [ ] **Step 6: コミットする**
 
 ```bash
-git add Cargo.toml rust-toolchain.toml .gitignore crates/apsis-tools
+git add Cargo.toml rust-toolchain.toml .gitignore crates/polaris-tools
 git commit -F - <<'MSG'
 feat(tools): add ToolSpec and read tool schema
 
-workspace の骨格と apsis-tools を置く。ツール定義は JSON Schema として
+workspace の骨格と polaris-tools を置く。ツール定義は JSON Schema として
 直列化し、この実バイト列を後続タスクの予算計測が数える。
 
 Co-Authored-By: Claude <noreply@anthropic.com>
@@ -261,39 +261,39 @@ MSG
 ### Task 2: 常時コンテキスト予算テスト
 
 **Files:**
-- Create: `crates/apsis-core/Cargo.toml`
-- Create: `crates/apsis-core/src/lib.rs`
-- Create: `crates/apsis-core/src/prompt.rs`
-- Create: `crates/apsis-core/src/budget.rs`
-- Test: `crates/apsis-core/src/budget.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-core/Cargo.toml`
+- Create: `crates/polaris-core/src/lib.rs`
+- Create: `crates/polaris-core/src/prompt.rs`
+- Create: `crates/polaris-core/src/budget.rs`
+- Test: `crates/polaris-core/src/budget.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
-- Consumes: `apsis_tools::{ToolSpec, all_specs}`
-- Produces: `apsis_core::budget::count_tokens(&str) -> usize`、`apsis_core::budget::always_on_tokens(&str, &[ToolSpec]) -> usize`、`apsis_core::prompt::SYSTEM_PROMPT: &str`、`apsis_core::budget::BUDGET_LIMIT: usize`、`apsis_core::budget::MAX_TOOLS: usize`
+- Consumes: `polaris_tools::{ToolSpec, all_specs}`
+- Produces: `polaris_core::budget::count_tokens(&str) -> usize`、`polaris_core::budget::always_on_tokens(&str, &[ToolSpec]) -> usize`、`polaris_core::prompt::SYSTEM_PROMPT: &str`、`polaris_core::budget::BUDGET_LIMIT: usize`、`polaris_core::budget::MAX_TOOLS: usize`
 
 - [ ] **Step 1: クレートの骨格を作る**
 
 `Cargo.toml` と `lib.rs` をここで作成する。`budget.rs` と `prompt.rs` は
 この時点では空のファイルとして作る。
 
-`crates/apsis-core/Cargo.toml`
+`crates/polaris-core/Cargo.toml`
 
 ```toml
 [package]
-name = "apsis-core"
+name = "polaris-core"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-apsis-tools = { path = "../apsis-tools" }
+polaris-tools = { path = "../polaris-tools" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tiktoken-rs = { workspace = true }
 ```
 
-`crates/apsis-core/src/lib.rs`
+`crates/polaris-core/src/lib.rs`
 
 ```rust
 pub mod budget;
@@ -301,7 +301,7 @@ pub mod prompt;
 ```
 - [ ] **Step 2: 失敗するテストを書く**
 
-`crates/apsis-core/src/budget.rs` の末尾に置く。
+`crates/polaris-core/src/budget.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn always_on_context_stays_within_budget() {
-        let specs = apsis_tools::all_specs();
+        let specs = polaris_tools::all_specs();
         let n = always_on_tokens(SYSTEM_PROMPT, &specs);
         assert!(
             n <= BUDGET_LIMIT,
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn tool_count_stays_within_limit() {
-        let n = apsis_tools::all_specs().len();
+        let n = polaris_tools::all_specs().len();
         assert!(n <= MAX_TOOLS, "ツールが {n} 本。上限 {MAX_TOOLS} 本を超えている");
     }
 
@@ -335,18 +335,18 @@ mod tests {
 
 - [ ] **Step 3: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-core`
+Run: `cargo test -p polaris-core`
 Expected: コンパイルエラー。`always_on_tokens` と `SYSTEM_PROMPT` が未定義
 
 - [ ] **Step 4: 最小の実装を書く**
 
-`crates/apsis-core/src/prompt.rs`
+`crates/polaris-core/src/prompt.rs`
 
 ```rust
 /// 常時載るシステムプロンプト。振る舞いの指示を削ると往復が増えて総コストが
 /// 上がるため、短さのためにここを削らない。削る対象は構造の重複に限る。
 pub const SYSTEM_PROMPT: &str = "\
-You are apsis, a coding agent. Read files and answer with what the code actually does.
+You are polaris, a coding agent. Read files and answer with what the code actually does.
 
 Rules:
 - State file paths as path:line so they can be opened directly.
@@ -356,12 +356,12 @@ Rules:
 ";
 ```
 
-`crates/apsis-core/src/budget.rs` の先頭に置く。
+`crates/polaris-core/src/budget.rs` の先頭に置く。
 
 ```rust
 //! 常時コンテキストの計測。数値は測定で担保し、見積で運用しない。
 
-use apsis_tools::ToolSpec;
+use polaris_tools::ToolSpec;
 
 /// 常時コンテキストの上限。
 pub const BUDGET_LIMIT: usize = 990;
@@ -386,13 +386,13 @@ pub fn always_on_tokens(system_prompt: &str, tools: &[ToolSpec]) -> usize {
 
 - [ ] **Step 5: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-core`
+Run: `cargo test -p polaris-core`
 Expected: 3 件とも PASS。予算超過なら実測値がメッセージに出るので、`SYSTEM_PROMPT` を削って収める
 
 - [ ] **Step 6: コミットする**
 
 ```bash
-git add crates/apsis-core
+git add crates/polaris-core
 git commit -F - <<'MSG'
 test(core): enforce always-on context budget
 
@@ -413,23 +413,23 @@ MSG
 足した瞬間に上限を破る。あわせて、モデルが 1 ターン使って調べる環境の事実も
 先に渡す。
 
-読む対象はグローバル規則 `~/.apsis/AGENTS.md` とプロジェクト規則
+読む対象はグローバル規則 `~/.polaris/AGENTS.md` とプロジェクト規則
 `<project-root>/AGENTS.md` の 2 つ。この順に連結し、合算してから上限で切り詰める。
 
 **Files:**
-- Create: `crates/apsis-core/src/constitution.rs`
-- Modify: `crates/apsis-core/src/prompt.rs`
-- Modify: `crates/apsis-core/src/lib.rs`
-- Modify: `crates/apsis-core/Cargo.toml`
-- Test: `crates/apsis-core/src/constitution.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-core/src/constitution.rs`
+- Modify: `crates/polaris-core/src/prompt.rs`
+- Modify: `crates/polaris-core/src/lib.rs`
+- Modify: `crates/polaris-core/Cargo.toml`
+- Test: `crates/polaris-core/src/constitution.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
-- Consumes: `apsis_core::budget::{count_tokens, always_on_tokens, BUDGET_LIMIT}`、`apsis_core::prompt::SYSTEM_PROMPT`
-- Produces: `apsis_core::constitution::CONSTITUTION_LIMIT: usize`、`constitution::extract_always_on(&str) -> String`、`constitution::load(project_root: &std::path::Path) -> String`、`constitution::load_from(global_agents: Option<&std::path::Path>, project_root: &std::path::Path) -> String`、`constitution::environment_block(cwd: &std::path::Path, branch: Option<&str>) -> String`、`apsis_core::prompt::build_system(constitution: &str, environment: &str) -> String`
+- Consumes: `polaris_core::budget::{count_tokens, always_on_tokens, BUDGET_LIMIT}`、`polaris_core::prompt::SYSTEM_PROMPT`
+- Produces: `polaris_core::constitution::CONSTITUTION_LIMIT: usize`、`constitution::extract_always_on(&str) -> String`、`constitution::load(project_root: &std::path::Path) -> String`、`constitution::load_from(global_agents: Option<&std::path::Path>, project_root: &std::path::Path) -> String`、`constitution::environment_block(cwd: &std::path::Path, branch: Option<&str>) -> String`、`polaris_core::prompt::build_system(constitution: &str, environment: &str) -> String`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`crates/apsis-core/src/constitution.rs` の末尾に置く。
+`crates/polaris-core/src/constitution.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -442,9 +442,9 @@ mod tests {
 
 前置き。ここは載せない。
 
-<!-- apsis:always-on -->
+<!-- polaris:always-on -->
 main へ直接 push しない。
-<!-- /apsis:always-on -->
+<!-- /polaris:always-on -->
 
 ## 詳細
 長い手続き。ここも載せない。
@@ -505,11 +505,11 @@ main へ直接 push しない。
 
     #[test]
     fn caps_oversized_constitution() {
-        let mut body = String::from("<!-- apsis:always-on -->\n");
+        let mut body = String::from("<!-- polaris:always-on -->\n");
         for i in 0..500 {
             body.push_str(&format!("規則 {i}: 長い行をここに書き連ねる。\n"));
         }
-        body.push_str("<!-- /apsis:always-on -->\n");
+        body.push_str("<!-- /polaris:always-on -->\n");
 
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
         std::fs::write(dir.path().join("AGENTS.md"), &body).expect("書けない");
@@ -531,8 +531,8 @@ main へ直接 push しない。
 
     #[test]
     fn environment_block_carries_cwd_and_branch() {
-        let got = environment_block(Path::new("/w/apsis"), Some("feat/x"));
-        assert!(got.contains("/w/apsis"));
+        let got = environment_block(Path::new("/w/polaris"), Some("feat/x"));
+        assert!(got.contains("/w/polaris"));
         assert!(got.contains("feat/x"));
     }
 
@@ -540,10 +540,10 @@ main へ直接 push しない。
     fn full_always_on_context_stays_within_budget() {
         let constitution = "a".repeat(2000);
         let capped = cap(&constitution, CONSTITUTION_LIMIT);
-        let env = environment_block(Path::new("/w/apsis"), Some("feat/m1-headless-loop"));
+        let env = environment_block(Path::new("/w/polaris"), Some("feat/m1-headless-loop"));
         let system = crate::prompt::build_system(&capped, &env);
 
-        let n = crate::budget::always_on_tokens(&system, &apsis_tools::all_specs());
+        let n = crate::budget::always_on_tokens(&system, &polaris_tools::all_specs());
         assert!(
             n <= crate::budget::BUDGET_LIMIT,
             "憲法と環境を含めた常時コンテキストが {n} トークン。上限を超えている"
@@ -554,12 +554,12 @@ main へ直接 push しない。
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-core constitution`
+Run: `cargo test -p polaris-core constitution`
 Expected: コンパイルエラー。`extract_always_on` と `load` が未定義
 
 - [ ] **Step 3: dev 依存を足す**
 
-`crates/apsis-core/Cargo.toml` へ追加する。
+`crates/polaris-core/Cargo.toml` へ追加する。
 
 ```toml
 [dev-dependencies]
@@ -568,7 +568,7 @@ tempfile = { workspace = true }
 
 - [ ] **Step 4: 最小の実装を書く**
 
-`crates/apsis-core/src/constitution.rs` の先頭に置く。
+`crates/polaris-core/src/constitution.rs` の先頭に置く。
 
 ```rust
 //! 常時載る文脈のうち、ハーネスが所有しない部分。AGENTS.md の全文は載せない。
@@ -581,8 +581,8 @@ use crate::budget::count_tokens;
 /// 憲法ブロックに許すトークン数の上限。
 pub const CONSTITUTION_LIMIT: usize = 150;
 
-const BEGIN: &str = "<!-- apsis:always-on -->";
-const END: &str = "<!-- /apsis:always-on -->";
+const BEGIN: &str = "<!-- polaris:always-on -->";
+const END: &str = "<!-- /polaris:always-on -->";
 
 /// AGENTS.md から常時載せる部分だけを取り出す。
 ///
@@ -661,9 +661,9 @@ pub fn load_from(global_agents: Option<&Path>, project_root: &Path) -> String {
     cap(&parts.join("\n"), CONSTITUTION_LIMIT)
 }
 
-/// `~/.apsis/AGENTS.md` をグローバル規則として解決してから読む。
+/// `~/.polaris/AGENTS.md` をグローバル規則として解決してから読む。
 pub fn load(project_root: &Path) -> String {
-    let global = std::env::var_os("HOME").map(|h| Path::new(&h).join(".apsis").join("AGENTS.md"));
+    let global = std::env::var_os("HOME").map(|h| Path::new(&h).join(".polaris").join("AGENTS.md"));
     load_from(global.as_deref(), project_root)
 }
 
@@ -677,7 +677,7 @@ pub fn environment_block(cwd: &Path, branch: Option<&str>) -> String {
 }
 ```
 
-`crates/apsis-core/src/prompt.rs` の末尾へ追加する。
+`crates/polaris-core/src/prompt.rs` の末尾へ追加する。
 
 ```rust
 /// 常時載る文脈を組み立てる。空の節は見出しごと落とす。
@@ -700,23 +700,23 @@ pub fn build_system(constitution: &str, environment: &str) -> String {
 }
 ```
 
-`crates/apsis-core/src/lib.rs` へ追加する。
+`crates/polaris-core/src/lib.rs` へ追加する。
 
 ```rust
 pub mod constitution;
 ```
 
-`crates/apsis-core/Cargo.toml` の `[dependencies]` に `apsis-tools` が無ければ追加する。
+`crates/polaris-core/Cargo.toml` の `[dependencies]` に `polaris-tools` が無ければ追加する。
 
 - [ ] **Step 5: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-core`
+Run: `cargo test -p polaris-core`
 Expected: 全て PASS。最後のテストが、憲法と環境を含めた状態でも上限内であることを示す
 
 - [ ] **Step 6: コミットする**
 
 ```bash
-git add crates/apsis-core
+git add crates/polaris-core
 git commit -F - <<'MSG'
 feat(core): load capped constitution block and environment
 
@@ -737,17 +737,17 @@ MSG
 ### Task 4: 読み取りパス方針
 
 **Files:**
-- Create: `crates/apsis-tools/src/path_policy.rs`
-- Modify: `crates/apsis-tools/src/lib.rs`（`pub mod path_policy;` を追加）
-- Test: `crates/apsis-tools/src/path_policy.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-tools/src/path_policy.rs`
+- Modify: `crates/polaris-tools/src/lib.rs`（`pub mod path_policy;` を追加）
+- Test: `crates/polaris-tools/src/path_policy.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
 - Consumes: なし
-- Produces: `apsis_tools::path_policy::is_denied(&std::path::Path) -> bool`
+- Produces: `polaris_tools::path_policy::is_denied(&std::path::Path) -> bool`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`crates/apsis-tools/src/path_policy.rs` の末尾に置く。
+`crates/polaris-tools/src/path_policy.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -790,12 +790,12 @@ mod tests {
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-tools path_policy`
+Run: `cargo test -p polaris-tools path_policy`
 Expected: コンパイルエラー。`is_denied` が未定義
 
 - [ ] **Step 3: 最小の実装を書く**
 
-`crates/apsis-tools/src/path_policy.rs` の先頭に置く。
+`crates/polaris-tools/src/path_policy.rs` の先頭に置く。
 
 ```rust
 //! 読み取りを拒否するパスの判定。過検出より見逃しを避ける方向に倒す。
@@ -842,7 +842,7 @@ pub fn is_denied(path: &Path) -> bool {
 }
 ```
 
-`crates/apsis-tools/src/lib.rs` の先頭付近へ追加する。
+`crates/polaris-tools/src/lib.rs` の先頭付近へ追加する。
 
 ```rust
 pub mod path_policy;
@@ -850,13 +850,13 @@ pub mod path_policy;
 
 - [ ] **Step 4: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-tools path_policy`
+Run: `cargo test -p polaris-tools path_policy`
 Expected: 2 件とも PASS
 
 - [ ] **Step 5: コミットする**
 
 ```bash
-git add crates/apsis-tools
+git add crates/polaris-tools
 git commit -F - <<'MSG'
 feat(tools): deny reading secret-bearing paths
 
@@ -873,18 +873,18 @@ MSG
 ### Task 5: read ツール
 
 **Files:**
-- Create: `crates/apsis-tools/src/read.rs`
-- Modify: `crates/apsis-tools/src/lib.rs`（`pub mod read;` を追加）
-- Modify: `crates/apsis-tools/Cargo.toml`（`tempfile` を dev-dependencies へ追加）
-- Test: `crates/apsis-tools/src/read.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-tools/src/read.rs`
+- Modify: `crates/polaris-tools/src/lib.rs`（`pub mod read;` を追加）
+- Modify: `crates/polaris-tools/Cargo.toml`（`tempfile` を dev-dependencies へ追加）
+- Test: `crates/polaris-tools/src/read.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
-- Consumes: `apsis_tools::path_policy::is_denied`、`apsis_tools::ToolError`
-- Produces: `apsis_tools::read::read(path: &std::path::Path, offset: usize, limit: usize) -> Result<String, ToolError>`
+- Consumes: `polaris_tools::path_policy::is_denied`、`polaris_tools::ToolError`
+- Produces: `polaris_tools::read::read(path: &std::path::Path, offset: usize, limit: usize) -> Result<String, ToolError>`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`crates/apsis-tools/src/read.rs` の末尾に置く。
+`crates/polaris-tools/src/read.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -926,12 +926,12 @@ mod tests {
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-tools read`
+Run: `cargo test -p polaris-tools read`
 Expected: コンパイルエラー。`read` が未定義
 
 - [ ] **Step 3: 依存を足す**
 
-`crates/apsis-tools/Cargo.toml` へ追加する。
+`crates/polaris-tools/Cargo.toml` へ追加する。
 
 ```toml
 [dev-dependencies]
@@ -940,7 +940,7 @@ tempfile = { workspace = true }
 
 - [ ] **Step 4: 最小の実装を書く**
 
-`crates/apsis-tools/src/read.rs` の先頭に置く。
+`crates/polaris-tools/src/read.rs` の先頭に置く。
 
 ```rust
 //! read ツール。行番号を付けて返すのは、モデルが path:line で位置を示せるようにするため。
@@ -963,7 +963,7 @@ pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolErro
 }
 ```
 
-`crates/apsis-tools/src/lib.rs` へ追加する。
+`crates/polaris-tools/src/lib.rs` へ追加する。
 
 ```rust
 pub mod read;
@@ -971,13 +971,13 @@ pub mod read;
 
 - [ ] **Step 5: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-tools read`
+Run: `cargo test -p polaris-tools read`
 Expected: 3 件とも PASS
 
 - [ ] **Step 6: コミットする**
 
 ```bash
-git add crates/apsis-tools
+git add crates/polaris-tools
 git commit -F - <<'MSG'
 feat(tools): implement read with line numbers and path policy
 
@@ -994,30 +994,30 @@ MSG
 ### Task 6: 監査ログ
 
 **Files:**
-- Create: `crates/apsis-core/src/secret_screen/mod.rs`（commons から取り込む）
-- Create: `crates/apsis-core/src/audit.rs`
-- Modify: `crates/apsis-core/src/lib.rs`
-- Modify: `crates/apsis-core/Cargo.toml`
-- Test: `crates/apsis-core/src/audit.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-core/src/secret_screen/mod.rs`（commons から取り込む）
+- Create: `crates/polaris-core/src/audit.rs`
+- Modify: `crates/polaris-core/src/lib.rs`
+- Modify: `crates/polaris-core/Cargo.toml`
+- Test: `crates/polaris-core/src/audit.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
 - Consumes: なし
-- Produces: `apsis_core::audit::AuditLog::open(&Path) -> std::io::Result<AuditLog>`、`AuditLog::record(&mut self, tool: &str, detail: &str) -> std::io::Result<()>`、`apsis_core::secret_screen::{screen_text, FilterResult}`
+- Produces: `polaris_core::audit::AuditLog::open(&Path) -> std::io::Result<AuditLog>`、`AuditLog::record(&mut self, tool: &str, detail: &str) -> std::io::Result<()>`、`polaris_core::secret_screen::{screen_text, FilterResult}`
 
 - [ ] **Step 1: commons からシークレット伏字化を取り込む**
 
 ```bash
 python3 ~/.claude/skills/commons-catalog/scripts/commons.py use secret-screen \
-  --into crates/apsis-core/src/secret_screen \
-  --project codex/apsis --lang rust
-mv crates/apsis-core/src/secret_screen/lib.rs crates/apsis-core/src/secret_screen/mod.rs
+  --into crates/polaris-core/src/secret_screen \
+  --project codex/polaris --lang rust
+mv crates/polaris-core/src/secret_screen/lib.rs crates/polaris-core/src/secret_screen/mod.rs
 ```
 
-`use` は `src/` の接頭辞を落として複写するため、`crates/apsis-core/src/secret_screen/lib.rs` へ置かれる。Rust のモジュール解決に合わせて `mod.rs` へ改名する。取り込んだコードの改変は commons 側へ伝播しない。
+`use` は `src/` の接頭辞を落として複写するため、`crates/polaris-core/src/secret_screen/lib.rs` へ置かれる。Rust のモジュール解決に合わせて `mod.rs` へ改名する。取り込んだコードの改変は commons 側へ伝播しない。
 
 - [ ] **Step 2: 失敗するテストを書く**
 
-`crates/apsis-core/src/audit.rs` の末尾に置く。
+`crates/polaris-core/src/audit.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -1054,12 +1054,12 @@ mod tests {
 
 - [ ] **Step 3: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-core audit`
+Run: `cargo test -p polaris-core audit`
 Expected: コンパイルエラー。`AuditLog` が未定義
 
 - [ ] **Step 4: 依存を足す**
 
-`crates/apsis-core/Cargo.toml` へ追加する。
+`crates/polaris-core/Cargo.toml` へ追加する。
 
 ```toml
 regex = { workspace = true }
@@ -1070,7 +1070,7 @@ regex = { workspace = true }
 
 - [ ] **Step 5: 最小の実装を書く**
 
-`crates/apsis-core/src/audit.rs` の先頭に置く。
+`crates/polaris-core/src/audit.rs` の先頭に置く。
 
 ```rust
 //! 追記専用の監査ログ。署名は付けない。インプロセスでは署名する主体と
@@ -1105,7 +1105,7 @@ impl AuditLog {
 }
 ```
 
-`crates/apsis-core/src/lib.rs` へ追加する。
+`crates/polaris-core/src/lib.rs` へ追加する。
 
 ```rust
 pub mod audit;
@@ -1114,13 +1114,13 @@ pub mod secret_screen;
 
 - [ ] **Step 6: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-core`
+Run: `cargo test -p polaris-core`
 Expected: 取り込んだ `secret_screen` の 20 件と audit の 2 件を含めて全て PASS
 
 - [ ] **Step 7: コミットする**
 
 ```bash
-git add crates/apsis-core
+git add crates/polaris-core
 git commit -F - <<'MSG'
 feat(core): add append-only audit log with secret redaction
 
@@ -1138,28 +1138,28 @@ MSG
 ### Task 7: Provider トレイトと SSE
 
 **Files:**
-- Create: `crates/apsis-provider/Cargo.toml`
-- Create: `crates/apsis-provider/src/lib.rs`
-- Create: `crates/apsis-provider/src/sse.rs`（commons から取り込む）
-- Test: `crates/apsis-provider/src/lib.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-provider/Cargo.toml`
+- Create: `crates/polaris-provider/src/lib.rs`
+- Create: `crates/polaris-provider/src/sse.rs`（commons から取り込む）
+- Test: `crates/polaris-provider/src/lib.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
 - Consumes: なし
-- Produces: `apsis_provider::{Provider, CompletionRequest, CompletionResponse, Message, Role, ToolCall, ProviderError}`、`apsis_provider::sse::{SseDecoder, SseEvent}`
+- Produces: `polaris_provider::{Provider, CompletionRequest, CompletionResponse, Message, Role, ToolCall, ProviderError}`、`polaris_provider::sse::{SseDecoder, SseEvent}`
 
 - [ ] **Step 1: commons から SSE デコーダを取り込む**
 
 ```bash
 python3 ~/.claude/skills/commons-catalog/scripts/commons.py use sse-decoder \
-  --into crates/apsis-provider/src \
-  --project codex/apsis --lang rust
+  --into crates/polaris-provider/src \
+  --project codex/polaris --lang rust
 ```
 
-`src/sse.rs` の接頭辞が落ちて `crates/apsis-provider/src/sse.rs` へ置かれる。改名は不要。
+`src/sse.rs` の接頭辞が落ちて `crates/polaris-provider/src/sse.rs` へ置かれる。改名は不要。
 
 - [ ] **Step 2: 失敗するテストを書く**
 
-`crates/apsis-provider/src/lib.rs` の末尾に置く。
+`crates/polaris-provider/src/lib.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -1215,22 +1215,22 @@ mod tests {
 
 - [ ] **Step 3: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-provider`
+Run: `cargo test -p polaris-provider`
 Expected: コンパイルエラー。`Provider` などが未定義
 
 - [ ] **Step 4: クレートを作る**
 
-`crates/apsis-provider/Cargo.toml`
+`crates/polaris-provider/Cargo.toml`
 
 ```toml
 [package]
-name = "apsis-provider"
+name = "polaris-provider"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-apsis-tools = { path = "../apsis-tools" }
+polaris-tools = { path = "../polaris-tools" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -1245,7 +1245,7 @@ wiremock = { workspace = true }
 
 - [ ] **Step 5: 最小の実装を書く**
 
-`crates/apsis-provider/src/lib.rs` の先頭に置く。
+`crates/polaris-provider/src/lib.rs` の先頭に置く。
 
 ```rust
 //! プロバイダ抽象。トランスポートに依存する部分は各実装が持ち、
@@ -1253,7 +1253,7 @@ wiremock = { workspace = true }
 
 pub mod sse;
 
-use apsis_tools::ToolSpec;
+use polaris_tools::ToolSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1306,13 +1306,13 @@ pub trait Provider: Send + Sync {
 
 - [ ] **Step 6: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-provider`
+Run: `cargo test -p polaris-provider`
 Expected: 取り込んだ `sse` の 7 件と lib の 2 件を含めて全て PASS
 
 - [ ] **Step 7: コミットする**
 
 ```bash
-git add crates/apsis-provider
+git add crates/polaris-provider
 git commit -F - <<'MSG'
 feat(provider): add Provider trait and vendored SSE decoder
 
@@ -1329,17 +1329,17 @@ MSG
 ### Task 8: OpenAI 互換プロバイダ
 
 **Files:**
-- Create: `crates/apsis-provider/src/openai.rs`
-- Modify: `crates/apsis-provider/src/lib.rs`（`pub mod openai;` を追加）
-- Test: `crates/apsis-provider/src/openai.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-provider/src/openai.rs`
+- Modify: `crates/polaris-provider/src/lib.rs`（`pub mod openai;` を追加）
+- Test: `crates/polaris-provider/src/openai.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
-- Consumes: `apsis_provider::{Provider, CompletionRequest, CompletionResponse, ToolCall, ProviderError, Message, Role}`
-- Produces: `apsis_provider::openai::OpenAiProvider::new(base_url: String, api_key: String, model: String) -> OpenAiProvider`
+- Consumes: `polaris_provider::{Provider, CompletionRequest, CompletionResponse, ToolCall, ProviderError, Message, Role}`
+- Produces: `polaris_provider::openai::OpenAiProvider::new(base_url: String, api_key: String, model: String) -> OpenAiProvider`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`crates/apsis-provider/src/openai.rs` の末尾に置く。
+`crates/polaris-provider/src/openai.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -1407,12 +1407,12 @@ mod tests {
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-provider openai`
+Run: `cargo test -p polaris-provider openai`
 Expected: コンパイルエラー。`OpenAiProvider` が未定義
 
 - [ ] **Step 3: 最小の実装を書く**
 
-`crates/apsis-provider/src/openai.rs` の先頭に置く。
+`crates/polaris-provider/src/openai.rs` の先頭に置く。
 
 ```rust
 //! OpenAI 互換のチャット補完。base_url を差し替えれば互換エンドポイントも叩ける。
@@ -1525,7 +1525,7 @@ impl Provider for OpenAiProvider {
 }
 ```
 
-`crates/apsis-provider/src/lib.rs` へ追加する。
+`crates/polaris-provider/src/lib.rs` へ追加する。
 
 ```rust
 pub mod openai;
@@ -1533,13 +1533,13 @@ pub mod openai;
 
 - [ ] **Step 4: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-provider`
+Run: `cargo test -p polaris-provider`
 Expected: 全て PASS
 
 - [ ] **Step 5: コミットする**
 
 ```bash
-git add crates/apsis-provider
+git add crates/polaris-provider
 git commit -F - <<'MSG'
 feat(provider): implement OpenAI-compatible completion
 
@@ -1556,17 +1556,17 @@ MSG
 ### Task 9: 停止条件
 
 **Files:**
-- Create: `crates/apsis-core/src/stop.rs`
-- Modify: `crates/apsis-core/src/lib.rs`
-- Test: `crates/apsis-core/src/stop.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-core/src/stop.rs`
+- Modify: `crates/polaris-core/src/lib.rs`
+- Test: `crates/polaris-core/src/stop.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
 - Consumes: なし
-- Produces: `apsis_core::stop::{StopTracker, StopReason}`、`StopTracker::new(max_turns: u32)`、`StopTracker::observe_error(&mut self, msg: &str) -> Option<StopReason>`、`StopTracker::observe_turn(&mut self) -> Option<StopReason>`
+- Produces: `polaris_core::stop::{StopTracker, StopReason}`、`StopTracker::new(max_turns: u32)`、`StopTracker::observe_error(&mut self, msg: &str) -> Option<StopReason>`、`StopTracker::observe_turn(&mut self) -> Option<StopReason>`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`crates/apsis-core/src/stop.rs` の末尾に置く。
+`crates/polaris-core/src/stop.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
@@ -1602,12 +1602,12 @@ mod tests {
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-core stop`
+Run: `cargo test -p polaris-core stop`
 Expected: コンパイルエラー。`StopTracker` が未定義
 
 - [ ] **Step 3: 最小の実装を書く**
 
-`crates/apsis-core/src/stop.rs` の先頭に置く。
+`crates/polaris-core/src/stop.rs` の先頭に置く。
 
 ```rust
 //! 停止条件。自動修復は行わない。壊れたまま回り続けるのが最も高くつくため、
@@ -1656,7 +1656,7 @@ impl StopTracker {
 }
 ```
 
-`crates/apsis-core/src/lib.rs` へ追加する。
+`crates/polaris-core/src/lib.rs` へ追加する。
 
 ```rust
 pub mod stop;
@@ -1664,13 +1664,13 @@ pub mod stop;
 
 - [ ] **Step 4: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-core stop`
+Run: `cargo test -p polaris-core stop`
 Expected: 3 件とも PASS
 
 - [ ] **Step 5: コミットする**
 
 ```bash
-git add crates/apsis-core
+git add crates/polaris-core
 git commit -F - <<'MSG'
 feat(core): add quantitative stop conditions
 
@@ -1686,25 +1686,25 @@ MSG
 ### Task 10: エージェントループ
 
 **Files:**
-- Create: `crates/apsis-core/src/session.rs`
-- Create: `crates/apsis-core/src/agent.rs`
-- Modify: `crates/apsis-core/src/lib.rs`
-- Modify: `crates/apsis-core/Cargo.toml`
-- Test: `crates/apsis-core/src/agent.rs` の `#[cfg(test)]` モジュール
+- Create: `crates/polaris-core/src/session.rs`
+- Create: `crates/polaris-core/src/agent.rs`
+- Modify: `crates/polaris-core/src/lib.rs`
+- Modify: `crates/polaris-core/Cargo.toml`
+- Test: `crates/polaris-core/src/agent.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
-- Consumes: `apsis_provider::{Provider, CompletionRequest, CompletionResponse, Message, Role, ToolCall}`、`apsis_tools::{all_specs, read::read}`、`apsis_core::stop::{StopTracker, StopReason}`、`apsis_core::audit::AuditLog`、`apsis_core::prompt::build_system`
-- Produces: `apsis_core::session::Session::new() -> Session`、`Session::push_user(&mut self, &str)`、`apsis_core::agent::run(provider: &dyn Provider, session: &mut Session, audit: &mut AuditLog, stop: &mut StopTracker, system: &str) -> Result<String, AgentError>`
+- Consumes: `polaris_provider::{Provider, CompletionRequest, CompletionResponse, Message, Role, ToolCall}`、`polaris_tools::{all_specs, read::read}`、`polaris_core::stop::{StopTracker, StopReason}`、`polaris_core::audit::AuditLog`、`polaris_core::prompt::build_system`
+- Produces: `polaris_core::session::Session::new() -> Session`、`Session::push_user(&mut self, &str)`、`polaris_core::agent::run(provider: &dyn Provider, session: &mut Session, audit: &mut AuditLog, stop: &mut StopTracker, system: &str) -> Result<String, AgentError>`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`crates/apsis-core/src/agent.rs` の末尾に置く。
+`crates/polaris-core/src/agent.rs` の末尾に置く。
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apsis_provider::{CompletionResponse, ToolCall};
+    use polaris_provider::{CompletionResponse, ToolCall};
     use std::sync::Mutex;
 
     /// 1 回目はツール呼び出し、2 回目は本文を返すプロバイダ。
@@ -1717,7 +1717,7 @@ mod tests {
         async fn complete(
             &self,
             _req: CompletionRequest,
-        ) -> Result<CompletionResponse, apsis_provider::ProviderError> {
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
             let mut r = self.replies.lock().expect("lock");
             Ok(if r.is_empty() { CompletionResponse::default() } else { r.remove(0) })
         }
@@ -1787,28 +1787,28 @@ mod tests {
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-core agent`
+Run: `cargo test -p polaris-core agent`
 Expected: コンパイルエラー。`Session` と `run` が未定義
 
 - [ ] **Step 3: 依存を足す**
 
-`crates/apsis-core/Cargo.toml` へ追加する。
+`crates/polaris-core/Cargo.toml` へ追加する。
 
 ```toml
-apsis-provider = { path = "../apsis-provider" }
+polaris-provider = { path = "../polaris-provider" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 ```
 
 - [ ] **Step 4: セッションを実装する**
 
-`crates/apsis-core/src/session.rs`
+`crates/polaris-core/src/session.rs`
 
 ```rust
 //! メッセージ履歴。M1 では追加のみで、圧縮もディスクへの永続化も持たない。
 //! 永続化と再開は M5 で入れる。
 
-use apsis_provider::{Message, Role};
+use polaris_provider::{Message, Role};
 
 #[derive(Default)]
 pub struct Session {
@@ -1836,14 +1836,14 @@ impl Session {
 
 - [ ] **Step 5: ループを実装する**
 
-`crates/apsis-core/src/agent.rs` の先頭に置く。
+`crates/polaris-core/src/agent.rs` の先頭に置く。
 
 ```rust
 //! エージェントループ。ツール呼び出しが無くなった時点の本文を返す。
 
 use std::path::Path;
 
-use apsis_provider::{CompletionRequest, Provider};
+use polaris_provider::{CompletionRequest, Provider};
 
 use crate::audit::AuditLog;
 use crate::session::Session;
@@ -1854,7 +1854,7 @@ pub enum AgentError {
     #[error("停止した: {0:?}")]
     Stopped(StopReason),
     #[error("プロバイダ: {0}")]
-    Provider(#[from] apsis_provider::ProviderError),
+    Provider(#[from] polaris_provider::ProviderError),
     #[error("入出力: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -1878,7 +1878,7 @@ pub async fn run(
             .complete(CompletionRequest {
                 system: system.to_string(),
                 messages: session.messages.clone(),
-                tools: apsis_tools::all_specs(),
+                tools: polaris_tools::all_specs(),
             })
             .await?;
 
@@ -1904,7 +1904,7 @@ pub async fn run(
 }
 
 /// ツール呼び出しを実際の実装へ振り分ける。失敗はモデルへ返す文字列にする。
-fn dispatch(call: &apsis_provider::ToolCall) -> Result<String, String> {
+fn dispatch(call: &polaris_provider::ToolCall) -> Result<String, String> {
     match call.name.as_str() {
         "read" => {
             let path = call.arguments["path"]
@@ -1912,14 +1912,14 @@ fn dispatch(call: &apsis_provider::ToolCall) -> Result<String, String> {
                 .ok_or_else(|| "path が無い".to_string())?;
             let offset = call.arguments["offset"].as_u64().unwrap_or(0) as usize;
             let limit = call.arguments["limit"].as_u64().unwrap_or(2000) as usize;
-            apsis_tools::read::read(Path::new(path), offset, limit).map_err(|e| e.to_string())
+            polaris_tools::read::read(Path::new(path), offset, limit).map_err(|e| e.to_string())
         }
         other => Err(format!("未知のツール: {other}")),
     }
 }
 ```
 
-`crates/apsis-core/src/lib.rs` へ追加する。
+`crates/polaris-core/src/lib.rs` へ追加する。
 
 ```rust
 pub mod agent;
@@ -1928,13 +1928,13 @@ pub mod session;
 
 - [ ] **Step 6: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-core`
+Run: `cargo test -p polaris-core`
 Expected: 全て PASS
 
 - [ ] **Step 7: コミットする**
 
 ```bash
-git add crates/apsis-core
+git add crates/polaris-core
 git commit -F - <<'MSG'
 feat(core): add the agent loop
 
@@ -1951,18 +1951,18 @@ MSG
 ### Task 11: CLI 一発実行
 
 **Files:**
-- Create: `crates/apsis-cli/Cargo.toml`
-- Create: `crates/apsis-cli/src/main.rs`
-- Create: `crates/apsis-cli/tests/cli.rs`
-- Test: `crates/apsis-cli/tests/cli.rs`
+- Create: `crates/polaris-cli/Cargo.toml`
+- Create: `crates/polaris-cli/src/main.rs`
+- Create: `crates/polaris-cli/tests/cli.rs`
+- Test: `crates/polaris-cli/tests/cli.rs`
 
 **Interfaces:**
-- Consumes: `apsis_core::{agent::run, session::Session, audit::AuditLog, stop::StopTracker, constitution, prompt::build_system}`、`apsis_provider::openai::OpenAiProvider`
-- Produces: バイナリ `apsis`
+- Consumes: `polaris_core::{agent::run, session::Session, audit::AuditLog, stop::StopTracker, constitution, prompt::build_system}`、`polaris_provider::openai::OpenAiProvider`
+- Produces: バイナリ `polaris`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`crates/apsis-cli/tests/cli.rs`
+`crates/polaris-cli/tests/cli.rs`
 
 ```rust
 use std::process::Command;
@@ -1971,67 +1971,67 @@ use std::process::Command;
 /// 実際のネットワークへは出ない。
 #[test]
 fn reports_missing_api_key() {
-    let exe = env!("CARGO_BIN_EXE_apsis");
+    let exe = env!("CARGO_BIN_EXE_polaris");
     let out = Command::new(exe)
         .args(["-p", "hello"])
-        .env_remove("APSIS_API_KEY")
+        .env_remove("POLARIS_API_KEY")
         .output()
         .expect("起動できない");
 
     assert!(!out.status.success(), "鍵が無いのに成功している");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("APSIS_API_KEY"), "鍵が無いことを伝えていない: {err}");
+    assert!(err.contains("POLARIS_API_KEY"), "鍵が無いことを伝えていない: {err}");
 }
 ```
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
-Run: `cargo test -p apsis-cli`
-Expected: `CARGO_BIN_EXE_apsis` が解決できずコンパイルエラー
+Run: `cargo test -p polaris-cli`
+Expected: `CARGO_BIN_EXE_polaris` が解決できずコンパイルエラー
 
 - [ ] **Step 3: クレートを作る**
 
-`crates/apsis-cli/Cargo.toml`
+`crates/polaris-cli/Cargo.toml`
 
 ```toml
 [package]
-name = "apsis-cli"
+name = "polaris-cli"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "apsis"
+name = "polaris"
 path = "src/main.rs"
 
 [dependencies]
-apsis-core = { path = "../apsis-core" }
-apsis-provider = { path = "../apsis-provider" }
+polaris-core = { path = "../polaris-core" }
+polaris-provider = { path = "../polaris-provider" }
 clap = { workspace = true }
 tokio = { workspace = true }
 ```
 
 - [ ] **Step 4: 最小の実装を書く**
 
-`crates/apsis-cli/src/main.rs`
+`crates/polaris-cli/src/main.rs`
 
 ```rust
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use apsis_core::{agent, audit::AuditLog, constitution, prompt, session::Session, stop::StopTracker};
-use apsis_provider::openai::OpenAiProvider;
+use polaris_core::{agent, audit::AuditLog, constitution, prompt, session::Session, stop::StopTracker};
+use polaris_provider::openai::OpenAiProvider;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "apsis", about = "最小コンテキストのコーディングエージェント")]
+#[command(name = "polaris", about = "最小コンテキストのコーディングエージェント")]
 struct Args {
     /// 実行する指示。
     #[arg(short, long)]
     prompt: String,
 
     /// 監査ログの出力先。
-    #[arg(long, default_value = "apsis-audit.jsonl")]
+    #[arg(long, default_value = "polaris-audit.jsonl")]
     audit: PathBuf,
 
     /// 1 回の実行で許すターン数の上限。
@@ -2043,13 +2043,13 @@ struct Args {
 async fn main() -> ExitCode {
     let args = Args::parse();
 
-    let Ok(api_key) = std::env::var("APSIS_API_KEY") else {
-        eprintln!("APSIS_API_KEY が設定されていない");
+    let Ok(api_key) = std::env::var("POLARIS_API_KEY") else {
+        eprintln!("POLARIS_API_KEY が設定されていない");
         return ExitCode::FAILURE;
     };
     let base_url =
-        std::env::var("APSIS_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let model = std::env::var("APSIS_MODEL").unwrap_or_else(|_| "gpt-5.4".into());
+        std::env::var("POLARIS_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let model = std::env::var("POLARIS_MODEL").unwrap_or_else(|_| "gpt-5.4".into());
 
     let provider = OpenAiProvider::new(base_url, api_key, model);
     let mut session = Session::new();
@@ -2084,7 +2084,7 @@ async fn main() -> ExitCode {
 
 - [ ] **Step 5: テストが通ることを確認する**
 
-Run: `cargo test -p apsis-cli`
+Run: `cargo test -p polaris-cli`
 Expected: PASS
 
 - [ ] **Step 6: 全体を通す**
@@ -2095,11 +2095,11 @@ Expected: 全て成功。予算テストが実測値とともに通ることを�
 - [ ] **Step 7: コミットする**
 
 ```bash
-git add crates/apsis-cli
+git add crates/polaris-cli
 git commit -F - <<'MSG'
 feat(cli): add headless one-shot entry point
 
-APSIS_API_KEY と APSIS_BASE_URL と APSIS_MODEL で接続先を決める。
+POLARIS_API_KEY と POLARIS_BASE_URL と POLARIS_MODEL で接続先を決める。
 鍵が無い場合はネットワークへ出る前に終了し、その旨を標準エラーへ出す。
 
 Co-Authored-By: Claude <noreply@anthropic.com>
@@ -2116,4 +2116,4 @@ MSG
 - 巨大な AGENTS.md を置いても常時コンテキストが 990 を超えない
 - `.ssh/id_rsa` への読み取りが `PathDenied` で拒否される
 - 監査ログに生の資格情報が現れない
-- `APSIS_API_KEY` を設定した状態で `apsis -p "Cargo.toml は何行か"` が答えを返す
+- `POLARIS_API_KEY` を設定した状態で `polaris -p "Cargo.toml は何行か"` が答えを返す

@@ -1,6 +1,6 @@
 //! 常時コンテキストの計測。数値は測定で担保し、見積で運用しない。
 
-use apsis_tools::ToolSpec;
+use polaris_tools::ToolSpec;
 
 /// 常時コンテキストの上限。
 pub const BUDGET_LIMIT: usize = 990;
@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn always_on_context_stays_within_budget() {
-        let specs = apsis_tools::all_specs();
+        let specs = polaris_tools::all_specs();
         let n = always_on_tokens(SYSTEM_PROMPT, &specs);
         assert!(
             n <= BUDGET_LIMIT,
@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn tool_count_stays_within_limit() {
-        let n = apsis_tools::all_specs().len();
+        let n = polaris_tools::all_specs().len();
         assert!(
             n <= MAX_TOOLS,
             "ツールが {n} 本。上限 {MAX_TOOLS} 本を超えている"

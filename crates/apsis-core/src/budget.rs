@@ -10,8 +10,13 @@ pub const MAX_TOOLS: usize = 6;
 
 /// 基準トークナイザで数える。プロバイダごとに実数は前後するため、
 /// 予算の判定は常にこの基準で行う。
+///
+/// `o200k_base()` は呼ぶたびに約20万行のランクテーブルを埋め込みデータから
+/// 再構築するため、呼び出し1回ごとに構築すると `cap()` の切り詰めループ
+/// （行や文字ごとに再計測する）で顕著に遅い。プロセス内で1度だけ構築した
+/// シングルトンを使い回す。
 pub fn count_tokens(text: &str) -> usize {
-    let bpe = tiktoken_rs::o200k_base().expect("o200k_base を読めない");
+    let bpe = tiktoken_rs::o200k_base_singleton();
     bpe.encode_with_special_tokens(text).len()
 }
 

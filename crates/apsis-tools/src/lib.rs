@@ -1,5 +1,7 @@
 //! apsis の組込みツール。常時提供するツールは 6 本を超えない。
 
+pub mod path_policy;
+
 use serde::Serialize;
 
 /// モデルへ渡すツール定義。`parameters` は JSON Schema。

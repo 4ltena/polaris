@@ -40,7 +40,10 @@ pub fn extract_always_on(markdown: &str) -> String {
 }
 
 /// 上限を超えていたら行単位で切り詰める。全部落とすことはしない。
-fn cap(text: &str, limit: usize) -> String {
+///
+/// `build_system` が構成ミスで未切り詰めの憲法テキストを渡されても安全に
+/// なるよう、クレート内から呼べる可視性にしてある。
+pub(crate) fn cap(text: &str, limit: usize) -> String {
     if count_tokens(text) <= limit {
         return text.to_string();
     }
@@ -99,19 +102,34 @@ fn read_block(path: &Path) -> String {
 /// グローバル規則とプロジェクト規則をこの順に読み、合算して上限で切り詰める。
 /// どちらが欠けていても失敗ではない。テストから経路を固定できるよう、
 /// グローバル側のパスは引数で受ける。
+///
+/// `cap()` は接頭辞を残すため、素朴に連結してから丸ごと切り詰めると、より
+/// 具体的なプロジェクト側の規則（常に後方）がグローバル側だけで上限に
+/// 達したときに丸ごと消える。ソースが両方とも有る場合は、グローバルを
+/// `CONSTITUTION_LIMIT / 2` で切り詰めてから、残り予算をプロジェクトへ渡す
+/// ことで両方を残す。片方しか無ければ、その1つが上限の全量を使ってよい。
 pub fn load_from(global_agents: Option<&Path>, project_root: &Path) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(g) = global_agents {
-        let b = read_block(g);
-        if !b.is_empty() {
-            parts.push(b);
+    let global = global_agents.map(read_block).unwrap_or_default();
+    let project = read_block(&project_root.join("AGENTS.md"));
+
+    match (global.is_empty(), project.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => cap(&project, CONSTITUTION_LIMIT),
+        (false, true) => cap(&global, CONSTITUTION_LIMIT),
+        (false, false) => {
+            let global_capped = cap(&global, CONSTITUTION_LIMIT / 2);
+            let global_tokens = count_tokens(&global_capped);
+            // 連結する改行自体のトークン代も引いておく。o200k_base のような
+            // 語境界に敏感なトークナイザでは改行が独立したチャンクになるため、
+            // 結合後の実測トークン数は各片の実測の単純和と一致する。
+            let separator_tokens = count_tokens("\n");
+            let project_limit = CONSTITUTION_LIMIT
+                .saturating_sub(global_tokens)
+                .saturating_sub(separator_tokens);
+            let project_capped = cap(&project, project_limit);
+            format!("{global_capped}\n{project_capped}")
         }
     }
-    let b = read_block(&project_root.join("AGENTS.md"));
-    if !b.is_empty() {
-        parts.push(b);
-    }
-    cap(&parts.join("\n"), CONSTITUTION_LIMIT)
 }
 
 /// `~/.apsis/AGENTS.md` をグローバル規則として解決してから読む。
@@ -244,6 +262,63 @@ main へ直接 push しない。
         // 文字が壊れて見える。有効な char 境界で切れていることの確認を兼ねる。
         assert!(line.starts_with(&got), "元の行の接頭辞になっていない");
         assert!(got.chars().all(|c| c == 'あ'), "文字が壊れている");
+    }
+
+    #[test]
+    fn both_sources_present_when_global_alone_is_oversized() {
+        // グローバル側だけで上限に達するほど巨大でも、より具体的な
+        // プロジェクト側の規則を消してはいけない。両方の文字列が残っている
+        // ことと、合計が上限内であることを確認する。
+        let g = tempfile::tempdir().expect("一時ディレクトリ");
+        let pj = tempfile::tempdir().expect("一時ディレクトリ");
+
+        let mut global_body = String::from("<!-- apsis:always-on -->\n");
+        for i in 0..500 {
+            global_body.push_str(&format!("全域規則 {i}: 長い行をここに書き連ねる。\n"));
+        }
+        global_body.push_str("<!-- /apsis:always-on -->\n");
+        std::fs::write(g.path().join("AGENTS.md"), &global_body).expect("書けない");
+
+        std::fs::write(
+            pj.path().join("AGENTS.md"),
+            "## Always on\n\nmain へ直接 push しない。\n",
+        )
+        .expect("書けない");
+
+        let got = load_from(Some(&g.path().join("AGENTS.md")), pj.path());
+        assert!(
+            got.contains("main へ直接 push しない。"),
+            "プロジェクト規則が消えている: {got}"
+        );
+        assert!(
+            got.contains("全域規則 0"),
+            "グローバル規則が残っていない: {got}"
+        );
+        let n = count_tokens(&got);
+        assert!(n <= CONSTITUTION_LIMIT, "上限を超えている: {n}");
+    }
+
+    #[test]
+    fn single_source_uses_the_full_limit() {
+        // グローバル側が無い場合、プロジェクト側だけで CONSTITUTION_LIMIT の
+        // 全量を使ってよい。半分に予約されていないことを、上限の半分を
+        // 超える量が実際に残ることで確認する。
+        let mut body = String::from("<!-- apsis:always-on -->\n");
+        for i in 0..500 {
+            body.push_str(&format!("規則 {i}: 長い行をここに書き連ねる。\n"));
+        }
+        body.push_str("<!-- /apsis:always-on -->\n");
+
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::write(dir.path().join("AGENTS.md"), &body).expect("書けない");
+
+        let got = load_from(None, dir.path());
+        let n = count_tokens(&got);
+        assert!(n <= CONSTITUTION_LIMIT, "上限を超えている: {n}");
+        assert!(
+            n > CONSTITUTION_LIMIT / 2,
+            "単独ソースなのに半分しか使えていない: {n}"
+        );
     }
 
     #[test]

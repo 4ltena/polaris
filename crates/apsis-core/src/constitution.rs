@@ -54,14 +54,40 @@ fn cap(text: &str, limit: usize) -> String {
         kept.push(line);
     }
     if kept.is_empty() {
-        // 1 行目だけで上限を超える場合は、文字単位で落として先頭を残す。
-        let mut s: String = text.lines().next().unwrap_or_default().to_string();
-        while count_tokens(&s) > limit && !s.is_empty() {
-            s.truncate(s.len() - s.chars().last().map_or(0, |c| c.len_utf8()));
-        }
-        return s;
+        // 1 行目だけで上限を超える場合は、char 境界を保ったまま二分探索で
+        // 収まる最大の接頭辞を探す。
+        return cap_by_char_boundary(text.lines().next().unwrap_or_default(), limit);
     }
     kept.join("\n")
+}
+
+/// `text` の先頭から、トークン数が `limit` 以下になる最大の接頭辞を返す。
+///
+/// 文字単位で 1 つずつ削ると、行の長さに比例した回数だけ `count_tokens` を
+/// 呼ぶことになり、`count_tokens` の呼び出しコストと無関係に遅い
+/// （20KB の1行なら数万回）。`char_indices` が返す文字境界だけを候補にして
+/// 二分探索するため、呼び出し回数は候補数の対数に収まる。マルチバイト文字を
+/// 跨いで切ることはない。空文字列は必ず `limit` 以下になるため、`lo` は
+/// 探索の初期値からループの不変条件として常に条件を満たし続ける。
+fn cap_by_char_boundary(text: &str, limit: usize) -> String {
+    if count_tokens(text) <= limit {
+        return text.to_string();
+    }
+
+    let mut boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    boundaries.push(text.len());
+
+    let mut lo = 0usize;
+    let mut hi = boundaries.len() - 1;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if count_tokens(&text[..boundaries[mid]]) <= limit {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    text[..boundaries[lo]].to_string()
 }
 
 fn read_block(path: &Path) -> String {
@@ -198,6 +224,26 @@ main へ直接 push しない。
             count_tokens(&got)
         );
         assert!(!got.is_empty(), "全部捨ててはいけない");
+    }
+
+    #[test]
+    fn caps_single_oversized_line_at_a_char_boundary() {
+        // 全角文字（UTF-8で3バイト）を並べた1行。行の途中改行が無いため
+        // cap() の二分探索フォールバックに直接入る。バイト単位で素朴に
+        // 切り詰めれば文字境界を跨いで不正な UTF-8 になる場面を作る。
+        let line = "あ".repeat(3000);
+        let got = cap(&line, CONSTITUTION_LIMIT);
+
+        assert!(!got.is_empty(), "非空の入力から空文字列を返してはいけない");
+        assert!(
+            count_tokens(&got) <= CONSTITUTION_LIMIT,
+            "切り詰められていない: {} トークン",
+            count_tokens(&got)
+        );
+        // 文字境界を跨いでいれば、この時点で元の行の正しい接頭辞になっておらず、
+        // 文字が壊れて見える。有効な char 境界で切れていることの確認を兼ねる。
+        assert!(line.starts_with(&got), "元の行の接頭辞になっていない");
+        assert!(got.chars().all(|c| c == 'あ'), "文字が壊れている");
     }
 
     #[test]

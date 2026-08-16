@@ -94,47 +94,7 @@ apsis/
 - [ ] **Step 1: workspace とクレートの骨格を作る**
 
 テストを走らせるには workspace が読める状態である必要がある。先に骨格を置く。
-`crates/apsis-tools/src/lib.rs` は空のまま作る。
-
-Step 3 の内容をここで作成し、Step 3 では内容を確認するだけにする。
-
-- [ ] **Step 2: 失敗するテストを書く**
-
-`crates/apsis-tools/src/lib.rs` の末尾に置く。
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_spec_serializes_with_required_path() {
-        let specs = all_specs();
-        let read = specs.iter().find(|s| s.name == "read").expect("read が無い");
-        let json = serde_json::to_value(read).expect("直列化できない");
-        assert_eq!(json["name"], "read");
-        assert_eq!(json["parameters"]["required"][0], "path");
-        assert_eq!(json["parameters"]["properties"]["path"]["type"], "string");
-    }
-
-    #[test]
-    fn all_specs_has_unique_names() {
-        let specs = all_specs();
-        let mut names: Vec<&str> = specs.iter().map(|s| s.name).collect();
-        names.sort_unstable();
-        let before = names.len();
-        names.dedup();
-        assert_eq!(before, names.len(), "ツール名が重複している");
-    }
-}
-```
-
-- [ ] **Step 3: テストが失敗することを確認する**
-
-Run: `cargo test -p apsis-tools`
-Expected: コンパイルエラー。`all_specs` と `ToolSpec` が未定義
-
-- [ ] **Step 3 の内容（Step 1 で作成済みであることを確認する）**
+この時点で `crates/apsis-tools/src/lib.rs` は空のファイルとして作る。
 
 `Cargo.toml`
 
@@ -194,6 +154,41 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 ```
+- [ ] **Step 2: 失敗するテストを書く**
+
+`crates/apsis-tools/src/lib.rs` の末尾に置く。
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_spec_serializes_with_required_path() {
+        let specs = all_specs();
+        let read = specs.iter().find(|s| s.name == "read").expect("read が無い");
+        let json = serde_json::to_value(read).expect("直列化できない");
+        assert_eq!(json["name"], "read");
+        assert_eq!(json["parameters"]["required"][0], "path");
+        assert_eq!(json["parameters"]["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn all_specs_has_unique_names() {
+        let specs = all_specs();
+        let mut names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "ツール名が重複している");
+    }
+}
+```
+
+- [ ] **Step 3: テストが失敗することを確認する**
+
+Run: `cargo test -p apsis-tools`
+Expected: コンパイルエラー。`all_specs` と `ToolSpec` が未定義
 
 - [ ] **Step 4: 最小の実装を書く**
 
@@ -278,9 +273,32 @@ MSG
 
 - [ ] **Step 1: クレートの骨格を作る**
 
-Step 3 の `Cargo.toml` と `lib.rs` をここで作成する。`budget.rs` と `prompt.rs` は
-空のまま作る。Step 3 では作成済みであることを確認する。
+`Cargo.toml` と `lib.rs` をここで作成する。`budget.rs` と `prompt.rs` は
+この時点では空のファイルとして作る。
 
+`crates/apsis-core/Cargo.toml`
+
+```toml
+[package]
+name = "apsis-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+apsis-tools = { path = "../apsis-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tiktoken-rs = { workspace = true }
+```
+
+`crates/apsis-core/src/lib.rs`
+
+```rust
+pub mod budget;
+pub mod prompt;
+```
 - [ ] **Step 2: 失敗するテストを書く**
 
 `crates/apsis-core/src/budget.rs` の末尾に置く。
@@ -319,32 +337,6 @@ mod tests {
 
 Run: `cargo test -p apsis-core`
 Expected: コンパイルエラー。`always_on_tokens` と `SYSTEM_PROMPT` が未定義
-
-- [ ] **Step 3 の内容（Step 1 で作成済みであることを確認する）**
-
-`crates/apsis-core/Cargo.toml`
-
-```toml
-[package]
-name = "apsis-core"
-version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
-
-[dependencies]
-apsis-tools = { path = "../apsis-tools" }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tiktoken-rs = { workspace = true }
-```
-
-`crates/apsis-core/src/lib.rs`
-
-```rust
-pub mod budget;
-pub mod prompt;
-```
 
 - [ ] **Step 4: 最小の実装を書く**
 

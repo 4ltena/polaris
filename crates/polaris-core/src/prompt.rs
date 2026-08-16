@@ -1,3 +1,5 @@
+//! 毎ターン送るシステムプロンプトを定義し、憲法と環境情報を差し込んで組み立てる。
+
 /// 常時載るシステムプロンプト。振る舞いの指示を削ると往復が増えて総コストが
 /// 上がるため、短さのためにここを削らない。削る対象は構造の重複に限る。
 pub const SYSTEM_PROMPT: &str = "\
@@ -8,6 +10,7 @@ Rules:
 - Never guess file contents. Read them.
 - If the same error occurs three times in a row, stop and report it.
 - Do not claim work is done without showing the command output that proves it.
+- Read docs/filemap.md before searching the tree.
 ";
 
 /// 常時載る文脈を組み立てる。空の節は見出しごと落とす。

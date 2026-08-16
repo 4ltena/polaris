@@ -15,6 +15,8 @@
 - Rust edition は `2024`、`rust-toolchain.toml` の channel は `1.96.0`、components に `rustfmt` と `clippy` を含める
 - 常時コンテキストは 990 トークン以下。計測の基準トークナイザは `tiktoken_rs::o200k_base()` とする
 - 常時提供するツールは 6 本を超えない
+- 憲法ブロックは 150 トークンを超えない。AGENTS.md の全文は常時コンテキストへ載せない
+- 常時コンテキストの合計は AGENTS.md の大きさに左右されない。超過分は切り詰める
 - クレート名の接頭辞は `apsis-`
 - 監査ログへ書く文字列は、書く直前に必ず `secret_screen::screen_text` を通す
 - commons から取り込んだファイルは取り込み後に改変してよい。改変は元へ戻さない
@@ -60,7 +62,8 @@ apsis/
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs                      モジュール宣言
-    │       ├── prompt.rs                   システムプロンプト
+    │       ├── prompt.rs                   システムプロンプトと組み立て
+    │       ├── constitution.rs             AGENTS.md 憲法ブロックと環境情報
     │       ├── budget.rs                   トークン計測
     │       ├── audit.rs                    追記専用 JSONL
     │       ├── secret_screen/mod.rs        commons/secret-screen を取り込む
@@ -88,7 +91,14 @@ apsis/
 - Consumes: なし
 - Produces: `apsis_tools::ToolSpec { name: &'static str, description: &'static str, parameters: serde_json::Value }`、`apsis_tools::all_specs() -> Vec<ToolSpec>`、`apsis_tools::ToolError`
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [ ] **Step 1: workspace とクレートの骨格を作る**
+
+テストを走らせるには workspace が読める状態である必要がある。先に骨格を置く。
+`crates/apsis-tools/src/lib.rs` は空のまま作る。
+
+Step 3 の内容をここで作成し、Step 3 では内容を確認するだけにする。
+
+- [ ] **Step 2: 失敗するテストを書く**
 
 `crates/apsis-tools/src/lib.rs` の末尾に置く。
 
@@ -119,19 +129,19 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認する**
+- [ ] **Step 3: テストが失敗することを確認する**
 
 Run: `cargo test -p apsis-tools`
 Expected: コンパイルエラー。`all_specs` と `ToolSpec` が未定義
 
-- [ ] **Step 3: workspace とクレートを作る**
+- [ ] **Step 3 の内容（Step 1 で作成済みであることを確認する）**
 
 `Cargo.toml`
 
 ```toml
 [workspace]
 resolver = "3"
-members = ["crates/apsis-tools", "crates/apsis-provider", "crates/apsis-core", "crates/apsis-cli"]
+members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
@@ -266,7 +276,12 @@ MSG
 - Consumes: `apsis_tools::{ToolSpec, all_specs}`
 - Produces: `apsis_core::budget::count_tokens(&str) -> usize`、`apsis_core::budget::always_on_tokens(&str, &[ToolSpec]) -> usize`、`apsis_core::prompt::SYSTEM_PROMPT: &str`、`apsis_core::budget::BUDGET_LIMIT: usize`、`apsis_core::budget::MAX_TOOLS: usize`
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [ ] **Step 1: クレートの骨格を作る**
+
+Step 3 の `Cargo.toml` と `lib.rs` をここで作成する。`budget.rs` と `prompt.rs` は
+空のまま作る。Step 3 では作成済みであることを確認する。
+
+- [ ] **Step 2: 失敗するテストを書く**
 
 `crates/apsis-core/src/budget.rs` の末尾に置く。
 
@@ -300,12 +315,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認する**
+- [ ] **Step 3: テストが失敗することを確認する**
 
 Run: `cargo test -p apsis-core`
 Expected: コンパイルエラー。`always_on_tokens` と `SYSTEM_PROMPT` が未定義
 
-- [ ] **Step 3: クレートを作る**
+- [ ] **Step 3 の内容（Step 1 で作成済みであることを確認する）**
 
 `crates/apsis-core/Cargo.toml`
 
@@ -399,7 +414,288 @@ MSG
 
 ---
 
-### Task 3: 読み取りパス方針
+### Task 3: 憲法ブロックと環境情報
+
+仕様は常時コンテキストに「AGENTS.md 憲法ブロック 150 トークン」を計上している。
+ここを実装しないまま予算テストを通すと、実態より軽い値で合格し、後から憲法を
+足した瞬間に上限を破る。あわせて、モデルが 1 ターン使って調べる環境の事実も
+先に渡す。
+
+**Files:**
+- Create: `crates/apsis-core/src/constitution.rs`
+- Modify: `crates/apsis-core/src/prompt.rs`
+- Modify: `crates/apsis-core/src/lib.rs`
+- Modify: `crates/apsis-core/Cargo.toml`
+- Test: `crates/apsis-core/src/constitution.rs` の `#[cfg(test)]` モジュール
+
+**Interfaces:**
+- Consumes: `apsis_core::budget::{count_tokens, always_on_tokens, BUDGET_LIMIT}`、`apsis_core::prompt::SYSTEM_PROMPT`
+- Produces: `apsis_core::constitution::CONSTITUTION_LIMIT: usize`、`constitution::extract_always_on(&str) -> String`、`constitution::load(project_root: &std::path::Path) -> String`、`constitution::environment_block(cwd: &std::path::Path, branch: Option<&str>) -> String`、`apsis_core::prompt::build_system(constitution: &str, environment: &str) -> String`
+
+- [ ] **Step 1: 失敗するテストを書く**
+
+`crates/apsis-core/src/constitution.rs` の末尾に置く。
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    const MARKED: &str = "\
+# AGENTS
+
+前置き。ここは載せない。
+
+<!-- apsis:always-on -->
+main へ直接 push しない。
+<!-- /apsis:always-on -->
+
+## 詳細
+長い手続き。ここも載せない。
+";
+
+    const HEADING: &str = "\
+# AGENTS
+
+## Always on
+
+main へ直接 push しない。
+
+## Skill routing
+
+長い手続き。ここは載せない。
+";
+
+    #[test]
+    fn extracts_marked_block_only() {
+        let got = extract_always_on(MARKED);
+        assert_eq!(got, "main へ直接 push しない。");
+    }
+
+    #[test]
+    fn falls_back_to_always_on_heading_and_stops_at_next_section() {
+        let got = extract_always_on(HEADING);
+        assert_eq!(got, "main へ直接 push しない。");
+        assert!(!got.contains("Skill routing"));
+    }
+
+    #[test]
+    fn returns_empty_without_marker_or_heading() {
+        assert_eq!(extract_always_on("# AGENTS\n\n本文だけ。\n"), "");
+    }
+
+    #[test]
+    fn caps_oversized_constitution() {
+        let mut body = String::from("<!-- apsis:always-on -->\n");
+        for i in 0..500 {
+            body.push_str(&format!("規則 {i}: 長い行をここに書き連ねる。\n"));
+        }
+        body.push_str("<!-- /apsis:always-on -->\n");
+
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::write(dir.path().join("AGENTS.md"), &body).expect("書けない");
+
+        let got = load(dir.path());
+        assert!(
+            count_tokens(&got) <= CONSTITUTION_LIMIT,
+            "切り詰められていない: {} トークン",
+            count_tokens(&got)
+        );
+        assert!(!got.is_empty(), "全部捨ててはいけない");
+    }
+
+    #[test]
+    fn load_returns_empty_when_agents_md_is_absent() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        assert_eq!(load(dir.path()), "");
+    }
+
+    #[test]
+    fn environment_block_carries_cwd_and_branch() {
+        let got = environment_block(Path::new("/w/apsis"), Some("feat/x"));
+        assert!(got.contains("/w/apsis"));
+        assert!(got.contains("feat/x"));
+    }
+
+    #[test]
+    fn full_always_on_context_stays_within_budget() {
+        let constitution = "a".repeat(2000);
+        let capped = cap(&constitution, CONSTITUTION_LIMIT);
+        let env = environment_block(Path::new("/w/apsis"), Some("feat/m1-headless-loop"));
+        let system = crate::prompt::build_system(&capped, &env);
+
+        let n = crate::budget::always_on_tokens(&system, &apsis_tools::all_specs());
+        assert!(
+            n <= crate::budget::BUDGET_LIMIT,
+            "憲法と環境を含めた常時コンテキストが {n} トークン。上限を超えている"
+        );
+    }
+}
+```
+
+- [ ] **Step 2: テストが失敗することを確認する**
+
+Run: `cargo test -p apsis-core constitution`
+Expected: コンパイルエラー。`extract_always_on` と `load` が未定義
+
+- [ ] **Step 3: dev 依存を足す**
+
+`crates/apsis-core/Cargo.toml` へ追加する。
+
+```toml
+[dev-dependencies]
+tempfile = { workspace = true }
+```
+
+- [ ] **Step 4: 最小の実装を書く**
+
+`crates/apsis-core/src/constitution.rs` の先頭に置く。
+
+```rust
+//! 常時載る文脈のうち、ハーネスが所有しない部分。AGENTS.md の全文は載せない。
+//! 上限で切り詰めるため、AGENTS.md がどれだけ大きくても予算は破れない。
+
+use std::path::Path;
+
+use crate::budget::count_tokens;
+
+/// 憲法ブロックに許すトークン数の上限。
+pub const CONSTITUTION_LIMIT: usize = 150;
+
+const BEGIN: &str = "<!-- apsis:always-on -->";
+const END: &str = "<!-- /apsis:always-on -->";
+
+/// AGENTS.md から常時載せる部分だけを取り出す。
+///
+/// マーカーで囲まれていればその内側を返す。マーカーが無ければ `## Always on`
+/// 見出しの節を次の `## ` の手前まで返す。どちらも無ければ空文字列を返す。
+/// 全文を返す経路は存在しない。
+pub fn extract_always_on(markdown: &str) -> String {
+    if let Some(start) = markdown.find(BEGIN) {
+        let after = start + BEGIN.len();
+        if let Some(rel) = markdown[after..].find(END) {
+            return markdown[after..after + rel].trim().to_string();
+        }
+    }
+
+    let mut out: Vec<&str> = Vec::new();
+    let mut inside = false;
+    for line in markdown.lines() {
+        if inside {
+            if line.starts_with("## ") {
+                break;
+            }
+            out.push(line);
+        } else if line.starts_with("## ") && line[3..].trim() == "Always on" {
+            inside = true;
+        }
+    }
+    out.join("\n").trim().to_string()
+}
+
+/// 上限を超えていたら行単位で切り詰める。全部落とすことはしない。
+fn cap(text: &str, limit: usize) -> String {
+    if count_tokens(text) <= limit {
+        return text.to_string();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let mut trial = kept.clone();
+        trial.push(line);
+        if count_tokens(&trial.join("\n")) > limit {
+            break;
+        }
+        kept.push(line);
+    }
+    if kept.is_empty() {
+        // 1 行目だけで上限を超える場合は、文字単位で落として先頭を残す。
+        let mut s: String = text.lines().next().unwrap_or_default().to_string();
+        while count_tokens(&s) > limit && !s.is_empty() {
+            s.truncate(s.len() - s.chars().last().map_or(0, |c| c.len_utf8()));
+        }
+        return s;
+    }
+    kept.join("\n")
+}
+
+/// プロジェクト直下の AGENTS.md から憲法ブロックを読む。
+/// 存在しないことは失敗ではない。読めなければ空文字列を返す。
+pub fn load(project_root: &Path) -> String {
+    let Ok(body) = std::fs::read_to_string(project_root.join("AGENTS.md")) else {
+        return String::new();
+    };
+    cap(&extract_always_on(&body), CONSTITUTION_LIMIT)
+}
+
+/// 環境情報。モデルが 1 ターン使って調べる事実を先に渡す。
+pub fn environment_block(cwd: &Path, branch: Option<&str>) -> String {
+    let mut s = format!("cwd: {}", cwd.display());
+    if let Some(b) = branch {
+        s.push_str(&format!("\ngit branch: {b}"));
+    }
+    s
+}
+```
+
+`crates/apsis-core/src/prompt.rs` の末尾へ追加する。
+
+```rust
+/// 常時載る文脈を組み立てる。空の節は見出しごと落とす。
+///
+/// 組み立て結果はセッションを通して同一でなければならない。ここが毎ターン
+/// 変わるとプロンプトキャッシュの接頭辞が動き、履歴全体が未キャッシュ扱いになる。
+pub fn build_system(constitution: &str, environment: &str) -> String {
+    let mut s = String::from(SYSTEM_PROMPT);
+    if !constitution.is_empty() {
+        s.push_str("\n## Project rules\n");
+        s.push_str(constitution);
+        s.push('\n');
+    }
+    if !environment.is_empty() {
+        s.push_str("\n## Environment\n");
+        s.push_str(environment);
+        s.push('\n');
+    }
+    s
+}
+```
+
+`crates/apsis-core/src/lib.rs` へ追加する。
+
+```rust
+pub mod constitution;
+```
+
+`crates/apsis-core/Cargo.toml` の `[dependencies]` に `apsis-tools` が無ければ追加する。
+
+- [ ] **Step 5: テストが通ることを確認する**
+
+Run: `cargo test -p apsis-core`
+Expected: 全て PASS。最後のテストが、憲法と環境を含めた状態でも上限内であることを示す
+
+- [ ] **Step 6: コミットする**
+
+```bash
+git add crates/apsis-core
+git commit -F - <<'MSG'
+feat(core): load capped constitution block and environment
+
+AGENTS.md の全文ではなく、マーカーで囲まれた部分か `## Always on` の節だけを
+常時コンテキストへ載せる。150 トークンの上限で切り詰めるため、AGENTS.md が
+どれだけ大きくなっても 990 の予算は破れない。
+
+環境情報を先に渡すのは、モデルが cwd やブランチを調べるだけで 1 往復
+使うのを避けるため。往復 1 回のコストは履歴全体であり、常時コンテキストの
+数十トークンより桁で大きい。
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+MSG
+```
+
+---
+
+### Task 4: 読み取りパス方針
 
 **Files:**
 - Create: `crates/apsis-tools/src/path_policy.rs`
@@ -535,7 +831,7 @@ MSG
 
 ---
 
-### Task 4: read ツール
+### Task 5: read ツール
 
 **Files:**
 - Create: `crates/apsis-tools/src/read.rs`
@@ -656,7 +952,7 @@ MSG
 
 ---
 
-### Task 5: 監査ログ
+### Task 6: 監査ログ
 
 **Files:**
 - Create: `crates/apsis-core/src/secret_screen/mod.rs`（commons から取り込む）
@@ -728,12 +1024,10 @@ Expected: コンパイルエラー。`AuditLog` が未定義
 
 ```toml
 regex = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }
 ```
 
-`regex` は取り込んだ `secret_screen` が使う。
+`regex` は取り込んだ `secret_screen` が使う。`[dev-dependencies]` の `tempfile` は
+憲法ブロックのタスクで既に追加されている。節を二重に作らず、無い場合だけ足す。
 
 - [ ] **Step 5: 最小の実装を書く**
 
@@ -802,7 +1096,7 @@ MSG
 
 ---
 
-### Task 6: Provider トレイトと SSE
+### Task 7: Provider トレイトと SSE
 
 **Files:**
 - Create: `crates/apsis-provider/Cargo.toml`
@@ -993,7 +1287,7 @@ MSG
 
 ---
 
-### Task 7: OpenAI 互換プロバイダ
+### Task 8: OpenAI 互換プロバイダ
 
 **Files:**
 - Create: `crates/apsis-provider/src/openai.rs`
@@ -1220,7 +1514,7 @@ MSG
 
 ---
 
-### Task 8: 停止条件
+### Task 9: 停止条件
 
 **Files:**
 - Create: `crates/apsis-core/src/stop.rs`
@@ -1350,7 +1644,7 @@ MSG
 
 ---
 
-### Task 9: エージェントループ
+### Task 10: エージェントループ
 
 **Files:**
 - Create: `crates/apsis-core/src/session.rs`
@@ -1360,8 +1654,8 @@ MSG
 - Test: `crates/apsis-core/src/agent.rs` の `#[cfg(test)]` モジュール
 
 **Interfaces:**
-- Consumes: `apsis_provider::{Provider, CompletionRequest, CompletionResponse, Message, Role, ToolCall}`、`apsis_tools::{all_specs, read::read}`、`apsis_core::stop::{StopTracker, StopReason}`、`apsis_core::audit::AuditLog`、`apsis_core::prompt::SYSTEM_PROMPT`
-- Produces: `apsis_core::session::Session::new() -> Session`、`Session::push_user(&mut self, &str)`、`apsis_core::agent::run(provider: &dyn Provider, session: &mut Session, audit: &mut AuditLog, stop: &mut StopTracker) -> Result<String, AgentError>`
+- Consumes: `apsis_provider::{Provider, CompletionRequest, CompletionResponse, Message, Role, ToolCall}`、`apsis_tools::{all_specs, read::read}`、`apsis_core::stop::{StopTracker, StopReason}`、`apsis_core::audit::AuditLog`、`apsis_core::prompt::build_system`
+- Produces: `apsis_core::session::Session::new() -> Session`、`Session::push_user(&mut self, &str)`、`apsis_core::agent::run(provider: &dyn Provider, session: &mut Session, audit: &mut AuditLog, stop: &mut StopTracker, system: &str) -> Result<String, AgentError>`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -1415,7 +1709,10 @@ mod tests {
         let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
         let mut stop = StopTracker::new(10);
 
-        let out = run(&p, &mut session, &mut audit, &mut stop).await.expect("失敗");
+        let system = crate::prompt::build_system("", "");
+        let out = run(&p, &mut session, &mut audit, &mut stop, &system)
+            .await
+            .expect("失敗");
         assert_eq!(out, "1 行だった");
 
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("読めない");
@@ -1440,7 +1737,10 @@ mod tests {
         let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
         let mut stop = StopTracker::new(50);
 
-        let err = run(&p, &mut session, &mut audit, &mut stop).await.expect_err("止まるべき");
+        let system = crate::prompt::build_system("", "");
+        let err = run(&p, &mut session, &mut audit, &mut stop, &system)
+            .await
+            .expect_err("止まるべき");
         assert!(matches!(err, AgentError::Stopped(StopReason::RepeatedError(_))));
     }
 }
@@ -1507,7 +1807,6 @@ use std::path::Path;
 use apsis_provider::{CompletionRequest, Provider};
 
 use crate::audit::AuditLog;
-use crate::prompt::SYSTEM_PROMPT;
 use crate::session::Session;
 use crate::stop::{StopReason, StopTracker};
 
@@ -1521,11 +1820,15 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
 }
 
+/// `system` は憲法ブロックと環境情報を含めて組み立て済みのものを渡す。
+/// ループ内で組み立てないのは、毎ターン同じ文字列を送ってキャッシュ接頭辞を
+/// 動かさないことを呼び出し側で保証させるため。
 pub async fn run(
     provider: &dyn Provider,
     session: &mut Session,
     audit: &mut AuditLog,
     stop: &mut StopTracker,
+    system: &str,
 ) -> Result<String, AgentError> {
     loop {
         if let Some(r) = stop.observe_turn() {
@@ -1534,7 +1837,7 @@ pub async fn run(
 
         let res = provider
             .complete(CompletionRequest {
-                system: SYSTEM_PROMPT.to_string(),
+                system: system.to_string(),
                 messages: session.messages.clone(),
                 tools: apsis_tools::all_specs(),
             })
@@ -1606,7 +1909,7 @@ MSG
 
 ---
 
-### Task 10: CLI 一発実行
+### Task 11: CLI 一発実行
 
 **Files:**
 - Create: `crates/apsis-cli/Cargo.toml`
@@ -1615,7 +1918,7 @@ MSG
 - Test: `crates/apsis-cli/tests/cli.rs`
 
 **Interfaces:**
-- Consumes: `apsis_core::{agent::run, session::Session, audit::AuditLog, stop::StopTracker}`、`apsis_provider::openai::OpenAiProvider`
+- Consumes: `apsis_core::{agent::run, session::Session, audit::AuditLog, stop::StopTracker, constitution, prompt::build_system}`、`apsis_provider::openai::OpenAiProvider`
 - Produces: バイナリ `apsis`
 
 - [ ] **Step 1: 失敗するテストを書く**
@@ -1677,7 +1980,7 @@ tokio = { workspace = true }
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use apsis_core::{agent, audit::AuditLog, session::Session, stop::StopTracker};
+use apsis_core::{agent, audit::AuditLog, constitution, prompt, session::Session, stop::StopTracker};
 use apsis_provider::openai::OpenAiProvider;
 use clap::Parser;
 
@@ -1722,7 +2025,12 @@ async fn main() -> ExitCode {
     };
     let mut stop = StopTracker::new(args.max_turns);
 
-    match agent::run(&provider, &mut session, &mut audit, &mut stop).await {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let constitution = constitution::load(&cwd);
+    let environment = constitution::environment_block(&cwd, None);
+    let system = prompt::build_system(&constitution, &environment);
+
+    match agent::run(&provider, &mut session, &mut audit, &mut stop, &system).await {
         Ok(text) => {
             println!("{text}");
             ExitCode::SUCCESS
@@ -1766,6 +2074,7 @@ MSG
 - `cargo test --workspace` が全て通る
 - `cargo clippy --workspace --all-targets -- -D warnings` が通る
 - 予算テストが 990 トークン以下を実測で示す
+- 巨大な AGENTS.md を置いても常時コンテキストが 990 を超えない
 - `.ssh/id_rsa` への読み取りが `PathDenied` で拒否される
 - 監査ログに生の資格情報が現れない
 - `APSIS_API_KEY` を設定した状態で `apsis -p "Cargo.toml は何行か"` が答えを返す

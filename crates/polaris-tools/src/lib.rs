@@ -1,6 +1,7 @@
 //! polaris の組込みツール。常時提供するツールは 6 本を超えない。
 
 pub mod path_policy;
+pub mod read;
 
 use serde::Serialize;
 

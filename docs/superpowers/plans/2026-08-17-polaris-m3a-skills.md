@@ -59,7 +59,7 @@ crates/
 
 **Interfaces:**
 - Consumes: なし
-- Produces: `polaris_core::config::Config { skills_paths: Vec<PathBuf> }`、`config::load_from(global: Option<&Path>, project: Option<&Path>) -> Config`、`config::load(project_root: &Path) -> Config`
+- Produces: `polaris_core::config::{Config { skills_paths: Vec<PathBuf> }, ConfigError}`、`config::try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Config, ConfigError>`、`config::load(project_root: &Path) -> Result<Config, ConfigError>`
 
 - [ ] **Step 1: 依存を足してクレートの骨格を用意する**
 

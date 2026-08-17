@@ -19,8 +19,12 @@ struct RawConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawSkills {
+    /// `None` はキー自体が無いこと（＝前段の値を引き継ぐ）を表し、
+    /// `Some(vec![])` は `paths = []` と明示されたこと（＝前段を空で
+    /// 上書きする）を表す。`Vec` のままでは両者が区別できず、
+    /// プロジェクト側が意図的にグローバルの一覧を空にする手段が無くなる。
     #[serde(default)]
-    paths: Vec<PathBuf>,
+    paths: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,21 +62,21 @@ fn read_one(path: &Path) -> Result<Option<RawConfig>, ConfigError> {
 
 /// グローバルとプロジェクトの設定を読み、後者で前者を上書きする。
 /// 存在しないことは失敗ではない。読めないことと壊れていることは失敗である。
+///
+/// `skills.paths` キーが無いファイルは前段の値をそのまま引き継ぐ。
+/// `paths = []` と明示されたファイルは前段を空で上書きする —
+/// 個人の skill をあるプロジェクトへ持ち込みたくない場合に、それを
+/// 表明する手段が要る。
 pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Config, ConfigError> {
     let mut merged = Config::default();
     for path in [global, project].into_iter().flatten() {
         if let Some(raw) = read_one(path)?
-            && !raw.skills.paths.is_empty()
+            && let Some(paths) = raw.skills.paths
         {
-            merged.skills_paths = raw.skills.paths;
+            merged.skills_paths = paths;
         }
     }
     Ok(merged)
-}
-
-/// 失敗を空の設定に潰す版。呼び出し側が診断を出せない場面でのみ使う。
-pub fn load_from(global: Option<&Path>, project: Option<&Path>) -> Config {
-    try_load_from(global, project).unwrap_or_default()
 }
 
 /// `~/.polaris/config.toml` と `<project-root>/.polaris/config.toml` を解決して読む。
@@ -96,7 +100,8 @@ mod tests {
     #[test]
     fn returns_empty_config_when_neither_file_exists() {
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
-        let c = load_from(None, Some(&dir.path().join("missing.toml")));
+        let c = try_load_from(None, Some(&dir.path().join("missing.toml")))
+            .expect("存在しないことは失敗ではない");
         assert!(c.skills_paths.is_empty());
     }
 
@@ -104,7 +109,7 @@ mod tests {
     fn reads_skills_paths_from_a_single_file() {
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
         let p = write(dir.path(), "[skills]\npaths = [\"/a\", \"/b\"]\n");
-        let c = load_from(Some(&p), None);
+        let c = try_load_from(Some(&p), None).expect("読めるはず");
         assert_eq!(
             c.skills_paths,
             vec![
@@ -120,7 +125,7 @@ mod tests {
         let pj = tempfile::tempdir().expect("一時ディレクトリ");
         let gp = write(g.path(), "[skills]\npaths = [\"/global\"]\n");
         let pp = write(pj.path(), "[skills]\npaths = [\"/project\"]\n");
-        let c = load_from(Some(&gp), Some(&pp));
+        let c = try_load_from(Some(&gp), Some(&pp)).expect("読めるはず");
         assert_eq!(c.skills_paths, vec![std::path::PathBuf::from("/project")]);
     }
 
@@ -132,6 +137,40 @@ mod tests {
         assert!(
             err.to_string().contains("config.toml"),
             "パスが含まれない: {err}"
+        );
+    }
+
+    #[test]
+    fn project_can_clear_global_skills_paths_with_an_empty_list() {
+        // 個人の skill をあるプロジェクトへ持ち込みたくない場合、
+        // `paths = []` と明示すればグローバルの一覧を空で上書きできる。
+        let g = tempfile::tempdir().expect("一時ディレクトリ");
+        let pj = tempfile::tempdir().expect("一時ディレクトリ");
+        let gp = write(g.path(), "[skills]\npaths = [\"/global\"]\n");
+        let pp = write(pj.path(), "[skills]\npaths = []\n");
+        let c = try_load_from(Some(&gp), Some(&pp)).expect("読めるはず");
+        assert!(
+            c.skills_paths.is_empty(),
+            "空リストの明示がグローバルを上書きしていない: {:?}",
+            c.skills_paths
+        );
+    }
+
+    #[test]
+    fn project_without_skills_section_inherits_global() {
+        // `[skills]` 節そのものが無いプロジェクト設定は「引き継ぐ」であって
+        // 「空にする」ではない。空リストの明示（前のテスト）と挙動が
+        // 分かれていなければ、この2つは今日のように同一になってしまう。
+        let g = tempfile::tempdir().expect("一時ディレクトリ");
+        let pj = tempfile::tempdir().expect("一時ディレクトリ");
+        let gp = write(g.path(), "[skills]\npaths = [\"/global\"]\n");
+        let pp = write(pj.path(), "# skills セクション無し\n");
+        let c = try_load_from(Some(&gp), Some(&pp)).expect("読めるはず");
+        assert_eq!(
+            c.skills_paths,
+            vec![std::path::PathBuf::from("/global")],
+            "skills 節が無いのにグローバルを引き継いでいない: {:?}",
+            c.skills_paths
         );
     }
 }

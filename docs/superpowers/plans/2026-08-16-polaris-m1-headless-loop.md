@@ -33,7 +33,7 @@
 | | 内容 | 単体で動くもの |
 | --- | --- | --- |
 | M1 | 本計画。read ツール、1 プロバイダ、予算テスト、監査ログ、停止条件 | ファイルを読んで答えるヘッドレスエージェント |
-| M2 | `write` / `edit` / `bash` と `polaris-sandbox`。宣言外書き込みの実サンドボックス拒否テスト。M1 と本 M2 の完了をもって `v1.0.0`（hamar）とする | 編集とコマンド実行ができる |
+| M2 | `write` / `edit` / `bash` と `polaris-sandbox`。宣言外書き込みの実サンドボックス拒否テスト。M1 と本 M2 の完了をもって `v1.0.0`（hamal）とする | 編集とコマンド実行ができる |
 | M3 | `polaris-skills` と `polaris-router`。`atomic-file-replace` の取り込み | skill が自動で添付される |
 | M4 | `polaris-agents`。`spawn`、波、継続波、path claim | subagent の並列実行 |
 | M5 | `polaris-tui` と圧縮、マルチプロバイダとフォールバック、セッションの追記永続化と再開 | 対話型の日常ドライバ |

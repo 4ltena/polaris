@@ -33,6 +33,7 @@ pub async fn run(
     audit: &mut AuditLog,
     stop: &mut StopTracker,
     system: &str,
+    skills: &[polaris_skills::Skill],
 ) -> Result<String, AgentError> {
     loop {
         // 毎ターン無条件に呼ぶ。エラー時にしか呼ばないと、エラーを一度も
@@ -63,7 +64,7 @@ pub async fn run(
         session.push_assistant_tool_calls(&res.text, res.tool_calls.clone());
 
         for call in &res.tool_calls {
-            let outcome = dispatch(call);
+            let outcome = dispatch(call, skills);
             audit.record(&call.name, &call.arguments.to_string())?;
             match outcome {
                 Ok(body) => {
@@ -85,7 +86,10 @@ pub async fn run(
 }
 
 /// ツール呼び出しを実際の実装へ振り分ける。失敗はモデルへ返す文字列にする。
-fn dispatch(call: &polaris_provider::ToolCall) -> Result<String, String> {
+fn dispatch(
+    call: &polaris_provider::ToolCall,
+    skills: &[polaris_skills::Skill],
+) -> Result<String, String> {
     match call.name.as_str() {
         "read" => {
             let path = call.arguments["path"]
@@ -94,6 +98,12 @@ fn dispatch(call: &polaris_provider::ToolCall) -> Result<String, String> {
             let offset = call.arguments["offset"].as_u64().unwrap_or(0) as usize;
             let limit = call.arguments["limit"].as_u64().unwrap_or(2000) as usize;
             polaris_tools::read::read(Path::new(path), offset, limit).map_err(|e| e.to_string())
+        }
+        "skill" => {
+            let q = call.arguments["q"]
+                .as_str()
+                .ok_or_else(|| "q が無い".to_string())?;
+            Ok(polaris_tools::skill::lookup(skills, q))
         }
         other => Err(format!("未知のツール: {other}")),
     }
@@ -154,7 +164,7 @@ mod tests {
         let mut stop = StopTracker::new(10);
 
         let system = crate::prompt::build_system("", "");
-        let out = run(&p, &mut session, &mut audit, &mut stop, &system)
+        let out = run(&p, &mut session, &mut audit, &mut stop, &system, &[])
             .await
             .expect("失敗");
         assert_eq!(out, "1 行だった");
@@ -210,7 +220,7 @@ mod tests {
         let mut stop = StopTracker::new(50);
 
         let system = crate::prompt::build_system("", "");
-        let out = run(&p, &mut session, &mut audit, &mut stop, &system)
+        let out = run(&p, &mut session, &mut audit, &mut stop, &system, &[])
             .await
             .expect("成功を挟んでいるので3回連続扱いにならず止まらないはず");
         assert_eq!(out, "終わった");
@@ -237,12 +247,96 @@ mod tests {
         let mut stop = StopTracker::new(50);
 
         let system = crate::prompt::build_system("", "");
-        let err = run(&p, &mut session, &mut audit, &mut stop, &system)
+        let err = run(&p, &mut session, &mut audit, &mut stop, &system, &[])
             .await
             .expect_err("止まるべき");
         assert!(matches!(
             err,
             AgentError::Stopped(StopReason::RepeatedError(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatches_the_skill_tool() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let skills = vec![polaris_skills::Skill {
+            name: "demo".into(),
+            description: "説明".into(),
+            body: "デモ本文".into(),
+            path: "/x/demo/SKILL.md".into(),
+        }];
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "skill".into(),
+                        arguments: serde_json::json!({ "q": "demo" }),
+                    }],
+                },
+                CompletionResponse { text: "読んだ".into(), tool_calls: vec![] },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("demo の本文を読んで");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
+        let mut stop = StopTracker::new(10);
+        let system = crate::prompt::build_system("", "");
+
+        let out = run(&p, &mut session, &mut audit, &mut stop, &system, &skills)
+            .await
+            .expect("失敗");
+        assert_eq!(out, "読んだ");
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.is_some())
+            .expect("ツール結果が積まれていない");
+        assert!(tool_msg.content.contains("デモ本文"), "本文が渡っていない");
+
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("読めない");
+        let skill_lines = log
+            .lines()
+            .filter(|l| l.contains("\"tool\":\"skill\""))
+            .count();
+        assert_eq!(skill_lines, 1, "skill の呼び出しが記録されていない: {log}");
+    }
+
+    #[tokio::test]
+    async fn the_skill_tool_reports_when_no_skills_are_loaded() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "skill".into(),
+                        arguments: serde_json::json!({ "q": "何か" }),
+                    }],
+                },
+                CompletionResponse { text: "了解".into(), tool_calls: vec![] },
+            ]),
+        };
+        let mut session = Session::new();
+        session.push_user("skill を探して");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
+        let mut stop = StopTracker::new(10);
+        let system = crate::prompt::build_system("", "");
+
+        run(&p, &mut session, &mut audit, &mut stop, &system, &[])
+            .await
+            .expect("失敗");
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.is_some())
+            .expect("ツール結果が積まれていない");
+        assert!(!tool_msg.content.is_empty(), "空の結果を返してはいけない");
     }
 }

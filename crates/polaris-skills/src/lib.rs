@@ -5,7 +5,7 @@ pub mod frontmatter;
 
 use std::path::PathBuf;
 
-pub use discovery::{Discovered, discover, discover_in};
+pub use discovery::{Discovered, SkipCause, Skipped, discover, discover_in};
 pub use frontmatter::SkillError;
 
 /// 読み込み済みの skill 1 件。

@@ -7,27 +7,56 @@ use std::path::{Path, PathBuf};
 use crate::frontmatter;
 use crate::{Skill, SkillError};
 
+/// skill を 1 件飛ばした理由。`SKILL.md` そのものを読めなかったのか、読めた
+/// が検証に落ちたのかは別の失敗なので、区別して運ぶ。
+#[derive(Debug, thiserror::Error)]
+pub enum SkipCause {
+    /// `SKILL.md` は存在するが読めない（権限、あるいはパス自体がディレクトリ
+    /// である、など）。パースへ一度も到達していないので `SkillError` は
+    /// 手に入らない。
+    #[error("SKILL.md を読めない: {0}")]
+    Unreadable(std::io::Error),
+    /// `SKILL.md` は読めたがフロントマターの検証に落ちた。
+    #[error(transparent)]
+    Invalid(SkillError),
+}
+
+/// 飛ばした skill 1 件。ディレクトリ名と理由を運ぶ。`SkillError` 側が
+/// 自分の識別子を文言に含めているのと同じ理由で、ここでもディレクトリ名を
+/// 明示のフィールドとして持つ — 呼び出し側が理由の種類によらず一貫して
+/// 「どの skill が飛ばされたか」を取り出せるようにするため。
+#[derive(Debug, thiserror::Error)]
+#[error("{dir_name}: {cause}")]
+pub struct Skipped {
+    pub dir_name: String,
+    #[source]
+    pub cause: SkipCause,
+}
+
 /// `discover`/`discover_in` の結果。読み込めた skill と、読み込めずに飛ばした
-/// skill のエラーを両方運ぶ。エラー自身が壊れた skill の識別子（ディレクトリ名
-/// や name）を保持しているため、ここでは `SkillError` をそのまま運ぶだけで
-/// 十分である。
+/// skill を理由付きで両方運ぶ。
 #[derive(Debug, Default)]
 pub struct Discovered {
     pub skills: Vec<Skill>,
-    pub skipped: Vec<SkillError>,
+    pub skipped: Vec<Skipped>,
 }
 
 /// 与えられたディレクトリ群を順に走査する。名前が衝突したら先に見つけたものを
 /// 採る。読めない・検証に落ちた skill は `skipped` に理由付きで積んで、探索
-/// 自体は続ける。
+/// 自体は続ける。ディレクトリ内のエントリはファイル名でソートしてから処理する
+/// — `read_dir` の返す順序に実行ごとの再現性はなく、探索結果の順序を
+/// ファイルシステム任せにはできない。探索先ディレクトリ群自体の順序（外側の
+/// ループ）は呼び出し側が渡した並びをそのまま使う。
 pub fn discover_in(dirs: &[PathBuf]) -> Discovered {
     let mut skills: Vec<Skill> = Vec::new();
-    let mut skipped: Vec<SkillError> = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
             continue;
         };
-        for entry in entries.flatten() {
+        let mut entries: Vec<std::fs::DirEntry> = read_dir.flatten().collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -36,8 +65,20 @@ pub fn discover_in(dirs: &[PathBuf]) -> Discovered {
                 continue;
             };
             let manifest = path.join("SKILL.md");
-            let Ok(text) = std::fs::read_to_string(&manifest) else {
-                continue;
+            let text = match std::fs::read_to_string(&manifest) {
+                Ok(text) => text,
+                // `SKILL.md` が無いことは「このディレクトリは skill ではない」
+                // であって、破損した skill ではない。それ以外の読み取り失敗
+                // （権限、あるいはパスがディレクトリであるなど）は、パースへ
+                // 到達する前に skill が消えるのと同じ穴なので報告する。
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    skipped.push(Skipped {
+                        dir_name: dir_name.to_string(),
+                        cause: SkipCause::Unreadable(err),
+                    });
+                    continue;
+                }
             };
             match frontmatter::parse(&text, dir_name) {
                 Ok((name, description, body)) => {
@@ -51,7 +92,10 @@ pub fn discover_in(dirs: &[PathBuf]) -> Discovered {
                         path: manifest,
                     });
                 }
-                Err(err) => skipped.push(err),
+                Err(err) => skipped.push(Skipped {
+                    dir_name: dir_name.to_string(),
+                    cause: SkipCause::Invalid(err),
+                }),
             }
         }
     }
@@ -166,6 +210,51 @@ mod tests {
         assert!(
             message.contains("Bad-Name"),
             "エラーに壊れた skill の名前が含まれていない: {message}"
+        );
+    }
+
+    #[test]
+    fn a_skill_md_that_cannot_be_read_is_reported_not_forgotten() {
+        // SKILL.md をディレクトリにしておくと read_to_string は失敗するが、
+        // これは NotFound ではない — ファイルという名の何かは存在する、
+        // 読めないだけ。パースに一度も到達しないので frontmatter::parse の
+        // エラーは手に入らない。それでも理由付きで skipped に載らなければ、
+        // 「パースに落ちた skill は報告するがそれ以前に読めなかった skill は
+        // 黙って消える」という同じ穴が一歩手前で開いたままになる。
+        let root = tempfile::tempdir().expect("一時");
+        let bad = root.path().join("unreadable-skill");
+        std::fs::create_dir_all(bad.join("SKILL.md")).expect("作れない");
+
+        let found = discover_in(&[root.path().to_path_buf()]);
+        assert!(found.skills.is_empty());
+        assert_eq!(
+            found.skipped.len(),
+            1,
+            "読めない skill 1 件が報告されるべき"
+        );
+        assert_eq!(found.skipped[0].dir_name, "unreadable-skill");
+        let message = found.skipped[0].to_string();
+        assert!(
+            message.contains("unreadable-skill"),
+            "エラーに読めなかった skill の名前が含まれていない: {message}"
+        );
+    }
+
+    #[test]
+    fn processing_order_within_a_directory_is_sorted_not_creation_order() {
+        // 作成順をソート順の逆に近い順にしておく。read_dir が返す順序に
+        // たまたま頼っていても気付けないよう、単調でない順で作る。
+        let root = tempfile::tempdir().expect("一時");
+        put(root.path(), "zeta", "ぜーた", "Z");
+        put(root.path(), "mid", "みっど", "M");
+        put(root.path(), "alpha", "あるふぁ", "A");
+
+        let found = discover_in(&[root.path().to_path_buf()]);
+        let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "mid", "zeta"],
+            "ディレクトリ内の処理順が名前でソートされていない"
         );
     }
 }

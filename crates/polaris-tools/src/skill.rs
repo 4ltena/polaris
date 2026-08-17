@@ -60,6 +60,12 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
         return "skill が 1 件も見つからない。探索先に SKILL.md が無い。".to_string();
     }
 
+    // 前後の空白を一度だけ落とし、以降の空判定・完全一致判定・部分一致
+    // 判定すべてで同じ値を使う。ここで trim した値と別の場所で untrimmed
+    // な q を使うと、前後に空白が付いた完全一致クエリが一致判定をすり抜け
+    // てしまう。
+    let q = q.trim();
+
     if let Some(s) = skills.iter().find(|s| s.name == q) {
         let (body, truncated) = cap_body(&s.body, MAX_BODY_BYTES);
         let mut out = format!("# {}\n\n{}\n", s.name, body);
@@ -78,7 +84,7 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
     // 「何があるか見せてほしい」という妥当な要求の読み方でもあるので、黙って
     // 全件流すのではなく、そう解釈したことを明示したうえで同じ件数上限を
     // かけて返す。
-    if q.trim().is_empty() {
+    if q.is_empty() {
         let all: Vec<&Skill> = skills.iter().collect();
         return list_candidates(
             &all,
@@ -188,6 +194,21 @@ mod tests {
         assert!(
             out.contains("空なので"),
             "空文字列を意図的な問い合わせとして扱ったと分かる文言が無い: {out}"
+        );
+    }
+
+    #[test]
+    fn a_padded_query_finds_the_same_skill_as_the_unpadded_query() {
+        // 空判定は q.trim() で行うのに、直前の完全一致判定は untrimmed の
+        // q をそのまま使っていた。前後に空白が付いた完全一致クエリは
+        // 一致判定に落ち、空判定にも当たらず、素通りして検索へ流れ込み
+        // 「一致なし」の候補一覧に化けてしまう。trim を一度だけ行い、
+        // 空判定にも一致判定にも同じ値を使うことを固定する。
+        let unpadded = lookup(&fixtures(), "git-commit");
+        let padded = lookup(&fixtures(), " git-commit ");
+        assert_eq!(
+            padded, unpadded,
+            "前後の空白を trim せずに一致判定している: {padded}"
         );
     }
 

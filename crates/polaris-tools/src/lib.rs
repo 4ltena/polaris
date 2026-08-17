@@ -19,6 +19,14 @@ pub enum ToolError {
     PathDenied(String),
     #[error("入出力エラー: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0} は通常ファイルではない")]
+    NotAFile(String),
+    #[error("{path} は上限 {limit} バイトを超えている（実際 {actual} バイト）")]
+    TooLarge {
+        path: String,
+        limit: u64,
+        actual: u64,
+    },
 }
 
 /// 常時提供するツールの一覧。

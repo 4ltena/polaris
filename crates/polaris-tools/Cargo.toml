@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+polaris-sandbox = { path = "../polaris-sandbox" }
 polaris-skills = { path = "../polaris-skills" }
 serde = { workspace = true }
 serde_json = { workspace = true }

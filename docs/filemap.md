@@ -88,6 +88,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `lib.rs` — polaris の組込みツール。常時提供するツールは 6 本を超えない。
 - `path_policy.rs` — 読み取りを拒否するパスの判定。過検出より見逃しを避ける方向に倒す。
+- `predicate.rs` — 書き込みが拒否されるかを事前に予測する。
 - `read.rs` — read ツール。行番号を付けて返すのは、モデルが path:line で位置を示せるようにするため。
 - `skill.rs` — skill ツール。名前に完全一致すれば本文を、そうでなければ候補の一覧を返す。
 

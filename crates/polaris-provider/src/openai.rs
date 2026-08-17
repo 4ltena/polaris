@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::{CompletionRequest, CompletionResponse, Provider, ProviderError, Role, ToolCall};
+use polaris_tools::ToolSpec;
 
 pub struct OpenAiProvider {
     base_url: String,
@@ -28,6 +29,30 @@ fn role_str(r: Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     }
+}
+
+/// `ToolSpec` をワイヤ形式（`{"type":"function","function":{...}}`）へ
+/// 変換する、この形の唯一の生成元。
+///
+/// 予算計測 (`polaris_core::budget::always_on_tokens`) もこの関数の出力を
+/// 数える。かつては予算側が `ToolSpec` の `Serialize` 実装を直接数え、この
+/// 関数がこことは別に同じ形を組み立てていた。二箇所が独立に「同じはず」の
+/// ワイヤ形状を作っていたことが、実際に送信するバイト列と計測するバイト列
+/// がずれる原因になったため、生成元をここへ一本化する。
+pub fn tool_wire_shape(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            })
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -70,20 +95,7 @@ impl Provider for OpenAiProvider {
             messages.push(entry);
         }
 
-        let tools: Vec<Value> = req
-            .tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                })
-            })
-            .collect();
+        let tools = tool_wire_shape(&req.tools);
 
         let mut body = serde_json::json!({
             "model": self.model,
@@ -404,6 +416,44 @@ mod tests {
         .await
         .expect_err("id が無いのでエラーになるべき");
         assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[tokio::test]
+    async fn sends_tool_definitions_in_the_shape_tool_wire_shape_produces() {
+        // 予算計測が数える形（`tool_wire_shape`）と、実際にワイヤへ乗る形が
+        // 同じ関数から出ていることを、モックが受け取った生のボディで確かめる。
+        // 型だけを見るテストでは、両者が独立に同じ形を再実装して食い違う
+        // ことを検出できない。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let specs = polaris_tools::all_specs();
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into());
+        p.complete(CompletionRequest {
+            system: "s".into(),
+            messages: vec![],
+            tools: specs.clone(),
+        })
+        .await
+        .expect("失敗した");
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("リクエストが記録されていない");
+        let body: Value = received[0].body_json().expect("JSON として読めない");
+
+        let expected = Value::Array(tool_wire_shape(&specs));
+        assert_eq!(
+            body["tools"], expected,
+            "送信されたツール定義が tool_wire_shape の出力と一致しない"
+        );
     }
 
     #[tokio::test]

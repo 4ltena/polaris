@@ -20,3 +20,20 @@ fn reports_missing_api_key() {
         "鍵が無いことを伝えていない: {err}"
     );
 }
+
+/// `--help` が接続先を決める3つの環境変数（と既定値）に触れていない場合、
+/// 新しく手にした人はソースを読まないと必要な環境変数に気づけない。
+#[test]
+fn help_mentions_the_three_environment_variables() {
+    let exe = env!("CARGO_BIN_EXE_polaris");
+    let out = Command::new(exe)
+        .arg("--help")
+        .output()
+        .expect("起動できない");
+
+    assert!(out.status.success(), "--help が失敗している");
+    let text = String::from_utf8_lossy(&out.stdout);
+    for var in ["POLARIS_API_KEY", "POLARIS_BASE_URL", "POLARIS_MODEL"] {
+        assert!(text.contains(var), "--help に {var} が無い: {text}");
+    }
+}

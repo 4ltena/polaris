@@ -81,6 +81,26 @@ mod tests {
     }
 
     #[test]
+    fn skill_spec_publishes_the_parameter_name_it_requires() {
+        // read 側と対になる公開スキーマの形の固定。ここが見るのは「公開した
+        // 引数名とその型が変わっていないこと」だけである。宣言した名前と
+        // dispatch が実際に読む名前が同じものを指しているかは、この
+        // クレートからは確かめられない（呼ぶ側が別クレートにある）ので、
+        // polaris-core 側の
+        // `agent::tests::the_skill_tool_reads_the_argument_name_its_schema_declares`
+        // が公開スキーマから引数名を取り出して束ねている。
+        let specs = all_specs();
+        let skill = specs
+            .iter()
+            .find(|s| s.name == "skill")
+            .expect("skill が無い");
+        let json = serde_json::to_value(skill).expect("直列化できない");
+        assert_eq!(json["name"], "skill");
+        assert_eq!(json["parameters"]["required"][0], "q");
+        assert_eq!(json["parameters"]["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
     fn all_specs_has_unique_names() {
         let specs = all_specs();
         let mut names: Vec<&str> = specs.iter().map(|s| s.name).collect();

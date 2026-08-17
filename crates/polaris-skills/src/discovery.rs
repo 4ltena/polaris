@@ -126,6 +126,164 @@ mod tests {
         .expect("書けない");
     }
 
+    /// `HOME` はプロセス全体で共有される。cargo test は同一プロセス内で
+    /// テストを並行に走らせるため、差し替える側どうしを直列化しないと、
+    /// 一方が張った `HOME` をもう一方が読む。
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `HOME` を差し替え、スコープを抜けたら（パニックしても）元へ戻す。
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: HOME_LOCK を保持している間だけ書き換える。この
+            // クレートで HOME を読むのは discover だけであり、その呼び出し
+            // 元テストはすべて同じロックを取る。
+            unsafe {
+                match &self.prev {
+                    Some(p) => std::env::set_var("HOME", p),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    fn set_home(home: Option<&std::path::Path>) -> HomeGuard {
+        // 直前のテストがロックを保持したままパニックしても、後続を巻き添えに
+        // しない（毒された中身は単なる ()）。
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HOME");
+        // SAFETY: 上と同じ。
+        unsafe {
+            match home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        HomeGuard { prev, _lock: lock }
+    }
+
+    #[test]
+    fn the_project_directory_is_searched_before_home() {
+        // 仕様が固定している探索順そのもの。順序を入れ替えると、個人の skill
+        // とプロジェクトの skill が同名で衝突したときの勝者が静かに反転する
+        // —— discover_in の衝突テストは「先に渡された方が勝つ」しか見ないので、
+        // 渡す順序を作る discover 側でひっくり返されると気付けない。
+        let project = tempfile::tempdir().expect("一時");
+        let home = tempfile::tempdir().expect("一時");
+        put(
+            &project.path().join(".polaris").join("skills"),
+            "dup",
+            "ぷろじぇくと側",
+            "PROJECT",
+        );
+        put(
+            &home.path().join(".polaris").join("skills"),
+            "dup",
+            "ほーむ側",
+            "HOME",
+        );
+
+        let _guard = set_home(Some(home.path()));
+        let found = discover(project.path(), &[]);
+
+        assert_eq!(found.skills.len(), 1, "同名は1件へ解決されるべき");
+        assert_eq!(
+            found.skills[0].body.trim(),
+            "PROJECT",
+            "探索順が仕様と違う。プロジェクトの skill が ~/.polaris/skills に負けている"
+        );
+    }
+
+    #[test]
+    fn home_is_searched_before_the_configured_extra_paths() {
+        // 設定で足した場所は3番目。ここでは同時に「追加パスが実際に走査
+        // されている」ことも確かめる。走査されていなければ順序の主張は
+        // 空振りするため、勝者だけを見ても意味が無い。
+        let project = tempfile::tempdir().expect("一時");
+        let home = tempfile::tempdir().expect("一時");
+        let extra = tempfile::tempdir().expect("一時");
+        put(
+            &home.path().join(".polaris").join("skills"),
+            "dup",
+            "ほーむ側",
+            "HOME",
+        );
+        put(extra.path(), "dup", "設定側", "EXTRA");
+        put(
+            extra.path(),
+            "only-in-extra",
+            "設定でのみ足した場所",
+            "EXTRA-ONLY",
+        );
+
+        let _guard = set_home(Some(home.path()));
+        let found = discover(project.path(), &[extra.path().to_path_buf()]);
+
+        assert!(
+            found.skills.iter().any(|s| s.name == "only-in-extra"),
+            "設定の skills.paths が走査されていない: {:?}",
+            found.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let dup = found
+            .skills
+            .iter()
+            .find(|s| s.name == "dup")
+            .expect("dup が見つからない");
+        assert_eq!(
+            dup.body.trim(),
+            "HOME",
+            "探索順が仕様と違う。~/.polaris/skills が設定の追加パスに負けている"
+        );
+    }
+
+    #[test]
+    fn home_skills_are_found_when_the_project_has_none() {
+        // 上の2つは衝突の勝者を見るので、~/.polaris/skills を丸ごと外しても
+        // 「プロジェクトが勝つ」側は通ってしまう。既定の2番目が実際に
+        // 走査されていること自体を独立に固定する。
+        let project = tempfile::tempdir().expect("一時");
+        let home = tempfile::tempdir().expect("一時");
+        put(
+            &home.path().join(".polaris").join("skills"),
+            "personal",
+            "個人の skill",
+            "HOME",
+        );
+
+        let _guard = set_home(Some(home.path()));
+        let found = discover(project.path(), &[]);
+
+        let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["personal"],
+            "~/.polaris/skills が走査されていない"
+        );
+    }
+
+    #[test]
+    fn a_missing_home_does_not_stop_the_project_from_being_searched() {
+        // HOME が無い環境でも、プロジェクトの skill は読めなければならない。
+        let project = tempfile::tempdir().expect("一時");
+        put(
+            &project.path().join(".polaris").join("skills"),
+            "alpha",
+            "あるふぁ",
+            "PROJECT",
+        );
+
+        let _guard = set_home(None);
+        let found = discover(project.path(), &[]);
+
+        let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha"]);
+        assert!(found.skipped.is_empty());
+    }
+
     #[test]
     fn finds_skills_in_each_directory() {
         let a = tempfile::tempdir().expect("一時");

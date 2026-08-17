@@ -135,6 +135,73 @@ mod tests {
         }
     }
 
+    /// 公開したツール定義そのものから、必須と宣言されている引数名を取り出す。
+    ///
+    /// テスト側に `"q"` と書いてしまうと、スキーマの宣言と `dispatch` の
+    /// 読み出しは互いに独立した2つの主張のまま残る。片方だけが変わっても
+    /// 両方の主張はそれぞれ自分の中では正しいので、どのテストも落ちない
+    /// —— モデルには `query` を送れと伝え、ハーネスは `q` を探し、
+    /// skill 呼び出しが全滅する状態で緑になる。
+    fn declared_required_param(tool: &str) -> String {
+        let specs = polaris_tools::all_specs();
+        let spec = specs
+            .iter()
+            .find(|s| s.name == tool)
+            .unwrap_or_else(|| panic!("{tool} のツール定義が無い"));
+        let json = serde_json::to_value(spec).expect("直列化できない");
+        json["parameters"]["required"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tool} のスキーマが必須引数を宣言していない"))
+            .to_string()
+    }
+
+    fn call_with(tool: &str, param: &str, value: &str) -> ToolCall {
+        let mut args = serde_json::Map::new();
+        args.insert(param.to_string(), serde_json::Value::String(value.into()));
+        ToolCall {
+            id: "c1".into(),
+            name: tool.into(),
+            arguments: serde_json::Value::Object(args),
+        }
+    }
+
+    #[test]
+    fn the_skill_tool_reads_the_argument_name_its_schema_declares() {
+        // 引数名をリテラルではなく公開スキーマから取る。スキーマ側の `q` を
+        // `query` へ変えると（dispatch は `q` を読んだまま）このテストだけで
+        // 食い違いが露見する。
+        let skills = vec![polaris_skills::Skill {
+            name: "demo".into(),
+            description: "説明".into(),
+            body: "デモ本文".into(),
+            path: "/x/demo/SKILL.md".into(),
+        }];
+        let param = declared_required_param("skill");
+        let out = dispatch(&call_with("skill", &param, "demo"), &skills).unwrap_or_else(|e| {
+            panic!("公開スキーマが宣言する引数名 {param} を dispatch が読んでいない: {e}")
+        });
+        assert!(out.contains("デモ本文"), "本文が返っていない: {out}");
+    }
+
+    #[test]
+    fn the_read_tool_reads_the_argument_name_its_schema_declares() {
+        // skill 側と同じ束ね方を read にも掛ける。read のスキーマは M1 から
+        // あるが、宣言と読み出しを結ぶものは同じく無かった。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, "hello\n").expect("書けない");
+
+        let param = declared_required_param("read");
+        let out = dispatch(
+            &call_with("read", &param, target.to_str().expect("パス")),
+            &[],
+        )
+        .unwrap_or_else(|e| {
+            panic!("公開スキーマが宣言する引数名 {param} を dispatch が読んでいない: {e}")
+        });
+        assert!(out.contains("hello"), "本文が返っていない: {out}");
+    }
+
     #[tokio::test]
     async fn runs_tool_then_returns_final_text() {
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
@@ -276,7 +343,10 @@ mod tests {
                         arguments: serde_json::json!({ "q": "demo" }),
                     }],
                 },
-                CompletionResponse { text: "読んだ".into(), tool_calls: vec![] },
+                CompletionResponse {
+                    text: "読んだ".into(),
+                    tool_calls: vec![],
+                },
             ]),
         };
 
@@ -319,7 +389,10 @@ mod tests {
                         arguments: serde_json::json!({ "q": "何か" }),
                     }],
                 },
-                CompletionResponse { text: "了解".into(), tool_calls: vec![] },
+                CompletionResponse {
+                    text: "了解".into(),
+                    tool_calls: vec![],
+                },
             ]),
         };
         let mut session = Session::new();
@@ -337,6 +410,16 @@ mod tests {
             .iter()
             .find(|m| m.tool_call_id.is_some())
             .expect("ツール結果が積まれていない");
-        assert!(!tool_msg.content.is_empty(), "空の結果を返してはいけない");
+        // 「非空であること」だけを見ると、どんな置き換えでも通ってしまう
+        // —— skill が1件も無いことを伝える分岐を丸ごと削っても、検索が外れた
+        // ときの候補一覧（この場合は空の一覧）が返るだけで、このテストは
+        // 緑のままだった。skill.rs 側の
+        // `an_empty_skill_set_is_distinguishable_from_a_query_matching_nothing`
+        // が固定しているのと同じ固有の文言を、ループを通した経路でも見る。
+        assert!(
+            tool_msg.content.contains("1 件も見つからない"),
+            "skill が1件も無いことがモデルへ届いていない: {}",
+            tool_msg.content
+        );
     }
 }

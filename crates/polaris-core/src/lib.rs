@@ -5,3 +5,4 @@ pub mod budget;
 pub mod constitution;
 pub mod prompt;
 pub mod secret_screen;
+pub mod stop;

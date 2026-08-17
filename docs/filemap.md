@@ -25,6 +25,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `constitution.rs` — 常時載る文脈のうち、ハーネスが所有しない部分。AGENTS.md の全文は載せない。
 - `lib.rs` — polaris-core の入口。予算・憲法・プロンプトの各モジュールを束ねる。
 - `prompt.rs` — 毎ターン送るシステムプロンプトを定義し、憲法と環境情報を差し込んで組み立てる。
+- `stop.rs` — 停止条件。自動修復は行わない。壊れたまま回り続けるのが最も高くつくため、
 
 ## `crates/polaris-core/src/secret_screen`
 

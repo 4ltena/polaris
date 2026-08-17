@@ -20,29 +20,55 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// 目安として選んだ。
 const MAX_RESULTS: usize = 20;
 
-/// `body` を高々 `limit` バイトへ切り詰める。UTF-8 の文字境界を跨がないよう
+/// 候補一覧の出力全体に許す上限バイト数。
+///
+/// `MAX_RESULTS` が縛るのは件数だけである。`description` は仕様上 1,024
+/// 文字まで許され、日本語なら 1 件で 3 KB に達するため、20 件そろうと
+/// 約 61 KB になる —— 同じファイルが 1 件の本文に課している
+/// `MAX_BODY_BYTES`（32 KiB）の倍を、より緩い根拠で通してしまう。候補
+/// 一覧は「どれを読むかを選ぶための目次」であって読み物ではないので、
+/// 目次が本文の上限を超えることはない。本文上限の 1/4 にあたる 8 KiB を
+/// 上限とし、超える分は件数上限と同じ文言で打ち切ったことを明示する。
+const MAX_LIST_BYTES: usize = 8 * 1024;
+
+/// 一致しなかったときに文言へ差し戻すクエリの上限バイト数。
+///
+/// クエリはモデルが書いた任意長の文字列で、この文言はツール結果として
+/// 会話履歴に残り、以後のターンで毎回再送される。このファイルで唯一
+/// 上限の無い入力だった。何を探したのかが分かれば足りるので短くてよい。
+const MAX_ECHOED_QUERY_BYTES: usize = 120;
+
+/// `text` を高々 `limit` バイトへ切り詰める。UTF-8 の文字境界を跨がないよう
 /// 境界を後退させる。切り詰めが実際に起きたかを bool で返す。
-fn cap_body(body: &str, limit: usize) -> (&str, bool) {
-    if body.len() <= limit {
-        return (body, false);
+fn cap_bytes(text: &str, limit: usize) -> (&str, bool) {
+    if text.len() <= limit {
+        return (text, false);
     }
     let mut end = limit;
-    while end > 0 && !body.is_char_boundary(end) {
+    while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    (&body[..end], true)
+    (&text[..end], true)
 }
 
-/// 候補一覧を `MAX_RESULTS` 件まで整形する。それを超えたら「打ち切った」と
-/// 明示する —— 沈黙して一部だけ返すと、モデルはそれが全件だと誤解する。
+/// 候補一覧を `MAX_RESULTS` 件かつ `MAX_LIST_BYTES` バイトまで整形する。
+/// どちらかで打ち切ったら「打ち切った」と明示する —— 沈黙して一部だけ
+/// 返すと、モデルはそれが全件だと誤解する。
 fn list_candidates(items: &[&Skill], header: &str) -> String {
     let mut out = String::from(header);
     let mut shown = 0usize;
     for s in items.iter().take(MAX_RESULTS) {
-        out.push_str(&format!("- {}: {}\n", s.name, s.description));
+        let line = format!("- {}: {}\n", s.name, s.description);
+        // 1 件目だけは上限を超えても出す。1 件も出さずに「打ち切った」と
+        // だけ返すと、モデルには次に打つ手が何も残らない。したがって出力は
+        // 高々 `MAX_LIST_BYTES` + 見出し + 候補 1 件分に収まる。
+        if shown > 0 && out.len() + line.len() > MAX_LIST_BYTES {
+            break;
+        }
+        out.push_str(&line);
         shown += 1;
     }
-    if items.len() > MAX_RESULTS {
+    if shown < items.len() {
         out.push_str(&format!(
             "(全 {} 件中 {shown} 件のみ表示。絞り込むか名前を直接渡すこと。)\n",
             items.len()
@@ -67,7 +93,7 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
     let q = q.trim();
 
     if let Some(s) = skills.iter().find(|s| s.name == q) {
-        let (body, truncated) = cap_body(&s.body, MAX_BODY_BYTES);
+        let (body, truncated) = cap_bytes(&s.body, MAX_BODY_BYTES);
         let mut out = format!("# {}\n\n{}\n", s.name, body);
         if truncated {
             out.push_str(&format!(
@@ -103,10 +129,18 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
 
     if hits.is_empty() {
         let all: Vec<&Skill> = skills.iter().collect();
-        return list_candidates(
-            &all,
-            &format!("{q} に当たる skill が無い。利用できるのは次のとおり。\n"),
-        );
+        // q はモデルが書いた任意長の文字列である。そのまま差し戻すと、
+        // 上限の無い入力が上限の無い出力になり、しかも履歴に残って毎ターン
+        // 再送される。何を探したのかが伝わる長さで切り、切ったと断る。
+        let (echoed, truncated) = cap_bytes(q, MAX_ECHOED_QUERY_BYTES);
+        let header = if truncated {
+            format!(
+                "{echoed}…（クエリが長いので先頭 {MAX_ECHOED_QUERY_BYTES} バイトのみ表示）に当たる skill が無い。利用できるのは次のとおり。\n"
+            )
+        } else {
+            format!("{echoed} に当たる skill が無い。利用できるのは次のとおり。\n")
+        };
+        return list_candidates(&all, &header);
     }
 
     list_candidates(&hits, "候補。本文が要るときは名前をそのまま渡す。\n")
@@ -245,6 +279,89 @@ mod tests {
         assert!(
             out.contains(&total.to_string()),
             "全 {total} 件のうち一部しか表示していないと分かる文言が無い: {out}"
+        );
+    }
+
+    #[test]
+    fn search_results_are_capped_by_bytes_not_only_by_count() {
+        // 仕様が `description` に許す上限は 1,024 文字。日本語なら 1 件で
+        // 約 3 KB になり、`MAX_RESULTS` の 20 件がそろうと約 61 KB
+        // —— 同じファイルが 1 件の本文に課している 32 KiB の倍が、
+        // 件数しか見ない上限の隙間から素通りする。
+        let description = "あ".repeat(1024);
+        let skills: Vec<Skill> = (0..MAX_RESULTS)
+            .map(|i| Skill {
+                name: format!("fat-{i:02}"),
+                description: description.clone(),
+                body: "本文".into(),
+                path: format!("/x/fat-{i:02}/SKILL.md").into(),
+            })
+            .collect();
+        let one_entry = format!("- fat-00: {description}\n").len();
+
+        let out = lookup(&skills, "");
+        let shown = out.lines().filter(|l| l.starts_with("- fat-")).count();
+
+        assert!(
+            shown < skills.len(),
+            "バイト数の上限が効いていない: {shown} 件すべてを表示した"
+        );
+        assert!(
+            out.len() <= MAX_LIST_BYTES + one_entry + 256,
+            "候補一覧が上限を超えている: {} バイト",
+            out.len()
+        );
+        assert!(
+            out.len() < MAX_BODY_BYTES,
+            "候補一覧が 1 件の本文に許した上限より大きい: {} バイト",
+            out.len()
+        );
+        assert!(
+            out.contains("件のみ表示"),
+            "一部しか表示していないと分かる文言が無い: {out}"
+        );
+    }
+
+    #[test]
+    fn a_single_candidate_over_the_byte_cap_is_still_returned() {
+        // 上限を理由に 1 件も出さずに「打ち切った」とだけ返すと、モデルには
+        // 次に打つ手が何も残らない。1 件目は必ず出す。
+        let skills = vec![Skill {
+            name: "huge".into(),
+            description: "説".repeat(MAX_LIST_BYTES),
+            body: "本文".into(),
+            path: "/x/huge/SKILL.md".into(),
+        }];
+
+        let out = lookup(&skills, "");
+        assert!(out.contains("- huge:"), "候補が 1 件も出ていない");
+        assert!(
+            !out.contains("件のみ表示"),
+            "全件表示したのに打ち切ったと言っている: {}",
+            &out[..out.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn a_no_match_message_does_not_echo_the_query_back_unbounded() {
+        // q はモデルが書いた任意長の文字列で、この文言は履歴に残って以後
+        // 毎ターン再送される。このファイルで唯一、上限の無い入力だった。
+        let q = "見つからない語".repeat(2000);
+        let out = lookup(&fixtures(), &q);
+
+        assert!(
+            out.len() < 1024,
+            "クエリをそのまま差し戻している: 出力 {} バイト、クエリ {} バイト",
+            out.len(),
+            q.len()
+        );
+        assert!(
+            out.contains("クエリが長いので"),
+            "クエリを切り詰めたと分かる文言が無い: {out}"
+        );
+        assert!(
+            out.contains("git-commit") && out.contains("writing-style"),
+            "候補一覧が出ていない: {out}"
         );
     }
 

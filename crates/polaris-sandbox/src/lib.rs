@@ -5,6 +5,9 @@
 
 pub mod policy;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 pub use policy::{SandboxMode, SandboxPolicy};
 
 #[derive(Debug, thiserror::Error)]

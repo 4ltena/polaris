@@ -93,10 +93,35 @@ fn cap_by_char_boundary(text: &str, limit: usize) -> String {
     text[..boundaries[lo]].to_string()
 }
 
+/// ファイルが無いことと、それ以外の読み取り失敗（権限、不正な UTF-8 など）
+/// を区別して返す。「無い」は `Ok(None)` — 通常の状態で、黙って無視して
+/// よい。それ以外は `Err` — 呼び出し側がユーザーへ知らせる責任を持つ。
+fn try_read_block(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => Ok(Some(extract_always_on(&body))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// ファイルが無ければ静かに空文字列を返す。それ以外の失敗（権限が無い、
+/// 文字コードが UTF-8 でない等）は、規則が読めなかったことを stderr へ
+/// 警告してから空文字列を返す。どちらも起動は止めない — 憲法が読めない
+/// ことは致命的ではないが、黙って「規則が無いことにする」のと、ユーザーへ
+/// 知らせた上で「規則を読めなかったので今回は適用しない」のとでは、後者
+/// でなければ、ユーザーは自分の規則が一度も効いていないことに気づけない。
 fn read_block(path: &Path) -> String {
-    std::fs::read_to_string(path)
-        .map(|b| extract_always_on(&b))
-        .unwrap_or_default()
+    match try_read_block(path) {
+        Ok(Some(block)) => block,
+        Ok(None) => String::new(),
+        Err(e) => {
+            eprintln!(
+                "警告: {} を読めない（{e}）。この規則は今回は適用されない。",
+                path.display()
+            );
+            String::new()
+        }
+    }
 }
 
 /// グローバル規則とプロジェクト規則をこの順に読み、合算して上限で切り詰める。
@@ -319,6 +344,64 @@ main へ直接 push しない。
             n > CONSTITUTION_LIMIT / 2,
             "単独ソースなのに半分しか使えていない: {n}"
         );
+    }
+
+    #[test]
+    fn try_read_block_returns_none_for_a_missing_file() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let missing = dir.path().join("AGENTS.md");
+        assert_eq!(
+            try_read_block(&missing).expect("エラーになってはいけない"),
+            None
+        );
+    }
+
+    #[test]
+    fn try_read_block_returns_err_for_invalid_utf8() {
+        // 非UTF-8（例: Shift-JIS）で保存された AGENTS.md は「無い」のと
+        // 同じに潰してはいけない。ユーザーの規則が読めなかったことを
+        // 呼び出し側が知れるように、Err として区別する。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, [0x82, 0xa0, 0x82, 0xa2]).expect("書けない"); // Shift-JIS の一部
+        let err = try_read_block(&path).expect_err("不正なUTF-8はエラーになるべき");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn try_read_block_returns_err_for_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "## Always on\n\n読めないはず\n").expect("書けない");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("権限を変更できない");
+
+        // このテストの前提（このプロセスが実際にパーミッションへ従う環境で
+        // 動いている）を、`try_read_block` を経由しない生の読み取りで独立に
+        // 確かめる。`result` の判定をこの ground truth に委ねてしまうと、
+        // `try_read_block` が常に `Ok` を返す退行が起きても「root 環境
+        // だったから」で握り潰され、テストが規制の有無を問わず通ってしまう。
+        let ground_truth = std::fs::read_to_string(&path);
+        let result = try_read_block(&path);
+
+        // 後片付け: tempdir の Drop が削除できるよう権限を戻す。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("権限を戻せない");
+
+        match ground_truth {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                let err = result.expect_err("権限が無いのでエラーになるべき");
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            // root で実行している等、パーミッションが強制されない環境では
+            // このテストの前提が成立しないため、判定をスキップする。
+            _ => eprintln!(
+                "この環境ではファイル権限が強制されない（root 実行?）。判定をスキップする。"
+            ),
+        }
     }
 
     #[test]

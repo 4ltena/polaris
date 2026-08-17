@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+polaris-provider = { path = "../polaris-provider" }
 polaris-tools = { path = "../polaris-tools" }
 regex = { workspace = true }
 serde = { workspace = true }
@@ -13,4 +14,6 @@ thiserror = { workspace = true }
 tiktoken-rs = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }

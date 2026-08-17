@@ -2,6 +2,7 @@
 
 pub mod path_policy;
 pub mod read;
+pub mod skill;
 
 use serde::Serialize;
 
@@ -31,7 +32,7 @@ pub enum ToolError {
 
 /// 常時提供するツールの一覧。
 pub fn all_specs() -> Vec<ToolSpec> {
-    vec![read_spec()]
+    vec![read_spec(), skill_spec()]
 }
 
 fn read_spec() -> ToolSpec {
@@ -46,6 +47,18 @@ fn read_spec() -> ToolSpec {
                 "limit": { "type": "integer" }
             },
             "required": ["path"]
+        }),
+    }
+}
+
+fn skill_spec() -> ToolSpec {
+    ToolSpec {
+        name: "skill",
+        description: "skill を引く。名前に完全一致すれば本文を返し、そうでなければ候補の名前と説明を返す。",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "q": { "type": "string" } },
+            "required": ["q"]
         }),
     }
 }

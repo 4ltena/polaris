@@ -68,6 +68,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-sandbox/src`
 
 - `lib.rs` — サンドボックス方針の定義と、OS 機構への委譲。
+- `linux.rs` — Linux の強制。landlock の ruleset を子の中で自分自身へ適用する。
 - `macos.rs` — macOS の強制。実行時に Seatbelt プロファイルを組み立て、
 - `policy.rs` — 方針と書込可能ルート。ルートは構築時に正規化する。
 

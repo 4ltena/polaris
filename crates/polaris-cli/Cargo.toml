@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 polaris-core = { path = "../polaris-core" }
 polaris-provider = { path = "../polaris-provider" }
+polaris-skills = { path = "../polaris-skills" }
 clap = { workspace = true }
 tokio = { workspace = true }
 

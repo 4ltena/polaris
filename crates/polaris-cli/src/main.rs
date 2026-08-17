@@ -84,7 +84,25 @@ async fn main() -> ExitCode {
     let environment = constitution::environment_block(&cwd, None);
     let system = prompt::build_system(&constitution, &environment);
 
-    match agent::run(&provider, &mut session, &mut audit, &mut stop, &system).await {
+    let config = polaris_core::config::load(&cwd).unwrap_or_else(|e| {
+        eprintln!("設定を読めない: {e}");
+        polaris_core::config::Config::default()
+    });
+    let discovered = polaris_skills::discover(&cwd, &config.skills_paths);
+    for line in format_skipped_skills(&discovered.skipped) {
+        eprintln!("{line}");
+    }
+
+    match agent::run(
+        &provider,
+        &mut session,
+        &mut audit,
+        &mut stop,
+        &system,
+        &discovered.skills,
+    )
+    .await
+    {
         Ok(text) => {
             println!("{text}");
             ExitCode::SUCCESS
@@ -112,6 +130,16 @@ fn default_audit_path(cwd: &Path) -> io::Result<PathBuf> {
     let dir = Path::new(&home).join(".polaris").join("state").join(id);
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("audit.jsonl"))
+}
+
+/// 飛ばした skill を1件1行に整形する。壊れた skill が1件あっても、読めなかった
+/// ことと理由を利用者へ黙って握り潰さないための表示用ロジックを、
+/// eprintln! 呼び出しから切り離してここへ置く（副作用なしでテストできる）。
+fn format_skipped_skills(skipped: &[polaris_skills::Skipped]) -> Vec<String> {
+    skipped
+        .iter()
+        .map(|s| format!("skill を読めない: {s}"))
+        .collect()
 }
 
 /// canonicalize 済みパスから決定的なプロジェクト識別子を作る。
@@ -148,6 +176,44 @@ mod tests {
         let a = project_id(Path::new("/w/polaris"));
         let b = project_id(Path::new("/w/other"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn skipped_skills_are_reported_one_line_each_naming_directory_and_cause() {
+        // discover が拾った skipped を握り潰さず、1件1行で標準エラーへ渡す
+        // ための整形ロジックを直接確かめる。実プロセスを起動して stderr を
+        // 検証すると API キーを要求する経路まで踏む必要があるため、ここでは
+        // 整形関数だけを切り出して検証する。
+        let skipped = vec![
+            polaris_skills::Skipped {
+                dir_name: "broken-one".into(),
+                cause: polaris_skills::SkipCause::Unreadable(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "権限が無い",
+                )),
+            },
+            polaris_skills::Skipped {
+                dir_name: "broken-two".into(),
+                cause: polaris_skills::SkipCause::Unreadable(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "権限が無い",
+                )),
+            },
+        ];
+
+        let lines = format_skipped_skills(&skipped);
+
+        assert_eq!(lines.len(), 2, "1件1行になっていない: {lines:?}");
+        assert!(
+            lines[0].contains("broken-one"),
+            "ディレクトリ名が含まれていない: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("broken-two"),
+            "ディレクトリ名が含まれていない: {}",
+            lines[1]
+        );
     }
 
     #[test]

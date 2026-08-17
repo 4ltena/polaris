@@ -1,5 +1,6 @@
 //! 常時コンテキストの計測。数値は測定で担保し、見積で運用しない。
 
+use polaris_provider::openai::tool_wire_shape;
 use polaris_tools::ToolSpec;
 
 /// 常時コンテキストの上限。
@@ -22,8 +23,15 @@ pub fn count_tokens(text: &str) -> usize {
 
 /// 毎ターン載るものの合計。システムプロンプトと、実際に送られる
 /// ツール定義の直列化結果を数える。
+///
+/// `ToolSpec` をそのまま直列化した形ではなく、`polaris_provider::openai::
+/// tool_wire_shape` が作るワイヤ形式（`{"type":"function","function":{…}}`)
+/// を数える。プロバイダが実際に送るバイト列と、ここで測るバイト列が
+/// 別々の場所で独立に組み立てられていたことがあり、その食い違いの分だけ
+/// 予算が実態より小さく出ていた。
 pub fn always_on_tokens(system_prompt: &str, tools: &[ToolSpec]) -> usize {
-    let tools_json = serde_json::to_string(tools).expect("ツール定義を直列化できない");
+    let wire = tool_wire_shape(tools);
+    let tools_json = serde_json::to_string(&wire).expect("ツール定義を直列化できない");
     count_tokens(system_prompt) + count_tokens(&tools_json)
 }
 
@@ -48,6 +56,24 @@ mod tests {
         assert!(
             n <= MAX_TOOLS,
             "ツールが {n} 本。上限 {MAX_TOOLS} 本を超えている"
+        );
+    }
+
+    #[test]
+    fn always_on_tokens_counts_the_wire_shape_not_the_bare_tool_spec() {
+        // `serde_json::to_string(&specs)` を直接数えると `{"type":"function",
+        // "function":{...}}` の包み分だけ少なく出る — 実際に送るバイト列と
+        // 計測するバイト列が別の場所で独立に組み立てられていたことによる
+        // 食い違いで、この milestone が測定を組織原理とする根拠そのものを
+        // 崩していた。ここで両者が一致しない（＝ここが素朴な直列化では
+        // なくワイヤ形式を数えている）ことを固定する。
+        let specs = polaris_tools::all_specs();
+        let naive_tools_tokens = count_tokens(&serde_json::to_string(&specs).unwrap());
+        let measured_tools_tokens =
+            always_on_tokens(SYSTEM_PROMPT, &specs) - count_tokens(SYSTEM_PROMPT);
+        assert!(
+            measured_tools_tokens > naive_tools_tokens,
+            "ワイヤ形式の包み分の差が無い: naive={naive_tools_tokens} measured={measured_tools_tokens}"
         );
     }
 

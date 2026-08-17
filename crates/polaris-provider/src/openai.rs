@@ -1,9 +1,24 @@
 //! OpenAI 互換のチャット補完。base_url を差し替えれば互換エンドポイントも叩ける。
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 use crate::{CompletionRequest, CompletionResponse, Provider, ProviderError, Role, ToolCall};
 use polaris_tools::ToolSpec;
+
+/// 接続確立（TCP/TLS ハンドシェイク）にかける上限。相手が応答すらしない
+/// 場合、これより短い時間で諦めてよい。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// リクエスト全体（接続からレスポンス受信完了まで）にかける上限。
+/// `reqwest::Client::new()` はデフォルトで無期限に待つため、相手が
+/// 接続だけ受けてハングすると、ワンショットの headless バイナリが
+/// `--max-turns` の助けも借りずに永久に止まる。非ストリーミングの
+/// チャット補完は生成に数十秒かかることがあるので、その通常応答を
+/// 打ち切らない程度に長く、かつハングが上限無しにならない値として
+/// 120 秒を選んだ。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct OpenAiProvider {
     base_url: String,
@@ -14,11 +29,29 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: String, model: String) -> Self {
+        Self::with_timeouts(base_url, api_key, model, CONNECT_TIMEOUT, REQUEST_TIMEOUT)
+    }
+
+    /// タイムアウト値を明示して構築する。短いタイムアウトを注入して
+    /// ハング挙動をテストできるようにするための経路。通常の呼び出しは
+    /// [`Self::new`] を使う。
+    fn with_timeouts(
+        base_url: String,
+        api_key: String,
+        model: String,
+        connect_timeout: Duration,
+        timeout: Duration,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(timeout)
+            .build()
+            .expect("HTTP クライアントを構築できない");
         Self {
             base_url,
             api_key,
             model,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }
@@ -416,6 +449,49 @@ mod tests {
         .await
         .expect_err("id が無いのでエラーになるべき");
         assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[tokio::test]
+    async fn total_request_timeout_bounds_a_stalled_response() {
+        // `reqwest::Client::new()` は無期限に待つ。相手が接続を受けたまま
+        // 応答を返さない場合をモックの遅延応答で再現し、設定した上限内で
+        // 確実にエラーへ戻ることを確かめる。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({
+                        "choices": [{ "message": { "content": "遅い" } }]
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let p = OpenAiProvider::with_timeouts(
+            server.uri(),
+            "k".into(),
+            "m".into(),
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(50),
+        );
+
+        let started = std::time::Instant::now();
+        let err = p
+            .complete(CompletionRequest {
+                system: "s".into(),
+                messages: vec![],
+                tools: vec![],
+            })
+            .await
+            .expect_err("タイムアウトでエラーになるべき");
+        assert!(matches!(err, ProviderError::Http(_)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "タイムアウトが効いていない。実測 {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! プロバイダ抽象。トランスポートに依存する部分は各実装が持ち、
 //! ここには要求と応答の形だけを置く。
 
+pub mod openai;
 pub mod sse;
 
 use polaris_tools::ToolSpec;

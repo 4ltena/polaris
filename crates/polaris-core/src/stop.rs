@@ -39,6 +39,16 @@ impl StopTracker {
         None
     }
 
+    /// 成功したツール呼び出しを記録し、連続エラーのストリークをリセットする。
+    /// これを呼ばないと `last_error` / `streak` はエラーからしか更新されず、
+    /// `error, success, error, success, error` のような系列でも「同一の
+    /// エラーが3回続いた」と判定されてしまう —
+    /// 実際には一度も連続していないのに。
+    pub fn observe_success(&mut self) {
+        self.last_error = None;
+        self.streak = 0;
+    }
+
     pub fn observe_turn(&mut self) -> Option<StopReason> {
         self.turns += 1;
         if self.turns >= self.max_turns {
@@ -74,6 +84,15 @@ mod tests {
             t.observe_error("other"),
             Some(StopReason::RepeatedError(_))
         ));
+    }
+
+    #[test]
+    fn success_between_errors_resets_the_streak_so_interleaved_errors_never_trip() {
+        let mut t = StopTracker::new(100);
+        for _ in 0..5 {
+            assert!(t.observe_error("boom").is_none());
+            t.observe_success();
+        }
     }
 
     #[test]

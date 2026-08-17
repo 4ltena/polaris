@@ -66,7 +66,13 @@ pub async fn run(
             let outcome = dispatch(call);
             audit.record(&call.name, &call.arguments.to_string())?;
             match outcome {
-                Ok(body) => session.push_tool_result(&call.id, &body),
+                Ok(body) => {
+                    // 成功したので連続エラーのストリークをリセットする。ここを
+                    // 呼ばないと、成功を挟んだ同一エラーの繰り返しが「連続」と
+                    // 誤判定されて止まる（stop.rs のコメント参照）。
+                    stop.observe_success();
+                    session.push_tool_result(&call.id, &body);
+                }
                 Err(msg) => {
                     if let Some(r) = stop.observe_error(&msg) {
                         return Err(AgentError::Stopped(r));
@@ -155,6 +161,59 @@ mod tests {
 
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("読めない");
         assert!(log.contains("\"tool\":\"read\""), "read が記録されていない");
+    }
+
+    #[tokio::test]
+    async fn interleaved_success_does_not_trip_the_repeated_error_stop() {
+        // stop.rs 側の単体テストと対になる、ループ経由の回帰テスト。
+        // 「同一エラー3回」を、間に成功を挟んだ5回のエラーとして再現する。
+        // observe_success がループの成功経路から呼ばれていなければ、
+        // 3回目のエラーで（成功を挟んでいるにもかかわらず）止まってしまう。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, "hello\n").expect("書けない");
+
+        let fail_call = || CompletionResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": "/home/u/.ssh/id_rsa" }),
+            }],
+        };
+        let ok_call = || CompletionResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": target.to_str().unwrap() }),
+            }],
+        };
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                fail_call(),
+                ok_call(),
+                fail_call(),
+                ok_call(),
+                fail_call(),
+                CompletionResponse {
+                    text: "終わった".into(),
+                    tool_calls: vec![],
+                },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("読んで");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
+        let mut stop = StopTracker::new(50);
+
+        let system = crate::prompt::build_system("", "");
+        let out = run(&p, &mut session, &mut audit, &mut stop, &system)
+            .await
+            .expect("成功を挟んでいるので3回連続扱いにならず止まらないはず");
+        assert_eq!(out, "終わった");
     }
 
     #[tokio::test]

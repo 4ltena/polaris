@@ -14,6 +14,18 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `Cargo.toml` — ワークスペース定義と共有依存
 - `rust-toolchain.toml` — ツールチェイン固定
 
+## `crates/polaris-cli`
+
+- `Cargo.toml` — polaris-cli クレートのマニフェスト
+
+## `crates/polaris-cli/src`
+
+- `main.rs` — `polaris` バイナリの入口。環境変数から接続先を決め、常時コンテキストを
+
+## `crates/polaris-cli/tests`
+
+- `cli.rs` — CLI バイナリの統合テスト。実プロセスを起動して振る舞いを確かめる。
+
 ## `crates/polaris-core`
 
 - `Cargo.toml` — polaris-core クレートのマニフェスト

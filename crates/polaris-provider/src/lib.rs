@@ -15,10 +15,62 @@ pub enum Role {
     Tool,
 }
 
+/// 履歴上の 1 メッセージ。`tool_calls` はアシスタントのターンがツールを
+/// 呼んだときだけ非空になり、`tool_call_id` はツール結果メッセージだけが
+/// 持つ。どちらも通常のユーザー/アシスタントの発話では空のままにする。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// アシスタントのターンをツール呼び出しとともに記録する。OpenAI の
+    /// 往復規約では、ツール結果を送る前にこのメッセージ自体が
+    /// `tool_calls` を保持したまま履歴に残っていなければならない。
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// ツール結果を、それが応答する呼び出しの id と結び付けて記録する。
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,10 +138,7 @@ mod tests {
         let res = p
             .complete(CompletionRequest {
                 system: "s".into(),
-                messages: vec![Message {
-                    role: Role::User,
-                    content: "go".into(),
-                }],
+                messages: vec![Message::user("go")],
                 tools: vec![],
             })
             .await

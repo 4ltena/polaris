@@ -38,10 +38,36 @@ impl Provider for OpenAiProvider {
             "content": req.system,
         })];
         for m in &req.messages {
-            messages.push(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "role": role_str(m.role),
                 "content": m.content,
-            }));
+            });
+            // アシスタントのターンがツールを呼んだ場合は、その `tool_calls` を
+            // このメッセージ自体に載せて送り返す。API はこれを見て、続く
+            // `role: "tool"` メッセージの `tool_call_id` と突き合わせる。
+            // `arguments` は受信時に一度パースした JSON 値を、送信時には
+            // 対称的に JSON 文字列へ戻す（ワイヤ上はどちらも文字列）。
+            if !m.tool_calls.is_empty() {
+                let calls: Vec<Value> = m
+                    .tool_calls
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {
+                                "name": c.name,
+                                "arguments": c.arguments.to_string(),
+                            }
+                        })
+                    })
+                    .collect();
+                entry["tool_calls"] = Value::Array(calls);
+            }
+            if let Some(id) = &m.tool_call_id {
+                entry["tool_call_id"] = Value::String(id.clone());
+            }
+            messages.push(entry);
         }
 
         let tools: Vec<Value> = req
@@ -96,12 +122,20 @@ impl Provider for OpenAiProvider {
             .and_then(|first| first.get("message"))
             .ok_or_else(|| ProviderError::Decode("choices が空、または message が無い".into()))?;
 
-        // content と tool_calls の両方が「フィールド自体が無い」場合のみ
-        // Decode にする。content が空文字列で「存在する」場合は、モデルが
-        // 何も言わなかっただけの正常応答として扱う（絶対に空≠不在にしない）。
+        // content と tool_calls の両方が「実質的に無い」場合のみ Decode に
+        // する。content は「フィールド自体が無い」だけでなく「JSON null」も
+        // 無いとして扱う。missing と null はワイヤ上ここで区別する意味が
+        // 無く、区別しないと tool_calls も無い `{"content": null}` が
+        // 「空文字列の正常応答」として静かに素通りしてしまう
+        // （ループはこれを「ツール呼び出し無し＝完了」と誤読する）。
+        // 一方、content が空文字列で「存在する」場合は、モデルが何も
+        // 言わなかっただけの正常応答として扱う（絶対に空≠不在にしない）。
+        // `content: null` かつ tool_calls が非空の組み合わせ（ツールだけを
+        // 呼ぶターンの通常形）はこのガードに引っかからない。
         let content_field = msg.get("content");
         let tool_calls_field = msg.get("tool_calls");
-        if content_field.is_none() && tool_calls_field.is_none() {
+        let content_is_absent = content_field.is_none_or(|c| c.is_null());
+        if content_is_absent && tool_calls_field.is_none() {
             return Err(ProviderError::Decode(
                 "message に content も tool_calls も無い".into(),
             ));
@@ -154,7 +188,7 @@ impl Provider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Message;
+    use crate::{Message, ToolCall};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -181,10 +215,7 @@ mod tests {
         let res = p
             .complete(CompletionRequest {
                 system: "s".into(),
-                messages: vec![Message {
-                    role: Role::User,
-                    content: "go".into(),
-                }],
+                messages: vec![Message::user("go")],
                 tools: vec![],
             })
             .await
@@ -262,6 +293,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn errors_when_content_is_null_and_tool_calls_missing() {
+        // content: null は JSON 上「存在する」が、tool_calls も無ければ
+        // 本文が実質何も無い応答であり、以前は "" として静かに Ok になって
+        // いた。ループは「ツール呼び出し無し＝完了」と読むため、これは
+        // 「空の答えで成功した」という誤った結果になる。
+        let err = complete_against(serde_json::json!({
+            "choices": [{ "message": { "content": null } }]
+        }))
+        .await
+        .expect_err("content が null で tool_calls も無いのでエラーになるべき");
+        assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[tokio::test]
     async fn empty_string_content_is_a_real_response_not_an_error() {
         let res = complete_against(serde_json::json!({
             "choices": [{ "message": { "content": "" } }]
@@ -323,5 +368,76 @@ mod tests {
         .await
         .expect_err("id が無いのでエラーになるべき");
         assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[tokio::test]
+    async fn serializes_tool_round_trip_to_the_wire_shape_openai_requires() {
+        // 型だけを見るテストは、実際のワイヤ形式のズレを見逃す。ここでは
+        // wiremock が受け取った生のリクエストボディを直接検証し、
+        // (1) tool_calls を持つアシスタントのメッセージがそのまま履歴に
+        //     残っていること、(2) arguments が JSON オブジェクトではなく
+        //     JSON 文字列として送信されること、(3) 続く tool 結果が
+        //     tool_call_id を持つこと、を確かめる。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "1 行だった" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into());
+        let history = vec![
+            Message::user("a.txt は何行か"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": "a.txt" }),
+                }],
+            ),
+            Message::tool_result("c1", "1: hello"),
+        ];
+
+        p.complete(CompletionRequest {
+            system: "s".into(),
+            messages: history,
+            tools: vec![],
+        })
+        .await
+        .expect("失敗した");
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("リクエストが記録されていない");
+        assert_eq!(received.len(), 1);
+        let body: Value = received[0].body_json().expect("JSON として読めない");
+        let messages = body["messages"].as_array().expect("messages が無い");
+
+        // 0: system, 1: user, 2: assistant(tool_calls), 3: tool
+        let assistant = &messages[2];
+        assert_eq!(assistant["role"], "assistant");
+        let calls = assistant["tool_calls"]
+            .as_array()
+            .expect("assistant の tool_calls が無い");
+        assert_eq!(calls[0]["id"], "c1");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "read");
+        let arguments = &calls[0]["function"]["arguments"];
+        assert!(
+            arguments.is_string(),
+            "arguments は JSON 文字列であるべき: {arguments:?}"
+        );
+        let parsed: Value =
+            serde_json::from_str(arguments.as_str().unwrap()).expect("パースできない");
+        assert_eq!(parsed["path"], "a.txt");
+
+        let tool_msg = &messages[3];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["tool_call_id"], "c1");
+        assert_eq!(tool_msg["content"], "1: hello");
     }
 }

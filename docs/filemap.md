@@ -36,6 +36,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `agent.rs` — エージェントループ。ツール呼び出しが無くなった時点の本文を返す。
 - `audit.rs` — 追記専用の監査ログ。署名は付けない。インプロセスでは署名する主体と
 - `budget.rs` — 常時コンテキストの計測。数値は測定で担保し、見積で運用しない。
+- `config.rs` — 設定ファイルの読み込み。存在しないことは正常だが、壊れていることは正常ではない。
 - `constitution.rs` — 常時載る文脈のうち、ハーネスが所有しない部分。AGENTS.md の全文は載せない。
 - `lib.rs` — polaris-core の入口。予算・憲法・プロンプトの各モジュールを束ねる。
 - `prompt.rs` — 毎ターン送るシステムプロンプトを定義し、憲法と環境情報を差し込んで組み立てる。
@@ -81,6 +82,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `docs/superpowers/plans`
 
 - `2026-08-16-polaris-m1-headless-loop.md` — polaris M1 ヘッドレス最小ループ Implementation Plan
+- `2026-08-17-polaris-m3a-skills.md` — polaris M3a Skills ローダと skill ツール Implementation Plan
 
 ## `docs/superpowers/specs`
 

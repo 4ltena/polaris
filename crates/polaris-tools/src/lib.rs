@@ -57,7 +57,12 @@ fn skill_spec() -> ToolSpec {
         description: "skill を引く。名前に完全一致すれば本文を返し、そうでなければ候補の名前と説明を返す。",
         parameters: serde_json::json!({
             "type": "object",
-            "properties": { "q": { "type": "string" } },
+            "properties": {
+                "q": {
+                    "type": "string",
+                    "description": "skill 名（完全一致で本文）、または検索語（名前と説明を照合して候補）。空文字列は全件列挙。"
+                }
+            },
             "required": ["q"]
         }),
     }
@@ -98,6 +103,13 @@ mod tests {
         assert_eq!(json["name"], "skill");
         assert_eq!(json["parameters"]["required"][0], "q");
         assert_eq!(json["parameters"]["properties"]["q"]["type"], "string");
+        // 引数ごとの説明。ツール全体の説明だけでは、名前を渡すと本文が返り
+        // それ以外は検索になるという 1 引数 2 モードの規約をモデルが引数の
+        // 側から知る手段が無い。説明を消せばここで落ちる。
+        let param_doc = json["parameters"]["properties"]["q"]["description"]
+            .as_str()
+            .expect("引数 q に説明が無い");
+        assert!(!param_doc.trim().is_empty(), "引数 q の説明が空");
     }
 
     #[test]

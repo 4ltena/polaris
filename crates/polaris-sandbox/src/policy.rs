@@ -45,6 +45,11 @@ impl SandboxPolicy {
                     "workspace-write には書込可能ルートが 1 件以上要る".into(),
                 ));
             }
+            SandboxMode::FullAccess if !roots.is_empty() => {
+                return Err(SandboxError::NotEnforced(
+                    "full-access に書込可能ルートは指定できない".into(),
+                ));
+            }
             _ => {}
         }
 
@@ -194,5 +199,106 @@ mod tests {
                 root.display()
             );
         }
+    }
+
+    #[test]
+    fn full_access_rejects_writable_roots() {
+        // full-access にルートを渡せてしまうと、方針の名前と実際の権限が
+        // 食い違う。read-only と同様に拒否する。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let err = SandboxPolicy::new(SandboxMode::FullAccess, &[dir.path().to_path_buf()])
+            .expect_err("full-access にルートが通ってしまった");
+        assert!(matches!(err, SandboxError::NotEnforced(_)), "{err}");
+    }
+
+    #[test]
+    fn contains_includes_root_and_child_paths() {
+        // ルート自身と、その下の子ディレクトリ・ファイルはcontainsする。
+        // 兄弟ディレクトリはしない。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+        let policy = SandboxPolicy::new(
+            SandboxMode::WorkspaceWrite,
+            std::slice::from_ref(&root_path.clone()),
+        )
+        .expect("方針を作れない");
+
+        // ルート自身が含まれる
+        assert!(
+            policy.contains(&root_path),
+            "root itself should be contained"
+        );
+
+        // 子ディレクトリが含まれる
+        let child = root_path.join("child");
+        assert!(
+            policy.contains(&child),
+            "child directory should be contained"
+        );
+
+        // 兄弟ディレクトリは含まれない
+        let sibling = root_path.parent().unwrap().join("sibling");
+        assert!(
+            !policy.contains(&sibling),
+            "sibling directory should not be contained"
+        );
+    }
+
+    #[test]
+    fn contains_full_access_always_true() {
+        // full-access は任意のパスに対して true を返す。
+        let policy =
+            SandboxPolicy::new(SandboxMode::FullAccess, &[]).expect("full-access を作れない");
+
+        let arbitrary = Path::new("/arbitrary/path");
+        assert!(
+            policy.contains(arbitrary),
+            "full-access should contain any path"
+        );
+    }
+
+    #[test]
+    fn contains_read_only_always_false() {
+        // read-only は任意のパスに対して false を返す。
+        let policy = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("read-only を作れない");
+
+        let arbitrary = Path::new("/arbitrary/path");
+        assert!(
+            !policy.contains(arbitrary),
+            "read-only should contain no paths"
+        );
+    }
+
+    #[test]
+    fn contains_resists_string_prefix_confusion() {
+        // Path::starts_with はパス成分で比較する。<root>/work と <root>/work-evil は異なる。
+        // 単純な文字列比較に「簡略化」されるのを防ぐためのテスト。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let root_path = root.path().canonicalize().expect("canonicalize");
+
+        // work ディレクトリを実際に作る
+        let work = root_path.join("work");
+        std::fs::create_dir(&work).expect("create work dir");
+        let work = work.canonicalize().expect("canonicalize work");
+
+        // work-evil はルート下に存在させるが、ルートのパスにはしない
+        let work_evil = root_path.join("work-evil");
+
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, std::slice::from_ref(&work))
+            .expect("方針を作れない");
+
+        // work 以下は含まれる
+        assert!(policy.contains(&work), "work should be contained");
+        let work_child = work.join("file.txt");
+        assert!(
+            policy.contains(&work_child),
+            "work/child should be contained"
+        );
+
+        // work-evil は含まれない
+        assert!(
+            !policy.contains(&work_evil),
+            "work-evil should not be contained (string prefix confusion)"
+        );
     }
 }

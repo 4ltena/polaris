@@ -34,6 +34,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `filemap.rs` — `docs/filemap.md` がリポジトリの実体と一致しているかを確かめるスナップショットテスト。
 
+## `crates/polaris-provider`
+
+- `Cargo.toml` — polaris-provider クレートのマニフェスト
+
+## `crates/polaris-provider/src`
+
+- `lib.rs` — プロバイダ抽象。トランスポートに依存する部分は各実装が持ち、
+- `sse.rs` — SSE(text/event-stream)を逐次デコードする。バイト片を push すると、
+
 ## `crates/polaris-tools`
 
 - `Cargo.toml` — polaris-tools クレートのマニフェスト

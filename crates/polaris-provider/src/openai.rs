@@ -123,19 +123,30 @@ impl Provider for OpenAiProvider {
             .ok_or_else(|| ProviderError::Decode("choices が空、または message が無い".into()))?;
 
         // content と tool_calls の両方が「実質的に無い」場合のみ Decode に
-        // する。content は「フィールド自体が無い」だけでなく「JSON null」も
-        // 無いとして扱う。missing と null はワイヤ上ここで区別する意味が
-        // 無く、区別しないと tool_calls も無い `{"content": null}` が
-        // 「空文字列の正常応答」として静かに素通りしてしまう
-        // （ループはこれを「ツール呼び出し無し＝完了」と誤読する）。
-        // 一方、content が空文字列で「存在する」場合は、モデルが何も
+        // する。左右対称に「無い」を定義する必要がある — 片方だけ緩いと、
+        // その緩い側の門から同じ黙った空成功が抜けてしまう。
+        //
+        // content が「無い」とは、フィールド自体が無いか、JSON null で
+        // あること。missing と null はワイヤ上ここで区別する意味が無い。
+        // 一方 content が空文字列で「存在する」場合は、モデルが何も
         // 言わなかっただけの正常応答として扱う（絶対に空≠不在にしない）。
+        //
+        // tool_calls が「無い」とは、フィールド自体が無いか、JSON null か、
+        // 空配列であること。`{"content": null, "tool_calls": null}` や
+        // `{"content": null, "tool_calls": []}` は、missing キーの場合と
+        // 意味的に同一（呼び出しは一つも要求されていない）であり、区別
+        // しないと text="" / tool_calls=[] の「正常終了っぽい空応答」が
+        // このガードをすり抜けてしまう（ループはこれを「ツール呼び出し
+        // 無し＝完了」と誤読し、空文字列を最終回答として返して黙って壊れる）。
+        //
         // `content: null` かつ tool_calls が非空の組み合わせ（ツールだけを
         // 呼ぶターンの通常形）はこのガードに引っかからない。
         let content_field = msg.get("content");
         let tool_calls_field = msg.get("tool_calls");
         let content_is_absent = content_field.is_none_or(|c| c.is_null());
-        if content_is_absent && tool_calls_field.is_none() {
+        let tool_calls_are_absent = tool_calls_field
+            .is_none_or(|c| c.is_null() || c.as_array().is_some_and(|a| a.is_empty()));
+        if content_is_absent && tool_calls_are_absent {
             return Err(ProviderError::Decode(
                 "message に content も tool_calls も無い".into(),
             ));
@@ -307,6 +318,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn errors_when_content_is_null_and_tool_calls_is_null() {
+        // tool_calls: null は「フィールドが無い」場合と意味的に同一で
+        // （呼び出しは一つも要求されていない）、区別しないと text="" /
+        // tool_calls=[] の「正常終了っぽい空応答」がガードをすり抜ける。
+        let err = complete_against(serde_json::json!({
+            "choices": [{ "message": { "content": null, "tool_calls": null } }]
+        }))
+        .await
+        .expect_err("content も tool_calls も null なのでエラーになるべき");
+        assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[tokio::test]
+    async fn errors_when_content_is_null_and_tool_calls_is_empty_array() {
+        // tool_calls: [] も同様に「呼び出しなし」であり、missing/null と
+        // 同じ扱いにしないと同じ抜け道になる。
+        let err = complete_against(serde_json::json!({
+            "choices": [{ "message": { "content": null, "tool_calls": [] } }]
+        }))
+        .await
+        .expect_err("content が null で tool_calls も空配列なのでエラーになるべき");
+        assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[tokio::test]
     async fn empty_string_content_is_a_real_response_not_an_error() {
         let res = complete_against(serde_json::json!({
             "choices": [{ "message": { "content": "" } }]
@@ -377,7 +413,8 @@ mod tests {
         // (1) tool_calls を持つアシスタントのメッセージがそのまま履歴に
         //     残っていること、(2) arguments が JSON オブジェクトではなく
         //     JSON 文字列として送信されること、(3) 続く tool 結果が
-        //     tool_call_id を持つこと、を確かめる。
+        //     tool_call_id を持つこと、(4) 普通のユーザーメッセージには
+        //     tool_calls / tool_call_id のどちらも乗らないこと、を確かめる。
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -418,6 +455,17 @@ mod tests {
         let messages = body["messages"].as_array().expect("messages が無い");
 
         // 0: system, 1: user, 2: assistant(tool_calls), 3: tool
+        let user = &messages[1];
+        assert_eq!(user["role"], "user");
+        assert!(
+            user.get("tool_calls").is_none(),
+            "普通のユーザーメッセージに tool_calls が乗っている: {user:?}"
+        );
+        assert!(
+            user.get("tool_call_id").is_none(),
+            "普通のユーザーメッセージに tool_call_id が乗っている: {user:?}"
+        );
+
         let assistant = &messages[2];
         assert_eq!(assistant["role"], "assistant");
         let calls = assistant["tool_calls"]

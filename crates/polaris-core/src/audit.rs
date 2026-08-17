@@ -17,15 +17,25 @@ impl AuditLog {
         Ok(Self { file })
     }
 
-    /// 1 呼び出しを 1 行として追記する。`detail` は書く直前に必ず伏字化を通す。
+    /// 1 呼び出しを 1 行として追記する。書き込む文字列は `tool` / `detail`
+    /// のどちらも、書く直前に必ず [`screen`] を通す。`tool` はモデルの
+    /// ツール呼び出しからそのまま渡ってくる値であり、閉じた集合ではない
+    /// （プロンプトインジェクションを受けたモデルが任意の文字列を出せる）
+    /// ため、例外なく同じ経路を通す。
     pub fn record(&mut self, tool: &str, detail: &str) -> std::io::Result<()> {
-        let screened = match screen_text(detail) {
-            FilterResult::Keep(s) | FilterResult::Redacted(s) => s,
-            FilterResult::Drop => "[DROPPED]".to_string(),
-        };
-        let line = serde_json::json!({ "tool": tool, "detail": screened });
+        let line = serde_json::json!({ "tool": screen(tool), "detail": screen(detail) });
         writeln!(self.file, "{line}")?;
         self.file.flush()
+    }
+}
+
+/// 監査ログへ書くあらゆる文字列が通る唯一の関門。`FilterResult::Drop`
+/// （行全体が丸ごとシークレットだった場合）は元の文字列を一切書かず
+/// `[DROPPED]` に置き換える。
+fn screen(s: &str) -> String {
+    match screen_text(s) {
+        FilterResult::Keep(s) | FilterResult::Redacted(s) => s,
+        FilterResult::Drop => "[DROPPED]".to_string(),
     }
 }
 
@@ -63,5 +73,49 @@ mod tests {
 
         let body = std::fs::read_to_string(&path).expect("読めない");
         assert_eq!(body.lines().count(), 2);
+    }
+
+    #[test]
+    fn redacts_secrets_in_tool_field_too() {
+        // tool はモデルのツール呼び出しからそのまま渡ってくる値であり、
+        // プロンプトインジェクションを受けたモデルが任意の文字列を出しうる。
+        // detail と同じ経路で伏字化されることを確認する。
+        let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).expect("開けない");
+        log.record(
+            "export API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz012345",
+            "harmless detail",
+        )
+        .expect("書けない");
+
+        let body = std::fs::read_to_string(&path).expect("読めない");
+        assert!(
+            !body.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
+            "tool 内の生の値が残っている"
+        );
+        assert!(body.contains("[REDACTED]"), "tool が伏字化されていない");
+    }
+
+    #[test]
+    fn writes_dropped_marker_when_entire_detail_is_secret() {
+        // 行全体が裸のシークレットのみで、周囲の文脈が無い場合
+        // screen_text は FilterResult::Drop を返す（secret_screen::tests::
+        // drops_bare_high_entropy_secret_with_no_surrounding_context と同じ
+        // 入力）。record はこの分岐で元の文字列を一切書かず [DROPPED] を書く。
+        let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).expect("開けない");
+        let bare_secret = "sk-abc123DEF456ghi789XYZ000aaa111";
+        assert!(matches!(screen_text(bare_secret), FilterResult::Drop));
+
+        log.record("bash", bare_secret).expect("書けない");
+
+        let body = std::fs::read_to_string(&path).expect("読めない");
+        assert!(!body.contains(bare_secret), "生の値が残っている");
+        assert!(
+            body.contains("[DROPPED]"),
+            "Drop 分岐でマーカーが書かれていない"
+        );
     }
 }

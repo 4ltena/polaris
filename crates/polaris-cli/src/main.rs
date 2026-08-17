@@ -184,20 +184,27 @@ mod tests {
         // ための整形ロジックを直接確かめる。実プロセスを起動して stderr を
         // 検証すると API キーを要求する経路まで踏む必要があるため、ここでは
         // 整形関数だけを切り出して検証する。
+        //
+        // ディレクトリ名だけを見ると、原因を丸ごと捨てる整形（`{s.dir_name}`
+        // だけを出す）でも通ってしまう。この関数は「skill が黙って消えた」と
+        // 利用者の間に立つ唯一のものなので、原因が出ていること、しかも
+        // 読めなかったのか検証に落ちたのかを取り違えていないことまで見る。
+        // 2件は別々の SkipCause 変種にしてある。
         let skipped = vec![
             polaris_skills::Skipped {
-                dir_name: "broken-one".into(),
+                dir_name: "unreadable-one".into(),
                 cause: polaris_skills::SkipCause::Unreadable(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "権限が無い",
                 )),
             },
             polaris_skills::Skipped {
-                dir_name: "broken-two".into(),
-                cause: polaris_skills::SkipCause::Unreadable(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "権限が無い",
-                )),
+                dir_name: "invalid-two".into(),
+                cause: polaris_skills::SkipCause::Invalid(
+                    polaris_skills::SkillError::InvalidName {
+                        name: "Invalid-Two".into(),
+                    },
+                ),
             },
         ];
 
@@ -205,14 +212,41 @@ mod tests {
 
         assert_eq!(lines.len(), 2, "1件1行になっていない: {lines:?}");
         assert!(
-            lines[0].contains("broken-one"),
+            lines[0].contains("unreadable-one"),
             "ディレクトリ名が含まれていない: {}",
             lines[0]
         );
         assert!(
-            lines[1].contains("broken-two"),
+            lines[0].contains("権限が無い"),
+            "読めなかった原因が含まれていない: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("invalid-two"),
             "ディレクトリ名が含まれていない: {}",
             lines[1]
+        );
+        assert!(
+            lines[1].contains("命名規則"),
+            "検証に落ちた原因が含まれていない: {}",
+            lines[1]
+        );
+        // 各行が自分の原因だけを運ぶ。全件の原因を全行へ書くような整形は、
+        // どの skill がなぜ消えたのかを結局伝えない。
+        assert!(
+            !lines[0].contains("命名規則") && !lines[1].contains("権限が無い"),
+            "行ごとの原因が混ざっている: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_printed_when_no_skill_was_skipped() {
+        // 何も飛ばしていないのに1行でも出れば、利用者は存在しない障害を
+        // 追うことになる。`.map().collect()` の副産物としてではなく、
+        // 空入力から空出力であることを直接固定する。
+        assert!(
+            format_skipped_skills(&[]).is_empty(),
+            "飛ばした skill が無いのに出力がある"
         );
     }
 

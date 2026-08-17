@@ -61,6 +61,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `openai.rs` — OpenAI 互換のチャット補完。base_url を差し替えれば互換エンドポイントも叩ける。
 - `sse.rs` — SSE(text/event-stream)を逐次デコードする。バイト片を push すると、
 
+## `crates/polaris-skills`
+
+- `Cargo.toml` — polaris-skills クレートのマニフェスト
+
+## `crates/polaris-skills/src`
+
+- `frontmatter.rs` — SKILL.md のフロントマター解析。仕様が定める制約だけを検証し、独自の制約を足さない。
+- `lib.rs` — Agent Skills 仕様に準拠した skill の読み込み。独自のフロントマターは足さない。
+
 ## `crates/polaris-tools`
 
 - `Cargo.toml` — polaris-tools クレートのマニフェスト

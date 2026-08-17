@@ -82,7 +82,6 @@ async fn main() -> ExitCode {
 
     let constitution = constitution::load(&cwd);
     let environment = constitution::environment_block(&cwd, None);
-    let system = prompt::build_system(&constitution, &environment);
 
     let config = polaris_core::config::load(&cwd).unwrap_or_else(|e| {
         eprintln!("設定を読めない: {e}");
@@ -93,12 +92,17 @@ async fn main() -> ExitCode {
         eprintln!("{line}");
     }
 
+    // 毎ターン載るものはここで一度だけ組み立てる。組み立てそのものは
+    // polaris-core にあり、予算のテストも同じ関数を呼ぶ。ここで組み立て直したり
+    // 継ぎ足したりすると、本番が送るものとテストが測るものが別になる。
+    let always_on = prompt::assemble_always_on(&constitution, &environment, &discovered.skills);
+
     match agent::run(
         &provider,
         &mut session,
         &mut audit,
         &mut stop,
-        &system,
+        &always_on,
         &discovered.skills,
     )
     .await

@@ -19,9 +19,11 @@ pub const CONSTITUTION_LIMIT: usize = 150;
 /// 実測値（24 トークン）の8倍以上の余裕を持たせつつ、憲法上限
 /// （`CONSTITUTION_LIMIT` = 150）と同程度の桁に収め、両方が同時に上限まで
 /// 積まれても常時コンテキストの合計が 990 に対して十分な余裕を残す値として
-/// 200 を選んだ。両方を同時に飽和させたときの実測は 626 トークンであり、
-/// これは `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget`
-/// が組み立てる入力そのものである（同時飽和を作るのはこのテストだけで、
+/// 200 を選んだ。両方を同時に飽和させ、さらに skill を 100 件渡したときの
+/// 実測は 626 トークンであり（skill は 1 トークンも足さない）、これは
+/// `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget`
+/// が組み立てる入力そのものである（受け入れ基準 1 の3つの入力を同時に
+/// 最大まで積むのはこのテストだけで、
 /// `full_always_on_context_stays_within_budget` は環境ブロックが実在の
 /// 長さの場合を測る）。この数はツールの本数とスキーマが変われば動く
 /// —— ここに書かれていた 525 は skill ツール以前の値のまま更新されて
@@ -438,14 +440,28 @@ main へ直接 push しない。
         assert!(got.contains("feat/x"));
     }
 
+    /// 予算のテストが渡す skill 一式。名前も説明も本文も、常時コンテキストへ
+    /// 漏れたら目に見えるだけの長さを持たせてある。ディスクを経由しないのは、
+    /// ここで見たいのが「発見できるか」ではなく「積まれないか」だから。
+    fn probe_skills(n: usize) -> Vec<polaris_skills::Skill> {
+        (0..n)
+            .map(|i| polaris_skills::Skill {
+                name: format!("budget-probe-{i:03}"),
+                description: format!("常時コンテキストへ漏れていないかを見る目印 {i:03}。"),
+                body: format!("本文 {i}"),
+                path: format!("/x/budget-probe-{i:03}/SKILL.md").into(),
+            })
+            .collect()
+    }
+
     #[test]
     fn full_always_on_context_stays_within_budget() {
         let constitution = "a".repeat(2000);
         let capped = cap(&constitution, CONSTITUTION_LIMIT);
         let env = environment_block(Path::new("/w/polaris"), Some("feat/m1-headless-loop"));
-        let system = crate::prompt::build_system(&capped, &env);
+        let always_on = crate::prompt::assemble_always_on(&capped, &env, &probe_skills(100));
 
-        let n = crate::budget::always_on_tokens(&system, &polaris_tools::all_specs());
+        let n = always_on.tokens();
         assert!(
             n <= crate::budget::BUDGET_LIMIT,
             "憲法と環境を含めた常時コンテキストが {n} トークン。上限を超えている"
@@ -464,13 +480,19 @@ main へ直接 push しない。
         // 環境ブロックが `cap()` を経由しない限り、この入力だけで
         // アサーション対象の合計が 990 を超えていた（キャップ無しで実測
         // 1,538 トークン）。
+        //
+        // 受け入れ基準 1 が挙げる3つの入力（skill の数、AGENTS.md の大きさ、
+        // 環境情報の長さ）を同時に最大まで積む唯一のテストなので、skill も
+        // 100 件渡す。ここが真の同時最悪ケースであり、報告する天井の数字は
+        // このテストが出す。
         let huge_cwd: String = (0..600).map(|i| format!("/component{i}")).collect();
         let oversized_constitution = "a".repeat(2000);
         let capped_constitution = cap(&oversized_constitution, CONSTITUTION_LIMIT);
         let env = environment_block(Path::new(&huge_cwd), Some("feat/m1-headless-loop"));
-        let system = crate::prompt::build_system(&capped_constitution, &env);
+        let always_on =
+            crate::prompt::assemble_always_on(&capped_constitution, &env, &probe_skills(100));
 
-        let n = crate::budget::always_on_tokens(&system, &polaris_tools::all_specs());
+        let n = always_on.tokens();
         assert!(
             n <= crate::budget::BUDGET_LIMIT,
             "巨大な cwd を含めても常時コンテキストは {n} トークン。上限を超えている"

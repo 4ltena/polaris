@@ -12,6 +12,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `.`
 
 - `Cargo.toml` — ワークスペース定義と共有依存
+- `README.md` — polaris
 - `rust-toolchain.toml` — ツールチェイン固定
 
 ## `crates/polaris-cli`

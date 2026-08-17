@@ -12,7 +12,16 @@ use polaris_core::{
 use polaris_provider::openai::OpenAiProvider;
 
 #[derive(Parser)]
-#[command(name = "polaris", about = "最小コンテキストのコーディングエージェント")]
+#[command(
+    name = "polaris",
+    about = "最小コンテキストのコーディングエージェント",
+    after_help = "\
+環境変数:
+  POLARIS_API_KEY   必須。OpenAI 互換エンドポイントの API キー。既定値は無い。
+  POLARIS_BASE_URL  省略時 https://api.openai.com/v1
+  POLARIS_MODEL     省略時 gpt-5.4
+"
+)]
 struct Args {
     /// 実行する指示。
     #[arg(short, long)]

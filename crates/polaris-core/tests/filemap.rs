@@ -58,16 +58,21 @@ fn file_name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// `.rs` ファイルの要約。ファイル中で最初に現れる `//!` 行の中身を返す。
-/// 1行も無ければ `None`（呼び出し側で失敗として扱う）。
+/// `.rs` ファイルの要約。ファイル中で最初に現れる、トリム後に非空である
+/// `//!` 行の中身を返す。マーカーだけで中身が無い行は「無い」のと同じ扱いで
+/// 読み飛ばす（そこで打ち切って空文字列を返すと、`//!` はあるが何も
+/// 書いていないファイルが missing-doc チェックをすり抜けてしまう）。
+/// 非空の行が1つも無ければ `None`（呼び出し側で失敗として扱う）。
 fn rust_summary(root: &Path, path: &str) -> Option<String> {
     let body = std::fs::read_to_string(root.join(path))
         .unwrap_or_else(|e| panic!("{path} を読めない: {e}"));
-    body.lines().find_map(|line| {
-        line.trim_start()
-            .strip_prefix("//!")
-            .map(|rest| rest.trim().to_string())
-    })
+    body.lines()
+        .filter_map(|line| {
+            line.trim_start()
+                .strip_prefix("//!")
+                .map(|rest| rest.trim().to_string())
+        })
+        .find(|s| !s.is_empty())
 }
 
 /// `.md` ファイルの要約。最初の `# ` 見出しの本文。無ければファイル名。
@@ -209,5 +214,56 @@ fn filemap_matches_repository() {
     let actual = std::fs::read_to_string(&doc_path).unwrap_or_default();
     if expected != actual {
         panic!("{}", diff_message(&expected, &actual));
+    }
+}
+
+#[cfg(test)]
+mod rust_summary_tests {
+    use super::*;
+
+    #[test]
+    fn blank_bang_comment_with_no_other_line_is_none() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::write(dir.path().join("blank.rs"), "//!\n\nfn f() {}\n").expect("書けない");
+        assert_eq!(
+            rust_summary(dir.path(), "blank.rs"),
+            None,
+            "中身の無い `//!` 行を要約として拾ってはいけない"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_bang_comment_is_none() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::write(dir.path().join("blank.rs"), "//!   \n\nfn f() {}\n").expect("書けない");
+        assert_eq!(
+            rust_summary(dir.path(), "blank.rs"),
+            None,
+            "空白だけの `//!` 行も無いのと同じ扱いにする"
+        );
+    }
+
+    #[test]
+    fn later_non_blank_bang_comment_is_used_when_first_is_blank() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::write(
+            dir.path().join("blank_then_real.rs"),
+            "//!\n//! 実際の説明。\n\nfn f() {}\n",
+        )
+        .expect("書けない");
+        assert_eq!(
+            rust_summary(dir.path(), "blank_then_real.rs"),
+            Some("実際の説明。".to_string())
+        );
+    }
+
+    #[test]
+    fn normal_bang_comment_is_unaffected() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::write(dir.path().join("normal.rs"), "//! 普通の説明。\n").expect("書けない");
+        assert_eq!(
+            rust_summary(dir.path(), "normal.rs"),
+            Some("普通の説明。".to_string())
+        );
     }
 }

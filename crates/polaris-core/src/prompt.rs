@@ -23,9 +23,17 @@ Rules:
 /// `cap()` を通す。未切り詰めの生テキストを渡す呼び出し側が将来増えても、
 /// このガードを経由しない限り上限を破れない。既に切り詰め済みの入力は
 /// `cap()` が冪等なため変化しない。
+///
+/// `environment` も同じ理由・同じ仕組みで `ENVIRONMENT_LIMIT` へ切り詰める。
+/// cwd もブランチ名もディスク/Git の言いなりの長さで、呼び出し側
+/// （`constitution::environment_block`）はそれ自体で長さを制限していない
+/// ため、ここで無条件にキャップしないと常時コンテキストの上限は異常に
+/// 長い cwd 1つで破れる。呼び出し側を経由しない限り抜け道が無いよう、
+/// 憲法と同じ「ここで二重にキャップする」設計に揃えた。
 pub fn build_system(constitution: &str, environment: &str) -> String {
     let constitution =
         crate::constitution::cap(constitution, crate::constitution::CONSTITUTION_LIMIT);
+    let environment = crate::constitution::cap(environment, crate::constitution::ENVIRONMENT_LIMIT);
     let mut s = String::from(SYSTEM_PROMPT);
     if !constitution.is_empty() {
         s.push_str("\n## Project rules\n");
@@ -34,7 +42,7 @@ pub fn build_system(constitution: &str, environment: &str) -> String {
     }
     if !environment.is_empty() {
         s.push_str("\n## Environment\n");
-        s.push_str(environment);
+        s.push_str(&environment);
         s.push('\n');
     }
     s

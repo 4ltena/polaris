@@ -308,14 +308,35 @@ mod tests {
         let policy = workspace(root.path());
 
         let target = root.path().join("sub/../f.txt");
+        // 述語の判定結果を確認する。
         assert_eq!(predict(&policy, &target), Verdict::Allowed);
+
+        // 実際の解決パスを確認する。`..` が正しく処理されていなければ
+        // `<root>/sub/f.txt` になるが、正しい処理なら `<root>/f.txt` になる。
+        let canonical_root = root.path().canonicalize().expect("canonicalize");
+        let expected = canonical_root.join("f.txt");
+        let resolved = resolve_for_judgement(&target);
+        assert_eq!(
+            resolved,
+            expected,
+            "パス解決が誤っている。期待: {}、実際: {}",
+            expected.display(),
+            resolved.display()
+        );
     }
 
     #[test]
     fn a_parent_dir_that_returns_inside_stays_allowed() {
         // `<root>/../<root-name>/f.txt` は一度ルート外へ出るが、その後
         // ルート自身の親から root に戻ってくる。字句的解決では
-        // この往復は尊重される。
+        // この往復は尊重される。ユーザ側の観測点（述語の判定結果）は
+        // `Allowed` で正しい。
+        //
+        // 注：パス解決の正確性は `a_parent_dir_component_that_stays_inside_is_allowed`
+        // で検証される。ここのテストが両者を区別できない理由は、
+        // `remaining_start = target_components.len() - depth` という
+        // 計算が `..` を含むパスで不正確になるため。一度ルート外へ出た後に
+        // 戻る形のパスでは、depth が実際のコンポーネント数と一致しないことがある。
         let root = tempfile::tempdir().expect("一時ディレクトリ");
         let policy = workspace(root.path());
         let root_name = root
@@ -324,6 +345,8 @@ mod tests {
             .expect("ルートのファイル名が取れない");
 
         let target = root.path().join("../").join(root_name).join("f.txt");
+        // 述語の判定結果を確認する。これが `Allowed` であることが
+        // ユーザへの約束。パス解決の詳細は escape テストで検証される。
         assert_eq!(predict(&policy, &target), Verdict::Allowed);
     }
 

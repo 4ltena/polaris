@@ -48,7 +48,13 @@ async fn main() -> ExitCode {
         std::env::var("POLARIS_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
     let model = std::env::var("POLARIS_MODEL").unwrap_or_else(|_| "gpt-5.4".into());
 
-    let provider = OpenAiProvider::new(base_url, api_key, model);
+    let provider = match OpenAiProvider::new(base_url, api_key, model) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut session = Session::new();
     session.push_user(&args.prompt);
 

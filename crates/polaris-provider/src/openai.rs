@@ -11,14 +11,37 @@ use polaris_tools::ToolSpec;
 /// 場合、これより短い時間で諦めてよい。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// リクエスト全体（接続からレスポンス受信完了まで）にかける上限。
-/// `reqwest::Client::new()` はデフォルトで無期限に待つため、相手が
-/// 接続だけ受けてハングすると、ワンショットの headless バイナリが
-/// `--max-turns` の助けも借りずに永久に止まる。非ストリーミングの
-/// チャット補完は生成に数十秒かかることがあるので、その通常応答を
-/// 打ち切らない程度に長く、かつハングが上限無しにならない値として
-/// 120 秒を選んだ。
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// 無通信（read）タイムアウト。`reqwest::Client::new()` はデフォルトで
+/// 無期限に待つため、相手が接続だけ受けてハングすると、ワンショットの
+/// headless バイナリが `--max-turns` の助けも借りずに永久に止まる —
+/// これを防ぐ上限は必要。
+///
+/// 以前はここに「リクエスト全体」への 120 秒の総時間上限
+/// (`ClientBuilder::timeout`) を置いていたが、それは誤った道具だった。
+/// このクライアントは非ストリーミングで、既定モデルは推論モデルなので、
+/// 正常な1回の補完が2分を超えることは普通にある。総時間上限はその
+/// 正常な応答をリトライ無しに殺し、ユーザーには「何も壊れていないのに
+/// タイムアウトした」ように見える。
+///
+/// 本来必要なのは総時間の上限ではなく無通信の検出であり、
+/// `reqwest` 0.12 は `ClientBuilder::read_timeout` を持つ
+/// （`Cargo.lock` で解決されるバージョンは 0.12.28 で、feature gate 無しに
+/// 使える）。ただし非ストリーミングのレスポンスに対しては、素朴な
+/// 「読み取りのたびにリセットされる」直感どおりには効かない点に注意：
+/// `reqwest` の実装（`async_impl/client.rs` の `PendingRequest::poll`）は
+/// レスポンスヘッダを受け取るまではリセットしない単発の sleep を張り、
+/// ヘッダ到着後の本文読み取りだけが読み取りごとにリセットされる
+/// (`async_impl/body.rs` の `ReadTimeoutBody`)。このクライアントの応答は
+/// モデルが生成し終えるまで1バイトも流れてこないため、支配的なのは前者
+/// ——つまりこの値自体を「正常に待ってよい生成時間」より十分大きく
+/// 取る必要があり、「読み取りが続く限り無限に待てる」わけではない。
+/// そのうえで、後半の本文転送フェーズ（大きな応答が細切れに届く場合）
+/// では読み取りごとのリセットが効き、総時間上限より安全側に倒れる。
+///
+/// 2分を明らかに超えうる正常な推論ターンに対して十分な余裕
+/// （2分の2.5倍）を残しつつ、死んだ接続を無期限にではなく5分以内に
+/// 検出できる値として 300 秒を選んだ。
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct OpenAiProvider {
     base_url: String,
@@ -28,8 +51,16 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(base_url: String, api_key: String, model: String) -> Self {
-        Self::with_timeouts(base_url, api_key, model, CONNECT_TIMEOUT, REQUEST_TIMEOUT)
+    /// # エラー
+    ///
+    /// TLS バックエンドの初期化失敗など、`reqwest::Client` を構築できない
+    /// 場合に返す。ここで `expect` して起動プロセスごと落とすと、ハーネスの
+    /// 他のあらゆる起動失敗（設定ミス等）が綺麗な `stderr` 一行 +
+    /// `ExitCode::FAILURE` で返るのに、この一箇所だけパニックで落ちる
+    /// 非対称が生まれる。呼び出し側（`main.rs`）は他の起動失敗と同じ経路で
+    /// これを処理する。
+    pub fn new(base_url: String, api_key: String, model: String) -> Result<Self, ProviderError> {
+        Self::with_timeouts(base_url, api_key, model, CONNECT_TIMEOUT, READ_TIMEOUT)
     }
 
     /// タイムアウト値を明示して構築する。短いタイムアウトを注入して
@@ -40,19 +71,19 @@ impl OpenAiProvider {
         api_key: String,
         model: String,
         connect_timeout: Duration,
-        timeout: Duration,
-    ) -> Self {
+        read_timeout: Duration,
+    ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
-            .timeout(timeout)
+            .read_timeout(read_timeout)
             .build()
-            .expect("HTTP クライアントを構築できない");
-        Self {
+            .map_err(|e| ProviderError::Http(format!("HTTP クライアントを構築できない: {e}")))?;
+        Ok(Self {
             base_url,
             api_key,
             model,
             client,
-        }
+        })
     }
 }
 
@@ -145,7 +176,20 @@ impl Provider for OpenAiProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
+            .map_err(|e| {
+                // `reqwest::Error` の `Display` はタイムアウトかどうかを
+                // 含めない（`error sending request for url (...)` としか
+                // 出ない）。`is_timeout()` を見て、無通信タイムアウトで
+                // 落ちたことをここで明示しないと、ユーザーは通信断と
+                // タイムアウトを区別できない。
+                if e.is_timeout() {
+                    ProviderError::Http(format!(
+                        "リクエストがタイムアウトした（一定時間応答が無かった）: {e}"
+                    ))
+                } else {
+                    ProviderError::Http(e.to_string())
+                }
+            })?;
 
         if !resp.status().is_success() {
             return Err(ProviderError::Http(format!("status {}", resp.status())));
@@ -267,7 +311,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into());
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
+            .expect("クライアントを構築できるべき");
         let res = p
             .complete(CompletionRequest {
                 system: "s".into(),
@@ -291,7 +336,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into());
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
+            .expect("クライアントを構築できるべき");
         let err = p
             .complete(CompletionRequest {
                 system: "s".into(),
@@ -313,7 +359,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into());
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
+            .expect("クライアントを構築できるべき");
         p.complete(CompletionRequest {
             system: "s".into(),
             messages: vec![],
@@ -452,10 +499,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn total_request_timeout_bounds_a_stalled_response() {
+    async fn read_timeout_bounds_a_stalled_response_and_says_so() {
         // `reqwest::Client::new()` は無期限に待つ。相手が接続を受けたまま
-        // 応答を返さない場合をモックの遅延応答で再現し、設定した上限内で
-        // 確実にエラーへ戻ることを確かめる。
+        // 応答を返さない場合をモックの遅延応答で再現し、設定した
+        // read_timeout 内で確実にエラーへ戻ること、かつそのエラーが
+        // タイムアウトだと分かる文言を持つことを確かめる。
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -475,7 +523,8 @@ mod tests {
             "m".into(),
             std::time::Duration::from_millis(50),
             std::time::Duration::from_millis(50),
-        );
+        )
+        .expect("クライアントを構築できるべき");
 
         let started = std::time::Instant::now();
         let err = p
@@ -486,11 +535,17 @@ mod tests {
             })
             .await
             .expect_err("タイムアウトでエラーになるべき");
-        assert!(matches!(err, ProviderError::Http(_)));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "タイムアウトが効いていない。実測 {:?}",
             started.elapsed()
+        );
+        let ProviderError::Http(msg) = err else {
+            panic!("Http エラーであるべき");
+        };
+        assert!(
+            msg.contains("タイムアウト"),
+            "タイムアウトだと分かる文言が無い: {msg}"
         );
     }
 
@@ -510,7 +565,8 @@ mod tests {
             .await;
 
         let specs = polaris_tools::all_specs();
-        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into());
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
+            .expect("クライアントを構築できるべき");
         p.complete(CompletionRequest {
             system: "s".into(),
             messages: vec![],
@@ -550,7 +606,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into());
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
+            .expect("クライアントを構築できるべき");
         let history = vec![
             Message::user("a.txt は何行か"),
             Message::assistant_with_tool_calls(

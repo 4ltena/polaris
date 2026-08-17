@@ -65,23 +65,60 @@ pub fn predict(policy: &SandboxPolicy, target: &Path) -> Verdict {
 /// 存在する最も近い祖先まで遡って正規化し、残りを繋ぎ直す。新規作成では
 /// 対象も途中のディレクトリも存在しないのが普通であり、ここを素朴に
 /// canonicalize すると全ての新規作成が判定不能になる。
+///
+/// 正規化したベースから先は、残りのパス成分を字句的に処理する。
+/// 成分には `.` や `..` が含まれることがあるが、存在しないため
+/// canonicalize は使えない。その代わり、字句的に処理することが正しい理由は
+/// 以下の通り：ベースは canonicalize() の結果なのでシンボリックリンクを
+/// 含まず、残りの成分は存在しないのでこれもシンボリックリンク不可である。
+/// したがって `base/../x` は正確に `base.parent()/x` と等価であり、
+/// 字句的解決が妥当である。
 fn resolve_for_judgement(target: &Path) -> PathBuf {
+    use std::path::Component;
+
     if let Ok(c) = target.canonicalize() {
         return c;
     }
 
-    let mut tail = Vec::new();
+    // ターゲットの全コンポーネントを前もって収集する。
+    let target_components: Vec<Component> = target.components().collect();
+
     let mut cursor = target;
+    let mut depth = 0; // 遡った深さを追跡する。
     loop {
         match cursor.parent() {
             Some(parent) => {
-                if let Some(name) = cursor.file_name() {
-                    tail.push(name.to_owned());
-                }
-                if let Ok(c) = parent.canonicalize() {
-                    let mut out = c;
-                    for name in tail.iter().rev() {
-                        out.push(name);
+                depth += 1;
+                if let Ok(base) = parent.canonicalize() {
+                    // base の構成を理解するために、target の最初の
+                    // (components.len() - depth) コンポーネントが base に
+                    // 対応するはずである（正確に一致するとは限らないが）。
+                    // 残りのコンポーネントを字句的に処理する。
+                    let remaining_start = if target_components.len() > depth {
+                        target_components.len() - depth
+                    } else {
+                        0
+                    };
+
+                    let mut out = base;
+                    for component in &target_components[remaining_start..] {
+                        match component {
+                            Component::CurDir => {
+                                // `.` は無視する。
+                            }
+                            Component::ParentDir => {
+                                // `..` は親へ遡る。
+                                out.pop();
+                            }
+                            Component::Normal(name) => {
+                                out.push(name);
+                            }
+                            Component::RootDir | Component::Prefix(_) => {
+                                // 存在しないパスの残りから RootDir や Prefix が
+                                // 出ることはない。出たら判定不能の信号。
+                                return target.to_path_buf();
+                            }
+                        }
                     }
                     return out;
                 }
@@ -242,5 +279,65 @@ mod tests {
             predict(&policy, std::path::Path::new("/etc/hosts")),
             Verdict::Allowed
         );
+    }
+
+    #[test]
+    fn a_parent_dir_component_that_escapes_needs_approval() {
+        // 存在しないディレクトリ a を通過してから `..` で脱出する場合、
+        // a が存在しなくても `..` の効果は変わらない。`<root>/a/../../outside`
+        // は字句的には `<root>/../outside` と同等で、ルート外へ出ている。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        let policy = workspace(root.path());
+
+        let target = root
+            .path()
+            .join("a/../../")
+            .join(outside.path().file_name().expect("ファイル名が取れない"))
+            .join("new.txt");
+        let Verdict::NeedsApproval { .. } = predict(&policy, &target) else {
+            panic!("脱出パスが許可された");
+        };
+    }
+
+    #[test]
+    fn a_parent_dir_component_that_stays_inside_is_allowed() {
+        // `<root>/sub/../f.txt` は字句的に `<root>/f.txt` となり、ルート内に
+        // 留まる。sub が存在しなくても成立する。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let policy = workspace(root.path());
+
+        let target = root.path().join("sub/../f.txt");
+        assert_eq!(predict(&policy, &target), Verdict::Allowed);
+    }
+
+    #[test]
+    fn a_parent_dir_that_returns_inside_stays_allowed() {
+        // `<root>/../<root-name>/f.txt` は一度ルート外へ出るが、その後
+        // ルート自身の親から root に戻ってくる。字句的解決では
+        // この往復は尊重される。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let policy = workspace(root.path());
+        let root_name = root
+            .path()
+            .file_name()
+            .expect("ルートのファイル名が取れない");
+
+        let target = root.path().join("../").join(root_name).join("f.txt");
+        assert_eq!(predict(&policy, &target), Verdict::Allowed);
+    }
+
+    #[test]
+    fn a_parent_dir_under_an_existing_directory_is_canonicalised() {
+        // 存在するディレクトリを通してから `..` を使う場合、
+        // canonicalize の高速路で処理される。この路は正しく `..` を処理する。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::create_dir(root.path().join("existing")).expect("ディレクトリ作成");
+        let policy = workspace(root.path());
+
+        let target = root.path().join("existing/../f.txt");
+        // existing が実在しているため `existing` まで canonicalize でき、
+        // その後 `..` を処理して `f.txt` を push する。結果はルート内。
+        assert_eq!(predict(&policy, &target), Verdict::Allowed);
     }
 }

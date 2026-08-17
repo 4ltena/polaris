@@ -96,7 +96,10 @@ fn dispatch(
                 .as_str()
                 .ok_or_else(|| "path が無い".to_string())?;
             let offset = call.arguments["offset"].as_u64().unwrap_or(0) as usize;
-            let limit = call.arguments["limit"].as_u64().unwrap_or(2000) as usize;
+            let limit = call.arguments["limit"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(polaris_tools::read::DEFAULT_LIMIT);
             polaris_tools::read::read(Path::new(path), offset, limit).map_err(|e| e.to_string())
         }
         "skill" => {
@@ -200,6 +203,33 @@ mod tests {
             panic!("公開スキーマが宣言する引数名 {param} を dispatch が読んでいない: {e}")
         });
         assert!(out.contains("hello"), "本文が返っていない: {out}");
+    }
+
+    #[test]
+    fn a_read_without_an_explicit_limit_says_it_stopped_early() {
+        // limit を省いた呼び出しには dispatch が既定値を補う。補われた側は
+        // 自分が切り詰められたことを知らないため、`(全 N 行中 …)` の断り書き
+        // だけが「ファイルはここで終わっていない」を伝える唯一の手段になる。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let target = dir.path().join("long.txt");
+        let total = polaris_tools::read::DEFAULT_LIMIT + 3;
+        let body: String = (0..total).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&target, body).expect("書けない");
+
+        let out = dispatch(
+            &call_with("read", "path", target.to_str().expect("パス")),
+            &[],
+        )
+        .expect("読めるべき");
+
+        assert!(
+            out.contains(&format!(
+                "続きは offset={} で読む",
+                polaris_tools::read::DEFAULT_LIMIT
+            )),
+            "既定の limit で打ち切ったことが結果に出ていない: {}",
+            &out[out.len().saturating_sub(160)..]
+        );
     }
 
     #[tokio::test]

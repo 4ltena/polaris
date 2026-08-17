@@ -10,6 +10,13 @@ use crate::{ToolError, path_policy};
 /// （観測値: `/dev/zero` で 4 秒 2.26 GB）よりは 3 桁小さく抑える。
 pub const MAX_READ_BYTES: u64 = 5 * 1024 * 1024;
 
+/// `limit` をモデルが省略したときに使う既定の行数。
+///
+/// 呼び出し側（`polaris_core::agent::dispatch`）がその場で 2000 と書いて
+/// いると、「何行で止めたか」を決める場所と「止めたと告げる場所」が離れる。
+/// 既定値をここへ置き、下の打ち切り表示と同じファイルで面倒を見る。
+pub const DEFAULT_LIMIT: usize = 2000;
+
 /// `offset` は 0 起点の行番号、`limit` は返す行数。出力の行番号は 1 起点。
 pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolError> {
     if path_policy::is_denied(path) {
@@ -68,6 +75,20 @@ pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolErro
     for (i, line) in lines.iter().enumerate().skip(offset).take(limit) {
         out.push_str(&format!("{}\t{}\n", i + 1, line));
     }
+
+    // ちょうど `limit` 行返しただけの出力は、ファイルがそこで終わっている
+    // のか、こちらが途中で止めたのかを区別できない。既定の `limit` は
+    // モデルが指定しなくても効くため、モデルは自分が切り詰められたことすら
+    // 知らないまま「全部読んだ」と受け取る —— 印の無い部分的な答えは、
+    // 完全な答えとして提示された誤った答えである。skill の本文と検索結果が
+    // 既に守っている規準を、この経路にも掛ける。
+    let end = offset.saturating_add(limit).min(total);
+    if end < total {
+        out.push_str(&format!(
+            "(全 {total} 行中 {}-{end} 行目を表示した。続きは offset={end} で読む。)\n",
+            offset + 1
+        ));
+    }
     Ok(out)
 }
 
@@ -96,7 +117,59 @@ mod tests {
     fn honors_offset_and_limit() {
         let f = fixture(&["a", "b", "c", "d"]);
         let out = read(f.path(), 1, 2).expect("読めない");
-        assert_eq!(out, "2\tb\n3\tc\n");
+        assert_eq!(
+            out,
+            "2\tb\n3\tc\n(全 4 行中 2-3 行目を表示した。続きは offset=3 で読む。)\n"
+        );
+    }
+
+    #[test]
+    fn a_truncated_read_says_where_it_stopped_and_how_to_continue() {
+        // limit で止めた出力と、ファイルがそこで終わっている出力が、同じ形で
+        // 返ってはいけない。止めた側には、止めたことと続きの読み方を書く。
+        let f = fixture(&["a", "b", "c", "d", "e"]);
+        let out = read(f.path(), 0, 2).expect("読めない");
+        assert_eq!(
+            out,
+            "1\ta\n2\tb\n(全 5 行中 1-2 行目を表示した。続きは offset=2 で読む。)\n"
+        );
+    }
+
+    #[test]
+    fn a_read_that_reaches_the_end_says_nothing_extra() {
+        // 最終行まで届いた出力に打ち切りの断り書きが付くと、こんどは
+        // 「まだ続きがある」という誤った答えになる。境界の両側を固定する。
+        let f = fixture(&["a", "b", "c"]);
+        assert_eq!(
+            read(f.path(), 0, 3).expect("読めない"),
+            "1\ta\n2\tb\n3\tc\n"
+        );
+        assert_eq!(read(f.path(), 2, 1).expect("読めない"), "3\tc\n");
+        assert_eq!(
+            read(f.path(), 0, 100).expect("読めない"),
+            "1\ta\n2\tb\n3\tc\n"
+        );
+    }
+
+    #[test]
+    fn the_default_limit_truncates_and_says_so() {
+        // モデルが limit を省いたときに効く既定値。指定していない以上、
+        // 打ち切られたことはモデルにはこの文言でしか分からない。
+        let lines: Vec<String> = (0..DEFAULT_LIMIT + 5)
+            .map(|i| format!("line {i}"))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let f = fixture(&refs);
+
+        let out = read(f.path(), 0, DEFAULT_LIMIT).expect("読めない");
+        assert!(
+            out.ends_with(&format!(
+                "(全 {} 行中 1-{DEFAULT_LIMIT} 行目を表示した。続きは offset={DEFAULT_LIMIT} で読む。)\n",
+                DEFAULT_LIMIT + 5
+            )),
+            "既定の limit で打ち切ったことを告げていない: {}",
+            &out[out.len().saturating_sub(160)..]
+        );
     }
 
     #[test]

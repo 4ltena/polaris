@@ -42,8 +42,9 @@ mod tests {
 
     #[test]
     fn always_on_context_stays_within_budget() {
-        let specs = polaris_tools::all_specs();
-        let n = always_on_tokens(SYSTEM_PROMPT, &specs);
+        // 常時コンテキストの下限 —— 憲法も環境情報も skill も無い状態。
+        // 本番が組み立てるのと同じ関数を通して測る。
+        let n = crate::prompt::assemble_always_on("", "", &[]).tokens();
         assert!(
             n <= BUDGET_LIMIT,
             "常時コンテキストが {n} トークン。上限 {BUDGET_LIMIT} を超えている"
@@ -77,13 +78,18 @@ mod tests {
         );
     }
 
-    /// 一時ディレクトリへ `n` 件の skill を実際に作って読み込み、`main.rs` と
-    /// 同じ手順で常時コンテキストを組み立てて計測する。
+    /// 一時ディレクトリへ `n` 件の skill を実際に作って読み込み、本番と同じ
+    /// `prompt::assemble_always_on` へそのまま渡して、送られるもの自体を返す。
+    ///
+    /// 「`main.rs` と同じ手順で組み立て直す」ことはしない。手順を書き写すと、
+    /// 測っているのは本番の写しであって本番ではなくなる。写しと本物は黙って
+    /// 食い違えるので、`main.rs` 側へ skill のカタログを足す変更がここへ
+    /// 届かなかった（再レビューの mutation N7）。
     ///
     /// cwd とブランチ名は固定値を使う。一時ディレクトリのパスをそのまま
     /// 環境ブロックへ入れると、ランダムなディレクトリ名の長さの違いだけで
     /// トークン数が動き、「skill の数で動いたのか」を判別できなくなる。
-    fn always_on_with_skills(n: usize) -> (usize, String, Vec<polaris_skills::Skill>) {
+    fn always_on_with_skills(n: usize) -> (crate::prompt::AlwaysOn, Vec<polaris_skills::Skill>) {
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
         for i in 0..n {
             let name = format!("catalog-probe-{i:03}");
@@ -110,9 +116,17 @@ mod tests {
             std::path::Path::new("/w/polaris"),
             Some("feat/m1-headless-loop"),
         );
-        let system = crate::prompt::build_system("プロジェクトの規則。", &env);
-        let tokens = always_on_tokens(&system, &polaris_tools::all_specs());
-        (tokens, system, discovered.skills)
+        let always_on =
+            crate::prompt::assemble_always_on("プロジェクトの規則。", &env, &discovered.skills);
+        // 組み立て関数が本当に n 件を受け取ったことを、組み立てた側から確かめる。
+        // ここを見ないと、渡し忘れて 0 件のまま3回測っていても等号は成立する
+        // —— それが B3 の元の欠陥そのものだった。
+        assert_eq!(
+            always_on.skills_seen(),
+            n,
+            "組み立て関数へ skill が {n} 件渡っていない"
+        );
+        (always_on, discovered.skills)
     }
 
     #[test]
@@ -122,9 +136,19 @@ mod tests {
         // が挙げる3つの入力のうち、この milestone が持ち込んだ唯一のもの。
         // 憲法の大きさと環境情報の長さには既に番人がいるが、skill の数には
         // いなかった。
-        let (zero, _, _) = always_on_with_skills(0);
-        let (fifteen, _, _) = always_on_with_skills(15);
-        let (hundred, system, skills) = always_on_with_skills(100);
+        //
+        // 3つの測定は、件数の違う skill を同じ組み立て関数へ通した結果である。
+        // 引数を取らない関数を3回呼んで結果を突き合わせても、同じ式を3回
+        // 評価して自分自身と比べているだけで、`count_tokens` が非決定的に
+        // ならない限り落ちない。等号が意味を持つのは、比べる3つが違う入力
+        // から来ているときだけ。
+        let (zero_ctx, _) = always_on_with_skills(0);
+        let (fifteen_ctx, _) = always_on_with_skills(15);
+        let (hundred_ctx, skills) = always_on_with_skills(100);
+
+        let zero = zero_ctx.tokens();
+        let fifteen = fifteen_ctx.tokens();
+        let hundred = hundred_ctx.tokens();
 
         assert_eq!(
             fifteen, hundred,
@@ -142,8 +166,12 @@ mod tests {
         // 一切現れないことを直接固定する —— 常時コンテキストへカタログ行を
         // 足す、スキーマへ skill 名の enum を入れる、という将来の変更は
         // どちらもここで落ちる。
+        //
+        // 見るのは組み立て結果そのもの。`all_specs()` をここで呼び直すと、
+        // 送られるツール定義とは別の一覧を検査することになる。
+        let system = hundred_ctx.system();
         let wire = serde_json::to_string(&polaris_provider::openai::tool_wire_shape(
-            &polaris_tools::all_specs(),
+            hundred_ctx.tools(),
         ))
         .expect("直列化できない");
         for s in &skills {

@@ -24,15 +24,23 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
 }
 
-/// `system` は憲法ブロックと環境情報を含めて組み立て済みのものを渡す。
+/// `always_on` は [`crate::prompt::assemble_always_on`] が組み立てたものを渡す。
 /// ループ内で組み立てないのは、毎ターン同じ文字列を送ってキャッシュ接頭辞を
 /// 動かさないことを呼び出し側で保証させるため。
+///
+/// 文字列と `Vec<ToolSpec>` を別々に受けず [`crate::prompt::AlwaysOn`] で受ける
+/// のは、毎ターン載るものをこの型の外側で作れないようにするため。呼び出し側が
+/// 組み立て済みの文字列へ継ぎ足せると、常時コンテキストの上限は呼び出し側の
+/// 書き方に委ねられてしまう。
+///
+/// `skills` は常時コンテキストには載らない。`skill` ツールが引かれたときだけ
+/// 参照する。
 pub async fn run(
     provider: &dyn Provider,
     session: &mut Session,
     audit: &mut AuditLog,
     stop: &mut StopTracker,
-    system: &str,
+    always_on: &crate::prompt::AlwaysOn,
     skills: &[polaris_skills::Skill],
 ) -> Result<String, AgentError> {
     loop {
@@ -45,9 +53,9 @@ pub async fn run(
 
         let res = provider
             .complete(CompletionRequest {
-                system: system.to_string(),
+                system: always_on.system().to_string(),
                 messages: session.messages.clone(),
-                tools: polaris_tools::all_specs(),
+                tools: always_on.tools().to_vec(),
             })
             .await?;
 
@@ -260,8 +268,8 @@ mod tests {
         let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
         let mut stop = StopTracker::new(10);
 
-        let system = crate::prompt::build_system("", "");
-        let out = run(&p, &mut session, &mut audit, &mut stop, &system, &[])
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let out = run(&p, &mut session, &mut audit, &mut stop, &always_on, &[])
             .await
             .expect("失敗");
         assert_eq!(out, "1 行だった");
@@ -316,8 +324,8 @@ mod tests {
         let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
         let mut stop = StopTracker::new(50);
 
-        let system = crate::prompt::build_system("", "");
-        let out = run(&p, &mut session, &mut audit, &mut stop, &system, &[])
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let out = run(&p, &mut session, &mut audit, &mut stop, &always_on, &[])
             .await
             .expect("成功を挟んでいるので3回連続扱いにならず止まらないはず");
         assert_eq!(out, "終わった");
@@ -343,8 +351,8 @@ mod tests {
         let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
         let mut stop = StopTracker::new(50);
 
-        let system = crate::prompt::build_system("", "");
-        let err = run(&p, &mut session, &mut audit, &mut stop, &system, &[])
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let err = run(&p, &mut session, &mut audit, &mut stop, &always_on, &[])
             .await
             .expect_err("止まるべき");
         assert!(matches!(
@@ -384,9 +392,9 @@ mod tests {
         session.push_user("demo の本文を読んで");
         let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
         let mut stop = StopTracker::new(10);
-        let system = crate::prompt::build_system("", "");
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
 
-        let out = run(&p, &mut session, &mut audit, &mut stop, &system, &skills)
+        let out = run(&p, &mut session, &mut audit, &mut stop, &always_on, &skills)
             .await
             .expect("失敗");
         assert_eq!(out, "読んだ");
@@ -429,9 +437,9 @@ mod tests {
         session.push_user("skill を探して");
         let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
         let mut stop = StopTracker::new(10);
-        let system = crate::prompt::build_system("", "");
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
 
-        run(&p, &mut session, &mut audit, &mut stop, &system, &[])
+        run(&p, &mut session, &mut audit, &mut stop, &always_on, &[])
             .await
             .expect("失敗");
 

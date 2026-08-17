@@ -61,6 +61,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `openai.rs` — OpenAI 互換のチャット補完。base_url を差し替えれば互換エンドポイントも叩ける。
 - `sse.rs` — SSE(text/event-stream)を逐次デコードする。バイト片を push すると、
 
+## `crates/polaris-sandbox`
+
+- `Cargo.toml` — polaris-sandbox クレートのマニフェスト
+
+## `crates/polaris-sandbox/src`
+
+- `lib.rs` — サンドボックス方針の定義と、OS 機構への委譲。
+- `policy.rs` — 方針と書込可能ルート。ルートは構築時に正規化する。
+
 ## `crates/polaris-skills`
 
 - `Cargo.toml` — polaris-skills クレートのマニフェスト
@@ -93,6 +102,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `docs/superpowers/plans`
 
 - `2026-08-16-polaris-m1-headless-loop.md` — polaris M1 ヘッドレス最小ループ Implementation Plan
+- `2026-08-17-polaris-m2-write-and-sandbox.md` — polaris M2 実装計画 — write / edit / bash とサンドボックス
 - `2026-08-17-polaris-m3a-skills.md` — polaris M3a Skills ローダと skill ツール Implementation Plan
 
 ## `docs/superpowers/specs`

@@ -20,10 +20,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src`
 
+- `audit.rs` — 追記専用の監査ログ。署名は付けない。インプロセスでは署名する主体と
 - `budget.rs` — 常時コンテキストの計測。数値は測定で担保し、見積で運用しない。
 - `constitution.rs` — 常時載る文脈のうち、ハーネスが所有しない部分。AGENTS.md の全文は載せない。
 - `lib.rs` — polaris-core の入口。予算・憲法・プロンプトの各モジュールを束ねる。
 - `prompt.rs` — 毎ターン送るシステムプロンプトを定義し、憲法と環境情報を差し込んで組み立てる。
+
+## `crates/polaris-core/src/secret_screen`
+
+- `mod.rs` — Remna のプライバシーフィルタ。捕捉したイベント（コマンド文字列やウィンドウ
 
 ## `crates/polaris-core/tests`
 

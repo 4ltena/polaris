@@ -8,6 +8,20 @@ use crate::budget::count_tokens;
 /// 憲法ブロックに許すトークン数の上限。
 pub const CONSTITUTION_LIMIT: usize = 150;
 
+/// 環境ブロックに許すトークン数の上限。
+///
+/// `environment_block` は cwd とブランチ名しか積まないが、どちらもディスク
+/// /Git の言いなりの文字列で、ハーネスが長さを決めていない。実在する値は
+/// この実リポジトリで cwd + branch 合わせて 24 トークン程度だが、上限を
+/// 明示しておかないと「skill の数、AGENTS.md の大きさ、環境情報の長さの
+/// いずれが増えても、上限を超える経路が存在しない」という約束が、異常に
+/// 長い cwd や巨大なブランチ名に対して破れる。実在する cwd・ブランチ名の
+/// 実測値（24 トークン）の8倍以上の余裕を持たせつつ、憲法上限
+/// （`CONSTITUTION_LIMIT` = 150）と同程度の桁に収め、両方が同時に上限まで
+/// 積まれても常時コンテキストの合計が 990 に対して十分な余裕
+/// （実測で 525 トークン）を残す値として 200 を選んだ。
+pub const ENVIRONMENT_LIMIT: usize = 200;
+
 const BEGIN: &str = "<!-- polaris:always-on -->";
 const END: &str = "<!-- /polaris:always-on -->";
 
@@ -428,6 +442,31 @@ main へ直接 push しない。
         assert!(
             n <= crate::budget::BUDGET_LIMIT,
             "憲法と環境を含めた常時コンテキストが {n} トークン。上限を超えている"
+        );
+    }
+
+    #[test]
+    fn absurdly_long_cwd_cannot_push_the_assembled_system_over_budget() {
+        // レビューの再現条件（憲法を上限まで埋め、加えて異常に長い cwd を
+        // 与えると 990 を超える）を、深くネストした作業ディレクトリで
+        // 再現する。単純な同一文字の繰り返しは BPE でごく少ないトークンに
+        // 圧縮されてしまい上限を超えないため、実在のパスに近い「多数の
+        // ディレクトリ階層」の形を使う。この長さ（7,690 バイト）は macOS の
+        // `PATH_MAX` を大きく超えており実在しえないが、`build_system` の
+        // 約束は「実在しうる入力でしか壊れない」であってはならない —
+        // 環境ブロックが `cap()` を経由しない限り、この入力だけで
+        // アサーション対象の合計が 990 を超えていた（キャップ無しで実測
+        // 1,538 トークン）。
+        let huge_cwd: String = (0..600).map(|i| format!("/component{i}")).collect();
+        let oversized_constitution = "a".repeat(2000);
+        let capped_constitution = cap(&oversized_constitution, CONSTITUTION_LIMIT);
+        let env = environment_block(Path::new(&huge_cwd), Some("feat/m1-headless-loop"));
+        let system = crate::prompt::build_system(&capped_constitution, &env);
+
+        let n = crate::budget::always_on_tokens(&system, &polaris_tools::all_specs());
+        assert!(
+            n <= crate::budget::BUDGET_LIMIT,
+            "巨大な cwd を含めても常時コンテキストは {n} トークン。上限を超えている"
         );
     }
 }

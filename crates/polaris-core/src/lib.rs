@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod audit;
 pub mod budget;
+pub mod config;
 pub mod constitution;
 pub mod prompt;
 pub mod secret_screen;

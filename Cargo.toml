@@ -18,3 +18,4 @@ regex = "1"
 clap = { version = "4", features = ["derive"] }
 wiremock = "0.6"
 tempfile = "3"
+toml = "0.8"

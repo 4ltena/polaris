@@ -14,12 +14,11 @@ pub fn default_path() -> Result<PathBuf, AuthError> {
     Ok(Path::new(&home).join(".polaris").join("auth.json"))
 }
 
-/// 保存する。一時ファイルへ 0600 で書いてから rename する。rename は
+/// 保存する。一時ファイルへ書いてから 0600 にして rename する。rename は
 /// 同一ディレクトリ内で原子的なので、途中で落ちても本体が半端な内容に
 /// 置き換わることがない。
 pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -28,14 +27,16 @@ pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     let body = serde_json::to_vec_pretty(c)
         .map_err(|e| AuthError::Decode(format!("資格情報を直列化できない: {e}")))?;
 
-    // 既存の一時ファイルが残っている場合に備えて truncate する。mode は
-    // 作成時にしか効かないので、既存ファイルを開いた場合に備えて
-    // set_permissions でも明示する。
+    // 既存の一時ファイルが残っている場合に備えて truncate する。open 時の
+    // mode は新規作成のときにしか効かず、この truncate 経路で既存ファイル
+    // を開いた場合には無力なので、パーミッションは open の引数に頼らず
+    // 常に set_permissions で明示する。これが 0600 を保証する唯一の経路
+    // であり、単一責任にしておくことで「もう一方があるから消してよい」と
+    // いう誤読を防ぐ。
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
         .open(&tmp)?;
     f.write_all(&body)?;
     f.sync_all()?;
@@ -139,6 +140,34 @@ mod tests {
         assert_eq!(
             load_from(&p).expect("読めない").expect("無い").access_token,
             "at2"
+        );
+    }
+
+    /// 一時ファイルが既に緩いパーミッションで残っている場合（前回の
+    /// 書き込みが rename 前に中断したなど）、open 時の mode は既存ファイル
+    /// を開くだけでは効かない。それでも set_permissions が unconditionally
+    /// 効くので、本体は 0600 になる。
+    #[test]
+    fn a_preexisting_loose_temp_file_is_still_corrected_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let p = dir.path().join("auth.json");
+        let tmp = p.with_extension("json.tmp");
+        std::fs::write(&tmp, b"leftover").expect("書けない");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
+            .expect("パーミッションを設定できない");
+
+        save_to(&p, &sample()).expect("保存できない");
+
+        let mode = std::fs::metadata(&p)
+            .expect("メタデータ")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "使い回した一時ファイルの緩いパーミッションが残った: {:o}",
+            mode & 0o777
         );
     }
 

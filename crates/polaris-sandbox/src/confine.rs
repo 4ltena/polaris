@@ -351,6 +351,94 @@ mod tests {
         );
     }
 
+    /// `/dev/null` へのリダイレクトが実サンドボックスで通ること。
+    ///
+    /// プロファイル本文（macOS）や ruleset の組み立て（Linux）を文字列や
+    /// 構造として見るテストでは、構文としては正しいが実際には効かない許可を
+    /// そのまま通してしまう。ここは本物の `/bin/sh` を本物の拘束下で走らせ、
+    /// リダイレクトが開けたかどうかを終了コードで見る。
+    ///
+    /// `&& echo SURVIVED` を付けているのが要点である。リダイレクトが開けない
+    /// とシェルは本体を一度も実行せずに落ちるので、「コマンドが走ったか」を
+    /// 標準出力で確かめないと、拒否と「実行はしたが何も出さなかった」を
+    /// 区別できない。
+    #[test]
+    fn a_redirect_to_dev_null_is_allowed_and_the_command_itself_still_runs() {
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
+            .expect("方針");
+
+        let out = run_confined(
+            &policy,
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), "echo hi > /dev/null && echo SURVIVED".into()],
+            None,
+        )
+        .expect("拘束実行そのものが失敗した");
+
+        assert_eq!(
+            out.status, 0,
+            "`> /dev/null` が拒否された。シェルの常套句が方針の拒否として \
+             モデルへ届く: {out:?}"
+        );
+        assert_eq!(out.stdout.trim(), "SURVIVED", "本体が走っていない: {out:?}");
+
+        // `2>` 側も同じ経路であることを確かめる。片方だけ通る状態は無い
+        // はずだが、モデルが実際に書くのは両方である。
+        let out = run_confined(
+            &policy,
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), "echo hi 2>/dev/null && echo SURVIVED".into()],
+            None,
+        )
+        .expect("拘束実行そのものが失敗した");
+        assert_eq!(out.status, 0, "`2>/dev/null` が拒否された: {out:?}");
+    }
+
+    /// read-only でも `/dev/null` は開ける。同時に、それが read-only の
+    /// 性質を減らしていないこと——普通のファイルへの書き込みは拒否された
+    /// まま——を同じテストの中で対にして見る。片方だけのテストは、
+    /// 「`/dev/null` を開けるようにしたつもりで書き込み全体を開けた」
+    /// 壊れ方を見逃す。
+    #[test]
+    fn read_only_can_discard_output_but_still_cannot_write_a_real_file() {
+        let scratch = tempfile::tempdir().expect("一時ディレクトリ");
+        let policy = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("方針");
+
+        let out = run_confined(
+            &policy,
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), "echo hi > /dev/null && echo SURVIVED".into()],
+            None,
+        )
+        .expect("拘束実行そのものが失敗した");
+        assert_eq!(
+            out.status, 0,
+            "read-only で `> /dev/null` が拒否された: {out:?}"
+        );
+        assert_eq!(out.stdout.trim(), "SURVIVED", "本体が走っていない: {out:?}");
+
+        let target = scratch
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("should-not-exist.txt");
+        let out = run_confined(
+            &policy,
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), format!("echo pwned > {}", target.display())],
+            None,
+        )
+        .expect("拘束実行そのものが失敗した");
+
+        assert_ne!(out.status, 0, "read-only なのに書き込みが成功した: {out:?}");
+        assert!(
+            !target.exists(),
+            "ファイルが作られている: {}",
+            target.display()
+        );
+    }
+
     #[test]
     fn stdin_reaches_the_child() {
         // write / edit のヘルパは操作を標準入力から受け取る。ここが通らないと

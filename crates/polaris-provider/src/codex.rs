@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::{CompletionRequest, Message, Role};
+use crate::{CompletionRequest, CompletionResponse, Message, ProviderError, Role, ToolCall, sse};
 
 /// 要求先。`store` を使わないので、この 1 本しか叩かない。
 pub const ENDPOINT_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -87,10 +87,302 @@ pub fn build_body(model: &str, req: &CompletionRequest) -> Value {
     body
 }
 
+/// SSE の意味論。フレーミングは `sse::SseDecoder` に任せ、ここは
+/// イベントの解釈だけを持つ。HTTP から切り離してあるので、ネットワーク
+/// 無しで試験できる。
+pub struct Folder {
+    decoder: sse::SseDecoder,
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    completed: bool,
+}
+
+impl Default for Folder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Folder {
+    pub fn new() -> Self {
+        Self {
+            decoder: sse::SseDecoder::new(),
+            text: String::new(),
+            tool_calls: Vec::new(),
+            completed: false,
+        }
+    }
+
+    /// 受け取ったバイト片を押し込む。完成したイベントだけを解釈する。
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProviderError> {
+        for ev in self.decoder.push(bytes) {
+            let data = ev.data.trim();
+            // 番兵。JSON ではないので解釈しない。
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let v: Value = serde_json::from_str(data)
+                .map_err(|e| ProviderError::Decode(format!("SSE の data が JSON でない: {e}")))?;
+
+            match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
+                "response.output_item.done" => self.take_item(&v)?,
+                "response.completed" => self.completed = true,
+                "response.failed" => {
+                    let msg = v
+                        .pointer("/response/error/message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("理由が示されていない");
+                    return Err(ProviderError::Http(format!("応答が失敗した: {msg}")));
+                }
+                "response.cancelled" => {
+                    return Err(ProviderError::Http("応答が取り消された".into()));
+                }
+                // 差分やその他は読み飛ばす。確定したアイテムだけを見れば
+                // 同じ結果になり、再結合の失敗という壊れ方を持ち込まない。
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn take_item(&mut self, v: &Value) -> Result<(), ProviderError> {
+        let Some(item) = v.get("item") else {
+            return Ok(());
+        };
+        match item
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+        {
+            "message" => {
+                if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                    for p in parts {
+                        if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                            self.text.push_str(t);
+                        }
+                    }
+                }
+            }
+            "function_call" => {
+                let id = item
+                    .get("call_id")
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        ProviderError::Decode("function_call に call_id が無い".into())
+                    })?;
+                let name = item
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| ProviderError::Decode("function_call に name が無い".into()))?;
+                let raw = item
+                    .get("arguments")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("{}");
+                let arguments: Value = serde_json::from_str(raw).map_err(|e| {
+                    ProviderError::Decode(format!("function_call の arguments が JSON でない: {e}"))
+                })?;
+                self.tool_calls.push(ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments,
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 畳んだ結果を返す。完了を見ていなければ硬い失敗にする。
+    pub fn finish(self) -> Result<CompletionResponse, ProviderError> {
+        if !self.completed {
+            return Err(ProviderError::Decode(
+                "response.completed を見ないままストリームが終わった".into(),
+            ));
+        }
+        Ok(CompletionResponse {
+            text: self.text,
+            tool_calls: self.tool_calls,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ToolCall;
+
+    fn frame(kind: &str, extra: Value) -> Vec<u8> {
+        let mut v = serde_json::json!({ "type": kind });
+        if let Some(o) = extra.as_object() {
+            for (k, val) in o {
+                v[k] = val.clone();
+            }
+        }
+        format!("data: {v}\n\n").into_bytes()
+    }
+
+    fn message_item(text: &str) -> Value {
+        serde_json::json!({
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": text }]
+            }
+        })
+    }
+
+    fn function_call_item(id: &str, name: &str, args: &str) -> Value {
+        serde_json::json!({
+            "item": { "type": "function_call", "call_id": id, "name": name, "arguments": args }
+        })
+    }
+
+    #[test]
+    fn a_text_only_stream_folds_into_text() {
+        let mut f = Folder::new();
+        f.push(&frame("response.output_item.done", message_item("42 行")))
+            .expect("押せる");
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("押せる");
+        let r = f.finish().expect("完了しているべき");
+        assert_eq!(r.text, "42 行");
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn a_function_call_item_becomes_a_tool_call() {
+        let mut f = Folder::new();
+        f.push(&frame(
+            "response.output_item.done",
+            function_call_item("call_9", "read", r#"{"path":"a.txt"}"#),
+        ))
+        .expect("押せる");
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("押せる");
+        let r = f.finish().expect("完了しているべき");
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].id, "call_9");
+        assert_eq!(r.tool_calls[0].name, "read");
+        assert_eq!(r.tool_calls[0].arguments["path"], "a.txt");
+    }
+
+    /// フレームがどこで分割されても結果が変わらない。分割耐性は
+    /// `sse.rs` の責任だが、この経路が実際にそれを通っていることは
+    /// 別に確かめる。通っていなければ、ここで結合をやり直している。
+    #[test]
+    fn a_stream_split_mid_frame_folds_the_same_way() {
+        let whole: Vec<u8> = frame("response.output_item.done", message_item("分割耐性"))
+            .into_iter()
+            .chain(frame("response.completed", serde_json::json!({})))
+            .collect();
+
+        for cut in 1..whole.len() {
+            let mut f = Folder::new();
+            f.push(&whole[..cut]).expect("押せる");
+            f.push(&whole[cut..]).expect("押せる");
+            let r = f.finish().expect("完了しているべき");
+            assert_eq!(r.text, "分割耐性", "{cut} バイト目で分割したときに壊れた");
+        }
+    }
+
+    /// `response.completed` を見ないまま終わった応答を、正常終了として
+    /// 返してはならない。エージェントループはツール呼び出しが無いことを
+    /// 「完了」と読むため、黙って空の最終回答を返す。
+    #[test]
+    fn a_stream_that_never_completes_is_an_error() {
+        let mut f = Folder::new();
+        f.push(&frame("response.output_item.done", message_item("途中")))
+            .expect("押せる");
+        let err = f.finish().expect_err("完了していないので失敗すべき");
+        assert!(
+            matches!(err, ProviderError::Decode(_)),
+            "Decode 以外: {err:?}"
+        );
+    }
+
+    /// 中身が空でも、完了していれば成功である。空文字列と不在を
+    /// 取り違えない。上のテストの対であり、これが無いと「常に失敗」の
+    /// 実装が通る。
+    #[test]
+    fn an_empty_but_completed_stream_is_a_success() {
+        let mut f = Folder::new();
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("押せる");
+        let r = f.finish().expect("完了しているので成功すべき");
+        assert!(r.text.is_empty());
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn a_failed_response_carries_its_message() {
+        let mut f = Folder::new();
+        let err = f
+            .push(&frame(
+                "response.failed",
+                serde_json::json!({ "response": { "error": { "message": "model overloaded" } } }),
+            ))
+            .expect_err("失敗すべき");
+        let ProviderError::Http(msg) = err else {
+            panic!("Http 以外: {err:?}");
+        };
+        assert!(msg.contains("model overloaded"), "理由が文面に無い: {msg}");
+    }
+
+    #[test]
+    fn a_cancelled_response_is_an_error() {
+        let mut f = Folder::new();
+        let err = f
+            .push(&frame("response.cancelled", serde_json::json!({})))
+            .expect_err("失敗すべき");
+        assert!(matches!(err, ProviderError::Http(_)), "Http 以外: {err:?}");
+    }
+
+    /// 差分イベントは読み飛ばす。拾って二重に積むと本文が重複する。
+    #[test]
+    fn delta_events_are_ignored() {
+        let mut f = Folder::new();
+        f.push(&frame(
+            "response.output_text.delta",
+            serde_json::json!({ "delta": "重複" }),
+        ))
+        .expect("押せる");
+        f.push(&frame("response.output_item.done", message_item("重複")))
+            .expect("押せる");
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("押せる");
+        let r = f.finish().expect("完了");
+        assert_eq!(r.text, "重複", "差分を拾って二重に積んでいる");
+    }
+
+    /// `arguments` が JSON として壊れている呼び出しは、ディスパッチャへ
+    /// 渡す前にここで止める。渡すと「未知の引数」に見え、原因が遡れない。
+    #[test]
+    fn a_function_call_with_broken_arguments_is_a_decode_error() {
+        let mut f = Folder::new();
+        let err = f
+            .push(&frame(
+                "response.output_item.done",
+                function_call_item("c", "read", "{ not json"),
+            ))
+            .expect_err("失敗すべき");
+        assert!(
+            matches!(err, ProviderError::Decode(_)),
+            "Decode 以外: {err:?}"
+        );
+    }
+
+    /// `[DONE]` という番兵は JSON ではない。解釈しようとして落ちない。
+    #[test]
+    fn the_done_sentinel_is_not_parsed_as_json() {
+        let mut f = Folder::new();
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("押せる");
+        f.push(b"data: [DONE]\n\n").expect("番兵で落ちてはいけない");
+        let r = f.finish().expect("完了");
+        assert!(r.text.is_empty());
+    }
 
     #[test]
     fn a_user_message_becomes_an_input_text_item() {

@@ -23,9 +23,11 @@ use polaris_provider::openai::OpenAiProvider;
 "
 )]
 struct Args {
-    /// 実行する指示。
-    #[arg(short, long)]
-    prompt: String,
+    /// 実行する指示。`--confined-apply` のときは不要（その経路は標準入力から
+    /// 変更操作を読むのであって、指示文を読まない）。それ以外の通常経路では
+    /// 必須のまま — clap が `required_unless_present` で強制する。
+    #[arg(short, long, required_unless_present = "confined_apply")]
+    prompt: Option<String>,
 
     /// 監査ログの出力先。省略すると `~/.polaris/state/<project-id>/audit.jsonl` を使う。
     #[arg(long)]
@@ -65,7 +67,12 @@ async fn main() -> ExitCode {
         }
     };
     let mut session = Session::new();
-    session.push_user(&args.prompt);
+    // confined-apply 経路は既に return 済みなので、ここに来た時点で clap の
+    // required_unless_present が --prompt を保証している。
+    let prompt = args
+        .prompt
+        .expect("clap が --prompt を保証しているはずの経路");
+    session.push_user(&prompt);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -204,6 +211,28 @@ fn project_id(canonical_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confined_apply_parses_without_a_prompt() {
+        // --confined-apply は標準入力から変更操作を読む経路であり、
+        // 指示文を必要としない。ここが必須のままだと、Task 7 が作った
+        // ヘルパの入口に誰も到達できない。
+        let args = Args::try_parse_from(["polaris", "--confined-apply"])
+            .expect("--confined-apply だけでは解釈できなかった");
+        assert!(args.confined_apply);
+        assert!(args.prompt.is_none());
+    }
+
+    #[test]
+    fn prompt_is_still_required_without_confined_apply() {
+        // --confined-apply を外した将来の「単純化」が prompt を全経路で
+        // 任意にしてしまうと、指示文が無いまま黙って実行が始まる。
+        // ここを固定しておけば、その簡略化はテストで止まる。
+        assert!(
+            Args::try_parse_from(["polaris"]).is_err(),
+            "--prompt 無しで解釈できてしまった"
+        );
+    }
 
     #[test]
     fn project_id_is_deterministic_for_the_same_path() {

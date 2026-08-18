@@ -220,6 +220,25 @@ mod tests {
         }
     }
 
+    /// テスト用の承認者。尋ねられた回数と最後の理由を記録しつつ、指定した
+    /// 決定を返す。`Gate::check` が実際に呼ばれたか（＝実行前に相談したか）
+    /// を配線レベルで観測するための唯一の手掛かり。`asked == 0` は
+    /// 「述語を一切通していない」ことの直接の証拠になる —— サンドボックス
+    /// 自身の拒否メッセージは `write`/`edit` の事前チェックと見分けが付かない
+    /// ことがある（Fix round 1 の指摘）ため、拒否の文面だけでは不十分。
+    struct RecordingApprover {
+        decision: crate::approval::Decision,
+        asked: usize,
+        last_reason: Option<String>,
+    }
+    impl crate::approval::Approver for RecordingApprover {
+        fn ask(&mut self, reason: &str) -> crate::approval::Decision {
+            self.asked += 1;
+            self.last_reason = Some(reason.to_string());
+            self.decision
+        }
+    }
+
     /// `write` / `edit` / `bash` を呼ばないテストのための、使われない文脈一式。
     /// `ToolContext` は参照しか持たないので、借用元をここで所有したまま
     /// 呼び出し側へ返し、各テストの中で `ToolContext` を組み立ててもらう。
@@ -888,6 +907,298 @@ print("wrote")
             tool_msg.content.contains(&target.display().to_string()),
             "拒否の理由にパスが無い: {}",
             tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_hardlinked_path_inside_the_root_is_stopped_by_the_gate_before_anything_runs()
+     {
+        // Fix round 1 の指摘: 上の `a_denied_write_comes_back_...` はルート外
+        // への書き込みを使っており、`Gate::check` を外しても実サンドボックス
+        // 自身が同じ形の拒否メッセージ（パスと方針を含む）を返すため、
+        // 「述語が実行前に止めた」ことと「試行してサンドボックスに拒否
+        // された」ことを区別できない。ハードリンクはこの区別を作れる —— 対象
+        // は書込可能ルートの内側（`<root>/hardlink.txt`）にあり、実サンド
+        // ボックスはパスだけを見て許可してしまう
+        // （`polaris_tools::predicate::tests::an_existing_hardlink_is_surfaced_for_approval`
+        // 参照）。`Gate::check` が実行前に止めていることを、(1) 承認者へ
+        // 実際に尋ねたこと、(2) 尋ねた理由にハードリンクの説明が含まれる
+        // こと、(3) ヘルパが一度も走らずファイルの中身が変わっていない
+        // こと、(4) ツール結果の文面がサンドボックス側の拒否
+        // （`ToolError::WriteDenied` の「子の出力:」）ではなく `Gate` 自身の
+        // 拒否文面であること、の4点で確認する。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        let helper_dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let helper = write_helper(helper_dir.path());
+
+        let real = outside.path().join("real.txt");
+        std::fs::write(&real, "original").expect("書けない");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("方針");
+        let linked = sandbox.writable_roots()[0].join("hardlink.txt");
+        std::fs::hard_link(&real, &linked).expect("hard_link");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": linked.display().to_string(),
+                            "content": "改竄"
+                        }),
+                    }],
+                },
+                CompletionResponse {
+                    text: "別の場所へ".into(),
+                    tool_calls: vec![],
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let mut session = Session::new();
+        session.push_user("hardlink.txt を書き換えて");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
+        let mut approver = RecordingApprover {
+            decision: crate::approval::Decision::Deny,
+            asked: 0,
+            last_reason: None,
+        };
+        {
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+
+            let out = run(
+                &p,
+                &mut session,
+                &mut audit,
+                &mut stop,
+                &always_on,
+                &[],
+                &mut ctx,
+            )
+            .await
+            .expect("拒否でループごと失敗した");
+            assert_eq!(out, "別の場所へ");
+        }
+
+        assert_eq!(approver.asked, 1, "承認者へ尋ねていない");
+        assert!(
+            approver
+                .last_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("ハードリンク"),
+            "尋ねた理由にハードリンクの説明が無い: {:?}",
+            approver.last_reason
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("読めない"),
+            "original",
+            "述語より先にヘルパが実行され、ハードリンクの実体が書き換わっている \
+             （実サンドボックスはこの書き込みをパス上は許可してしまう）"
+        );
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.is_some())
+            .expect("ツール結果が積まれていない");
+        assert!(
+            tool_msg.content.starts_with("利用者が承認しなかった"),
+            "拒否の文面が Gate 自身のものになっていない \
+             （サンドボックス側の拒否と混同している可能性がある）: {}",
+            tool_msg.content
+        );
+        assert!(
+            !tool_msg.content.contains("子の出力"),
+            "サンドボックス側（ToolError::WriteDenied）の拒否文面が混ざっている: {}",
+            tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_never_consults_the_approver() {
+        // Fix round 1 の指摘: `bash` は述語を通さないはずだが、それを配線
+        // レベルで確認するテストが無かった。`ApprovalPolicy::Always`
+        // （`Verdict` に関わらず必ず尋ねる）の下で `bash` を1回走らせ、
+        // 承認者が一度も尋ねられていないことを確認する。Always を選ぶのは、
+        // `bash` の腕へ誤って `Gate::check` が混入した場合、対象パスが
+        // ルートの内側だろうと外だろうと必ず検出できるようにするため
+        // （`OnRequest` だと、混入したチェックの対象パスの選び方次第では
+        // 見逃しうる）。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("方針");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({ "command": "echo ok" }),
+                    }],
+                },
+                CompletionResponse {
+                    text: "終わった".into(),
+                    tool_calls: vec![],
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let mut session = Session::new();
+        session.push_user("echo して");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+        let mut approver = RecordingApprover {
+            decision: crate::approval::Decision::Allow,
+            asked: 0,
+            last_reason: None,
+        };
+        {
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: std::path::Path::new("/bin/true"), // bash はヘルパを使わない
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+
+            let out = run(
+                &p,
+                &mut session,
+                &mut audit,
+                &mut stop,
+                &always_on,
+                &[],
+                &mut ctx,
+            )
+            .await
+            .expect("失敗");
+            assert_eq!(out, "終わった");
+        }
+
+        assert_eq!(
+            approver.asked, 0,
+            "bash が承認者へ尋ねている（述語を通さないはずの経路に触れている）"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_write_s_audit_record_carries_the_policy_and_the_target() {
+        // Fix round 1 の指摘: `write`/`edit` のときに監査記録の `sandbox`/
+        // `target` を埋めるという Task 11〜12 の主張を、`agent.rs` の呼び出し
+        // 経路を通したところで検査するテストが無かった（`audit.rs` 側は
+        // `Record` 型そのものを検査するだけで、呼び出し元の組み立てロジック
+        // は対象外）。実際にループを1周させ、書き出された監査行を読み戻して
+        // 両欄を確認する。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let helper_dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let helper = write_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("方針");
+        let target = sandbox.writable_roots()[0].join("audited.txt");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": target.display().to_string(),
+                            "content": "本文"
+                        }),
+                    }],
+                },
+                CompletionResponse {
+                    text: "書いた".into(),
+                    tool_calls: vec![],
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let audit_path = dir.path().join("audit.jsonl");
+        let mut session = Session::new();
+        session.push_user("audited.txt を作って");
+        let mut audit = AuditLog::open(&audit_path).expect("開けない");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        run(
+            &p,
+            &mut session,
+            &mut audit,
+            &mut stop,
+            &always_on,
+            &[],
+            &mut ctx,
+        )
+        .await
+        .expect("失敗");
+
+        let log = std::fs::read_to_string(&audit_path).expect("読めない");
+        let line = log
+            .lines()
+            .find(|l| l.contains("\"tool\":\"write\""))
+            .expect("write の監査行が無い");
+        let v: serde_json::Value = serde_json::from_str(line).expect("JSON でない");
+        // 完全一致ではなくファイル名の含有で見る。tmpdir の乱数接頭辞
+        // （macOS では `/private/var/folders/<hash>/T/.tmpXXXXXX/...`）は
+        // それ自体が高エントロピーな文字列に見えるため、`screen()` が
+        // `[REDACTED]` へ部分的に書き換えることがある（実測で確認した。
+        // secret_screen 自身の「見逃しより過検出を避ける」という設計方針
+        // どおりの挙動であり、ここでの欠陥ではない）。完全一致で見ると
+        // テストが実行環境の一時ディレクトリ名に左右されて壊れるため、
+        // 「target 欄が存在し、対象ファイル名を運んでいる」ことだけを見る。
+        assert!(
+            v["target"]
+                .as_str()
+                .expect("target 欄が無い（または null）")
+                .contains("audited.txt"),
+            "監査記録の target が書込先を運んでいない: {v}"
+        );
+        assert!(
+            v["sandbox"]
+                .as_str()
+                .expect("sandbox 欄が無い（または null）")
+                .contains("workspace-write"),
+            "監査記録の sandbox に方針が無い: {v}"
         );
     }
 }

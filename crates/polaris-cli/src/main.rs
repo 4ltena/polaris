@@ -34,11 +34,20 @@ struct Args {
     /// 1 回の実行で許すターン数の上限。
     #[arg(long, default_value_t = 20)]
     max_turns: u32,
+
+    /// 拘束された子として 1 件の変更操作を標準入力から読んで実行する。
+    /// 内部用であり、利用者が直接使うものではない。
+    #[arg(long, hide = true)]
+    confined_apply: bool,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+
+    if args.confined_apply {
+        return run_confined_apply();
+    }
 
     let Ok(api_key) = std::env::var("POLARIS_API_KEY") else {
         eprintln!("POLARIS_API_KEY が設定されていない");
@@ -113,6 +122,34 @@ async fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 拘束された子としての入口。標準入力の JSON 1 件を実行して終わる。
+fn run_confined_apply() -> ExitCode {
+    use std::io::Read;
+
+    let mut buf = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        eprintln!("標準入力を読めない: {e}");
+        return ExitCode::FAILURE;
+    }
+    let mutation: polaris_sandbox::Mutation = match serde_json::from_str(&buf) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("操作を解釈できない: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match polaris_sandbox::helper::apply(&mutation) {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
             ExitCode::FAILURE
         }
     }

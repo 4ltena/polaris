@@ -841,7 +841,9 @@ dependencies = [
  "clap",
  "polaris-core",
  "polaris-provider",
+ "polaris-sandbox",
  "polaris-skills",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

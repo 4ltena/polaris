@@ -11,6 +11,7 @@
 
 pub mod pkce;
 pub mod store;
+pub mod token;
 
 /// 認可の発行者。
 pub const ISSUER: &str = "https://auth.openai.com";

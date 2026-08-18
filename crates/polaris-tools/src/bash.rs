@@ -132,15 +132,58 @@ mod tests {
     }
 
     #[test]
-    fn truncation_lands_on_a_character_boundary() {
-        // バイト単位で切ると多バイト文字の途中で割れる。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
-        let n = MAX_OUTPUT_BYTES / 3 + 10;
-        let out = run(
-            &workspace(dir.path()),
-            &format!("for i in $(seq {n}); do printf 'あ'; done"),
-        )
-        .expect("失敗");
-        assert!(out.is_char_boundary(out.len()), "文字境界で切れていない");
+    fn truncation_lands_on_a_character_boundary_of_the_input() {
+        // 元の主張は `out.is_char_boundary(out.len())` だった。これは Rust の
+        // どんな `String` に対しても真（`len()` は常に文字境界）であり、何も
+        // 確かめていない。実際に効いていたのは「境界まで戻さずに切ると
+        // `&s[..end]` が panic する」という副作用だけで、panic を避けるように
+        // 書き換えた実装（`get()` で空を返す等）や境界への寄せ方を誤った実装は、
+        // 「境界」と名乗るこのテストを緑のまま通り抜ける。
+        //
+        // 監査ログ側（`polaris_core::audit` の同名テスト）と同じ形にする。
+        // 切り詰めた本文が入力の接頭辞であり、その切れ目が入力の文字境界に
+        // 載っており、しかも上限のすぐ手前まで来ていることを見る。実コマンド
+        // ではなく純粋関数へ直接あてるのは、これが `truncate` の性質であって
+        // 子プロセスの性質ではないためである（子を通す経路は
+        // `oversized_output_is_truncated_and_says_so` が別に見ている）。
+        //
+        // "あ" は 3 バイト。MAX_OUTPUT_BYTES は 3 の倍数ではないので、単純に
+        // MAX_OUTPUT_BYTES バイト目で切ると必ず文字の途中を踏む。
+        let input = "あ".repeat(MAX_OUTPUT_BYTES / 3 + 10);
+        assert!(
+            input.len() > MAX_OUTPUT_BYTES,
+            "前提が崩れている: 上限を超えていない"
+        );
+        assert!(
+            !input.is_char_boundary(MAX_OUTPUT_BYTES),
+            "前提が崩れている: 上限がちょうど文字境界に載っており、境界戻しが効かない"
+        );
+
+        let out = truncate(&input);
+        // 印は本文の次の行から始まる。入力に改行は無いので、最初の行が本文。
+        let body = out.split('\n').next().expect("本文が無い");
+
+        assert!(
+            input.starts_with(body),
+            "切り詰めた本文が入力の接頭辞になっていない（別の文字列を返している）"
+        );
+        assert!(
+            input.is_char_boundary(body.len()),
+            "切れ目が入力の文字境界に載っていない: {} バイト目",
+            body.len()
+        );
+        assert!(
+            body.len() <= MAX_OUTPUT_BYTES,
+            "上限を超えて返している: {} バイト",
+            body.len()
+        );
+        // UTF-8 の 1 文字は最大 4 バイトなので、境界戻しは高々 3 バイト。
+        // これより手前で切る実装（空文字列を返す等）はここで落ちる。
+        assert!(
+            body.len() > MAX_OUTPUT_BYTES - 4,
+            "上限よりかなり手前で切っている: {} バイト",
+            body.len()
+        );
+        assert!(out.contains("切り詰め"), "切り詰めたことが本文に無い");
     }
 }

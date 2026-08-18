@@ -23,6 +23,12 @@ pub enum Mutation {
 pub fn apply(m: &Mutation) -> Result<String, String> {
     match m {
         Mutation::Write { path, content } => {
+            // path がシンボリックリンクで、その先が書込可能ルートの外を
+            // 指していても、ここでは検証しない。意図的である。apply 自体は
+            // パスの検証を一切行わず、実際に止めるのは OS のサンドボックス
+            // （拘束された子として起動されること）に全面的に委ねている。
+            // ここへ検証を足しても二重の主張になるだけで、外れれば偽の
+            // 安心を生む。
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -35,7 +41,7 @@ pub fn apply(m: &Mutation) -> Result<String, String> {
         }
         Mutation::Edit { path, old, new } => {
             let body = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-            let hits = body.matches(old.as_str()).count();
+            let hits = count_overlapping(&body, old);
             match hits {
                 0 => Err(format!("{} に置換対象が見つからない", path.display())),
                 1 => {
@@ -53,6 +59,38 @@ pub fn apply(m: &Mutation) -> Result<String, String> {
             }
         }
     }
+}
+
+/// `needle` が `haystack` に何回現れるかを、重なりを許して数える。
+///
+/// `str::matches` は非重複の出現しか数えない。`needle = "aa"` を
+/// `haystack = "aaa"` に対して数えると、重ならない数え方では 1 になるが、
+/// 実際には位置 0 と位置 1 の 2 箇所に出現しており、どちらを置き換えたのか
+/// 呼び出し側には分からない。これは複数一致を拒否する仕組みが元々
+/// 防ごうとしている事態と同じ種類であり、見逃すと「成功したのに意図と
+/// 違う結果が残る」という最悪の形になる。
+fn count_overlapping(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut offset = 0;
+    while let Some(rel) = haystack[offset..].find(needle) {
+        count += 1;
+        let hit_start = offset + rel;
+        // needle の全長分進めると重なりを見逃す。次の探索は、この一致の
+        // 先頭文字の次の文字境界から始める。
+        let advance = haystack[hit_start..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        offset = hit_start + advance;
+        if offset > haystack.len() {
+            break;
+        }
+    }
+    count
 }
 
 #[cfg(test)]
@@ -109,6 +147,29 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).expect("読めない"),
             "xxx と xxx",
+            "拒否したのに書き換わっている"
+        );
+    }
+
+    #[test]
+    fn edit_refuses_when_the_marker_overlaps_itself() {
+        // "aa" は "aaa" の中に非重複な数え方ではちょうど1回に見えるが、
+        // 実際には位置0と位置1の2箇所に出現する。str::matches はここを
+        // 見逃し、1件目（先頭2文字）だけを黙って置き換えてしまう。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "aaa").expect("書けない");
+
+        let err = apply(&Mutation::Edit {
+            path: target.clone(),
+            old: "aa".into(),
+            new: "b".into(),
+        })
+        .expect_err("重なった一致が通ってしまった");
+        assert!(err.contains("2"), "件数が伝わらない: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("読めない"),
+            "aaa",
             "拒否したのに書き換わっている"
         );
     }

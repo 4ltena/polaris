@@ -46,12 +46,36 @@ pub fn staged_helper_from(
         std::fs::copy(&canonical, &dest)?;
         #[cfg(unix)]
         {
+            // 0700 は他ユーザーからの保護であり、同一 UID で動く拘束下の
+            // subagent からの保護ではない。それを止めるのは直後の検証
+            // （退避先が書込可能ルートの外にあることの確定）そのものであり、
+            // このモードは多層防御であって、主たる制御ではない。将来
+            // 「強化」しても、ここが守っている性質は増えない。
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700))?;
         }
     }
 
-    Ok(dest.canonicalize()?)
+    let dest_canonical = dest.canonicalize()?;
+
+    // 退避先そのものが書込可能ルートの内側（シンボリックリンク越しの解決を
+    // 含む）なら、この関数の存在理由が反転する。呼び出し側が良い state_dir を
+    // 渡すことに頼らず、ここで自分の出力を検証する。次の呼び出し元は
+    // Task 12 の CLI 配線であり、その次は M4 の subagent スケジューラであって、
+    // ここを誤ると拘束下の任意コード実行を作ることになる。
+    if let Some(root) = policy
+        .writable_roots()
+        .iter()
+        .find(|r| dest_canonical.starts_with(r))
+    {
+        return Err(SandboxError::NotEnforced(format!(
+            "退避先 {} が書込可能ルート {} の内側にある",
+            dest_canonical.display(),
+            root.display()
+        )));
+    }
+
+    Ok(dest_canonical)
 }
 
 #[cfg(test)]
@@ -98,6 +122,49 @@ mod tests {
 
         let staged = staged_helper_from(&policy, state.path(), &exe).expect("解決できない");
         assert_eq!(staged, exe.canonicalize().expect("canonicalize"));
+    }
+
+    #[test]
+    fn a_state_dir_inside_a_writable_root_is_rejected() {
+        // state_dir がルートの内側なら、複製した先も内側になる。この関数の
+        // 目的がそのまま反転してしまうので、呼び出し側の選択に頼らず自分で
+        // 拒否する。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let state = root.path().join("state");
+        let fake_exe = root.path().join("polaris");
+        std::fs::write(&fake_exe, b"x").expect("書けない");
+
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
+            .expect("方針");
+
+        let err = staged_helper_from(&policy, &state, &fake_exe)
+            .expect_err("書込可能ルート内の state_dir が通ってしまった");
+        assert!(matches!(err, SandboxError::NotEnforced(_)), "{err}");
+    }
+
+    #[test]
+    fn a_state_dir_reached_through_a_symlink_into_a_writable_root_is_rejected() {
+        // state_dir 自身は書込可能ルートの外にあるパスでも、シンボリック
+        // リンクを辿った先がルートの内側なら同じ問題になる。文字列としての
+        // starts_with ではなく、canonicalize してから比較する必要がある
+        // ことを固定する。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let real_state = root.path().join("state");
+        std::fs::create_dir_all(&real_state).expect("作れない");
+
+        let link_parent = tempfile::tempdir().expect("一時ディレクトリ");
+        let state_link = link_parent.path().join("state-link");
+        std::os::unix::fs::symlink(&real_state, &state_link).expect("symlink");
+
+        let fake_exe = root.path().join("polaris");
+        std::fs::write(&fake_exe, b"x").expect("書けない");
+
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
+            .expect("方針");
+
+        let err = staged_helper_from(&policy, &state_link, &fake_exe)
+            .expect_err("シンボリックリンク越しの書込可能ルート内が通ってしまった");
+        assert!(matches!(err, SandboxError::NotEnforced(_)), "{err}");
     }
 
     #[test]

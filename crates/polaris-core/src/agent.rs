@@ -1032,6 +1032,149 @@ print("wrote")
         );
     }
 
+    /// 標準入力を読み捨てて、`target` を固定の内容で必ず上書きする代役ヘルパ。
+    ///
+    /// 下のゲートのテスト専用である。ここで見たいのは「ゲートが実行前に
+    /// 止めたか」であって変更操作の意味論ではないので、JSON を解釈する
+    /// 必要は無い。むしろ *解釈しない* ほうが強い: 万一ゲートを通り抜けた
+    /// 場合、ヘルパは必ず対象を書き換えるので、「中身が変わっていない」と
+    /// いう主張が確実に効く（JSON を解釈する代役だと、解釈に失敗して
+    /// 何も書かず、通り抜けたのに中身が無事という結果になりうる）。
+    fn clobber_helper(dir: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("clobber-helper.sh");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nset -e\ncat > /dev/null\nprintf '改竄' > {}\necho clobbered\n",
+                target.display()
+            ),
+        )
+        .expect("書けない");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        p
+    }
+
+    #[tokio::test]
+    async fn an_edit_to_a_hardlinked_path_inside_the_root_is_stopped_by_the_gate_before_anything_runs()
+     {
+        // 上の write 版の対。仕様は predict-and-ask を `write` と `edit` の
+        // 両方に課しているのに、固定していたのは `write` だけだった
+        // （最終レビューの指摘: `dispatch` の `"edit"` の腕から
+        // `ctx.gate.check` を消しても 254 件が全て緑のままだった。同じ削除を
+        // `"write"` の腕で行うと 1 件落ちる）。ハードリンクの緩和策は
+        // ゲートが走ることでしか効かないので、これは整頓ではなく効力の話
+        // である。
+        //
+        // 器具は write 版と同じ理由でハードリンクを使う。対象は書込可能
+        // ルートの内側（`<root>/hardlink.txt`）にあり、実サンドボックスは
+        // パスだけを見て許可してしまうので、止められるのは述語だけである。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        let helper_dir = tempfile::tempdir().expect("一時ディレクトリ");
+
+        let real = outside.path().join("real.txt");
+        std::fs::write(&real, "original").expect("書けない");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("方針");
+        let linked = sandbox.writable_roots()[0].join("hardlink.txt");
+        std::fs::hard_link(&real, &linked).expect("hard_link");
+        let helper = clobber_helper(helper_dir.path(), &linked);
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "edit".into(),
+                        arguments: serde_json::json!({
+                            "path": linked.display().to_string(),
+                            "old": "original",
+                            "new": "改竄"
+                        }),
+                    }],
+                },
+                CompletionResponse {
+                    text: "別の場所へ".into(),
+                    tool_calls: vec![],
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let mut session = Session::new();
+        session.push_user("hardlink.txt を編集して");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
+        let mut approver = RecordingApprover {
+            decision: crate::approval::Decision::Deny,
+            asked: 0,
+            last_reason: None,
+        };
+        {
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+
+            let out = run(
+                &p,
+                &mut session,
+                &mut audit,
+                &mut stop,
+                &always_on,
+                &[],
+                &mut ctx,
+            )
+            .await
+            .expect("拒否でループごと失敗した");
+            assert_eq!(out, "別の場所へ");
+        }
+
+        assert_eq!(approver.asked, 1, "承認者へ尋ねていない");
+        assert!(
+            approver
+                .last_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("ハードリンク"),
+            "尋ねた理由にハードリンクの説明が無い: {:?}",
+            approver.last_reason
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("読めない"),
+            "original",
+            "述語より先にヘルパが実行され、ハードリンクの実体が書き換わっている \
+             （実サンドボックスはこの書き込みをパス上は許可してしまう）"
+        );
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.is_some())
+            .expect("ツール結果が積まれていない");
+        assert!(
+            tool_msg.content.starts_with("利用者が承認しなかった"),
+            "拒否の文面が Gate 自身のものになっていない \
+             （サンドボックス側の拒否と混同している可能性がある）: {}",
+            tool_msg.content
+        );
+        assert!(
+            !tool_msg.content.contains("子の出力"),
+            "サンドボックス側（ToolError::WriteDenied）の拒否文面が混ざっている: {}",
+            tool_msg.content
+        );
+    }
+
     #[tokio::test]
     async fn bash_attempts_and_reports_without_ever_consulting_the_approver() {
         // Fix round 1 の指摘: `bash` は述語を通さないはずだが、それを配線

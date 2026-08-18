@@ -854,6 +854,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "polaris-provider",
+ "polaris-sandbox",
  "polaris-skills",
  "polaris-tools",
  "regex",

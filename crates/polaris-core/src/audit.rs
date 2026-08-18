@@ -17,16 +17,39 @@ impl AuditLog {
         Ok(Self { file })
     }
 
-    /// 1 呼び出しを 1 行として追記する。書き込む文字列は `tool` / `detail`
-    /// のどちらも、書く直前に必ず [`screen`] を通す。`tool` はモデルの
-    /// ツール呼び出しからそのまま渡ってくる値であり、閉じた集合ではない
-    /// （プロンプトインジェクションを受けたモデルが任意の文字列を出せる）
-    /// ため、例外なく同じ経路を通す。
-    pub fn record(&mut self, tool: &str, detail: &str) -> std::io::Result<()> {
-        let line = serde_json::json!({ "tool": screen(tool), "detail": screen(detail) });
+    /// 1 行を追記する。**ここへ渡るあらゆる文字列は書く直前に伏字化を通る。**
+    /// 欄を増やすときは必ず `screen` を通すこと。通し忘れは、そのまま
+    /// 生の資格情報がログへ落ちる経路になる。`tool` はモデルのツール呼び出し
+    /// からそのまま渡ってくる値であり、閉じた集合ではない（プロンプト
+    /// インジェクションを受けたモデルが任意の文字列を出せる）ため、他の欄と
+    /// 例外なく同じ経路を通す。
+    pub fn record(&mut self, r: &Record<'_>) -> std::io::Result<()> {
+        let mut line = serde_json::json!({
+            "tool": screen(r.tool),
+            "detail": screen(r.detail),
+            "result": screen(r.result),
+        });
+        if let Some(p) = r.sandbox {
+            line["sandbox"] = serde_json::Value::String(screen(&p.describe()));
+        }
+        if let Some(t) = r.target {
+            line["target"] = serde_json::Value::String(screen(&t.display().to_string()));
+        }
         writeln!(self.file, "{line}")?;
         self.file.flush()
     }
+}
+
+/// 監査ログ 1 行の内容。仕様が求める「型、解決後のサンドボックス方針、
+/// 書込先、結果」をこの型が運ぶ。`sandbox` と `target` は「無い」ことと
+/// 「空文字列だった」ことを区別するため `Option` で受け、`None` のときは
+/// 欄ごと省く（[`AuditLog::record`] 側の仕事）。
+pub struct Record<'a> {
+    pub tool: &'a str,
+    pub detail: &'a str,
+    pub sandbox: Option<&'a polaris_sandbox::SandboxPolicy>,
+    pub target: Option<&'a Path>,
+    pub result: &'a str,
 }
 
 /// 監査ログへ書くあらゆる文字列が通る唯一の関門。`FilterResult::Drop`
@@ -48,10 +71,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
         let path = dir.path().join("audit.jsonl");
         let mut log = AuditLog::open(&path).expect("開けない");
-        log.record(
-            "bash",
-            "export API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz012345",
-        )
+        log.record(&Record {
+            tool: "bash",
+            detail: "export API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz012345",
+            sandbox: None,
+            target: None,
+            result: "ok",
+        })
         .expect("書けない");
 
         let body = std::fs::read_to_string(&path).expect("読めない");
@@ -68,8 +94,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
         let path = dir.path().join("audit.jsonl");
         let mut log = AuditLog::open(&path).expect("開けない");
-        log.record("read", "src/main.rs").expect("書けない");
-        log.record("read", "src/lib.rs").expect("書けない");
+        log.record(&Record {
+            tool: "read",
+            detail: "src/main.rs",
+            sandbox: None,
+            target: None,
+            result: "ok",
+        })
+        .expect("書けない");
+        log.record(&Record {
+            tool: "read",
+            detail: "src/lib.rs",
+            sandbox: None,
+            target: None,
+            result: "ok",
+        })
+        .expect("書けない");
 
         let body = std::fs::read_to_string(&path).expect("読めない");
         assert_eq!(body.lines().count(), 2);
@@ -83,10 +123,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
         let path = dir.path().join("audit.jsonl");
         let mut log = AuditLog::open(&path).expect("開けない");
-        log.record(
-            "export API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz012345",
-            "harmless detail",
-        )
+        log.record(&Record {
+            tool: "export API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz012345",
+            detail: "harmless detail",
+            sandbox: None,
+            target: None,
+            result: "ok",
+        })
         .expect("書けない");
 
         let body = std::fs::read_to_string(&path).expect("読めない");
@@ -95,6 +138,91 @@ mod tests {
             "tool 内の生の値が残っている"
         );
         assert!(body.contains("[REDACTED]"), "tool が伏字化されていない");
+    }
+
+    #[test]
+    fn a_record_carries_the_policy_the_target_and_the_result() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).expect("開けない");
+
+        let policy = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("方針");
+
+        log.record(&Record {
+            tool: "write",
+            detail: "{\"path\":\"a.txt\"}",
+            sandbox: Some(&policy),
+            target: Some(std::path::Path::new("/w/a.txt")),
+            result: "ok",
+        })
+        .expect("書けない");
+
+        let line = std::fs::read_to_string(&path).expect("読めない");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
+        assert_eq!(v["tool"], "write");
+        assert_eq!(v["result"], "ok");
+        assert_eq!(v["target"], "/w/a.txt");
+        assert!(
+            v["sandbox"]
+                .as_str()
+                .expect("sandbox が無い")
+                .contains("workspace-write"),
+            "方針が記録されていない: {v}"
+        );
+    }
+
+    #[test]
+    fn every_new_field_passes_through_the_secret_screen() {
+        // 欄を増やすたびに伏字化を通し忘れる穴が開く。M1 では tool 欄が
+        // 通っていない時期があった。ここでは target と result の双方に
+        // 秘密らしき文字列を入れ、そのまま落ちないことを見る。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).expect("開けない");
+
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        log.record(&Record {
+            tool: "bash",
+            detail: "echo x",
+            sandbox: None,
+            target: Some(std::path::Path::new(secret)),
+            result: secret,
+        })
+        .expect("書けない");
+
+        let line = std::fs::read_to_string(&path).expect("読めない");
+        assert!(
+            !line.contains(secret),
+            "秘密が生のまま監査ログに落ちている: {line}"
+        );
+    }
+
+    #[test]
+    fn an_absent_policy_and_target_are_omitted_rather_than_written_as_empty() {
+        // 空文字列を書くと、「方針が無い」と「方針が空文字列だった」が
+        // 区別できなくなる。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).expect("開けない");
+
+        log.record(&Record {
+            tool: "read",
+            detail: "{}",
+            sandbox: None,
+            target: None,
+            result: "ok",
+        })
+        .expect("書けない");
+
+        let line = std::fs::read_to_string(&path).expect("読めない");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
+        assert!(v.get("sandbox").is_none() || v["sandbox"].is_null(), "{v}");
+        assert!(v.get("target").is_none() || v["target"].is_null(), "{v}");
     }
 
     #[test]
@@ -109,7 +237,14 @@ mod tests {
         let bare_secret = "sk-abc123DEF456ghi789XYZ000aaa111";
         assert!(matches!(screen_text(bare_secret), FilterResult::Drop));
 
-        log.record("bash", bare_secret).expect("書けない");
+        log.record(&Record {
+            tool: "bash",
+            detail: bare_secret,
+            sandbox: None,
+            target: None,
+            result: "ok",
+        })
+        .expect("書けない");
 
         let body = std::fs::read_to_string(&path).expect("読めない");
         assert!(!body.contains(bare_secret), "生の値が残っている");

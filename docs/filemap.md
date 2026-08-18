@@ -34,6 +34,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src`
 
 - `agent.rs` — エージェントループ。ツール呼び出しが無くなった時点の本文を返す。
+- `approval.rs` — 承認境界。`sandbox_mode` が技術的境界を、`approval_policy` が停止して
 - `audit.rs` — 追記専用の監査ログ。署名は付けない。インプロセスでは署名する主体と
 - `budget.rs` — 常時コンテキストの計測。数値は測定で担保し、見積で運用しない。
 - `config.rs` — 設定ファイルの読み込み。存在しないことは正常だが、壊れていることは正常ではない。

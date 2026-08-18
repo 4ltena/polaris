@@ -190,4 +190,40 @@ mod tests {
         .expect("承認したのに拒否された");
         assert_eq!(approver.asked.len(), 1, "Always なのに尋ねなかった");
     }
+
+    #[test]
+    fn always_with_needs_approval_preserves_the_specific_reason() {
+        // (Always, NeedsApproval) の最も危険なケース。方針が「常に尋ねる」でも、
+        // 述語が実際の理由（パス外など）を見つけている。その詳細な理由を
+        // 汎用の「書き込もうとしている」メッセージで上書きしてはいけない。
+        // 尋ねる相手は詳細な理由を知る必要がある。
+        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        let sandbox = workspace(root.path());
+        let mut approver = Scripted {
+            answers: vec![Decision::Allow],
+            asked: vec![],
+        };
+        let mut gate = Gate::new(ApprovalPolicy::Always);
+
+        let target = outside.path().join("risky.txt");
+        gate.check(&sandbox, &target, &mut approver)
+            .expect("承認したのに拒否された");
+
+        assert_eq!(approver.asked.len(), 1);
+        let reason = &approver.asked[0];
+        // 仕様が要求する 3 点を全て含むことを確認する。
+        assert!(
+            reason.contains(&target.display().to_string()),
+            "理由にパスが無い: {reason}"
+        );
+        assert!(
+            reason.contains("workspace-write"),
+            "理由に方針が無い: {reason}"
+        );
+        assert!(
+            reason.contains(&sandbox.writable_roots()[0].display().to_string()),
+            "理由にルートが無い: {reason}"
+        );
+    }
 }

@@ -14,6 +14,8 @@ pub mod pkce;
 pub mod store;
 pub mod token;
 
+use std::path::Path;
+
 /// 認可の発行者。
 pub const ISSUER: &str = "https://auth.openai.com";
 /// codex CLI に登録された client_id。redirect_uri もこれに紐づく。
@@ -57,4 +59,133 @@ pub struct Credentials {
     pub account_id: String,
     #[serde(default)]
     pub expires_at: Option<u64>,
+}
+
+/// 期限までこの秒数を切ったら更新する。1 ターンの往復が数十秒に及ぶ
+/// ことがあるため、要求の途中で失効しない程度の余裕を取る。
+pub const EXPIRY_MARGIN_SECS: u64 = 300;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 更新が要るか。期限が不明なら要る。
+pub fn needs_refresh(c: &Credentials, now: u64) -> bool {
+    match c.expires_at {
+        None => true,
+        Some(exp) => exp <= now.saturating_add(EXPIRY_MARGIN_SECS),
+    }
+}
+
+/// 保管された資格情報を読み、必要なら更新して返す。
+pub async fn ensure_fresh(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
+    let c = store::load_from(store_path)?.ok_or(AuthError::NotLoggedIn)?;
+    if !needs_refresh(&c, now_secs()) {
+        return Ok(c);
+    }
+    let fresh = token::refresh(issuer, &c.refresh_token).await?;
+    store::save_to(store_path, &fresh)?;
+    Ok(fresh)
+}
+
+/// 期限に関わらず更新する。401 を受けたあとの再試行で使う。
+pub async fn force_refresh(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
+    let c = store::load_from(store_path)?.ok_or(AuthError::NotLoggedIn)?;
+    let fresh = token::refresh(issuer, &c.refresh_token).await?;
+    store::save_to(store_path, &fresh)?;
+    Ok(fresh)
+}
+
+/// 保管を消す。戻り値は「実際にあったか」。
+pub fn logout(store_path: &Path) -> Result<bool, AuthError> {
+    store::delete_at(store_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn creds(expires_at: Option<u64>) -> Credentials {
+        Credentials {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            account_id: "acct".into(),
+            expires_at,
+        }
+    }
+
+    /// 期限が不明なら毎回更新する。楽観的に使い回すと、失効した
+    /// トークンでの 401 が通常経路になり、認証の問題がモデルの問題に
+    /// 見える。
+    #[test]
+    fn an_unknown_expiry_always_needs_refresh() {
+        assert!(needs_refresh(&creds(None), 1_000));
+    }
+
+    /// 余裕の外側では更新しない。ここが常に真だと、毎ターン更新が走る。
+    #[test]
+    fn a_token_well_before_expiry_is_left_alone() {
+        let now = 1_000_000;
+        let c = creds(Some(now + EXPIRY_MARGIN_SECS + 10));
+        assert!(
+            !needs_refresh(&c, now),
+            "余裕があるのに更新しようとしている"
+        );
+    }
+
+    /// 余裕の内側では更新する。上の対。
+    #[test]
+    fn a_token_inside_the_margin_needs_refresh() {
+        let now = 1_000_000;
+        let c = creds(Some(now + EXPIRY_MARGIN_SECS - 10));
+        assert!(needs_refresh(&c, now), "期限が近いのに更新しない");
+    }
+
+    #[test]
+    fn an_expired_token_needs_refresh() {
+        let now = 1_000_000;
+        assert!(needs_refresh(&creds(Some(now - 1)), now));
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_on_an_empty_store_says_not_logged_in() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let err = ensure_fresh("http://unused.invalid", &dir.path().join("auth.json"))
+            .await
+            .expect_err("ログインしていないので失敗すべき");
+        assert!(
+            matches!(err, AuthError::NotLoggedIn),
+            "NotLoggedIn 以外になっている: {err:?}"
+        );
+    }
+
+    /// 余裕のあるトークンは、ネットワークへ出ずにそのまま返る。issuer に
+    /// 到達不能な URL を渡しているので、更新しようとすれば失敗する。
+    #[tokio::test]
+    async fn ensure_fresh_returns_a_valid_token_without_touching_the_network() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let p = dir.path().join("auth.json");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store::save_to(&p, &creds(Some(now + EXPIRY_MARGIN_SECS + 3600))).expect("保存");
+
+        let got = ensure_fresh("http://127.0.0.1:1/unreachable", &p)
+            .await
+            .expect("更新せずに返るべき");
+        assert_eq!(got.access_token, "at");
+    }
+
+    #[tokio::test]
+    async fn logout_removes_the_store_and_reports_it() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let p = dir.path().join("auth.json");
+        store::save_to(&p, &creds(None)).expect("保存");
+        assert!(logout(&p).expect("削除できる"));
+        assert!(!logout(&p).expect("2 回目も失敗しない"));
+    }
 }

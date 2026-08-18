@@ -15,6 +15,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `README.md` — polaris
 - `rust-toolchain.toml` — ツールチェイン固定
 
+## `crates/polaris-auth`
+
+- `Cargo.toml` — polaris-auth クレートのマニフェスト
+
+## `crates/polaris-auth/src`
+
+- `lib.rs` — ChatGPT のサブスクリプション認証（OAuth）の寿命と資格情報の保管。
+- `pkce.rs` — PKCE (RFC 7636) の verifier と challenge。
+
 ## `crates/polaris-cli`
 
 - `Cargo.toml` — polaris-cli クレートのマニフェスト
@@ -116,7 +125,9 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-16-polaris-m1-headless-loop.md` — polaris M1 ヘッドレス最小ループ Implementation Plan
 - `2026-08-17-polaris-m2-write-and-sandbox.md` — polaris M2 実装計画 — write / edit / bash とサンドボックス
 - `2026-08-17-polaris-m3a-skills.md` — polaris M3a Skills ローダと skill ツール Implementation Plan
+- `2026-08-18-polaris-m25-codex-provider.md` — polaris M2.5 Codex プロバイダ 実装計画
 
 ## `docs/superpowers/specs`
 
 - `2026-08-16-polaris-harness-design.md` — polaris 設計仕様
+- `2026-08-18-polaris-codex-provider-design.md` — polaris Codex プロバイダ 設計

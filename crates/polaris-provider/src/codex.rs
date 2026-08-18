@@ -5,9 +5,15 @@
 //! JSON ではなく JSON を収めた文字列である。`openai.rs` と関数を共有
 //! しないのは、片方を直したときにもう片方が黙って壊れる形にしないため。
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::StreamExt;
 use serde_json::Value;
 
-use crate::{CompletionRequest, CompletionResponse, Message, ProviderError, Role, ToolCall, sse};
+use crate::{
+    CompletionRequest, CompletionResponse, Message, Provider, ProviderError, Role, ToolCall, sse,
+};
 
 /// 要求先。`store` を使わないので、この 1 本しか叩かない。
 pub const ENDPOINT_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -205,6 +211,122 @@ impl Folder {
             text: self.text,
             tool_calls: self.tool_calls,
         })
+    }
+}
+
+/// 無通信がこの時間続いたら切る。応答全体で測ると正常な長考を打ち切る。
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub struct CodexProvider {
+    base: String,
+    model: String,
+    tokens: Arc<dyn crate::TokenSource>,
+    client: reqwest::Client,
+    idle: Duration,
+}
+
+impl CodexProvider {
+    pub fn new(base: String, model: String, tokens: Arc<dyn crate::TokenSource>) -> Self {
+        Self::with_idle_timeout(base, model, tokens, DEFAULT_IDLE_TIMEOUT)
+    }
+
+    pub fn with_idle_timeout(
+        base: String,
+        model: String,
+        tokens: Arc<dyn crate::TokenSource>,
+        idle: Duration,
+    ) -> Self {
+        Self {
+            base,
+            model,
+            tokens,
+            client: reqwest::Client::new(),
+            idle,
+        }
+    }
+
+    /// 1 回の要求を投げ、SSE を畳む。401 はここでは畳まず、そのまま
+    /// 呼び出し側へ返して再試行の判断をさせる。
+    async fn attempt(
+        &self,
+        token: &crate::Token,
+        body: &Value,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let resp = self
+            .client
+            .post(format!("{}/responses", self.base))
+            .bearer_auth(&token.access_token)
+            .header("chatgpt-account-id", &token.account_id)
+            .header("accept", "text/event-stream")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            // 呼び出し側が更新して再試行するかを決める。
+            return Err(ProviderError::Auth(format!("status {status}")));
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let hint = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("不明")
+                .to_string();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Http(format!(
+                "レート制限。retry-after: {hint} 秒。{body}"
+            )));
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Http(format!("status {status}: {body}")));
+        }
+
+        let mut folder = Folder::new();
+        let mut stream = resp.bytes_stream();
+        loop {
+            // 無通信で測る。応答全体の長さは正常に伸びる。
+            let next = tokio::time::timeout(self.idle, stream.next()).await;
+            match next {
+                Err(_) => {
+                    return Err(ProviderError::Http(format!(
+                        "{} 秒のあいだ応答が届かなかった",
+                        self.idle.as_secs()
+                    )));
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => {
+                    let bytes = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
+                    folder.push(&bytes)?;
+                }
+            }
+        }
+        folder.finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for CodexProvider {
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
+        let body = build_body(&self.model, &req);
+
+        let token = self.tokens.token().await?;
+        match self.attempt(&token, &body).await {
+            Err(ProviderError::Auth(_)) => {
+                // 1 回だけ。無限に再試行しない。
+                let token = self.tokens.refreshed().await?;
+                self.attempt(&token, &body).await.map_err(|e| match e {
+                    ProviderError::Auth(_) => ProviderError::Auth(
+                        "更新後も認証を拒否された。`polaris login` をやり直すこと".into(),
+                    ),
+                    other => other,
+                })
+            }
+            other => other,
+        }
     }
 }
 
@@ -509,5 +631,199 @@ mod tests {
         };
         let body = build_body("m", &req);
         assert!(body.get("tools").is_none(), "空の tools を送っている");
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct Tokens {
+        calls: AtomicUsize,
+        refreshes: AtomicUsize,
+    }
+
+    impl Tokens {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                refreshes: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::TokenSource for Tokens {
+        async fn token(&self) -> Result<crate::Token, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::Token {
+                access_token: "first".into(),
+                account_id: "acct-1".into(),
+            })
+        }
+        async fn refreshed(&self) -> Result<crate::Token, ProviderError> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::Token {
+                access_token: "second".into(),
+                account_id: "acct-1".into(),
+            })
+        }
+    }
+
+    fn req() -> CompletionRequest {
+        CompletionRequest {
+            system: "s".into(),
+            messages: vec![Message::user("やって")],
+            tools: vec![],
+        }
+    }
+
+    fn sse_body(frames: &[Vec<u8>]) -> String {
+        frames
+            .iter()
+            .map(|f| String::from_utf8_lossy(f).to_string())
+            .collect()
+    }
+
+    /// 送出したヘッダと本文が仕様どおりであること。ここが違うと、
+    /// 応答の解釈がいくら正しくてもサーバは相手にしない。
+    #[tokio::test]
+    async fn the_request_carries_the_bearer_and_the_account_id() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer first"))
+            .and(header("chatgpt-account-id", "acct-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+                frame("response.output_item.done", message_item("ok")),
+                frame("response.completed", serde_json::json!({})),
+            ])))
+            .mount(&s)
+            .await;
+
+        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
+        let r = p.complete(req()).await.expect("成功すべき");
+        assert_eq!(r.text, "ok");
+    }
+
+    /// 401 を受けたら更新して 1 回だけ再試行し、成功する。
+    #[tokio::test]
+    async fn a_401_is_retried_once_with_a_refreshed_token() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer first"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer second"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+                frame("response.output_item.done", message_item("再試行で成功")),
+                frame("response.completed", serde_json::json!({})),
+            ])))
+            .mount(&s)
+            .await;
+
+        let t = Tokens::new();
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
+        let r = p.complete(req()).await.expect("再試行で成功すべき");
+        assert_eq!(r.text, "再試行で成功");
+        assert_eq!(
+            t.refreshes.load(Ordering::SeqCst),
+            1,
+            "更新の回数が 1 でない"
+        );
+    }
+
+    /// 401 が 2 回続いたら諦める。無限に再試行しない。種類は Auth で
+    /// あり、Http ではない。
+    #[tokio::test]
+    async fn a_second_401_gives_up_as_an_auth_error() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .mount(&s)
+            .await;
+
+        let t = Tokens::new();
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
+        let err = p.complete(req()).await.expect_err("失敗すべき");
+        assert!(matches!(err, ProviderError::Auth(_)), "Auth 以外: {err:?}");
+        assert_eq!(
+            t.refreshes.load(Ordering::SeqCst),
+            1,
+            "再試行が 1 回で止まっていない"
+        );
+    }
+
+    /// 429 はリセット情報を文面へ含める。掴めない拒否は同じ失敗を
+    /// 繰り返させる。
+    #[tokio::test]
+    async fn a_429_surfaces_the_retry_hint() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "37")
+                    .set_body_string("rate limited"),
+            )
+            .mount(&s)
+            .await;
+
+        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
+        let err = p.complete(req()).await.expect_err("失敗すべき");
+        let ProviderError::Http(msg) = err else {
+            panic!("Http 以外: {err:?}");
+        };
+        assert!(msg.contains("37"), "retry-after が文面に無い: {msg}");
+    }
+
+    /// 完了を見ないまま切れたストリームは失敗である。HTTP は 200 なので、
+    /// ここを通すと空の最終回答が返る。
+    #[tokio::test]
+    async fn a_truncated_stream_is_an_error_even_on_200() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[frame(
+                "response.output_item.done",
+                message_item("途中で切れた"),
+            )])))
+            .mount(&s)
+            .await;
+
+        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
+        let err = p.complete(req()).await.expect_err("失敗すべき");
+        assert!(
+            matches!(err, ProviderError::Decode(_)),
+            "Decode 以外: {err:?}"
+        );
+    }
+
+    /// トークンが取れない時点で Auth である。ネットワークへ出ない。
+    #[tokio::test]
+    async fn a_token_source_failure_is_an_auth_error() {
+        struct NoTokens;
+        #[async_trait::async_trait]
+        impl crate::TokenSource for NoTokens {
+            async fn token(&self) -> Result<crate::Token, ProviderError> {
+                Err(ProviderError::Auth("ログインしていない".into()))
+            }
+            async fn refreshed(&self) -> Result<crate::Token, ProviderError> {
+                Err(ProviderError::Auth("ログインしていない".into()))
+            }
+        }
+
+        let p = CodexProvider::new(
+            "http://127.0.0.1:1/unreachable".into(),
+            "m".into(),
+            Arc::new(NoTokens),
+        );
+        let err = p.complete(req()).await.expect_err("失敗すべき");
+        assert!(matches!(err, ProviderError::Auth(_)), "Auth 以外: {err:?}");
     }
 }

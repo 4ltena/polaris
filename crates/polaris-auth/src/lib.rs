@@ -10,6 +10,7 @@
 //! 失効しうる。独立した store を持てば、この事故は原理的に起きない。
 
 pub mod pkce;
+pub mod store;
 
 /// 認可の発行者。
 pub const ISSUER: &str = "https://auth.openai.com";
@@ -42,4 +43,16 @@ pub enum AuthError {
     PortInUse(String),
     #[error("ログインしていない")]
     NotLoggedIn,
+}
+
+/// 保管する資格情報。`expires_at` は Unix 秒。応答が `expires_in` を
+/// 持たない場合は `None` にする。0 や現在時刻で埋めると、期限が不明で
+/// あることと失効していることの区別が消える。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Credentials {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub account_id: String,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }

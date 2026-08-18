@@ -10,7 +10,7 @@ use std::path::Path;
 
 use polaris_provider::{CompletionRequest, Provider};
 
-use crate::audit::AuditLog;
+use crate::audit::{AuditLog, Record};
 use crate::session::Session;
 use crate::stop::{StopReason, StopTracker};
 
@@ -73,7 +73,21 @@ pub async fn run(
 
         for call in &res.tool_calls {
             let outcome = dispatch(call, skills);
-            audit.record(&call.name, &call.arguments.to_string())?;
+            // `result` はモデルへ実際に返す本文（成功時）かエラー文言
+            // （失敗時）そのもの。`sandbox` と `target` は Task 12 が
+            // 実際の呼び出し経路から埋める。ここではまだ持っていないため
+            // `None` を渡す。
+            let result: &str = match &outcome {
+                Ok(body) => body.as_str(),
+                Err(msg) => msg.as_str(),
+            };
+            audit.record(&Record {
+                tool: &call.name,
+                detail: &call.arguments.to_string(),
+                sandbox: None,
+                target: None,
+                result,
+            })?;
             match outcome {
                 Ok(body) => {
                     // 成功したので連続エラーのストリークをリセットする。ここを

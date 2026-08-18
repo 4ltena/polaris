@@ -35,6 +35,33 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
     }
     p.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))\n");
     p.push_str("(allow file-read*)\n");
+    // Rust のランタイムが起動時に要る。main スレッドのガードページを張る
+    // 前に `sysconf(_SC_PAGESIZE)` を引き、macOS ではこれが sysctl
+    // （`hw.pagesize_compat`）へ落ちる。拒否するとページ長が取れず、
+    // 続く mmap が EINVAL で失敗して
+    // 「failed to allocate a guard page: Invalid argument (os error 22)」
+    // → `fatal runtime error` → SIGABRT となる。これは *こちらのコードが
+    // 1 行も走る前* に起きるので、`--confined-apply` ヘルパは read-only と
+    // workspace-write の両方で必ず落ち、その abort が方針違反による拒否と
+    // 同じ形（非0終了＋stderr）で親へ届いていた。実測で確認した
+    // （`polaris-cli/tests/confined_helper.rs` が本物のバイナリと本物の
+    // プロファイルで固定している）。
+    //
+    // なぜ絞り込まないか。実測では
+    // `(allow sysctl-read (sysctl-name "hw.pagesize" "hw.pagesize_compat"))`
+    // でもヘルパは起動する（`hw.pagesize` だけでは足りない）。それでも
+    // 名前で絞らないのは、このプロファイルがヘルパ専用ではないためである。
+    // `bash` ツールが起動する任意の子も同じプロファイルの下で走り、機械の
+    // 諸元（`hw.ncpu`、`hw.memsize`、`kern.osversion` 等）を引くものは
+    // 珍しくない。2 件だけを許すと、ヘルパは直るが `bash` から起動した
+    // Rust バイナリや多くのランタイムが同じ様態で落ち続ける（現に、この
+    // 行が無い状態では `sh -c 'polaris --help'` すら abort する）。
+    //
+    // 境界を広げないと言える理由。`sysctl-read` は機械の諸元の読み取り
+    // だけであり、書き込みの権限を一切与えない。このプロファイルが守って
+    // いるのは書き込みの境界であって、読み取りはすでに直上の
+    // `(allow file-read*)` でファイルシステム全体に開いている。
+    p.push_str("(allow sysctl-read)\n");
 
     let roots = policy.writable_roots();
     if !roots.is_empty() {

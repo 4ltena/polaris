@@ -44,6 +44,23 @@ pub(crate) fn run_mutation(
         return Ok(outcome.stdout.trim().to_string());
     }
 
+    // 非0終了をすべて「方針が拒否した」と名付けると、目印が一致しない
+    // `edit` のような、ごく普通の失敗までサンドボックスの拒否として
+    // モデルへ届く。モデルは方針を疑って別の場所を探し始め、目印を直せば
+    // 済む往復を1回捨てる —— 拒否メッセージが防ぐためにある浪費そのもの
+    // である。
+    //
+    // 見分けの材料は子側にしか無い（errno はプロセス境界を越えない）ので、
+    // 判定は `helper::apply` が行い、結論だけが標準エラーの印として届く。
+    // 印が無ければ従来どおり拒否として扱う。ヘルパが起動できなかった場合
+    // や想定外の様態はこちら側へ落ちるので、保守的な向きは変わらない。
+    if let Some(reason) = polaris_sandbox::helper::request_problem(&outcome.stderr) {
+        return Err(ToolError::MutationFailed {
+            path: path.display().to_string(),
+            detail: reason.to_string(),
+        });
+    }
+
     Err(ToolError::WriteDenied {
         path: path.display().to_string(),
         policy: policy.describe(),

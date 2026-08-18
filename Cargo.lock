@@ -843,6 +843,7 @@ dependencies = [
  "polaris-provider",
  "polaris-sandbox",
  "polaris-skills",
+ "polaris-tools",
  "serde_json",
  "tempfile",
  "tokio",

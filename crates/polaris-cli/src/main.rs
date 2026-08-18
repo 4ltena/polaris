@@ -282,8 +282,12 @@ fn run_confined_apply() -> ExitCode {
             println!("{msg}");
             ExitCode::SUCCESS
         }
-        Err(msg) => {
-            eprintln!("{msg}");
+        Err(e) => {
+            // 失敗の種別（OS が拒んだのか、要求そのものに問題があるのか）は
+            // errno が手に入るこの側でしか判定できない。結論を `to_wire` の
+            // 印として標準エラーへ載せ、親（`run_mutation`）が両者を取り違え
+            // ないようにする。終了コードの約束事は増やさない。
+            eprintln!("{}", e.to_wire());
             ExitCode::FAILURE
         }
     }
@@ -298,11 +302,19 @@ fn run_confined_apply() -> ExitCode {
 /// 共有する。作り直すと2つの経路が別々のディレクトリへ分裂しうるため、
 /// 組み立てをここへ1本化する。
 ///
+/// 識別子は作業ディレクトリではなく `project::resolve_root` が返す
+/// プロジェクトルートから作る。書込可能ルートを導くのと同じ解決である。
+/// 作業ディレクトリを直接ハッシュしていたときは、同じプロジェクトでも
+/// リポジトリの深い場所から起動しただけで別のディレクトリになり、監査
+/// ログと 30MB のヘルパ複製が起動場所ごとに分裂していた。監査ログは
+/// このマイルストーンが用意した再構成の記録であり、履歴が分かれれば
+/// 「一箇所を見れば経緯が分かる」が成り立たない。
+///
 /// `<project-id>` はプロジェクトを一意に識別できればよく、プロジェクトの
-/// 正体を推測できる必要は無いため、canonicalize したパスのハッシュ値を使う。
+/// 正体を推測できる必要は無いため、解決済みパスのハッシュ値を使う。
 fn default_state_dir(cwd: &Path) -> io::Result<PathBuf> {
-    let canonical = cwd.canonicalize()?;
-    let id = project_id(&canonical);
+    let root = polaris_core::project::resolve_root(cwd);
+    let id = project_id(&root);
 
     let home = std::env::var_os("HOME")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME が設定されていない"))?;
@@ -456,32 +468,77 @@ mod tests {
         );
     }
 
+    /// HOME を差し替えるテストが同じプロセス内で同時に走ると互いの HOME を
+    /// 踏む。差し替えはここで直列化する。
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// HOME を差し替えて `f` を走らせ、必ず元へ戻す。
+    ///
+    /// SAFETY: 同一プロセス内で HOME を一時的に差し替えるだけで、他プロセス
+    /// へは影響しない。`std::env::set_var` の安全条件はマルチスレッドからの
+    /// 同時読み書きであり、それは上の `HOME_LOCK` で直列化している。
+    fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        let out = f();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("HOME", p) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        out
+    }
+
+    #[test]
+    fn one_project_has_one_state_dir_no_matter_how_deep_you_start() {
+        // 書込可能ルートは `project::resolve_root` から導くのに、状態
+        // ディレクトリだけが作業ディレクトリを直接ハッシュしていた。同じ
+        // プロジェクトを深い場所から起動すると、監査ログとヘルパの退避先が
+        // 別々にできる。監査ログは再構成の記録なので、分裂すると履歴が
+        // どこにも揃わない。
+        let home = tempfile::tempdir().expect("一時ディレクトリ");
+        let project = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::create_dir(project.path().join(".git")).expect("mkdir");
+        let deep = project.path().join("crates/polaris-core/src");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        let other = tempfile::tempdir().expect("一時ディレクトリ");
+        std::fs::create_dir(other.path().join(".git")).expect("mkdir");
+
+        let (from_root, from_deep, from_other) = with_home(home.path(), || {
+            (
+                default_state_dir(project.path()).expect("既定パスを決められない"),
+                default_state_dir(&deep).expect("既定パスを決められない"),
+                default_state_dir(other.path()).expect("既定パスを決められない"),
+            )
+        });
+
+        assert_eq!(
+            from_root,
+            from_deep,
+            "起動した深さで状態ディレクトリが分裂している: {} と {}",
+            from_root.display(),
+            from_deep.display()
+        );
+        // 全てを同じ場所へ集めるだけの退化した「修正」を弾く。別プロジェクト
+        // は別のディレクトリでなければならない。
+        assert_ne!(
+            from_root,
+            from_other,
+            "別のプロジェクトが同じ状態ディレクトリを共有している: {}",
+            from_root.display()
+        );
+    }
+
     #[test]
     fn default_audit_path_lives_under_home_state_not_cwd() {
         let home = tempfile::tempdir().expect("一時ディレクトリ");
         let project = tempfile::tempdir().expect("一時ディレクトリ");
 
-        // SAFETY: このテストは同一プロセス内で HOME を一時的に差し替えるだけで、
-        // 他プロセスへは影響しない。std::env::set_var の安全条件はマルチ
-        // スレッドからの同時読み書きだが、cargo test はテストごとに別プロセス
-        // または直列実行のどちらでもこの変更を他のテストと共有しないため、
-        // ここでの使用に問題はない。
-        let prev_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-
-        let got = default_audit_path(project.path()).expect("既定パスを決められない");
-
-        if let Some(p) = prev_home {
-            unsafe {
-                std::env::set_var("HOME", p);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("HOME");
-            }
-        }
+        let got = with_home(home.path(), || {
+            default_audit_path(project.path()).expect("既定パスを決められない")
+        });
 
         assert!(
             got.starts_with(home.path()),

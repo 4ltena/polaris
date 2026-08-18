@@ -26,6 +26,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-cli/tests`
 
 - `cli.rs` — CLI バイナリの統合テスト。実プロセスを起動して振る舞いを確かめる。
+- `confined_helper.rs` — 本物の `polaris` バイナリを、本物の拘束プロファイルの下でヘルパとして
 
 ## `crates/polaris-core`
 

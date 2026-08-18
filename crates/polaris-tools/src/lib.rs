@@ -40,6 +40,14 @@ pub enum ToolError {
         policy: String,
         detail: String,
     },
+    /// ヘルパは走ったが、要求どおりには実行できなかった（置換対象が0件・
+    /// 複数件、対象ファイルが無い、等）。方針の話ではないので、方針も
+    /// 書込可能ルートも文面に出さない。ここを `WriteDenied` と混ぜると、
+    /// 目印を選び直せば済む場面でモデルが権限の問題を探し始める。
+    #[error(
+        "{path} への変更は実行できなかった。サンドボックスの拒否ではなく、要求そのものの問題である。理由: {detail}"
+    )]
+    MutationFailed { path: String, detail: String },
     #[error("コマンドが終了コード {status} で失敗した。方針 {policy}。出力: {detail}")]
     CommandFailed {
         status: i32,

@@ -4,7 +4,9 @@
 //! 書込可能ルートを保持し、プラットフォーム固有の機構へ渡すだけである。
 
 pub mod confine;
+pub mod helper;
 pub mod policy;
+pub mod stage;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -13,6 +15,7 @@ pub mod macos;
 pub mod linux;
 
 pub use confine::{Outcome, run_confined};
+pub use helper::Mutation;
 pub use policy::{SandboxMode, SandboxPolicy};
 
 #[derive(Debug, thiserror::Error)]

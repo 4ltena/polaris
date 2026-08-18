@@ -180,6 +180,30 @@ mod tests {
         assert_eq!(got.access_token, "at");
     }
 
+    /// 余裕のあるトークンでも、`force_refresh` は `needs_refresh` を見ずに
+    /// ネットワークへ出る。issuer に到達不能な URL を渡しているので、
+    /// 「そのまま返す」のではなく「到達を試みて失敗する」ことを確かめる。
+    /// ここへ `ensure_fresh` のガードが紛れ込むと、この失敗が静かに
+    /// 「更新せず返す」成功へ変わる。
+    #[tokio::test]
+    async fn force_refresh_attempts_the_network_even_when_the_token_is_fresh() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let p = dir.path().join("auth.json");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store::save_to(&p, &creds(Some(now + EXPIRY_MARGIN_SECS + 3600))).expect("保存");
+
+        let err = force_refresh("http://127.0.0.1:1/unreachable", &p)
+            .await
+            .expect_err("新鮮でもネットワークへ出て失敗するべき");
+        assert!(
+            matches!(err, AuthError::Http(_)),
+            "Http 以外になっている: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn logout_removes_the_store_and_reports_it() {
         let dir = tempfile::tempdir().expect("一時ディレクトリ");

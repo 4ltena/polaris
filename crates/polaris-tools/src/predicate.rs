@@ -61,6 +61,19 @@ pub fn predict(policy: &SandboxPolicy, target: &Path) -> Verdict {
     Verdict::Allowed
 }
 
+/// 相対パスを `base` へ接いで絶対パスにする。絶対パスはそのまま返す。
+///
+/// 純粋な関数として切り出してあるのは、基準を引数で受ければ作業ディレクトリ
+/// を動かさずに試験できるためである。作業ディレクトリはプロセス全体で 1 つ
+/// しか無く、試験の中で書き換えると他の試験へ漏れる。
+pub fn absolutize(base: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base.join(target)
+    }
+}
+
 /// 判定用にパスを解決する。存在しないパスは canonicalize できないので、
 /// 存在する最も近い祖先まで遡って正規化し、残りを繋ぎ直す。新規作成では
 /// 対象も途中のディレクトリも存在しないのが普通であり、ここを素朴に
@@ -75,6 +88,26 @@ pub fn predict(policy: &SandboxPolicy, target: &Path) -> Verdict {
 /// 字句的解決が妥当である。
 fn resolve_for_judgement(target: &Path) -> PathBuf {
     use std::path::Component;
+
+    // 相対パスは、まず現在の作業ディレクトリへ接ぐ。接がないと、まだ存在
+    // しない相対パス（＝`write` の通常の使い方そのもの）が canonicalize
+    // できず、祖先を遡っても空パスにしか行き着かないため、`target` が
+    // そのまま返り、書込可能ルートと一致せず「範囲の外」と判定される。
+    // 実際に初回の実走で、ルート直下への `write` が
+    // 「smoke-out.txt は書込可能な範囲の外にある」と拒否された。
+    //
+    // 基準を cwd に取るのは、実際に書くのが子プロセスであり、子は cwd を
+    // 継承して同じ相対パスを解決するためである。判定の基準と書き込みの
+    // 基準がここで一致する。cwd が取れない場合は接がずに進み、従来どおり
+    // 承認を求める側へ倒れる。
+    let anchored;
+    let target = match std::env::current_dir() {
+        Ok(cwd) => {
+            anchored = absolutize(&cwd, target);
+            anchored.as_path()
+        }
+        Err(_) => target,
+    };
 
     if let Ok(c) = target.canonicalize() {
         return c;
@@ -154,6 +187,59 @@ fn has_extra_hard_links(path: &Path) -> bool {
 mod tests {
     use super::*;
     use polaris_sandbox::{SandboxMode, SandboxPolicy};
+
+    /// 相対パスをそのまま判定すると、まだ存在しないファイルは必ず
+    /// 「範囲の外」になる。初回の実走で踏んだ欠陥そのもの。基準を
+    /// cwd に取らないと落ちる。
+    #[test]
+    fn a_relative_target_inside_the_root_is_allowed() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.canonicalize().expect("canonicalize");
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root]).expect("方針");
+
+        // 存在しない相対パス。`write` が新規ファイルを作るときの通常形。
+        let verdict = predict(&policy, Path::new("polaris-relative-probe.txt"));
+        assert_eq!(
+            verdict,
+            Verdict::Allowed,
+            "cwd 直下への新規作成が承認待ちになっている。相対パスが cwd へ \
+             接がれていない"
+        );
+    }
+
+    /// 相対パスでも、`..` で cwd の外へ出るものは承認へ倒れる。接ぐ処理が
+    /// 「何でも内側」にしてしまっていないことを対で見る。片側だけでは、
+    /// 単に常に Allowed を返す実装が通ってしまう。
+    #[test]
+    fn a_relative_target_escaping_the_root_still_needs_approval() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.canonicalize().expect("canonicalize");
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root]).expect("方針");
+
+        let verdict = predict(
+            &policy,
+            Path::new("../../polaris-relative-escape-probe.txt"),
+        );
+        assert!(
+            matches!(verdict, Verdict::NeedsApproval { .. }),
+            "cwd の外へ出る相対パスが許可された: {verdict:?}"
+        );
+    }
+
+    /// `absolutize` そのものの形。絶対パスは触らない。
+    #[test]
+    fn absolutize_joins_only_relative_targets() {
+        let base = Path::new("/base/dir");
+        assert_eq!(
+            absolutize(base, Path::new("a/b.txt")),
+            PathBuf::from("/base/dir/a/b.txt")
+        );
+        assert_eq!(
+            absolutize(base, Path::new("/elsewhere/b.txt")),
+            PathBuf::from("/elsewhere/b.txt"),
+            "絶対パスが base へ接がれている"
+        );
+    }
 
     fn workspace(root: &std::path::Path) -> SandboxPolicy {
         SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.to_path_buf()])

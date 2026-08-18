@@ -16,6 +16,27 @@
 //!   `sandbox-exec` の終了状態（`classify_apply_failure`）、Linux は
 //!   `pre_exec` クロージャが返すエラーに積んだ番兵 errno
 //!   （`classify_spawn_error`）で見分ける。両者の詳細は各関数のコメントへ。
+//!
+//! fix round 2 で直した点: `wait_with_output` がエラーを返す経路では、
+//! 書き込みスレッドの `JoinHandle` を合流させずに `?` で早期 return して
+//! いた。合流しないまま drop すると、スレッドは検知できないまま生き
+//! 残る（detach）。`wait_with_output` の結果は `?` を使わずいったん
+//! 変数で受け、書き込みスレッドを必ず合流させたあとで、その結果を
+//! 見て何を返すか決める。
+//!
+//! 既知の限界（未解決、意図的に残している）:
+//!
+//! - Linux の番兵 errno は、`pre_exec` が失敗した「という事実」だけを
+//!   親へ運べる。`apply_to_current_process` が返す本当のエラー内容
+//!   （カーネルが古い／ruleset を作れない／ルートが消えている、等）は
+//!   fork の通知経路の制約上、親には届かない。`NotEnforced` の文言は
+//!   「なぜ」ではなく「起きた」までしか言えない。
+//! - `classify_apply_failure`（macOS）が拾えるのは、`sandbox_apply` の
+//!   文字列と、SIGABRT かつ出力が両方とも空という既知の様態の 2 つだけ
+//!   である。これ以外の経路で `sandbox-exec` が静かに適用へ失敗する
+//!   様態が存在すれば、それは今のところ `None`（＝ `Ok(Outcome)`）を
+//!   返してしまう。実機で確認できた範囲の網羅であり、完全性の主張では
+//!   ない。
 
 use std::io::Write;
 use std::path::Path;
@@ -77,11 +98,23 @@ pub fn run_confined(
 
     // wait_with_output は内部で self.stdin を drop するが、piped にした
     // 場合はすでに上で take() 済みなので、ここでの drop は no-op になる。
-    let out = child.wait_with_output()?;
+    //
+    // ここで `?` を使わないのが要点。`wait_with_output` 自体がエラーを
+    // 返す経路（稀だが起こりうる）で早期 return すると、下の join に
+    // 辿り着けないまま `writer` の `JoinHandle` が drop され、書き込み
+    // スレッドが合流されずに検知不能なまま生き残る（detach）。結果を
+    // いったん変数で受け、書き込みスレッドを必ず合流させたあとで、
+    // 何を返すか決める。
+    let wait_result = child.wait_with_output();
 
-    // 呼び出しを抜ける前に、書き込みスレッドを必ず合流させる。
-    if let Some(handle) = writer {
-        match handle.join() {
+    // 呼び出しを抜ける前に、wait_with_output の成否に関わらず書き込み
+    // スレッドを必ず合流させる。
+    let writer_join_result = writer.map(|handle| handle.join());
+
+    let out = wait_result?;
+
+    if let Some(join_result) = writer_join_result {
+        match join_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(SandboxError::Io(e)),
             Err(_) => {

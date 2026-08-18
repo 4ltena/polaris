@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 polaris-provider = { path = "../polaris-provider" }
+polaris-sandbox = { path = "../polaris-sandbox" }
 polaris-skills = { path = "../polaris-skills" }
 polaris-tools = { path = "../polaris-tools" }
 regex = { workspace = true }

@@ -27,7 +27,7 @@ impl AuditLog {
         let mut line = serde_json::json!({
             "tool": screen(r.tool),
             "detail": screen(r.detail),
-            "result": screen(r.result),
+            "result": truncate_result(&screen(r.result)),
         });
         if let Some(p) = r.sandbox {
             line["sandbox"] = serde_json::Value::String(screen(&p.describe()));
@@ -60,6 +60,37 @@ fn screen(s: &str) -> String {
         FilterResult::Keep(s) | FilterResult::Redacted(s) => s,
         FilterResult::Drop => "[DROPPED]".to_string(),
     }
+}
+
+/// `result` 欄だけの上限（バイト）。監査ログの役目は「何をして、どう
+/// 終わったか」を再構成できることであり、成功した呼び出しの本文をまるごと
+/// 複製する場所ではない。特に `read` は成功するとファイル全体を本文として
+/// 返すため、上限を設けないと監査ログがワークスペースの複製先になる。
+///
+/// `polaris_tools::bash::MAX_OUTPUT_BYTES`（32 KiB）はモデルへ返す一次
+/// チャンネルの上限であり、そちらは応答の実物である必要がある。ここは
+/// 二次的な記録で、読む側が話を再構成し実物を見に行くための手掛かりが
+/// 残ればよいため、より小さい 4 KiB を選ぶ。
+const MAX_RESULT_BYTES: usize = 4 * 1024;
+
+/// `result` を上限まで切り詰める。**バイト単位で単純に切ると多バイト文字の
+/// 途中で割れて panic する** ため、文字境界まで戻ってから切る
+/// （`polaris_tools::bash::truncate` と同じ考え方）。切り詰めたことを
+/// 本文へ明記するのは、印の無い部分的な結果は完全な答えとして提示された
+/// 誤った答えになるため。
+fn truncate_result(s: &str) -> String {
+    if s.len() <= MAX_RESULT_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_RESULT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[監査ログでは {} バイトを超えたのでここで切り詰めた。全文はツール呼び出しの結果側にある]",
+        &s[..end],
+        MAX_RESULT_BYTES
+    )
 }
 
 #[cfg(test)]
@@ -251,6 +282,71 @@ mod tests {
         assert!(
             body.contains("[DROPPED]"),
             "Drop 分岐でマーカーが書かれていない"
+        );
+    }
+
+    #[test]
+    fn a_result_over_the_ceiling_is_truncated_and_says_so() {
+        // read が成功するとファイル全体を result として渡してくる。
+        // 上限を設けないと監査ログがワークスペースの複製先になる。
+        //
+        // 空白無しで 20 文字以上続く塊は screen() の高エントロピー判定に
+        // 掛かって丸ごと [DROPPED] になってしまう（それ自体は正しい挙動）ため、
+        // 単語を空白で区切った、ファイル本文らしい内容を使う。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).expect("開けない");
+
+        let long = "lorem ipsum dolor sit amet ".repeat(MAX_RESULT_BYTES / 10);
+        log.record(&Record {
+            tool: "read",
+            detail: "{}",
+            sandbox: None,
+            target: None,
+            result: &long,
+        })
+        .expect("書けない");
+
+        let line = std::fs::read_to_string(&path).expect("読めない");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
+        let recorded = v["result"].as_str().expect("result が無い");
+        assert!(
+            recorded.len() < long.len(),
+            "切り詰められていない: {} バイト",
+            recorded.len()
+        );
+        assert!(
+            recorded.contains("切り詰め"),
+            "切り詰めたことが本文に無い: {recorded}"
+        );
+    }
+
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        // バイト単位で単純に切ると多バイト文字の途中で割れて panic する。
+        // "あ" は 3 バイトなので、MAX_RESULT_BYTES（4096、3 の倍数でない）を
+        // 単純に切ると境界に当たらない位置を必ず踏む。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).expect("開けない");
+
+        let long = "あ".repeat(MAX_RESULT_BYTES / 3 + 10);
+        log.record(&Record {
+            tool: "read",
+            detail: "{}",
+            sandbox: None,
+            target: None,
+            result: &long,
+        })
+        .expect("書けない（境界の途中で切って panic した可能性がある）");
+
+        let line = std::fs::read_to_string(&path).expect("読めない");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
+        let recorded = v["result"].as_str().expect("result が無い");
+        assert!(
+            recorded.len() <= MAX_RESULT_BYTES + 200,
+            "上限近辺に収まっていない: {} バイト",
+            recorded.len()
         );
     }
 }

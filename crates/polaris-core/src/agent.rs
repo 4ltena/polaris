@@ -1033,7 +1033,7 @@ print("wrote")
     }
 
     #[tokio::test]
-    async fn bash_never_consults_the_approver() {
+    async fn bash_attempts_and_reports_without_ever_consulting_the_approver() {
         // Fix round 1 の指摘: `bash` は述語を通さないはずだが、それを配線
         // レベルで確認するテストが無かった。`ApprovalPolicy::Always`
         // （`Verdict` に関わらず必ず尋ねる）の下で `bash` を1回走らせ、
@@ -1042,12 +1042,23 @@ print("wrote")
         // ルートの内側だろうと外だろうと必ず検出できるようにするため
         // （`OnRequest` だと、混入したチェックの対象パスの選び方次第では
         // 見逃しうる）。
+        //
+        // Fix round 2 の指摘: 上記だけでは「尋ねない」半分しか固定できて
+        // いなかった。仕様が要求するのは「試行し、結果を返す」との連言
+        // （何に触れるか事前に決められないため、事前に断るのではなく実際に
+        // 触ってみて結果を報告する）であり、`bash` の腕を丸ごと no-op に
+        // 置き換えても（＝一切実行しなくても）このテストは緑のままだった
+        // （254件全通過で検出できず）。実際に副作用のあるコマンドを走らせ、
+        // (1) 副作用が本当に起きたこと（拘束された子が実際に走った証拠）と
+        // (2) その出力がツール結果として往路へ戻ってきたこと（試行の結果を
+        // 報告している証拠）の両方を確認する。
         let root = tempfile::tempdir().expect("一時ディレクトリ");
         let sandbox = polaris_sandbox::SandboxPolicy::new(
             polaris_sandbox::SandboxMode::WorkspaceWrite,
             &[root.path().to_path_buf()],
         )
         .expect("方針");
+        let proof = sandbox.writable_roots()[0].join("proof.txt");
 
         let p = Scripted {
             replies: Mutex::new(vec![
@@ -1056,7 +1067,13 @@ print("wrote")
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
                         name: "bash".into(),
-                        arguments: serde_json::json!({ "command": "echo ok" }),
+                        arguments: serde_json::json!({
+                            "command": format!(
+                                "echo bash-really-ran > {} && cat {}",
+                                proof.display(),
+                                proof.display()
+                            )
+                        }),
                     }],
                 },
                 CompletionResponse {
@@ -1068,7 +1085,7 @@ print("wrote")
 
         let dir = tempfile::tempdir().expect("一時ディレクトリ");
         let mut session = Session::new();
-        session.push_user("echo して");
+        session.push_user("proof.txt を作って中身を教えて");
         let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("開けない");
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
@@ -1100,6 +1117,30 @@ print("wrote")
             assert_eq!(out, "終わった");
         }
 
+        // (1) 副作用が実際に起きたこと。`bash` の腕を no-op に置き換えても
+        // 上の `run` 自体は成功しうるので、ここが唯一 no-op を検出できる点。
+        assert_eq!(
+            std::fs::read_to_string(&proof)
+                .expect("proof.txt が無い（bash が実際には実行されていない）")
+                .trim(),
+            "bash-really-ran",
+            "bash が実際に走った形跡が無い"
+        );
+
+        // (2) その出力がツール結果としてモデルへ戻っていること（試行の結果を
+        // 報告している証拠）。
+        let tool_msg = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.is_some())
+            .expect("ツール結果が積まれていない");
+        assert!(
+            tool_msg.content.contains("bash-really-ran"),
+            "コマンドの出力がツール結果として返っていない: {}",
+            tool_msg.content
+        );
+
+        // (3) 述語を一切通していないこと（Fix round 1 の元の主張）。
         assert_eq!(
             approver.asked, 0,
             "bash が承認者へ尋ねている（述語を通さないはずの経路に触れている）"

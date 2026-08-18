@@ -5,13 +5,16 @@
 //! 実体は同じ秘密情報に届いてしまう。サンドボックスが入るまではこの
 //! 関数が唯一の防壁なので、過小拒否になる方向の揺れは許容しない。
 //!
-//! `polaris_core::secret_screen::is_excluded_path` は監査ログへ書く前の
-//! パス除外判定であり、このモジュールとは別の目的を持つ独立した関数
+//! かつて `polaris_core::secret_screen::is_excluded_path` という、監査ログへ
+//! 書く前のパス除外判定を担う別の独立した関数が存在した
 //! （`polaris-tools` は `polaris-core` に依存できないため、そもそも直接
-//! 呼べない）。過去のレビューで、そちらのほうがここより広い秘密パスの
-//! 一覧を持っていたことが指摘された。以下の一覧はその一覧が拒否する
-//! 範囲を最低限含むように拡張してある。今後どちらか一方だけを広げると
-//! 同じズレが再発するため、両方に手を入れる。
+//! 呼べなかった）。似た目的の公開関数が2つ並び、どちらか一方だけが実際に
+//! 配線されている状態そのものが危険だった —— 次に触る者はどちらか見つけた
+//! 方を使い、半分の確率で何も守らない方を選ぶ。Task 12 で両者を突き合わせ、
+//! `is_excluded_path` だけが持っていた被覆（裸の拡張子ファイル、例えば
+//! 拡張子扱いされない `.pem` 単体の名前）をここへ折り込んだうえで
+//! `is_excluded_path` は削除した。今後この一覧を広げるときは、二重に
+//! 保守する別実装を作らずここへ集約すること。
 
 use std::path::Path;
 
@@ -76,9 +79,15 @@ pub fn is_denied(path: &Path) -> bool {
     if name.ends_with(".keychain") || name.ends_with(".keychain-db") {
         return true;
     }
-    if let Some(ext) = path.extension().map(|e| e.to_string_lossy().to_lowercase())
-        && DENIED_EXTS.iter().any(|e| ext == *e)
-    {
+    // `Path::extension()` ではなく、ファイル名そのものの末尾一致で判定する。
+    // `Path::extension()` は「先頭が `.` でそれ以外に `.` を含まない」名前
+    // （裸の `.pem` 等）を隠しファイルとして扱い拡張子無しを返すため、
+    // 鍵素材そのものである裸の拡張子ファイルを見逃す
+    // （`/tmp/x/.pem` は `Path::new(".pem").extension()` が `None` を返す —
+    // Task 12 で `secret_screen::is_excluded_path` と突き合わせて発覚した
+    // 欠落で、あちらは文字列の末尾一致だったためこの穴が無かった。ここへ
+    // 折り込む）。
+    if DENIED_EXTS.iter().any(|e| name.ends_with(&format!(".{e}"))) {
         return true;
     }
     false
@@ -248,6 +257,29 @@ mod tests {
     #[test]
     fn denies_additional_key_extensions() {
         for p in ["/home/u/key.p8", "/home/u/app.jks", "/home/u/app.keystore"] {
+            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+        }
+    }
+
+    #[test]
+    fn denies_bare_dotfiles_named_after_a_sensitive_extension() {
+        // `Path::extension()` は「先頭が `.` でそれ以外に `.` を含まない」
+        // 名前（`.pem` のような裸の拡張子ファイル）を隠しファイルとして扱い
+        // 拡張子無しを返す。`is_denied` がこれに頼っていた間は、鍵素材その
+        // ものである裸の `.pem` / `.key` 等を見逃していた
+        // （`secret_screen::is_excluded_path` との突き合わせで Task 12 が
+        // 発見し、ここへ折り込んだ欠落）。
+        assert_eq!(
+            Path::new(".pem").extension(),
+            None,
+            "前提: extension() は None を返す"
+        );
+        for p in [
+            "/home/u/.pem",
+            "/home/u/.key",
+            "/home/u/.pfx",
+            "/home/u/.p12",
+        ] {
             assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
         }
     }

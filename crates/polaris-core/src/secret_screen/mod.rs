@@ -329,55 +329,6 @@ pub fn screen_text(s: &str) -> FilterResult {
     FilterResult::Redacted(text)
 }
 
-/// 配下のファイルがすべて機微情報とみなせるディレクトリの区間（パス中に
-/// 部分文字列として現れれば除外対象）。
-/// `.ssh/` は公開鍵（`id_rsa.pub` 等）や `known_hosts` も置くディレクトリなので
-/// ここには含めず、秘密鍵のファイル名だけを [`SENSITIVE_FILE_NAMES`] で判定する。
-const SENSITIVE_DIR_SEGMENTS: &[&str] = &["/.aws/", "/.gnupg/"];
-
-/// ディレクトリを問わずシークレットとみなすファイル名（完全一致）。
-const SENSITIVE_FILE_NAMES: &[&str] = &[
-    "id_rsa",
-    "id_dsa",
-    "id_ecdsa",
-    "id_ed25519",
-    ".netrc",
-    ".npmrc",
-    "credentials",
-    // GCP/各種クラウド SDK が使う認証情報ファイル（Important 4 の是正）。
-    "credentials.json",
-    "service-account.json",
-];
-
-/// 鍵素材を示す拡張子。
-const SENSITIVE_SUFFIXES: &[&str] = &[".pem", ".key", ".pfx", ".p12"];
-
-/// パスがシークレット/PII を含みうるファイルを指しているか（保存前に除外すべきか）。
-/// 接尾辞・接頭辞・ディレクトリ区間のマッチのみで判定する純粋な文字列処理で、
-/// 実際にファイルシステムへアクセスすることはない。
-pub fn is_excluded_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
-
-    // ディレクトリ区間は「.../.aws/foo」だけでなく、末尾の「.../.aws」(末尾スラッ
-    // シュ無し = ディレクトリそのものを指すパス）も除外対象に含める。
-    let is_sensitive_dir = SENSITIVE_DIR_SEGMENTS
-        .iter()
-        .any(|seg| normalized.contains(seg) || normalized.ends_with(seg.trim_end_matches('/')));
-    if is_sensitive_dir {
-        return true;
-    }
-    if SENSITIVE_FILE_NAMES.contains(&file_name) {
-        return true;
-    }
-    if file_name == ".env" || file_name.starts_with(".env.") || file_name == ".envrc" {
-        return true;
-    }
-    SENSITIVE_SUFFIXES
-        .iter()
-        .any(|suf| file_name.ends_with(suf))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,13 +368,6 @@ mod tests {
             }
             other => panic!("expected redaction, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn excludes_dotenv() {
-        assert!(is_excluded_path("/proj/.env"));
-        assert!(is_excluded_path("/home/u/.aws/credentials"));
-        assert!(!is_excluded_path("/proj/src/main.rs"));
     }
 
     // --- 追加テスト: brief Step 3 が要求する残りのルール ---------------------
@@ -479,20 +423,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn excludes_pem_and_ssh_key_paths() {
-        assert!(is_excluded_path("/proj/certs/server.pem"));
-        assert!(is_excluded_path("/home/u/.ssh/id_rsa"));
-        assert!(!is_excluded_path("/home/u/.ssh/id_rsa.pub"));
-        assert!(!is_excluded_path("/proj/README.md"));
-    }
-
-    #[test]
-    fn excludes_aws_dir_without_trailing_slash() {
-        // ディレクトリそのものを指すパス（末尾スラッシュ無し）も除外されること。
-        assert!(is_excluded_path("/home/u/.aws"));
-    }
-
     // --- レビュー指摘の是正テスト（Critical 1〜3, Important 4〜5） -----------
 
     #[test]
@@ -519,17 +449,6 @@ mod tests {
             }
             other => panic!("expected redaction, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn excludes_credentials_json_service_account_and_envrc() {
-        // Important 4: SENSITIVE_FILE_NAMES が完全一致のみなので、
-        // `credentials.json` / `service-account.json` / `.envrc` を除外できない。
-        assert!(is_excluded_path("/proj/credentials.json"));
-        assert!(is_excluded_path("/proj/service-account.json"));
-        assert!(is_excluded_path("/home/u/.envrc"));
-        // 公開鍵は引き続き除外しないこと。
-        assert!(!is_excluded_path("/home/u/.ssh/id_rsa.pub"));
     }
 
     #[test]

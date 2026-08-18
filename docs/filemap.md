@@ -92,6 +92,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-tools/src`
 
+- `bash.rs` — `bash` ツール。拘束された `/bin/sh` の中でコマンドを走らせる。
 - `edit.rs` — `edit` ツール。`write` と同じ拘束経路を通る。
 - `lib.rs` — polaris の組込みツール。常時提供するツールは 6 本を超えない。
 - `path_policy.rs` — 読み取りを拒否するパスの判定。過検出より見逃しを避ける方向に倒す。

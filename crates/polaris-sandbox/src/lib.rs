@@ -3,6 +3,7 @@
 //! このクレートは強制の仕組みそのものを実装しない。方針と正規化済みの
 //! 書込可能ルートを保持し、プラットフォーム固有の機構へ渡すだけである。
 
+pub mod confine;
 pub mod policy;
 
 #[cfg(target_os = "macos")]
@@ -11,6 +12,7 @@ pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+pub use confine::{Outcome, run_confined};
 pub use policy::{SandboxMode, SandboxPolicy};
 
 #[derive(Debug, thiserror::Error)]

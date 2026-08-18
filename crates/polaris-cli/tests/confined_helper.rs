@@ -48,13 +48,21 @@ const STARTUP_FAILURE: &[&str] = &["panicked", "fatal runtime error", "guard pag
 /// 本番と同じ経路でヘルパのパスを得る。`main.rs` は `staged_helper` を
 /// 通しており、テストはその実体版（実行ファイルを差し替えられる方）を
 /// 本物のバイナリに対して呼ぶ。
+///
+/// 本物のバイナリを *書込可能ルートの内側へ置いてから* 渡す。これが本番の
+/// 配置そのものである（`<project>/target/debug/polaris` を `<project>` を
+/// ルートにして起動する）。`env!("CARGO_BIN_EXE_polaris")` をそのまま渡すと、
+/// ルートは毎回新しい一時ディレクトリなのでバイナリは必ずルートの外にあり、
+/// `staged_helper_from` は早期 return して複製も権限設定も退避先の検証も
+/// 一度も走らない。それでは「退避先がルートの外にある」という主張が構造上
+/// 必ず真になり、何も確かめていないことになる。
 fn staged_real_binary(policy: &SandboxPolicy, state_dir: &Path) -> PathBuf {
-    polaris_sandbox::stage::staged_helper_from(
-        policy,
-        state_dir,
-        Path::new(env!("CARGO_BIN_EXE_polaris")),
-    )
-    .expect("ヘルパを用意できない")
+    let inside_the_root = policy.writable_roots()[0].join("polaris");
+    std::fs::copy(env!("CARGO_BIN_EXE_polaris"), &inside_the_root)
+        .expect("本物のバイナリを書込可能ルートの内側へ置けない");
+
+    polaris_sandbox::stage::staged_helper_from(policy, state_dir, &inside_the_root)
+        .expect("ヘルパを用意できない")
 }
 
 fn workspace_write(root: &Path) -> SandboxPolicy {
@@ -68,9 +76,18 @@ fn a_write_inside_the_root_lands_through_the_real_binary_under_a_real_profile() 
     let policy = workspace_write(root.path());
     let helper = staged_real_binary(&policy, state.path());
 
+    // ここは `staged_helper_from` が実際に複製したことを見ている。渡した
+    // 実体は書込可能ルートの内側にあるので、退避が働かなければこの主張は
+    // 偽になる（ワークスペースへ書ける者が次の変更操作のヘルパを差し替え
+    // られる状態がそのまま残る）。
     assert!(
         !helper.starts_with(policy.writable_roots()[0].as_path()),
         "ヘルパが書込可能ルートの内側にある: {}",
+        helper.display()
+    );
+    assert!(
+        helper.exists(),
+        "退避したはずのヘルパが無い: {}",
         helper.display()
     );
 

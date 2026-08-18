@@ -72,6 +72,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-provider/src`
 
+- `codex.rs` — ChatGPT のサブスクリプション認証で Responses API を話すプロバイダ。
 - `lib.rs` — プロバイダ抽象。トランスポートに依存する部分は各実装が持ち、
 - `openai.rs` — OpenAI 互換のチャット補完。base_url を差し替えれば互換エンドポイントも叩ける。
 - `sse.rs` — SSE(text/event-stream)を逐次デコードする。バイト片を push すると、

@@ -18,4 +18,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+# 本物のバイナリを本物のプロファイルの下でヘルパとして起動する統合テスト
+# （tests/confined_helper.rs）が、ツール層をそのまま通すために要る。
+polaris-tools = { path = "../polaris-tools" }
 tempfile = { workspace = true }

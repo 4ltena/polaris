@@ -14,11 +14,13 @@ pub fn default_path() -> Result<PathBuf, AuthError> {
     Ok(Path::new(&home).join(".polaris").join("auth.json"))
 }
 
-/// 保存する。一時ファイルへ書いてから 0600 にして rename する。rename は
-/// 同一ディレクトリ内で原子的なので、途中で落ちても本体が半端な内容に
+/// 保存する。一時ファイルを 0600 で新規作成し（既存の tmp を開き直す場合は
+/// set_permissions で締める）、書いてから rename する。rename は同一
+/// ディレクトリ内で原子的なので、途中で落ちても本体が半端な内容に
 /// 置き換わることがない。
 pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -27,20 +29,44 @@ pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     let body = serde_json::to_vec_pretty(c)
         .map_err(|e| AuthError::Decode(format!("資格情報を直列化できない: {e}")))?;
 
-    // 既存の一時ファイルが残っている場合に備えて truncate する。open 時の
-    // mode は新規作成のときにしか効かず、この truncate 経路で既存ファイル
-    // を開いた場合には無力なので、パーミッションは open の引数に頼らず
-    // 常に set_permissions で明示する。これが 0600 を保証する唯一の経路
-    // であり、単一責任にしておくことで「もう一方があるから消してよい」と
-    // いう誤読を防ぐ。
+    // 0600 は open 時の mode と set_permissions の二重で保証する。これは
+    // 冗長ではない。両者は同じ後置条件へ別ルートで到達しているのではなく、
+    // それぞれ別の経路だけを担っている: mode は「tmp を新規作成する」経路
+    // （通常の save_to 呼び出しはほぼ毎回ここを通る）を、set_permissions は
+    // 「前回の書き込みが rename 前に中断し、緩いパーミッションの tmp が
+    // 残っていてそれを開き直す」経路を担う。
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
+        // mode(0o600) はここが担う新規作成経路でのみ意味を持つ。open() が
+        // ファイルを新規作成する瞬間にモードをファイル生成へ埋め込むため、
+        // 生成からこの後の set_permissions が効くまでの間、ファイルが
+        // umask 既定（この環境では 0644）で存在する window は一切生じない。
+        // write_all/sync_all/drop の後で権限を締める set_permissions では、
+        // 生成の瞬間から締めるまでのこの window 自体を閉じることはできない
+        // — ここは平文の OAuth access_token/refresh_token を書き込む対象
+        // であり、この window を残さないことに意味がある。
+        //
+        // ただしこの window は他プロセスからの並行アクセスでしか観測でき
+        // ない性質であり、単一スレッド・逐次実行のこのファイル内のテスト
+        // では、この mode(0o600) を消しても検出できない（個別ミューテー
+        // ション再検証で確認済み）。これは tmp+rename の原子性がテストで
+        // 観測不能なのと同種の限界で、polaris-sandbox の述語が「これは
+        // 緩和であって保証ではない」と明記する書き方に倣い、ここでも
+        // 「テストが無い＝忘れられた」ではなく「性質上テストできない」こと
+        // を明記しておく。この行を消してよい根拠には決してならない。
+        .mode(0o600)
         .open(&tmp)?;
     f.write_all(&body)?;
     f.sync_all()?;
     drop(f);
+    // set_permissions はこちらの経路（既存 tmp の開き直し）を担う。open 時
+    // の mode は新規作成のときにしか効かず、この経路で既存ファイルを開いた
+    // 場合には無力なので、set_permissions が unconditionally 効くことが
+    // この経路で 0600 を保証する唯一の手段になる。
+    // a_preexisting_loose_temp_file_is_still_corrected_to_owner_only で
+    // 個別にテストされている。
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(&tmp, path)?;
     Ok(())

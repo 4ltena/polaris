@@ -26,8 +26,8 @@ impl AuditLog {
     pub fn record(&mut self, r: &Record<'_>) -> std::io::Result<()> {
         let mut line = serde_json::json!({
             "tool": screen(r.tool),
-            "detail": screen(r.detail),
-            "result": truncate_result(&screen(r.result)),
+            "detail": truncate_field(&screen(r.detail), MAX_DETAIL_BYTES),
+            "result": truncate_field(&screen(r.result), MAX_RESULT_BYTES),
         });
         if let Some(p) = r.sandbox {
             line["sandbox"] = serde_json::Value::String(screen(&p.describe()));
@@ -73,23 +73,36 @@ fn screen(s: &str) -> String {
 /// 残ればよいため、より小さい 4 KiB を選ぶ。
 const MAX_RESULT_BYTES: usize = 4 * 1024;
 
-/// `result` を上限まで切り詰める。**バイト単位で単純に切ると多バイト文字の
+/// `detail` 欄だけの上限（バイト）。`detail` は「モデルが送った引数だから
+/// 有界」という理屈で当初は無制限にしていたが誤りだった。`write` の
+/// `content` はファイル全体、`edit` の `old`/`new` もファイルの一部を
+/// まるごと運びうる（`polaris-tools::write_spec` / `edit_spec` 参照）。
+/// これは `read` が成功したときの `result`（ファイル全体の本文）と
+/// 構造的に同じ危険であり、「何を依頼されたか」を再構成できれば足りる
+/// という監査ログの役目も `result` と同一である。あえて別の値を選ぶ理由が
+/// 無いため、`MAX_RESULT_BYTES` と同じ 4 KiB を採用する（値が一致するのは
+/// 決め打ちの結果であり、定数を分けているのは今後どちらかだけ変える必要が
+/// 生じたときに独立して変更できるようにするため）。
+const MAX_DETAIL_BYTES: usize = MAX_RESULT_BYTES;
+
+/// 欄を上限まで切り詰める。**バイト単位で単純に切ると多バイト文字の
 /// 途中で割れて panic する** ため、文字境界まで戻ってから切る
 /// （`polaris_tools::bash::truncate` と同じ考え方）。切り詰めたことを
 /// 本文へ明記するのは、印の無い部分的な結果は完全な答えとして提示された
-/// 誤った答えになるため。
-fn truncate_result(s: &str) -> String {
-    if s.len() <= MAX_RESULT_BYTES {
+/// 誤った答えになるため。`result` と `detail` の両方がこれを通る
+/// （[`AuditLog::record`] 参照）。
+fn truncate_field(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
         return s.to_string();
     }
-    let mut end = MAX_RESULT_BYTES;
+    let mut end = max_bytes;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
     format!(
-        "{}\n[監査ログでは {} バイトを超えたのでここで切り詰めた。全文はツール呼び出しの結果側にある]",
+        "{}\n[監査ログでは {} バイトを超えたのでここで切り詰めた。全文は元のツール呼び出しか対象ファイルを確認すること]",
         &s[..end],
-        MAX_RESULT_BYTES
+        max_bytes
     )
 }
 
@@ -347,6 +360,44 @@ mod tests {
             recorded.len() <= MAX_RESULT_BYTES + 200,
             "上限近辺に収まっていない: {} バイト",
             recorded.len()
+        );
+    }
+
+    #[test]
+    fn a_detail_over_the_ceiling_is_truncated_and_says_so() {
+        // detail は「モデルが送った引数だから有界」という理屈で当初は
+        // 無制限だったが誤り。write の content や edit の old/new は
+        // ファイル全体を運びうる。result と同じ経路（truncate_field）を
+        // 通ることを確認する。
+        //
+        // 空白無しで 20 文字以上続く塊は screen() の高エントロピー判定に
+        // 掛かって丸ごと [DROPPED] になってしまう（それ自体は正しい挙動）ため、
+        // 単語を空白で区切った、ファイル本文らしい内容を使う。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).expect("開けない");
+
+        let long = "lorem ipsum dolor sit amet ".repeat(MAX_DETAIL_BYTES / 10);
+        log.record(&Record {
+            tool: "write",
+            detail: &long,
+            sandbox: None,
+            target: None,
+            result: "ok",
+        })
+        .expect("書けない");
+
+        let line = std::fs::read_to_string(&path).expect("読めない");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
+        let recorded = v["detail"].as_str().expect("detail が無い");
+        assert!(
+            recorded.len() < long.len(),
+            "切り詰められていない: {} バイト",
+            recorded.len()
+        );
+        assert!(
+            recorded.contains("切り詰め"),
+            "切り詰めたことが本文に無い: {recorded}"
         );
     }
 }

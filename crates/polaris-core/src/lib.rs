@@ -5,6 +5,7 @@ pub mod audit;
 pub mod budget;
 pub mod config;
 pub mod constitution;
+pub mod project;
 pub mod prompt;
 pub mod secret_screen;
 pub mod session;

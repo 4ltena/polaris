@@ -1,5 +1,6 @@
 //! polaris の組込みツール。常時提供するツールは 6 本を超えない。
 
+pub mod bash;
 pub mod edit;
 pub mod path_policy;
 pub mod predicate;
@@ -39,11 +40,23 @@ pub enum ToolError {
         policy: String,
         detail: String,
     },
+    #[error("コマンドが終了コード {status} で失敗した。方針 {policy}。出力: {detail}")]
+    CommandFailed {
+        status: i32,
+        policy: String,
+        detail: String,
+    },
 }
 
 /// 常時提供するツールの一覧。
 pub fn all_specs() -> Vec<ToolSpec> {
-    vec![read_spec(), write_spec(), edit_spec(), skill_spec()]
+    vec![
+        read_spec(),
+        write_spec(),
+        edit_spec(),
+        bash_spec(),
+        skill_spec(),
+    ]
 }
 
 fn read_spec() -> ToolSpec {
@@ -89,6 +102,20 @@ fn edit_spec() -> ToolSpec {
                 "new": { "type": "string", "description": "置換後の文字列。" }
             },
             "required": ["path", "old", "new"]
+        }),
+    }
+}
+
+fn bash_spec() -> ToolSpec {
+    ToolSpec {
+        name: "bash",
+        description: "シェルコマンドを実行する。grep と find もここから使う。サンドボックスの外への書き込みは拒否される。",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "/bin/sh -c へ渡すコマンド行。" }
+            },
+            "required": ["command"]
         }),
     }
 }

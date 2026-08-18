@@ -22,6 +22,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-auth/src`
 
 - `lib.rs` — ChatGPT のサブスクリプション認証（OAuth）の寿命と資格情報の保管。
+- `login.rs` — 認可 URL の組み立てと、コールバックの一度きりの受け取り。
 - `pkce.rs` — PKCE (RFC 7636) の verifier と challenge。
 - `store.rs` — 資格情報の保管。`~/.polaris/auth.json`、0600、原子的書き込み。
 - `token.rs` — `/oauth/token` への交換と更新。

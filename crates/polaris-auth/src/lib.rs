@@ -9,6 +9,7 @@
 //! ローテーションさせる場合、こちらが更新した瞬間に codex 側の控えが
 //! 失効しうる。独立した store を持てば、この事故は原理的に起きない。
 
+pub mod login;
 pub mod pkce;
 pub mod store;
 pub mod token;

@@ -1,9 +1,11 @@
 //! polaris の組込みツール。常時提供するツールは 6 本を超えない。
 
+pub mod edit;
 pub mod path_policy;
 pub mod predicate;
 pub mod read;
 pub mod skill;
+pub mod write;
 
 use serde::Serialize;
 
@@ -29,11 +31,19 @@ pub enum ToolError {
         limit: u64,
         actual: u64,
     },
+    #[error("サンドボックス: {0}")]
+    Sandbox(#[from] polaris_sandbox::SandboxError),
+    #[error("{path} への書き込みは拒否された。方針 {policy}。子の出力: {detail}")]
+    WriteDenied {
+        path: String,
+        policy: String,
+        detail: String,
+    },
 }
 
 /// 常時提供するツールの一覧。
 pub fn all_specs() -> Vec<ToolSpec> {
-    vec![read_spec(), skill_spec()]
+    vec![read_spec(), write_spec(), edit_spec(), skill_spec()]
 }
 
 fn read_spec() -> ToolSpec {
@@ -48,6 +58,37 @@ fn read_spec() -> ToolSpec {
                 "limit": { "type": "integer" }
             },
             "required": ["path"]
+        }),
+    }
+}
+
+fn write_spec() -> ToolSpec {
+    ToolSpec {
+        name: "write",
+        description: "ファイルを新規作成する。既存ファイルは上書きする。途中のディレクトリは作る。",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "書き込む先のパス。" },
+                "content": { "type": "string", "description": "ファイル全体の内容。" }
+            },
+            "required": ["path", "content"]
+        }),
+    }
+}
+
+fn edit_spec() -> ToolSpec {
+    ToolSpec {
+        name: "edit",
+        description: "既存ファイルの一部を置き換える。old はファイル内で一意に定まる文字列にすること。複数一致すると失敗する。",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "編集するファイルのパス。" },
+                "old": { "type": "string", "description": "置換前の文字列。ファイル内で一意であること。" },
+                "new": { "type": "string", "description": "置換後の文字列。" }
+            },
+            "required": ["path", "old", "new"]
         }),
     }
 }

@@ -56,6 +56,31 @@ pub fn apply_to_current_process(policy: &SandboxPolicy) -> Result<(), SandboxErr
         ))
         .map_err(|e| SandboxError::NotEnforced(format!("読み取り規則を足せない: {e}")))?;
 
+    // `/dev/null` への書き込みだけを開ける。macOS 側と同じ理由である
+    // （`macos::build_profile` の長いコメントを参照）。landlock でも
+    // `cmd > /dev/null` は
+    // `/bin/sh: 1: cannot create /dev/null: Permission denied` となり、
+    // リダイレクトが開けない時点でコマンド本体が一度も走らない。
+    //
+    // 与える権利は `AccessFs::WriteFile` の 1 つだけとする。`>` が要求する
+    // のは既存ファイルを書き込みで開くことであり、それを司る権利がこれ
+    // 一つである（`O_TRUNC` を司る `Truncate` は ABI V3 の権利で、この
+    // ruleset は V2 の権利しか handle していないため関与しない）。
+    // `AccessFs::from_all` を渡すと unlink（`RemoveFile`）や同じ場所への
+    // 新規作成まで一緒に開くことになるので使わない。規則の対象は
+    // `/dev/null` というファイル 1 個であり、`PathBeneath` を使っていても
+    // ディレクトリではないため `/dev` 配下の他のノードには波及しない。
+    //
+    // read-only でも足すのは macOS と同じ理由による。書いた内容は捨てられ、
+    // ファイルシステムの状態は変わらない。
+    ruleset = ruleset
+        .add_rule(PathBeneath::new(
+            PathFd::new("/dev/null")
+                .map_err(|e| SandboxError::NotEnforced(format!("/dev/null を開けない: {e}")))?,
+            AccessFs::WriteFile,
+        ))
+        .map_err(|e| SandboxError::NotEnforced(format!("/dev/null の規則を足せない: {e}")))?;
+
     for root in policy.writable_roots() {
         ruleset = ruleset
             .add_rule(PathBeneath::new(

@@ -62,6 +62,39 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
     // いるのは書き込みの境界であって、読み取りはすでに直上の
     // `(allow file-read*)` でファイルシステム全体に開いている。
     p.push_str("(allow sysctl-read)\n");
+    // `/dev/null` への書き込みだけを開ける。`cmd > /dev/null` と
+    // `cmd 2>/dev/null` はシェルの常套句であり、リダイレクトが開けないと
+    // シェルは本体を一度も実行せずに落ちる（`ls / >/dev/null && echo ok`
+    // で何も走らないことを実測した）。しかもその失敗は
+    // 「方針 workspace-write（書込可能: <root>）」を名指しする形でモデルへ
+    // 届くので、モデルは書込可能ルートの側を疑い、パスを変えて同じ失敗を
+    // 何度でも繰り返す。仕様の「原因を掴めない拒否メッセージは同じ失敗の
+    // 反復を招き、時間とトークンを消費する」に当たる。
+    //
+    // 実測（本物のプロファイルを `/usr/bin/sandbox-exec` へ直接渡した）:
+    //
+    // | 追加する許可 | `> /dev/null` | ルート内 | ルート外 | `rm /dev/null` |
+    // | 無し（従来） | 拒否 | 可 | 拒否 | 拒否 |
+    // | `file-write-data (literal "/dev/null")` | 可 | 可 | 拒否 | 拒否 |
+    // | `file-write* (literal "/dev/null")` | 可 | 可 | 拒否 | 拒否 |
+    //
+    // `file-write-create` だけ、`file-write-mode` だけではどちらも
+    // `Operation not permitted` のままで開けない。`file-write-data` が
+    // リダイレクトを通す最小の権利であり、`file-write*` と違って unlink も
+    // setattr も与えない。対象は `(literal "/dev/null")` の 1 個だけで、
+    // `/dev/zero`、`/dev/stdout`、`/dev/stderr`、`/dev/fd/N`、`/dev` 配下の
+    // 新規作成がいずれも拒否のままであることも同じ実測で確認した。
+    // `/dev/stdout` などを開けるかは fdesc 越しの再判定という別の測定を
+    // 要するため、ここでは意図的に触れない（M3 の課題）。
+    //
+    // read-only でもこの 1 行を出す。`/dev/null` への書き込みはカーネルが
+    // 捨てるだけでファイルシステムの状態を一切変えないので、read-only が
+    // 守っている性質（何も変更されない）は減らない。実際に read-only の
+    // 下で普通のファイルへの書き込みが拒否されたままであることは
+    // `confine.rs` の実サンドボックステストが対で見ている。ここで分岐を
+    // 設けると、`--sandbox read-only` の `bash` だけが同じ誤解を招く拒否を
+    // 出し続けることになる。
+    p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
 
     let roots = policy.writable_roots();
     if !roots.is_empty() {
@@ -135,16 +168,51 @@ mod tests {
     }
 
     #[test]
-    fn read_only_grants_no_write_at_all() {
+    fn read_only_grants_no_write_to_any_file_beyond_the_dev_null_sink() {
         // read-only でルートは持てない（Task 1 で拒否される）。ここで見るのは
         // 書き込み許可の節そのものが出ないこと。空のルート一覧に対して
         // (allow file-write*) だけが裸で残ると、全書き込みが許可される。
+        //
+        // 例外は `/dev/null` の 1 行だけである。書いた内容をカーネルが捨てる
+        // だけでファイルシステムの状態を変えないため read-only の性質を
+        // 減らさない。行を数える形で固定するのは、「書き込みに触れる許可が
+        // ここに増えていない」ことが read-only の中身そのものだからである。
+        // `!contains("file-write*")` だけでは `file-write-data` を使った
+        // 追加の許可が黙って通る。
         let policy = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("方針");
         let p = build_profile(&policy);
         assert!(!p.contains("file-write*"), "書き込み許可がある:\n{p}");
+        let writes: Vec<&str> = p.lines().filter(|l| l.contains("file-write")).collect();
+        assert_eq!(
+            writes,
+            vec!["(allow file-write-data (literal \"/dev/null\"))"],
+            "read-only に /dev/null 以外の書き込み許可がある:\n{p}"
+        );
         assert!(
             p.contains("(allow file-read*)"),
             "読み取りが許可されていない:\n{p}"
+        );
+    }
+
+    #[test]
+    fn the_restrictive_profile_keeps_the_sysctl_read_grant() {
+        // この 1 行が消えると、Rust のランタイムは main の前段で
+        // `sysconf(_SC_PAGESIZE)` を引けず、ガードページの mmap が EINVAL で
+        // 失敗して SIGABRT する。つまり本物のヘルパが起動できなくなり、その
+        // 中断は方針違反による拒否と同じ形（非0終了 + stderr）でモデルへ届く。
+        // 本命の検出は本物のバイナリを使う `polaris-cli/tests/confined_helper.rs`
+        // だが、事故による削除をユニットの段で即座に落とす。
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let ws = build_profile(&workspace(&[dir.path().to_path_buf()]));
+        assert!(
+            ws.contains("(allow sysctl-read)"),
+            "workspace-write に sysctl-read が無い:\n{ws}"
+        );
+
+        let ro = build_profile(&SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("方針"));
+        assert!(
+            ro.contains("(allow sysctl-read)"),
+            "read-only に sysctl-read が無い:\n{ro}"
         );
     }
 

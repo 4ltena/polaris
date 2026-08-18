@@ -98,11 +98,33 @@ pub enum ProviderError {
     Http(String),
     #[error("応答を解釈できない: {0}")]
     Decode(String),
+    #[error("認証: {0}")]
+    Auth(String),
 }
 
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
+}
+
+/// 1 回の要求に使う資格情報。プロバイダはこれ以上のことを知らない。
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub access_token: String,
+    pub account_id: String,
+}
+
+/// トークンの供給元。`token()` は「いま使えるもの」を返し、`refreshed()`
+/// は期限に関わらず更新したものを返す。401 を受けたあとの再試行が後者を
+/// 使う。
+///
+/// このトレイトを `polaris-provider` に置き、実装を `polaris-cli` に
+/// 置くことで、`polaris-auth` がこのクレートへ依存せずに済む。同時に、
+/// プロバイダのテストが OAuth もファイルもブラウザも要らなくなる。
+#[async_trait::async_trait]
+pub trait TokenSource: Send + Sync {
+    async fn token(&self) -> Result<Token, ProviderError>;
+    async fn refreshed(&self) -> Result<Token, ProviderError>;
 }
 
 #[cfg(test)]
@@ -152,5 +174,48 @@ mod tests {
         let mut d = sse::SseDecoder::new();
         let evs = d.push(b"data: hello\n\n");
         assert_eq!(evs[0].data, "hello");
+    }
+
+    struct CannedTokens {
+        first: String,
+        second: String,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSource for CannedTokens {
+        async fn token(&self) -> Result<Token, ProviderError> {
+            Ok(Token {
+                access_token: self.first.clone(),
+                account_id: "acct".into(),
+            })
+        }
+        async fn refreshed(&self) -> Result<Token, ProviderError> {
+            Ok(Token {
+                access_token: self.second.clone(),
+                account_id: "acct".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn token_source_is_object_safe_and_distinguishes_refresh() {
+        let s: Box<dyn TokenSource> = Box::new(CannedTokens {
+            first: "a".into(),
+            second: "b".into(),
+        });
+        assert_eq!(s.token().await.expect("取れる").access_token, "a");
+        assert_eq!(s.refreshed().await.expect("取れる").access_token, "b");
+    }
+
+    /// 認証の失敗はモデルの失敗と別の種類である。文面ではなく型で
+    /// 区別できること。文面での判別は、メッセージを直した瞬間に壊れる。
+    #[test]
+    fn an_auth_error_is_its_own_variant() {
+        let e = ProviderError::Auth("ログインしていない".into());
+        assert!(matches!(e, ProviderError::Auth(_)));
+        assert!(
+            !matches!(ProviderError::Http("x".into()), ProviderError::Auth(_)),
+            "Http が Auth と一致してしまう"
+        );
     }
 }

@@ -1181,7 +1181,7 @@ pub async fn run(issuer: &str, store_path: &Path) -> Result<Credentials, AuthErr
 - [ ] **Step 4: テストが通ることを確かめる**
 
 Run: `cargo test -p polaris-auth`
-Expected: 30 passed, 0 failed。
+Expected: 29 passed, 0 failed。
 
 - [ ] **Step 5: 変異で確かめる**
 
@@ -1356,7 +1356,7 @@ pub fn logout(store_path: &Path) -> Result<bool, AuthError> {
 - [ ] **Step 4: テストが通ることを確かめる**
 
 Run: `cargo test -p polaris-auth`
-Expected: 37 passed, 0 failed。
+Expected: 36 passed, 0 failed。
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings` と `cargo fmt --all -- --check`
 Expected: どちらも clean。
@@ -2279,14 +2279,10 @@ git commit -m "feat(provider): fold Responses SSE events into a completion"
     }
 ```
 
-`crates/polaris-provider/Cargo.toml` の `[dev-dependencies]` に `async-trait` を足す（テスト内でトレイトを実装するため）。
-
-```toml
-[dev-dependencies]
-tokio = { workspace = true }
-wiremock = { workspace = true }
-async-trait = { workspace = true }
-```
+`crates/polaris-provider/Cargo.toml` は変更しない。`async-trait` は既に
+`[dependencies]` にあり（Task 6 以前から存在する）、`[dev-dependencies]` へ
+重ねて書く必要はない。テストコードは `[dependencies]` のクレートをそのまま
+使える。
 
 - [ ] **Step 2: テストが落ちることを確かめる**
 

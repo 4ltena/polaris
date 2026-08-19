@@ -1,39 +1,45 @@
-//! 本物の `polaris` バイナリを、本物の拘束プロファイルの下でヘルパとして
-//! 起動する統合テスト。
+//! Integration test that launches the real `polaris` binary as a helper
+//! under a real confinement profile.
 //!
-//! これが無かったために M2 の中心機能が壊れたまま緑で出荷されかけた。
-//! ツール層のテストはすべて `/bin/sh` の代役ヘルパを使っており、代役は
-//! どんなプロファイルの下でも起動できる。一方、本物のヘルパは Rust の
-//! ランタイムを持つ。macOS の既定（`workspace-write`）と `read-only` では
-//! プロファイルに `(allow sysctl-read)` が無く、ガードページを張る前段で
-//! `sysconf(_SC_PAGESIZE)` が拒否されて起動時に SIGABRT していた。つまり
-//! ワークスペースの *内側* への `write` / `edit` すら失敗し、しかもその
-//! 中断が「方針による拒否」と同じ形（非0終了 + stderr）でモデルへ届いて
-//! いた。代役ヘルパのテストはこの区別を作れない。
+//! Without this, M2's central feature nearly shipped green while broken.
+//! Every test at the tool layer uses a `/bin/sh` stand-in helper, and the
+//! stand-in can launch under any profile. The real helper, on the other
+//! hand, carries the Rust runtime. Under macOS's default
+//! (`workspace-write`) and `read-only`, the profile lacked `(allow
+//! sysctl-read)`, so `sysconf(_SC_PAGESIZE)` was refused right before
+//! setting up the guard page, and the process SIGABRTed on startup. That
+//! meant even `write` / `edit` *inside* the workspace failed, and that
+//! abort reached the model in the exact same shape as "denied by policy"
+//! (nonzero exit + stderr). Tests using the stand-in helper can't tell the
+//! two apart.
 //!
-//! ここで確かめるのは 3 点である。
+//! What this verifies is three things.
 //!
-//! 1. 書込可能ルートの内側への変更が本当に成立する（ファイルが存在し、
-//!    中身が `content` そのものである = 本物のヘルパが JSON を解釈した）
-//! 2. ルートの外への変更が本当に拒否される。しかも「ヘルパが起動できな
-//!    かった」ではなく「方針が拒んだ」として拒否される
-//! 3. 目印が一致しない `edit` は拒否ではなく要求の問題として返る
+//! 1. A change inside the writable root really lands (the file exists,
+//!    and its contents are exactly `content` — meaning the real helper
+//!    parsed the JSON)
+//! 2. A change outside the root is really refused, and refused as
+//!    "denied by policy", not "the helper failed to launch"
+//! 3. An `edit` whose marker doesn't match comes back as a request
+//!    problem, not a denial
 //!
-//! この場所を選んだ理由: 本物のバイナリのパスをテストから得る手段が
-//! `env!("CARGO_BIN_EXE_polaris")` であり、これはバイナリを宣言している
-//! クレート（`polaris-cli`）の統合テストでのみ使える。`polaris-tools` の
-//! ユニットテストからは、ビルド生成物のパスを推測する以外に到達できず、
-//! 推測はプロファイルや `--target` の指定で静かに外れる。
+//! Why this location: the only way for a test to obtain the real binary's
+//! path is `env!("CARGO_BIN_EXE_polaris")`, which only works in
+//! integration tests of the crate that declares the binary
+//! (`polaris-cli`). From `polaris-tools`'s unit tests there's no way to
+//! reach it other than guessing the build artifact's path, and that guess
+//! silently breaks with profile or `--target` choices.
 
 use std::path::{Path, PathBuf};
 
 use polaris_sandbox::{SandboxMode, SandboxPolicy};
 use polaris_tools::ToolError;
 
-/// OS がその操作を拒んだときに現れる文言。macOS の Seatbelt は `EPERM`、
-/// Linux の landlock は `EACCES` を返し、それぞれ Rust の `io::Error` では
-/// `(os error 1)` / `(os error 13)` として表示される。子が `/bin/sh` の
-/// 場合はシェル自身の文言（`Operation not permitted`）が載る。
+/// The text that appears when the OS refuses the operation. macOS's
+/// Seatbelt returns `EPERM`, Linux's landlock returns `EACCES`, and
+/// Rust's `io::Error` displays each as `(os error 1)` / `(os error 13)`
+/// respectively. When the child is `/bin/sh`, the shell's own wording
+/// (`Operation not permitted`) appears.
 const OS_REFUSAL: &[&str] = &[
     "Operation not permitted",
     "Permission denied",
@@ -41,92 +47,100 @@ const OS_REFUSAL: &[&str] = &[
     "(os error 13)",
 ];
 
-/// ヘルパが起動そのものに失敗したときに現れる文言。拒否と取り違えて
-/// いないことを確かめるために使う。
+/// The text that appears when the helper itself fails to launch. Used to
+/// confirm this isn't being mistaken for a denial.
 const STARTUP_FAILURE: &[&str] = &["panicked", "fatal runtime error", "guard page"];
 
-/// 本番と同じ経路でヘルパのパスを得る。`main.rs` は `staged_helper` を
-/// 通しており、テストはその実体版（実行ファイルを差し替えられる方）を
-/// 本物のバイナリに対して呼ぶ。
+/// Obtains the helper's path through the same path production uses.
+/// `main.rs` goes through `staged_helper`, so the test calls its
+/// underlying version (the one whose executable can be swapped) against
+/// the real binary.
 ///
-/// 本物のバイナリを *書込可能ルートの内側へ置いてから* 渡す。これが本番の
-/// 配置そのものである（`<project>/target/debug/polaris` を `<project>` を
-/// ルートにして起動する）。`env!("CARGO_BIN_EXE_polaris")` をそのまま渡すと、
-/// ルートは毎回新しい一時ディレクトリなのでバイナリは必ずルートの外にあり、
-/// `staged_helper_from` は早期 return して複製も権限設定も退避先の検証も
-/// 一度も走らない。それでは「退避先がルートの外にある」という主張が構造上
-/// 必ず真になり、何も確かめていないことになる。
+/// Passes the real binary in only *after placing it inside the writable
+/// root*. This is exactly production's layout (launching
+/// `<project>/target/debug/polaris` with `<project>` as the root). If
+/// `env!("CARGO_BIN_EXE_polaris")` were passed directly, the root is a
+/// fresh temp directory every time, so the binary would always already be
+/// outside the root, and `staged_helper_from` would return early — never
+/// running the copy, the permission setup, or the verification of the
+/// staging location even once. That would make the claim "the staging
+/// location is outside the root" structurally always true, verifying
+/// nothing.
 fn staged_real_binary(policy: &SandboxPolicy, state_dir: &Path) -> PathBuf {
     let inside_the_root = policy.writable_roots()[0].join("polaris");
     std::fs::copy(env!("CARGO_BIN_EXE_polaris"), &inside_the_root)
-        .expect("本物のバイナリを書込可能ルートの内側へ置けない");
+        .expect("could not place the real binary inside the writable root");
 
     polaris_sandbox::stage::staged_helper_from(policy, state_dir, &inside_the_root)
-        .expect("ヘルパを用意できない")
+        .expect("could not prepare the helper")
 }
 
 fn workspace_write(root: &Path) -> SandboxPolicy {
-    SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.to_path_buf()]).expect("方針")
+    SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.to_path_buf()]).expect("policy")
 }
 
 #[test]
 fn a_write_inside_the_root_lands_through_the_real_binary_under_a_real_profile() {
-    let root = tempfile::tempdir().expect("一時ディレクトリ");
-    let state = tempfile::tempdir().expect("一時ディレクトリ");
+    let root = tempfile::tempdir().expect("temp directory");
+    let state = tempfile::tempdir().expect("temp directory");
     let policy = workspace_write(root.path());
     let helper = staged_real_binary(&policy, state.path());
 
-    // ここは `staged_helper_from` が実際に複製したことを見ている。渡した
-    // 実体は書込可能ルートの内側にあるので、退避が働かなければこの主張は
-    // 偽になる（ワークスペースへ書ける者が次の変更操作のヘルパを差し替え
-    // られる状態がそのまま残る）。
+    // This checks that `staged_helper_from` actually made a copy. Since
+    // the binary we passed in is inside the writable root, this claim
+    // would be false if staging didn't work (leaving anyone who can write
+    // to the workspace able to replace the helper used for the next
+    // mutation).
     assert!(
         !helper.starts_with(policy.writable_roots()[0].as_path()),
-        "ヘルパが書込可能ルートの内側にある: {}",
+        "helper is inside the writable root: {}",
         helper.display()
     );
     assert!(
         helper.exists(),
-        "退避したはずのヘルパが無い: {}",
+        "the helper that should have been staged is missing: {}",
         helper.display()
     );
 
     let target = policy.writable_roots()[0].join("in.txt");
-    let msg = polaris_tools::write::write(&policy, &helper, &target, "本文")
-        .expect("ワークスペースの内側への書き込みが失敗した（本物のヘルパが拘束下で起動できていない可能性がある）");
-
-    // 中身が `content` そのものであることを見る。代役ヘルパのテストが
-    // 見ているのは「stdin に乗った直列化結果」であって、これではない。
-    // ここが一致するのは、本物のヘルパが JSON を `Mutation` として解釈し、
-    // `helper::apply` が実際に走ったときだけである。
-    assert_eq!(
-        std::fs::read_to_string(&target).expect("ファイルが無い"),
-        "本文",
-        "書かれた内容が content そのものでない"
+    let msg = polaris_tools::write::write(&policy, &helper, &target, "body text").expect(
+        "write inside the workspace failed (the real helper may not be able to launch under confinement)",
     );
-    assert!(!msg.trim().is_empty(), "結果の説明が空");
+
+    // Checks that the content is exactly `content`. What the stand-in
+    // helper's tests check is "the serialized result that rode on
+    // stdin", which is not this. This only matches when the real helper
+    // parsed the JSON as a `Mutation` and `helper::apply` actually ran.
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("file is missing"),
+        "body text",
+        "the content written is not exactly `content`"
+    );
+    assert!(!msg.trim().is_empty(), "result description is empty");
 }
 
 #[test]
 fn a_write_outside_the_root_is_refused_by_the_policy_not_by_a_helper_that_could_not_start() {
-    let root = tempfile::tempdir().expect("一時ディレクトリ");
-    let outside = tempfile::tempdir().expect("一時ディレクトリ");
-    let state = tempfile::tempdir().expect("一時ディレクトリ");
+    let root = tempfile::tempdir().expect("temp directory");
+    let outside = tempfile::tempdir().expect("temp directory");
+    let state = tempfile::tempdir().expect("temp directory");
     let policy = workspace_write(root.path());
     let helper = staged_real_binary(&policy, state.path());
 
-    // 対照実験をこのテストの中に置く。ルート外への失敗だけを見るテストは、
-    // 「方針が拒んだ」と「ヘルパが一度も走らなかった」を区別できない
-    // ——「Err である」「ファイルが無い」「文面にパスと方針がある」の3点は、
-    // 起動に失敗したヘルパでも完全に満たされる（現に、この修正前の
-    // 本物のバイナリはそう振る舞っていた）。同じ方針・同じヘルパで内側
-    // への書き込みが成立することを先に確かめ、以降の失敗が起動の失敗では
-    // ないことをこのテスト自身で保証する。
+    // Put a control run inside this test. A test that only looks at
+    // failure outside the root can't distinguish "denied by policy" from
+    // "the helper never ran at all" — the three signs of "it's an Err",
+    // "the file is missing", and "the message names a path and a policy"
+    // are all fully satisfied even by a helper that failed to launch (in
+    // fact, the real binary behaved exactly that way before this fix). We
+    // first confirm that a write inside the root succeeds with this same
+    // policy and this same helper, so this test itself guarantees the
+    // failure that follows isn't a launch failure.
     let control = policy.writable_roots()[0].join("control.txt");
     polaris_tools::write::write(&policy, &helper, &control, "control")
-        .expect("対照実験が失敗した: このヘルパはこのプロファイルの下で起動できていない");
+        .expect("control run failed: this helper cannot launch under this profile");
     assert_eq!(
-        std::fs::read_to_string(&control).expect("対照のファイルが無い"),
+        std::fs::read_to_string(&control).expect("control file is missing"),
         "control"
     );
 
@@ -135,73 +149,77 @@ fn a_write_outside_the_root_is_refused_by_the_policy_not_by_a_helper_that_could_
         .canonicalize()
         .expect("canonicalize")
         .join("pwned.txt");
-    let err = polaris_tools::write::write(&policy, &helper, &target, "本文")
-        .expect_err("ルート外への書き込みが成功した");
+    let err = polaris_tools::write::write(&policy, &helper, &target, "body text")
+        .expect_err("write outside the root succeeded");
 
-    assert!(
-        !target.exists(),
-        "ファイルが作られている: {}",
-        target.display()
-    );
+    assert!(!target.exists(), "file was created: {}", target.display());
 
     let ToolError::WriteDenied { detail, .. } = &err else {
-        panic!("方針による拒否として返っていない: {err:?}");
+        panic!("not returned as denied by policy: {err:?}");
     };
     assert!(
         OS_REFUSAL.iter().any(|s| detail.contains(s)),
-        "子の出力に OS の拒否が無い（拒否ではない何かを拒否と名付けている）: {detail}"
+        "the child's output has no OS refusal (something that isn't a denial is being named a denial): {detail}"
     );
     assert!(
         !STARTUP_FAILURE.iter().any(|s| detail.contains(s)),
-        "ヘルパが起動に失敗しており、それが拒否として報告されている: {detail}"
+        "the helper failed to launch, and that is being reported as a denial: {detail}"
     );
 
-    // 仕様が要求する拒否メッセージの中身（パス・方針・書込可能ルート）。
+    // The contents the spec requires the denial message to carry (path,
+    // policy, writable root).
     let msg = err.to_string();
     assert!(
         msg.contains(&target.display().to_string()),
-        "パスが無い: {msg}"
+        "path is missing: {msg}"
     );
-    assert!(msg.contains("workspace-write"), "方針が無い: {msg}");
+    assert!(msg.contains("workspace-write"), "policy is missing: {msg}");
     assert!(
         msg.contains(&policy.writable_roots()[0].display().to_string()),
-        "書込可能ルートが無い: {msg}"
+        "writable root is missing: {msg}"
     );
 }
 
 #[test]
 fn an_edit_whose_marker_is_absent_is_a_request_problem_not_a_policy_denial() {
-    // ルートの *内側* にあるファイルを、存在しない目印で置換しようとする。
-    // 方針は一切関係しない失敗であり、モデルがすべきことは目印を選び直す
-    // ことである。これを拒否として返すと、モデルは権限の問題を探しに行き、
-    // 往復を1回捨てる。
-    let root = tempfile::tempdir().expect("一時ディレクトリ");
-    let state = tempfile::tempdir().expect("一時ディレクトリ");
+    // Tries to replace, inside a file that's *inside* the root, using a
+    // marker that doesn't exist. This is a failure that has nothing to do
+    // with policy; what the model should do is pick a different marker.
+    // Returning this as a denial sends the model off hunting for a
+    // permissions problem and throws away a round trip.
+    let root = tempfile::tempdir().expect("temp directory");
+    let state = tempfile::tempdir().expect("temp directory");
     let policy = workspace_write(root.path());
     let helper = staged_real_binary(&policy, state.path());
 
     let target = policy.writable_roots()[0].join("f.txt");
-    std::fs::write(&target, "元の本文").expect("書けない");
+    std::fs::write(&target, "original body text").expect("cannot write");
 
-    let err = polaris_tools::edit::edit(&policy, &helper, &target, "存在しない目印", "新")
-        .expect_err("目印が無いのに置換が成功した");
+    let err = polaris_tools::edit::edit(
+        &policy,
+        &helper,
+        &target,
+        "a marker that does not exist",
+        "new",
+    )
+    .expect_err("replacement succeeded despite a missing marker");
 
     let ToolError::MutationFailed { detail, .. } = &err else {
-        panic!("要求の問題ではなく別の種類として返っている: {err:?}");
+        panic!("returned as a different kind instead of a request problem: {err:?}");
     };
     assert!(
         detail.contains("not found"),
-        "子が報告した理由が届いていない: {detail}"
+        "the reason the child reported did not come through: {detail}"
     );
 
     let msg = err.to_string();
     assert!(
         !msg.contains("workspace-write"),
-        "要求の問題なのに方針を名指ししている（モデルが権限の問題を探し始める）: {msg}"
+        "naming the policy despite this being a request problem (the model would start hunting for a permissions problem): {msg}"
     );
     assert_eq!(
-        std::fs::read_to_string(&target).expect("読めない"),
-        "元の本文",
-        "失敗したのに中身が変わっている"
+        std::fs::read_to_string(&target).expect("cannot read"),
+        "original body text",
+        "content changed despite the failure"
     );
 }

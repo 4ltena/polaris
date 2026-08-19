@@ -45,10 +45,12 @@ pub fn account_id_from_id_token(id_token: &str) -> Option<String> {
 
 /// フォーム POST を投げて `Credentials` を組み立てる共通部分。
 /// `fallback_refresh` は、応答が refresh_token を省いたときに保つ値。
+/// `fallback_account` は、応答が id_token を省いたときに保つ account_id。
 async fn post_token(
     issuer: &str,
     form: &[(&str, &str)],
     fallback_refresh: Option<&str>,
+    fallback_account: Option<&str>,
 ) -> Result<Credentials, AuthError> {
     let resp = reqwest::Client::new()
         .post(format!("{issuer}/oauth/token"))
@@ -79,10 +81,24 @@ async fn post_token(
         .or_else(|| fallback_refresh.map(|s| s.to_string()))
         .ok_or_else(|| AuthError::Decode("応答にも手元にも refresh_token が無い".into()))?;
 
+    // refresh_token と同じ形で、応答が省いたときは手元の値を保つ。
+    // refresh_token grant は OIDC の id_token を再発行する義務を負わない
+    // ため、更新応答に id_token が無いことは異常ではない。ここに fallback が
+    // 無いと、動いていた account_id が更新のたびに "" へ潰れて保存され、
+    // 以後 `chatgpt-account-id:` が空のまま送られる。認証の失敗が
+    // モデルの失敗に見える経路そのものである。
+    //
+    // refresh_token と違い、最後まで値が無いことを硬い失敗にはしない。
+    // refresh_token が無い資格情報は次の更新ができず回復不能だが、
+    // account_id はここで空になったからといって回復不能ではなく、
+    // 実バックエンドが空のヘッダを許すかどうかを試験できる場所が無い。
+    // 「今日より悪くしない」側に倒し、fallback を尽くしたあとは既存どおり
+    // 既定値で埋める。
     let account_id = t
         .id_token
         .as_deref()
         .and_then(account_id_from_id_token)
+        .or_else(|| fallback_account.map(|s| s.to_string()))
         .unwrap_or_default();
 
     Ok(Credentials {
@@ -109,12 +125,21 @@ pub async fn exchange_code(
             ("code_verifier", verifier),
         ],
         None,
+        None,
     )
     .await
 }
 
 /// refresh token で更新する。
-pub async fn refresh(issuer: &str, refresh_token: &str) -> Result<Credentials, AuthError> {
+///
+/// `account_id` には保管している現在の値を渡す。応答が id_token を省いた
+/// ときにこれを保つ。`refresh_token` の fallback と同じ形であり、手元の値を
+/// 持たない初回のログイン（`exchange_code`）は、どちらへも `None` を渡す。
+pub async fn refresh(
+    issuer: &str,
+    refresh_token: &str,
+    account_id: Option<&str>,
+) -> Result<Credentials, AuthError> {
     post_token(
         issuer,
         &[
@@ -123,8 +148,28 @@ pub async fn refresh(issuer: &str, refresh_token: &str) -> Result<Credentials, A
             ("refresh_token", refresh_token),
         ],
         Some(refresh_token),
+        account_id,
     )
     .await
+}
+
+/// account_id は id_token の payload に入る。テスト用に
+/// `{"chatgpt_account_id":"acct-1"}` を base64url で包んだ JWT 風の
+/// 3 分割文字列を作る。署名は検証しない（サーバから TLS で受け取った
+/// ものであり、こちらが発行者を検証する立場に無い）。
+///
+/// `lib.rs` のテストも同じ形の id_token を使うので、モジュール直下に置いて
+/// 共有する。書き写すと、片方だけ payload の鍵を直したときに黙って
+/// 食い違う。
+#[cfg(test)]
+pub(crate) fn id_token_with_account(account: &str) -> String {
+    use base64::Engine;
+    let payload = serde_json::json!({
+        "https://api.openai.com/auth": { "chatgpt_account_id": account }
+    });
+    let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&payload).unwrap());
+    format!("header.{b}.signature")
 }
 
 #[cfg(test)]
@@ -132,20 +177,6 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// account_id は id_token の payload に入る。テスト用に
-    /// `{"chatgpt_account_id":"acct-1"}` を base64url で包んだ JWT 風の
-    /// 3 分割文字列を作る。署名は検証しない（サーバから TLS で受け取った
-    /// ものであり、こちらが発行者を検証する立場に無い）。
-    fn id_token_with_account(account: &str) -> String {
-        use base64::Engine;
-        let payload = serde_json::json!({
-            "https://api.openai.com/auth": { "chatgpt_account_id": account }
-        });
-        let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&payload).unwrap());
-        format!("header.{b}.signature")
-    }
 
     async fn server_returning(body: serde_json::Value) -> MockServer {
         let s = MockServer::start().await;
@@ -204,7 +235,9 @@ mod tests {
         }))
         .await;
 
-        let c = refresh(&s.uri(), "old-rt").await.expect("更新できるべき");
+        let c = refresh(&s.uri(), "old-rt", None)
+            .await
+            .expect("更新できるべき");
         assert_eq!(c.access_token, "new-at");
         assert_eq!(
             c.refresh_token, "old-rt",
@@ -224,7 +257,9 @@ mod tests {
         }))
         .await;
 
-        let c = refresh(&s.uri(), "old-rt").await.expect("更新できるべき");
+        let c = refresh(&s.uri(), "old-rt", None)
+            .await
+            .expect("更新できるべき");
         assert_eq!(
             c.refresh_token, "rotated-rt",
             "回転した refresh token を採っていない"
@@ -240,7 +275,7 @@ mod tests {
             .mount(&s)
             .await;
 
-        let err = refresh(&s.uri(), "rt").await.expect_err("失敗すべき");
+        let err = refresh(&s.uri(), "rt", None).await.expect_err("失敗すべき");
         assert!(
             matches!(err, AuthError::Http(_)),
             "Http 以外になっている: {err:?}"
@@ -252,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn a_response_without_an_access_token_is_a_decode_error() {
         let s = server_returning(serde_json::json!({ "expires_in": 3600 })).await;
-        let err = refresh(&s.uri(), "rt").await.expect_err("失敗すべき");
+        let err = refresh(&s.uri(), "rt", None).await.expect_err("失敗すべき");
         assert!(
             matches!(err, AuthError::Decode(_)),
             "Decode 以外になっている: {err:?}"

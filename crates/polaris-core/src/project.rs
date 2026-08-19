@@ -1,13 +1,14 @@
-//! プロジェクトルートの解決。
+//! Resolves the project root.
 //!
-//! M2 以降、書込可能ルートはここが返す値から導かれる。作業ディレクトリを
-//! そのままルートにすると、リポジトリの深い場所から起動しただけで書ける
-//! 範囲が変わる。目印が無いときに `/` まで遡らないのは、そこで遡ると
-//! 書込可能ルートがファイルシステム全体になるためである。
+//! From M2 onward, the writable root is derived from the value this returns.
+//! Using the working directory as the root outright would mean the writable
+//! range shifts just because the process was launched from somewhere deep in
+//! the repository. We don't walk up to `/` when no marker is found, because
+//! doing so would make the writable root the entire filesystem.
 
 use std::path::{Path, PathBuf};
 
-/// 目印となるディレクトリ。最も近いものを採る。
+/// Marker directories. The nearest one wins.
 const MARKERS: &[&str] = &[".git", ".polaris"];
 
 pub fn resolve_root(start: &Path) -> PathBuf {
@@ -31,7 +32,7 @@ mod tests {
 
     #[test]
     fn a_subdirectory_resolves_to_the_repository_root() {
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let root = tempfile::tempdir().expect("temp directory");
         std::fs::create_dir(root.path().join(".git")).expect("mkdir");
         let deep = root.path().join("crates/polaris-core/src");
         std::fs::create_dir_all(&deep).expect("mkdir");
@@ -44,8 +45,8 @@ mod tests {
 
     #[test]
     fn a_polaris_directory_also_marks_the_root() {
-        // git を使わない利用者もいる。`.polaris/` があればそこをルートとする。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        // Not everyone uses git. If a `.polaris/` directory exists, treat it as the root.
+        let root = tempfile::tempdir().expect("temp directory");
         std::fs::create_dir(root.path().join(".polaris")).expect("mkdir");
         let deep = root.path().join("a/b");
         std::fs::create_dir_all(&deep).expect("mkdir");
@@ -58,9 +59,9 @@ mod tests {
 
     #[test]
     fn the_nearest_marker_wins() {
-        // 入れ子のリポジトリでは内側が勝つ。外側を選ぶと、書込可能ルートが
-        // 意図より広がる。
-        let outer = tempfile::tempdir().expect("一時ディレクトリ");
+        // For a nested repository, the inner one wins. Choosing the outer one
+        // would make the writable root broader than intended.
+        let outer = tempfile::tempdir().expect("temp directory");
         std::fs::create_dir(outer.path().join(".git")).expect("mkdir");
         let inner = outer.path().join("vendor/thing");
         std::fs::create_dir_all(inner.join(".git")).expect("mkdir");
@@ -75,9 +76,9 @@ mod tests {
 
     #[test]
     fn without_any_marker_the_starting_directory_is_the_root() {
-        // 目印が無いときに `/` まで遡ると、書込可能ルートがファイルシステム
-        // 全体になる。遡りは必ず止める。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // Walking up to `/` when no marker is found would make the writable
+        // root the entire filesystem. The walk must always stop.
+        let dir = tempfile::tempdir().expect("temp directory");
         let deep = dir.path().join("x/y");
         std::fs::create_dir_all(&deep).expect("mkdir");
 

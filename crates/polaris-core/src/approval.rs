@@ -1,8 +1,9 @@
-//! 承認境界。`sandbox_mode` が技術的境界を、`approval_policy` が停止して
-//! 確認する条件を定める。二つは直交する。
+//! Approval boundary. `sandbox_mode` sets the technical boundary;
+//! `approval_policy` sets the condition under which we stop and confirm.
+//! The two are orthogonal.
 //!
-//! 尋ねる相手を trait にするのは、テストが実際の端末入力を要らないように
-//! するためである。
+//! The party being asked is a trait so that tests don't need real terminal
+//! input.
 
 use std::path::Path;
 
@@ -11,11 +12,11 @@ use polaris_tools::predicate::{Verdict, predict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPolicy {
-    /// 尋ねない。範囲外はそのまま断る。
+    /// Never ask. Anything out of scope is refused outright.
     Never,
-    /// 範囲外のときだけ尋ねる。
+    /// Ask only when out of scope.
     OnRequest,
-    /// 変更操作のたびに尋ねる。
+    /// Ask before every mutating operation.
     Always,
 }
 
@@ -38,7 +39,8 @@ impl Gate {
         Self { policy }
     }
 
-    /// 変更操作の前に呼ぶ。通ってよければ `Ok(())`、止めるなら理由を返す。
+    /// Call before a mutating operation. Returns `Ok(())` if it may proceed,
+    /// or a reason if it must stop.
     pub fn check(
         &mut self,
         sandbox: &SandboxPolicy,
@@ -50,7 +52,7 @@ impl Gate {
         let reason = match (&verdict, self.policy) {
             (Verdict::Allowed, ApprovalPolicy::Always) => {
                 format!(
-                    "{} へ書き込む。方針 {}",
+                    "writing to {}. policy {}",
                     target.display(),
                     sandbox.describe()
                 )
@@ -59,15 +61,16 @@ impl Gate {
             (Verdict::NeedsApproval { reason }, _) => reason.clone(),
         };
 
-        // 尋ねる相手がいない設定では、尋ねずに断る。通してしまうと、
-        // 無人であることがそのまま権限の拡大になる。
+        // When there's no one configured to ask, refuse without asking.
+        // Letting it through would mean running unattended is itself an
+        // expansion of privilege.
         if self.policy == ApprovalPolicy::Never {
             return Err(reason);
         }
 
         match approver.ask(&reason) {
             Decision::Allow => Ok(()),
-            Decision::Deny => Err(format!("利用者が承認しなかった: {reason}")),
+            Decision::Deny => Err(format!("the user did not approve: {reason}")),
         }
     }
 }
@@ -89,13 +92,13 @@ mod tests {
     }
 
     fn workspace(root: &std::path::Path) -> SandboxPolicy {
-        SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.to_path_buf()]).expect("方針")
+        SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.to_path_buf()]).expect("policy")
     }
 
     #[test]
     fn a_target_inside_the_root_is_never_asked_about() {
-        // 範囲内の書き込みで毎回止まると、承認が意味を失う。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // If in-scope writes stopped every time, approval would lose its meaning.
+        let dir = tempfile::tempdir().expect("temp directory");
         let sandbox = workspace(dir.path());
         let mut approver = Scripted {
             answers: vec![],
@@ -108,18 +111,18 @@ mod tests {
             &sandbox.writable_roots()[0].join("a.txt"),
             &mut approver,
         )
-        .expect("範囲内が拒否された");
+        .expect("an in-scope target was refused");
         assert!(
             approver.asked.is_empty(),
-            "余計に尋ねた: {:?}",
+            "asked unnecessarily: {:?}",
             approver.asked
         );
     }
 
     #[test]
     fn a_target_outside_the_root_is_asked_about_with_the_reason() {
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        let root = tempfile::tempdir().expect("temp directory");
+        let outside = tempfile::tempdir().expect("temp directory");
         let sandbox = workspace(root.path());
         let mut approver = Scripted {
             answers: vec![Decision::Allow],
@@ -129,20 +132,20 @@ mod tests {
 
         let target = outside.path().join("b.txt");
         gate.check(&sandbox, &target, &mut approver)
-            .expect("承認したのに拒否された");
+            .expect("was refused despite being approved");
 
         assert_eq!(approver.asked.len(), 1);
         assert!(
             approver.asked[0].contains(&target.display().to_string()),
-            "理由にパスが無い: {}",
+            "reason is missing the path: {}",
             approver.asked[0]
         );
     }
 
     #[test]
     fn a_denied_approval_stops_the_operation() {
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        let root = tempfile::tempdir().expect("temp directory");
+        let outside = tempfile::tempdir().expect("temp directory");
         let sandbox = workspace(root.path());
         let mut approver = Scripted {
             answers: vec![Decision::Deny],
@@ -151,15 +154,17 @@ mod tests {
         let mut gate = Gate::new(ApprovalPolicy::OnRequest);
 
         gate.check(&sandbox, &outside.path().join("b.txt"), &mut approver)
-            .expect_err("拒否したのに通った");
+            .expect_err("went through despite being denied");
     }
 
     #[test]
     fn never_refuses_without_asking() {
-        // 無人実行では尋ねる相手がいない。尋ねずに通すのではなく、尋ねずに
-        // 断る。通してしまうと、無人であることが権限の拡大になる。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        // In an unattended run, there's no one to ask. Rather than letting
+        // it through without asking, it must refuse without asking. Letting
+        // it through would mean running unattended is itself an expansion
+        // of privilege.
+        let root = tempfile::tempdir().expect("temp directory");
+        let outside = tempfile::tempdir().expect("temp directory");
         let sandbox = workspace(root.path());
         let mut approver = Scripted {
             answers: vec![Decision::Allow],
@@ -168,13 +173,13 @@ mod tests {
         let mut gate = Gate::new(ApprovalPolicy::Never);
 
         gate.check(&sandbox, &outside.path().join("b.txt"), &mut approver)
-            .expect_err("Never なのに通った");
-        assert!(approver.asked.is_empty(), "Never なのに尋ねた");
+            .expect_err("went through despite being Never");
+        assert!(approver.asked.is_empty(), "asked despite being Never");
     }
 
     #[test]
     fn always_asks_even_inside_the_root() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp directory");
         let sandbox = workspace(dir.path());
         let mut approver = Scripted {
             answers: vec![Decision::Allow],
@@ -187,18 +192,19 @@ mod tests {
             &sandbox.writable_roots()[0].join("a.txt"),
             &mut approver,
         )
-        .expect("承認したのに拒否された");
-        assert_eq!(approver.asked.len(), 1, "Always なのに尋ねなかった");
+        .expect("was refused despite being approved");
+        assert_eq!(approver.asked.len(), 1, "did not ask despite being Always");
     }
 
     #[test]
     fn always_with_needs_approval_preserves_the_specific_reason() {
-        // (Always, NeedsApproval) の最も危険なケース。方針が「常に尋ねる」でも、
-        // 述語が実際の理由（パス外など）を見つけている。その詳細な理由を
-        // 汎用の「書き込もうとしている」メッセージで上書きしてはいけない。
-        // 尋ねる相手は詳細な理由を知る必要がある。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        // The most dangerous case of (Always, NeedsApproval). Even when the
+        // policy is "always ask," the predicate has already found the actual
+        // reason (e.g. out of path). That detailed reason must not be
+        // overwritten by a generic "about to write" message. The party being
+        // asked needs to know the detailed reason.
+        let root = tempfile::tempdir().expect("temp directory");
+        let outside = tempfile::tempdir().expect("temp directory");
         let sandbox = workspace(root.path());
         let mut approver = Scripted {
             answers: vec![Decision::Allow],
@@ -208,22 +214,22 @@ mod tests {
 
         let target = outside.path().join("risky.txt");
         gate.check(&sandbox, &target, &mut approver)
-            .expect("承認したのに拒否された");
+            .expect("was refused despite being approved");
 
         assert_eq!(approver.asked.len(), 1);
         let reason = &approver.asked[0];
-        // 仕様が要求する 3 点を全て含むことを確認する。
+        // Confirm all 3 points the spec requires are present.
         assert!(
             reason.contains(&target.display().to_string()),
-            "理由にパスが無い: {reason}"
+            "reason is missing the path: {reason}"
         );
         assert!(
             reason.contains("workspace-write"),
-            "理由に方針が無い: {reason}"
+            "reason is missing the policy: {reason}"
         );
         assert!(
             reason.contains(&sandbox.writable_roots()[0].display().to_string()),
-            "理由にルートが無い: {reason}"
+            "reason is missing the root: {reason}"
         );
     }
 }

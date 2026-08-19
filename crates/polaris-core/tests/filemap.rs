@@ -1,43 +1,42 @@
-//! `docs/filemap.md` がリポジトリの実体と一致しているかを確かめるスナップショットテスト。
+//! A snapshot test that confirms `docs/filemap.md` matches the actual state of the repository.
 //!
-//! エージェントは探索の代わりにこの文書を読む。文書がずれていれば古い経路へ
-//! 確信を持って誘導してしまうため、ずれを検出したら黙って通さず必ず落ちる。
+//! Agents read this document instead of exploring. If the document drifts,
+//! it confidently misdirects toward stale paths, so any detected drift
+//! must fail loudly rather than pass silently.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// `CARGO_MANIFEST_DIR` は `crates/polaris-core` を指す。リポジトリルートは
-/// その2階層上。
+/// `CARGO_MANIFEST_DIR` points to `crates/polaris-core`. The repository
+/// root is 2 levels above that.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("CARGO_MANIFEST_DIR からリポジトリルートを求められない")
+        .expect("cannot derive the repository root from CARGO_MANIFEST_DIR")
         .to_path_buf()
 }
 
-/// 台帳となるファイル一覧を取得する。`git` が無い、またはここが git
-/// リポジトリでない場合はテストとして失敗させる。スキップは false pass に
-/// なるため許さない。
+/// Gets the file listing that serves as the ledger. Fails the test outright
+/// if `git` is missing, or if this isn't a git repository. Skipping isn't
+/// allowed, since that would be a false pass.
 fn list_files(root: &Path) -> Vec<String> {
     let output = Command::new("git")
         .args(["ls-files", "--cached", "--others", "--exclude-standard"])
         .current_dir(root)
         .output()
-        .unwrap_or_else(|e| {
-            panic!("git を実行できない: {e}。git がインストールされているか確認する")
-        });
+        .unwrap_or_else(|e| panic!("cannot run git: {e}. Check whether git is installed"));
 
     if !output.status.success() {
         panic!(
-            "git ls-files が失敗した（{} が git リポジトリでない可能性がある）: {}",
+            "git ls-files failed ({} might not be a git repository): {}",
             root.display(),
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    let stdout = String::from_utf8(output.stdout).expect("git ls-files の出力が UTF-8 でない");
+    let stdout = String::from_utf8(output.stdout).expect("git ls-files' output is not UTF-8");
     let mut files: Vec<String> = stdout
         .lines()
         .map(str::to_string)
@@ -58,14 +57,16 @@ fn file_name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// `.rs` ファイルの要約。ファイル中で最初に現れる、トリム後に非空である
-/// `//!` 行の中身を返す。マーカーだけで中身が無い行は「無い」のと同じ扱いで
-/// 読み飛ばす（そこで打ち切って空文字列を返すと、`//!` はあるが何も
-/// 書いていないファイルが missing-doc チェックをすり抜けてしまう）。
-/// 非空の行が1つも無ければ `None`（呼び出し側で失敗として扱う）。
+/// A `.rs` file's summary. Returns the content of the first `//!` line in
+/// the file that is non-empty after trimming. A line that's just the
+/// marker with no content is skipped and treated the same as "not
+/// present" (returning an empty string by cutting off there instead would
+/// let a file that has `//!` but wrote nothing in it slip past the
+/// missing-doc check). `None` if there isn't a single non-empty line (the
+/// caller treats this as a failure).
 fn rust_summary(root: &Path, path: &str) -> Option<String> {
     let body = std::fs::read_to_string(root.join(path))
-        .unwrap_or_else(|e| panic!("{path} を読めない: {e}"));
+        .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     body.lines()
         .filter_map(|line| {
             line.trim_start()
@@ -75,35 +76,37 @@ fn rust_summary(root: &Path, path: &str) -> Option<String> {
         .find(|s| !s.is_empty())
 }
 
-/// `.md` ファイルの要約。最初の `# ` 見出しの本文。無ければファイル名。
+/// A `.md` file's summary. The text of the first `# ` heading. Falls back
+/// to the file name if there isn't one.
 fn markdown_summary(root: &Path, path: &str) -> String {
     let body = std::fs::read_to_string(root.join(path))
-        .unwrap_or_else(|e| panic!("{path} を読めない: {e}"));
+        .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     body.lines()
         .find_map(|line| line.strip_prefix("# ").map(|rest| rest.trim().to_string()))
         .unwrap_or_else(|| file_name_of(path).to_string())
 }
 
-/// `.toml` ファイルの要約。パスから決まる固定ラベル。未知のパターンは
-/// ラベルを推測せず失敗させる。
+/// A `.toml` file's summary. A fixed label determined by the path. An
+/// unrecognized pattern fails rather than guessing a label.
 fn toml_summary(path: &str) -> String {
     if path == "Cargo.toml" {
-        return "ワークスペース定義と共有依存".to_string();
+        return "workspace definition and shared dependencies".to_string();
     }
     if path == "rust-toolchain.toml" {
-        return "ツールチェイン固定".to_string();
+        return "pinned toolchain".to_string();
     }
     if let Some(rest) = path.strip_prefix("crates/")
         && let Some(name) = rest.strip_suffix("/Cargo.toml")
         && !name.contains('/')
     {
-        return format!("{name} クレートのマニフェスト");
+        return format!("manifest for the {name} crate");
     }
-    panic!("{path} に割り当てるラベルが無い。filemap.rs の toml_summary にパターンを追加する");
+    panic!("no label assigned for {path}. Add a pattern to toml_summary in filemap.rs");
 }
 
-/// リポジトリの実体から `docs/filemap.md` の期待される本文を組み立てる。
-/// `.rs` に `//!` が無いファイルがあれば、文書を組み立てず失敗させる。
+/// Assembles the expected content of `docs/filemap.md` from the actual
+/// state of the repository. Fails without assembling the document if any
+/// `.rs` file has no `//!`.
 fn build_expected(root: &Path) -> String {
     let files = list_files(root);
 
@@ -133,7 +136,7 @@ fn build_expected(root: &Path) -> String {
 
     assert!(
         missing_doc.is_empty(),
-        "{} 個の .rs ファイルに `//!` 行が無い。モジュールの責務を1行で書く:\n{}",
+        "{} .rs file(s) have no `//!` line. Write the module's responsibility in one line:\n{}",
         missing_doc.len(),
         missing_doc
             .iter()
@@ -143,12 +146,12 @@ fn build_expected(root: &Path) -> String {
     );
 
     let mut out = String::new();
-    out.push_str("# ファイルマップ\n\n");
+    out.push_str("# File map\n\n");
     out.push_str(
-        "生成ファイルである。手で編集しない。`crates/polaris-core/tests/filemap.rs` が\n\
-         `git ls-files --cached --others --exclude-standard` の結果からリポジトリの実体を\n\
-         読み、本文を再構築して `docs/filemap.md` と突き合わせる。ずれていればテストが\n\
-         失敗する。更新するときは次を実行する。\n\n\
+        "This is a generated file. Do not edit it by hand. `crates/polaris-core/tests/filemap.rs`\n\
+         reads the actual state of the repository from the result of\n\
+         `git ls-files --cached --others --exclude-standard`, rebuilds the body, and checks it\n\
+         against `docs/filemap.md`. The test fails on any drift. To update it, run:\n\n\
          ```\n\
          UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap\n\
          ```\n",
@@ -165,7 +168,8 @@ fn build_expected(root: &Path) -> String {
     out
 }
 
-/// 期待値と実際の内容が食い違った箇所だけを示す。文書全体を2回貼らない。
+/// Shows only the spot where the expected and actual content diverge.
+/// Doesn't paste the whole document twice.
 fn diff_message(expected: &str, actual: &str) -> String {
     let exp: Vec<&str> = expected.lines().collect();
     let act: Vec<&str> = actual.lines().collect();
@@ -183,20 +187,20 @@ fn diff_message(expected: &str, actual: &str) -> String {
     }
 
     let mut msg = format!(
-        "docs/filemap.md がリポジトリの実体とずれている（期待 {} 行 / 実際 {} 行、{} 行目付近から食い違う）\n",
+        "docs/filemap.md has drifted from the actual state of the repository (expected {} lines / actual {} lines, diverging around line {})\n",
         exp.len(),
         act.len(),
         start + 1
     );
-    msg.push_str("--- 期待（再構築した内容）\n");
+    msg.push_str("--- expected (rebuilt content)\n");
     for l in &exp[start..exp_end] {
         msg.push_str(&format!("+ {l}\n"));
     }
-    msg.push_str("--- 実際（docs/filemap.md の現在の内容）\n");
+    msg.push_str("--- actual (current content of docs/filemap.md)\n");
     for l in &act[start..act_end] {
         msg.push_str(&format!("- {l}\n"));
     }
-    msg.push_str("\nUPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap で再生成できる。\n");
+    msg.push_str("\nRegenerate with UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap.\n");
     msg
 }
 
@@ -207,7 +211,7 @@ fn filemap_matches_repository() {
     let doc_path = root.join("docs/filemap.md");
 
     if std::env::var("UPDATE_FILEMAP").is_ok_and(|v| v != "0" && !v.is_empty()) {
-        std::fs::write(&doc_path, &expected).expect("docs/filemap.md を書けない");
+        std::fs::write(&doc_path, &expected).expect("cannot write docs/filemap.md");
         return;
     }
 
@@ -223,47 +227,51 @@ mod rust_summary_tests {
 
     #[test]
     fn blank_bang_comment_with_no_other_line_is_none() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
-        std::fs::write(dir.path().join("blank.rs"), "//!\n\nfn f() {}\n").expect("書けない");
+        let dir = tempfile::tempdir().expect("temp directory");
+        std::fs::write(dir.path().join("blank.rs"), "//!\n\nfn f() {}\n").expect("cannot write");
         assert_eq!(
             rust_summary(dir.path(), "blank.rs"),
             None,
-            "中身の無い `//!` 行を要約として拾ってはいけない"
+            "must not pick up a `//!` line with no content as the summary"
         );
     }
 
     #[test]
     fn whitespace_only_bang_comment_is_none() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
-        std::fs::write(dir.path().join("blank.rs"), "//!   \n\nfn f() {}\n").expect("書けない");
+        let dir = tempfile::tempdir().expect("temp directory");
+        std::fs::write(dir.path().join("blank.rs"), "//!   \n\nfn f() {}\n").expect("cannot write");
         assert_eq!(
             rust_summary(dir.path(), "blank.rs"),
             None,
-            "空白だけの `//!` 行も無いのと同じ扱いにする"
+            "a `//!` line with only whitespace should also be treated as not present"
         );
     }
 
     #[test]
     fn later_non_blank_bang_comment_is_used_when_first_is_blank() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp directory");
         std::fs::write(
             dir.path().join("blank_then_real.rs"),
-            "//!\n//! 実際の説明。\n\nfn f() {}\n",
+            "//!\n//! the actual description.\n\nfn f() {}\n",
         )
-        .expect("書けない");
+        .expect("cannot write");
         assert_eq!(
             rust_summary(dir.path(), "blank_then_real.rs"),
-            Some("実際の説明。".to_string())
+            Some("the actual description.".to_string())
         );
     }
 
     #[test]
     fn normal_bang_comment_is_unaffected() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
-        std::fs::write(dir.path().join("normal.rs"), "//! 普通の説明。\n").expect("書けない");
+        let dir = tempfile::tempdir().expect("temp directory");
+        std::fs::write(
+            dir.path().join("normal.rs"),
+            "//! an ordinary description.\n",
+        )
+        .expect("cannot write");
         assert_eq!(
             rust_summary(dir.path(), "normal.rs"),
-            Some("普通の説明。".to_string())
+            Some("an ordinary description.".to_string())
         );
     }
 }

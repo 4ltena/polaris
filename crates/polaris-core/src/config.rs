@@ -1,13 +1,13 @@
-//! 設定ファイルの読み込み。存在しないことは正常だが、壊れていることは正常ではない。
+//! Loads config files. Not existing is normal; being malformed is not.
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// 統合後の設定。
+/// The merged configuration.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// skill を追加で探す場所。既定の 2 箇所には含まれない。
+    /// Additional places to look for skills. Not included in the 2 default locations.
     pub skills_paths: Vec<PathBuf>,
 }
 
@@ -19,22 +19,23 @@ struct RawConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawSkills {
-    /// `None` はキー自体が無いこと（＝前段の値を引き継ぐ）を表し、
-    /// `Some(vec![])` は `paths = []` と明示されたこと（＝前段を空で
-    /// 上書きする）を表す。`Vec` のままでは両者が区別できず、
-    /// プロジェクト側が意図的にグローバルの一覧を空にする手段が無くなる。
+    /// `None` means the key itself is absent (= inherit the prior stage's
+    /// value), and `Some(vec![])` means `paths = []` was given explicitly
+    /// (= override the prior stage with an empty list). Leaving this as a
+    /// plain `Vec` would make the two indistinguishable, taking away the
+    /// project's ability to deliberately empty out the global list.
     #[serde(default)]
     paths: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("{path} を読めない: {source}")]
+    #[error("cannot read {path}: {source}")]
     Io {
         path: String,
         source: std::io::Error,
     },
-    #[error("{path} の TOML を解釈できない: {source}")]
+    #[error("cannot parse TOML in {path}: {source}")]
     Parse {
         path: String,
         source: toml::de::Error,
@@ -60,13 +61,13 @@ fn read_one(path: &Path) -> Result<Option<RawConfig>, ConfigError> {
         })
 }
 
-/// グローバルとプロジェクトの設定を読み、後者で前者を上書きする。
-/// 存在しないことは失敗ではない。読めないことと壊れていることは失敗である。
+/// Reads the global and project configs, letting the latter override the
+/// former. Not existing is not a failure. Being unreadable or malformed is.
 ///
-/// `skills.paths` キーが無いファイルは前段の値をそのまま引き継ぐ。
-/// `paths = []` と明示されたファイルは前段を空で上書きする —
-/// 個人の skill をあるプロジェクトへ持ち込みたくない場合に、それを
-/// 表明する手段が要る。
+/// A file missing the `skills.paths` key inherits the prior stage's value
+/// as-is. A file that explicitly gives `paths = []` overrides the prior
+/// stage with an empty list — there needs to be a way to declare that when
+/// personal skills should not be carried into a given project.
 pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Config, ConfigError> {
     let mut merged = Config::default();
     for path in [global, project].into_iter().flatten() {
@@ -79,7 +80,7 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
     Ok(merged)
 }
 
-/// `~/.polaris/config.toml` と `<project-root>/.polaris/config.toml` を解決して読む。
+/// Resolves and reads `~/.polaris/config.toml` and `<project-root>/.polaris/config.toml`.
 pub fn load(project_root: &Path) -> Result<Config, ConfigError> {
     let global =
         std::env::var_os("HOME").map(|h| Path::new(&h).join(".polaris").join("config.toml"));
@@ -93,23 +94,23 @@ mod tests {
 
     fn write(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         let p = dir.join("config.toml");
-        std::fs::write(&p, body).expect("書けない");
+        std::fs::write(&p, body).expect("could not write");
         p
     }
 
     #[test]
     fn returns_empty_config_when_neither_file_exists() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp directory");
         let c = try_load_from(None, Some(&dir.path().join("missing.toml")))
-            .expect("存在しないことは失敗ではない");
+            .expect("not existing is not a failure");
         assert!(c.skills_paths.is_empty());
     }
 
     #[test]
     fn reads_skills_paths_from_a_single_file() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp directory");
         let p = write(dir.path(), "[skills]\npaths = [\"/a\", \"/b\"]\n");
-        let c = try_load_from(Some(&p), None).expect("読めるはず");
+        let c = try_load_from(Some(&p), None).expect("should be readable");
         assert_eq!(
             c.skills_paths,
             vec![
@@ -121,55 +122,57 @@ mod tests {
 
     #[test]
     fn project_overrides_global() {
-        let g = tempfile::tempdir().expect("一時ディレクトリ");
-        let pj = tempfile::tempdir().expect("一時ディレクトリ");
+        let g = tempfile::tempdir().expect("temp directory");
+        let pj = tempfile::tempdir().expect("temp directory");
         let gp = write(g.path(), "[skills]\npaths = [\"/global\"]\n");
         let pp = write(pj.path(), "[skills]\npaths = [\"/project\"]\n");
-        let c = try_load_from(Some(&gp), Some(&pp)).expect("読めるはず");
+        let c = try_load_from(Some(&gp), Some(&pp)).expect("should be readable");
         assert_eq!(c.skills_paths, vec![std::path::PathBuf::from("/project")]);
     }
 
     #[test]
     fn malformed_toml_is_reported_not_swallowed() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp directory");
         let p = write(dir.path(), "[skills\npaths = ");
-        let err = try_load_from(Some(&p), None).expect_err("壊れた TOML は報告されるべき");
+        let err = try_load_from(Some(&p), None).expect_err("malformed TOML should be reported");
         assert!(
             err.to_string().contains("config.toml"),
-            "パスが含まれない: {err}"
+            "path is missing: {err}"
         );
     }
 
     #[test]
     fn project_can_clear_global_skills_paths_with_an_empty_list() {
-        // 個人の skill をあるプロジェクトへ持ち込みたくない場合、
-        // `paths = []` と明示すればグローバルの一覧を空で上書きできる。
-        let g = tempfile::tempdir().expect("一時ディレクトリ");
-        let pj = tempfile::tempdir().expect("一時ディレクトリ");
+        // When personal skills should not be carried into a given project,
+        // explicitly giving `paths = []` lets the global list be overridden
+        // with an empty one.
+        let g = tempfile::tempdir().expect("temp directory");
+        let pj = tempfile::tempdir().expect("temp directory");
         let gp = write(g.path(), "[skills]\npaths = [\"/global\"]\n");
         let pp = write(pj.path(), "[skills]\npaths = []\n");
-        let c = try_load_from(Some(&gp), Some(&pp)).expect("読めるはず");
+        let c = try_load_from(Some(&gp), Some(&pp)).expect("should be readable");
         assert!(
             c.skills_paths.is_empty(),
-            "空リストの明示がグローバルを上書きしていない: {:?}",
+            "explicit empty list did not override the global one: {:?}",
             c.skills_paths
         );
     }
 
     #[test]
     fn project_without_skills_section_inherits_global() {
-        // `[skills]` 節そのものが無いプロジェクト設定は「引き継ぐ」であって
-        // 「空にする」ではない。空リストの明示（前のテスト）と挙動が
-        // 分かれていなければ、この2つは今日のように同一になってしまう。
-        let g = tempfile::tempdir().expect("一時ディレクトリ");
-        let pj = tempfile::tempdir().expect("一時ディレクトリ");
+        // A project config missing the `[skills]` section entirely should
+        // "inherit", not "clear". If this isn't kept distinct in behavior
+        // from an explicit empty list (the previous test), the two would
+        // collapse into being identical, just as they stand today.
+        let g = tempfile::tempdir().expect("temp directory");
+        let pj = tempfile::tempdir().expect("temp directory");
         let gp = write(g.path(), "[skills]\npaths = [\"/global\"]\n");
-        let pp = write(pj.path(), "# skills セクション無し\n");
-        let c = try_load_from(Some(&gp), Some(&pp)).expect("読めるはず");
+        let pp = write(pj.path(), "# no skills section\n");
+        let c = try_load_from(Some(&gp), Some(&pp)).expect("should be readable");
         assert_eq!(
             c.skills_paths,
             vec![std::path::PathBuf::from("/global")],
-            "skills 節が無いのにグローバルを引き継いでいない: {:?}",
+            "did not inherit global despite having no skills section: {:?}",
             c.skills_paths
         );
     }

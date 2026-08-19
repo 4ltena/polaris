@@ -1,37 +1,41 @@
-//! 常時コンテキストの計測。数値は測定で担保し、見積で運用しない。
+//! Measurement of the always-on context. Numbers are backed by measurement,
+//! never operated on by estimate.
 
 use polaris_provider::openai::tool_wire_shape;
 use polaris_tools::ToolSpec;
 
-/// 常時コンテキストの上限。
+/// The ceiling on the always-on context.
 pub const BUDGET_LIMIT: usize = 990;
 
-/// 常時提供するツールの上限本数。
+/// The ceiling on the number of always-on tools.
 pub const MAX_TOOLS: usize = 6;
 
-/// 基準トークナイザで数える。プロバイダごとに実数は前後するため、
-/// 予算の判定は常にこの基準で行う。
+/// Counts using the reference tokenizer. The actual count shifts from
+/// provider to provider, so budget judgments are always made against this
+/// one reference.
 ///
-/// `o200k_base()` は呼ぶたびに約20万行のランクテーブルを埋め込みデータから
-/// 再構築するため、呼び出し1回ごとに構築すると `cap()` の切り詰めループ
-/// （行や文字ごとに再計測する）で顕著に遅い。プロセス内で1度だけ構築した
-/// シングルトンを使い回す。
+/// `o200k_base()` rebuilds a rank table of roughly 200,000 lines from
+/// embedded data every time it's called, so building it on every single call
+/// would be noticeably slow inside `cap()`'s truncation loop (which
+/// re-measures line by line, or character by character). We reuse a
+/// singleton built once per process.
 pub fn count_tokens(text: &str) -> usize {
     let bpe = tiktoken_rs::o200k_base_singleton();
     bpe.encode_with_special_tokens(text).len()
 }
 
-/// 毎ターン載るものの合計。システムプロンプトと、実際に送られる
-/// ツール定義の直列化結果を数える。
+/// The total of everything carried on every turn. Counts the system prompt
+/// plus the serialized form of the tool definitions actually sent.
 ///
-/// `ToolSpec` をそのまま直列化した形ではなく、`polaris_provider::openai::
-/// tool_wire_shape` が作るワイヤ形式（`{"type":"function","function":{…}}`)
-/// を数える。プロバイダが実際に送るバイト列と、ここで測るバイト列が
-/// 別々の場所で独立に組み立てられていたことがあり、その食い違いの分だけ
-/// 予算が実態より小さく出ていた。
+/// This counts not the plain serialization of `ToolSpec` itself, but the
+/// wire form built by `polaris_provider::openai::tool_wire_shape`
+/// (`{"type":"function","function":{…}}`). There was a period where the byte
+/// stream a provider actually sends and the byte stream measured here were
+/// assembled independently in separate places, and the budget came out
+/// smaller than reality by exactly the amount of that discrepancy.
 pub fn always_on_tokens(system_prompt: &str, tools: &[ToolSpec]) -> usize {
     let wire = tool_wire_shape(tools);
-    let tools_json = serde_json::to_string(&wire).expect("ツール定義を直列化できない");
+    let tools_json = serde_json::to_string(&wire).expect("cannot serialize tool definitions");
     count_tokens(system_prompt) + count_tokens(&tools_json)
 }
 
@@ -42,51 +46,56 @@ mod tests {
 
     #[test]
     fn always_on_context_stays_within_budget() {
-        // 常時コンテキストの下限 —— 憲法も環境情報も skill も無い状態。
-        // 本番が組み立てるのと同じ関数を通して測る。
+        // The floor of the always-on context — no constitution, no
+        // environment info, no skills. Measured through the same function
+        // production uses to assemble it.
         let n = crate::prompt::assemble_always_on("", "", &[]).tokens();
         assert!(
             n <= BUDGET_LIMIT,
-            "常時コンテキストが {n} トークン。上限 {BUDGET_LIMIT} を超えている"
+            "always-on context is {n} tokens, over the {BUDGET_LIMIT} limit"
         );
     }
 
-    /// codex プロバイダのワイヤ形式でも上限を割らないことを固定する。
+    /// Pins that the codex provider's wire shape also stays within the limit.
     ///
-    /// `always_on_tokens` が数えるのは `openai::tool_wire_shape`
-    /// （`{"type":"function","function":{…}}`）だが、実際に送られる形は
-    /// プロバイダで違う。codex は Responses API の平坦な形
-    /// （`{"type":"function","name":…}`）を送るので、同じツール定義でも
-    /// バイト列が違い、トークン数も違う。今日は codex のほうが安いが、
-    /// 安いことは測って初めて言える。ここが無いと、codex のワイヤ形式を
-    /// 将来変えたときに実数が上限へ寄っても、どのテストも気づかない。
+    /// What `always_on_tokens` counts is `openai::tool_wire_shape`
+    /// (`{"type":"function","function":{…}}`), but the shape actually sent
+    /// differs by provider. codex sends the Responses API's flat shape
+    /// (`{"type":"function","name":…}`), so even for the same tool
+    /// definitions the byte stream — and therefore the token count —
+    /// differs. Today codex happens to be cheaper, but "cheaper" can only be
+    /// said once it's been measured. Without this test, if codex's wire
+    /// shape changes in the future and the real count creeps toward the
+    /// limit, no test would notice.
     ///
-    /// 上限との比較は `always_on_context_stays_within_budget` と同じ形で行い、
-    /// 数えるツール定義も本番と同じ `assemble_always_on` の結果から採る。
+    /// The comparison against the limit follows the same shape as
+    /// `always_on_context_stays_within_budget`, and the tool definitions
+    /// counted are also taken from the same `assemble_always_on` result
+    /// production uses.
     #[test]
     fn the_codex_wire_shape_also_stays_within_budget() {
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let wire =
             serde_json::to_string(&polaris_provider::codex::tool_wire_shape(always_on.tools()))
-                .expect("直列化できない");
+                .expect("cannot serialize");
 
-        // 空振り防止。ツールが 0 本なら、どんな上限でも通ってしまう。
+        // Guards against a vacuous pass. If there are 0 tools, any limit would pass.
         assert!(
             !always_on.tools().is_empty(),
-            "ツール定義が 1 本も入っていない"
+            "not a single tool definition is present"
         );
-        // 測っているのが本当に codex の平坦な形であることを、同じテストの中で
-        // 押さえる。openai の入れ子形は `"function":` という鍵を持つので、
-        // 取り違えるとここで落ちる。
+        // Confirms within this same test that what's being measured really
+        // is codex's flat shape. openai's nested shape has a `"function":`
+        // key, so if the two are ever swapped, this fails.
         assert!(
             !wire.contains("\"function\":"),
-            "codex のはずのワイヤ形式が入れ子になっている: {wire}"
+            "the wire shape that should be codex's is nested: {wire}"
         );
 
         let n = count_tokens(always_on.system()) + count_tokens(&wire);
         assert!(
             n <= BUDGET_LIMIT,
-            "codex のワイヤ形式で常時コンテキストが {n} トークン。上限 {BUDGET_LIMIT} を超えている"
+            "always-on context is {n} tokens under codex's wire shape, over the {BUDGET_LIMIT} limit"
         );
     }
 
@@ -95,60 +104,68 @@ mod tests {
         let n = polaris_tools::all_specs().len();
         assert!(
             n <= MAX_TOOLS,
-            "ツールが {n} 本。上限 {MAX_TOOLS} 本を超えている"
+            "there are {n} tools, over the {MAX_TOOLS} limit"
         );
     }
 
     #[test]
     fn always_on_tokens_counts_the_wire_shape_not_the_bare_tool_spec() {
-        // `serde_json::to_string(&specs)` を直接数えると `{"type":"function",
-        // "function":{...}}` の包み分だけ少なく出る — 実際に送るバイト列と
-        // 計測するバイト列が別の場所で独立に組み立てられていたことによる
-        // 食い違いで、この milestone が測定を組織原理とする根拠そのものを
-        // 崩していた。ここで両者が一致しない（＝ここが素朴な直列化では
-        // なくワイヤ形式を数えている）ことを固定する。
+        // Counting `serde_json::to_string(&specs)` directly comes out lower
+        // by exactly the wrapping overhead of `{"type":"function",
+        // "function":{...}}` — a discrepancy from the byte stream actually
+        // sent and the byte stream measured having once been assembled
+        // independently in separate places, which undermined the very
+        // premise this milestone rests on: that measurement is the
+        // organizing principle. Here we pin that the two do not match
+        // (i.e. that this counts the wire shape, not a naive serialization).
         let specs = polaris_tools::all_specs();
         let naive_tools_tokens = count_tokens(&serde_json::to_string(&specs).unwrap());
         let measured_tools_tokens =
             always_on_tokens(SYSTEM_PROMPT, &specs) - count_tokens(SYSTEM_PROMPT);
         assert!(
             measured_tools_tokens > naive_tools_tokens,
-            "ワイヤ形式の包み分の差が無い: naive={naive_tools_tokens} measured={measured_tools_tokens}"
+            "no difference for the wire shape's wrapping overhead: naive={naive_tools_tokens} measured={measured_tools_tokens}"
         );
     }
 
-    /// 一時ディレクトリへ `n` 件の skill を実際に作って読み込み、本番と同じ
-    /// `prompt::assemble_always_on` へそのまま渡して、送られるもの自体を返す。
+    /// Actually creates and loads `n` skills into a temp directory, feeds
+    /// them straight into the same `prompt::assemble_always_on` production
+    /// uses, and returns the very thing that gets sent.
     ///
-    /// 「`main.rs` と同じ手順で組み立て直す」ことはしない。手順を書き写すと、
-    /// 測っているのは本番の写しであって本番ではなくなる。写しと本物は黙って
-    /// 食い違えるので、`main.rs` 側へ skill のカタログを足す変更がここへ
-    /// 届かなかった（再レビューの mutation N7）。
+    /// This does not "reassemble things by rewriting the same steps as
+    /// `main.rs`." Copying out the steps would mean what's being measured
+    /// is a copy of production, not production itself. A copy and the real
+    /// thing silently drift apart — which is exactly why a change adding
+    /// the skill catalog on the `main.rs` side once failed to reach this
+    /// test (re-review's mutation N7).
     ///
-    /// cwd とブランチ名は固定値を使う。一時ディレクトリのパスをそのまま
-    /// 環境ブロックへ入れると、ランダムなディレクトリ名の長さの違いだけで
-    /// トークン数が動き、「skill の数で動いたのか」を判別できなくなる。
+    /// Uses fixed values for cwd and the branch name. Feeding the temp
+    /// directory's own path straight into the environment block would move
+    /// the token count purely from differences in the random directory
+    /// name's length, making it impossible to tell whether it moved because
+    /// of the skill count.
     fn always_on_with_skills(n: usize) -> (crate::prompt::AlwaysOn, Vec<polaris_skills::Skill>) {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp directory");
         for i in 0..n {
             let name = format!("catalog-probe-{i:03}");
             let d = dir.path().join(&name);
-            std::fs::create_dir_all(&d).expect("作れない");
+            std::fs::create_dir_all(&d).expect("cannot create");
             std::fs::write(
                 d.join("SKILL.md"),
                 format!(
-                    "---\nname: {name}\ndescription: 常時コンテキストへ漏れていないかを見る目印 {i:03}。\n---\n本文 {i}\n"
+                    "---\nname: {name}\ndescription: marker {i:03} for checking whether this leaks into the always-on context.\n---\nbody {i}\n"
                 ),
             )
-            .expect("書けない");
+            .expect("cannot write");
         }
 
         let discovered = polaris_skills::discover_in(&[dir.path().to_path_buf()]);
-        // 読めていなければ以下の比較は「0 件と 0 件を比べる」空振りになる。
+        // If these weren't actually read, the comparison below becomes a
+        // vacuous "comparing 0 to 0."
         assert_eq!(
             discovered.skills.len(),
             n,
-            "fixture の skill が {n} 件読めていない"
+            "did not read {n} fixture skills"
         );
 
         let env = crate::constitution::environment_block(
@@ -156,31 +173,35 @@ mod tests {
             Some("feat/m1-headless-loop"),
         );
         let always_on =
-            crate::prompt::assemble_always_on("プロジェクトの規則。", &env, &discovered.skills);
-        // 組み立て関数が本当に n 件を受け取ったことを、組み立てた側から確かめる。
-        // ここを見ないと、渡し忘れて 0 件のまま3回測っていても等号は成立する
-        // —— それが B3 の元の欠陥そのものだった。
+            crate::prompt::assemble_always_on("Project rules.", &env, &discovered.skills);
+        // Confirms from the assembling side that the assembly function
+        // really did receive n skills. Without this check, forgetting to
+        // pass them and measuring 0 skills three times over would still
+        // satisfy the equality — that was the original B3 defect itself.
         assert_eq!(
             always_on.skills_seen(),
             n,
-            "組み立て関数へ skill が {n} 件渡っていない"
+            "the assembly function did not receive {n} skills"
         );
         (always_on, discovered.skills)
     }
 
     #[test]
     fn the_always_on_total_does_not_move_as_the_number_of_skills_grows() {
-        // 仕様のテスト戦略が名指ししている検査（「skill を15件から100件へ
-        // 増やしても合計が変化しないことを確認する」）であり、受け入れ基準 1
-        // が挙げる3つの入力のうち、この milestone が持ち込んだ唯一のもの。
-        // 憲法の大きさと環境情報の長さには既に番人がいるが、skill の数には
-        // いなかった。
+        // This is the check the spec's test strategy names by name ("confirm
+        // the total doesn't change even as skills grow from 15 to 100") —
+        // the only one of the 3 inputs listed by acceptance criterion 1 that
+        // this milestone introduced. The size of the constitution and the
+        // length of environment info already had guards; the number of
+        // skills did not.
         //
-        // 3つの測定は、件数の違う skill を同じ組み立て関数へ通した結果である。
-        // 引数を取らない関数を3回呼んで結果を突き合わせても、同じ式を3回
-        // 評価して自分自身と比べているだけで、`count_tokens` が非決定的に
-        // ならない限り落ちない。等号が意味を持つのは、比べる3つが違う入力
-        // から来ているときだけ。
+        // The 3 measurements are the results of passing skill sets of
+        // different sizes through the same assembly function. Calling an
+        // argument-less function 3 times and comparing the results against
+        // each other would just be evaluating the same expression 3 times
+        // and comparing it to itself — it wouldn't fail unless
+        // `count_tokens` became nondeterministic. The equality only means
+        // something when the 3 values being compared come from different inputs.
         let (zero_ctx, _) = always_on_with_skills(0);
         let (fifteen_ctx, _) = always_on_with_skills(15);
         let (hundred_ctx, skills) = always_on_with_skills(100);
@@ -191,37 +212,39 @@ mod tests {
 
         assert_eq!(
             fifteen, hundred,
-            "skill を15件から100件へ増やすと常時コンテキストが {fifteen} から {hundred} トークンへ動いた"
+            "growing skills from 15 to 100 moved the always-on context from {fifteen} to {hundred} tokens"
         );
         assert_eq!(
             zero, hundred,
-            "skill が0件のときと100件のときで常時コンテキストが違う: {zero} と {hundred}"
+            "always-on context differs between 0 skills and 100 skills: {zero} vs {hundred}"
         );
-        assert!(hundred <= BUDGET_LIMIT, "上限 {BUDGET_LIMIT} を超えている");
+        assert!(hundred <= BUDGET_LIMIT, "over the {BUDGET_LIMIT} limit");
 
-        // 合計の一致だけでは、将来 skill 由来の文字列が入り込んでも「たまたま
-        // トークン数が同じ」場合を見逃す。常時載る2つの経路（システム
-        // プロンプトと、実際に送られるツール定義）に skill の名前も説明も
-        // 一切現れないことを直接固定する —— 常時コンテキストへカタログ行を
-        // 足す、スキーマへ skill 名の enum を入れる、という将来の変更は
-        // どちらもここで落ちる。
+        // Matching totals alone would miss the case where a skill-derived
+        // string sneaks in but the token count "happens to match." We
+        // directly pin that neither a skill's name nor its description ever
+        // appears in either of the two always-on channels (the system
+        // prompt, and the tool definitions actually sent) — a future change
+        // that adds a catalog line to the always-on context, or adds an enum
+        // of skill names to the schema, would both fail here.
         //
-        // 見るのは組み立て結果そのもの。`all_specs()` をここで呼び直すと、
-        // 送られるツール定義とは別の一覧を検査することになる。
+        // What's inspected is the assembly result itself. Calling
+        // `all_specs()` again here would inspect a different list from the
+        // tool definitions actually sent.
         let system = hundred_ctx.system();
         let wire = serde_json::to_string(&polaris_provider::openai::tool_wire_shape(
             hundred_ctx.tools(),
         ))
-        .expect("直列化できない");
+        .expect("cannot serialize");
         for s in &skills {
             assert!(
                 !system.contains(&s.name) && !wire.contains(&s.name),
-                "skill の名前 {} が常時コンテキストへ漏れている",
+                "skill name {} leaked into the always-on context",
                 s.name
             );
             assert!(
                 !system.contains(&s.description) && !wire.contains(&s.description),
-                "skill の説明が常時コンテキストへ漏れている: {}",
+                "a skill's description leaked into the always-on context: {}",
                 s.name
             );
         }

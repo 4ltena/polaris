@@ -1,4 +1,4 @@
-//! polaris-core の入口。予算・憲法・プロンプトの各モジュールを束ねる。
+//! Entry point for polaris-core. Ties together the budget, constitution, and prompt modules.
 
 pub mod agent;
 pub mod approval;

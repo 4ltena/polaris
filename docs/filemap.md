@@ -1,9 +1,9 @@
-# ファイルマップ
+# File map
 
-生成ファイルである。手で編集しない。`crates/polaris-core/tests/filemap.rs` が
-`git ls-files --cached --others --exclude-standard` の結果からリポジトリの実体を
-読み、本文を再構築して `docs/filemap.md` と突き合わせる。ずれていればテストが
-失敗する。更新するときは次を実行する。
+This is a generated file. Do not edit it by hand. `crates/polaris-core/tests/filemap.rs`
+reads the actual state of the repository from the result of
+`git ls-files --cached --others --exclude-standard`, rebuilds the body, and checks it
+against `docs/filemap.md`. The test fails on any drift. To update it, run:
 
 ```
 UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
@@ -11,13 +11,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `.`
 
-- `Cargo.toml` — ワークスペース定義と共有依存
+- `Cargo.toml` — workspace definition and shared dependencies
 - `README.md` — polaris
-- `rust-toolchain.toml` — ツールチェイン固定
+- `rust-toolchain.toml` — pinned toolchain
 
 ## `crates/polaris-auth`
 
-- `Cargo.toml` — polaris-auth クレートのマニフェスト
+- `Cargo.toml` — manifest for the polaris-auth crate
 
 ## `crates/polaris-auth/src`
 
@@ -29,7 +29,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-cli`
 
-- `Cargo.toml` — polaris-cli クレートのマニフェスト
+- `Cargo.toml` — manifest for the polaris-cli crate
 
 ## `crates/polaris-cli/src`
 
@@ -43,33 +43,33 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core`
 
-- `Cargo.toml` — polaris-core クレートのマニフェスト
+- `Cargo.toml` — manifest for the polaris-core crate
 
 ## `crates/polaris-core/src`
 
-- `agent.rs` — エージェントループ。ツール呼び出しが無くなった時点の本文を返す。
-- `approval.rs` — 承認境界。`sandbox_mode` が技術的境界を、`approval_policy` が停止して
-- `audit.rs` — 追記専用の監査ログ。署名は付けない。インプロセスでは署名する主体と
-- `budget.rs` — 常時コンテキストの計測。数値は測定で担保し、見積で運用しない。
-- `config.rs` — 設定ファイルの読み込み。存在しないことは正常だが、壊れていることは正常ではない。
-- `constitution.rs` — 常時載る文脈のうち、ハーネスが所有しない部分。AGENTS.md の全文は載せない。
-- `lib.rs` — polaris-core の入口。予算・憲法・プロンプトの各モジュールを束ねる。
-- `project.rs` — プロジェクトルートの解決。
-- `prompt.rs` — 毎ターン載るもの一式を組み立てる唯一の場所。
-- `session.rs` — メッセージ履歴。M1 では追加のみで、圧縮もディスクへの永続化も持たない。
-- `stop.rs` — 停止条件。自動修復は行わない。壊れたまま回り続けるのが最も高くつくため、
+- `agent.rs` — The agent loop. Returns the body text at the point tool calls stop.
+- `approval.rs` — Approval boundary. `sandbox_mode` sets the technical boundary;
+- `audit.rs` — Append-only audit log. Not signed: in-process, the entity signing and the
+- `budget.rs` — Measurement of the always-on context. Numbers are backed by measurement,
+- `config.rs` — Loads config files. Not existing is normal; being malformed is not.
+- `constitution.rs` — The part of the always-on context that the harness does not own. The
+- `lib.rs` — Entry point for polaris-core. Ties together the budget, constitution, and prompt modules.
+- `project.rs` — Resolves the project root.
+- `prompt.rs` — The single place that assembles the set of things loaded every turn.
+- `session.rs` — Message history. In M1, this is append-only — no compaction, no
+- `stop.rs` — Stop conditions. No automatic recovery is attempted. Continuing to spin
 
 ## `crates/polaris-core/src/secret_screen`
 
-- `mod.rs` — Remna のプライバシーフィルタ。捕捉したイベント（コマンド文字列やウィンドウ
+- `mod.rs` — Remna's privacy filter. Pure logic that runs **before** a captured event
 
 ## `crates/polaris-core/tests`
 
-- `filemap.rs` — `docs/filemap.md` がリポジトリの実体と一致しているかを確かめるスナップショットテスト。
+- `filemap.rs` — A snapshot test that confirms `docs/filemap.md` matches the actual state of the repository.
 
 ## `crates/polaris-provider`
 
-- `Cargo.toml` — polaris-provider クレートのマニフェスト
+- `Cargo.toml` — manifest for the polaris-provider crate
 
 ## `crates/polaris-provider/src`
 
@@ -80,7 +80,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-sandbox`
 
-- `Cargo.toml` — polaris-sandbox クレートのマニフェスト
+- `Cargo.toml` — manifest for the polaris-sandbox crate
 
 ## `crates/polaris-sandbox/src`
 
@@ -94,7 +94,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-skills`
 
-- `Cargo.toml` — polaris-skills クレートのマニフェスト
+- `Cargo.toml` — manifest for the polaris-skills crate
 
 ## `crates/polaris-skills/src`
 
@@ -104,7 +104,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-tools`
 
-- `Cargo.toml` — polaris-tools クレートのマニフェスト
+- `Cargo.toml` — manifest for the polaris-tools crate
 
 ## `crates/polaris-tools/src`
 
@@ -119,7 +119,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `docs`
 
-- `filemap.md` — ファイルマップ
+- `filemap.md` — File map
 
 ## `docs/superpowers`
 

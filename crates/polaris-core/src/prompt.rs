@@ -1,20 +1,24 @@
-//! 毎ターン載るもの一式を組み立てる唯一の場所。
+//! The single place that assembles the set of things loaded every turn.
 //!
-//! システムプロンプトへ憲法と環境情報を差し込み、送るツール定義と束ねて
-//! `AlwaysOn` にする。
+//! Splices the constitution and environment info into the system prompt,
+//! bundles it with the tool definitions to send, and turns it into
+//! `AlwaysOn`.
 //!
-//! 常時コンテキストが 990 トークンを超えないこと、そして skill が何件あっても
-//! 増えないことは、この設計の中心的な主張である。主張を測れるようにするには、
-//! 本番が送るものとテストが測るものが同じでなければならない。かつては
-//! `main.rs` が組み立て、テストは同じ手順を書き写して別に組み立てていた。
-//! 2つは黙って食い違えるので、`main.rs` へ skill のカタログを1行足す変更は
-//! どのテストからも届かなかった（再レビューの mutation N7）。組み立てを
-//! ここへ1本にまとめ、`main.rs` もテストも同じ `assemble_always_on` を呼ぶ。
+//! That the always-on context never exceeds 990 tokens, and never grows no
+//! matter how many skills there are, is this design's central claim. For
+//! that claim to be measurable, what production sends and what the tests
+//! measure must be the same thing. This used to be assembled by `main.rs`,
+//! with tests copying the same steps and assembling it separately. The two
+//! silently drift apart, so a change adding one line for the skill catalog
+//! to `main.rs` reached none of the tests (re-review's mutation N7).
+//! Assembly is consolidated here into one path, and both `main.rs` and the
+//! tests call the same `assemble_always_on`.
 
 use polaris_tools::ToolSpec;
 
-/// 常時載るシステムプロンプト。振る舞いの指示を削ると往復が増えて総コストが
-/// 上がるため、短さのためにここを削らない。削る対象は構造の重複に限る。
+/// The system prompt that's always loaded. Cutting behavioral instructions
+/// increases round trips and raises total cost, so don't cut this for the
+/// sake of brevity. What may be cut is limited to structural duplication.
 pub const SYSTEM_PROMPT: &str = "\
 You are polaris, a coding agent. Read files and answer with what the code actually does.
 
@@ -26,23 +30,28 @@ Rules:
 - Read docs/filemap.md before searching the tree.
 ";
 
-/// 常時載る文脈を組み立てる。空の節は見出しごと落とす。
+/// Assembles the context that's always loaded. Drops empty sections
+/// heading and all.
 ///
-/// 組み立て結果はセッションを通して同一でなければならない。ここが毎ターン
-/// 変わるとプロンプトキャッシュの接頭辞が動き、履歴全体が未キャッシュ扱いになる。
+/// The assembled result must be identical throughout the session. If this
+/// changes every turn, the prompt cache's prefix shifts and the entire
+/// history gets treated as uncached.
 ///
-/// `constitution` は呼び出し側で `constitution::load` 等により既に
-/// `CONSTITUTION_LIMIT` へ切り詰められている想定だが、ここでも
-/// `cap()` を通す。未切り詰めの生テキストを渡す呼び出し側が将来増えても、
-/// このガードを経由しない限り上限を破れない。既に切り詰め済みの入力は
-/// `cap()` が冪等なため変化しない。
+/// `constitution` is expected to already have been truncated to
+/// `CONSTITUTION_LIMIT` by the caller (via `constitution::load` etc.), but
+/// it's still run through `cap()` here too. Even if a future caller starts
+/// passing untruncated raw text, the ceiling cannot be broken as long as it
+/// goes through this guard. Input that's already been truncated is
+/// unchanged, since `cap()` is idempotent.
 ///
-/// `environment` も同じ理由・同じ仕組みで `ENVIRONMENT_LIMIT` へ切り詰める。
-/// cwd もブランチ名もディスク/Git の言いなりの長さで、呼び出し側
-/// （`constitution::environment_block`）はそれ自体で長さを制限していない
-/// ため、ここで無条件にキャップしないと常時コンテキストの上限は異常に
-/// 長い cwd 1つで破れる。呼び出し側を経由しない限り抜け道が無いよう、
-/// 憲法と同じ「ここで二重にキャップする」設計に揃えた。
+/// `environment` is truncated to `ENVIRONMENT_LIMIT` for the same reason
+/// and by the same mechanism. Both the cwd and the branch name have
+/// lengths dictated by the disk / Git, and the caller
+/// (`constitution::environment_block`) doesn't limit their length on its
+/// own, so without an unconditional cap here, the always-on context's
+/// ceiling could be broken by a single abnormally long cwd. To leave no
+/// way around it short of going through the caller, this is aligned with
+/// the same "cap here too, redundantly" design as the constitution.
 pub(crate) fn build_system(constitution: &str, environment: &str) -> String {
     let constitution =
         crate::constitution::cap(constitution, crate::constitution::CONSTITUTION_LIMIT);
@@ -61,18 +70,24 @@ pub(crate) fn build_system(constitution: &str, environment: &str) -> String {
     s
 }
 
-/// 毎ターン必ず送るもの一式。システムプロンプトと、そのターンで公開する
-/// ツール定義を1つにまとめて持つ。
+/// The set of things always sent every turn, without fail. Holds the
+/// system prompt together with the tool definitions exposed for that turn
+/// as a single unit.
 ///
-/// フィールドは非公開で、変更する手段も公開していない。組み立てられるのは
-/// [`assemble_always_on`] からだけである。これは行儀の問題ではなく、この
-/// 型が守っている不変条件そのものによる —— 呼び出し側が組み立て後の
-/// システムプロンプトへ何かを継ぎ足せるなら、`polaris-core` の外に
-/// 「常時コンテキストを増やせる経路」が残り、受け入れ基準 1 の
-/// 「上限を超える経路が存在しない」が `main.rs` の書き方次第になる。
-/// 継ぎ足したい変更は [`assemble_always_on`] の内側を触るほかなく、
-/// その内側は `budget::tests::the_always_on_total_does_not_move_as_the_number_of_skills_grows`
-/// が 0 件 / 15 件 / 100 件の skill で測っている。
+/// The fields are private, and no means of mutating them is exposed
+/// either. The only way to build one is through [`assemble_always_on`].
+/// This isn't a matter of good manners — it follows from the very
+/// invariant this type protects: if a caller could append anything to the
+/// already-assembled system prompt, a path to "grow the always-on context"
+/// would remain open outside `polaris-core`, and acceptance criterion 1's
+/// claim that "no path exists to exceed the ceiling" would end up
+/// depending on how `main.rs` happens to be written. With no public
+/// constructor and no public mutator, that path is unrepresentable, not
+/// merely something callers are expected to avoid. Any change that needs
+/// to append something has no choice but to touch the inside of
+/// [`assemble_always_on`], and that inside is measured by
+/// `budget::tests::the_always_on_total_does_not_move_as_the_number_of_skills_grows`
+/// with 0 / 15 / 100 skills.
 #[derive(Debug, Clone)]
 pub struct AlwaysOn {
     system: String,
@@ -81,43 +96,49 @@ pub struct AlwaysOn {
 }
 
 impl AlwaysOn {
-    /// 送るシステムプロンプト。
+    /// The system prompt to send.
     pub fn system(&self) -> &str {
         &self.system
     }
 
-    /// 送るツール定義。
+    /// The tool definitions to send.
     pub fn tools(&self) -> &[ToolSpec] {
         &self.tools
     }
 
-    /// この一式の実測トークン数。予算のテストはすべてこの経路で測る。
+    /// This set's measured token count. Every budget test measures through
+    /// this path.
     pub fn tokens(&self) -> usize {
         crate::budget::always_on_tokens(&self.system, &self.tools)
     }
 
-    /// 組み立て時に渡された skill の件数。
+    /// The number of skills handed in at assembly time.
     ///
-    /// 常時コンテキストには一切載らない（載っていないことがこの milestone の
-    /// 主張である）。それでも数だけを控えるのは、「skill を 100 件渡しても
-    /// 合計が動かない」というテストが、実は 0 件しか渡せていなかった、という
-    /// 空振りを検出できるようにするためである。B3 の元の欠陥がまさに
-    /// 「渡したはずのものが計算に入っていない」だったので、渡ったことを
-    /// 組み立てた側から言えるようにしておく。
+    /// None of them are loaded into the always-on context at all (that
+    /// they aren't loaded is this milestone's claim). The reason for
+    /// keeping just the count anyway is to let a test like "the total
+    /// doesn't move even when 100 skills are handed in" catch the no-op
+    /// failure mode of actually only having had 0 skills handed in. B3's
+    /// original defect was exactly "what was supposedly handed in never
+    /// made it into the calculation", so this lets the assembling side
+    /// itself state that it was actually received.
     pub fn skills_seen(&self) -> usize {
         self.skills_seen
     }
 }
 
-/// 常時コンテキストを組み立てる唯一の関数。`main.rs` もテストもこれを呼ぶ。
+/// The single function that assembles the always-on context. Both
+/// `main.rs` and the tests call this.
 ///
-/// `skills` を受け取って何も載せない。これがこの関数の主張である —— ルータ
-/// （`skill` ツール）が発見を担うので、skill の名前も説明も常時コンテキストへ
-/// 出す必要が無く、出さない限り合計は skill の件数に依存しない。引数として
-/// 受け取るのは、載せないことをテストから測れるようにするためである。件数の
-/// 違う3つの入力を同じ関数へ通し、出てきたトークン数が一致することを見る。
-/// 引数を取らない関数では、同じ式を3回評価して自分自身と比べるだけの
-/// 恒真式にしかならない（B3 の元の欠陥）。
+/// Takes `skills` and loads none of it. That is this function's claim —
+/// the router (the `skill` tool) handles discovery, so there's no need to
+/// surface a skill's name or description into the always-on context, and
+/// as long as it isn't surfaced, the total doesn't depend on the number of
+/// skills. It's taken as an argument so that tests can measure that it
+/// isn't loaded: pass 3 inputs with different counts through the same
+/// function and check that the resulting token counts match. A function
+/// that took no argument would only be a tautology — evaluating the same
+/// expression 3 times and comparing it to itself (B3's original defect).
 pub fn assemble_always_on(
     constitution: &str,
     environment: &str,
@@ -137,36 +158,41 @@ mod tests {
 
     #[test]
     fn caps_an_oversized_constitution_passed_directly() {
-        // build_system 自身が守りを持つことを確認する。呼び出し側が切り詰めを
-        // 忘れた生テキストを渡しても、憲法部分は上限を超えない。
-        let oversized = "規則".repeat(5000);
+        // Confirm build_system itself carries this protection. Even if a
+        // caller passes raw text and forgot to truncate it, the
+        // constitution portion does not exceed the ceiling.
+        let oversized = "rule".repeat(5000);
         let system = build_system(&oversized, "");
 
         let prefix = format!("{SYSTEM_PROMPT}\n## Project rules\n");
         let body = system
             .strip_prefix(&prefix)
-            .expect("Project rules 節が組み立てられていない")
+            .expect("the Project rules section was not assembled")
             .strip_suffix('\n')
-            .expect("末尾の改行が無い");
+            .expect("missing trailing newline");
 
         let n = crate::budget::count_tokens(body);
         assert!(
             n <= CONSTITUTION_LIMIT,
-            "憲法部分が上限を超えている: {n} トークン"
+            "the constitution portion exceeds the ceiling: {n} tokens"
         );
-        assert!(!body.is_empty(), "非空の入力から空を返してはいけない");
+        assert!(
+            !body.is_empty(),
+            "must not return empty from non-empty input"
+        );
     }
 
     #[test]
     fn skills_seen_reports_what_was_handed_in() {
-        // `AlwaysOn::skills_seen` は予算テストが「本当に 100 件渡っているか」を
-        // 確かめるための唯一の手がかりなので、それ自体が入力を反映している
-        // ことを固定する。常に 0 を返す実装ならここで落ちる。
+        // `AlwaysOn::skills_seen` is the only clue the budget tests have
+        // for confirming "were 100 really handed in", so pin down that it
+        // reflects the input itself. An implementation that always returns
+        // 0 fails here.
         let skills: Vec<polaris_skills::Skill> = (0..3)
             .map(|i| polaris_skills::Skill {
                 name: format!("s{i}"),
-                description: "説明".into(),
-                body: "本文".into(),
+                description: "description".into(),
+                body: "body".into(),
                 path: format!("/x/s{i}/SKILL.md").into(),
             })
             .collect();
@@ -177,9 +203,9 @@ mod tests {
 
     #[test]
     fn already_capped_input_is_unchanged() {
-        // 既に切り詰め済みの入力は cap() が冪等なため変化しない。
-        let already_capped = crate::constitution::cap("固定の規則。", CONSTITUTION_LIMIT);
+        // Input that's already been truncated is unchanged, since cap() is idempotent.
+        let already_capped = crate::constitution::cap("a fixed rule.", CONSTITUTION_LIMIT);
         let system = build_system(&already_capped, "");
-        assert!(system.contains("固定の規則。"));
+        assert!(system.contains("a fixed rule."));
     }
 }

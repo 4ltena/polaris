@@ -125,14 +125,23 @@ M2.5 完了後、初めて実際の ChatGPT サブスクリプションで一気
 
 | 指標 | 値 | 測ったテスト |
 | --- | --- | --- |
-| 常時コンテキストの下限（システムプロンプトとツール定義のみ） | 582 トークン | `budget.rs` の `always_on_context_stays_within_budget` |
-| 憲法を上限まで充填し実環境と skill 100 件を与えた場合 | 758 トークン | `constitution.rs` の `full_always_on_context_stays_within_budget` |
-| 真の同時最大（憲法と環境を同時に飽和させ skill 100 件） | 941 トークン | `constitution.rs` の `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget` |
+| 常時コンテキストの下限（システムプロンプトとツール定義のみ） | 496 トークン | `budget.rs` の `always_on_context_stays_within_budget` |
+| 憲法を上限まで充填し実環境と skill 100 件を与えた場合 | 672 トークン | `constitution.rs` の `full_always_on_context_stays_within_budget` |
+| 真の同時最大（憲法と環境を同時に飽和させ skill 100 件） | 855 トークン | `constitution.rs` の `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget` |
+| codex 側ツールワイヤ形式での下限（openai と並行して独立に固定） | 486 トークン | `budget.rs` の `always_on_tokens_counts_the_wire_shape_not_the_bare_tool_spec` |
 | 上限 | 990 トークン | |
 | ツール本数 | 5 / 上限 6 | |
-| テスト | 350 件（ホスト、effort 実装後の実測。Linux コンテナは M2 完了時点で 260 件を確認、M2.5 以降は polaris-auth/provider のみで Linux 固有のサンドボックス経路には触れていない） | |
+| テスト | 350 件（ホスト。Linux コンテナは M2 完了時点で 260 件を確認、M2.5 以降は polaris-auth/provider のみで Linux 固有のサンドボックス経路には触れていない） | |
 
 常時コンテキストは、実際に送信されるシステムプロンプトとツールスキーマを `tiktoken_rs::o200k_base()` で数えた実測値である。見積ではない。
+
+### `crates/` 配下を全て英語化した
+
+利用者の指示で、`crates/` 配下のソース（エラーメッセージ・doc/インラインコメント・ログ出力・CLI ヘルプ・ツールスキーマ）を全クレート（`polaris-tools`・`polaris-sandbox`・`polaris-auth`・`polaris-provider`・`polaris-core`・`polaris-skills`・`polaris-cli`）で英語へ翻訳した。`docs/`・README.md・AGENTS.md は対象外のまま日本語で残している。7クレートをクレート単位で順に翻訳し、各クレートでテスト件数の不変とビルド成功を確認した。
+
+ツールスキーマの英語化で常時コンテキストの実測値が動いた。下限は 582→496 トークン、真の同時最大は 941→855 トークンへ下がった（英語の方が同じ内容を tiktoken で少ないトークン数に符号化するため）。上限 990 に対する余裕は広がった。codex 側のツールワイヤ形式（openai とは別形式）も、既定モデルの実測と並んで独立に固定するテストを新設した。
+
+作業中、翻訳を担当したエージェントがセッションの利用上限に2回当たり、いずれも未コミットの作業が残った状態で中断した。1回目は稼働中のエージェントを `SendMessage` で再開しようとしたが、届いた先が文脈を持たない別インスタンスだったため失敗し、元のエージェントの完了を待つ形に切り替えた。2回目はツリーの状態（コミット未実施、失敗していたテスト2件の原因）を確認したうえで新しいエージェントへ引き継がせ、無事に完了させた。テスト用のバイト境界フィクスチャ（"あ" が3バイトの UTF-8 であることを利用したテスト）で2文字だけ日本語が取り残されていたのを検出し、意味を保つ形（同じく3バイトの "★" へ置換）で自分で直接修正した。
 
 **数値を書くときは、それを産んだテスト名を必ず添える。** この表は実装者とレビュアの実測で三度訂正されている。以前ここにあった「176 トークン」「23 件」、および `constitution.rs` のコメントにあった「525」は、どのテストも測っていない値だった。
 

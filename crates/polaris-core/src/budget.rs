@@ -250,6 +250,64 @@ mod tests {
         }
     }
 
+    /// M3b で `lookup` の戻り値へ near-universal な skill を常時含めるよ
+    /// うにしたが、それは `AlwaysOn`（システムプロンプトとツール定義）
+    /// とは別の経路（ツール結果、メッセージ末尾）である。この設計が
+    /// `assemble_always_on` に一切触れていないことを、near-universal 該
+    /// 当が 0 件・少数（4 件）・上限（`MAX_NEAR_UNIVERSAL` 件）のどの場
+    /// 合でもトークン数が変わらないことで確認する。
+    #[test]
+    fn near_universal_skills_do_not_move_the_always_on_total() {
+        fn universal_skill(i: usize) -> polaris_skills::Skill {
+            polaris_skills::Skill {
+                name: format!("universal-{i:02}"),
+                description: "Use when implementing any feature or bugfix, before writing implementation code".into(),
+                body: "body".into(),
+                path: format!("/x/universal-{i:02}/SKILL.md").into(),
+            }
+        }
+        fn ordinary_skill(i: usize) -> polaris_skills::Skill {
+            polaris_skills::Skill {
+                name: format!("ordinary-{i:02}"),
+                description: "Handles Stripe webhook signature verification.".into(),
+                body: "body".into(),
+                path: format!("/x/ordinary-{i:02}/SKILL.md").into(),
+            }
+        }
+
+        let none: Vec<polaris_skills::Skill> = (0..10).map(ordinary_skill).collect();
+        let some: Vec<polaris_skills::Skill> = (0..4)
+            .map(universal_skill)
+            .chain((0..10).map(ordinary_skill))
+            .collect();
+        let many: Vec<polaris_skills::Skill> = (0..polaris_tools::skill::MAX_NEAR_UNIVERSAL)
+            .map(universal_skill)
+            .chain((0..10).map(ordinary_skill))
+            .collect();
+
+        // Confirm the fixtures actually exercise what they claim to before
+        // trusting the token-count comparison below.
+        assert_eq!(polaris_tools::skill::near_universal(&none).len(), 0);
+        assert_eq!(polaris_tools::skill::near_universal(&some).len(), 4);
+        assert_eq!(
+            polaris_tools::skill::near_universal(&many).len(),
+            polaris_tools::skill::MAX_NEAR_UNIVERSAL
+        );
+
+        let tokens_none = crate::prompt::assemble_always_on("", "", &none).tokens();
+        let tokens_some = crate::prompt::assemble_always_on("", "", &some).tokens();
+        let tokens_many = crate::prompt::assemble_always_on("", "", &many).tokens();
+
+        assert_eq!(
+            tokens_none, tokens_some,
+            "AlwaysOn tokens moved when near-universal skills were added"
+        );
+        assert_eq!(
+            tokens_none, tokens_many,
+            "AlwaysOn tokens moved when the near-universal set reached its cap"
+        );
+    }
+
     #[test]
     fn count_tokens_is_nonzero_for_nonempty_text() {
         assert!(count_tokens("hello world") > 0);

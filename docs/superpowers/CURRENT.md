@@ -104,6 +104,17 @@ HEAD `ba83f0c` で、ホスト 265 件、カーネル 6.19.7 のコンテナ 260
 
 HEAD `dbb5e82` で 344 テスト、clippy `-D warnings` clean、fmt clean、`git status --short` 空。常時コンテキストへの影響はゼロトークンで、codex 側のツールワイヤ形式（482 トークン）も openai 側（492 トークン）と並んで独立に固定した——将来どちらかの形式が肥大しても気づけるようにするためで、以前は openai 側しか測っていなかった。
 
+### 実キーでの初回実行と、そこで判明した2件
+
+M2.5 完了後、初めて実際の ChatGPT サブスクリプションで一気通貫を実行した（`polaris login` → `POLARIS_PROVIDER=codex polaris -p "…"`）。受け入れ基準 1・2・3 をすべて実バックエンドで確認した——保管先とパーミッション（`-rw-------`）、`~/.codex/auth.json` が全過程で不変であること、実際の一発実行、期限切れからの更新まで。
+
+実行して初めて2件の食い違いが出た。
+
+- 設計時にバイナリの文字列から拾った既定モデル名（`gpt-5.1-codex-max`・`gpt-5.2-codex`・`gpt-5.3-codex`）が、実カタログに1つも存在しなかった。実バックエンドは 400 で「ChatGPT アカウントでの Codex 利用ではサポートされていない」と明確に拒否していた（認証自体は通っており 401 ではなかった）。`codex debug models` で実カタログを取得し、既定を `gpt-5.6-sol` へ差し替えた
+- 利用者からの追加要求で、ChatGPT のプラン（`chatgpt_plan_type`。`access_token` の JWT に既にある claim）から `reasoning.effort` を自動で決める経路を足した。`plus` は `low`、`pro` で始まる値は `xhigh`。Pro の利用量ティア（5x/20x 等）は `plan_type` だけでは区別できないと分かったため、pro 系は一律 `xhigh` に倒す裁定を利用者から得た。どちらにも当たらない値は `reasoning` キー自体を送らずサーバの既定へ委ねる
+
+いずれも仕様の「保証しない範囲」が最初から明記していた形の食い違いであり、動かして初めて見える種類のものだった。修正は 350 テストで再検証済み。`~/.local/bin/polaris`（`codex` と同じ場所）へ PATH を通した。
+
 ## 委譲して待っているもの
 
 なし。
@@ -119,7 +130,7 @@ HEAD `dbb5e82` で 344 テスト、clippy `-D warnings` clean、fmt clean、`git
 | 真の同時最大（憲法と環境を同時に飽和させ skill 100 件） | 941 トークン | `constitution.rs` の `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget` |
 | 上限 | 990 トークン | |
 | ツール本数 | 5 / 上限 6 | |
-| テスト | 344 件（ホスト、M2.5 完了時点。Linux コンテナは M2 完了時点で 260 件を確認、M2.5 は polaris-auth/provider のみで Linux 固有のサンドボックス経路には触れていない） | |
+| テスト | 350 件（ホスト、effort 実装後の実測。Linux コンテナは M2 完了時点で 260 件を確認、M2.5 以降は polaris-auth/provider のみで Linux 固有のサンドボックス経路には触れていない） | |
 
 常時コンテキストは、実際に送信されるシステムプロンプトとツールスキーマを `tiktoken_rs::o200k_base()` で数えた実測値である。見積ではない。
 

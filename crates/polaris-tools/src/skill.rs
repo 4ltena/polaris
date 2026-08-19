@@ -1,45 +1,55 @@
-//! skill ツール。名前に完全一致すれば本文を、そうでなければ候補の一覧を返す。
+//! skill tool. Returns the body on an exact name match, otherwise returns a
+//! list of candidates.
 
 use polaris_skills::Skill;
 
-/// SKILL.md 本文を返す際の上限バイト数。Agent Skills 仕様は本文を概ね
-/// 5,000 トークン未満に保ち、詳細は参照ファイルへ逃がすことを推奨している。
-/// ここではトークナイザを持たないためバイト数で近似する。日本語混じりの
-/// 本文では 1 トークンあたり概ね 2〜4 バイトになりやすいため、5,000 トークン
-/// を厳密な下限ではなく「およそこの規模」の目安として扱い、余裕を持たせて
-/// 32 KiB を上限にする —— 仕様の推奨よりも明確に緩いが、暴走した本文が
-/// 会話コストを際限なく押し上げることは防ぐ。`read` が `MAX_READ_BYTES` で
-/// 同じ役割を果たしているのと対をなす。
+/// Byte cap applied when returning a SKILL.md body. The Agent Skills spec
+/// recommends keeping the body under roughly 5,000 tokens and pushing
+/// detail out to reference files. There's no tokenizer here, so this
+/// approximates using byte count instead. For a body that mixes in
+/// Japanese, each token tends to run roughly 2 to 4 bytes, so this treats
+/// 5,000 tokens not as a strict floor but as a "roughly this scale"
+/// guideline, and sets the cap at 32 KiB with some margin — clearly looser
+/// than the spec's recommendation, but enough to stop a runaway body from
+/// pushing conversation cost up without bound. This mirrors the role
+/// `MAX_READ_BYTES` plays for `read`.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 
-/// 検索結果として一度に返す候補の上限件数。会話履歴はターンごとにまるごと
-/// 再送されるため、件数を無制限にすると skill が増えるほど毎ターンの
-/// コストが際限なく増える —— 990 トークン予算が別の場所で防いでいるのと
-/// 同じ種類のコストが、この経路から素通りしてしまう。20 件は、一度に
-/// 見渡せる規模を残しつつ、打ち切りが起きたら明示して絞り込みを促すための
-/// 目安として選んだ。
+/// Cap on the number of candidates returned at once as a search result.
+/// Because the conversation history is resent in full on every turn, an
+/// unbounded count would make the per-turn cost grow without limit as
+/// skills accumulate — the same kind of cost a 990-token budget prevents
+/// elsewhere in the system would slip straight through this path. 20 was
+/// chosen as a guideline that leaves a scale that can still be surveyed at
+/// a glance, while making the truncation explicit and nudging toward
+/// narrowing the query when it kicks in.
 const MAX_RESULTS: usize = 20;
 
-/// 候補一覧の出力全体に許す上限バイト数。
+/// Cap on the total byte size allowed for the whole candidate-list output.
 ///
-/// `MAX_RESULTS` が縛るのは件数だけである。`description` は仕様上 1,024
-/// 文字まで許され、日本語なら 1 件で 3 KB に達するため、20 件そろうと
-/// 約 61 KB になる —— 同じファイルが 1 件の本文に課している
-/// `MAX_BODY_BYTES`（32 KiB）の倍を、より緩い根拠で通してしまう。候補
-/// 一覧は「どれを読むかを選ぶための目次」であって読み物ではないので、
-/// 目次が本文の上限を超えることはない。本文上限の 1/4 にあたる 8 KiB を
-/// 上限とし、超える分は件数上限と同じ文言で打ち切ったことを明示する。
+/// `MAX_RESULTS` only bounds the count. The spec allows `description` up to
+/// 1,024 characters, and for Japanese that can reach 3 KB for a single
+/// entry, so 20 of them together come to about 61 KB — twice the
+/// `MAX_BODY_BYTES` (32 KiB) that this same file imposes on a single
+/// body's content, let through on flimsier grounds. A candidate list is a
+/// "table of contents for choosing what to read", not something meant to
+/// be read in full, so the table of contents should never exceed the cap
+/// on the body itself. Set the cap at 8 KiB, a quarter of the body cap, and
+/// when it's exceeded, state that it was truncated using the same wording
+/// as the count cap.
 const MAX_LIST_BYTES: usize = 8 * 1024;
 
-/// 一致しなかったときに文言へ差し戻すクエリの上限バイト数。
+/// Cap on the query echoed back into the message when nothing matches.
 ///
-/// クエリはモデルが書いた任意長の文字列で、この文言はツール結果として
-/// 会話履歴に残り、以後のターンで毎回再送される。このファイルで唯一
-/// 上限の無い入力だった。何を探したのかが分かれば足りるので短くてよい。
+/// The query is an arbitrary-length string written by the model, and this
+/// wording stays in the conversation history as the tool result, resent
+/// every subsequent turn. This was the one input in this file with no cap.
+/// Knowing what was searched for is enough, so it can be kept short.
 const MAX_ECHOED_QUERY_BYTES: usize = 120;
 
-/// `text` を高々 `limit` バイトへ切り詰める。UTF-8 の文字境界を跨がないよう
-/// 境界を後退させる。切り詰めが実際に起きたかを bool で返す。
+/// Truncates `text` to at most `limit` bytes. Backs off the cut point so it
+/// never crosses a UTF-8 character boundary. Returns whether truncation
+/// actually happened, as a bool.
 fn cap_bytes(text: &str, limit: usize) -> (&str, bool) {
     if text.len() <= limit {
         return (text, false);
@@ -51,17 +61,19 @@ fn cap_bytes(text: &str, limit: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-/// 候補一覧を `MAX_RESULTS` 件かつ `MAX_LIST_BYTES` バイトまで整形する。
-/// どちらかで打ち切ったら「打ち切った」と明示する —— 沈黙して一部だけ
-/// 返すと、モデルはそれが全件だと誤解する。
+/// Formats the candidate list up to `MAX_RESULTS` entries and
+/// `MAX_LIST_BYTES` bytes. If either one causes a cutoff, state explicitly
+/// that it was cut off — silently returning only part of the list would let
+/// the model mistake it for the full set.
 fn list_candidates(items: &[&Skill], header: &str) -> String {
     let mut out = String::from(header);
     let mut shown = 0usize;
     for s in items.iter().take(MAX_RESULTS) {
         let line = format!("- {}: {}\n", s.name, s.description);
-        // 1 件目だけは上限を超えても出す。1 件も出さずに「打ち切った」と
-        // だけ返すと、モデルには次に打つ手が何も残らない。したがって出力は
-        // 高々 `MAX_LIST_BYTES` + 見出し + 候補 1 件分に収まる。
+        // Always emit the first entry even if it exceeds the cap.
+        // Returning "truncated" without showing even one entry leaves the
+        // model with no next move at all. So the output fits within, at
+        // most, `MAX_LIST_BYTES` + header + one candidate's worth.
         if shown > 0 && out.len() + line.len() > MAX_LIST_BYTES {
             break;
         }
@@ -70,26 +82,31 @@ fn list_candidates(items: &[&Skill], header: &str) -> String {
     }
     if shown < items.len() {
         out.push_str(&format!(
-            "(全 {} 件中 {shown} 件のみ表示。絞り込むか名前を直接渡すこと。)\n",
+            "(showing {shown} of {} total; narrow the query or pass a name directly.)\n",
             items.len()
         ));
     }
     out
 }
 
-/// 与えられた語を skill 名として引き、外れたら名前と説明を検索する。
+/// Looks up the given term as a skill name; if it doesn't match, searches
+/// names and descriptions instead.
 ///
-/// 検索が本文を返さないのは段階的開示のためである。候補を見てから読むかを
-/// 決められるようにする。すべての本文を返すなら検索する意味が無い。
+/// The reason a search doesn't return the body is progressive disclosure:
+/// it lets a candidate be seen before deciding whether to read it. If every
+/// body were returned, searching would be pointless.
 pub fn lookup(skills: &[Skill], q: &str) -> String {
     if skills.is_empty() {
-        return "skill が 1 件も見つからない。探索先に SKILL.md が無い。".to_string();
+        return "no skill was found at all. there is no SKILL.md at the search location."
+            .to_string();
     }
 
-    // 前後の空白を一度だけ落とし、以降の空判定・完全一致判定・部分一致
-    // 判定すべてで同じ値を使う。ここで trim した値と別の場所で untrimmed
-    // な q を使うと、前後に空白が付いた完全一致クエリが一致判定をすり抜け
-    // てしまう。
+    // Strip leading/trailing whitespace exactly once, and use that same
+    // value for every judgment that follows: the empty check, the
+    // exact-match check, and the partial-match check. Using this trimmed
+    // value in one place and an untrimmed `q` elsewhere would let an
+    // exact-match query with surrounding whitespace slip past the match
+    // check.
     let q = q.trim();
 
     if let Some(s) = skills.iter().find(|s| s.name == q) {
@@ -97,24 +114,26 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
         let mut out = format!("# {}\n\n{}\n", s.name, body);
         if truncated {
             out.push_str(&format!(
-                "\n(本文を {MAX_BODY_BYTES} バイトで打ち切った。全文が要るときは {} を直接読むこと。)\n",
+                "\n(the body was truncated at {MAX_BODY_BYTES} bytes. read {} directly for the full text.)\n",
                 s.path.display()
             ));
         }
         return out;
     }
 
-    // 空文字列・空白のみの q は「意図的に何も絞り込まない」問い合わせとして
-    // 扱う。Rust の `str::contains` は空の針に対して常に真を返すため、下の
-    // 検索へ素通しすると事実上「全 skill を返せ」になってしまう。それ自体は
-    // 「何があるか見せてほしい」という妥当な要求の読み方でもあるので、黙って
-    // 全件流すのではなく、そう解釈したことを明示したうえで同じ件数上限を
-    // かけて返す。
+    // Treat an empty or whitespace-only q as a query that deliberately
+    // narrows nothing down. Rust's `str::contains` always returns true
+    // against an empty needle, so letting it pass straight through to the
+    // search below would effectively become "return every skill". That's
+    // itself a reasonable reading of "show me what's available", so rather
+    // than silently streaming everything back, state that this
+    // interpretation was made and apply the same count cap as any other
+    // result.
     if q.is_empty() {
         let all: Vec<&Skill> = skills.iter().collect();
         return list_candidates(
             &all,
-            "q が空なので、存在する skill を列挙する。絞り込むには名前や語を渡すこと。\n",
+            "q is empty, so listing the skills that exist. pass a name or term to narrow it down.\n",
         );
     }
 
@@ -129,21 +148,26 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
 
     if hits.is_empty() {
         let all: Vec<&Skill> = skills.iter().collect();
-        // q はモデルが書いた任意長の文字列である。そのまま差し戻すと、
-        // 上限の無い入力が上限の無い出力になり、しかも履歴に残って毎ターン
-        // 再送される。何を探したのかが伝わる長さで切り、切ったと断る。
+        // q is an arbitrary-length string written by the model. Echoing it
+        // back as-is would turn an uncapped input into uncapped output, and
+        // it stays in history to be resent every turn. Cut it to a length
+        // that still conveys what was searched for, and say that it was
+        // cut.
         let (echoed, truncated) = cap_bytes(q, MAX_ECHOED_QUERY_BYTES);
         let header = if truncated {
             format!(
-                "{echoed}…（クエリが長いので先頭 {MAX_ECHOED_QUERY_BYTES} バイトのみ表示）に当たる skill が無い。利用できるのは次のとおり。\n"
+                "{echoed}… (query is long, showing only the first {MAX_ECHOED_QUERY_BYTES} bytes) matched no skill. what's available is listed below.\n"
             )
         } else {
-            format!("{echoed} に当たる skill が無い。利用できるのは次のとおり。\n")
+            format!("{echoed} matched no skill. what's available is listed below.\n")
         };
         return list_candidates(&all, &header);
     }
 
-    list_candidates(&hits, "候補。本文が要るときは名前をそのまま渡す。\n")
+    list_candidates(
+        &hits,
+        "candidates. pass the name as-is if you need the body.\n",
+    )
 }
 
 #[cfg(test)]
@@ -154,14 +178,14 @@ mod tests {
         vec![
             polaris_skills::Skill {
                 name: "git-commit".into(),
-                description: "コミットを作る。commit や git の話題で使う。".into(),
-                body: "本文A".into(),
+                description: "Creates a commit. Used for commit or git topics.".into(),
+                body: "Body A".into(),
                 path: "/x/git-commit/SKILL.md".into(),
             },
             polaris_skills::Skill {
                 name: "writing-style".into(),
-                description: "日本語の散文を整える。".into(),
-                body: "本文B".into(),
+                description: "Polishes Japanese prose.".into(),
+                body: "Body B".into(),
                 path: "/x/writing-style/SKILL.md".into(),
             },
         ]
@@ -170,91 +194,101 @@ mod tests {
     #[test]
     fn an_exact_name_returns_the_body() {
         let out = lookup(&fixtures(), "git-commit");
-        assert!(out.contains("本文A"), "本文が返っていない: {out}");
-        assert!(!out.contains("本文B"));
+        assert!(out.contains("Body A"), "the body was not returned: {out}");
+        assert!(!out.contains("Body B"));
     }
 
     #[test]
     fn a_query_returns_names_and_descriptions_not_bodies() {
-        let out = lookup(&fixtures(), "コミット");
+        let out = lookup(&fixtures(), "commit");
         assert!(out.contains("git-commit"));
         assert!(
-            !out.contains("本文A"),
-            "検索で本文まで返してはいけない: {out}"
+            !out.contains("Body A"),
+            "a search must not also return the body: {out}"
         );
     }
 
     #[test]
     fn a_query_matching_nothing_says_so_and_lists_what_exists() {
-        let out = lookup(&fixtures(), "まったく無関係な語");
+        let out = lookup(&fixtures(), "a completely unrelated term");
         assert!(out.contains("git-commit") && out.contains("writing-style"));
     }
 
     #[test]
     fn an_empty_skill_set_is_distinguishable_from_a_query_matching_nothing() {
-        // どちらも非空の文字列を返すという点だけを見れば見分けが付かない。
-        // 「skill が1件も無い」ことを示す固有の文言が、単に検索が外れた場合
-        // の出力には現れないことを固定する。`skills.is_empty()` の早期
-        // return を削除すると、空集合への問い合わせは hits.is_empty() 経路
-        // に落ち、この文言を含まない出力になるため、この違いを検出できる。
-        let empty_set = lookup(&[], "何か");
+        // Looking only at whether both return a non-empty string wouldn't
+        // distinguish them. Pin down that the distinct wording for "not a
+        // single skill exists" never shows up in output from a search that
+        // simply found no match. If the early return for `skills.is_empty()`
+        // were removed, a query against an empty set would fall into the
+        // `hits.is_empty()` path and produce output without this wording,
+        // which is what lets this difference be detected.
+        let empty_set = lookup(&[], "something");
         assert!(
-            empty_set.contains("1 件も見つからない"),
-            "skill が1件も無いことを示す文言が無い: {empty_set}"
+            empty_set.contains("no skill was found at all"),
+            "missing the wording that says not a single skill exists: {empty_set}"
         );
 
-        let no_match = lookup(&fixtures(), "まったく無関係な語");
+        let no_match = lookup(&fixtures(), "a completely unrelated term");
         assert!(
-            !no_match.contains("1 件も見つからない"),
-            "1件もヒットしなかっただけなのに「1件も無い」と言っている: {no_match}"
+            !no_match.contains("no skill was found at all"),
+            "says \"not a single one exists\" when this was merely zero hits: {no_match}"
         );
     }
 
     #[test]
     fn an_empty_query_lists_what_exists_instead_of_matching_everything_silently() {
-        // Rust の `"anything".contains("")` は常に真なので、空文字列を検索
-        // へ素通しすると全件が「ヒット」してしまう。それを候補一覧として
-        // 返すこと自体は妥当だが、本文までは含めない・そう解釈したと分かる
-        // ことを固定する。
+        // Rust's `"anything".contains("")` is always true, so letting an
+        // empty string pass straight through to the search below would
+        // make everything "hit". Returning that as a candidate list is
+        // reasonable on its own, but pin down that it doesn't include the
+        // bodies, and that it's discernible that this interpretation was
+        // made.
         //
-        // 「名前が含まれて本文は含まれない」というだけでは、意図的な分岐を
-        // 削って検索へ素通しさせても（needle が空文字なので全件が hits に
-        // 入り、同じ list_candidates で整形されるため）見分けが付かない。
-        // 意図的な分岐だけが出す固有の文言まで固定して、その分岐が実際に
-        // 通っていることを検出できるようにする。
+        // "names are included but bodies aren't" alone wouldn't distinguish
+        // this from removing the deliberate branch and letting it fall
+        // through to the search (since needle is an empty string,
+        // everything lands in hits and gets formatted by the same
+        // list_candidates, so the two are indistinguishable). Pin down the
+        // wording unique to the deliberate branch itself, so that branch
+        // actually running can be detected.
         let out = lookup(&fixtures(), "");
         assert!(out.contains("git-commit") && out.contains("writing-style"));
-        assert!(!out.contains("本文A") && !out.contains("本文B"));
+        assert!(!out.contains("Body A") && !out.contains("Body B"));
         assert!(
-            out.contains("空なので"),
-            "空文字列を意図的な問い合わせとして扱ったと分かる文言が無い: {out}"
+            out.contains("is empty, so listing"),
+            "missing wording indicating the empty string was treated as a deliberate query: {out}"
         );
     }
 
     #[test]
     fn a_padded_query_finds_the_same_skill_as_the_unpadded_query() {
-        // 空判定は q.trim() で行うのに、直前の完全一致判定は untrimmed の
-        // q をそのまま使っていた。前後に空白が付いた完全一致クエリは
-        // 一致判定に落ち、空判定にも当たらず、素通りして検索へ流れ込み
-        // 「一致なし」の候補一覧に化けてしまう。trim を一度だけ行い、
-        // 空判定にも一致判定にも同じ値を使うことを固定する。
+        // The empty check was done with q.trim(), but the exact-match check
+        // right before it used the untrimmed q as-is. An exact-match query
+        // padded with whitespace would fail the match check, also miss the
+        // empty check, and fall straight through into the search, turning
+        // into a "no match" candidate list. Pin down that trim happens
+        // exactly once and the same value is used for both the empty check
+        // and the match check.
         let unpadded = lookup(&fixtures(), "git-commit");
         let padded = lookup(&fixtures(), " git-commit ");
         assert_eq!(
             padded, unpadded,
-            "前後の空白を trim せずに一致判定している: {padded}"
+            "matching without trimming leading/trailing whitespace: {padded}"
         );
     }
 
     #[test]
     fn a_whitespace_only_query_is_treated_the_same_as_empty() {
-        // 空白のみは素通しだと「候補が無い」経路（hits が空）に落ちても
-        // 一覧は出るため、上と同じ理由で固有の文言まで確かめる。
+        // A whitespace-only query would still produce a list even by
+        // falling through to the "no candidates" path (hits is empty), so
+        // for the same reason as above, pin down the distinctive wording
+        // too.
         let out = lookup(&fixtures(), "   ");
         assert!(out.contains("git-commit") && out.contains("writing-style"));
         assert!(
-            out.contains("空なので"),
-            "空白のみを意図的な問い合わせとして扱ったと分かる文言が無い: {out}"
+            out.contains("is empty, so listing"),
+            "missing wording indicating whitespace-only was treated as a deliberate query: {out}"
         );
     }
 
@@ -263,8 +297,8 @@ mod tests {
         let skills: Vec<Skill> = (0..(MAX_RESULTS + 10))
             .map(|i| Skill {
                 name: format!("skill-{i:02}"),
-                description: "テスト用の説明。".into(),
-                body: "本文".into(),
+                description: "A description for testing.".into(),
+                body: "body".into(),
                 path: format!("/x/skill-{i:02}/SKILL.md").into(),
             })
             .collect();
@@ -274,26 +308,27 @@ mod tests {
         let shown = out.lines().filter(|l| l.starts_with("- skill-")).count();
         assert_eq!(
             shown, MAX_RESULTS,
-            "上限 {MAX_RESULTS} 件だけを表示すべき: {shown} 件表示された"
+            "should show only the cap of {MAX_RESULTS} entries: {shown} shown"
         );
         assert!(
             out.contains(&total.to_string()),
-            "全 {total} 件のうち一部しか表示していないと分かる文言が無い: {out}"
+            "missing wording indicating only some of the {total} total were shown: {out}"
         );
     }
 
     #[test]
     fn search_results_are_capped_by_bytes_not_only_by_count() {
-        // 仕様が `description` に許す上限は 1,024 文字。日本語なら 1 件で
-        // 約 3 KB になり、`MAX_RESULTS` の 20 件がそろうと約 61 KB
-        // —— 同じファイルが 1 件の本文に課している 32 KiB の倍が、
-        // 件数しか見ない上限の隙間から素通りする。
-        let description = "あ".repeat(1024);
+        // The spec allows `description` up to 1,024 characters. For
+        // Japanese that comes to about 3 KB per entry, and 20 of them
+        // (`MAX_RESULTS`) together come to about 61 KB — twice the 32 KiB
+        // that this same file imposes on a single body, slipping through
+        // the gap left by a cap that only looks at count.
+        let description = "€".repeat(1024);
         let skills: Vec<Skill> = (0..MAX_RESULTS)
             .map(|i| Skill {
                 name: format!("fat-{i:02}"),
                 description: description.clone(),
-                body: "本文".into(),
+                body: "body".into(),
                 path: format!("/x/fat-{i:02}/SKILL.md").into(),
             })
             .collect();
@@ -304,73 +339,75 @@ mod tests {
 
         assert!(
             shown < skills.len(),
-            "バイト数の上限が効いていない: {shown} 件すべてを表示した"
+            "the byte cap has no effect: displayed all {shown} entries"
         );
         assert!(
             out.len() <= MAX_LIST_BYTES + one_entry + 256,
-            "候補一覧が上限を超えている: {} バイト",
+            "candidate list exceeds the cap: {} bytes",
             out.len()
         );
         assert!(
             out.len() < MAX_BODY_BYTES,
-            "候補一覧が 1 件の本文に許した上限より大きい: {} バイト",
+            "candidate list is bigger than the cap allowed for a single body: {} bytes",
             out.len()
         );
         assert!(
-            out.contains("件のみ表示"),
-            "一部しか表示していないと分かる文言が無い: {out}"
+            out.contains("narrow the query or pass a name directly"),
+            "missing wording indicating only some were shown: {out}"
         );
     }
 
     #[test]
     fn a_single_candidate_over_the_byte_cap_is_still_returned() {
-        // 上限を理由に 1 件も出さずに「打ち切った」とだけ返すと、モデルには
-        // 次に打つ手が何も残らない。1 件目は必ず出す。
+        // Returning "truncated" for cap reasons without showing even a
+        // single entry leaves the model with no next move at all. Always
+        // emit the first entry.
         let skills = vec![Skill {
             name: "huge".into(),
-            description: "説".repeat(MAX_LIST_BYTES),
-            body: "本文".into(),
+            description: "€".repeat(MAX_LIST_BYTES),
+            body: "body".into(),
             path: "/x/huge/SKILL.md".into(),
         }];
 
         let out = lookup(&skills, "");
-        assert!(out.contains("- huge:"), "候補が 1 件も出ていない");
+        assert!(out.contains("- huge:"), "not even one candidate was shown");
         assert!(
-            !out.contains("件のみ表示"),
-            "全件表示したのに打ち切ったと言っている: {}",
+            !out.contains("narrow the query or pass a name directly"),
+            "says it was truncated even though everything was shown: {}",
             &out[..out.len().min(200)]
         );
     }
 
     #[test]
     fn a_no_match_message_does_not_echo_the_query_back_unbounded() {
-        // q はモデルが書いた任意長の文字列で、この文言は履歴に残って以後
-        // 毎ターン再送される。このファイルで唯一、上限の無い入力だった。
-        let q = "見つからない語".repeat(2000);
+        // q is an arbitrary-length string written by the model, and this
+        // wording stays in history to be resent every subsequent turn.
+        // This was the one input in this file with no cap.
+        let q = "a term that won't be found".repeat(2000);
         let out = lookup(&fixtures(), &q);
 
         assert!(
             out.len() < 1024,
-            "クエリをそのまま差し戻している: 出力 {} バイト、クエリ {} バイト",
+            "echoing the query straight back: output {} bytes, query {} bytes",
             out.len(),
             q.len()
         );
         assert!(
-            out.contains("クエリが長いので"),
-            "クエリを切り詰めたと分かる文言が無い: {out}"
+            out.contains("query is long, showing only the first"),
+            "missing wording indicating the query was truncated: {out}"
         );
         assert!(
             out.contains("git-commit") && out.contains("writing-style"),
-            "候補一覧が出ていない: {out}"
+            "candidate list is not shown: {out}"
         );
     }
 
     #[test]
     fn an_oversized_body_is_truncated_and_says_so() {
-        let big_body = "あ".repeat(MAX_BODY_BYTES);
+        let big_body = "€".repeat(MAX_BODY_BYTES);
         let skills = vec![Skill {
             name: "big".into(),
-            description: "巨大な skill".into(),
+            description: "a huge skill".into(),
             body: big_body.clone(),
             path: "/x/big/SKILL.md".into(),
         }];
@@ -378,29 +415,29 @@ mod tests {
         let out = lookup(&skills, "big");
         assert!(
             out.len() < big_body.len(),
-            "本文が打ち切られていない: 出力 {} バイト、本文 {} バイト",
+            "the body was not truncated: output {} bytes, body {} bytes",
             out.len(),
             big_body.len()
         );
         assert!(
-            out.contains("打ち切"),
-            "打ち切ったことを示す文言が無い: {}",
+            out.contains("truncated"),
+            "missing wording indicating truncation: {}",
             &out[out.len().saturating_sub(120)..]
         );
     }
 
     #[test]
     fn a_body_within_the_cap_is_returned_whole_and_unmarked() {
-        let body = "本文".repeat(10);
+        let body = "body".repeat(10);
         let skills = vec![Skill {
             name: "small".into(),
-            description: "小さい skill".into(),
+            description: "a small skill".into(),
             body: body.clone(),
             path: "/x/small/SKILL.md".into(),
         }];
 
         let out = lookup(&skills, "small");
         assert!(out.contains(&body));
-        assert!(!out.contains("打ち切"));
+        assert!(!out.contains("truncated"));
     }
 }

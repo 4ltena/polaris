@@ -1,8 +1,9 @@
-//! `write` ツール。実際の書き込みは拘束された子の中で起きる。
+//! `write` tool. The actual write happens inside a confined child process.
 //!
-//! プロセス内で `std::fs::write` を呼ばないのは、OS の強制がプロセス境界で
-//! しか効かないためである。プロセス内で書けば、守っているのはこのクレートの
-//! パス判定だけになり、判定の誤りがそのまま範囲外への書き込みになる。
+//! `std::fs::write` isn't called in-process because OS enforcement only
+//! takes effect at a process boundary. Writing in-process would leave only
+//! this crate's path judgment as protection, and any error in that
+//! judgment becomes a write outside the range, directly.
 
 use std::path::Path;
 
@@ -23,15 +24,18 @@ pub fn write(
     run_mutation(policy, helper, &mutation, path)
 }
 
-/// `write` と `edit` が共有する起動と結果の解釈。
+/// The launch and result interpretation shared by `write` and `edit`.
 pub(crate) fn run_mutation(
     policy: &SandboxPolicy,
     helper: &Path,
     mutation: &Mutation,
     path: &Path,
 ) -> Result<String, ToolError> {
-    let payload = serde_json::to_string(mutation)
-        .map_err(|e| ToolError::Io(std::io::Error::other(format!("操作を直列化できない: {e}"))))?;
+    let payload = serde_json::to_string(mutation).map_err(|e| {
+        ToolError::Io(std::io::Error::other(format!(
+            "can't serialize the operation: {e}"
+        )))
+    })?;
 
     let outcome = run_confined(
         policy,
@@ -44,16 +48,20 @@ pub(crate) fn run_mutation(
         return Ok(outcome.stdout.trim().to_string());
     }
 
-    // 非0終了をすべて「方針が拒否した」と名付けると、目印が一致しない
-    // `edit` のような、ごく普通の失敗までサンドボックスの拒否として
-    // モデルへ届く。モデルは方針を疑って別の場所を探し始め、目印を直せば
-    // 済む往復を1回捨てる —— 拒否メッセージが防ぐためにある浪費そのもの
-    // である。
+    // Labeling every non-zero exit as "the policy denied it" would deliver
+    // even an ordinary failure — like an `edit` whose marker doesn't match —
+    // to the model as a sandbox denial. The model would start doubting the
+    // policy and searching elsewhere, throwing away a round trip that a
+    // changed marker alone would have fixed — exactly the waste the denial
+    // message exists to prevent.
     //
-    // 見分けの材料は子側にしか無い（errno はプロセス境界を越えない）ので、
-    // 判定は `helper::apply` が行い、結論だけが標準エラーの印として届く。
-    // 印が無ければ従来どおり拒否として扱う。ヘルパが起動できなかった場合
-    // や想定外の様態はこちら側へ落ちるので、保守的な向きは変わらない。
+    // The material needed to tell the two apart exists only on the child's
+    // side (errno doesn't cross the process boundary), so the judgment is
+    // made by `helper::apply`, and only the conclusion arrives as a marker
+    // on stderr. Without the marker, this is treated as a denial as before.
+    // A helper that fails to launch, or any unanticipated shape of failure,
+    // falls through to this side, so the conservative default doesn't
+    // change.
     if let Some(reason) = polaris_sandbox::helper::request_problem(&outcome.stderr) {
         return Err(ToolError::MutationFailed {
             path: path.display().to_string(),
@@ -74,26 +82,30 @@ mod tests {
 
     use crate::write::write;
 
-    /// 標準入力をそのまま `target` へ書き出すだけの、最小のヘルパ代役。
+    /// A minimal stand-in helper that just writes stdin straight to
+    /// `target`.
     ///
-    /// 実際のヘルパ（`--confined-apply` を受けて JSON を `Mutation` として
-    /// 解釈する）とは違う。ここで確かめたいのはツール層が「変更操作を
-    /// stdin に乗せる」「拘束された子として起動する」「子の終了状態と
-    /// 標準出力・標準エラーをどう解釈するか」の3点であり、JSON の意味論
-    /// （一致件数の判定など）は Task 7 の `helper::apply` の単体テストが
-    /// すでに押さえている。ここへ python3 を挟むと、このマシンでは
-    /// `/usr/bin/python3` が存在せず `/Library/Frameworks` 配下のユーザ
-    /// 導入 3.11 に解決されるため、サンドボックスを主題とするテストが
-    /// インタプリタの所在という無関係な依存を抱え込む。`/bin/sh` と
-    /// `cat` だけで足りる。
+    /// This differs from the real helper (which takes `--confined-apply`
+    /// and interprets JSON as a `Mutation`). What we want to confirm here
+    /// is three things about the tool layer: that it puts the mutation on
+    /// stdin, that it launches as a confined child, and how it interprets
+    /// the child's exit status and stdout/stderr. The JSON semantics
+    /// (match-count judgment, etc.) are already covered by the unit tests
+    /// for `helper::apply` from Task 7. Bringing python3 into this would
+    /// mean, on this machine, `/usr/bin/python3` doesn't exist and
+    /// resolves to a user-installed 3.11 under `/Library/Frameworks`,
+    /// saddling a test whose subject is the sandbox with an unrelated
+    /// dependency on where the interpreter happens to live. `/bin/sh` and
+    /// `cat` alone are enough.
     ///
-    /// `set -e` が要る。redirection の失敗（サンドボックスによる拒否）は
-    /// `cat` 自体を起動する前にシェルが検出するが、それだけでは非特殊
-    /// 組込みコマンドの1行が失敗しただけとして扱われ、スクリプトは次の
-    /// `echo wrote` へ進んでしまう。それだと拒否されたはずの試行が
-    /// 「成功して wrote と言った」ことになり、受け入れ基準を確かめる
-    /// つもりのテストが誤った理由で通る。`set -e` を付けて、拒否が
-    /// スクリプト自体の非0終了として最後まで伝わるようにする。
+    /// `set -e` is required. A redirection failure (a sandbox denial) is
+    /// detected by the shell before `cat` itself launches, but on its own
+    /// that is treated as just one non-special builtin command failing,
+    /// and the script proceeds to the next line, `echo wrote`. That would
+    /// turn what should have been a denied attempt into "succeeded and
+    /// said wrote", letting a test meant to verify the acceptance criteria
+    /// pass for the wrong reason. `set -e` makes the denial propagate all
+    /// the way through as the script's own non-zero exit.
     fn success_helper(dir: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("fake-helper-success");
         std::fs::write(
@@ -103,7 +115,7 @@ mod tests {
                 target.display()
             ),
         )
-        .expect("書けない");
+        .expect("can't write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -114,38 +126,41 @@ mod tests {
 
     #[test]
     fn a_write_inside_the_root_succeeds_through_the_confined_helper() {
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let helper_dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let root = tempfile::tempdir().expect("temp dir");
+        let helper_dir = tempfile::tempdir().expect("temp dir");
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
         let target = policy.writable_roots()[0].join("out.txt");
         let helper = success_helper(helper_dir.path(), &target);
 
-        let msg = write(&policy, &helper, &target, "本文").expect("失敗した");
+        let msg = write(&policy, &helper, &target, "hello").expect("failed");
 
-        // 代役ヘルパは JSON を解釈しないので、ファイルに残るのは `content`
-        // そのものではなく、標準入力に乗った変更操作の直列化結果である。
-        // 見たいのは「stdin に本当に乗って子まで届いた」という配線であり、
-        // ヘルパの意味論ではない（ブリーフ訂正の通り、弱い主張で足りる）。
-        let written = std::fs::read_to_string(&target).expect("読めない");
+        // The stand-in helper doesn't parse JSON, so what ends up in the
+        // file isn't `content` itself but the serialized mutation that rode
+        // in on stdin. What we want to see is the wiring — that it really
+        // rode in on stdin and reached the child — not the helper's
+        // semantics (per the brief's correction, a weak assertion is
+        // enough).
+        let written = std::fs::read_to_string(&target).expect("can't read");
         assert!(
-            written.contains("本文"),
-            "内容が stdin に乗って子まで届いていない: {written}"
+            written.contains("hello"),
+            "the content did not ride on stdin and reach the child: {written}"
         );
-        assert!(!msg.trim().is_empty(), "結果の説明が空");
+        assert!(!msg.trim().is_empty(), "the result description is empty");
     }
 
     #[test]
     fn a_write_outside_the_root_is_denied_by_the_real_sandbox_through_the_tool() {
-        // 受け入れ基準 3。モックを使わず、`write` ツールを通して実際に
-        // 書き込みを試み、拒否を観測する。共有の起動ヘルパ（run_confined）
-        // を直接叩く経路では基準を満たさない。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let outside = tempfile::tempdir().expect("一時ディレクトリ");
-        let helper_dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // Acceptance criterion 3. Without a mock, actually attempt a write
+        // through the `write` tool and observe the denial. A path that
+        // hits the shared launch helper (run_confined) directly does not
+        // satisfy the criterion.
+        let root = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("temp dir");
+        let helper_dir = tempfile::tempdir().expect("temp dir");
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
         let target = outside
             .path()
@@ -154,39 +169,42 @@ mod tests {
             .join("pwned.txt");
         let helper = success_helper(helper_dir.path(), &target);
 
-        let err =
-            write(&policy, &helper, &target, "本文").expect_err("ルート外への書き込みが成功した");
+        let err = write(&policy, &helper, &target, "hello")
+            .expect_err("a write outside the root succeeded");
 
         assert!(
             !target.exists(),
-            "ファイルが作られている: {}",
+            "the file was created: {}",
             target.display()
         );
-        // 拒否メッセージは、拒否されたパスと方針と書込可能ルートを含む。
+        // The denial message includes the denied path, the policy, and the
+        // writable root.
         let msg = err.to_string();
         assert!(
             msg.contains(&target.display().to_string()),
-            "パスが無い: {msg}"
+            "path is missing: {msg}"
         );
-        assert!(msg.contains("workspace-write"), "方針が無い: {msg}");
+        assert!(msg.contains("workspace-write"), "policy is missing: {msg}");
     }
 
     #[test]
     fn a_helper_that_cannot_be_confined_is_an_error_not_a_silent_success() {
-        // 拘束できなかったのに書けてしまう状態を作らない。
-        // macOS では起動するのは `/usr/bin/sandbox-exec` であり、存在しない
-        // ヘルパは拘束された子の中での exec 失敗として現れる。したがって
-        // `run_confined` 自体は `Err` ではなく非0の `status` を持つ
-        // `Ok(Outcome)` を返し、それを非0終了として解釈する `write` 側の
-        // 通常の拒否経路がここを捕まえる（実測: `sandbox-exec: execvp() ...
-        // failed: No such file or directory` が `detail` に載る）。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        // Don't allow a state where a write succeeds despite failing to be
+        // confined. On macOS, what actually launches is
+        // `/usr/bin/sandbox-exec`, and a helper that doesn't exist shows up
+        // as an exec failure inside the confined child. So `run_confined`
+        // itself returns not an `Err` but an `Ok(Outcome)` with a non-zero
+        // `status`, and `write`'s ordinary denial path — which interprets
+        // that as a non-zero exit — catches it here (observed:
+        // `sandbox-exec: execvp() ... failed: No such file or directory`
+        // lands in `detail`).
+        let root = tempfile::tempdir().expect("temp dir");
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
         let missing = root.path().join("no-such-helper");
         let target = policy.writable_roots()[0].join("x.txt");
 
-        assert!(write(&policy, &missing, &target, "本文").is_err());
+        assert!(write(&policy, &missing, &target, "hello").is_err());
         assert!(!target.exists());
     }
 }

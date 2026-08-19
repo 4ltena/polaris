@@ -1,24 +1,30 @@
-//! 読み取りを拒否するパスの判定。過検出より見逃しを避ける方向に倒す。
+//! Decides which paths reading is denied on. Leans toward avoiding missed
+//! secrets rather than avoiding over-broad denials.
 //!
-//! 比較はすべて小文字化してから行う。macOS の既定ファイルシステムは
-//! 大文字小文字を区別しないため、`.SSH` や `.ENV` のような表記でも
-//! 実体は同じ秘密情報に届いてしまう。サンドボックスが入るまではこの
-//! 関数が唯一の防壁なので、過小拒否になる方向の揺れは許容しない。
+//! All comparisons are done after lowercasing. macOS's default filesystem is
+//! case-insensitive, so a spelling like `.SSH` or `.ENV` still reaches the
+//! same underlying secret. Until the sandbox is in place, this function is
+//! the only line of defense, so no drift toward under-denial is tolerated.
 //!
-//! かつて `polaris_core::secret_screen::is_excluded_path` という、監査ログへ
-//! 書く前のパス除外判定を担う別の独立した関数が存在した
-//! （`polaris-tools` は `polaris-core` に依存できないため、そもそも直接
-//! 呼べなかった）。似た目的の公開関数が2つ並び、どちらか一方だけが実際に
-//! 配線されている状態そのものが危険だった —— 次に触る者はどちらか見つけた
-//! 方を使い、半分の確率で何も守らない方を選ぶ。Task 12 で両者を突き合わせ、
-//! `is_excluded_path` だけが持っていた被覆（裸の拡張子ファイル、例えば
-//! 拡張子扱いされない `.pem` 単体の名前）をここへ折り込んだうえで
-//! `is_excluded_path` は削除した。今後この一覧を広げるときは、二重に
-//! 保守する別実装を作らずここへ集約すること。
+//! There used to be a separate, independent function,
+//! `polaris_core::secret_screen::is_excluded_path`, responsible for the path
+//! exclusion judgment made before writing to the audit log (`polaris-tools`
+//! cannot depend on `polaris-core`, so it could never be called directly
+//! anyway). Having two public functions with a similar purpose sitting side
+//! by side, with only one of them actually wired in, was itself the
+//! dangerous part — whoever touched this next would use whichever one they
+//! found, with a coin-flip's chance of picking the one that protected
+//! nothing. Task 12 cross-checked the two, folded in the coverage that only
+//! `is_excluded_path` had (bare-extension files, e.g. a name that is just
+//! `.pem` with nothing else, which doesn't count as an extension), and then
+//! deleted `is_excluded_path`. When this list grows in the future, fold the
+//! change in here rather than creating a second implementation to maintain
+//! in parallel.
 
 use std::path::Path;
 
-/// パスの一部にこれらのディレクトリ名が現れたら拒否する（小文字で比較）。
+/// Deny if any of these directory names appear as a path component
+/// (compared lowercase).
 const DENIED_DIRS: &[&str] = &[
     ".ssh",
     ".gnupg",
@@ -29,7 +35,7 @@ const DENIED_DIRS: &[&str] = &[
     ".kube",
 ];
 
-/// ファイル名がこれらと完全一致したら拒否する（小文字で比較）。
+/// Deny if the file name exactly matches one of these (compared lowercase).
 const DENIED_NAMES: &[&str] = &[
     ".env",
     "credentials",
@@ -48,7 +54,7 @@ const DENIED_NAMES: &[&str] = &[
     "service-account.json",
 ];
 
-/// 拡張子がこれらなら拒否する（小文字で比較）。
+/// Deny if the extension is one of these (compared lowercase).
 const DENIED_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "pub", "p8", "jks", "keystore"];
 
 pub fn is_denied(path: &Path) -> bool {
@@ -70,33 +76,37 @@ pub fn is_denied(path: &Path) -> bool {
     if DENIED_NAMES.iter().any(|n| name == *n) {
         return true;
     }
-    // `.env.local` のような接尾辞付きも拒否する。`environment.rs` は巻き込まない。
+    // Also deny suffixed forms like `.env.local`. Doesn't sweep in
+    // `environment.rs`.
     if name.starts_with(".env.") {
         return true;
     }
-    // macOS のキーチェーンファイルだけを拒否する。`keychain_helpers.rs` のような
-    // 「keychain」を含むだけの通常のソースファイルを部分一致で巻き込まない。
+    // Deny only macOS keychain files. Don't sweep in an ordinary source
+    // file that merely contains the word "keychain", like
+    // `keychain_helpers.rs`, via a partial match.
     if name.ends_with(".keychain") || name.ends_with(".keychain-db") {
         return true;
     }
-    // `Path::extension()` ではなく、ファイル名そのものの末尾一致で判定する。
-    // `Path::extension()` は「先頭が `.` でそれ以外に `.` を含まない」名前
-    // （裸の `.pem` 等）を隠しファイルとして扱い拡張子無しを返すため、
-    // 鍵素材そのものである裸の拡張子ファイルを見逃す
-    // （`/tmp/x/.pem` は `Path::new(".pem").extension()` が `None` を返す —
-    // Task 12 で `secret_screen::is_excluded_path` と突き合わせて発覚した
-    // 欠落で、あちらは文字列の末尾一致だったためこの穴が無かった。ここへ
-    // 折り込む）。
+    // Judge by a suffix match on the file name itself, not
+    // `Path::extension()`. `Path::extension()` treats a name that starts
+    // with `.` and contains no other `.` (a bare `.pem`, for example) as a
+    // hidden file and returns no extension, which misses a bare-extension
+    // file that is itself key material
+    // (`Path::new(".pem").extension()` returns `None` for `/tmp/x/.pem` —
+    // a gap discovered in Task 12 by cross-checking against
+    // `secret_screen::is_excluded_path`, which didn't have this hole
+    // because it used a plain string suffix match. Folded in here).
     if DENIED_EXTS.iter().any(|e| name.ends_with(&format!(".{e}"))) {
         return true;
     }
     false
 }
 
-/// `/proc/<pid>/environ`（Linux）はプロセスの環境変数をそのまま含み、
-/// harness 自身の `POLARIS_API_KEY` もそこに載る。ただし `proc` は
-/// ソースツリーにも普通に現れうるディレクトリ名なので、ディレクトリ名
-/// 単体では拒否せず、ファイル名が厳密に `environ` であることと組み合わせる。
+/// `/proc/<pid>/environ` (Linux) contains a process's environment variables
+/// verbatim, including the harness's own `POLARIS_API_KEY`. However, `proc`
+/// is also a directory name that can ordinarily show up in a source tree,
+/// so this doesn't deny on the directory name alone; it combines that with
+/// the file name being exactly `environ`.
 fn is_proc_environ(path: &Path) -> bool {
     let is_environ = path
         .file_name()
@@ -109,9 +119,10 @@ fn is_proc_environ(path: &Path) -> bool {
         .any(|c| c.as_os_str().to_string_lossy().to_lowercase() == "proc")
 }
 
-/// GitHub CLI の `hosts.yml` は保存済みトークンを平文で含む。`hosts.yml`
-/// という名前単体は他の用途（Ansible インベントリ等）でも使われるため、
-/// `gh` ディレクトリ区間との組み合わせでのみ拒否する。
+/// The GitHub CLI's `hosts.yml` contains a saved token in plain text. The
+/// name `hosts.yml` alone is also used for other purposes (an Ansible
+/// inventory, for example), so this denies only in combination with a `gh`
+/// directory component.
 fn is_gh_hosts_file(path: &Path) -> bool {
     let is_hosts_yml = path
         .file_name()
@@ -142,7 +153,7 @@ mod tests {
             "/home/u/cert.pub",
             "/home/u/Library/Keychains/login.keychain-db",
         ] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
@@ -154,13 +165,14 @@ mod tests {
             "/home/u/proj/docs/env-setup.md",
             "/home/u/proj/environment.rs",
         ] {
-            assert!(!is_denied(Path::new(p)), "{p} は許可されるべき");
+            assert!(!is_denied(Path::new(p)), "{p} should be allowed");
         }
     }
 
     #[test]
     fn allows_benign_keychain_named_source() {
-        // `keychain` を含むだけの通常のソースファイルを部分一致で巻き込まない。
+        // Don't sweep in an ordinary source file that merely contains
+        // "keychain" via a partial match.
         assert!(!is_denied(Path::new(
             "/home/u/proj/crates/polaris-tools/src/keychain_helpers.rs"
         )));
@@ -168,11 +180,12 @@ mod tests {
 
     #[test]
     fn denies_case_variants_on_case_insensitive_filesystems() {
-        // macOS の既定ファイルシステムは大文字小文字を区別しない。
-        // `known_hosts` はどの完全一致ルールにも掛からないため、ここが
-        // 通るのはディレクトリ区間の大文字小文字畳み込みが効いている
-        // 場合に限られる（`.SSH/id_rsa` だと `id_rsa` の完全一致ルール
-        // 単体でも通ってしまい、ディレクトリ側の畳み込みを検証できない）。
+        // macOS's default filesystem is case-insensitive. `known_hosts`
+        // doesn't hit any exact-match rule, so this only passes if the
+        // directory component's case-folding is actually in effect (with
+        // `.SSH/id_rsa`, the exact-match rule for `id_rsa` alone would
+        // already pass it, so it couldn't verify the directory-side
+        // folding).
         for p in [
             "/home/u/.SSH/known_hosts",
             "/home/u/proj/.ENV",
@@ -180,46 +193,47 @@ mod tests {
         ] {
             assert!(
                 is_denied(Path::new(p)),
-                "{p} は大文字小文字を問わず拒否されるべき"
+                "{p} should be denied regardless of case"
             );
         }
     }
 
     #[test]
     fn denies_gcloud_and_aws_directories_in_isolation() {
-        // ファイル名側のルール（`credentials` 等）に頼らず、ディレクトリ名だけで
-        // 拒否できることを確認する。どちらのファイル名も DENIED_NAMES に一致しない。
+        // Confirm this can deny on the directory name alone, without
+        // relying on the file-name-side rule (`credentials`, etc.). Neither
+        // file name here matches DENIED_NAMES.
         for p in [
             "/home/u/.config/gcloud/credentials.db",
             "/home/u/.aws/config",
         ] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
-    // --- Important 4: secret_screen::is_excluded_path と同等以上の被覆 -------
-    // レビューが `is_denied == false` と実測した9パスのうち、`/proc/self/
-    // environ` を除く8つ（`.zsh_history` はどちらの一覧にも無いため対象外）を
-    // 1ルールずつ切り分けて検証する。
+    // --- Important 4: coverage at least equal to secret_screen::is_excluded_path -------
+    // Of the 9 paths the review measured as `is_denied == false`, verify 8
+    // of them (excluding `/proc/self/environ`; `.zsh_history` is out of
+    // scope because it's on neither list) one rule at a time.
 
     #[test]
     fn denies_netrc_npmrc_and_pypirc_by_exact_name() {
         for p in ["/home/u/.netrc", "/home/u/.npmrc", "/home/u/.pypirc"] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
     #[test]
     fn denies_envrc_and_git_credentials_by_exact_name() {
         for p in ["/home/u/.envrc", "/home/u/proj/.git-credentials"] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
     #[test]
     fn denies_pgpass_and_my_cnf_by_exact_name() {
         for p in ["/home/u/.pgpass", "/home/u/.my.cnf"] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
@@ -229,16 +243,17 @@ mod tests {
             "/home/u/creds/credentials.json",
             "/home/u/gcp/service-account.json",
         ] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
     #[test]
     fn denies_docker_and_kube_directories_in_isolation() {
-        // ファイル名側のルールに頼らず、ディレクトリ名だけで拒否できることを
-        // 確認する。`config.json` / `config` はどちらも DENIED_NAMES に無い。
+        // Confirm this can deny on the directory name alone, without
+        // relying on the file-name-side rule. `config.json` / `config`
+        // match neither entry in DENIED_NAMES.
         for p in ["/home/u/.docker/config.json", "/home/u/.kube/config"] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
@@ -250,29 +265,29 @@ mod tests {
     #[test]
     fn denies_proc_self_environ() {
         assert!(is_denied(Path::new("/proc/self/environ")));
-        // 他プロセスの pid でも同様に拒否する。
+        // Also deny for another process's pid.
         assert!(is_denied(Path::new("/proc/1234/environ")));
     }
 
     #[test]
     fn denies_additional_key_extensions() {
         for p in ["/home/u/key.p8", "/home/u/app.jks", "/home/u/app.keystore"] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
     #[test]
     fn denies_bare_dotfiles_named_after_a_sensitive_extension() {
-        // `Path::extension()` は「先頭が `.` でそれ以外に `.` を含まない」
-        // 名前（`.pem` のような裸の拡張子ファイル）を隠しファイルとして扱い
-        // 拡張子無しを返す。`is_denied` がこれに頼っていた間は、鍵素材その
-        // ものである裸の `.pem` / `.key` 等を見逃していた
-        // （`secret_screen::is_excluded_path` との突き合わせで Task 12 が
-        // 発見し、ここへ折り込んだ欠落）。
+        // `Path::extension()` treats a name that starts with `.` and
+        // contains no other `.` (a bare-extension file like `.pem`) as a
+        // hidden file and returns no extension. While `is_denied` relied on
+        // this, it missed bare `.pem` / `.key` files that are themselves
+        // key material (a gap Task 12 found by cross-checking against
+        // `secret_screen::is_excluded_path`, and folded in here).
         assert_eq!(
             Path::new(".pem").extension(),
             None,
-            "前提: extension() は None を返す"
+            "premise: extension() returns None"
         );
         for p in [
             "/home/u/.pem",
@@ -280,41 +295,43 @@ mod tests {
             "/home/u/.pfx",
             "/home/u/.p12",
         ] {
-            assert!(is_denied(Path::new(p)), "{p} は拒否されるべき");
+            assert!(is_denied(Path::new(p)), "{p} should be denied");
         }
     }
 
     #[test]
     fn denies_id_dsa_by_exact_name() {
-        // `.ssh` ディレクトリの外でも、ファイル名単体のルールで拒否できる
-        // ことを確認する（ディレクトリ側のルールに頼らない）。
+        // Confirm this can deny on the file-name-only rule even outside a
+        // `.ssh` directory (without relying on the directory-side rule).
         assert!(is_denied(Path::new("/home/u/backup/id_dsa")));
     }
 
     #[test]
     fn allows_benign_files_resembling_the_new_rules() {
-        // 新しいルールが厳密一致・接頭辞・接尾辞・ディレクトリ区間のみで
-        // 判定されており、部分一致に倒れていないことを確認する。
+        // Confirm the new rules are judged only by exact match, prefix,
+        // suffix, or directory component, and don't degrade into a partial
+        // match.
         for p in [
-            // ".netrc" 等はファイル名の完全一致であり、それを含むだけの
-            // 通常のファイルは巻き込まない。
+            // ".netrc" etc. are exact file-name matches; don't sweep in an
+            // ordinary file that merely contains that string.
             "/home/u/docs/netrc-setup.md",
             "/home/u/src/npmrc_loader.rs",
-            // ".docker" / ".kube" はディレクトリ区間の完全一致であり、
-            // 紛らわしい別名のディレクトリは巻き込まない。
+            // ".docker" / ".kube" are exact directory-component matches;
+            // don't sweep in a confusingly-named different directory.
             "/home/u/proj/docker-compose/README.md",
             "/home/u/proj/src/kubeconfig_loader.rs",
-            // "hosts.yml" は `gh` ディレクトリ配下でのみ拒否する。
+            // "hosts.yml" is denied only under a `gh` directory.
             "/home/u/proj/ansible/hosts.yml",
-            // "environ" は `proc` ディレクトリ配下でのみ拒否する。
+            // "environ" is denied only under a `proc` directory.
             "/home/u/proj/environ.rs",
             "/home/u/proj/proc/build.rs",
-            // 拡張子ルールはドット区切りの拡張子一致であり、ファイル名の
-            // 途中に文字列として現れるだけでは拒否しない。
+            // The extension rule matches a dot-separated extension; it
+            // doesn't deny just because the string appears somewhere in
+            // the middle of a file name.
             "/home/u/proj/src/jks_parser.rs",
             "/home/u/proj/notes/keystore-migration.md",
         ] {
-            assert!(!is_denied(Path::new(p)), "{p} は許可されるべき");
+            assert!(!is_denied(Path::new(p)), "{p} should be allowed");
         }
     }
 }

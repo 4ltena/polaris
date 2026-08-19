@@ -86,7 +86,7 @@ pub async fn ensure_fresh(issuer: &str, store_path: &Path) -> Result<Credentials
     if !needs_refresh(&c, now_secs()) {
         return Ok(c);
     }
-    let fresh = token::refresh(issuer, &c.refresh_token).await?;
+    let fresh = token::refresh(issuer, &c.refresh_token, Some(&c.account_id)).await?;
     store::save_to(store_path, &fresh)?;
     Ok(fresh)
 }
@@ -94,7 +94,7 @@ pub async fn ensure_fresh(issuer: &str, store_path: &Path) -> Result<Credentials
 /// 期限に関わらず更新する。401 を受けたあとの再試行で使う。
 pub async fn force_refresh(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
     let c = store::load_from(store_path)?.ok_or(AuthError::NotLoggedIn)?;
-    let fresh = token::refresh(issuer, &c.refresh_token).await?;
+    let fresh = token::refresh(issuer, &c.refresh_token, Some(&c.account_id)).await?;
     store::save_to(store_path, &fresh)?;
     Ok(fresh)
 }
@@ -201,6 +201,92 @@ mod tests {
         assert!(
             matches!(err, AuthError::Http(_)),
             "Http 以外になっている: {err:?}"
+        );
+    }
+
+    /// `/oauth/token` が `body` を返すだけの偽サーバ。実 API は叩かない。
+    async fn token_server_returning(body: serde_json::Value) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        let s = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&s)
+            .await;
+        s
+    }
+
+    /// 期限の切れた資格情報を書いて、その保管先を返す。
+    fn store_with_expired_credentials(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("auth.json");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store::save_to(&p, &creds(Some(now.saturating_sub(1)))).expect("保存");
+        p
+    }
+
+    /// 更新応答が id_token を省いても、保管していた account_id を保つ。
+    ///
+    /// refresh_token grant は id_token を再発行する義務を負わないので、
+    /// これは例外的な応答ではない。ここで account_id が `""` へ潰れると、
+    /// その空値がそのままディスクへ保存され、以後 `chatgpt-account-id:` が
+    /// 空のまま送られる。失敗はモデル側の 401 として現れ、原因が認証まで
+    /// 遡れなくなる。
+    ///
+    /// 併せて、`ensure_fresh` の成功経路そのものを固定する —— 偽サーバ相手に
+    /// 更新が成功し、新しい access_token がディスクへ書き戻ることを見る。
+    /// これまでこの経路は到達不能な issuer に対してしか動かしておらず、
+    /// 常に失敗側だけを通っていた。
+    #[tokio::test]
+    async fn ensure_fresh_keeps_the_old_account_id_when_the_response_omits_the_id_token() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let p = store_with_expired_credentials(dir.path());
+        let s = token_server_returning(serde_json::json!({
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let got = ensure_fresh(&s.uri(), &p).await.expect("更新できるべき");
+        assert_eq!(got.access_token, "new-at", "更新が起きていない");
+        assert_eq!(
+            got.account_id, "acct",
+            "id_token が無い応答で account_id が捨てられた"
+        );
+
+        let saved = store::load_from(&p).expect("読める").expect("あるはず");
+        assert_eq!(saved.access_token, "new-at", "更新結果が保存されていない");
+        assert_eq!(
+            saved.account_id, "acct",
+            "空の account_id がディスクへ焼き付いた"
+        );
+    }
+
+    /// 応答が別の account_id を運んできたら、そちらを採る。上の対。
+    /// 片方だけでは「常に手元の値を返す」実装が通ってしまい、アカウントの
+    /// 切り替わりを取りこぼす。
+    #[tokio::test]
+    async fn ensure_fresh_adopts_a_rotated_account_id() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let p = store_with_expired_credentials(dir.path());
+        let s = token_server_returning(serde_json::json!({
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "id_token": crate::token::id_token_with_account("acct-2"),
+            "expires_in": 3600
+        }))
+        .await;
+
+        let got = ensure_fresh(&s.uri(), &p).await.expect("更新できるべき");
+        assert_eq!(got.account_id, "acct-2", "応答の account_id を採っていない");
+
+        let saved = store::load_from(&p).expect("読める").expect("あるはず");
+        assert_eq!(
+            saved.account_id, "acct-2",
+            "新しい account_id が保存されていない"
         );
     }
 

@@ -1,4 +1,5 @@
-//! OpenAI 互換のチャット補完。base_url を差し替えれば互換エンドポイントも叩ける。
+//! OpenAI-compatible chat completions. Swap out `base_url` and you can hit
+//! compatible endpoints too.
 
 use std::time::Duration;
 
@@ -7,40 +8,44 @@ use serde_json::Value;
 use crate::{CompletionRequest, CompletionResponse, Provider, ProviderError, Role, ToolCall};
 use polaris_tools::ToolSpec;
 
-/// 接続確立（TCP/TLS ハンドシェイク）にかける上限。相手が応答すらしない
-/// 場合、これより短い時間で諦めてよい。
+/// The cap on connection establishment (TCP/TLS handshake). If the peer
+/// doesn't even respond, it's fine to give up sooner than this.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 無通信（read）タイムアウト。`reqwest::Client::new()` はデフォルトで
-/// 無期限に待つため、相手が接続だけ受けてハングすると、ワンショットの
-/// headless バイナリが `--max-turns` の助けも借りずに永久に止まる —
-/// これを防ぐ上限は必要。
+/// The idle (read) timeout. `reqwest::Client::new()` waits indefinitely by
+/// default, so if the peer accepts the connection and then just hangs, a
+/// one-shot headless binary would stall forever without even the help of
+/// `--max-turns` — a cap against that is necessary.
 ///
-/// 以前はここに「リクエスト全体」への 120 秒の総時間上限
-/// (`ClientBuilder::timeout`) を置いていたが、それは誤った道具だった。
-/// このクライアントは非ストリーミングで、既定モデルは推論モデルなので、
-/// 正常な1回の補完が2分を超えることは普通にある。総時間上限はその
-/// 正常な応答をリトライ無しに殺し、ユーザーには「何も壊れていないのに
-/// タイムアウトした」ように見える。
+/// This used to have a 120-second total-time cap on the "whole request"
+/// (`ClientBuilder::timeout`), but that was the wrong tool. This client is
+/// non-streaming, and the default model is a reasoning model, so it's
+/// perfectly normal for a single healthy completion to take longer than
+/// 2 minutes. A total-time cap kills that healthy response without a
+/// retry, and to the user it looks like "it timed out even though nothing
+/// was broken."
 ///
-/// 本来必要なのは総時間の上限ではなく無通信の検出であり、
-/// `reqwest` 0.12 は `ClientBuilder::read_timeout` を持つ
-/// （`Cargo.lock` で解決されるバージョンは 0.12.28 で、feature gate 無しに
-/// 使える）。ただし非ストリーミングのレスポンスに対しては、素朴な
-/// 「読み取りのたびにリセットされる」直感どおりには効かない点に注意：
-/// `reqwest` の実装（`async_impl/client.rs` の `PendingRequest::poll`）は
-/// レスポンスヘッダを受け取るまではリセットしない単発の sleep を張り、
-/// ヘッダ到着後の本文読み取りだけが読み取りごとにリセットされる
-/// (`async_impl/body.rs` の `ReadTimeoutBody`)。このクライアントの応答は
-/// モデルが生成し終えるまで1バイトも流れてこないため、支配的なのは前者
-/// ——つまりこの値自体を「正常に待ってよい生成時間」より十分大きく
-/// 取る必要があり、「読み取りが続く限り無限に待てる」わけではない。
-/// そのうえで、後半の本文転送フェーズ（大きな応答が細切れに届く場合）
-/// では読み取りごとのリセットが効き、総時間上限より安全側に倒れる。
+/// What's actually needed isn't a total-time cap but idle detection, and
+/// `reqwest` 0.12 has `ClientBuilder::read_timeout` (the version resolved
+/// in `Cargo.lock` is 0.12.28, usable without a feature gate). Note,
+/// though, that for a non-streaming response it doesn't behave the way
+/// the naive intuition of "gets reset on every read" would suggest:
+/// `reqwest`'s implementation (`PendingRequest::poll` in
+/// `async_impl/client.rs`) arms a single-shot sleep that isn't reset until
+/// the response headers arrive, and only the body read *after* the
+/// headers arrive gets reset on every read (`ReadTimeoutBody` in
+/// `async_impl/body.rs`). This client's response doesn't stream a single
+/// byte until the model has finished generating, so the former dominates
+/// — meaning this value itself needs to be set comfortably larger than
+/// "how long it's normal to wait for generation," not "wait forever as
+/// long as reads keep coming." That said, during the later body-transfer
+/// phase (when a large response arrives in pieces), the per-read reset
+/// does kick in, which errs safer than a total-time cap.
 ///
-/// 2分を明らかに超えうる正常な推論ターンに対して十分な余裕
-/// （2分の2.5倍）を残しつつ、死んだ接続を無期限にではなく5分以内に
-/// 検出できる値として 300 秒を選んだ。
+/// 300 seconds was chosen as a value that leaves ample headroom (2.5x
+/// 2 minutes) for a healthy reasoning turn that can clearly exceed
+/// 2 minutes, while still detecting a dead connection within 5 minutes
+/// rather than never.
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct OpenAiProvider {
@@ -51,21 +56,22 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// # エラー
+    /// # Errors
     ///
-    /// TLS バックエンドの初期化失敗など、`reqwest::Client` を構築できない
-    /// 場合に返す。ここで `expect` して起動プロセスごと落とすと、ハーネスの
-    /// 他のあらゆる起動失敗（設定ミス等）が綺麗な `stderr` 一行 +
-    /// `ExitCode::FAILURE` で返るのに、この一箇所だけパニックで落ちる
-    /// 非対称が生まれる。呼び出し側（`main.rs`）は他の起動失敗と同じ経路で
-    /// これを処理する。
+    /// Returned when `reqwest::Client` cannot be constructed, e.g. TLS
+    /// backend initialization failure. `expect`-ing here and taking down
+    /// the whole startup process would create an asymmetry where every
+    /// other startup failure in the harness (misconfiguration, etc.)
+    /// comes back as a clean one-line `stderr` plus `ExitCode::FAILURE`,
+    /// while this one spot alone panics. The caller (`main.rs`) handles
+    /// this through the same path as other startup failures.
     pub fn new(base_url: String, api_key: String, model: String) -> Result<Self, ProviderError> {
         Self::with_timeouts(base_url, api_key, model, CONNECT_TIMEOUT, READ_TIMEOUT)
     }
 
-    /// タイムアウト値を明示して構築する。短いタイムアウトを注入して
-    /// ハング挙動をテストできるようにするための経路。通常の呼び出しは
-    /// [`Self::new`] を使う。
+    /// Constructs with explicit timeout values. The path used to inject a
+    /// short timeout so hang behavior can be tested. Normal callers use
+    /// [`Self::new`].
     fn with_timeouts(
         base_url: String,
         api_key: String,
@@ -77,7 +83,7 @@ impl OpenAiProvider {
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
             .build()
-            .map_err(|e| ProviderError::Http(format!("HTTP クライアントを構築できない: {e}")))?;
+            .map_err(|e| ProviderError::Http(format!("could not build HTTP client: {e}")))?;
         Ok(Self {
             base_url,
             api_key,
@@ -95,14 +101,16 @@ fn role_str(r: Role) -> &'static str {
     }
 }
 
-/// `ToolSpec` をワイヤ形式（`{"type":"function","function":{...}}`）へ
-/// 変換する、この形の唯一の生成元。
+/// The sole place that converts a `ToolSpec` into the wire shape
+/// (`{"type":"function","function":{...}}`).
 ///
-/// 予算計測 (`polaris_core::budget::always_on_tokens`) もこの関数の出力を
-/// 数える。かつては予算側が `ToolSpec` の `Serialize` 実装を直接数え、この
-/// 関数がこことは別に同じ形を組み立てていた。二箇所が独立に「同じはず」の
-/// ワイヤ形状を作っていたことが、実際に送信するバイト列と計測するバイト列
-/// がずれる原因になったため、生成元をここへ一本化する。
+/// Budget accounting (`polaris_core::budget::always_on_tokens`) also
+/// counts this function's output. Budget accounting used to count
+/// `ToolSpec`'s `Serialize` implementation directly, with this function
+/// independently building the same shape elsewhere. Having two places
+/// independently build what was supposed to be "the same" wire shape is
+/// what caused the bytes actually sent and the bytes actually measured to
+/// drift apart, so the shape now has a single source of truth here.
 pub fn tool_wire_shape(tools: &[ToolSpec]) -> Vec<Value> {
     tools
         .iter()
@@ -131,11 +139,12 @@ impl Provider for OpenAiProvider {
                 "role": role_str(m.role),
                 "content": m.content,
             });
-            // アシスタントのターンがツールを呼んだ場合は、その `tool_calls` を
-            // このメッセージ自体に載せて送り返す。API はこれを見て、続く
-            // `role: "tool"` メッセージの `tool_call_id` と突き合わせる。
-            // `arguments` は受信時に一度パースした JSON 値を、送信時には
-            // 対称的に JSON 文字列へ戻す（ワイヤ上はどちらも文字列）。
+            // If an assistant turn called a tool, its `tool_calls` ride
+            // along on this same message when sent back. The API matches
+            // these against the `tool_call_id` of the `role: "tool"`
+            // message that follows. `arguments` is parsed into a JSON
+            // value once on receipt, and symmetrically turned back into a
+            // JSON string on send (on the wire, both are strings).
             if !m.tool_calls.is_empty() {
                 let calls: Vec<Value> = m
                     .tool_calls
@@ -177,14 +186,15 @@ impl Provider for OpenAiProvider {
             .send()
             .await
             .map_err(|e| {
-                // `reqwest::Error` の `Display` はタイムアウトかどうかを
-                // 含めない（`error sending request for url (...)` としか
-                // 出ない）。`is_timeout()` を見て、無通信タイムアウトで
-                // 落ちたことをここで明示しないと、ユーザーは通信断と
-                // タイムアウトを区別できない。
+                // `reqwest::Error`'s `Display` doesn't say whether it was
+                // a timeout (it only prints something like `error sending
+                // request for url (...)`). Without checking `is_timeout()`
+                // and spelling out here that this failed because of the
+                // idle timeout, the user can't tell a dropped connection
+                // apart from a timeout.
                 if e.is_timeout() {
                     ProviderError::Http(format!(
-                        "リクエストがタイムアウトした（一定時間応答が無かった）: {e}"
+                        "the request timed out (no response for a while): {e}"
                     ))
                 } else {
                     ProviderError::Http(e.to_string())
@@ -200,36 +210,44 @@ impl Provider for OpenAiProvider {
             .await
             .map_err(|e| ProviderError::Decode(e.to_string()))?;
 
-        // `choices` が無い/空、または choices[0].message が無いなら、応答を
-        // 解釈できていない。ここで Decode にしないと text="" / tool_calls=[]
-        // という「正常終了っぽい空応答」になり、上位のエージェントループが
-        // 「ツール呼び出しなし＝完了」と誤読して黙って壊れる。
+        // If `choices` is missing/empty, or choices[0].message is missing,
+        // the response couldn't be interpreted. Without turning this into
+        // Decode here, it becomes a "looks like a normal completion"
+        // empty response (text="" / tool_calls=[]), and the agent loop
+        // above misreads "no tool call" as "done" and silently breaks.
         let msg = v
             .get("choices")
             .and_then(|c| c.as_array())
             .and_then(|arr| arr.first())
             .and_then(|first| first.get("message"))
-            .ok_or_else(|| ProviderError::Decode("choices が空、または message が無い".into()))?;
+            .ok_or_else(|| {
+                ProviderError::Decode("choices is empty, or message is missing".into())
+            })?;
 
-        // content と tool_calls の両方が「実質的に無い」場合のみ Decode に
-        // する。左右対称に「無い」を定義する必要がある — 片方だけ緩いと、
-        // その緩い側の門から同じ黙った空成功が抜けてしまう。
+        // Only turn this into Decode when both content and tool_calls are
+        // "effectively absent." "Absent" has to be defined symmetrically
+        // for both sides — if only one side is lenient, the same silent
+        // empty success slips out through that lenient gate.
         //
-        // content が「無い」とは、フィールド自体が無いか、JSON null で
-        // あること。missing と null はワイヤ上ここで区別する意味が無い。
-        // 一方 content が空文字列で「存在する」場合は、モデルが何も
-        // 言わなかっただけの正常応答として扱う（絶対に空≠不在にしない）。
+        // content is "absent" when the field itself is missing, or it's
+        // JSON null. There's no meaningful distinction to draw here on
+        // the wire between missing and null. Meanwhile, when content is
+        // an empty string, it "is present" — that's treated as a normal
+        // response where the model simply said nothing (never treat empty
+        // as equivalent to absent).
         //
-        // tool_calls が「無い」とは、フィールド自体が無いか、JSON null か、
-        // 空配列であること。`{"content": null, "tool_calls": null}` や
-        // `{"content": null, "tool_calls": []}` は、missing キーの場合と
-        // 意味的に同一（呼び出しは一つも要求されていない）であり、区別
-        // しないと text="" / tool_calls=[] の「正常終了っぽい空応答」が
-        // このガードをすり抜けてしまう（ループはこれを「ツール呼び出し
-        // 無し＝完了」と誤読し、空文字列を最終回答として返して黙って壊れる）。
+        // tool_calls is "absent" when the field itself is missing, or
+        // it's JSON null, or it's an empty array. `{"content": null,
+        // "tool_calls": null}` and `{"content": null, "tool_calls": []}`
+        // are semantically identical to the missing-key case (no call was
+        // ever requested), and without treating them the same, the
+        // "looks like a normal completion" empty response of text="" /
+        // tool_calls=[] slips past this guard (the loop misreads it as
+        // "no tool call = done" and returns an empty string as the final
+        // answer, silently breaking).
         //
-        // `content: null` かつ tool_calls が非空の組み合わせ（ツールだけを
-        // 呼ぶターンの通常形）はこのガードに引っかからない。
+        // The combination of `content: null` with a non-empty tool_calls
+        // (the normal shape of a tool-only turn) does not trip this guard.
         let content_field = msg.get("content");
         let tool_calls_field = msg.get("tool_calls");
         let content_is_absent = content_field.is_none_or(|c| c.is_null());
@@ -237,7 +255,7 @@ impl Provider for OpenAiProvider {
             .is_none_or(|c| c.is_null() || c.as_array().is_some_and(|a| a.is_empty()));
         if content_is_absent && tool_calls_are_absent {
             return Err(ProviderError::Decode(
-                "message に content も tool_calls も無い".into(),
+                "message has neither content nor tool_calls".into(),
             ));
         }
         let text = content_field
@@ -248,27 +266,35 @@ impl Provider for OpenAiProvider {
         let mut tool_calls = Vec::new();
         if let Some(calls) = tool_calls_field.and_then(|tc| tc.as_array()) {
             for c in calls {
-                // function.name が無い/空だと、ディスパッチャには「空名前の
-                // 未知ツール」として届き、デコード失敗がツール選択の問題に
-                // 見えてしまう。ここで止めて発生源で報告する。
+                // If function.name is missing/empty, it reaches the
+                // dispatcher looking like "an unknown tool with an empty
+                // name," and the decode failure ends up looking like a
+                // tool-selection problem. Stop it here and report it at
+                // the source instead.
                 let name = c
                     .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| {
-                        ProviderError::Decode("tool_calls[].function.name が無いか空".into())
+                        ProviderError::Decode(
+                            "tool_calls[].function.name is missing or empty".into(),
+                        )
                     })?;
 
-                // id も同様に無い/空を Decode にする。name と同じ構造の
-                // フィールドで、コストが同じなので揃えた。ただし空 id が
-                // 下流（ツール結果の突き合わせ）で実際にどう壊れるかまでは
-                // 確認していない。
+                // id gets the same missing/empty treatment as Decode, for
+                // the same reason. It's a field with the same shape as
+                // name, at the same cost, so it's kept consistent.
+                // That said, exactly how an empty id would actually break
+                // things downstream (matching against tool results)
+                // hasn't been confirmed.
                 let id = c
                     .get("id")
                     .and_then(|i| i.as_str())
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| ProviderError::Decode("tool_calls[].id が無いか空".into()))?;
+                    .ok_or_else(|| {
+                        ProviderError::Decode("tool_calls[].id is missing or empty".into())
+                    })?;
 
                 let raw = c["function"]["arguments"].as_str().unwrap_or("{}");
                 let arguments: Value =
@@ -312,7 +338,7 @@ mod tests {
             .await;
 
         let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
-            .expect("クライアントを構築できるべき");
+            .expect("client should be constructible");
         let res = p
             .complete(CompletionRequest {
                 system: "s".into(),
@@ -320,7 +346,7 @@ mod tests {
                 tools: vec![],
             })
             .await
-            .expect("失敗した");
+            .expect("should succeed");
 
         assert_eq!(res.tool_calls.len(), 1);
         assert_eq!(res.tool_calls[0].name, "read");
@@ -337,7 +363,7 @@ mod tests {
             .await;
 
         let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
-            .expect("クライアントを構築できるべき");
+            .expect("client should be constructible");
         let err = p
             .complete(CompletionRequest {
                 system: "s".into(),
@@ -345,7 +371,7 @@ mod tests {
                 tools: vec![],
             })
             .await
-            .expect_err("エラーになるべき");
+            .expect_err("should be an error");
         assert!(matches!(err, ProviderError::Http(_)));
     }
 
@@ -360,7 +386,7 @@ mod tests {
             .await;
 
         let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
-            .expect("クライアントを構築できるべき");
+            .expect("client should be constructible");
         p.complete(CompletionRequest {
             system: "s".into(),
             messages: vec![],
@@ -373,7 +399,7 @@ mod tests {
     async fn errors_when_choices_is_missing() {
         let err = complete_against(serde_json::json!({}))
             .await
-            .expect_err("choices が無いのでエラーになるべき");
+            .expect_err("should be an error since choices is missing");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
@@ -381,7 +407,7 @@ mod tests {
     async fn errors_when_choices_is_empty() {
         let err = complete_against(serde_json::json!({ "choices": [] }))
             .await
-            .expect_err("choices が空なのでエラーになるべき");
+            .expect_err("should be an error since choices is empty");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
@@ -391,46 +417,48 @@ mod tests {
             "choices": [{ "message": {} }]
         }))
         .await
-        .expect_err("content も tool_calls も無いのでエラーになるべき");
+        .expect_err("should be an error since neither content nor tool_calls is present");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
     #[tokio::test]
     async fn errors_when_content_is_null_and_tool_calls_missing() {
-        // content: null は JSON 上「存在する」が、tool_calls も無ければ
-        // 本文が実質何も無い応答であり、以前は "" として静かに Ok になって
-        // いた。ループは「ツール呼び出し無し＝完了」と読むため、これは
-        // 「空の答えで成功した」という誤った結果になる。
+        // content: null is "present" in JSON terms, but if tool_calls is
+        // also missing, the response effectively has no body at all, and
+        // this used to silently become Ok as "". The loop reads that as
+        // "no tool call = done," so this ends up as the wrong result of
+        // "succeeded with an empty answer."
         let err = complete_against(serde_json::json!({
             "choices": [{ "message": { "content": null } }]
         }))
         .await
-        .expect_err("content が null で tool_calls も無いのでエラーになるべき");
+        .expect_err("should be an error since content is null and tool_calls is also missing");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
     #[tokio::test]
     async fn errors_when_content_is_null_and_tool_calls_is_null() {
-        // tool_calls: null は「フィールドが無い」場合と意味的に同一で
-        // （呼び出しは一つも要求されていない）、区別しないと text="" /
-        // tool_calls=[] の「正常終了っぽい空応答」がガードをすり抜ける。
+        // tool_calls: null is semantically identical to "the field is
+        // missing" (no call was ever requested), and without treating
+        // them the same, the "looks like a normal completion" empty
+        // response of text="" / tool_calls=[] slips past the guard.
         let err = complete_against(serde_json::json!({
             "choices": [{ "message": { "content": null, "tool_calls": null } }]
         }))
         .await
-        .expect_err("content も tool_calls も null なのでエラーになるべき");
+        .expect_err("should be an error since both content and tool_calls are null");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
     #[tokio::test]
     async fn errors_when_content_is_null_and_tool_calls_is_empty_array() {
-        // tool_calls: [] も同様に「呼び出しなし」であり、missing/null と
-        // 同じ扱いにしないと同じ抜け道になる。
+        // tool_calls: [] is likewise "no calls," and unless it's treated
+        // the same as missing/null, it becomes the same escape hatch.
         let err = complete_against(serde_json::json!({
             "choices": [{ "message": { "content": null, "tool_calls": [] } }]
         }))
         .await
-        .expect_err("content が null で tool_calls も空配列なのでエラーになるべき");
+        .expect_err("should be an error since content is null and tool_calls is an empty array");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
@@ -440,7 +468,7 @@ mod tests {
             "choices": [{ "message": { "content": "" } }]
         }))
         .await
-        .expect("content が空文字列でも正常応答として扱うべき");
+        .expect("an empty string content should still be treated as a normal response");
         assert_eq!(res.text, "");
         assert_eq!(res.tool_calls.len(), 0);
     }
@@ -459,7 +487,7 @@ mod tests {
             }]
         }))
         .await
-        .expect_err("function.name が無いのでエラーになるべき");
+        .expect_err("should be an error since function.name is missing");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
@@ -477,7 +505,7 @@ mod tests {
             }]
         }))
         .await
-        .expect_err("function.name が空文字列なのでエラーになるべき");
+        .expect_err("should be an error since function.name is an empty string");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
@@ -494,16 +522,17 @@ mod tests {
             }]
         }))
         .await
-        .expect_err("id が無いのでエラーになるべき");
+        .expect_err("should be an error since id is missing");
         assert!(matches!(err, ProviderError::Decode(_)));
     }
 
     #[tokio::test]
     async fn read_timeout_bounds_a_stalled_response_and_says_so() {
-        // `reqwest::Client::new()` は無期限に待つ。相手が接続を受けたまま
-        // 応答を返さない場合をモックの遅延応答で再現し、設定した
-        // read_timeout 内で確実にエラーへ戻ること、かつそのエラーが
-        // タイムアウトだと分かる文言を持つことを確かめる。
+        // `reqwest::Client::new()` waits indefinitely. Reproduce the case
+        // where the peer accepts the connection but never returns a
+        // response, using a mock's delayed response, and confirm that we
+        // reliably get back an error within the configured read_timeout,
+        // and that the error's wording makes clear it was a timeout.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -511,7 +540,7 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_delay(std::time::Duration::from_millis(300))
                     .set_body_json(serde_json::json!({
-                        "choices": [{ "message": { "content": "遅い" } }]
+                        "choices": [{ "message": { "content": "slow" } }]
                     })),
             )
             .mount(&server)
@@ -524,7 +553,7 @@ mod tests {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_millis(50),
         )
-        .expect("クライアントを構築できるべき");
+        .expect("client should be constructible");
 
         let started = std::time::Instant::now();
         let err = p
@@ -534,27 +563,28 @@ mod tests {
                 tools: vec![],
             })
             .await
-            .expect_err("タイムアウトでエラーになるべき");
+            .expect_err("should be an error from the timeout");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
-            "タイムアウトが効いていない。実測 {:?}",
+            "the timeout didn't take effect. actual elapsed: {:?}",
             started.elapsed()
         );
         let ProviderError::Http(msg) = err else {
-            panic!("Http エラーであるべき");
+            panic!("should be an Http error");
         };
         assert!(
-            msg.contains("タイムアウト"),
-            "タイムアウトだと分かる文言が無い: {msg}"
+            msg.contains("timed out"),
+            "wording identifying this as a timeout is missing: {msg}"
         );
     }
 
     #[tokio::test]
     async fn sends_tool_definitions_in_the_shape_tool_wire_shape_produces() {
-        // 予算計測が数える形（`tool_wire_shape`）と、実際にワイヤへ乗る形が
-        // 同じ関数から出ていることを、モックが受け取った生のボディで確かめる。
-        // 型だけを見るテストでは、両者が独立に同じ形を再実装して食い違う
-        // ことを検出できない。
+        // Confirm, from the raw body the mock actually received, that the
+        // shape budget accounting counts (`tool_wire_shape`) and the shape
+        // that actually rides the wire come from the same function. A
+        // test that only looks at types can't detect the two
+        // independently reimplementing the same shape and drifting apart.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -566,50 +596,51 @@ mod tests {
 
         let specs = polaris_tools::all_specs();
         let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
-            .expect("クライアントを構築できるべき");
+            .expect("client should be constructible");
         p.complete(CompletionRequest {
             system: "s".into(),
             messages: vec![],
             tools: specs.clone(),
         })
         .await
-        .expect("失敗した");
+        .expect("should succeed");
 
         let received = server
             .received_requests()
             .await
-            .expect("リクエストが記録されていない");
-        let body: Value = received[0].body_json().expect("JSON として読めない");
+            .expect("request should have been recorded");
+        let body: Value = received[0].body_json().expect("should be readable as JSON");
 
         let expected = Value::Array(tool_wire_shape(&specs));
         assert_eq!(
             body["tools"], expected,
-            "送信されたツール定義が tool_wire_shape の出力と一致しない"
+            "the tool definitions sent don't match tool_wire_shape's output"
         );
     }
 
     #[tokio::test]
     async fn serializes_tool_round_trip_to_the_wire_shape_openai_requires() {
-        // 型だけを見るテストは、実際のワイヤ形式のズレを見逃す。ここでは
-        // wiremock が受け取った生のリクエストボディを直接検証し、
-        // (1) tool_calls を持つアシスタントのメッセージがそのまま履歴に
-        //     残っていること、(2) arguments が JSON オブジェクトではなく
-        //     JSON 文字列として送信されること、(3) 続く tool 結果が
-        //     tool_call_id を持つこと、(4) 普通のユーザーメッセージには
-        //     tool_calls / tool_call_id のどちらも乗らないこと、を確かめる。
+        // A test that only looks at types misses an actual drift in the
+        // wire format. Here we directly verify the raw request body
+        // wiremock received, confirming: (1) an assistant message
+        // carrying tool_calls stays in the history as-is, (2) arguments
+        // is sent as a JSON string rather than a JSON object, (3) the
+        // tool result that follows carries tool_call_id, and (4) an
+        // ordinary user message carries neither tool_calls nor
+        // tool_call_id.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{ "message": { "content": "1 行だった" } }]
+                "choices": [{ "message": { "content": "it was 1 line" } }]
             })))
             .mount(&server)
             .await;
 
         let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
-            .expect("クライアントを構築できるべき");
+            .expect("client should be constructible");
         let history = vec![
-            Message::user("a.txt は何行か"),
+            Message::user("how many lines is a.txt?"),
             Message::assistant_with_tool_calls(
                 "",
                 vec![ToolCall {
@@ -627,43 +658,43 @@ mod tests {
             tools: vec![],
         })
         .await
-        .expect("失敗した");
+        .expect("should succeed");
 
         let received = server
             .received_requests()
             .await
-            .expect("リクエストが記録されていない");
+            .expect("request should have been recorded");
         assert_eq!(received.len(), 1);
-        let body: Value = received[0].body_json().expect("JSON として読めない");
-        let messages = body["messages"].as_array().expect("messages が無い");
+        let body: Value = received[0].body_json().expect("should be readable as JSON");
+        let messages = body["messages"].as_array().expect("messages is missing");
 
         // 0: system, 1: user, 2: assistant(tool_calls), 3: tool
         let user = &messages[1];
         assert_eq!(user["role"], "user");
         assert!(
             user.get("tool_calls").is_none(),
-            "普通のユーザーメッセージに tool_calls が乗っている: {user:?}"
+            "tool_calls is riding on an ordinary user message: {user:?}"
         );
         assert!(
             user.get("tool_call_id").is_none(),
-            "普通のユーザーメッセージに tool_call_id が乗っている: {user:?}"
+            "tool_call_id is riding on an ordinary user message: {user:?}"
         );
 
         let assistant = &messages[2];
         assert_eq!(assistant["role"], "assistant");
         let calls = assistant["tool_calls"]
             .as_array()
-            .expect("assistant の tool_calls が無い");
+            .expect("assistant's tool_calls is missing");
         assert_eq!(calls[0]["id"], "c1");
         assert_eq!(calls[0]["type"], "function");
         assert_eq!(calls[0]["function"]["name"], "read");
         let arguments = &calls[0]["function"]["arguments"];
         assert!(
             arguments.is_string(),
-            "arguments は JSON 文字列であるべき: {arguments:?}"
+            "arguments should be a JSON string: {arguments:?}"
         );
         let parsed: Value =
-            serde_json::from_str(arguments.as_str().unwrap()).expect("パースできない");
+            serde_json::from_str(arguments.as_str().unwrap()).expect("should be parseable");
         assert_eq!(parsed["path"], "a.txt");
 
         let tool_msg = &messages[3];

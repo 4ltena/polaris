@@ -1,9 +1,11 @@
-//! ChatGPT のサブスクリプション認証で Responses API を話すプロバイダ。
+//! A provider that speaks the Responses API using ChatGPT subscription
+//! auth.
 //!
-//! `/chat/completions` とは形が違う。ツール定義は入れ子ではなく平坦で、
-//! 履歴は `messages` ではなく `input` の要素列であり、`arguments` は
-//! JSON ではなく JSON を収めた文字列である。`openai.rs` と関数を共有
-//! しないのは、片方を直したときにもう片方が黙って壊れる形にしないため。
+//! The shape differs from `/chat/completions`. Tool definitions are flat
+//! rather than nested, history is a sequence of `input` elements rather
+//! than `messages`, and `arguments` is a string holding JSON rather than
+//! JSON itself. This doesn't share functions with `openai.rs` so that
+//! fixing one side can never silently break the other.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,20 +17,21 @@ use crate::{
     CompletionRequest, CompletionResponse, Message, Provider, ProviderError, Role, ToolCall, sse,
 };
 
-/// 要求先。`store` を使わないので、この 1 本しか叩かない。
+/// The endpoint to send requests to. `store` is never used, so this is the
+/// only one ever hit.
 pub const ENDPOINT_BASE: &str = "https://chatgpt.com/backend-api/codex";
-/// `POLARIS_MODEL` を省いたときの既定。
+/// The default used when `POLARIS_MODEL` is omitted.
 ///
-/// 設計時にバイナリの文字列から拾った `gpt-5.1-codex-max` /
-/// `gpt-5.2-codex` / `gpt-5.3-codex` は、実カタログ（`codex debug
-/// models`）に1つも存在しなかった。実バックエンドは 400 で
-/// 「ChatGPT アカウントでの Codex 利用ではサポートされていない」と
-/// 明確に返しており、認証自体は通っていた（401 ではない）。実カタログの
-/// 最優先モデルへ差し替える。仕様が明記するとおり、この名前が今後も
-/// 通る保証は無い。
+/// `gpt-5.1-codex-max` / `gpt-5.2-codex` / `gpt-5.3-codex`, picked up from
+/// strings in the binary at design time, existed in none of the real
+/// catalog (`codex debug models`). The real backend clearly returned a 400
+/// saying "Codex usage on a ChatGPT account is not supported" for these,
+/// with auth itself going through fine (not a 401). Swapped in for the
+/// real catalog's top-priority model instead. As the spec states plainly,
+/// there's no guarantee this name will keep working going forward either.
 pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 
-/// 履歴を Responses の `input` 要素列へ変換する。
+/// Converts history into a sequence of Responses `input` elements.
 pub fn input_items(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     for m in messages {
@@ -39,8 +42,9 @@ pub fn input_items(messages: &[Message]) -> Vec<Value> {
                 "content": [{ "type": "input_text", "text": m.content }],
             })),
             Role::Assistant => {
-                // 本文が空でツール呼び出しだけのターンは珍しくない。
-                // 空の message を足すと、内容の無い発話が履歴に増える。
+                // A turn with empty body text and only tool calls isn't
+                // unusual. Adding an empty message would just pile up
+                // content-free utterances in the history.
                 if !m.content.is_empty() {
                     out.push(serde_json::json!({
                         "type": "message",
@@ -53,7 +57,7 @@ pub fn input_items(messages: &[Message]) -> Vec<Value> {
                         "type": "function_call",
                         "call_id": c.id,
                         "name": c.name,
-                        // JSON そのものではなく、JSON を収めた文字列。
+                        // A string holding JSON, not JSON itself.
                         "arguments": c.arguments.to_string(),
                     }));
                 }
@@ -68,7 +72,7 @@ pub fn input_items(messages: &[Message]) -> Vec<Value> {
     out
 }
 
-/// ツール定義を Responses の平坦な形へ変換する。
+/// Converts tool definitions into the Responses API's flat shape.
 pub fn tool_wire_shape(tools: &[polaris_tools::ToolSpec]) -> Vec<Value> {
     tools
         .iter()
@@ -83,18 +87,20 @@ pub fn tool_wire_shape(tools: &[polaris_tools::ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-/// 要求本文を組み立てる。
+/// Assembles the request body.
 ///
-/// `effort` は `reasoning.effort` として送る。`None` なら `reasoning`
-/// キー自体を出さず、サーバの既定に委ねる — `tools` を空配列ではなく
-/// キーごと省く既存の判断と同じ形である。
+/// `effort` is sent as `reasoning.effort`. When it's `None`, the
+/// `reasoning` key itself is omitted rather than sent, leaving it to the
+/// server's default — the same shape as the existing decision to omit the
+/// `tools` key entirely rather than send an empty array.
 pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) -> Value {
     let mut body = serde_json::json!({
         "model": model,
         "instructions": req.system,
         "input": input_items(&req.messages),
-        // サーバに会話状態を持たせない。毎ターン全文を送る。送るものと
-        // 測るものが一致し、接頭辞も動かない。
+        // Never let the server hold conversation state. Send the full
+        // text every turn. What's sent and what's measured then match,
+        // and the prefix never shifts under us.
         "store": false,
         "stream": true,
     });
@@ -108,9 +114,9 @@ pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) ->
     body
 }
 
-/// SSE の意味論。フレーミングは `sse::SseDecoder` に任せ、ここは
-/// イベントの解釈だけを持つ。HTTP から切り離してあるので、ネットワーク
-/// 無しで試験できる。
+/// SSE semantics. Framing is left to `sse::SseDecoder`; this only holds
+/// event interpretation. Keeping it separate from HTTP means it can be
+/// tested without a network.
 pub struct Folder {
     decoder: sse::SseDecoder,
     text: String,
@@ -134,16 +140,17 @@ impl Folder {
         }
     }
 
-    /// 受け取ったバイト片を押し込む。完成したイベントだけを解釈する。
+    /// Pushes in a received byte fragment. Only complete events get
+    /// interpreted.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProviderError> {
         for ev in self.decoder.push(bytes) {
             let data = ev.data.trim();
-            // 番兵。JSON ではないので解釈しない。
+            // A sentinel. Not JSON, so it isn't interpreted.
             if data.is_empty() || data == "[DONE]" {
                 continue;
             }
             let v: Value = serde_json::from_str(data)
-                .map_err(|e| ProviderError::Decode(format!("SSE の data が JSON でない: {e}")))?;
+                .map_err(|e| ProviderError::Decode(format!("SSE data is not JSON: {e}")))?;
 
             match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
                 "response.output_item.done" => self.take_item(&v)?,
@@ -152,14 +159,15 @@ impl Folder {
                     let msg = v
                         .pointer("/response/error/message")
                         .and_then(|m| m.as_str())
-                        .unwrap_or("理由が示されていない");
-                    return Err(ProviderError::Http(format!("応答が失敗した: {msg}")));
+                        .unwrap_or("no reason given");
+                    return Err(ProviderError::Http(format!("the response failed: {msg}")));
                 }
                 "response.cancelled" => {
-                    return Err(ProviderError::Http("応答が取り消された".into()));
+                    return Err(ProviderError::Http("the response was cancelled".into()));
                 }
-                // 差分やその他は読み飛ばす。確定したアイテムだけを見れば
-                // 同じ結果になり、再結合の失敗という壊れ方を持ち込まない。
+                // Deltas and everything else are skipped. Looking only at
+                // finalized items gives the same result, and doesn't drag
+                // in reassembly failure as a new way to break.
                 _ => {}
             }
         }
@@ -189,20 +197,18 @@ impl Folder {
                     .get("call_id")
                     .and_then(|s| s.as_str())
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        ProviderError::Decode("function_call に call_id が無い".into())
-                    })?;
+                    .ok_or_else(|| ProviderError::Decode("function_call has no call_id".into()))?;
                 let name = item
                     .get("name")
                     .and_then(|s| s.as_str())
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| ProviderError::Decode("function_call に name が無い".into()))?;
+                    .ok_or_else(|| ProviderError::Decode("function_call has no name".into()))?;
                 let raw = item
                     .get("arguments")
                     .and_then(|s| s.as_str())
                     .unwrap_or("{}");
                 let arguments: Value = serde_json::from_str(raw).map_err(|e| {
-                    ProviderError::Decode(format!("function_call の arguments が JSON でない: {e}"))
+                    ProviderError::Decode(format!("function_call's arguments is not JSON: {e}"))
                 })?;
                 self.tool_calls.push(ToolCall {
                     id: id.to_string(),
@@ -215,11 +221,12 @@ impl Folder {
         Ok(())
     }
 
-    /// 畳んだ結果を返す。完了を見ていなければ硬い失敗にする。
+    /// Returns the folded result. If completion was never observed, this
+    /// is a hard failure.
     pub fn finish(self) -> Result<CompletionResponse, ProviderError> {
         if !self.completed {
             return Err(ProviderError::Decode(
-                "response.completed を見ないままストリームが終わった".into(),
+                "the stream ended without ever seeing response.completed".into(),
             ));
         }
         Ok(CompletionResponse {
@@ -229,7 +236,8 @@ impl Folder {
     }
 }
 
-/// 無通信がこの時間続いたら切る。応答全体で測ると正常な長考を打ち切る。
+/// Cut the connection once silence lasts this long. Measuring against the
+/// whole response would cut off a normal long think.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct CodexProvider {
@@ -260,13 +268,15 @@ impl CodexProvider {
         }
     }
 
-    /// 1 回の要求を投げ、SSE を畳む。401 はここでは畳まず、そのまま
-    /// 呼び出し側へ返して再試行の判断をさせる。
+    /// Sends a single request and folds the SSE. A 401 is not folded
+    /// here; it's returned to the caller as-is so the caller can decide
+    /// whether to retry.
     ///
-    /// 本文はここで組み立てる。`token` ごとに `effort` が変わりうる
-    /// （更新後のトークンが別のプラン判定を持つことは実際には無いが、
-    /// 「その回の試行が使ったトークンの effort をその回の本文に使う」
-    /// という対応を保つほうが、呼び出し側で本文を使い回すより誤りにくい）。
+    /// The body is assembled here. `effort` can vary per `token` (in
+    /// practice a refreshed token never actually carries a different plan
+    /// determination, but keeping the correspondence "this attempt's body
+    /// uses the effort of the token this attempt used" is less error-prone
+    /// than having the caller reuse a body across attempts).
     async fn attempt(
         &self,
         token: &crate::Token,
@@ -286,7 +296,7 @@ impl CodexProvider {
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            // 呼び出し側が更新して再試行するかを決める。
+            // Let the caller decide whether to refresh and retry.
             return Err(ProviderError::Auth(format!("status {status}")));
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -294,11 +304,11 @@ impl CodexProvider {
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("不明")
+                .unwrap_or("unknown")
                 .to_string();
             let body = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Http(format!(
-                "レート制限。retry-after: {hint} 秒。{body}"
+                "rate limited. retry-after: {hint} seconds. {body}"
             )));
         }
         if !status.is_success() {
@@ -309,12 +319,13 @@ impl CodexProvider {
         let mut folder = Folder::new();
         let mut stream = resp.bytes_stream();
         loop {
-            // 無通信で測る。応答全体の長さは正常に伸びる。
+            // Measured against idle time. The response's overall length
+            // grows normally.
             let next = tokio::time::timeout(self.idle, stream.next()).await;
             match next {
                 Err(_) => {
                     return Err(ProviderError::Http(format!(
-                        "{} 秒のあいだ応答が届かなかった",
+                        "no response arrived for {} seconds",
                         self.idle.as_secs()
                     )));
                 }
@@ -335,11 +346,11 @@ impl Provider for CodexProvider {
         let token = self.tokens.token().await?;
         match self.attempt(&token, &req).await {
             Err(ProviderError::Auth(_)) => {
-                // 1 回だけ。無限に再試行しない。
+                // Exactly once. Never retry indefinitely.
                 let token = self.tokens.refreshed().await?;
                 self.attempt(&token, &req).await.map_err(|e| match e {
                     ProviderError::Auth(_) => ProviderError::Auth(
-                        "更新後も認証を拒否された。`polaris login` をやり直すこと".into(),
+                        "auth was still refused after refreshing. redo `polaris login`".into(),
                     ),
                     other => other,
                 })
@@ -383,12 +394,15 @@ mod tests {
     #[test]
     fn a_text_only_stream_folds_into_text() {
         let mut f = Folder::new();
-        f.push(&frame("response.output_item.done", message_item("42 行")))
-            .expect("押せる");
+        f.push(&frame(
+            "response.output_item.done",
+            message_item("42 lines"),
+        ))
+        .expect("push should succeed");
         f.push(&frame("response.completed", serde_json::json!({})))
-            .expect("押せる");
-        let r = f.finish().expect("完了しているべき");
-        assert_eq!(r.text, "42 行");
+            .expect("push should succeed");
+        let r = f.finish().expect("should be complete");
+        assert_eq!(r.text, "42 lines");
         assert!(r.tool_calls.is_empty());
     }
 
@@ -399,59 +413,64 @@ mod tests {
             "response.output_item.done",
             function_call_item("call_9", "read", r#"{"path":"a.txt"}"#),
         ))
-        .expect("押せる");
+        .expect("push should succeed");
         f.push(&frame("response.completed", serde_json::json!({})))
-            .expect("押せる");
-        let r = f.finish().expect("完了しているべき");
+            .expect("push should succeed");
+        let r = f.finish().expect("should be complete");
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].id, "call_9");
         assert_eq!(r.tool_calls[0].name, "read");
         assert_eq!(r.tool_calls[0].arguments["path"], "a.txt");
     }
 
-    /// フレームがどこで分割されても結果が変わらない。分割耐性は
-    /// `sse.rs` の責任だが、この経路が実際にそれを通っていることは
-    /// 別に確かめる。通っていなければ、ここで結合をやり直している。
+    /// The result doesn't change no matter where the frame gets split.
+    /// Split tolerance is `sse.rs`'s responsibility, but whether this
+    /// path actually goes through it is confirmed separately here. If it
+    /// didn't, this would be redoing the reassembly on its own.
     #[test]
     fn a_stream_split_mid_frame_folds_the_same_way() {
-        let whole: Vec<u8> = frame("response.output_item.done", message_item("分割耐性"))
+        let whole: Vec<u8> = frame("response.output_item.done", message_item("split tolerance"))
             .into_iter()
             .chain(frame("response.completed", serde_json::json!({})))
             .collect();
 
         for cut in 1..whole.len() {
             let mut f = Folder::new();
-            f.push(&whole[..cut]).expect("押せる");
-            f.push(&whole[cut..]).expect("押せる");
-            let r = f.finish().expect("完了しているべき");
-            assert_eq!(r.text, "分割耐性", "{cut} バイト目で分割したときに壊れた");
+            f.push(&whole[..cut]).expect("push should succeed");
+            f.push(&whole[cut..]).expect("push should succeed");
+            let r = f.finish().expect("should be complete");
+            assert_eq!(r.text, "split tolerance", "broke when split at byte {cut}");
         }
     }
 
-    /// `response.completed` を見ないまま終わった応答を、正常終了として
-    /// 返してはならない。エージェントループはツール呼び出しが無いことを
-    /// 「完了」と読むため、黙って空の最終回答を返す。
+    /// A response that ended without ever seeing `response.completed`
+    /// must never be returned as a normal success. The agent loop reads
+    /// the absence of a tool call as "done," so it would silently return
+    /// an empty final answer.
     #[test]
     fn a_stream_that_never_completes_is_an_error() {
         let mut f = Folder::new();
-        f.push(&frame("response.output_item.done", message_item("途中")))
-            .expect("押せる");
-        let err = f.finish().expect_err("完了していないので失敗すべき");
+        f.push(&frame("response.output_item.done", message_item("midway")))
+            .expect("push should succeed");
+        let err = f
+            .finish()
+            .expect_err("should fail since it never completed");
         assert!(
             matches!(err, ProviderError::Decode(_)),
-            "Decode 以外: {err:?}"
+            "not Decode: {err:?}"
         );
     }
 
-    /// 中身が空でも、完了していれば成功である。空文字列と不在を
-    /// 取り違えない。上のテストの対であり、これが無いと「常に失敗」の
-    /// 実装が通る。
+    /// Even with an empty body, if it completed, it's a success. Don't
+    /// conflate an empty string with absence. This is the counterpart to
+    /// the test above — without it, an implementation that "always fails"
+    /// would pass.
     #[test]
     fn an_empty_but_completed_stream_is_a_success() {
         let mut f = Folder::new();
         f.push(&frame("response.completed", serde_json::json!({})))
-            .expect("押せる");
-        let r = f.finish().expect("完了しているので成功すべき");
+            .expect("push should succeed");
+        let r = f.finish().expect("should succeed since it completed");
         assert!(r.text.is_empty());
         assert!(r.tool_calls.is_empty());
     }
@@ -464,11 +483,14 @@ mod tests {
                 "response.failed",
                 serde_json::json!({ "response": { "error": { "message": "model overloaded" } } }),
             ))
-            .expect_err("失敗すべき");
+            .expect_err("should fail");
         let ProviderError::Http(msg) = err else {
-            panic!("Http 以外: {err:?}");
+            panic!("not Http: {err:?}");
         };
-        assert!(msg.contains("model overloaded"), "理由が文面に無い: {msg}");
+        assert!(
+            msg.contains("model overloaded"),
+            "reason missing from message: {msg}"
+        );
     }
 
     #[test]
@@ -476,29 +498,37 @@ mod tests {
         let mut f = Folder::new();
         let err = f
             .push(&frame("response.cancelled", serde_json::json!({})))
-            .expect_err("失敗すべき");
-        assert!(matches!(err, ProviderError::Http(_)), "Http 以外: {err:?}");
+            .expect_err("should fail");
+        assert!(matches!(err, ProviderError::Http(_)), "not Http: {err:?}");
     }
 
-    /// 差分イベントは読み飛ばす。拾って二重に積むと本文が重複する。
+    /// Delta events are skipped. Picking them up and piling them on
+    /// doubles the body text.
     #[test]
     fn delta_events_are_ignored() {
         let mut f = Folder::new();
         f.push(&frame(
             "response.output_text.delta",
-            serde_json::json!({ "delta": "重複" }),
+            serde_json::json!({ "delta": "duplicate" }),
         ))
-        .expect("押せる");
-        f.push(&frame("response.output_item.done", message_item("重複")))
-            .expect("押せる");
+        .expect("push should succeed");
+        f.push(&frame(
+            "response.output_item.done",
+            message_item("duplicate"),
+        ))
+        .expect("push should succeed");
         f.push(&frame("response.completed", serde_json::json!({})))
-            .expect("押せる");
-        let r = f.finish().expect("完了");
-        assert_eq!(r.text, "重複", "差分を拾って二重に積んでいる");
+            .expect("push should succeed");
+        let r = f.finish().expect("should complete");
+        assert_eq!(
+            r.text, "duplicate",
+            "picked up the delta and double-counted it"
+        );
     }
 
-    /// `arguments` が JSON として壊れている呼び出しは、ディスパッチャへ
-    /// 渡す前にここで止める。渡すと「未知の引数」に見え、原因が遡れない。
+    /// A call whose `arguments` is broken as JSON is stopped here, before
+    /// it reaches the dispatcher. Passing it through would look like "an
+    /// unknown argument," and the cause couldn't be traced back.
     #[test]
     fn a_function_call_with_broken_arguments_is_a_decode_error() {
         let mut f = Folder::new();
@@ -507,45 +537,47 @@ mod tests {
                 "response.output_item.done",
                 function_call_item("c", "read", "{ not json"),
             ))
-            .expect_err("失敗すべき");
+            .expect_err("should fail");
         assert!(
             matches!(err, ProviderError::Decode(_)),
-            "Decode 以外: {err:?}"
+            "not Decode: {err:?}"
         );
     }
 
-    /// `[DONE]` という番兵は JSON ではない。解釈しようとして落ちない。
+    /// The `[DONE]` sentinel is not JSON. Don't crash trying to interpret
+    /// it.
     #[test]
     fn the_done_sentinel_is_not_parsed_as_json() {
         let mut f = Folder::new();
         f.push(&frame("response.completed", serde_json::json!({})))
-            .expect("押せる");
-        f.push(b"data: [DONE]\n\n").expect("番兵で落ちてはいけない");
-        let r = f.finish().expect("完了");
+            .expect("push should succeed");
+        f.push(b"data: [DONE]\n\n")
+            .expect("must not fail on the sentinel");
+        let r = f.finish().expect("should complete");
         assert!(r.text.is_empty());
     }
 
     #[test]
     fn a_user_message_becomes_an_input_text_item() {
-        let items = input_items(&[Message::user("こんにちは")]);
+        let items = input_items(&[Message::user("hello")]);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[0]["role"], "user");
         assert_eq!(items[0]["content"][0]["type"], "input_text");
-        assert_eq!(items[0]["content"][0]["text"], "こんにちは");
+        assert_eq!(items[0]["content"][0]["text"], "hello");
     }
 
     #[test]
     fn an_assistant_message_becomes_an_output_text_item() {
-        let items = input_items(&[Message::assistant("はい")]);
+        let items = input_items(&[Message::assistant("yes")]);
         assert_eq!(items[0]["role"], "assistant");
         assert_eq!(items[0]["content"][0]["type"], "output_text");
-        assert_eq!(items[0]["content"][0]["text"], "はい");
+        assert_eq!(items[0]["content"][0]["text"], "yes");
     }
 
-    /// ツール呼び出しは `function_call` になり、`arguments` は JSON では
-    /// なく JSON を収めた文字列である。ここを Value のまま送ると、
-    /// サーバは型が違うと言って 400 を返す。
+    /// A tool call becomes a `function_call`, and `arguments` is a string
+    /// holding JSON, not JSON itself. Sending it as a raw Value here
+    /// makes the server say the type is wrong and return a 400.
     #[test]
     fn a_tool_call_becomes_a_function_call_with_stringified_arguments() {
         let items = input_items(&[Message::assistant_with_tool_calls(
@@ -556,24 +588,28 @@ mod tests {
                 arguments: serde_json::json!({ "path": "Cargo.toml" }),
             }],
         )]);
-        assert_eq!(items.len(), 1, "本文が空のときに空の message を足している");
+        assert_eq!(
+            items.len(),
+            1,
+            "an empty message got added even though the body was empty"
+        );
         assert_eq!(items[0]["type"], "function_call");
         assert_eq!(items[0]["call_id"], "call_1");
         assert_eq!(items[0]["name"], "read");
         let raw = items[0]["arguments"]
             .as_str()
-            .expect("arguments が文字列でない");
-        let parsed: Value = serde_json::from_str(raw).expect("arguments が JSON でない");
+            .expect("arguments is not a string");
+        let parsed: Value = serde_json::from_str(raw).expect("arguments is not JSON");
         assert_eq!(parsed["path"], "Cargo.toml");
     }
 
-    /// 本文とツール呼び出しの両方を持つターンは、message を先に、
-    /// function_call を後に並べる。順序が逆だと、モデルは自分の発話より
-    /// 先に自分の呼び出しを見ることになる。
+    /// A turn carrying both body text and tool calls emits the message
+    /// first and the function_call after. If the order were reversed, the
+    /// model would see its own call before its own utterance.
     #[test]
     fn a_turn_with_both_text_and_calls_emits_the_message_first() {
         let items = input_items(&[Message::assistant_with_tool_calls(
-            "読みます",
+            "I'll read it",
             vec![ToolCall {
                 id: "c".into(),
                 name: "read".into(),
@@ -587,14 +623,15 @@ mod tests {
 
     #[test]
     fn a_tool_result_becomes_a_function_call_output() {
-        let items = input_items(&[Message::tool_result("call_1", "42 行")]);
+        let items = input_items(&[Message::tool_result("call_1", "42 lines")]);
         assert_eq!(items[0]["type"], "function_call_output");
         assert_eq!(items[0]["call_id"], "call_1");
-        assert_eq!(items[0]["output"], "42 行");
+        assert_eq!(items[0]["output"], "42 lines");
     }
 
-    /// Responses のツール定義は平坦である。`/chat/completions` の
-    /// `{"type":"function","function":{…}}` を送ると受け付けられない。
+    /// The Responses API's tool definitions are flat. Sending
+    /// `/chat/completions`'s `{"type":"function","function":{…}}` gets
+    /// rejected.
     #[test]
     fn tool_definitions_are_flat_not_nested() {
         let specs = polaris_tools::all_specs();
@@ -602,10 +639,10 @@ mod tests {
         assert_eq!(wire.len(), specs.len());
         for (w, s) in wire.iter().zip(specs.iter()) {
             assert_eq!(w["type"], "function");
-            assert_eq!(w["name"], s.name, "name が平坦に置かれていない");
+            assert_eq!(w["name"], s.name, "name is not placed flat");
             assert!(
                 w.get("function").is_none(),
-                "入れ子の function が残っている"
+                "a nested function is still present"
             );
             assert!(w["description"].is_string());
             assert_eq!(w["parameters"], s.parameters);
@@ -615,36 +652,45 @@ mod tests {
     #[test]
     fn the_body_carries_instructions_and_never_stores_state() {
         let req = CompletionRequest {
-            system: "システム".into(),
-            messages: vec![Message::user("やって")],
+            system: "system".into(),
+            messages: vec![Message::user("go")],
             tools: polaris_tools::all_specs(),
         };
         let body = build_body("gpt-5.3-codex", &req, None);
 
         assert_eq!(body["model"], "gpt-5.3-codex");
-        assert_eq!(body["instructions"], "システム");
-        assert_eq!(body["store"], false, "サーバに会話状態を持たせている");
+        assert_eq!(body["instructions"], "system");
+        assert_eq!(
+            body["store"], false,
+            "the server is being made to hold conversation state"
+        );
         assert_eq!(body["stream"], true);
         assert!(
             body.get("previous_response_id").is_none(),
-            "会話の再利用を使っている"
+            "conversation reuse is being used"
         );
         assert_eq!(
-            body["input"].as_array().expect("input が配列でない").len(),
+            body["input"]
+                .as_array()
+                .expect("input is not an array")
+                .len(),
             1
         );
         assert_eq!(
-            body["tools"].as_array().expect("tools が配列でない").len(),
+            body["tools"]
+                .as_array()
+                .expect("tools is not an array")
+                .len(),
             req.tools.len()
         );
         assert!(
             body.get("reasoning").is_none(),
-            "effort を渡していないのに reasoning を送っている"
+            "reasoning is being sent even though effort wasn't passed"
         );
     }
 
-    /// ツールが 1 本も無いときは `tools` を送らない。空配列を送ると、
-    /// 「ツールを使うな」の指示と受け取られうる。
+    /// When there isn't a single tool, `tools` isn't sent at all. Sending
+    /// an empty array could be taken as an instruction to "use no tools."
     #[test]
     fn an_empty_tool_list_is_omitted_rather_than_sent_empty() {
         let req = CompletionRequest {
@@ -653,12 +699,14 @@ mod tests {
             tools: vec![],
         };
         let body = build_body("m", &req, None);
-        assert!(body.get("tools").is_none(), "空の tools を送っている");
+        assert!(body.get("tools").is_none(), "an empty tools is being sent");
     }
 
-    /// `effort` を渡したときは `reasoning.effort` として乗る。渡さなければ
-    /// `reasoning` キー自体が無いことの対。片方だけでは、常に
-    /// reasoning を出す実装も、常に省く実装も通ってしまう。
+    /// When `effort` is passed, it rides as `reasoning.effort`. The
+    /// counterpart to the fact that the `reasoning` key itself is absent
+    /// when it isn't passed. With only one half of this pair, either an
+    /// implementation that always emits reasoning, or one that always
+    /// omits it, would pass.
     #[test]
     fn an_effort_becomes_the_reasoning_field() {
         let req = CompletionRequest {
@@ -712,7 +760,7 @@ mod tests {
     fn req() -> CompletionRequest {
         CompletionRequest {
             system: "s".into(),
-            messages: vec![Message::user("やって")],
+            messages: vec![Message::user("go")],
             tools: vec![],
         }
     }
@@ -724,8 +772,9 @@ mod tests {
             .collect()
     }
 
-    /// 送出したヘッダと本文が仕様どおりであること。ここが違うと、
-    /// 応答の解釈がいくら正しくてもサーバは相手にしない。
+    /// The headers and body sent out must match the spec. If this is
+    /// wrong, no matter how correctly the response gets interpreted, the
+    /// server won't even talk to us.
     #[tokio::test]
     async fn the_request_carries_the_bearer_and_the_account_id() {
         let s = MockServer::start().await;
@@ -741,11 +790,11 @@ mod tests {
             .await;
 
         let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
-        let r = p.complete(req()).await.expect("成功すべき");
+        let r = p.complete(req()).await.expect("should succeed");
         assert_eq!(r.text, "ok");
     }
 
-    /// 401 を受けたら更新して 1 回だけ再試行し、成功する。
+    /// On receiving a 401, refresh and retry exactly once, and succeed.
     #[tokio::test]
     async fn a_401_is_retried_once_with_a_refreshed_token() {
         let s = MockServer::start().await;
@@ -759,7 +808,10 @@ mod tests {
             .and(path("/responses"))
             .and(header("authorization", "Bearer second"))
             .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
-                frame("response.output_item.done", message_item("再試行で成功")),
+                frame(
+                    "response.output_item.done",
+                    message_item("succeeded on retry"),
+                ),
                 frame("response.completed", serde_json::json!({})),
             ])))
             .mount(&s)
@@ -767,17 +819,17 @@ mod tests {
 
         let t = Tokens::new();
         let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
-        let r = p.complete(req()).await.expect("再試行で成功すべき");
-        assert_eq!(r.text, "再試行で成功");
+        let r = p.complete(req()).await.expect("should succeed on retry");
+        assert_eq!(r.text, "succeeded on retry");
         assert_eq!(
             t.refreshes.load(Ordering::SeqCst),
             1,
-            "更新の回数が 1 でない"
+            "the number of refreshes isn't 1"
         );
     }
 
-    /// 401 が 2 回続いたら諦める。無限に再試行しない。種類は Auth で
-    /// あり、Http ではない。
+    /// If 401 happens twice in a row, give up. Never retry indefinitely.
+    /// The kind is Auth, not Http.
     #[tokio::test]
     async fn a_second_401_gives_up_as_an_auth_error() {
         let s = MockServer::start().await;
@@ -789,22 +841,23 @@ mod tests {
 
         let t = Tokens::new();
         let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
-        let err = p.complete(req()).await.expect_err("失敗すべき");
-        assert!(matches!(err, ProviderError::Auth(_)), "Auth 以外: {err:?}");
+        let err = p.complete(req()).await.expect_err("should fail");
+        assert!(matches!(err, ProviderError::Auth(_)), "not Auth: {err:?}");
         assert_eq!(
             t.refreshes.load(Ordering::SeqCst),
             1,
-            "再試行が 1 回で止まっていない"
+            "the retry didn't stop at 1"
         );
     }
 
-    /// 上のテストが確かめるのは「結果が Auth である」ことだけで、
-    /// 「速く終わる」ことではない。`complete` の再試行を `loop` へ
-    /// 退化させる変異はコンパイルも通り、上のテストをハングさせる
-    /// だけで、赤い X にはならない。ここでは時間で区切り、かつ
-    /// サーバが実際に受け取ったリクエスト数を数えることで、ループへの
-    /// 退化を高速に・かつ確実に検出する。ループなら 500ms のあいだに
-    /// 2 を超える回数のリクエストが届くはずである。
+    /// What the test above confirms is only that "the result is Auth,"
+    /// not that "it finishes quickly." A mutation that degrades
+    /// `complete`'s retry into a `loop` still compiles and would just
+    /// hang the test above forever, never showing up as a red X. Here we
+    /// bound it by time and additionally count how many requests the
+    /// server actually received, to detect a degradation into a loop both
+    /// fast and reliably. If it were looping, more than 2 requests should
+    /// arrive within 500ms.
     #[tokio::test]
     async fn a_second_401_stops_retrying_within_a_time_bound() {
         let s = MockServer::start().await;
@@ -820,32 +873,32 @@ mod tests {
         let bound = Duration::from_millis(500);
         let outcome = tokio::time::timeout(bound, p.complete(req())).await;
 
-        // wiremock はリクエスト記録を既定で有効にしている。タイムアウト
-        // が発火した場合でも、そこまでに届いた回数は意味を持つ
-        // （ループなら 2 を超えているはず）。
+        // wiremock has request recording on by default. Even if the
+        // timeout fired, the count received up to that point is still
+        // meaningful (if it were looping, it should exceed 2).
         let received = s
             .received_requests()
             .await
-            .expect("リクエスト記録は既定で有効なはず")
+            .expect("request recording should be on by default")
             .len();
 
         let mut failures = Vec::new();
         if outcome.is_err() {
             failures.push(format!(
-                "{bound:?} 以内に終わらなかった（{received} 回受信済み）。再試行がループしている可能性がある"
+                "did not finish within {bound:?} ({received} received so far). the retry may be looping"
             ));
         }
         if received != 2 {
             failures.push(format!(
-                "初回 + 再試行 1 回のちょうど 2 回で止まっていない（{received} 回受信した）"
+                "did not stop at exactly 2 (initial + 1 retry) ({received} received)"
             ));
         }
         assert!(failures.is_empty(), "{}", failures.join("; "));
     }
 
-    /// 500 は Auth ではない。再試行の入口を 401 専用に保つ。ここが
-    /// 崩れると、一時的なサーバ障害のたびに `refreshed()` を呼んで
-    /// トークンを消費することになる。
+    /// A 500 is not Auth. Keep the retry entry point exclusive to 401. If
+    /// this breaks down, every transient server failure would call
+    /// `refreshed()` and burn a token.
     #[tokio::test]
     async fn a_500_response_does_not_trigger_the_refresh_and_retry_path() {
         let s = MockServer::start().await;
@@ -857,17 +910,17 @@ mod tests {
 
         let t = Tokens::new();
         let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
-        let err = p.complete(req()).await.expect_err("失敗すべき");
-        assert!(matches!(err, ProviderError::Http(_)), "Http 以外: {err:?}");
+        let err = p.complete(req()).await.expect_err("should fail");
+        assert!(matches!(err, ProviderError::Http(_)), "not Http: {err:?}");
         assert_eq!(
             t.refreshes.load(Ordering::SeqCst),
             0,
-            "500 なのに更新（再試行）が起きている"
+            "a refresh (retry) happened even though it was a 500"
         );
     }
 
-    /// 429 はリセット情報を文面へ含める。掴めない拒否は同じ失敗を
-    /// 繰り返させる。
+    /// A 429 includes the reset information in its wording. A rejection
+    /// you can't act on just makes the same failure repeat.
     #[tokio::test]
     async fn a_429_surfaces_the_retry_hint() {
         let s = MockServer::start().await;
@@ -882,15 +935,19 @@ mod tests {
             .await;
 
         let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
-        let err = p.complete(req()).await.expect_err("失敗すべき");
+        let err = p.complete(req()).await.expect_err("should fail");
         let ProviderError::Http(msg) = err else {
-            panic!("Http 以外: {err:?}");
+            panic!("not Http: {err:?}");
         };
-        assert!(msg.contains("37"), "retry-after が文面に無い: {msg}");
+        assert!(
+            msg.contains("37"),
+            "retry-after missing from message: {msg}"
+        );
     }
 
-    /// 完了を見ないまま切れたストリームは失敗である。HTTP は 200 なので、
-    /// ここを通すと空の最終回答が返る。
+    /// A stream that was cut off without ever seeing completion is a
+    /// failure. HTTP is 200, so letting this through would return an
+    /// empty final answer.
     #[tokio::test]
     async fn a_truncated_stream_is_an_error_even_on_200() {
         let s = MockServer::start().await;
@@ -898,30 +955,31 @@ mod tests {
             .and(path("/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[frame(
                 "response.output_item.done",
-                message_item("途中で切れた"),
+                message_item("cut off midway"),
             )])))
             .mount(&s)
             .await;
 
         let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
-        let err = p.complete(req()).await.expect_err("失敗すべき");
+        let err = p.complete(req()).await.expect_err("should fail");
         assert!(
             matches!(err, ProviderError::Decode(_)),
-            "Decode 以外: {err:?}"
+            "not Decode: {err:?}"
         );
     }
 
-    /// トークンが取れない時点で Auth である。ネットワークへ出ない。
+    /// The moment a token can't be obtained, it's Auth. Never reaches the
+    /// network.
     #[tokio::test]
     async fn a_token_source_failure_is_an_auth_error() {
         struct NoTokens;
         #[async_trait::async_trait]
         impl crate::TokenSource for NoTokens {
             async fn token(&self) -> Result<crate::Token, ProviderError> {
-                Err(ProviderError::Auth("ログインしていない".into()))
+                Err(ProviderError::Auth("not logged in".into()))
             }
             async fn refreshed(&self) -> Result<crate::Token, ProviderError> {
-                Err(ProviderError::Auth("ログインしていない".into()))
+                Err(ProviderError::Auth("not logged in".into()))
             }
         }
 
@@ -930,7 +988,7 @@ mod tests {
             "m".into(),
             Arc::new(NoTokens),
         );
-        let err = p.complete(req()).await.expect_err("失敗すべき");
-        assert!(matches!(err, ProviderError::Auth(_)), "Auth 以外: {err:?}");
+        let err = p.complete(req()).await.expect_err("should fail");
+        assert!(matches!(err, ProviderError::Auth(_)), "not Auth: {err:?}");
     }
 }

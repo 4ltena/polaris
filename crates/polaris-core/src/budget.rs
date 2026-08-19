@@ -51,6 +51,45 @@ mod tests {
         );
     }
 
+    /// codex プロバイダのワイヤ形式でも上限を割らないことを固定する。
+    ///
+    /// `always_on_tokens` が数えるのは `openai::tool_wire_shape`
+    /// （`{"type":"function","function":{…}}`）だが、実際に送られる形は
+    /// プロバイダで違う。codex は Responses API の平坦な形
+    /// （`{"type":"function","name":…}`）を送るので、同じツール定義でも
+    /// バイト列が違い、トークン数も違う。今日は codex のほうが安いが、
+    /// 安いことは測って初めて言える。ここが無いと、codex のワイヤ形式を
+    /// 将来変えたときに実数が上限へ寄っても、どのテストも気づかない。
+    ///
+    /// 上限との比較は `always_on_context_stays_within_budget` と同じ形で行い、
+    /// 数えるツール定義も本番と同じ `assemble_always_on` の結果から採る。
+    #[test]
+    fn the_codex_wire_shape_also_stays_within_budget() {
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let wire =
+            serde_json::to_string(&polaris_provider::codex::tool_wire_shape(always_on.tools()))
+                .expect("直列化できない");
+
+        // 空振り防止。ツールが 0 本なら、どんな上限でも通ってしまう。
+        assert!(
+            !always_on.tools().is_empty(),
+            "ツール定義が 1 本も入っていない"
+        );
+        // 測っているのが本当に codex の平坦な形であることを、同じテストの中で
+        // 押さえる。openai の入れ子形は `"function":` という鍵を持つので、
+        // 取り違えるとここで落ちる。
+        assert!(
+            !wire.contains("\"function\":"),
+            "codex のはずのワイヤ形式が入れ子になっている: {wire}"
+        );
+
+        let n = count_tokens(always_on.system()) + count_tokens(&wire);
+        assert!(
+            n <= BUDGET_LIMIT,
+            "codex のワイヤ形式で常時コンテキストが {n} トークン。上限 {BUDGET_LIMIT} を超えている"
+        );
+    }
+
     #[test]
     fn tool_count_stays_within_limit() {
         let n = polaris_tools::all_specs().len();

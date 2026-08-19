@@ -3,18 +3,7 @@
 
 use polaris_skills::Skill;
 
-// Not yet called from `lookup` -- a later task wires ranking in. Its own
-// unit tests are the only caller today, and `cargo clippy --all-targets`
-// still compiles the plain `lib` target (without `cfg(test)`) where none of
-// that applies, so without this the module reads as entirely dead code.
-#[allow(dead_code)]
 mod bm25;
-
-// Not yet called from `lookup` -- a later task wires selection in. Its own
-// unit tests are the only caller today, and `cargo clippy --all-targets`
-// still compiles the plain `lib` target (without `cfg(test)`) where none of
-// that applies, so without this the module reads as entirely dead code.
-#[allow(dead_code)]
 mod near_universal;
 
 pub use near_universal::{MAX_NEAR_UNIVERSAL, near_universal};
@@ -81,10 +70,10 @@ fn cap_bytes(text: &str, limit: usize) -> (&str, bool) {
 /// `MAX_LIST_BYTES` bytes. If either one causes a cutoff, state explicitly
 /// that it was cut off — silently returning only part of the list would let
 /// the model mistake it for the full set.
-fn list_candidates(items: &[&Skill], header: &str) -> String {
+fn list_candidates(items: &[&Skill], header: &str, max_count: usize) -> String {
     let mut out = String::from(header);
     let mut shown = 0usize;
-    for s in items.iter().take(MAX_RESULTS) {
+    for s in items.iter().take(max_count) {
         let line = format!("- {}: {}\n", s.name, s.description);
         // Always emit the first entry even if it exceeds the cap.
         // Returning "truncated" without showing even one entry leaves the
@@ -150,19 +139,21 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
         return list_candidates(
             &all,
             "q is empty, so listing the skills that exist. pass a name or term to narrow it down.\n",
+            MAX_RESULTS,
         );
     }
 
-    let needle = q.to_lowercase();
-    let hits: Vec<&Skill> = skills
-        .iter()
-        .filter(|s| {
-            s.name.to_lowercase().contains(&needle)
-                || s.description.to_lowercase().contains(&needle)
-        })
-        .collect();
+    let index = bm25::Bm25::new(skills);
+    let ranked = index.rank(q, MAX_RESULTS);
+    let universal = near_universal::near_universal(skills);
+    let mut combined: Vec<&Skill> = ranked;
+    for u in universal {
+        if !combined.iter().any(|s| s.name == u.name) {
+            combined.push(u);
+        }
+    }
 
-    if hits.is_empty() {
+    if combined.is_empty() {
         let all: Vec<&Skill> = skills.iter().collect();
         // q is an arbitrary-length string written by the model. Echoing it
         // back as-is would turn an uncapped input into uncapped output, and
@@ -177,12 +168,13 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
         } else {
             format!("{echoed} matched no skill. what's available is listed below.\n")
         };
-        return list_candidates(&all, &header);
+        return list_candidates(&all, &header, MAX_RESULTS);
     }
 
     list_candidates(
-        &hits,
+        &combined,
         "candidates. pass the name as-is if you need the body.\n",
+        MAX_RESULTS + near_universal::MAX_NEAR_UNIVERSAL,
     )
 }
 
@@ -455,5 +447,138 @@ mod tests {
         let out = lookup(&skills, "small");
         assert!(out.contains(&body));
         assert!(!out.contains("truncated"));
+    }
+
+    #[test]
+    fn a_multi_word_query_finds_a_skill_the_old_substring_match_never_could() {
+        let skills = vec![
+            Skill {
+                name: "git-commit".into(),
+                description: "Creates a commit. Used for commit or git topics.".into(),
+                body: "Body A".into(),
+                path: "/x/git-commit/SKILL.md".into(),
+            },
+            Skill {
+                name: "deploy-tool".into(),
+                description: "Handles deployment to production servers.".into(),
+                body: "Body B".into(),
+                path: "/x/deploy-tool/SKILL.md".into(),
+            },
+        ];
+        let out = lookup(&skills, "how do I deploy this to production");
+        assert!(
+            out.contains("deploy-tool"),
+            "multi-word query did not find deploy-tool: {out}"
+        );
+    }
+
+    #[test]
+    fn a_synonym_query_finds_a_skill_that_never_uses_the_query_word() {
+        let skills = vec![Skill {
+            name: "secret-scanner".into(),
+            description: "Scans for leaked secrets before commit.".into(),
+            body: "body".into(),
+            path: "/x/secret-scanner/SKILL.md".into(),
+        }];
+        let out = lookup(&skills, "credential rotation policy");
+        assert!(
+            out.contains("secret-scanner"),
+            "synonym expansion did not surface secret-scanner: {out}"
+        );
+    }
+
+    #[test]
+    fn a_stemmed_query_finds_a_skill_using_a_different_word_form() {
+        let skills = vec![Skill {
+            name: "deploy-tool".into(),
+            description: "Handles deployment to production servers.".into(),
+            body: "body".into(),
+            path: "/x/deploy-tool/SKILL.md".into(),
+        }];
+        let out = lookup(&skills, "deploying to prod");
+        assert!(out.contains("deploy-tool"));
+    }
+
+    #[test]
+    fn a_near_universal_skill_is_always_included_regardless_of_query_relevance() {
+        let skills = vec![
+            Skill {
+                name: "test-driven-development".into(),
+                description: "Use when implementing any feature or bugfix, before writing implementation code".into(),
+                body: "body".into(),
+                path: "/x/test-driven-development/SKILL.md".into(),
+            },
+            Skill {
+                name: "deploy-tool".into(),
+                description: "Handles deployment to production servers.".into(),
+                body: "body".into(),
+                path: "/x/deploy-tool/SKILL.md".into(),
+            },
+        ];
+        // "production servers" matches deploy-tool by BM25, and has no
+        // lexical relationship to test-driven-development at all -- the
+        // near-universal skill must still show up.
+        let out = lookup(&skills, "production servers");
+        assert!(out.contains("deploy-tool"));
+        assert!(
+            out.contains("test-driven-development"),
+            "near-universal skill was not included despite zero query relevance: {out}"
+        );
+    }
+
+    #[test]
+    fn a_near_universal_skill_does_not_appear_on_an_exact_name_match() {
+        let skills = vec![
+            Skill {
+                name: "test-driven-development".into(),
+                description: "Use when implementing any feature or bugfix, before writing implementation code".into(),
+                body: "TDD body".into(),
+                path: "/x/test-driven-development/SKILL.md".into(),
+            },
+            Skill {
+                name: "deploy-tool".into(),
+                description: "Handles deployment to production servers.".into(),
+                body: "deploy body".into(),
+                path: "/x/deploy-tool/SKILL.md".into(),
+            },
+        ];
+        let out = lookup(&skills, "deploy-tool");
+        assert!(out.contains("deploy body"));
+        assert!(
+            !out.contains("test-driven-development"),
+            "near-universal skill leaked into an exact-name-match result: {out}"
+        );
+    }
+
+    #[test]
+    fn a_near_universal_skill_does_not_appear_on_an_empty_query_beyond_its_natural_listing() {
+        // An empty query already lists everything, so a near-universal
+        // skill appears there too -- but it must not be duplicated or
+        // specially annotated, just present once like any other skill.
+        let skills = vec![Skill {
+            name: "test-driven-development".into(),
+            description:
+                "Use when implementing any feature or bugfix, before writing implementation code"
+                    .into(),
+            body: "body".into(),
+            path: "/x/test-driven-development/SKILL.md".into(),
+        }];
+        let out = lookup(&skills, "");
+        let occurrences = out.matches("test-driven-development").count();
+        assert_eq!(occurrences, 1, "listed more than once: {out}");
+    }
+
+    #[test]
+    fn a_corpus_with_no_near_universal_skill_behaves_exactly_as_before() {
+        let skills = vec![Skill {
+            name: "deploy-tool".into(),
+            description: "Handles deployment to production servers.".into(),
+            body: "body".into(),
+            path: "/x/deploy-tool/SKILL.md".into(),
+        }];
+        let out = lookup(&skills, "deploying to prod");
+        assert!(out.contains("deploy-tool"));
+        assert!(out.contains("candidates. pass the name as-is if you need the body."));
+        assert_eq!(out.matches("deploy-tool").count(), 1);
     }
 }

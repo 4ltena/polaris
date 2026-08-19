@@ -66,3 +66,46 @@ POLARIS_PROVIDER=codex polaris -p "Cargo.toml は何行か"
 保管する。`~/.codex/` には読み書きとも触れない。
 
 `polaris logout` で保管した資格情報を消す。
+
+### 保管先とパーミッションを手で確かめる
+
+実際の資格情報を要するため、ここから先は自動テストで固定できない。手で追う。
+
+`polaris login` を実行する前に、codex 側の資格情報の状態を控える。
+
+```
+shasum -a 256 ~/.codex/auth.json 2>/dev/null || echo "codex 側の資格情報は無い"
+```
+
+Linux では `sha256sum` を使う。`polaris login` のあとに同じコマンドを実行し、
+出力が前と一致することを見る。`codex login` を一度も実行していなければ、
+前後とも「無い」と表示される。それも正しい状態である。
+
+polaris 側の保管先は次で見る。
+
+```
+ls -l ~/.polaris/auth.json
+```
+
+`-rw-------` であること。group と other に権限が残っていれば、同じホストの
+別のユーザーがアクセストークンを読める。
+
+### 期限切れからの更新を手で確かめる
+
+`~/.polaris/auth.json` の `expires_at` を、過去の Unix 秒か `null` へ書き換える。
+期限が不明な資格情報は毎回更新する扱いなので、どちらでも更新経路へ入る。行ごと
+消してはいけない。`expires_at` は最後の項目であり、直前の行に余分なカンマが
+残って JSON が壊れる。
+
+その状態でもう一度実行する。
+
+```
+POLARIS_PROVIDER=codex polaris -p "Cargo.toml は何行か"
+```
+
+答えが返れば、`refresh_token` での更新を経てバックエンドへ到達している。
+`polaris login` を促すエラーが出た場合は、更新そのものが失敗している。
+
+更新のあとの `~/.polaris/auth.json` も見る。`expires_at` が未来の値へ進んで
+いれば、更新結果が書き戻っている。`account_id` が空文字へ変わっていないこと、
+パーミッションが `-rw-------` のままであることも併せて確かめる。

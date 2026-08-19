@@ -1,30 +1,33 @@
-//! macOS の強制。実行時に Seatbelt プロファイルを組み立て、
-//! `/usr/bin/sandbox-exec` へ渡して子を起動する。
+//! macOS enforcement. Builds a Seatbelt profile at runtime and launches the
+//! child by passing it to `/usr/bin/sandbox-exec`.
 //!
-//! パスは本文へ埋め込まず `-D key=value` と `(param "KEY")` で渡す。
-//! 空白や括弧を含むパスで SBPL の引用規則を踏まないためである。
+//! Paths are not embedded in the profile body; they're passed via
+//! `-D key=value` and `(param "KEY")`. This is so a path containing
+//! whitespace or parentheses doesn't trip SBPL's quoting rules.
 
 use std::path::Path;
 
 use crate::policy::{SandboxMode, SandboxPolicy};
 
-/// `PATH` を引かない。`PATH` 上の同名バイナリで差し替えられる経路を塞ぐ。
-/// この実体そのものが改竄されている状況では、攻撃者はすでに root を持つ。
+/// Does not consult `PATH`. This closes off the path where a same-named
+/// binary on `PATH` could be substituted. In a situation where this binary
+/// itself has been tampered with, the attacker already has root.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// 方針から SBPL のプロファイル本文を組み立てる。
+/// Builds the SBPL profile body from the policy.
 pub fn build_profile(policy: &SandboxPolicy) -> String {
     let mut p = String::from("(version 1)\n");
 
     if policy.mode() == SandboxMode::FullAccess {
-        // 境界は越えるが制限しない。プロファイルを作らない分岐にしないのは、
-        // 試験する経路と本番の経路を同一に保つためである。
+        // Crosses the boundary but imposes no restriction. This isn't
+        // branched into skipping profile construction altogether, so as to
+        // keep the tested path and the production path identical.
         p.push_str("(allow default)\n");
         return p;
     }
 
     p.push_str("(deny default)\n");
-    // シェルがシェルとして振る舞うために要る最低限。
+    // The bare minimum a shell needs to behave as a shell.
     p.push_str("(allow process-fork)\n");
     p.push_str("(allow process-exec)\n");
     p.push_str("(allow signal (target same-sandbox))\n");
@@ -35,65 +38,74 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
     }
     p.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))\n");
     p.push_str("(allow file-read*)\n");
-    // Rust のランタイムが起動時に要る。main スレッドのガードページを張る
-    // 前に `sysconf(_SC_PAGESIZE)` を引き、macOS ではこれが sysctl
-    // （`hw.pagesize_compat`）へ落ちる。拒否するとページ長が取れず、
-    // 続く mmap が EINVAL で失敗して
-    // 「failed to allocate a guard page: Invalid argument (os error 22)」
-    // → `fatal runtime error` → SIGABRT となる。これは *こちらのコードが
-    // 1 行も走る前* に起きるので、`--confined-apply` ヘルパは read-only と
-    // workspace-write の両方で必ず落ち、その abort が方針違反による拒否と
-    // 同じ形（非0終了＋stderr）で親へ届いていた。実測で確認した
-    // （`polaris-cli/tests/confined_helper.rs` が本物のバイナリと本物の
-    // プロファイルで固定している）。
+    // The Rust runtime needs this at startup. Before setting up the main
+    // thread's guard page, it queries `sysconf(_SC_PAGESIZE)`, which on
+    // macOS falls through to a sysctl (`hw.pagesize_compat`). If that's
+    // denied, the page size can't be obtained, the subsequent mmap fails
+    // with EINVAL, and
+    // "failed to allocate a guard page: Invalid argument (os error 22)"
+    // → `fatal runtime error` → SIGABRT follows. This happens *before a
+    // single line of our own code runs*, so the `--confined-apply` helper
+    // always crashed under both read-only and workspace-write, and that
+    // abort arrived at the parent in the same shape as a policy-violation
+    // denial (nonzero exit + stderr). Confirmed by measurement (pinned by
+    // `polaris-cli/tests/confined_helper.rs`, which uses the real binary
+    // and the real profile).
     //
-    // なぜ絞り込まないか。実測では
+    // Why this isn't narrowed further. Measurement showed that the helper
+    // also launches with just
     // `(allow sysctl-read (sysctl-name "hw.pagesize" "hw.pagesize_compat"))`
-    // でもヘルパは起動する（`hw.pagesize` だけでは足りない）。それでも
-    // 名前で絞らないのは、このプロファイルがヘルパ専用ではないためである。
-    // `bash` ツールが起動する任意の子も同じプロファイルの下で走り、機械の
-    // 諸元（`hw.ncpu`、`hw.memsize`、`kern.osversion` 等）を引くものは
-    // 珍しくない。2 件だけを許すと、ヘルパは直るが `bash` から起動した
-    // Rust バイナリや多くのランタイムが同じ様態で落ち続ける（現に、この
-    // 行が無い状態では `sh -c 'polaris --help'` すら abort する）。
+    // (`hw.pagesize` alone is not enough). Even so, this doesn't narrow by
+    // name, because this profile isn't dedicated to the helper. Any child
+    // the `bash` tool launches also runs under this same profile, and it's
+    // not unusual for one to query machine characteristics (`hw.ncpu`,
+    // `hw.memsize`, `kern.osversion`, etc.). Allowing only those two names
+    // would fix the helper, but Rust binaries and many other runtimes
+    // launched from `bash` would keep crashing the same way (in fact,
+    // without this line, even `sh -c 'polaris --help'` aborts).
     //
-    // 境界を広げないと言える理由。`sysctl-read` は機械の諸元の読み取り
-    // だけであり、書き込みの権限を一切与えない。このプロファイルが守って
-    // いるのは書き込みの境界であって、読み取りはすでに直上の
-    // `(allow file-read*)` でファイルシステム全体に開いている。
+    // Why this can be said not to widen the boundary. `sysctl-read` only
+    // reads machine characteristics; it grants no write permission at all.
+    // What this profile protects is the write boundary, and reads are
+    // already opened to the entire filesystem by the `(allow file-read*)`
+    // directly above.
     p.push_str("(allow sysctl-read)\n");
-    // `/dev/null` への書き込みだけを開ける。`cmd > /dev/null` と
-    // `cmd 2>/dev/null` はシェルの常套句であり、リダイレクトが開けないと
-    // シェルは本体を一度も実行せずに落ちる（`ls / >/dev/null && echo ok`
-    // で何も走らないことを実測した）。しかもその失敗は
-    // 「方針 workspace-write（書込可能: <root>）」を名指しする形でモデルへ
-    // 届くので、モデルは書込可能ルートの側を疑い、パスを変えて同じ失敗を
-    // 何度でも繰り返す。仕様の「原因を掴めない拒否メッセージは同じ失敗の
-    // 反復を招き、時間とトークンを消費する」に当たる。
+    // Opens up writing to `/dev/null` only. `cmd > /dev/null` and
+    // `cmd 2>/dev/null` are shell idioms in everyday use, and if the
+    // redirection can't be opened, the shell falls over before ever
+    // executing the command body (measured: `ls / >/dev/null && echo ok`
+    // runs nothing at all). Worse, that failure reaches the model naming
+    // "policy workspace-write (writable: <root>)", so the model doubts the
+    // writable root and repeats the same failure over and over by changing
+    // the path. This is exactly the case the spec calls out: "a denial
+    // message that gives no purchase on the cause invites the same failure
+    // to repeat, burning time and tokens".
     //
-    // 実測（本物のプロファイルを `/usr/bin/sandbox-exec` へ直接渡した）:
+    // Measured (the real profile passed directly to `/usr/bin/sandbox-exec`):
     //
-    // | 追加する許可 | `> /dev/null` | ルート内 | ルート外 | `rm /dev/null` |
-    // | 無し（従来） | 拒否 | 可 | 拒否 | 拒否 |
-    // | `file-write-data (literal "/dev/null")` | 可 | 可 | 拒否 | 拒否 |
-    // | `file-write* (literal "/dev/null")` | 可 | 可 | 拒否 | 拒否 |
+    // | grant added | `> /dev/null` | inside root | outside root | `rm /dev/null` |
+    // | none (previous) | denied | ok | denied | denied |
+    // | `file-write-data (literal "/dev/null")` | ok | ok | denied | denied |
+    // | `file-write* (literal "/dev/null")` | ok | ok | denied | denied |
     //
-    // `file-write-create` だけ、`file-write-mode` だけではどちらも
-    // `Operation not permitted` のままで開けない。`file-write-data` が
-    // リダイレクトを通す最小の権利であり、`file-write*` と違って unlink も
-    // setattr も与えない。対象は `(literal "/dev/null")` の 1 個だけで、
-    // `/dev/zero`、`/dev/stdout`、`/dev/stderr`、`/dev/fd/N`、`/dev` 配下の
-    // 新規作成がいずれも拒否のままであることも同じ実測で確認した。
-    // `/dev/stdout` などを開けるかは fdesc 越しの再判定という別の測定を
-    // 要するため、ここでは意図的に触れない（M3 の課題）。
+    // `file-write-create` alone, and `file-write-mode` alone, both still
+    // leave it as `Operation not permitted` and it cannot be opened.
+    // `file-write-data` is the minimal right that lets the redirection
+    // through, and unlike `file-write*` it grants neither unlink nor
+    // setattr. The target is exactly the one entry `(literal "/dev/null")`,
+    // and the same measurement confirmed that `/dev/zero`, `/dev/stdout`,
+    // `/dev/stderr`, `/dev/fd/N`, and creating new nodes under `/dev`
+    // all remain denied. Whether `/dev/stdout` and the like can be opened
+    // requires a separate measurement — re-judging through the fdesc — so
+    // this deliberately leaves it untouched here (M3's task).
     //
-    // read-only でもこの 1 行を出す。`/dev/null` への書き込みはカーネルが
-    // 捨てるだけでファイルシステムの状態を一切変えないので、read-only が
-    // 守っている性質（何も変更されない）は減らない。実際に read-only の
-    // 下で普通のファイルへの書き込みが拒否されたままであることは
-    // `confine.rs` の実サンドボックステストが対で見ている。ここで分岐を
-    // 設けると、`--sandbox read-only` の `bash` だけが同じ誤解を招く拒否を
-    // 出し続けることになる。
+    // Emits this one line for read-only too. Writing to `/dev/null` is just
+    // dropped by the kernel and changes nothing in the filesystem's state,
+    // so it doesn't diminish what read-only protects (that nothing gets
+    // changed). That an ordinary file write stays denied under read-only is
+    // verified as a pair by `confine.rs`'s real-sandbox tests. Branching
+    // here instead would mean `--sandbox read-only`'s `bash` alone keeps
+    // producing the same misleading denial.
     p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
 
     let roots = policy.writable_roots();
@@ -108,8 +120,8 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
     p
 }
 
-/// `sandbox-exec` へ渡す argv を組み立てる。プログラム本体と引数は
-/// `--` の後ろへ置き、境界を曖昧にしない。
+/// Builds the argv passed to `sandbox-exec`. The program itself and its
+/// arguments go after `--`, so the boundary isn't ambiguous.
 pub fn build_args(policy: &SandboxPolicy, program: &Path, args: &[String]) -> Vec<String> {
     let mut out = vec!["-p".to_string(), build_profile(policy)];
     for (i, root) in policy.writable_roots().iter().enumerate() {
@@ -127,23 +139,25 @@ mod tests {
     use crate::policy::{SandboxMode, SandboxPolicy};
 
     fn workspace(roots: &[std::path::PathBuf]) -> SandboxPolicy {
-        SandboxPolicy::new(SandboxMode::WorkspaceWrite, roots).expect("方針を作れない")
+        SandboxPolicy::new(SandboxMode::WorkspaceWrite, roots).expect("can't create policy")
     }
 
     #[test]
     fn the_profile_starts_closed() {
-        // deny default が無ければ、以降の allow は「既定で全許可の上に
-        // 少し足す」ことになり、方針の意味が反転する。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // Without deny default, every subsequent allow becomes "add a
+        // little on top of allow-everything-by-default", inverting what
+        // the policy means.
+        let dir = tempfile::tempdir().expect("temp dir");
         let p = build_profile(&workspace(&[dir.path().to_path_buf()]));
-        assert!(p.contains("(deny default)"), "既定拒否が無い:\n{p}");
+        assert!(p.contains("(deny default)"), "no default denial:\n{p}");
     }
 
     #[test]
     fn every_writable_root_gets_its_own_parameterised_subpath() {
-        // ルートを 1 件でも落とすと、書けるはずの場所が黙って減る。
-        let a = tempfile::tempdir().expect("一時ディレクトリ");
-        let b = tempfile::tempdir().expect("一時ディレクトリ");
+        // Dropping even one root would silently shrink the set of places
+        // that should be writable.
+        let a = tempfile::tempdir().expect("temp dir");
+        let b = tempfile::tempdir().expect("temp dir");
         let policy = workspace(&[a.path().to_path_buf(), b.path().to_path_buf()]);
         let p = build_profile(&policy);
 
@@ -152,75 +166,82 @@ mod tests {
         assert_eq!(
             p.matches("WRITABLE_ROOT_").count(),
             2,
-            "ルート数とパラメータ数が一致しない:\n{p}"
+            "root count and parameter count don't match:\n{p}"
         );
     }
 
     #[test]
     fn paths_never_appear_verbatim_in_the_profile_body() {
-        // パスを本文へ直接書くと、空白や括弧を含むパスで SBPL が壊れる。
-        // 値は必ず -D 側へ渡す。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // Writing a path directly into the body would break SBPL for a
+        // path containing whitespace or parentheses. The value always
+        // crosses through -D instead.
+        let dir = tempfile::tempdir().expect("temp dir");
         let policy = workspace(&[dir.path().to_path_buf()]);
         let p = build_profile(&policy);
         let root = policy.writable_roots()[0].display().to_string();
-        assert!(!p.contains(&root), "パスが本文に埋め込まれている:\n{p}");
+        assert!(!p.contains(&root), "the path is embedded in the body:\n{p}");
     }
 
     #[test]
     fn read_only_grants_no_write_to_any_file_beyond_the_dev_null_sink() {
-        // read-only でルートは持てない（Task 1 で拒否される）。ここで見るのは
-        // 書き込み許可の節そのものが出ないこと。空のルート一覧に対して
-        // (allow file-write*) だけが裸で残ると、全書き込みが許可される。
+        // read-only can't hold a root (rejected by Task 1). What this
+        // checks is that the write-permission clause itself doesn't
+        // appear. If (allow file-write*) is left bare against an empty
+        // root list, all writes are permitted.
         //
-        // 例外は `/dev/null` の 1 行だけである。書いた内容をカーネルが捨てる
-        // だけでファイルシステムの状態を変えないため read-only の性質を
-        // 減らさない。行を数える形で固定するのは、「書き込みに触れる許可が
-        // ここに増えていない」ことが read-only の中身そのものだからである。
-        // `!contains("file-write*")` だけでは `file-write-data` を使った
-        // 追加の許可が黙って通る。
-        let policy = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("方針");
+        // The one exception is the single `/dev/null` line. The kernel
+        // just drops what's written and the filesystem's state doesn't
+        // change, so this doesn't diminish read-only's property. Pinning
+        // this down by counting lines is because "no additional
+        // write-touching grant has appeared here" is the very substance of
+        // what read-only means. `!contains("file-write*")` alone would let
+        // an added grant using `file-write-data` slip through unnoticed.
+        let policy = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("policy");
         let p = build_profile(&policy);
-        assert!(!p.contains("file-write*"), "書き込み許可がある:\n{p}");
+        assert!(!p.contains("file-write*"), "a write grant exists:\n{p}");
         let writes: Vec<&str> = p.lines().filter(|l| l.contains("file-write")).collect();
         assert_eq!(
             writes,
             vec!["(allow file-write-data (literal \"/dev/null\"))"],
-            "read-only に /dev/null 以外の書き込み許可がある:\n{p}"
+            "read-only has a write grant other than /dev/null:\n{p}"
         );
         assert!(
             p.contains("(allow file-read*)"),
-            "読み取りが許可されていない:\n{p}"
+            "reading is not permitted:\n{p}"
         );
     }
 
     #[test]
     fn the_restrictive_profile_keeps_the_sysctl_read_grant() {
-        // この 1 行が消えると、Rust のランタイムは main の前段で
-        // `sysconf(_SC_PAGESIZE)` を引けず、ガードページの mmap が EINVAL で
-        // 失敗して SIGABRT する。つまり本物のヘルパが起動できなくなり、その
-        // 中断は方針違反による拒否と同じ形（非0終了 + stderr）でモデルへ届く。
-        // 本命の検出は本物のバイナリを使う `polaris-cli/tests/confined_helper.rs`
-        // だが、事故による削除をユニットの段で即座に落とす。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // If this one line disappears, the Rust runtime can't query
+        // `sysconf(_SC_PAGESIZE)` before main, the guard page's mmap fails
+        // with EINVAL, and it SIGABRTs. In other words the real helper
+        // becomes unable to launch, and that failure reaches the model in
+        // the same shape as a policy-violation denial (nonzero exit +
+        // stderr). The primary detector is
+        // `polaris-cli/tests/confined_helper.rs`, which uses the real
+        // binary, but this fails an accidental removal immediately at the
+        // unit level.
+        let dir = tempfile::tempdir().expect("temp dir");
         let ws = build_profile(&workspace(&[dir.path().to_path_buf()]));
         assert!(
             ws.contains("(allow sysctl-read)"),
-            "workspace-write に sysctl-read が無い:\n{ws}"
+            "workspace-write is missing sysctl-read:\n{ws}"
         );
 
-        let ro = build_profile(&SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("方針"));
+        let ro = build_profile(&SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("policy"));
         assert!(
             ro.contains("(allow sysctl-read)"),
-            "read-only に sysctl-read が無い:\n{ro}"
+            "read-only is missing sysctl-read:\n{ro}"
         );
     }
 
     #[test]
     fn full_access_still_produces_a_profile_so_the_path_is_the_same_one_we_test() {
-        // full-access でも境界を越える。プロファイルを作らない分岐を設けると、
-        // 試験する経路と本番の経路が別物になる。
-        let policy = SandboxPolicy::new(SandboxMode::FullAccess, &[]).expect("方針");
+        // full-access still crosses the boundary. Branching to skip
+        // profile construction would make the tested path and the
+        // production path different things.
+        let policy = SandboxPolicy::new(SandboxMode::FullAccess, &[]).expect("policy");
         let p = build_profile(&policy);
         assert!(p.starts_with("(version 1)"), "{p}");
         assert!(p.contains("(allow default)"), "{p}");
@@ -228,8 +249,8 @@ mod tests {
 
     #[test]
     fn args_pass_each_root_as_a_d_parameter_and_separate_the_command_with_dashdash() {
-        let a = tempfile::tempdir().expect("一時ディレクトリ");
-        let b = tempfile::tempdir().expect("一時ディレクトリ");
+        let a = tempfile::tempdir().expect("temp dir");
+        let b = tempfile::tempdir().expect("temp dir");
         let policy = workspace(&[a.path().to_path_buf(), b.path().to_path_buf()]);
 
         let args = build_args(
@@ -238,17 +259,17 @@ mod tests {
             &["hello".to_string()],
         );
 
-        assert_eq!(args[0], "-p", "プロファイルの指定が先頭でない: {args:?}");
+        assert_eq!(args[0], "-p", "the profile spec is not first: {args:?}");
         let root0 = policy.writable_roots()[0].display();
         assert!(
             args.iter()
                 .any(|a| a == &format!("-DWRITABLE_ROOT_0={root0}")),
-            "ルート 0 が -D で渡っていない: {args:?}"
+            "root 0 was not passed via -D: {args:?}"
         );
         let sep = args
             .iter()
             .position(|a| a == "--")
-            .expect("-- が無い: コマンドと引数の境界が曖昧になる");
+            .expect("no --: the boundary between command and arguments is ambiguous");
         assert_eq!(args[sep + 1], "/bin/echo");
         assert_eq!(args[sep + 2], "hello");
     }

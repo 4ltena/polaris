@@ -1,7 +1,8 @@
-//! サンドボックス方針の定義と、OS 機構への委譲。
+//! Sandbox policy definitions, and delegation to OS mechanisms.
 //!
-//! このクレートは強制の仕組みそのものを実装しない。方針と正規化済みの
-//! 書込可能ルートを保持し、プラットフォーム固有の機構へ渡すだけである。
+//! This crate does not implement the enforcement mechanism itself. It holds
+//! the policy and the normalized writable roots, and merely hands them off
+//! to platform-specific mechanisms.
 
 pub mod confine;
 pub mod helper;
@@ -20,12 +21,12 @@ pub use policy::{SandboxMode, SandboxPolicy};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    #[error("サンドボックスを適用できなかった: {0}")]
+    #[error("failed to apply the sandbox: {0}")]
     NotEnforced(String),
-    #[error("拒否された: {path}（方針 {policy}）")]
+    #[error("denied: {path} (policy {policy})")]
     Denied { path: String, policy: String },
-    #[error("入出力: {0}")]
+    #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("このプラットフォームには強制の委譲先が無い")]
+    #[error("this platform has no enforcement delegate")]
     UnsupportedPlatform,
 }

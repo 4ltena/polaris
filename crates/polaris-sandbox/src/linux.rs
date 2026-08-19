@@ -1,23 +1,28 @@
-//! Linux の強制。landlock の ruleset を子の中で自分自身へ適用する。
+//! Linux enforcement. Applies a landlock ruleset to the process itself,
+//! from inside the child.
 //!
-//! `restrict_self()` はスレッド単位で一方向であり、呼んだ後に作られた
-//! スレッドと子へ継承される。走行中のハーネス本体で呼ぶと、そのスレッドが
-//! 恒久的に制限され、以降の全ての作業が巻き添えになる。呼ぶ場所は
-//! `Command::pre_exec` の内側だけである。
+//! `restrict_self()` is per-thread and one-way, inherited by threads and
+//! children created after the call. Calling it from the running harness's
+//! own body would permanently restrict that thread, dragging all of its
+//! subsequent work down with it. The only place it's called is inside
+//! `Command::pre_exec`.
 
 use crate::SandboxError;
 use crate::policy::{SandboxMode, SandboxPolicy};
 
-/// 実用上の下限。ABI 1（カーネル 5.13）ではディレクトリを跨ぐ rename と
-/// link を表現できず、エディタや多くのツールが使う「一時ファイルへ書いて
-/// rename で置き換える」保存が扱えない。ABI 2（5.19）を下限とする。
+/// The practical floor. ABI 1 (kernel 5.13) can't express a rename or link
+/// that crosses directories, so it can't handle the "write to a temp file,
+/// then replace via rename" save pattern that editors and many tools use.
+/// ABI 2 (5.19) is taken as the floor.
 const REQUIRED_ABI: landlock::ABI = landlock::ABI::V2;
 
-/// 現在のプロセス（＝ fork 済みの子）へ方針を適用する。
+/// Applies the policy to the current process (i.e. the already-forked
+/// child).
 ///
-/// `full-access` では何も適用しない。制限しないことが方針だからである。
-/// ただし呼び出し側は `full-access` でも子を起こす。試験する経路と本番の
-/// 経路を同一に保つためである。
+/// `full-access` applies nothing at all, because not restricting is the
+/// policy. The caller still launches the child even for `full-access`,
+/// though — so as to keep the tested path and the production path
+/// identical.
 pub fn apply_to_current_process(policy: &SandboxPolicy) -> Result<(), SandboxError> {
     use landlock::{
         Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -28,85 +33,90 @@ pub fn apply_to_current_process(policy: &SandboxPolicy) -> Result<(), SandboxErr
         return Ok(());
     }
 
-    // ABI V2 未満（カーネル 5.19 未満）では `AccessFs::Refer`（ディレクトリを
-    // 跨ぐ rename/link）が無く、既定の best-effort だとこの一項目だけが
-    // 黙って落とされて `PartiallyEnforced` に倒れる。ここだけ
-    // `HardRequirement` にして、要求の一部でも満たせないカーネルでは
-    // `handle_access` の時点で即座に失敗させる。エラーは landlock 側が
-    // 「どの権利が足りないか」を運ぶので、それをそのまま報告に混ぜる。
+    // Below ABI V2 (kernel below 5.19), there's no `AccessFs::Refer`
+    // (rename/link crossing directories), and with the default best-effort
+    // this one item alone gets silently dropped, falling back to
+    // `PartiallyEnforced`. This makes just this one `HardRequirement`, so
+    // that on a kernel that can't satisfy even part of the request,
+    // `handle_access` fails immediately, right there. The error carries,
+    // from the landlock side, which right is missing, so that's folded
+    // straight into the report.
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(REQUIRED_ABI))
         .map_err(|e| {
             SandboxError::NotEnforced(format!(
-                "カーネルが landlock {REQUIRED_ABI:?} の要求権利を満たさない: {e}"
+                "the kernel does not satisfy the rights required by landlock {REQUIRED_ABI:?}: {e}"
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
         .create()
-        .map_err(|e| SandboxError::NotEnforced(format!("ruleset を作れない: {e}")))?;
+        .map_err(|e| SandboxError::NotEnforced(format!("can't create the ruleset: {e}")))?;
 
-    // 読み取りは全体に許す。read-only と workspace-write の違いは
-    // 書き込み側にしかない。
+    // Reads are allowed across the board. The difference between read-only
+    // and workspace-write lies only on the write side.
     ruleset = ruleset
         .add_rule(PathBeneath::new(
             PathFd::new("/")
-                .map_err(|e| SandboxError::NotEnforced(format!("/ を開けない: {e}")))?,
+                .map_err(|e| SandboxError::NotEnforced(format!("can't open /: {e}")))?,
             AccessFs::from_read(REQUIRED_ABI),
         ))
-        .map_err(|e| SandboxError::NotEnforced(format!("読み取り規則を足せない: {e}")))?;
+        .map_err(|e| SandboxError::NotEnforced(format!("can't add the read rule: {e}")))?;
 
-    // `/dev/null` への書き込みだけを開ける。macOS 側と同じ理由である
-    // （`macos::build_profile` の長いコメントを参照）。landlock でも
-    // `cmd > /dev/null` は
-    // `/bin/sh: 1: cannot create /dev/null: Permission denied` となり、
-    // リダイレクトが開けない時点でコマンド本体が一度も走らない。
+    // Opens up writing to `/dev/null` only. Same reason as the macOS side
+    // (see the long comment in `macos::build_profile`). With landlock too,
+    // `cmd > /dev/null` becomes
+    // `/bin/sh: 1: cannot create /dev/null: Permission denied`, and the
+    // command body never runs once the redirection can't be opened.
     //
-    // 与える権利は `AccessFs::WriteFile` の 1 つだけとする。`>` が要求する
-    // のは既存ファイルを書き込みで開くことであり、それを司る権利がこれ
-    // 一つである（`O_TRUNC` を司る `Truncate` は ABI V3 の権利で、この
-    // ruleset は V2 の権利しか handle していないため関与しない）。
-    // `AccessFs::from_all` を渡すと unlink（`RemoveFile`）や同じ場所への
-    // 新規作成まで一緒に開くことになるので使わない。規則の対象は
-    // `/dev/null` というファイル 1 個であり、`PathBeneath` を使っていても
-    // ディレクトリではないため `/dev` 配下の他のノードには波及しない。
+    // The right granted is `AccessFs::WriteFile` alone. What `>` requires is
+    // opening an existing file for writing, and this is the single right
+    // that governs that (`Truncate`, which governs `O_TRUNC`, is an ABI V3
+    // right, and this ruleset only handles V2 rights, so it doesn't come
+    // into play). Passing `AccessFs::from_all` would open up unlink
+    // (`RemoveFile`) and creating new entries in the same location as well,
+    // so that isn't used. The rule's target is the single file `/dev/null`;
+    // even though `PathBeneath` is used, it isn't a directory, so this
+    // doesn't spill over to other nodes under `/dev`.
     //
-    // read-only でも足すのは macOS と同じ理由による。書いた内容は捨てられ、
-    // ファイルシステムの状態は変わらない。
+    // Adding this for read-only too is for the same reason as macOS. What's
+    // written is discarded, and the filesystem's state doesn't change.
     ruleset = ruleset
         .add_rule(PathBeneath::new(
             PathFd::new("/dev/null")
-                .map_err(|e| SandboxError::NotEnforced(format!("/dev/null を開けない: {e}")))?,
+                .map_err(|e| SandboxError::NotEnforced(format!("can't open /dev/null: {e}")))?,
             AccessFs::WriteFile,
         ))
-        .map_err(|e| SandboxError::NotEnforced(format!("/dev/null の規則を足せない: {e}")))?;
+        .map_err(|e| SandboxError::NotEnforced(format!("can't add the /dev/null rule: {e}")))?;
 
     for root in policy.writable_roots() {
         ruleset = ruleset
             .add_rule(PathBeneath::new(
                 PathFd::new(root).map_err(|e| {
-                    SandboxError::NotEnforced(format!("{} を開けない: {e}", root.display()))
+                    SandboxError::NotEnforced(format!("can't open {}: {e}", root.display()))
                 })?,
                 AccessFs::from_all(REQUIRED_ABI),
             ))
-            .map_err(|e| SandboxError::NotEnforced(format!("書き込み規則を足せない: {e}")))?;
+            .map_err(|e| SandboxError::NotEnforced(format!("can't add the write rule: {e}")))?;
     }
 
     let status = ruleset
         .restrict_self()
-        .map_err(|e| SandboxError::NotEnforced(format!("restrict_self に失敗: {e}")))?;
+        .map_err(|e| SandboxError::NotEnforced(format!("restrict_self failed: {e}")))?;
 
-    // 適用されなかった状態、一部しか適用されなかった状態のどちらも拒否では
-    // ない。ここを通してしまうと、守っていない（または一部しか守っていない）
-    // 状態が完全に守っている状態と同じ見た目になる。`HardRequirement` は
-    // ABI 側の不足を `handle_access` の時点で捕まえるが、それとは別の理由
-    // （例えば restrict_self 自体が seccomp に塞がれて一部だけ効くような
-    // 経路）で `PartiallyEnforced` に落ちる可能性を塞ぐため、
-    // `FullyEnforced` 以外を丸ごと拒否する。
+    // Neither the state where nothing was applied, nor the state where only
+    // part was applied, is a denial. Letting this through would make a
+    // state that isn't protected (or is only partly protected) look
+    // identical to a state that's fully protected. `HardRequirement` catches
+    // an ABI-side shortfall at `handle_access` time, but to also close off
+    // the possibility of falling into `PartiallyEnforced` for some other
+    // reason (for example, a path where `restrict_self` itself is blocked
+    // by seccomp and only partially takes effect), this rejects anything
+    // other than `FullyEnforced` outright.
     if status.ruleset != RulesetStatus::FullyEnforced {
         return Err(SandboxError::NotEnforced(format!(
-            "カーネルが landlock {REQUIRED_ABI:?} を完全には強制しなかった（{:?}）。\
-             カーネルが古いか、seccomp に塞がれているか、機能が部分的にしか使えない",
+            "the kernel did not fully enforce landlock {REQUIRED_ABI:?} ({:?}). \
+             either the kernel is too old, seccomp is blocking it, or the feature is only partially available",
             status.ruleset
         )));
     }
@@ -118,12 +128,14 @@ pub fn apply_to_current_process(policy: &SandboxPolicy) -> Result<(), SandboxErr
 mod linux_enforcement {
     use crate::policy::{SandboxMode, SandboxPolicy};
 
-    /// `/bin/sh -c script` を policy の下（fork 後・exec 前に
-    /// `apply_to_current_process` を通した子）で起動し、終了ステータスを返す。
-    /// 適用そのものが失敗した場合（`pre_exec` が `Err` を返す）は `Command`
-    /// の起動自体が失敗として親に返るため、ここで panic する。各テストの
-    /// 診断としては起動失敗より「書けた／書けなかった」の方が本題なので、
-    /// 起動失敗はテスト側の意図と無関係な壊れ方として扱う。
+    /// Launches `/bin/sh -c script` under the policy (a child that has been
+    /// run through `apply_to_current_process` after fork but before exec),
+    /// and returns the exit status. If the application itself fails
+    /// (`pre_exec` returns `Err`), that comes back to the parent as
+    /// `Command`'s own launch failure, so this panics here. For each test's
+    /// diagnosis, "could it write / could it not" is the real subject
+    /// rather than a launch failure, so a launch failure is treated as
+    /// breakage unrelated to what the test intends.
     fn run_under_policy(policy: &SandboxPolicy, script: &str) -> std::process::ExitStatus {
         let policy_for_child = policy.clone();
         let mut cmd = std::process::Command::new("/bin/sh");
@@ -135,65 +147,71 @@ mod linux_enforcement {
                     .map_err(|e| std::io::Error::other(e.to_string()))
             });
         }
-        cmd.status().expect("起動できない")
+        cmd.status().expect("can't launch")
     }
 
     #[test]
     fn a_write_outside_the_root_is_denied_by_the_real_kernel() {
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let outside = tempfile::tempdir().expect("一時ディレクトリ");
+        let root = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("temp dir");
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
         let target = outside.path().join("should-not-exist.txt");
         let status = run_under_policy(&policy, &format!("echo pwned > {}", target.display()));
 
-        assert!(!status.success(), "ルート外への書き込みが成功した");
+        assert!(!status.success(), "a write outside the root succeeded");
         assert!(
             !target.exists(),
-            "ファイルが作られている: {}",
+            "the file was created: {}",
             target.display()
         );
     }
 
     #[test]
     fn a_write_inside_the_writable_root_succeeds() {
-        // ルート外への拒否だけを見るテストは「全部拒否する」壊れ方を見逃す
-        // （書き込みルールを丸ごと削っても、read-access に弱めても、この
-        // テストは通り続けてしまう）。ルート内への書き込みが実際に通ること
-        // を対にして確認し、「denies everything」を検出可能にする。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        // A test that only checks denial outside the root misses the
+        // "deny everything" failure mode (even deleting the write rule
+        // entirely, or weakening it to read-access, would let this test
+        // keep passing). Confirm as a pair that a write inside the root
+        // actually goes through, making "denies everything" detectable.
+        let root = tempfile::tempdir().expect("temp dir");
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
         let target = root.path().join("should-exist.txt");
         let status = run_under_policy(&policy, &format!("echo ok > {}", target.display()));
 
-        assert!(status.success(), "ルート内への書き込みが拒否された");
+        assert!(status.success(), "a write inside the root was denied");
         assert!(
             target.exists(),
-            "ファイルが作られていない: {}",
+            "the file was not created: {}",
             target.display()
         );
-        let content = std::fs::read_to_string(&target).expect("書けたはずのファイルを読めない");
-        assert_eq!(content.trim(), "ok", "書いた内容と読めた内容が違う");
+        let content = std::fs::read_to_string(&target)
+            .expect("can't read a file that should have been writable");
+        assert_eq!(
+            content.trim(),
+            "ok",
+            "what was written and what was read differ"
+        );
     }
 
     #[test]
     fn read_only_denies_any_write() {
-        // read-only は書込可能ルートを 1 件も持てない（Task 1 の制約）。
-        // ここで見るのは、その状態で「どこにも書けない」がそのまま
-        // 強制側にも反映されていること。
-        let scratch = tempfile::tempdir().expect("一時ディレクトリ");
-        let policy = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("方針");
+        // read-only can't hold even one writable root (Task 1's
+        // constraint). What this checks is that "can't write anywhere" in
+        // that state is actually reflected on the enforcement side too.
+        let scratch = tempfile::tempdir().expect("temp dir");
+        let policy = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("policy");
 
         let target = scratch.path().join("should-not-exist.txt");
         let status = run_under_policy(&policy, &format!("echo pwned > {}", target.display()));
 
-        assert!(!status.success(), "read-only なのに書き込みが成功した");
+        assert!(!status.success(), "a write succeeded despite read-only");
         assert!(
             !target.exists(),
-            "ファイルが作られている: {}",
+            "the file was created: {}",
             target.display()
         );
     }

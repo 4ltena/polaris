@@ -1,22 +1,23 @@
-//! ヘルパ用バイナリを書込可能ルートの外へ退避する。
+//! Stage the helper binary outside the writable roots.
 //!
-//! `current_exe()` は通常ビルド生成物の中、すなわちワークスペースの内側に
-//! ある。ワークスペースへ書ける者がそれを差し替えれば、次の変更操作が
-//! 差し替えられたコードを拘束下で実行する。M4 の `read write` 型 subagent に
-//! とって、これは型が与えていない権限を得る経路そのものになる。
+//! `current_exe()` normally lives inside the build output, i.e. inside the
+//! workspace. If someone who can write to the workspace replaces it, the
+//! next mutation operation executes the replaced code under confinement.
+//! For M4's `read write`-typed subagent, this is exactly a path to
+//! obtaining a permission its type was never granted.
 
 use std::path::{Path, PathBuf};
 
 use crate::SandboxError;
 use crate::policy::SandboxPolicy;
 
-/// 実行中のバイナリを退避したうえでその場所を返す。
+/// Stages the running binary and returns its location.
 pub fn staged_helper(policy: &SandboxPolicy, state_dir: &Path) -> Result<PathBuf, SandboxError> {
     let exe = std::env::current_exe()?;
     staged_helper_from(policy, state_dir, &exe)
 }
 
-/// テストから実体を差し替えられるようにした本体。
+/// The body, made so tests can substitute the actual binary.
 pub fn staged_helper_from(
     policy: &SandboxPolicy,
     state_dir: &Path,
@@ -35,9 +36,10 @@ pub fn staged_helper_from(
     std::fs::create_dir_all(state_dir)?;
     let dest = state_dir.join("polaris-helper");
 
-    // 内容が変わっていれば必ず複製し直す。古い複製を使い続けると、
-    // 直したはずのヘルパが動かないうえ、症状が「直っていない」なので
-    // 原因が見えにくい。サイズと更新時刻ではなく中身で比べる。
+    // Always re-copy if the content has changed. Continuing to use a stale
+    // copy means the helper you thought you fixed doesn't work, and since
+    // the symptom just looks like "it's not fixed", the cause is hard to
+    // see. Compare by content, not by size and mtime.
     let need_copy = match std::fs::read(&dest) {
         Ok(existing) => existing != std::fs::read(&canonical)?,
         Err(_) => true,
@@ -46,11 +48,13 @@ pub fn staged_helper_from(
         std::fs::copy(&canonical, &dest)?;
         #[cfg(unix)]
         {
-            // 0700 は他ユーザーからの保護であり、同一 UID で動く拘束下の
-            // subagent からの保護ではない。それを止めるのは直後の検証
-            // （退避先が書込可能ルートの外にあることの確定）そのものであり、
-            // このモードは多層防御であって、主たる制御ではない。将来
-            // 「強化」しても、ここが守っている性質は増えない。
+            // 0700 protects against other users, not against a confined
+            // subagent running under the same UID. What stops that is the
+            // verification that follows immediately (confirming the staged
+            // location is outside the writable roots), and this mode is
+            // defense in depth, not the primary control. "Hardening" it
+            // further in the future would not add to what is protected
+            // here.
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700))?;
         }
@@ -58,18 +62,20 @@ pub fn staged_helper_from(
 
     let dest_canonical = dest.canonicalize()?;
 
-    // 退避先そのものが書込可能ルートの内側（シンボリックリンク越しの解決を
-    // 含む）なら、この関数の存在理由が反転する。呼び出し側が良い state_dir を
-    // 渡すことに頼らず、ここで自分の出力を検証する。次の呼び出し元は
-    // Task 12 の CLI 配線であり、その次は M4 の subagent スケジューラであって、
-    // ここを誤ると拘束下の任意コード実行を作ることになる。
+    // If the staged location itself is inside a writable root (including
+    // resolution through a symlink), this function's whole reason for
+    // existing inverts. Rather than relying on the caller to pass a good
+    // state_dir, verify our own output here. The next caller is Task 12's
+    // CLI wiring, and after that M4's subagent scheduler, and getting this
+    // wrong there means creating arbitrary code execution under
+    // confinement.
     if let Some(root) = policy
         .writable_roots()
         .iter()
         .find(|r| dest_canonical.starts_with(r))
     {
         return Err(SandboxError::NotEnforced(format!(
-            "退避先 {} が書込可能ルート {} の内側にある",
+            "the staged location {} is inside the writable root {}",
             dest_canonical.display(),
             root.display()
         )));
@@ -85,108 +91,111 @@ mod tests {
 
     #[test]
     fn a_helper_inside_a_writable_root_is_copied_out_of_it() {
-        // ここが M4 の権限昇格を塞ぐ。ワークスペースへ書ける者がヘルパを
-        // 差し替えられる状態を残さない。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let state = tempfile::tempdir().expect("一時ディレクトリ");
+        // This is what blocks M4's privilege escalation. Don't leave a
+        // state where someone who can write to the workspace can replace
+        // the helper.
+        let root = tempfile::tempdir().expect("temp dir");
+        let state = tempfile::tempdir().expect("temp dir");
 
         let fake_exe = root.path().join("polaris");
-        std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").expect("書けない");
+        std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").expect("can't write");
 
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
-        let staged = staged_helper_from(&policy, state.path(), &fake_exe).expect("退避できない");
+        let staged = staged_helper_from(&policy, state.path(), &fake_exe).expect("can't stage");
 
         assert!(
             !staged.starts_with(policy.writable_roots()[0].as_path()),
-            "退避先が書込可能ルートの内側にある: {}",
+            "the staged location is inside the writable root: {}",
             staged.display()
         );
-        assert!(staged.exists(), "退避先にファイルが無い");
+        assert!(staged.exists(), "no file at the staged location");
     }
 
     #[test]
     fn a_helper_already_outside_every_root_is_used_as_is() {
-        // 不要な複製をしない。インストール済みのバイナリを毎回コピーする
-        // 必要は無い。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let elsewhere = tempfile::tempdir().expect("一時ディレクトリ");
-        let state = tempfile::tempdir().expect("一時ディレクトリ");
+        // Don't make an unnecessary copy. There's no need to copy an
+        // already installed binary every time.
+        let root = tempfile::tempdir().expect("temp dir");
+        let elsewhere = tempfile::tempdir().expect("temp dir");
+        let state = tempfile::tempdir().expect("temp dir");
 
         let exe = elsewhere.path().join("polaris");
-        std::fs::write(&exe, b"x").expect("書けない");
+        std::fs::write(&exe, b"x").expect("can't write");
 
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
-        let staged = staged_helper_from(&policy, state.path(), &exe).expect("解決できない");
+        let staged = staged_helper_from(&policy, state.path(), &exe).expect("can't resolve");
         assert_eq!(staged, exe.canonicalize().expect("canonicalize"));
     }
 
     #[test]
     fn a_state_dir_inside_a_writable_root_is_rejected() {
-        // state_dir がルートの内側なら、複製した先も内側になる。この関数の
-        // 目的がそのまま反転してしまうので、呼び出し側の選択に頼らず自分で
-        // 拒否する。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        // If state_dir is inside the root, the copy's destination ends up
+        // inside it too. That would directly invert this function's
+        // purpose, so reject it ourselves instead of relying on the
+        // caller's choice.
+        let root = tempfile::tempdir().expect("temp dir");
         let state = root.path().join("state");
         let fake_exe = root.path().join("polaris");
-        std::fs::write(&fake_exe, b"x").expect("書けない");
+        std::fs::write(&fake_exe, b"x").expect("can't write");
 
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
         let err = staged_helper_from(&policy, &state, &fake_exe)
-            .expect_err("書込可能ルート内の state_dir が通ってしまった");
+            .expect_err("a state_dir inside the writable root went through");
         assert!(matches!(err, SandboxError::NotEnforced(_)), "{err}");
     }
 
     #[test]
     fn a_state_dir_reached_through_a_symlink_into_a_writable_root_is_rejected() {
-        // state_dir 自身は書込可能ルートの外にあるパスでも、シンボリック
-        // リンクを辿った先がルートの内側なら同じ問題になる。文字列としての
-        // starts_with ではなく、canonicalize してから比較する必要がある
-        // ことを固定する。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        // Even when state_dir's own path is outside the writable root, if
+        // following a symlink lands inside the root, the same problem
+        // occurs. This pins down that the comparison must canonicalize
+        // first rather than doing a string-level starts_with.
+        let root = tempfile::tempdir().expect("temp dir");
         let real_state = root.path().join("state");
-        std::fs::create_dir_all(&real_state).expect("作れない");
+        std::fs::create_dir_all(&real_state).expect("can't create");
 
-        let link_parent = tempfile::tempdir().expect("一時ディレクトリ");
+        let link_parent = tempfile::tempdir().expect("temp dir");
         let state_link = link_parent.path().join("state-link");
         std::os::unix::fs::symlink(&real_state, &state_link).expect("symlink");
 
         let fake_exe = root.path().join("polaris");
-        std::fs::write(&fake_exe, b"x").expect("書けない");
+        std::fs::write(&fake_exe, b"x").expect("can't write");
 
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
         let err = staged_helper_from(&policy, &state_link, &fake_exe)
-            .expect_err("シンボリックリンク越しの書込可能ルート内が通ってしまった");
+            .expect_err("a writable root reached through a symlink went through");
         assert!(matches!(err, SandboxError::NotEnforced(_)), "{err}");
     }
 
     #[test]
     fn a_stale_staged_copy_is_refreshed_when_the_source_changes() {
-        // 内容が変わったのに古い複製を使い続けると、直したはずのヘルパが
-        // 動かない。しかも症状は「直っていない」であり、原因が見えにくい。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let state = tempfile::tempdir().expect("一時ディレクトリ");
+        // If the content changed but an old copy keeps being used, the
+        // helper you thought you fixed doesn't work. And the symptom just
+        // looks like "it's not fixed", making the cause hard to see.
+        let root = tempfile::tempdir().expect("temp dir");
+        let state = tempfile::tempdir().expect("temp dir");
         let exe = root.path().join("polaris");
 
-        std::fs::write(&exe, b"version-1").expect("書けない");
+        std::fs::write(&exe, b"version-1").expect("can't write");
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
-        let first = staged_helper_from(&policy, state.path(), &exe).expect("退避");
-        assert_eq!(std::fs::read(&first).expect("読めない"), b"version-1");
+            .expect("policy");
+        let first = staged_helper_from(&policy, state.path(), &exe).expect("stage");
+        assert_eq!(std::fs::read(&first).expect("can't read"), b"version-1");
 
-        std::fs::write(&exe, b"version-2").expect("書けない");
-        let second = staged_helper_from(&policy, state.path(), &exe).expect("退避");
+        std::fs::write(&exe, b"version-2").expect("can't write");
+        let second = staged_helper_from(&policy, state.path(), &exe).expect("stage");
         assert_eq!(
-            std::fs::read(&second).expect("読めない"),
+            std::fs::read(&second).expect("can't read"),
             b"version-2",
-            "古い複製が使われている"
+            "an old copy is being used"
         );
     }
 }

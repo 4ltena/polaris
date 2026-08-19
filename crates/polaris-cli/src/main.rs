@@ -24,16 +24,20 @@ use polaris_sandbox::{SandboxMode, SandboxPolicy};
     about = "最小コンテキストのコーディングエージェント",
     after_help = "\
 環境変数:
-  POLARIS_API_KEY   必須。OpenAI 互換エンドポイントの API キー。既定値は無い。
-  POLARIS_BASE_URL  省略時 https://api.openai.com/v1
-  POLARIS_MODEL     省略時 gpt-5.4
+  POLARIS_PROVIDER  openai（既定）または codex。codex は `polaris login` の認証を使う。
+  POLARIS_API_KEY   provider=openai のとき必須。OpenAI 互換エンドポイントの API キー。
+  POLARIS_BASE_URL  provider=openai のとき、省略時 https://api.openai.com/v1
+  POLARIS_MODEL     省略時 gpt-5.4（openai）/ gpt-5.3-codex（codex）
 "
 )]
 struct Args {
-    /// 実行する指示。`--confined-apply` のときは不要（その経路は標準入力から
-    /// 変更操作を読むのであって、指示文を読まない）。それ以外の通常経路では
-    /// 必須のまま — clap が `required_unless_present` で強制する。
-    #[arg(short, long, required_unless_present = "confined_apply")]
+    /// 実行する指示。サブコマンドと `--confined-apply` のときは不要。
+    ///
+    /// clap の `required_unless_present` を使わないのは、それが引数名しか
+    /// 見ず、サブコマンドの有無を見ないためである。ここを必須にすると
+    /// `polaris login` が「--prompt が無い」で弾かれる。M2 の Task 8 で
+    /// `--confined-apply` が同じ形で到達不能になった。検証は解析後に手で行う。
+    #[arg(short, long)]
     prompt: Option<String>,
 
     /// 監査ログの出力先。省略すると `~/.polaris/state/<project-id>/audit.jsonl` を使う。
@@ -56,6 +60,17 @@ struct Args {
     /// 承認境界の方針。
     #[arg(long, value_enum, default_value_t = ApprovalPolicyArg::OnRequest)]
     approval: ApprovalPolicyArg,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// ChatGPT のサブスクリプションで認証する。ブラウザが開く。
+    Login,
+    /// 保管した資格情報を消す。`~/.codex/` には触れない。
+    Logout,
 }
 
 /// `--sandbox` の取りうる値。`polaris_sandbox::SandboxMode` を直接 clap の
@@ -120,35 +135,154 @@ impl Approver for TerminalApprover {
     }
 }
 
+/// `polaris-auth` を `polaris-provider` の `TokenSource` へ繋ぐ。この
+/// 変換をここへ置くことで、`polaris-auth` がプロバイダのクレートへ依存
+/// しないで済む。
+struct AuthTokens {
+    issuer: String,
+    store: PathBuf,
+}
+
+fn to_provider_error(e: polaris_auth::AuthError) -> polaris_provider::ProviderError {
+    match e {
+        polaris_auth::AuthError::NotLoggedIn => polaris_provider::ProviderError::Auth(
+            "ログインしていない。`polaris login` を実行すること".into(),
+        ),
+        other => polaris_provider::ProviderError::Auth(other.to_string()),
+    }
+}
+
+#[async_trait::async_trait]
+impl polaris_provider::TokenSource for AuthTokens {
+    async fn token(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
+        let c = polaris_auth::ensure_fresh(&self.issuer, &self.store)
+            .await
+            .map_err(to_provider_error)?;
+        Ok(polaris_provider::Token {
+            access_token: c.access_token,
+            account_id: c.account_id,
+        })
+    }
+
+    async fn refreshed(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
+        let c = polaris_auth::force_refresh(&self.issuer, &self.store)
+            .await
+            .map_err(to_provider_error)?;
+        Ok(polaris_provider::Token {
+            access_token: c.access_token,
+            account_id: c.account_id,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+
+    match args.command {
+        Some(Command::Login) => {
+            let store = match polaris_auth::store::default_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("保管先を決められない: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return match polaris_auth::login::run(polaris_auth::ISSUER, &store).await {
+                Ok(_) => {
+                    println!("ログインしました: {}", store.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("ログインできない: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some(Command::Logout) => {
+            let store = match polaris_auth::store::default_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("保管先を決められない: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return match polaris_auth::logout(&store) {
+                Ok(true) => {
+                    println!("ログアウトしました: {}", store.display());
+                    ExitCode::SUCCESS
+                }
+                Ok(false) => {
+                    println!("ログインしていません");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("ログアウトできない: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        None => {}
+    }
 
     if args.confined_apply {
         return run_confined_apply();
     }
 
-    let Ok(api_key) = std::env::var("POLARIS_API_KEY") else {
-        eprintln!("POLARIS_API_KEY が設定されていない");
+    let Some(prompt) = args.prompt.clone() else {
+        eprintln!("--prompt が要る（`polaris --help` を見ること）");
         return ExitCode::FAILURE;
     };
-    let base_url =
-        std::env::var("POLARIS_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let model = std::env::var("POLARIS_MODEL").unwrap_or_else(|_| "gpt-5.4".into());
 
-    let provider = match OpenAiProvider::new(base_url, api_key, model) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
+    let model = std::env::var("POLARIS_MODEL").ok();
+    let provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| "openai".to_string());
+
+    let provider: Box<dyn polaris_provider::Provider> = match provider_name.as_str() {
+        "openai" => {
+            // 既存の組み立てをそのまま使う。挙動は変わらない。
+            let base = std::env::var("POLARIS_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            let key = match std::env::var("POLARIS_API_KEY") {
+                Ok(k) => k,
+                Err(_) => {
+                    eprintln!("POLARIS_API_KEY が設定されていない");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let model = model.unwrap_or_else(|| "gpt-5.4".to_string());
+            match OpenAiProvider::new(base, key, model) {
+                Ok(p) => Box::new(p),
+                Err(e) => {
+                    eprintln!("クライアントを構築できない: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        "codex" => {
+            let store = match polaris_auth::store::default_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("保管先を決められない: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let model = model.unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
+            Box::new(polaris_provider::codex::CodexProvider::new(
+                polaris_provider::codex::ENDPOINT_BASE.to_string(),
+                model,
+                std::sync::Arc::new(AuthTokens {
+                    issuer: polaris_auth::ISSUER.to_string(),
+                    store,
+                }),
+            ))
+        }
+        other => {
+            eprintln!("POLARIS_PROVIDER が未知の値 {other}。openai か codex を指定すること");
             return ExitCode::FAILURE;
         }
     };
+
     let mut session = Session::new();
-    // confined-apply 経路は既に return 済みなので、ここに来た時点で clap の
-    // required_unless_present が --prompt を保証している。
-    let prompt = args
-        .prompt
-        .expect("clap が --prompt を保証しているはずの経路");
     session.push_user(&prompt);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -240,7 +374,7 @@ async fn main() -> ExitCode {
     let always_on = prompt::assemble_always_on(&constitution, &environment, &discovered.skills);
 
     match agent::run(
-        &provider,
+        provider.as_ref(),
         &mut session,
         &mut audit,
         &mut stop,
@@ -372,14 +506,17 @@ mod tests {
     }
 
     #[test]
-    fn prompt_is_still_required_without_confined_apply() {
-        // --confined-apply を外した将来の「単純化」が prompt を全経路で
-        // 任意にしてしまうと、指示文が無いまま黙って実行が始まる。
-        // ここを固定しておけば、その簡略化はテストで止まる。
-        assert!(
-            Args::try_parse_from(["polaris"]).is_err(),
-            "--prompt 無しで解釈できてしまった"
-        );
+    fn prompt_parses_as_optional_at_the_clap_level() {
+        // `required_unless_present` は使わない。それはサブコマンドの有無を
+        // 見ず、引数名しか見ないため、ここへサブコマンドを足すと
+        // `polaris login` が「--prompt が無い」で弾かれる（M2 Task 8 と
+        // 同じ罠）。clap の段階では `prompt` は常に任意で、「通常経路では
+        // 必須」であることは実バイナリを起動して確かめる
+        // `tests/subcommands.rs::the_normal_path_still_requires_a_prompt`
+        // が担う。ここでは clap の解析結果だけを固定する。
+        let args =
+            Args::try_parse_from(["polaris"]).expect("clap は prompt を必須にしていないはず");
+        assert!(args.prompt.is_none());
     }
 
     #[test]

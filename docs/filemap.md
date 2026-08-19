@@ -98,9 +98,9 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-skills/src`
 
-- `discovery.rs` — skill の探索。1 件の破損が全体を巻き込まないよう、読めないものは飛ばす。
-- `frontmatter.rs` — SKILL.md のフロントマター解析。仕様が定める制約だけを検証し、独自の制約を足さない。
-- `lib.rs` — Agent Skills 仕様に準拠した skill の読み込み。独自のフロントマターは足さない。
+- `discovery.rs` — Skill discovery. A single corrupt skill must not take down the whole
+- `frontmatter.rs` — SKILL.md frontmatter parsing. Validates only the constraints the specification lays down; adds no constraints of its own.
+- `lib.rs` — Loading of skills that conform to the Agent Skills specification. Adds no frontmatter fields of its own.
 
 ## `crates/polaris-tools`
 

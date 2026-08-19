@@ -316,7 +316,7 @@ Long procedure. Not loaded.
         // cap()'s binary-search fallback. Truncating naively at the byte
         // level would create a case where the cut crosses a character
         // boundary and produces invalid UTF-8.
-        let line = "あ".repeat(3000);
+        let line = "★".repeat(3000);
         let got = cap(&line, CONSTITUTION_LIMIT);
 
         assert!(
@@ -333,7 +333,7 @@ Long procedure. Not loaded.
         // would look broken. This also doubles as confirmation that the cut
         // lands on a valid char boundary.
         assert!(line.starts_with(&got), "not a prefix of the original line");
-        assert!(got.chars().all(|c| c == 'あ'), "a character is broken");
+        assert!(got.chars().all(|c| c == '★'), "a character is broken");
     }
 
     #[test]

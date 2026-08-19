@@ -353,14 +353,14 @@ mod tests {
     #[test]
     fn truncation_lands_on_a_character_boundary() {
         // Simply cutting at a raw byte offset can split a multi-byte
-        // character in half and panic. "あ" is 3 bytes, so simply cutting at
+        // character in half and panic. "★" is 3 bytes, so simply cutting at
         // MAX_RESULT_BYTES (4096, not a multiple of 3) is guaranteed to land
         // on a position that isn't a boundary.
         let dir = tempfile::tempdir().expect("temp directory");
         let path = dir.path().join("audit.jsonl");
         let mut log = AuditLog::open(&path).expect("cannot open");
 
-        let long = "あ".repeat(MAX_RESULT_BYTES / 3 + 10);
+        let long = "★".repeat(MAX_RESULT_BYTES / 3 + 10);
         log.record(&Record {
             tool: "read",
             detail: "{}",

@@ -10,6 +10,15 @@ use polaris_skills::Skill;
 #[allow(dead_code)]
 mod bm25;
 
+// Not yet called from `lookup` -- a later task wires selection in. Its own
+// unit tests are the only caller today, and `cargo clippy --all-targets`
+// still compiles the plain `lib` target (without `cfg(test)`) where none of
+// that applies, so without this the module reads as entirely dead code.
+#[allow(dead_code)]
+mod near_universal;
+
+pub use near_universal::{MAX_NEAR_UNIVERSAL, near_universal};
+
 /// Byte cap applied when returning a SKILL.md body. The Agent Skills spec
 /// recommends keeping the body under roughly 5,000 tokens and pushing
 /// detail out to reference files. There's no tokenizer here, so this

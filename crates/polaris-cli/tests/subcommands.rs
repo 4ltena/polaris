@@ -1,11 +1,12 @@
-//! サブコマンドが実際に到達することを固定する。
+//! Pins down that subcommands are actually reachable.
 //!
-//! M2 の Task 8 で、`--prompt` の必須検証によって `--confined-apply` が
-//! 到達不能になっていた。同じ形の罠なので、引数の組み立てを目で読むのでは
-//! なく、実バイナリを起動して確かめる。
+//! In M2 Task 8, `--confined-apply` had become unreachable because of the
+//! required-argument validation on `--prompt`. Since it's the same shape
+//! of trap, this verifies by launching the real binary rather than
+//! reading the argument setup by eye.
 //!
-//! `HOME` を一時ディレクトリへ向けるので、実の `~/.polaris` にも
-//! `~/.codex` にも触れない。
+//! `HOME` is pointed at a temp directory, so this never touches the real
+//! `~/.polaris` or `~/.codex`.
 
 use std::process::Command;
 
@@ -13,88 +14,91 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_polaris")
 }
 
-/// `login` は `--prompt` 無しで解析を通る。`--help` で止めるので
-/// ブラウザは開かず、ネットワークにも出ない。
+/// `login` parses successfully without `--prompt`. Stopping at `--help`
+/// means it never opens a browser or reaches the network.
 #[test]
 fn the_login_subcommand_is_reachable_without_a_prompt() {
     let out = Command::new(bin())
         .args(["login", "--help"])
         .output()
-        .expect("起動できない");
+        .expect("could not launch");
     assert!(
         out.status.success(),
-        "login --help が失敗した。stderr: {}",
+        "login --help failed. stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
 
-/// `logout` は `--prompt` 無しで最後まで走る。ログインしていない状態でも
-/// 失敗しない。
+/// `logout` runs to completion without `--prompt`. It doesn't fail even
+/// when not logged in.
 #[test]
 fn the_logout_subcommand_runs_without_a_prompt() {
-    let home = tempfile::tempdir().expect("一時ディレクトリ");
+    let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .arg("logout")
         .env("HOME", home.path())
         .output()
-        .expect("起動できない");
+        .expect("could not launch");
     assert!(
         out.status.success(),
-        "logout が失敗した。stderr: {}",
+        "logout failed. stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
 
-/// `logout` は自分の store だけを消す。`~/.codex/auth.json` には触れない。
+/// `logout` deletes only its own store. It doesn't touch
+/// `~/.codex/auth.json`.
 #[test]
 fn logout_never_touches_the_codex_store() {
-    let home = tempfile::tempdir().expect("一時ディレクトリ");
+    let home = tempfile::tempdir().expect("temp directory");
     let codex = home.path().join(".codex");
-    std::fs::create_dir_all(&codex).expect("作れない");
+    std::fs::create_dir_all(&codex).expect("cannot create");
     let codex_auth = codex.join("auth.json");
-    std::fs::write(&codex_auth, b"{\"sentinel\":true}").expect("書けない");
+    std::fs::write(&codex_auth, b"{\"sentinel\":true}").expect("cannot write");
 
     let polaris_dir = home.path().join(".polaris");
-    std::fs::create_dir_all(&polaris_dir).expect("作れない");
+    std::fs::create_dir_all(&polaris_dir).expect("cannot create");
     let polaris_auth = polaris_dir.join("auth.json");
     std::fs::write(
         &polaris_auth,
         b"{\"access_token\":\"a\",\"refresh_token\":\"r\",\"account_id\":\"x\"}",
     )
-    .expect("書けない");
+    .expect("cannot write");
 
     let out = Command::new(bin())
         .arg("logout")
         .env("HOME", home.path())
         .output()
-        .expect("起動できない");
-    assert!(out.status.success(), "logout が失敗した");
+        .expect("could not launch");
+    assert!(out.status.success(), "logout failed");
 
-    assert!(!polaris_auth.exists(), "自分の store を消していない");
+    assert!(!polaris_auth.exists(), "did not delete its own store");
     assert_eq!(
-        std::fs::read(&codex_auth).expect("読めない"),
+        std::fs::read(&codex_auth).expect("cannot read"),
         b"{\"sentinel\":true}",
-        "codex の store に触れている"
+        "touched the codex store"
     );
 }
 
-/// 通常経路では `--prompt` が要る。任意にしたことで、指示なしの実行が
-/// 黙って走り出してはいけない。上の 3 本の対であり、これが無いと
-/// 「prompt を一切見ない」実装が通る。
+/// The normal path still requires `--prompt`. Making it optional must not
+/// let a run with no instruction start silently. This is the counterpart
+/// to the three tests above — without it, an implementation that ignores
+/// prompt entirely would pass.
 #[test]
 fn the_normal_path_still_requires_a_prompt() {
-    let out = Command::new(bin()).output().expect("起動できない");
-    assert!(!out.status.success(), "指示なしで成功している");
+    let out = Command::new(bin()).output().expect("could not launch");
+    assert!(!out.status.success(), "succeeded with no instruction");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("prompt"),
-        "何が足りないかを言っていない: {stderr}"
+        "does not say what's missing: {stderr}"
     );
 }
 
-/// 受け入れ基準 5。`POLARIS_PROVIDER` を設定しない既定の実行が、これまで
-/// どおり openai の経路へ入る。キーが無いことを openai の言葉で叱ることで、
-/// codex の経路へ逸れていないことが分かる。
+/// Acceptance criterion 5. The default run, with `POLARIS_PROVIDER`
+/// unset, still takes the openai path as before. Scolding about the
+/// missing key in openai's own words confirms it hasn't strayed onto the
+/// codex path.
 #[test]
 fn the_default_provider_is_still_openai() {
     let out = Command::new(bin())
@@ -102,42 +106,45 @@ fn the_default_provider_is_still_openai() {
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
         .output()
-        .expect("起動できない");
-    assert!(!out.status.success(), "キー無しで成功している");
+        .expect("could not launch");
+    assert!(!out.status.success(), "succeeded with no key");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("POLARIS_API_KEY"),
-        "openai の経路へ入っていない: {stderr}"
+        "did not take the openai path: {stderr}"
     );
 }
 
-/// 受け入れ基準 4。ログアウト状態で codex を指すと、`polaris login` を
-/// 名指しするエラーが出る。HTTP エラーにはならない。ネットワークへ出る前に
-/// 止まるので、実 API は叩かない。
+/// Acceptance criterion 4. Pointing at codex while logged out produces an
+/// error naming `polaris login`. It's not an HTTP error — this stops
+/// before reaching the network, so no real API call is made.
 #[test]
 fn a_logged_out_codex_run_names_the_login_command() {
-    let home = tempfile::tempdir().expect("一時ディレクトリ");
+    let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
-        .args(["-p", "何行か"])
+        .args(["-p", "a few lines"])
         .env("HOME", home.path())
         .env("POLARIS_PROVIDER", "codex")
         .env_remove("POLARIS_API_KEY")
         .output()
-        .expect("起動できない");
-    assert!(!out.status.success(), "ログインしていないのに成功している");
+        .expect("could not launch");
+    assert!(
+        !out.status.success(),
+        "succeeded despite not being logged in"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("polaris login"),
-        "やるべきことを名指ししていない: {stderr}"
+        "does not name what needs to be done: {stderr}"
     );
     assert!(
         !stderr.contains("status "),
-        "HTTP エラーとして出ている: {stderr}"
+        "came out as an HTTP error: {stderr}"
     );
 }
 
-/// 未知のプロバイダ名は起動時に落とす。実行してから「モデルが応答しない」
-/// で気付くのでは遅い。
+/// An unknown provider name fails at startup. Noticing only after
+/// running, via "the model isn't responding", is too late.
 #[test]
 fn an_unknown_provider_name_fails_fast() {
     let out = Command::new(bin())
@@ -145,8 +152,11 @@ fn an_unknown_provider_name_fails_fast() {
         .env("POLARIS_PROVIDER", "nonesuch")
         .env("POLARIS_API_KEY", "dummy")
         .output()
-        .expect("起動できない");
-    assert!(!out.status.success(), "未知のプロバイダで成功している");
+        .expect("could not launch");
+    assert!(!out.status.success(), "succeeded with an unknown provider");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("nonesuch"), "名前を出していない: {stderr}");
+    assert!(
+        stderr.contains("nonesuch"),
+        "did not print the name: {stderr}"
+    );
 }

@@ -33,13 +33,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-cli/src`
 
-- `main.rs` — `polaris` バイナリの入口。環境変数から接続先を決め、常時コンテキストを
+- `main.rs` — Entry point for the `polaris` binary. Decides the endpoint from environment
 
 ## `crates/polaris-cli/tests`
 
-- `cli.rs` — CLI バイナリの統合テスト。実プロセスを起動して振る舞いを確かめる。
-- `confined_helper.rs` — 本物の `polaris` バイナリを、本物の拘束プロファイルの下でヘルパとして
-- `subcommands.rs` — サブコマンドが実際に到達することを固定する。
+- `cli.rs` — Integration tests for the CLI binary. Launches the real process to verify behavior.
+- `confined_helper.rs` — Integration test that launches the real `polaris` binary as a helper
+- `subcommands.rs` — Pins down that subcommands are actually reachable.
 
 ## `crates/polaris-core`
 

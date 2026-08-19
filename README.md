@@ -24,9 +24,10 @@ cargo build --release
 
 | 変数 | 既定値 | 意味 |
 | --- | --- | --- |
-| `POLARIS_API_KEY` | なし（必須） | OpenAI 互換エンドポイントの API キー。未設定だと起動直後に失敗する。 |
-| `POLARIS_BASE_URL` | `https://api.openai.com/v1` | チャット補完エンドポイントのベース URL。OpenAI 互換の別エンドポイントに差し替えられる。 |
-| `POLARIS_MODEL` | `gpt-5.4` | 使用するモデル名。 |
+| `POLARIS_PROVIDER` | `openai` | `openai` か `codex`。`codex` は `polaris login` で得た ChatGPT のサブスクリプション認証を使い、API キーを要しない。 |
+| `POLARIS_API_KEY` | なし | `POLARIS_PROVIDER=openai` のとき必須。OpenAI 互換エンドポイントの API キー。 |
+| `POLARIS_BASE_URL` | `https://api.openai.com/v1` | `POLARIS_PROVIDER=openai` のときのベース URL。 |
+| `POLARIS_MODEL` | `gpt-5.4` / `gpt-5.3-codex` | 使用するモデル名。既定はプロバイダごとに異なる。 |
 
 `polaris --help` にも同じ内容を載せてある。
 
@@ -49,3 +50,19 @@ POLARIS_API_KEY=sk-... polaris -p "Cargo.toml は何行か"
 `cargo build --release` の前であれば `cargo run -p polaris-cli --` の後に
 同じ引数を続けてもよい。これが M1 の受け入れ基準そのものであり、動けば
 `Cargo.toml` の行数を含む答えを標準出力へ返す。
+
+## ChatGPT のサブスクリプションで使う
+
+API キーを持たない場合は、ChatGPT の認証で繋げる。
+
+```
+polaris login
+POLARIS_PROVIDER=codex polaris -p "Cargo.toml は何行か"
+```
+
+`polaris login` はブラウザを開き、`http://localhost:1455/auth/callback` で
+認可を受け取る。このポートは登録済みの redirect_uri のものなので選び直せず、
+`codex login` とは同時に走らない。資格情報は `~/.polaris/auth.json` に 0600 で
+保管する。`~/.codex/` には読み書きとも触れない。
+
+`polaris logout` で保管した資格情報を消す。

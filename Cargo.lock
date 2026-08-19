@@ -902,7 +902,9 @@ dependencies = [
 name = "polaris-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
+ "polaris-auth",
  "polaris-core",
  "polaris-provider",
  "polaris-sandbox",

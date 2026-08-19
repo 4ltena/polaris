@@ -1,13 +1,13 @@
-//! `/oauth/token` への交換と更新。
+//! Exchange and refresh against `/oauth/token`.
 //!
-//! `issuer` を引数で受けるのは、テストが偽のサーバを指せるようにするため
-//! である。実 API を叩くテストは 1 本も作らない。
+//! `issuer` is taken as an argument so tests can point at a fake server.
+//! We never write a single test that hits the real API.
 
 use serde::Deserialize;
 
 use crate::{AuthError, CLIENT_ID, Credentials, REDIRECT_URI};
 
-/// トークン応答。`refresh_token` と `expires_in` は返らないことがある。
+/// The token response. `refresh_token` and `expires_in` may not come back.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: Option<String>,
@@ -16,7 +16,7 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
-/// 現在の Unix 秒。
+/// The current Unix seconds.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -24,11 +24,11 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// id_token（JWT）の payload から chatgpt_account_id を取り出す。
+/// Extracts chatgpt_account_id from the id_token (JWT) payload.
 ///
-/// 署名は検証しない。この値は TLS の下でサーバから受け取ったものであり、
-/// こちらは発行者を検証する立場に無い。壊れていたら `None` を返す。
-/// panic しないことをテストで固定する。
+/// Doesn't verify the signature. This value was received from the server
+/// under TLS, and we're not in a position to verify the issuer. Returns
+/// `None` if malformed. We pin down not panicking with a test.
 pub fn account_id_from_id_token(id_token: &str) -> Option<String> {
     use base64::Engine;
 
@@ -43,12 +43,13 @@ pub fn account_id_from_id_token(id_token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// `access_token`（JWT）の payload から chatgpt_plan_type を取り出す。
+/// Extracts chatgpt_plan_type from the `access_token` (JWT) payload.
 ///
-/// `account_id_from_id_token` と同じ理由で署名は検証しない。ただしこちらは
-/// `id_token` ではなく `access_token` を読む — `chatgpt_plan_type` は
-/// `access_token` の claim にあり、`id_token` には無い。壊れていたら
-/// `None` を返し、panic しないことをテストで固定する。
+/// Doesn't verify the signature, for the same reason as
+/// `account_id_from_id_token`. This one reads `access_token`, not
+/// `id_token`, though — `chatgpt_plan_type` is a claim on `access_token`,
+/// not on `id_token`. Returns `None` if malformed, and we pin down not
+/// panicking with a test.
 pub fn plan_type_from_access_token(access_token: &str) -> Option<String> {
     use base64::Engine;
 
@@ -63,9 +64,10 @@ pub fn plan_type_from_access_token(access_token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// フォーム POST を投げて `Credentials` を組み立てる共通部分。
-/// `fallback_refresh` は、応答が refresh_token を省いたときに保つ値。
-/// `fallback_account` は、応答が id_token を省いたときに保つ account_id。
+/// The shared part that sends a form POST and assembles `Credentials`.
+/// `fallback_refresh` is the value kept when the response omits
+/// refresh_token. `fallback_account` is the account_id kept when the
+/// response omits id_token.
 async fn post_token(
     issuer: &str,
     form: &[(&str, &str)],
@@ -93,27 +95,33 @@ async fn post_token(
     let access_token = t
         .access_token
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AuthError::Decode("応答に access_token が無い".into()))?;
+        .ok_or_else(|| AuthError::Decode("the response has no access_token".into()))?;
 
     let refresh_token = t
         .refresh_token
         .filter(|s| !s.is_empty())
         .or_else(|| fallback_refresh.map(|s| s.to_string()))
-        .ok_or_else(|| AuthError::Decode("応答にも手元にも refresh_token が無い".into()))?;
+        .ok_or_else(|| {
+            AuthError::Decode(
+                "there is no refresh_token in either the response or what we hold".into(),
+            )
+        })?;
 
-    // refresh_token と同じ形で、応答が省いたときは手元の値を保つ。
-    // refresh_token grant は OIDC の id_token を再発行する義務を負わない
-    // ため、更新応答に id_token が無いことは異常ではない。ここに fallback が
-    // 無いと、動いていた account_id が更新のたびに "" へ潰れて保存され、
-    // 以後 `chatgpt-account-id:` が空のまま送られる。認証の失敗が
-    // モデルの失敗に見える経路そのものである。
+    // In the same shape as refresh_token: when the response omits it, keep
+    // the value we hold. A refresh_token grant carries no obligation to
+    // reissue an OIDC id_token, so a refresh response lacking id_token is
+    // not abnormal. Without a fallback here, a working account_id would
+    // collapse to "" and get saved on every refresh, and
+    // `chatgpt-account-id:` would go out empty from then on. This is
+    // exactly the path where an auth failure looks like a model failure.
     //
-    // refresh_token と違い、最後まで値が無いことを硬い失敗にはしない。
-    // refresh_token が無い資格情報は次の更新ができず回復不能だが、
-    // account_id はここで空になったからといって回復不能ではなく、
-    // 実バックエンドが空のヘッダを許すかどうかを試験できる場所が無い。
-    // 「今日より悪くしない」側に倒し、fallback を尽くしたあとは既存どおり
-    // 既定値で埋める。
+    // Unlike refresh_token, we don't turn its being missing all the way
+    // through into a hard failure. Credentials without a refresh_token
+    // can't do the next refresh and are unrecoverable, but account_id going
+    // empty here isn't unrecoverable in the same way, and we have no place
+    // to test whether the real backend tolerates an empty header. We lean
+    // toward "don't make it worse than today," and after exhausting the
+    // fallback, fill it with the existing default as before.
     let account_id = t
         .id_token
         .as_deref()
@@ -129,7 +137,7 @@ async fn post_token(
     })
 }
 
-/// 認可コードを資格情報へ交換する。
+/// Exchanges an authorization code for credentials.
 pub async fn exchange_code(
     issuer: &str,
     code: &str,
@@ -150,11 +158,12 @@ pub async fn exchange_code(
     .await
 }
 
-/// refresh token で更新する。
+/// Refreshes with the refresh token.
 ///
-/// `account_id` には保管している現在の値を渡す。応答が id_token を省いた
-/// ときにこれを保つ。`refresh_token` の fallback と同じ形であり、手元の値を
-/// 持たない初回のログイン（`exchange_code`）は、どちらへも `None` を渡す。
+/// Pass the current value we hold as `account_id`. This is what gets kept
+/// when the response omits id_token. It's the same shape as the
+/// `refresh_token` fallback, and the initial login (`exchange_code`), which
+/// holds no value of its own yet, passes `None` to both.
 pub async fn refresh(
     issuer: &str,
     refresh_token: &str,
@@ -173,14 +182,14 @@ pub async fn refresh(
     .await
 }
 
-/// account_id は id_token の payload に入る。テスト用に
-/// `{"chatgpt_account_id":"acct-1"}` を base64url で包んだ JWT 風の
-/// 3 分割文字列を作る。署名は検証しない（サーバから TLS で受け取った
-/// ものであり、こちらが発行者を検証する立場に無い）。
+/// account_id lives in the id_token payload. For tests, builds a
+/// JWT-shaped, 3-part string wrapping `{"chatgpt_account_id":"acct-1"}` in
+/// base64url. Doesn't verify the signature (it was received from the server
+/// under TLS, and we're not in a position to verify the issuer).
 ///
-/// `lib.rs` のテストも同じ形の id_token を使うので、モジュール直下に置いて
-/// 共有する。書き写すと、片方だけ payload の鍵を直したときに黙って
-/// 食い違う。
+/// `lib.rs`'s tests use an id_token of the same shape, so this is placed at
+/// the module root and shared. Copying it would let the two silently
+/// diverge if only one side's payload key ever got fixed.
 #[cfg(test)]
 pub(crate) fn id_token_with_account(account: &str) -> String {
     use base64::Engine;
@@ -231,15 +240,19 @@ mod tests {
 
         let c = exchange_code(&s.uri(), "the-code", "the-verifier")
             .await
-            .expect("交換できるべき");
+            .expect("should be able to exchange");
         assert_eq!(c.access_token, "at");
         assert_eq!(c.refresh_token, "rt");
         assert_eq!(c.account_id, "acct-1");
-        assert!(c.expires_at.is_some(), "expires_in があるのに期限が無い");
+        assert!(
+            c.expires_at.is_some(),
+            "expires_in is present but there's no expiry"
+        );
     }
 
-    /// `expires_in` が無い応答は「期限不明」であり、`None` になる。
-    /// ここを現在時刻や 0 で埋めると、不明と失効の区別が消える。
+    /// A response without `expires_in` has an "unknown expiry" and becomes
+    /// `None`. Filling this with the current time or 0 would erase the
+    /// distinction between unknown and expired.
     #[tokio::test]
     async fn a_response_without_expires_in_has_an_unknown_expiry() {
         let s = server_returning(serde_json::json!({
@@ -251,12 +264,13 @@ mod tests {
 
         let c = exchange_code(&s.uri(), "c", "v")
             .await
-            .expect("交換できるべき");
-        assert_eq!(c.expires_at, None, "期限不明が None になっていない");
+            .expect("should be able to exchange");
+        assert_eq!(c.expires_at, None, "an unknown expiry didn't become None");
     }
 
-    /// refresh token を返さない更新応答では、渡した既存の値を保つ。
-    /// ここを空にすると、次回の更新ができなくなる。
+    /// A refresh response that doesn't return a refresh token keeps the
+    /// existing value we passed in. Emptying this out would make the next
+    /// refresh impossible.
     #[tokio::test]
     async fn refresh_keeps_the_old_refresh_token_when_the_response_omits_it() {
         let s = server_returning(serde_json::json!({
@@ -268,16 +282,17 @@ mod tests {
 
         let c = refresh(&s.uri(), "old-rt", None)
             .await
-            .expect("更新できるべき");
+            .expect("should be able to refresh");
         assert_eq!(c.access_token, "new-at");
         assert_eq!(
             c.refresh_token, "old-rt",
-            "既存の refresh token が捨てられた"
+            "the existing refresh token was discarded"
         );
     }
 
-    /// 応答が新しい refresh token を返したら、そちらを使う。上の対。
-    /// 片方だけでは「常に古い方を返す」実装が通ってしまう。
+    /// If the response returns a new refresh token, use that. The
+    /// counterpart to the case above. With only one of the two, an
+    /// implementation that "always returns the old one" would pass.
     #[tokio::test]
     async fn refresh_adopts_a_rotated_refresh_token() {
         let s = server_returning(serde_json::json!({
@@ -290,10 +305,10 @@ mod tests {
 
         let c = refresh(&s.uri(), "old-rt", None)
             .await
-            .expect("更新できるべき");
+            .expect("should be able to refresh");
         assert_eq!(
             c.refresh_token, "rotated-rt",
-            "回転した refresh token を採っていない"
+            "didn't adopt the rotated refresh token"
         );
     }
 
@@ -306,29 +321,34 @@ mod tests {
             .mount(&s)
             .await;
 
-        let err = refresh(&s.uri(), "rt", None).await.expect_err("失敗すべき");
+        let err = refresh(&s.uri(), "rt", None)
+            .await
+            .expect_err("should fail");
         assert!(
             matches!(err, AuthError::Http(_)),
-            "Http 以外になっている: {err:?}"
+            "got something other than Http: {err:?}"
         );
     }
 
-    /// access_token が無い応答は成功ではない。空の資格情報を返すと、
-    /// 次の API 呼び出しが 401 になり、原因が認証まで遡れなくなる。
+    /// A response without access_token is not a success. Returning empty
+    /// credentials would make the next API call a 401, with the cause no
+    /// longer traceable back to auth.
     #[tokio::test]
     async fn a_response_without_an_access_token_is_a_decode_error() {
         let s = server_returning(serde_json::json!({ "expires_in": 3600 })).await;
-        let err = refresh(&s.uri(), "rt", None).await.expect_err("失敗すべき");
+        let err = refresh(&s.uri(), "rt", None)
+            .await
+            .expect_err("should fail");
         assert!(
             matches!(err, AuthError::Decode(_)),
-            "Decode 以外になっている: {err:?}"
+            "got something other than Decode: {err:?}"
         );
     }
 
     #[test]
     fn the_account_id_comes_out_of_the_id_token_payload() {
-        let got =
-            account_id_from_id_token(&id_token_with_account("acct-xyz")).expect("取り出せるべき");
+        let got = account_id_from_id_token(&id_token_with_account("acct-xyz"))
+            .expect("should be extractable");
         assert_eq!(got, "acct-xyz");
     }
 
@@ -341,8 +361,8 @@ mod tests {
 
     #[test]
     fn the_plan_type_comes_out_of_the_access_token_payload() {
-        let got =
-            plan_type_from_access_token(&access_token_with_plan("plus")).expect("取り出せるべき");
+        let got = plan_type_from_access_token(&access_token_with_plan("plus"))
+            .expect("should be extractable");
         assert_eq!(got, "plus");
     }
 

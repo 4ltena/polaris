@@ -1,9 +1,10 @@
-//! 認可 URL の組み立てと、コールバックの一度きりの受け取り。
+//! Building the authorization URL, and receiving the callback exactly once.
 //!
-//! ポート 1455 は client_id に登録された redirect_uri のポートであり、
-//! 選び直せない。したがって `codex login` とは同時に走らない。塞がって
-//! いるときは、汎用の bind エラーではなくその衝突を名指しする。原因を
-//! 掴めない拒否メッセージは、同じ失敗の反復を招く。
+//! Port 1455 is the port of the redirect_uri registered to the client_id,
+//! and it cannot be chosen freely. So this cannot run at the same time as
+//! `codex login`. When it's occupied, we name that collision instead of a
+//! generic bind error. A denial message whose cause can't be grasped
+//! invites the same failure to repeat.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,9 +16,9 @@ use crate::{
     AuthError, CALLBACK_PORT, CLIENT_ID, Credentials, REDIRECT_URI, SCOPE, pkce, store, token,
 };
 
-/// ブラウザで開く認可 URL を組み立てる。
+/// Builds the authorization URL to open in the browser.
 pub fn authorize_url(challenge: &str, state: &str) -> String {
-    let mut u = url::Url::parse(crate::ISSUER).expect("ISSUER が URL として壊れている");
+    let mut u = url::Url::parse(crate::ISSUER).expect("ISSUER is malformed as a URL");
     u.set_path("/oauth/authorize");
     u.query_pairs_mut()
         .append_pair("client_id", CLIENT_ID)
@@ -30,21 +31,22 @@ pub fn authorize_url(challenge: &str, state: &str) -> String {
     u.to_string()
 }
 
-/// HTTP のリクエスト行から `code` と `state` を取り出す。
+/// Extracts `code` and `state` from the HTTP request line.
 ///
-/// `GET /auth/callback?code=…&state=… HTTP/1.1` の 2 つ目の空白区切りが
-/// 対象。相対パスのままでは `Url::parse` が使えないので、任意のベースへ
-/// 接いでから query を読む。ベースは解釈のためだけに使い、外へは出ない。
+/// The target is the second whitespace-delimited field of
+/// `GET /auth/callback?code=…&state=… HTTP/1.1`. Since `Url::parse` can't
+/// take a bare relative path, we join it onto an arbitrary base and read the
+/// query from that. The base is used only for parsing and never goes
+/// anywhere external.
 pub fn parse_callback(request_line: &str) -> Result<(String, String), AuthError> {
-    let target = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| AuthError::Decode(format!("リクエスト行を読めない: {request_line}")))?;
+    let target = request_line.split_whitespace().nth(1).ok_or_else(|| {
+        AuthError::Decode(format!("could not read the request line: {request_line}"))
+    })?;
 
     let parsed = url::Url::parse("http://localhost")
-        .expect("ベースが壊れている")
+        .expect("base is malformed")
         .join(target)
-        .map_err(|e| AuthError::Decode(format!("コールバックの URL を読めない: {e}")))?;
+        .map_err(|e| AuthError::Decode(format!("could not parse the callback URL: {e}")))?;
 
     let q: std::collections::HashMap<String, String> = parsed.query_pairs().into_owned().collect();
 
@@ -56,22 +58,23 @@ pub fn parse_callback(request_line: &str) -> Result<(String, String), AuthError>
     let code = q
         .get("code")
         .cloned()
-        .ok_or_else(|| AuthError::Decode("コールバックに code が無い".into()))?;
+        .ok_or_else(|| AuthError::Decode("callback has no code".into()))?;
     let state = q.get("state").cloned().unwrap_or_default();
     Ok((code, state))
 }
 
-/// 登録済みのポートを掴む。塞がっていたら衝突を名指しする。
+/// Grabs the registered port. If it's occupied, names the collision.
 pub async fn bind_callback() -> Result<TcpListener, AuthError> {
     TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
         .await
         .map_err(|e| AuthError::PortInUse(e.to_string()))
 }
 
-/// コールバックを一度だけ受け、`code` を返す。
+/// Receives the callback exactly once and returns `code`.
 ///
-/// 待ち続けないよう `timeout` で切る。ブラウザには短い本文を返す。空の
-/// 応答だと、利用者は成功したのか分からないまま端末へ戻ることになる。
+/// Cut off with `timeout` so we don't wait forever. Returns a short body to
+/// the browser. With an empty response, the user would return to the
+/// terminal with no idea whether it succeeded.
 pub async fn wait_for_callback(
     listener: TcpListener,
     expected_state: &str,
@@ -79,10 +82,11 @@ pub async fn wait_for_callback(
 ) -> Result<String, AuthError> {
     let accepted = tokio::time::timeout(timeout, listener.accept())
         .await
-        .map_err(|_| AuthError::Denied("コールバックを待ち切れなかった".into()))?;
+        .map_err(|_| AuthError::Denied("timed out waiting for the callback".into()))?;
     let (mut stream, _) = accepted?;
 
-    // リクエスト行だけ読めれば足りる。ヘッダの終端まで待つ必要は無い。
+    // Reading just the request line is enough. No need to wait for the end
+    // of headers.
     let mut buf = [0u8; 2048];
     let n = stream.read(&mut buf).await?;
     let head = String::from_utf8_lossy(&buf[..n]);
@@ -91,7 +95,8 @@ pub async fn wait_for_callback(
     let result = parse_callback(&request_line).and_then(|(code, state)| {
         if state != expected_state {
             Err(AuthError::Denied(
-                "state が一致しない。別の認可の応答を受け取った可能性がある".into(),
+                "state doesn't match. May have received the response to a different authorization"
+                    .into(),
             ))
         } else {
             Ok(code)
@@ -101,11 +106,11 @@ pub async fn wait_for_callback(
     let (status, body) = match &result {
         Ok(_) => (
             "200 OK",
-            "polaris のログインが完了しました。端末に戻ってください。",
+            "polaris login is complete. Return to the terminal.",
         ),
         Err(_) => (
             "400 Bad Request",
-            "polaris のログインに失敗しました。端末を確認してください。",
+            "polaris login failed. Check the terminal.",
         ),
     };
     let resp = format!(
@@ -118,7 +123,7 @@ pub async fn wait_for_callback(
     result
 }
 
-/// ブラウザを開く。開けなくても致命ではない。URL を出して続ける。
+/// Opens the browser. Not opening isn't fatal. Prints the URL and continues.
 fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let program = "open";
@@ -128,15 +133,16 @@ fn open_browser(url: &str) {
     let _ = std::process::Command::new(program).arg(url).spawn();
 }
 
-/// login 一式。bind してからブラウザを開く。順序が逆だと、利用者が
-/// 認可を終えた時点でこちらがまだ待ち受けておらず、取りこぼす。
+/// The full login sequence. Binds before opening the browser. In the
+/// reverse order, by the time the user finishes authorizing, we might not
+/// yet be listening, and miss the callback.
 pub async fn run(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
     let p = pkce::generate()?;
     let state = pkce::random_urlsafe(16)?;
 
     let listener = bind_callback().await?;
     let url = authorize_url(&p.challenge, &state);
-    eprintln!("ブラウザで認可してください: {url}");
+    eprintln!("Authorize in your browser: {url}");
     open_browser(&url);
 
     let code = wait_for_callback(listener, &state, Duration::from_secs(300)).await?;
@@ -152,7 +158,7 @@ mod tests {
     #[test]
     fn the_authorize_url_carries_every_parameter_the_flow_needs() {
         let u = authorize_url("the-challenge", "the-state");
-        let parsed = url::Url::parse(&u).expect("URL として壊れている");
+        let parsed = url::Url::parse(&u).expect("malformed as a URL");
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
 
         assert_eq!(parsed.host_str(), Some("auth.openai.com"));
@@ -177,31 +183,35 @@ mod tests {
 
     #[test]
     fn the_callback_query_is_parsed_into_code_and_state() {
-        let (code, state) = parse_callback("GET /auth/callback?code=abc&state=xyz HTTP/1.1")
-            .expect("解釈できるべき");
+        let (code, state) =
+            parse_callback("GET /auth/callback?code=abc&state=xyz HTTP/1.1").expect("should parse");
         assert_eq!(code, "abc");
         assert_eq!(state, "xyz");
     }
 
-    /// パーセント符号化された値が復号される。生のまま交換へ渡すと、
-    /// サーバ側で invalid_grant になり、原因が符号化だと分からない。
+    /// A percent-encoded value gets decoded. Passing it raw into the
+    /// exchange would produce an invalid_grant on the server side, with no
+    /// way to tell encoding was the cause.
     #[test]
     fn percent_encoded_values_are_decoded() {
         let (code, _) = parse_callback("GET /auth/callback?code=a%2Fb%2Bc&state=s HTTP/1.1")
-            .expect("解釈できるべき");
+            .expect("should parse");
         assert_eq!(code, "a/b+c");
     }
 
-    /// 認可が拒否されたときは `error` が返る。これを「code が無い」で
-    /// 片付けると、利用者に何が起きたか伝わらない。
+    /// When authorization is denied, `error` comes back. Treating this as
+    /// "there's no code" leaves the user with no idea what happened.
     #[test]
     fn an_error_response_is_surfaced_with_its_reason() {
         let err = parse_callback("GET /auth/callback?error=access_denied HTTP/1.1")
-            .expect_err("失敗すべき");
+            .expect_err("should fail");
         let AuthError::Denied(msg) = err else {
-            panic!("Denied 以外になっている: {err:?}");
+            panic!("got something other than Denied: {err:?}");
         };
-        assert!(msg.contains("access_denied"), "理由が文面に無い: {msg}");
+        assert!(
+            msg.contains("access_denied"),
+            "reason is missing from the text: {msg}"
+        );
     }
 
     #[test]
@@ -210,8 +220,8 @@ mod tests {
         assert!(parse_callback("garbage").is_err());
     }
 
-    /// state が一致しないコールバックは受け取らない。CSRF の対策であり、
-    /// ここを外すと第三者が仕込んだ code を掴まされうる。
+    /// A callback with a mismatched state is not accepted. This is a CSRF
+    /// defense; removing it would let an attacker-planted code get accepted.
     #[tokio::test]
     async fn a_state_mismatch_is_rejected() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -228,13 +238,17 @@ mod tests {
 
         let err = wait_for_callback(listener, "EXPECTED", Duration::from_secs(5))
             .await
-            .expect_err("state 不一致は失敗すべき");
-        assert!(matches!(err, AuthError::Denied(_)), "Denied 以外: {err:?}");
+            .expect_err("a state mismatch should fail");
+        assert!(
+            matches!(err, AuthError::Denied(_)),
+            "other than Denied: {err:?}"
+        );
         client.await.expect("client");
     }
 
-    /// 対になる肯定側。state が一致すれば code を返す。これが無いと、
-    /// 「常に拒否する」実装が上のテストを通ってしまう。
+    /// The positive counterpart. If state matches, returns the code.
+    /// Without this, an implementation that "always denies" would pass the
+    /// test above.
     #[tokio::test]
     async fn a_matching_state_yields_the_code() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -247,22 +261,22 @@ mod tests {
                 .expect("write");
             let mut buf = Vec::new();
             let _ = s.read_to_end(&mut buf).await;
-            // ブラウザに何か表示されること。空の応答だと利用者は
-            // 成功したのか分からない。
+            // Something must be shown in the browser. With an empty
+            // response the user has no way to know whether it succeeded.
             String::from_utf8_lossy(&buf).to_string()
         });
 
         let code = wait_for_callback(listener, "EXPECTED", Duration::from_secs(5))
             .await
-            .expect("受け取れるべき");
+            .expect("should be receivable");
         assert_eq!(code, "the-code");
 
         let body = client.await.expect("client");
         assert!(
             body.starts_with("HTTP/1.1 200"),
-            "200 を返していない: {body}"
+            "didn't return 200: {body}"
         );
-        assert!(!body.trim().is_empty(), "ブラウザへ何も返していない");
+        assert!(!body.trim().is_empty(), "returned nothing to the browser");
     }
 
     #[tokio::test]
@@ -270,37 +284,39 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let err = wait_for_callback(listener, "S", Duration::from_millis(50))
             .await
-            .expect_err("タイムアウトすべき");
+            .expect_err("should time out");
         assert!(
             matches!(err, AuthError::Denied(_) | AuthError::Io(_)),
-            "予期しない種類: {err:?}"
+            "unexpected variant: {err:?}"
         );
     }
 
-    /// 1455 が塞がっているとき、汎用の bind エラーではなく衝突を名指しする。
+    /// When 1455 is occupied, names the collision instead of a generic bind
+    /// error.
     #[tokio::test]
     async fn a_busy_callback_port_names_the_collision() {
         let Ok(_held) = TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).await else {
-            // 何か他のプロセスが既に握っている環境では、この試験の前提が
-            // 成立しない。握れないこと自体は異常ではないので飛ばす。
+            // Some other process may already hold it in this environment,
+            // in which case this test's premise doesn't hold. Not being
+            // able to grab it isn't itself abnormal, so skip it.
             return;
         };
         let err = bind_callback()
             .await
-            .expect_err("塞がっているので失敗すべき");
+            .expect_err("should fail since it's occupied");
         let AuthError::PortInUse(_) = err else {
-            panic!("PortInUse 以外になっている: {err:?}");
+            panic!("got something other than PortInUse: {err:?}");
         };
-        // 文面に codex login への言及があること。`Display` は
-        // `AuthError` の属性で組み立てられる。
+        // The text must mention codex login. `Display` is built from
+        // `AuthError`'s attribute.
         let shown = err.to_string();
         assert!(
             shown.contains("codex login"),
-            "衝突の相手を名指ししていない: {shown}"
+            "doesn't name the other party in the collision: {shown}"
         );
         assert!(
             shown.contains(&CALLBACK_PORT.to_string()),
-            "ポート番号が文面に無い: {shown}"
+            "port number is missing from the text: {shown}"
         );
     }
 }

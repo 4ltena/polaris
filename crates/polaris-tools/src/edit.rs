@@ -1,4 +1,4 @@
-//! `edit` ツール。`write` と同じ拘束経路を通る。
+//! `edit` tool. Goes through the same confined path as `write`.
 
 use std::path::Path;
 
@@ -27,8 +27,9 @@ mod tests {
 
     use crate::edit::edit;
 
-    /// `write.rs` の `success_helper` と同じ理由づけで `/bin/sh` だけを使う。
-    /// stdin をそのまま `target` へ書き出し、`edited` と報告するだけの代役。
+    /// Uses only `/bin/sh`, for the same reason as `write.rs`'s
+    /// `success_helper`. A stand-in that just writes stdin straight to
+    /// `target` and reports `edited`.
     fn success_helper(dir: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("fake-edit-helper-success");
         std::fs::write(
@@ -38,7 +39,7 @@ mod tests {
                 target.display()
             ),
         )
-        .expect("書けない");
+        .expect("can't write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -47,18 +48,20 @@ mod tests {
         p
     }
 
-    /// stdin を捨てて（読み切ってデッドロックを避けつつ）固定の理由を
-    /// 標準エラーへ書いて非0で終了するだけの代役。実際の一致件数の判定
-    /// （0件・複数件・重なりの数え方）は Task 7 の `helper::apply` の単体
-    /// テストがすでに押さえている。ここで確かめたいのは、子の標準エラーが
-    /// ツールのエラーまで裸の終了コードに潰されず届くという配線だけである。
+    /// Discards stdin (reading it fully to avoid a deadlock) and just exits
+    /// non-zero after writing a fixed reason to stderr. The actual
+    /// match-count judgment (zero matches, multiple matches, how overlaps
+    /// are counted) is already covered by the unit tests for
+    /// `helper::apply` from Task 7. What we want to confirm here is only the
+    /// wiring: that the child's stderr reaches the tool's error rather than
+    /// being collapsed into a bare exit code.
     fn failure_helper(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("fake-edit-helper-failure");
         std::fs::write(
             &p,
-            "#!/bin/sh\ncat > /dev/null\necho '置換対象が 2 箇所' 1>&2\nexit 1\n",
+            "#!/bin/sh\ncat > /dev/null\necho 'replacement target matched in 2 places' 1>&2\nexit 1\n",
         )
-        .expect("書けない");
+        .expect("can't write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -69,41 +72,50 @@ mod tests {
 
     #[test]
     fn an_edit_inside_the_root_succeeds_through_the_confined_helper() {
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let helper_dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let root = tempfile::tempdir().expect("temp dir");
+        let helper_dir = tempfile::tempdir().expect("temp dir");
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
 
         let target = policy.writable_roots()[0].join("f.txt");
         let helper = success_helper(helper_dir.path(), &target);
 
-        let msg = edit(&policy, &helper, &target, "xxx", "yyy").expect("失敗した");
+        let msg = edit(&policy, &helper, &target, "xxx", "yyy").expect("failed");
 
-        // write 側と同じく、代役ヘルパは JSON を解釈しないので、ファイルに
-        // 残るのは置換結果ではなく stdin に乗った変更操作の直列化結果。
-        // old / new の双方が子まで届いたことを確かめる。
-        let written = std::fs::read_to_string(&target).expect("読めない");
-        assert!(written.contains("xxx"), "old が子へ届いていない: {written}");
-        assert!(written.contains("yyy"), "new が子へ届いていない: {written}");
-        assert!(!msg.trim().is_empty(), "結果の説明が空");
+        // As on the write side, the stand-in helper doesn't parse JSON, so
+        // what ends up in the file isn't the replacement result but the
+        // serialized mutation that rode in on stdin. Confirm that both old
+        // and new reached the child.
+        let written = std::fs::read_to_string(&target).expect("can't read");
+        assert!(
+            written.contains("xxx"),
+            "old did not reach the child: {written}"
+        );
+        assert!(
+            written.contains("yyy"),
+            "new did not reach the child: {written}"
+        );
+        assert!(!msg.trim().is_empty(), "the result description is empty");
     }
 
     #[test]
     fn a_failing_edit_returns_the_child_s_reason_rather_than_a_bare_exit_code() {
-        // 「exit 1」だけを返すと、モデルは何を直せばよいか分からず同じ
-        // 失敗を繰り返す。往復とトークンの浪費になる。
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
-        let helper_dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // Returning just "exit 1" leaves the model unable to tell what to
+        // fix, so it repeats the same failure — wasting a round trip and
+        // tokens.
+        let root = tempfile::tempdir().expect("temp dir");
+        let helper_dir = tempfile::tempdir().expect("temp dir");
         let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
-            .expect("方針");
+            .expect("policy");
         let helper = failure_helper(helper_dir.path());
 
         let target = policy.writable_roots()[0].join("f.txt");
 
-        let err = edit(&policy, &helper, &target, "xxx", "yyy").expect_err("失敗ヘルパが通った");
+        let err = edit(&policy, &helper, &target, "xxx", "yyy")
+            .expect_err("the failure helper succeeded");
         assert!(
-            err.to_string().contains("2 箇所"),
-            "理由が伝わらない: {err}"
+            err.to_string().contains("2 places"),
+            "the reason is not conveyed: {err}"
         );
     }
 }

@@ -387,7 +387,7 @@ mod tests {
 
         assert!(
             out.contains(&format!(
-                "続きは offset={} で読む",
+                "continue with offset={}",
                 polaris_tools::read::DEFAULT_LIMIT
             )),
             "既定の limit で打ち切ったことが結果に出ていない: {}",
@@ -685,7 +685,7 @@ mod tests {
         // `an_empty_skill_set_is_distinguishable_from_a_query_matching_nothing`
         // が固定しているのと同じ固有の文言を、ループを通した経路でも見る。
         assert!(
-            tool_msg.content.contains("1 件も見つからない"),
+            tool_msg.content.contains("no skill was found at all"),
             "skill が1件も無いことがモデルへ届いていない: {}",
             tool_msg.content
         );
@@ -1002,7 +1002,7 @@ print("wrote")
                 .last_reason
                 .as_deref()
                 .unwrap_or("")
-                .contains("ハードリンク"),
+                .contains("hard link"),
             "尋ねた理由にハードリンクの説明が無い: {:?}",
             approver.last_reason
         );
@@ -1026,7 +1026,7 @@ print("wrote")
             tool_msg.content
         );
         assert!(
-            !tool_msg.content.contains("子の出力"),
+            !tool_msg.content.contains("child output"),
             "サンドボックス側（ToolError::WriteDenied）の拒否文面が混ざっている: {}",
             tool_msg.content
         );
@@ -1145,7 +1145,7 @@ print("wrote")
                 .last_reason
                 .as_deref()
                 .unwrap_or("")
-                .contains("ハードリンク"),
+                .contains("hard link"),
             "尋ねた理由にハードリンクの説明が無い: {:?}",
             approver.last_reason
         );
@@ -1169,7 +1169,7 @@ print("wrote")
             tool_msg.content
         );
         assert!(
-            !tool_msg.content.contains("子の出力"),
+            !tool_msg.content.contains("child output"),
             "サンドボックス側（ToolError::WriteDenied）の拒否文面が混ざっている: {}",
             tool_msg.content
         );

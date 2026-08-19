@@ -1,4 +1,4 @@
-//! polaris の組込みツール。常時提供するツールは 6 本を超えない。
+//! polaris's built-in tools. The always-on tool set never exceeds 6 tools.
 
 pub mod bash;
 pub mod edit;
@@ -10,7 +10,7 @@ pub mod write;
 
 use serde::Serialize;
 
-/// モデルへ渡すツール定義。`parameters` は JSON Schema。
+/// Tool definition passed to the model. `parameters` is a JSON Schema.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
     pub name: &'static str,
@@ -20,35 +20,38 @@ pub struct ToolSpec {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
-    #[error("パス {0} は読み取りを許可されていない")]
+    #[error("path {0} is not permitted to be read")]
     PathDenied(String),
-    #[error("入出力エラー: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("{0} は通常ファイルではない")]
+    #[error("{0} is not a regular file")]
     NotAFile(String),
-    #[error("{path} は上限 {limit} バイトを超えている（実際 {actual} バイト）")]
+    #[error("{path} exceeds the {limit} byte cap (actual: {actual} bytes)")]
     TooLarge {
         path: String,
         limit: u64,
         actual: u64,
     },
-    #[error("サンドボックス: {0}")]
+    #[error("sandbox: {0}")]
     Sandbox(#[from] polaris_sandbox::SandboxError),
-    #[error("{path} への書き込みは拒否された。方針 {policy}。子の出力: {detail}")]
+    #[error("write to {path} was denied. policy: {policy}. child output: {detail}")]
     WriteDenied {
         path: String,
         policy: String,
         detail: String,
     },
-    /// ヘルパは走ったが、要求どおりには実行できなかった（置換対象が0件・
-    /// 複数件、対象ファイルが無い、等）。方針の話ではないので、方針も
-    /// 書込可能ルートも文面に出さない。ここを `WriteDenied` と混ぜると、
-    /// 目印を選び直せば済む場面でモデルが権限の問題を探し始める。
+    /// The helper ran, but could not carry out the request as asked (zero
+    /// matches for the replacement, multiple matches, the target file is
+    /// missing, etc.). This is not a policy matter, so neither the policy
+    /// nor the writable roots appear in the text. Mixing this into
+    /// `WriteDenied` would make the model start hunting for a permissions
+    /// problem in a situation where all it needs to do is pick a different
+    /// marker.
     #[error(
-        "{path} への変更は実行できなかった。サンドボックスの拒否ではなく、要求そのものの問題である。理由: {detail}"
+        "the change to {path} could not be carried out. This is not a sandbox denial, but a problem with the request itself. reason: {detail}"
     )]
     MutationFailed { path: String, detail: String },
-    #[error("コマンドが終了コード {status} で失敗した。方針 {policy}。出力: {detail}")]
+    #[error("the command failed with exit code {status}. policy: {policy}. output: {detail}")]
     CommandFailed {
         status: i32,
         policy: String,
@@ -56,7 +59,7 @@ pub enum ToolError {
     },
 }
 
-/// 常時提供するツールの一覧。
+/// The list of tools provided at all times.
 pub fn all_specs() -> Vec<ToolSpec> {
     vec![
         read_spec(),
@@ -70,7 +73,7 @@ pub fn all_specs() -> Vec<ToolSpec> {
 fn read_spec() -> ToolSpec {
     ToolSpec {
         name: "read",
-        description: "ファイルを読む。行番号付きで返す。offset と limit で範囲を指定できる。",
+        description: "Read a file. Returns it with line numbers. Use offset and limit to specify a range.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -86,12 +89,12 @@ fn read_spec() -> ToolSpec {
 fn write_spec() -> ToolSpec {
     ToolSpec {
         name: "write",
-        description: "ファイルを新規作成する。既存ファイルは上書きする。途中のディレクトリは作る。",
+        description: "Create a new file. Overwrites an existing file. Creates intermediate directories.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "書き込む先のパス。" },
-                "content": { "type": "string", "description": "ファイル全体の内容。" }
+                "path": { "type": "string", "description": "The path to write to." },
+                "content": { "type": "string", "description": "The file's full contents." }
             },
             "required": ["path", "content"]
         }),
@@ -101,13 +104,13 @@ fn write_spec() -> ToolSpec {
 fn edit_spec() -> ToolSpec {
     ToolSpec {
         name: "edit",
-        description: "既存ファイルの一部を置き換える。old はファイル内で一意に定まる文字列にすること。複数一致すると失敗する。",
+        description: "Replace part of an existing file. `old` must be a string that is uniquely determined within the file. Fails if there are multiple matches.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "編集するファイルのパス。" },
-                "old": { "type": "string", "description": "置換前の文字列。ファイル内で一意であること。" },
-                "new": { "type": "string", "description": "置換後の文字列。" }
+                "path": { "type": "string", "description": "The path of the file to edit." },
+                "old": { "type": "string", "description": "The string before replacement. Must be unique within the file." },
+                "new": { "type": "string", "description": "The string after replacement." }
             },
             "required": ["path", "old", "new"]
         }),
@@ -117,11 +120,11 @@ fn edit_spec() -> ToolSpec {
 fn bash_spec() -> ToolSpec {
     ToolSpec {
         name: "bash",
-        description: "シェルコマンドを実行する。grep と find もここから使う。サンドボックスの外への書き込みは拒否される。",
+        description: "Run a shell command. Use this for grep and find too. Writes outside the sandbox are denied.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "/bin/sh -c へ渡すコマンド行。" }
+                "command": { "type": "string", "description": "The command line passed to /bin/sh -c." }
             },
             "required": ["command"]
         }),
@@ -131,13 +134,13 @@ fn bash_spec() -> ToolSpec {
 fn skill_spec() -> ToolSpec {
     ToolSpec {
         name: "skill",
-        description: "skill を引く。名前に完全一致すれば本文を返し、そうでなければ候補の名前と説明を返す。",
+        description: "Look up a skill. Returns the body on an exact name match, otherwise returns candidate names and descriptions.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "q": {
                     "type": "string",
-                    "description": "skill 名（完全一致で本文）、または検索語（名前と説明を照合して候補）。空文字列は全件列挙。"
+                    "description": "A skill name (exact match returns the body), or a search term (matched against names and descriptions to produce candidates). An empty string lists everything."
                 }
             },
             "required": ["q"]
@@ -152,11 +155,8 @@ mod tests {
     #[test]
     fn read_spec_serializes_with_required_path() {
         let specs = all_specs();
-        let read = specs
-            .iter()
-            .find(|s| s.name == "read")
-            .expect("read が無い");
-        let json = serde_json::to_value(read).expect("直列化できない");
+        let read = specs.iter().find(|s| s.name == "read").expect("no read");
+        let json = serde_json::to_value(read).expect("can't serialize");
         assert_eq!(json["name"], "read");
         assert_eq!(json["parameters"]["required"][0], "path");
         assert_eq!(json["parameters"]["properties"]["path"]["type"], "string");
@@ -164,29 +164,33 @@ mod tests {
 
     #[test]
     fn skill_spec_publishes_the_parameter_name_it_requires() {
-        // read 側と対になる公開スキーマの形の固定。ここが見るのは「公開した
-        // 引数名とその型が変わっていないこと」だけである。宣言した名前と
-        // dispatch が実際に読む名前が同じものを指しているかは、この
-        // クレートからは確かめられない（呼ぶ側が別クレートにある）ので、
-        // polaris-core 側の
+        // This pins the shape of the public schema, a counterpart to the
+        // read side. All this checks is that the published argument name
+        // and its type haven't changed. Whether the declared name and the
+        // name dispatch actually reads refer to the same thing can't be
+        // confirmed from this crate (the caller lives in a different
+        // crate), so on the polaris-core side,
         // `agent::tests::the_skill_tool_reads_the_argument_name_its_schema_declares`
-        // が公開スキーマから引数名を取り出して束ねている。
+        // pulls the argument name out of the published schema and ties the
+        // two together.
         let specs = all_specs();
-        let skill = specs
-            .iter()
-            .find(|s| s.name == "skill")
-            .expect("skill が無い");
-        let json = serde_json::to_value(skill).expect("直列化できない");
+        let skill = specs.iter().find(|s| s.name == "skill").expect("no skill");
+        let json = serde_json::to_value(skill).expect("can't serialize");
         assert_eq!(json["name"], "skill");
         assert_eq!(json["parameters"]["required"][0], "q");
         assert_eq!(json["parameters"]["properties"]["q"]["type"], "string");
-        // 引数ごとの説明。ツール全体の説明だけでは、名前を渡すと本文が返り
-        // それ以外は検索になるという 1 引数 2 モードの規約をモデルが引数の
-        // 側から知る手段が無い。説明を消せばここで落ちる。
+        // Per-argument description. The tool-level description alone gives
+        // the model no way to learn, from the argument side, the
+        // one-argument / two-mode convention where passing a name returns
+        // the body and anything else becomes a search. Removing the
+        // description makes this fail.
         let param_doc = json["parameters"]["properties"]["q"]["description"]
             .as_str()
-            .expect("引数 q に説明が無い");
-        assert!(!param_doc.trim().is_empty(), "引数 q の説明が空");
+            .expect("argument q has no description");
+        assert!(
+            !param_doc.trim().is_empty(),
+            "argument q's description is empty"
+        );
     }
 
     #[test]
@@ -196,6 +200,6 @@ mod tests {
         names.sort_unstable();
         let before = names.len();
         names.dedup();
-        assert_eq!(before, names.len(), "ツール名が重複している");
+        assert_eq!(before, names.len(), "tool names are duplicated");
     }
 }

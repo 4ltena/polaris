@@ -108,14 +108,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-tools/src`
 
-- `bash.rs` — `bash` ツール。拘束された `/bin/sh` の中でコマンドを走らせる。
-- `edit.rs` — `edit` ツール。`write` と同じ拘束経路を通る。
-- `lib.rs` — polaris の組込みツール。常時提供するツールは 6 本を超えない。
-- `path_policy.rs` — 読み取りを拒否するパスの判定。過検出より見逃しを避ける方向に倒す。
-- `predicate.rs` — 書き込みが拒否されるかを事前に予測する。
-- `read.rs` — read ツール。行番号を付けて返すのは、モデルが path:line で位置を示せるようにするため。
-- `skill.rs` — skill ツール。名前に完全一致すれば本文を、そうでなければ候補の一覧を返す。
-- `write.rs` — `write` ツール。実際の書き込みは拘束された子の中で起きる。
+- `bash.rs` — `bash` tool. Runs a command inside a confined `/bin/sh`.
+- `edit.rs` — `edit` tool. Goes through the same confined path as `write`.
+- `lib.rs` — polaris's built-in tools. The always-on tool set never exceeds 6 tools.
+- `path_policy.rs` — Decides which paths reading is denied on. Leans toward avoiding missed
+- `predicate.rs` — Predicts ahead of time whether a write will be denied.
+- `read.rs` — read tool. Line numbers are attached to the output so the model can
+- `skill.rs` — skill tool. Returns the body on an exact name match, otherwise returns a
+- `write.rs` — `write` tool. The actual write happens inside a confined child process.
 
 ## `docs`
 

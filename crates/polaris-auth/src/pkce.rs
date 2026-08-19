@@ -1,19 +1,19 @@
-//! PKCE (RFC 7636) の verifier と challenge。
+//! PKCE (RFC 7636) verifier and challenge.
 //!
-//! 乱数は `/dev/urandom` を直接読む。polaris は既に Unix 前提であり
-//! （`st_nlink` の検査、0600 のパーミッション）、乱数のためだけに依存を
-//! 増やす理由が無い。
+//! Randomness is read directly from `/dev/urandom`. polaris already assumes
+//! Unix (checking `st_nlink`, 0600 permissions), so there's no reason to add
+//! a dependency just for randomness.
 
 use crate::AuthError;
 
-/// verifier と、それから導いた challenge の対。
+/// A verifier paired with the challenge derived from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pkce {
     pub verifier: String,
     pub challenge: String,
 }
 
-/// `/dev/urandom` から読んだ乱数を base64url（パディング無し）にする。
+/// Turns randomness read from `/dev/urandom` into base64url (no padding).
 pub fn random_urlsafe(bytes: usize) -> Result<String, AuthError> {
     use base64::Engine;
     use std::io::Read;
@@ -23,7 +23,7 @@ pub fn random_urlsafe(bytes: usize) -> Result<String, AuthError> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf))
 }
 
-/// verifier から challenge を導く。S256 は「SHA-256 して base64url」である。
+/// Derives the challenge from the verifier. S256 is "SHA-256, then base64url."
 pub fn challenge_for(verifier: &str) -> String {
     use base64::Engine;
     use sha2::{Digest, Sha256};
@@ -32,8 +32,8 @@ pub fn challenge_for(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-/// 新しい対を作る。32 バイトの乱数は base64url で 43 文字になり、
-/// RFC が定める下限とちょうど一致する。
+/// Creates a new pair. 32 bytes of randomness becomes 43 characters in
+/// base64url, which exactly matches the lower bound the RFC sets.
 pub fn generate() -> Result<Pkce, AuthError> {
     let verifier = random_urlsafe(32)?;
     let challenge = challenge_for(&verifier);
@@ -47,8 +47,9 @@ pub fn generate() -> Result<Pkce, AuthError> {
 mod tests {
     use super::*;
 
-    /// RFC 7636 Appendix B の既知ベクタ。verifier をこの値に固定したとき、
-    /// challenge がこの値にならなければ S256 の計算が間違っている。
+    /// The known test vector from RFC 7636 Appendix B. With the verifier
+    /// fixed to this value, if the challenge doesn't come out to this
+    /// value, the S256 computation is wrong.
     #[test]
     fn s256_matches_the_rfc_test_vector() {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -56,49 +57,52 @@ mod tests {
         assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
     }
 
-    /// verifier は RFC が定める長さ（43〜128 文字）に収まり、
-    /// unreserved 文字だけで構成される。
+    /// verifier stays within the length the RFC sets (43-128 characters)
+    /// and consists only of unreserved characters.
     #[test]
     fn a_generated_verifier_is_within_the_rfc_length_and_charset() {
-        let p = generate().expect("生成できない");
+        let p = generate().expect("failed to generate");
         assert!(
             (43..=128).contains(&p.verifier.chars().count()),
-            "verifier の長さが RFC の範囲外: {}",
+            "verifier length is outside the RFC's range: {}",
             p.verifier.chars().count()
         );
         assert!(
             p.verifier
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)),
-            "verifier に unreserved 以外の文字がある: {}",
+            "verifier has a character outside unreserved: {}",
             p.verifier
         );
     }
 
-    /// 生成のたびに違う値が出る。固定値を返す実装がこのテストで落ちる。
-    /// 対になる肯定側は上の 2 本（形が正しいこと）が見ている。
+    /// Each generation produces a different value. An implementation that
+    /// returns a fixed value fails this test. The counterpart positive
+    /// check — that the shape is correct — is covered by the two tests
+    /// above.
     #[test]
     fn two_generations_differ() {
-        let a = generate().expect("生成できない");
-        let b = generate().expect("生成できない");
-        assert_ne!(a.verifier, b.verifier, "verifier が毎回同じ");
-        assert_ne!(a.challenge, b.challenge, "challenge が毎回同じ");
+        let a = generate().expect("failed to generate");
+        let b = generate().expect("failed to generate");
+        assert_ne!(a.verifier, b.verifier, "verifier is the same every time");
+        assert_ne!(a.challenge, b.challenge, "challenge is the same every time");
     }
 
-    /// 生成した対は整合している。challenge が verifier と無関係でないこと。
+    /// A generated pair is internally consistent. The challenge is not
+    /// unrelated to the verifier.
     #[test]
     fn a_generated_pair_is_self_consistent() {
-        let p = generate().expect("生成できない");
+        let p = generate().expect("failed to generate");
         assert_eq!(p.challenge, challenge_for(&p.verifier));
     }
 
     #[test]
     fn random_urlsafe_has_no_padding_and_no_unsafe_characters() {
-        let s = random_urlsafe(32).expect("生成できない");
-        assert!(!s.contains('='), "パディングが残っている: {s}");
+        let s = random_urlsafe(32).expect("failed to generate");
+        assert!(!s.contains('='), "padding is still present: {s}");
         assert!(
             !s.contains('+') && !s.contains('/'),
-            "URL 安全でない文字がある: {s}"
+            "has a character that isn't URL-safe: {s}"
         );
         assert!(!s.is_empty());
     }

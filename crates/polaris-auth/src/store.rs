@@ -1,23 +1,23 @@
-//! 資格情報の保管。`~/.polaris/auth.json`、0600、原子的書き込み。
+//! Storage for credentials. `~/.polaris/auth.json`, 0600, atomic writes.
 //!
-//! `~/.codex/auth.json` は読まない。コピーもしない。
+//! Never reads `~/.codex/auth.json`. Never copies it either.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::{AuthError, Credentials};
 
-/// 既定の保管先。`~/.polaris/auth.json`。
+/// The default storage location. `~/.polaris/auth.json`.
 pub fn default_path() -> Result<PathBuf, AuthError> {
     let home = std::env::var_os("HOME")
-        .ok_or_else(|| AuthError::Io(std::io::Error::other("HOME が設定されていない")))?;
+        .ok_or_else(|| AuthError::Io(std::io::Error::other("HOME is not set")))?;
     Ok(Path::new(&home).join(".polaris").join("auth.json"))
 }
 
-/// 保存する。一時ファイルを 0600 で新規作成し（既存の tmp を開き直す場合は
-/// set_permissions で締める）、書いてから rename する。rename は同一
-/// ディレクトリ内で原子的なので、途中で落ちても本体が半端な内容に
-/// 置き換わることがない。
+/// Saves. Creates the temp file newly at 0600 (when reopening an existing
+/// tmp, tightens it with set_permissions), writes, then renames. rename is
+/// atomic within the same directory, so even if we crash partway through,
+/// the real file never gets replaced with half-written content.
 pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -27,52 +27,57 @@ pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     }
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec_pretty(c)
-        .map_err(|e| AuthError::Decode(format!("資格情報を直列化できない: {e}")))?;
+        .map_err(|e| AuthError::Decode(format!("could not serialize credentials: {e}")))?;
 
-    // 0600 は open 時の mode と set_permissions の二重で保証する。これは
-    // 冗長ではない。両者は同じ後置条件へ別ルートで到達しているのではなく、
-    // それぞれ別の経路だけを担っている: mode は「tmp を新規作成する」経路
-    // （通常の save_to 呼び出しはほぼ毎回ここを通る）を、set_permissions は
-    // 「前回の書き込みが rename 前に中断し、緩いパーミッションの tmp が
-    // 残っていてそれを開き直す」経路を担う。
+    // 0600 is guaranteed by both the open-time mode AND set_permissions.
+    // This is not redundancy. The two do not reach the same postcondition by
+    // separate routes — each covers only its own distinct path: mode covers
+    // the "tmp is created fresh" path (an ordinary save_to call goes
+    // through here almost every time), while set_permissions covers the "a
+    // previous write was interrupted before rename, leaving a
+    // loosely-permissioned tmp behind, and we're reopening it" path.
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        // mode(0o600) はここが担う新規作成経路でのみ意味を持つ。open() が
-        // ファイルを新規作成する瞬間にモードをファイル生成へ埋め込むため、
-        // 生成からこの後の set_permissions が効くまでの間、ファイルが
-        // umask 既定（この環境では 0644）で存在する window は一切生じない。
-        // write_all/sync_all/drop の後で権限を締める set_permissions では、
-        // 生成の瞬間から締めるまでのこの window 自体を閉じることはできない
-        // — ここは平文の OAuth access_token/refresh_token を書き込む対象
-        // であり、この window を残さないことに意味がある。
+        // mode(0o600) only matters on the fresh-creation path this covers.
+        // Because open() embeds the mode into file creation at the instant
+        // it creates the file, no window ever opens where the file exists
+        // at the umask default (0644 in this environment) between creation
+        // and the point where the later set_permissions takes effect. With
+        // set_permissions alone tightening permissions after
+        // write_all/sync_all/drop, that window from the instant of creation
+        // to the moment it's tightened cannot be closed at all — this is a
+        // target that writes a plaintext OAuth access_token/refresh_token,
+        // and closing off that window matters.
         //
-        // ただしこの window は他プロセスからの並行アクセスでしか観測でき
-        // ない性質であり、単一スレッド・逐次実行のこのファイル内のテスト
-        // では、この mode(0o600) を消しても検出できない（個別ミューテー
-        // ション再検証で確認済み）。これは tmp+rename の原子性がテストで
-        // 観測不能なのと同種の限界で、polaris-sandbox の述語が「これは
-        // 緩和であって保証ではない」と明記する書き方に倣い、ここでも
-        // 「テストが無い＝忘れられた」ではなく「性質上テストできない」こと
-        // を明記しておく。この行を消してよい根拠には決してならない。
+        // That said, this window is only observable through concurrent
+        // access from another process, so within this file's tests, which
+        // are single-threaded and sequential, removing this mode(0o600)
+        // cannot be detected (confirmed by individual mutation
+        // re-verification). This is the same kind of limitation as the
+        // atomicity of tmp+rename being unobservable in tests; following
+        // how polaris-sandbox's predicates are written to spell out "this
+        // is a mitigation, not a guarantee," we spell out here too that
+        // this is "untestable by nature," not "no test means it was
+        // forgotten." This is never grounds for deleting this line.
         .mode(0o600)
         .open(&tmp)?;
     f.write_all(&body)?;
     f.sync_all()?;
     drop(f);
-    // set_permissions はこちらの経路（既存 tmp の開き直し）を担う。open 時
-    // の mode は新規作成のときにしか効かず、この経路で既存ファイルを開いた
-    // 場合には無力なので、set_permissions が unconditionally 効くことが
-    // この経路で 0600 を保証する唯一の手段になる。
-    // a_preexisting_loose_temp_file_is_still_corrected_to_owner_only で
-    // 個別にテストされている。
+    // set_permissions covers this path (reopening an existing tmp). The
+    // open-time mode only takes effect on fresh creation and is powerless
+    // when this path opens an existing file, so set_permissions taking
+    // effect unconditionally is the only means of guaranteeing 0600 on this
+    // path. Tested individually in
+    // a_preexisting_loose_temp_file_is_still_corrected_to_owner_only.
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// 読む。存在しないことは失敗ではない。壊れていることは失敗である。
+/// Reads. Nonexistence is not a failure. Corruption is.
 pub fn load_from(path: &Path) -> Result<Option<Credentials>, AuthError> {
     let body = match std::fs::read(path) {
         Ok(b) => b,
@@ -81,10 +86,10 @@ pub fn load_from(path: &Path) -> Result<Option<Credentials>, AuthError> {
     };
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|e| AuthError::Decode(format!("{} を解釈できない: {e}", path.display())))
+        .map_err(|e| AuthError::Decode(format!("could not parse {}: {e}", path.display())))
 }
 
-/// 削除する。戻り値は「実際にファイルがあったか」。
+/// Deletes. The return value is whether the file actually existed.
 pub fn delete_at(path: &Path) -> Result<bool, AuthError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -108,136 +113,146 @@ mod tests {
 
     #[test]
     fn a_saved_credential_round_trips() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp dir");
         let p = dir.path().join("auth.json");
-        save_to(&p, &sample()).expect("保存できない");
-        let got = load_from(&p).expect("読めない").expect("無い");
+        save_to(&p, &sample()).expect("failed to save");
+        let got = load_from(&p).expect("failed to read").expect("missing");
         assert_eq!(got, sample());
     }
 
     #[test]
     fn a_missing_file_is_not_an_error() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
-        let got = load_from(&dir.path().join("nope.json")).expect("存在しないことは失敗ではない");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let got = load_from(&dir.path().join("nope.json")).expect("nonexistence is not a failure");
         assert!(got.is_none());
     }
 
-    /// 資格情報のファイルは所有者だけが読める。他のプロセスから読めては
-    /// ならない。
+    /// The credentials file is readable only by its owner. It must not be
+    /// readable from another process.
     #[test]
     fn the_saved_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp dir");
         let p = dir.path().join("auth.json");
-        save_to(&p, &sample()).expect("保存できない");
+        save_to(&p, &sample()).expect("failed to save");
         let mode = std::fs::metadata(&p)
-            .expect("メタデータ")
+            .expect("metadata")
             .permissions()
             .mode();
         assert_eq!(
             mode & 0o777,
             0o600,
-            "パーミッションが 0600 でない: {:o}",
+            "permissions are not 0600: {:o}",
             mode & 0o777
         );
     }
 
-    /// 上書き保存でもパーミッションが緩まない。1 回目で 0600 になっても、
-    /// 2 回目が既定の 0644 で作り直せば穴が開く。
+    /// Permissions don't loosen even on an overwriting save. Becoming 0600
+    /// the first time doesn't stop a hole opening up if the second
+    /// recreates it at the default 0644.
     #[test]
     fn overwriting_keeps_the_file_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp dir");
         let p = dir.path().join("auth.json");
-        save_to(&p, &sample()).expect("保存できない");
+        save_to(&p, &sample()).expect("failed to save");
         let mut second = sample();
         second.access_token = "at2".into();
-        save_to(&p, &second).expect("保存できない");
+        save_to(&p, &second).expect("failed to save");
         let mode = std::fs::metadata(&p)
-            .expect("メタデータ")
+            .expect("metadata")
             .permissions()
             .mode();
         assert_eq!(
             mode & 0o777,
             0o600,
-            "上書きでパーミッションが緩んだ: {:o}",
+            "permissions loosened on overwrite: {:o}",
             mode & 0o777
         );
         assert_eq!(
-            load_from(&p).expect("読めない").expect("無い").access_token,
+            load_from(&p)
+                .expect("failed to read")
+                .expect("missing")
+                .access_token,
             "at2"
         );
     }
 
-    /// 一時ファイルが既に緩いパーミッションで残っている場合（前回の
-    /// 書き込みが rename 前に中断したなど）、open 時の mode は既存ファイル
-    /// を開くだけでは効かない。それでも set_permissions が unconditionally
-    /// 効くので、本体は 0600 になる。
+    /// When a temp file is already left behind with loose permissions (e.g.
+    /// a previous write was interrupted before rename), the open-time mode
+    /// has no effect from merely opening an existing file. Even so,
+    /// set_permissions takes effect unconditionally, so the real file ends
+    /// up at 0600.
     #[test]
     fn a_preexisting_loose_temp_file_is_still_corrected_to_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp dir");
         let p = dir.path().join("auth.json");
         let tmp = p.with_extension("json.tmp");
-        std::fs::write(&tmp, b"leftover").expect("書けない");
+        std::fs::write(&tmp, b"leftover").expect("failed to write");
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
-            .expect("パーミッションを設定できない");
+            .expect("failed to set permissions");
 
-        save_to(&p, &sample()).expect("保存できない");
+        save_to(&p, &sample()).expect("failed to save");
 
         let mode = std::fs::metadata(&p)
-            .expect("メタデータ")
+            .expect("metadata")
             .permissions()
             .mode();
         assert_eq!(
             mode & 0o777,
             0o600,
-            "使い回した一時ファイルの緩いパーミッションが残った: {:o}",
+            "the reused temp file's loose permissions survived: {:o}",
             mode & 0o777
         );
     }
 
-    /// 書き込みは一時ファイルへ書いてから rename する。rename の前に
-    /// 落ちても旧ファイルは無傷である。ここでは「一時ファイルが残っていても
-    /// 本体は旧内容のまま読める」ことで、書き込み先が本体でないことを見る。
+    /// A write goes to the temp file, then renames. Crashing before the
+    /// rename leaves the old file intact. Here we check that the write
+    /// target isn't the real file, by confirming that "even with a temp
+    /// file left behind, the real file still reads back its old content."
     #[test]
     fn a_leftover_temp_file_does_not_disturb_the_stored_credentials() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp dir");
         let p = dir.path().join("auth.json");
-        save_to(&p, &sample()).expect("保存できない");
+        save_to(&p, &sample()).expect("failed to save");
 
-        // 中断された書き込みの痕跡を模す。
-        std::fs::write(dir.path().join("auth.json.tmp"), b"half-written").expect("書けない");
+        // Simulates the trace of an interrupted write.
+        std::fs::write(dir.path().join("auth.json.tmp"), b"half-written").expect("failed to write");
 
-        let got = load_from(&p).expect("読めない").expect("無い");
-        assert_eq!(got, sample(), "本体が一時ファイルに汚染されている");
+        let got = load_from(&p).expect("failed to read").expect("missing");
+        assert_eq!(
+            got,
+            sample(),
+            "the real file was contaminated by the temp file"
+        );
     }
 
     #[test]
     fn delete_reports_whether_a_file_was_there() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp dir");
         let p = dir.path().join("auth.json");
         assert!(
-            !delete_at(&p).expect("削除で失敗しない"),
-            "無いのに消したと言った"
+            !delete_at(&p).expect("delete shouldn't fail"),
+            "said it deleted something that wasn't there"
         );
-        save_to(&p, &sample()).expect("保存できない");
+        save_to(&p, &sample()).expect("failed to save");
         assert!(
-            delete_at(&p).expect("削除できない"),
-            "あったのに消していないと言った"
+            delete_at(&p).expect("failed to delete"),
+            "said it didn't delete something that was there"
         );
         assert!(!p.exists());
     }
 
     #[test]
     fn a_corrupt_file_is_an_error_not_a_silent_absence() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp dir");
         let p = dir.path().join("auth.json");
-        std::fs::write(&p, b"{ not json").expect("書けない");
-        let err = load_from(&p).expect_err("壊れたファイルは失敗であるべき");
+        std::fs::write(&p, b"{ not json").expect("failed to write");
+        let err = load_from(&p).expect_err("a corrupt file should fail");
         assert!(
             matches!(err, AuthError::Decode(_)),
-            "壊れたファイルが Decode 以外になっている: {err:?}"
+            "corrupt file resulted in something other than Decode: {err:?}"
         );
     }
 }

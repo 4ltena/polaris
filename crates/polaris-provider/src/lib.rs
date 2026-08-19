@@ -113,6 +113,11 @@ pub trait Provider: Send + Sync {
 pub struct Token {
     pub access_token: String,
     pub account_id: String,
+    /// Responses API へ送る `reasoning.effort`。`polaris-auth` の
+    /// `chatgpt_plan_type` から決まる値で、決められなければ `None`。
+    /// `polaris-provider` は `polaris-auth` に依存しないため、値の由来は
+    /// 知らず、渡された文字列をそのまま使うだけである。
+    pub effort: Option<String>,
 }
 
 /// トークンの供給元。`token()` は「いま使えるもの」を返し、`refreshed()`
@@ -188,12 +193,14 @@ mod tests {
             Ok(Token {
                 access_token: self.first.clone(),
                 account_id: "acct".into(),
+                effort: None,
             })
         }
         async fn refreshed(&self) -> Result<Token, ProviderError> {
             Ok(Token {
                 access_token: self.second.clone(),
                 account_id: "acct".into(),
+                effort: None,
             })
         }
     }

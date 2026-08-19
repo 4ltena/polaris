@@ -18,7 +18,15 @@ use crate::{
 /// 要求先。`store` を使わないので、この 1 本しか叩かない。
 pub const ENDPOINT_BASE: &str = "https://chatgpt.com/backend-api/codex";
 /// `POLARIS_MODEL` を省いたときの既定。
-pub const DEFAULT_MODEL: &str = "gpt-5.3-codex";
+///
+/// 設計時にバイナリの文字列から拾った `gpt-5.1-codex-max` /
+/// `gpt-5.2-codex` / `gpt-5.3-codex` は、実カタログ（`codex debug
+/// models`）に1つも存在しなかった。実バックエンドは 400 で
+/// 「ChatGPT アカウントでの Codex 利用ではサポートされていない」と
+/// 明確に返しており、認証自体は通っていた（401 ではない）。実カタログの
+/// 最優先モデルへ差し替える。仕様が明記するとおり、この名前が今後も
+/// 通る保証は無い。
+pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 
 /// 履歴を Responses の `input` 要素列へ変換する。
 pub fn input_items(messages: &[Message]) -> Vec<Value> {
@@ -76,7 +84,11 @@ pub fn tool_wire_shape(tools: &[polaris_tools::ToolSpec]) -> Vec<Value> {
 }
 
 /// 要求本文を組み立てる。
-pub fn build_body(model: &str, req: &CompletionRequest) -> Value {
+///
+/// `effort` は `reasoning.effort` として送る。`None` なら `reasoning`
+/// キー自体を出さず、サーバの既定に委ねる — `tools` を空配列ではなく
+/// キーごと省く既存の判断と同じ形である。
+pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) -> Value {
     let mut body = serde_json::json!({
         "model": model,
         "instructions": req.system,
@@ -89,6 +101,9 @@ pub fn build_body(model: &str, req: &CompletionRequest) -> Value {
     let tools = tool_wire_shape(&req.tools);
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
+    }
+    if let Some(e) = effort {
+        body["reasoning"] = serde_json::json!({ "effort": e });
     }
     body
 }
@@ -247,18 +262,24 @@ impl CodexProvider {
 
     /// 1 回の要求を投げ、SSE を畳む。401 はここでは畳まず、そのまま
     /// 呼び出し側へ返して再試行の判断をさせる。
+    ///
+    /// 本文はここで組み立てる。`token` ごとに `effort` が変わりうる
+    /// （更新後のトークンが別のプラン判定を持つことは実際には無いが、
+    /// 「その回の試行が使ったトークンの effort をその回の本文に使う」
+    /// という対応を保つほうが、呼び出し側で本文を使い回すより誤りにくい）。
     async fn attempt(
         &self,
         token: &crate::Token,
-        body: &Value,
+        req: &CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
+        let body = build_body(&self.model, req, token.effort.as_deref());
         let resp = self
             .client
             .post(format!("{}/responses", self.base))
             .bearer_auth(&token.access_token)
             .header("chatgpt-account-id", &token.account_id)
             .header("accept", "text/event-stream")
-            .json(body)
+            .json(&body)
             .send()
             .await
             .map_err(|e| ProviderError::Http(e.to_string()))?;
@@ -311,14 +332,12 @@ impl CodexProvider {
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
-        let body = build_body(&self.model, &req);
-
         let token = self.tokens.token().await?;
-        match self.attempt(&token, &body).await {
+        match self.attempt(&token, &req).await {
             Err(ProviderError::Auth(_)) => {
                 // 1 回だけ。無限に再試行しない。
                 let token = self.tokens.refreshed().await?;
-                self.attempt(&token, &body).await.map_err(|e| match e {
+                self.attempt(&token, &req).await.map_err(|e| match e {
                     ProviderError::Auth(_) => ProviderError::Auth(
                         "更新後も認証を拒否された。`polaris login` をやり直すこと".into(),
                     ),
@@ -600,7 +619,7 @@ mod tests {
             messages: vec![Message::user("やって")],
             tools: polaris_tools::all_specs(),
         };
-        let body = build_body("gpt-5.3-codex", &req);
+        let body = build_body("gpt-5.3-codex", &req, None);
 
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["instructions"], "システム");
@@ -618,6 +637,10 @@ mod tests {
             body["tools"].as_array().expect("tools が配列でない").len(),
             req.tools.len()
         );
+        assert!(
+            body.get("reasoning").is_none(),
+            "effort を渡していないのに reasoning を送っている"
+        );
     }
 
     /// ツールが 1 本も無いときは `tools` を送らない。空配列を送ると、
@@ -629,8 +652,22 @@ mod tests {
             messages: vec![Message::user("x")],
             tools: vec![],
         };
-        let body = build_body("m", &req);
+        let body = build_body("m", &req, None);
         assert!(body.get("tools").is_none(), "空の tools を送っている");
+    }
+
+    /// `effort` を渡したときは `reasoning.effort` として乗る。渡さなければ
+    /// `reasoning` キー自体が無いことの対。片方だけでは、常に
+    /// reasoning を出す実装も、常に省く実装も通ってしまう。
+    #[test]
+    fn an_effort_becomes_the_reasoning_field() {
+        let req = CompletionRequest {
+            system: "s".into(),
+            messages: vec![Message::user("x")],
+            tools: vec![],
+        };
+        let body = build_body("m", &req, Some("xhigh"));
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
     use std::sync::Arc;
@@ -659,6 +696,7 @@ mod tests {
             Ok(crate::Token {
                 access_token: "first".into(),
                 account_id: "acct-1".into(),
+                effort: None,
             })
         }
         async fn refreshed(&self) -> Result<crate::Token, ProviderError> {
@@ -666,6 +704,7 @@ mod tests {
             Ok(crate::Token {
                 access_token: "second".into(),
                 account_id: "acct-1".into(),
+                effort: None,
             })
         }
     }

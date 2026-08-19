@@ -66,7 +66,7 @@ fn cap_bytes(text: &str, limit: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-/// Formats the candidate list up to `MAX_RESULTS` entries and
+/// Formats the candidate list up to `max_count` entries and
 /// `MAX_LIST_BYTES` bytes. If either one causes a cutoff, state explicitly
 /// that it was cut off — silently returning only part of the list would let
 /// the model mistake it for the full set.
@@ -96,6 +96,16 @@ fn list_candidates(items: &[&Skill], header: &str, max_count: usize) -> String {
 
 /// Looks up the given term as a skill name; if it doesn't match, searches
 /// names and descriptions instead.
+///
+/// A search ranks by BM25 over skill names and descriptions, with stemming
+/// and synonym expansion applied to both the query and the corpus. Because
+/// BM25's tokenizer only recognizes ASCII tokens, a query that scores every
+/// skill at 0 (Japanese and other non-Latin queries, or one sharing no
+/// vocabulary with any skill) falls back to the old substring-containment
+/// match instead, so CJK and short substring/prefix queries stay reachable.
+/// Whatever the search finds is always joined with the small set of
+/// "near-universal" skills, which are included regardless of query
+/// relevance.
 ///
 /// The reason a search doesn't return the body is progressive disclosure:
 /// it lets a candidate be seen before deciding whether to read it. If every
@@ -144,12 +154,47 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
     }
 
     let index = bm25::Bm25::new(skills);
-    let ranked = index.rank(q, MAX_RESULTS);
-    let universal = near_universal::near_universal(skills);
-    let mut combined: Vec<&Skill> = ranked;
-    for u in universal {
-        if !combined.iter().any(|s| s.name == u.name) {
-            combined.push(u);
+    let mut ranked = index.rank(q, MAX_RESULTS);
+
+    // BM25's tokenizer only extracts ASCII [a-z0-9]+ tokens, so a query
+    // written in Japanese (or any non-Latin script), or one with no token
+    // overlapping any skill's vocabulary, scores every skill at 0. The
+    // previous substring-containment search had no such limitation.
+    // Falling back to it here when BM25 finds nothing keeps
+    // Japanese-described skills and short substring/prefix queries
+    // reachable, matching the spec's requirement not to regress CJK
+    // search behavior.
+    if ranked.is_empty() {
+        let needle = q.to_lowercase();
+        ranked = skills
+            .iter()
+            .filter(|s| {
+                s.name.to_lowercase().contains(&needle)
+                    || s.description.to_lowercase().contains(&needle)
+            })
+            .take(MAX_RESULTS)
+            .collect();
+    }
+
+    // Whether the real content search found anything, independent of
+    // near_universal -- drives which message header is shown below, so a
+    // query that matched nothing doesn't read as if it succeeded just
+    // because a near-universal skill is always present.
+    let content_found = !ranked.is_empty();
+
+    // near_universal items go first: `list_candidates`'s byte cap
+    // truncates in slice order, so appending them after `ranked` would
+    // let a corpus of large (e.g. Japanese) descriptions push them past
+    // the cap and silently defeat the "always included" guarantee they
+    // exist for. Putting them first means the content search results are
+    // what get trimmed under byte pressure, not the always-included set.
+    // Dedup relies on `polaris-skills`'s discovery guaranteeing unique
+    // names within a single loaded skill set (first name wins on a
+    // collision) -- `lookup` itself does not re-enforce that here.
+    let mut combined: Vec<&Skill> = near_universal::near_universal(skills);
+    for r in ranked.iter() {
+        if !combined.iter().any(|s| s.name == r.name) {
+            combined.push(r);
         }
     }
 
@@ -171,9 +216,14 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
         return list_candidates(&all, &header, MAX_RESULTS);
     }
 
+    let header = if content_found {
+        "candidates. pass the name as-is if you need the body.\n"
+    } else {
+        "no direct match for the search; showing skills that apply almost always instead.\n"
+    };
     list_candidates(
         &combined,
-        "candidates. pass the name as-is if you need the body.\n",
+        header,
         MAX_RESULTS + near_universal::MAX_NEAR_UNIVERSAL,
     )
 }
@@ -229,8 +279,8 @@ mod tests {
         // single skill exists" never shows up in output from a search that
         // simply found no match. If the early return for `skills.is_empty()`
         // were removed, a query against an empty set would fall into the
-        // `hits.is_empty()` path and produce output without this wording,
-        // which is what lets this difference be detected.
+        // `combined.is_empty()` path and produce output without this
+        // wording, which is what lets this difference be detected.
         let empty_set = lookup(&[], "something");
         assert!(
             empty_set.contains("no skill was found at all"),
@@ -580,5 +630,85 @@ mod tests {
         assert!(out.contains("deploy-tool"));
         assert!(out.contains("candidates. pass the name as-is if you need the body."));
         assert_eq!(out.matches("deploy-tool").count(), 1);
+    }
+
+    #[test]
+    fn near_universal_survives_when_content_search_alone_would_fill_the_count_cap() {
+        let mut skills: Vec<Skill> = (0..(MAX_RESULTS + 10))
+            .map(|i| Skill {
+                name: format!("deploy-tool-{i:02}"),
+                description: "Handles deployment to production servers.".into(),
+                body: "body".into(),
+                path: format!("/x/deploy-tool-{i:02}/SKILL.md").into(),
+            })
+            .collect();
+        skills.push(Skill {
+            name: "test-driven-development".into(),
+            description:
+                "Use when implementing any feature or bugfix, before writing implementation code"
+                    .into(),
+            body: "body".into(),
+            path: "/x/test-driven-development/SKILL.md".into(),
+        });
+        let out = lookup(&skills, "deploying to production servers");
+        assert!(
+            out.contains("test-driven-development"),
+            "near-universal skill was truncated away despite the count cap: {out}"
+        );
+        let deploy_count = (0..(MAX_RESULTS + 10))
+            .filter(|i| out.contains(&format!("deploy-tool-{i:02}")))
+            .count();
+        assert_eq!(
+            deploy_count, MAX_RESULTS,
+            "expected exactly MAX_RESULTS content-search hits, got {deploy_count}: {out}"
+        );
+    }
+
+    #[test]
+    fn a_skill_that_is_both_near_universal_and_a_strong_content_match_appears_once() {
+        let skills = vec![Skill {
+            name: "test-driven-development".into(),
+            description:
+                "Use when implementing any feature or bugfix, before writing implementation code"
+                    .into(),
+            body: "body".into(),
+            path: "/x/test-driven-development/SKILL.md".into(),
+        }];
+        let out = lookup(&skills, "implementing a feature or bugfix");
+        assert_eq!(out.matches("test-driven-development").count(), 1);
+    }
+
+    #[test]
+    fn a_query_matching_nothing_but_near_universal_present_gets_a_distinct_header() {
+        let skills = vec![
+            Skill {
+                name: "test-driven-development".into(),
+                description: "Use when implementing any feature or bugfix, before writing implementation code".into(),
+                body: "body".into(),
+                path: "/x/test-driven-development/SKILL.md".into(),
+            },
+            Skill {
+                name: "deploy-tool".into(),
+                description: "Handles deployment to production servers.".into(),
+                body: "body".into(),
+                path: "/x/deploy-tool/SKILL.md".into(),
+            },
+        ];
+        let out = lookup(&skills, "a completely unrelated term");
+        assert!(out.contains("no direct match"));
+        assert!(out.contains("test-driven-development"));
+        assert!(!out.contains("deploy-tool"));
+    }
+
+    #[test]
+    fn a_japanese_query_still_finds_a_skill_via_the_substring_fallback() {
+        let skills = vec![Skill {
+            name: "profile-generator".into(),
+            description: "日本語の紹介文を生成する。".into(),
+            body: "body".into(),
+            path: "/x/profile-generator/SKILL.md".into(),
+        }];
+        let out = lookup(&skills, "紹介文");
+        assert!(out.contains("profile-generator"));
     }
 }

@@ -210,9 +210,14 @@ mod tests {
 
     #[test]
     fn stemming_does_not_strip_below_the_minimum_stem_length() {
-        // "es" stripped from "ies"-less "yes" would leave "y", under the
-        // length-3 floor, so it must stay unchanged instead.
+        // "yes" returns via the earlier len() <= 4 short-circuit -- it
+        // never reaches the suffix loop below at all.
         assert_eq!(stem("yes"), "yes");
+        // "bring" (len 5, > 4) reaches the suffix loop and matches "ing",
+        // but the stripped remainder "br" has length 2, under the
+        // length-3 floor, so the rule does not apply. This is the
+        // floor's actual trigger case.
+        assert_eq!(stem("bring"), "bring");
     }
 
     #[test]
@@ -345,5 +350,43 @@ mod tests {
         let index = Bm25::new(&skills);
         let hits = index.rank("how do I write a commit for this", 20);
         assert!(hits.iter().any(|s| s.name == "git-commit"));
+    }
+
+    #[test]
+    fn rank_truncates_to_k_even_when_more_candidates_score_positively() {
+        let skills: Vec<Skill> = (0..10)
+            .map(|i| Skill {
+                name: format!("deploy-tool-{i}"),
+                description: "Handles deployment to production servers.".into(),
+                body: "b".into(),
+                path: format!("/x/deploy-tool-{i}/SKILL.md").into(),
+            })
+            .collect();
+        let index = Bm25::new(&skills);
+        let hits = index.rank("deploying to production", 3);
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn rank_breaks_ties_by_name_ascending() {
+        let skills = vec![
+            Skill {
+                name: "zeta-deploy".into(),
+                description: "Handles deployment to production.".into(),
+                body: "b".into(),
+                path: "/x/zeta-deploy/SKILL.md".into(),
+            },
+            Skill {
+                name: "alpha-deploy".into(),
+                description: "Handles deployment to production.".into(),
+                body: "b".into(),
+                path: "/x/alpha-deploy/SKILL.md".into(),
+            },
+        ];
+        let index = Bm25::new(&skills);
+        let hits = index.rank("deployment production", 20);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].name, "alpha-deploy");
+        assert_eq!(hits[1].name, "zeta-deploy");
     }
 }

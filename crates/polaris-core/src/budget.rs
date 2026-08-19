@@ -299,6 +299,11 @@ mod tests {
         let tokens_many = crate::prompt::assemble_always_on("", "", &many).tokens();
 
         assert_eq!(
+            crate::prompt::assemble_always_on("", "", &many).skills_seen(),
+            many.len()
+        );
+
+        assert_eq!(
             tokens_none, tokens_some,
             "AlwaysOn tokens moved when near-universal skills were added"
         );

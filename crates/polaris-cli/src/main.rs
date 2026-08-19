@@ -27,7 +27,7 @@ use polaris_sandbox::{SandboxMode, SandboxPolicy};
   POLARIS_PROVIDER  openai（既定）または codex。codex は `polaris login` の認証を使う。
   POLARIS_API_KEY   provider=openai のとき必須。OpenAI 互換エンドポイントの API キー。
   POLARIS_BASE_URL  provider=openai のとき、省略時 https://api.openai.com/v1
-  POLARIS_MODEL     省略時 gpt-5.4（openai）/ gpt-5.3-codex（codex）
+  POLARIS_MODEL     省略時 gpt-5.4（openai）/ gpt-5.6-sol（codex）
 "
 )]
 struct Args {
@@ -152,15 +152,24 @@ fn to_provider_error(e: polaris_auth::AuthError) -> polaris_provider::ProviderEr
     }
 }
 
+/// `access_token` の `chatgpt_plan_type` claim から `reasoning.effort` を
+/// 決める。決められなければ `None` を返し、サーバの既定へ委ねる。
+fn effort_for(access_token: &str) -> Option<String> {
+    let plan = polaris_auth::token::plan_type_from_access_token(access_token);
+    polaris_auth::effort_for_plan_type(plan.as_deref()).map(|s| s.to_string())
+}
+
 #[async_trait::async_trait]
 impl polaris_provider::TokenSource for AuthTokens {
     async fn token(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
         let c = polaris_auth::ensure_fresh(&self.issuer, &self.store)
             .await
             .map_err(to_provider_error)?;
+        let effort = effort_for(&c.access_token);
         Ok(polaris_provider::Token {
             access_token: c.access_token,
             account_id: c.account_id,
+            effort,
         })
     }
 
@@ -168,9 +177,11 @@ impl polaris_provider::TokenSource for AuthTokens {
         let c = polaris_auth::force_refresh(&self.issuer, &self.store)
             .await
             .map_err(to_provider_error)?;
+        let effort = effort_for(&c.access_token);
         Ok(polaris_provider::Token {
             access_token: c.access_token,
             account_id: c.account_id,
+            effort,
         })
     }
 }

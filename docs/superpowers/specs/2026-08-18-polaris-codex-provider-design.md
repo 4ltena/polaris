@@ -36,7 +36,7 @@ OpenAI は Codex for Open Source の案内で、第三者クライアントを�
 | コールバック | `http://localhost:1455/auth/callback` |
 | API | `https://chatgpt.com/backend-api/codex/responses` |
 | ヘッダ | `Authorization: Bearer <access_token>`、`chatgpt-account-id` |
-| モデル | `gpt-5.1-codex-max`、`gpt-5.2-codex`、`gpt-5.3-codex` |
+| モデル | 設計時にバイナリの文字列から拾った `gpt-5.1-codex-max`・`gpt-5.2-codex`・`gpt-5.3-codex` は、後の実機検証で実カタログに1つも存在しないと判明した（400、ChatGPT アカウントでの Codex 利用は未サポートと明確に拒否。認証自体は通っていた）。実際に有効な名前は `codex debug models` の実カタログでのみ確認できる。実装は `gpt-5.6-sol` を既定とする |
 
 コールバックのポート 1455 は client_id に登録済みの redirect_uri であり、変更
 できない。したがって polaris の login はこのポートを掴む必要があり、
@@ -207,7 +207,14 @@ pub struct Token {
 
 `POLARIS_PROVIDER` が `openai` と `codex` をとる。既定は `openai` であり、
 現行の挙動は変わらない。`POLARIS_MODEL` は共用し、`codex` のときの既定を
-`gpt-5.3-codex` とする。
+`gpt-5.6-sol` とする（実機検証で判明した実カタログの値。上の「前提と根拠」
+節を参照）。
+
+`reasoning.effort` は `chatgpt_plan_type`（`access_token` の claim）から
+決める。`plus` は `low`、`pro` で始まる値（`pro`・`prolite` 等、Pro の
+利用量ティアは `plan_type` だけでは区別できないため一律）は `xhigh`。
+どちらにも当たらない値や取得できない場合は `reasoning` キー自体を送らず、
+サーバの既定に委ねる。
 
 サブコマンド `login` と `logout` を追加する。ここには既知の罠がある。現行の
 `--prompt` は `required_unless_present = "confined_apply"` であり、M2 の Task 8

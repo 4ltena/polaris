@@ -80,6 +80,27 @@ pub fn needs_refresh(c: &Credentials, now: u64) -> bool {
     }
 }
 
+/// `chatgpt_plan_type` から Responses API へ送る `reasoning.effort` を決める。
+///
+/// Pro の利用量ティア（5x/20x 等）は `plan_type` だけでは区別できない
+/// （`plus`/`pro`/`prolite`/`team`/`enterprise` 等の区分しか持たない）。
+/// この区別には別の rate-limit/credits 系 API が要り、今回のログイン
+/// スコープでは取得経路が無い。区別できない以上、pro 系はすべて xhigh へ
+/// 倒す — 低く倒すと Pro の高いティアの利用者が不必要に弱い推論を強いられ、
+/// 高く倒すと Plus の利用者だけが誤って重い設定になる。両者のうち、pro
+/// 系利用者が能力を発揮できることを優先した。
+///
+/// `plus`/`pro*` のどちらでもない値（`free`・`team`・`enterprise` 等）や
+/// 取得できなかった場合は `None` を返し、サーバの既定へ委ねる。ここに
+/// 無い区分の挙動を当て推量しないためである。
+pub fn effort_for_plan_type(plan_type: Option<&str>) -> Option<&'static str> {
+    match plan_type {
+        Some("plus") => Some("low"),
+        Some(s) if s.starts_with("pro") => Some("xhigh"),
+        _ => None,
+    }
+}
+
 /// 保管された資格情報を読み、必要なら更新して返す。
 pub async fn ensure_fresh(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
     let c = store::load_from(store_path)?.ok_or(AuthError::NotLoggedIn)?;
@@ -148,6 +169,29 @@ mod tests {
     fn an_expired_token_needs_refresh() {
         let now = 1_000_000;
         assert!(needs_refresh(&creds(Some(now - 1)), now));
+    }
+
+    #[test]
+    fn plus_gets_a_low_effort() {
+        assert_eq!(effort_for_plan_type(Some("plus")), Some("low"));
+    }
+
+    /// pro の利用量ティア（5x/20x）は plan_type だけでは区別できないので、
+    /// pro で始まる値はすべて xhigh へ倒す。`pro` そのものだけでなく
+    /// `prolite` のような接頭辞一致も対象であることを対で見る —
+    /// 完全一致 `== "pro"` に弱めた実装だとこちらだけが落ちる。
+    #[test]
+    fn pro_and_its_variants_get_a_high_effort() {
+        assert_eq!(effort_for_plan_type(Some("pro")), Some("xhigh"));
+        assert_eq!(effort_for_plan_type(Some("prolite")), Some("xhigh"));
+    }
+
+    /// plus でも pro 系でもない値は、当て推量せずサーバの既定へ委ねる。
+    #[test]
+    fn an_unmapped_plan_defers_to_the_server_default() {
+        assert_eq!(effort_for_plan_type(Some("team")), None);
+        assert_eq!(effort_for_plan_type(Some("free")), None);
+        assert_eq!(effort_for_plan_type(None), None);
     }
 
     #[tokio::test]

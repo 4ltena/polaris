@@ -27,7 +27,7 @@ cargo build --release
 | `POLARIS_PROVIDER` | `openai` | `openai` か `codex`。`codex` は `polaris login` で得た ChatGPT のサブスクリプション認証を使い、API キーを要しない。 |
 | `POLARIS_API_KEY` | なし | `POLARIS_PROVIDER=openai` のとき必須。OpenAI 互換エンドポイントの API キー。 |
 | `POLARIS_BASE_URL` | `https://api.openai.com/v1` | `POLARIS_PROVIDER=openai` のときのベース URL。 |
-| `POLARIS_MODEL` | `gpt-5.4` / `gpt-5.3-codex` | 使用するモデル名。既定はプロバイダごとに異なる。 |
+| `POLARIS_MODEL` | `gpt-5.4` / `gpt-5.6-sol` | 使用するモデル名。既定はプロバイダごとに異なる。`codex` の既定は `codex debug models` の実カタログで確認できる。 |
 
 `polaris --help` にも同じ内容を載せてある。
 

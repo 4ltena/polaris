@@ -43,6 +43,26 @@ pub fn account_id_from_id_token(id_token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// `access_token`（JWT）の payload から chatgpt_plan_type を取り出す。
+///
+/// `account_id_from_id_token` と同じ理由で署名は検証しない。ただしこちらは
+/// `id_token` ではなく `access_token` を読む — `chatgpt_plan_type` は
+/// `access_token` の claim にあり、`id_token` には無い。壊れていたら
+/// `None` を返し、panic しないことをテストで固定する。
+pub fn plan_type_from_access_token(access_token: &str) -> Option<String> {
+    use base64::Engine;
+
+    let payload_b64 = access_token.split('.').nth(1)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    v.get("https://api.openai.com/auth")
+        .and_then(|a| a.get("chatgpt_plan_type"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+}
+
 /// フォーム POST を投げて `Credentials` を組み立てる共通部分。
 /// `fallback_refresh` は、応答が refresh_token を省いたときに保つ値。
 /// `fallback_account` は、応答が id_token を省いたときに保つ account_id。
@@ -166,6 +186,17 @@ pub(crate) fn id_token_with_account(account: &str) -> String {
     use base64::Engine;
     let payload = serde_json::json!({
         "https://api.openai.com/auth": { "chatgpt_account_id": account }
+    });
+    let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&payload).unwrap());
+    format!("header.{b}.signature")
+}
+
+#[cfg(test)]
+pub(crate) fn access_token_with_plan(plan: &str) -> String {
+    use base64::Engine;
+    let payload = serde_json::json!({
+        "https://api.openai.com/auth": { "chatgpt_plan_type": plan }
     });
     let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&payload).unwrap());
@@ -306,5 +337,19 @@ mod tests {
         assert!(account_id_from_id_token("not-a-jwt").is_none());
         assert!(account_id_from_id_token("a.!!!.c").is_none());
         assert!(account_id_from_id_token("").is_none());
+    }
+
+    #[test]
+    fn the_plan_type_comes_out_of_the_access_token_payload() {
+        let got =
+            plan_type_from_access_token(&access_token_with_plan("plus")).expect("取り出せるべき");
+        assert_eq!(got, "plus");
+    }
+
+    #[test]
+    fn a_malformed_access_token_does_not_panic() {
+        assert!(plan_type_from_access_token("not-a-jwt").is_none());
+        assert!(plan_type_from_access_token("a.!!!.c").is_none());
+        assert!(plan_type_from_access_token("").is_none());
     }
 }

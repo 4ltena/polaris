@@ -190,7 +190,7 @@ fn an_edit_whose_marker_is_absent_is_a_request_problem_not_a_policy_denial() {
         panic!("要求の問題ではなく別の種類として返っている: {err:?}");
     };
     assert!(
-        detail.contains("見つからない"),
+        detail.contains("not found"),
         "子が報告した理由が届いていない: {detail}"
     );
 

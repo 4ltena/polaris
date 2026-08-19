@@ -1,23 +1,23 @@
-//! SKILL.md のフロントマター解析。仕様が定める制約だけを検証し、独自の制約を足さない。
+//! SKILL.md frontmatter parsing. Validates only the constraints the specification lays down; adds no constraints of its own.
 
-/// 仕様が `name` に課す上限。
+/// The upper bound the specification places on `name`.
 const NAME_MAX: usize = 64;
-/// 仕様が `description` に課す上限。
+/// The upper bound the specification places on `description`.
 const DESCRIPTION_MAX: usize = 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SkillError {
-    #[error("{skill} の SKILL.md にフロントマターが無い")]
+    #[error("{skill}'s SKILL.md has no frontmatter")]
     NoFrontmatter { skill: String },
-    #[error("{skill} の SKILL.md に必須フィールド {field} が無い")]
+    #[error("{skill}'s SKILL.md is missing the required field {field}")]
     MissingField { skill: String, field: &'static str },
-    #[error("name {name} が仕様の命名規則に反する")]
+    #[error("name {name} violates the specification's naming rules")]
     InvalidName { name: String },
-    #[error("name {name} が親ディレクトリ名 {dir} と一致しない")]
+    #[error("name {name} does not match the parent directory name {dir}")]
     NameMismatch { name: String, dir: String },
-    #[error("{skill} の SKILL.md で description の長さ {len} が範囲外")]
+    #[error("{skill}'s SKILL.md has a description length {len} outside the allowed range")]
     InvalidDescription { skill: String, len: usize },
-    #[error("{skill} の SKILL.md の {field} が未対応の構文を含む: {detail}")]
+    #[error("{skill}'s SKILL.md field {field} contains unsupported syntax: {detail}")]
     UnsupportedSyntax {
         skill: String,
         field: &'static str,
@@ -25,7 +25,7 @@ pub enum SkillError {
     },
 }
 
-/// 仕様の命名規則。小文字英数字とハイフンのみ、先頭末尾にハイフンなし、連続ハイフンなし、1 から 64 文字。
+/// The specification's naming rule: lowercase alphanumerics and hyphens only, no leading or trailing hyphen, no consecutive hyphens, 1 to 64 characters.
 fn name_is_valid(name: &str) -> bool {
     if name.is_empty() || name.chars().count() > NAME_MAX {
         return false;
@@ -37,9 +37,10 @@ fn name_is_valid(name: &str) -> bool {
         .all(|c| c == '-' || c.is_ascii_digit() || c.is_ascii_lowercase())
 }
 
-/// `start` 以降で、行頭が空白始まりか完全に空である行を連続して集める。
-/// インデントの無い行に達したら、そこはトップレベルの次のキーか終端なので
-/// そこで止める。
+/// From `start` onward, collects consecutive lines that either start with
+/// whitespace or are completely empty. Once a line without indentation is
+/// reached, that is the next top-level key or the terminator, so collection
+/// stops there.
 fn collect_indented_block<'a>(lines: &[&'a str], start: usize) -> Vec<&'a str> {
     let mut out = Vec::new();
     if start >= lines.len() {
@@ -55,9 +56,10 @@ fn collect_indented_block<'a>(lines: &[&'a str], start: usize) -> Vec<&'a str> {
     out
 }
 
-/// ブロックの行から共通の先頭インデントを取り除いて連結する。`fold` が真なら
-/// `>`（フォールド）として改行を空白へ、偽なら `|`（リテラル）として改行を
-/// 保持する。末尾の空行は落とす。
+/// Strips the common leading indentation from the block's lines and joins
+/// them. When `fold` is true, joins as `>` (folded), turning newlines into
+/// spaces; when false, joins as `|` (literal), keeping newlines. Drops
+/// trailing empty lines.
 fn join_block(block_lines: &[&str], fold: bool) -> String {
     let indent = block_lines
         .iter()
@@ -89,13 +91,15 @@ fn join_block(block_lines: &[&str], fold: bool) -> String {
     }
 }
 
-/// フロントマターの `key: value` 行から値を取り出す。単一行のプレーン値・
-/// 引用符付き値に加えて、ブロックスカラー `|`（改行を保持するリテラル）と
-/// `>`（改行を空白へ折り畳むフォールド）、および素のプレーン値の複数行継続を
-/// 認める。仕様が要求する範囲を超える構文（チョンピング指定や明示インデント
-/// 指定を伴うブロックスカラーなど）は確信を持って解釈できないため、値を
-/// でっち上げず `SkillError::UnsupportedSyntax` を返す。知らないキーそのもの
-/// は黙って読み飛ばす — 仕様が任意フィールドを認めているため。
+/// Extracts a value from a frontmatter `key: value` line. Besides a
+/// single-line plain value or quoted value, this accepts the block scalars
+/// `|` (literal, keeps newlines) and `>` (folded, folds newlines into
+/// spaces), as well as a plain-value multi-line continuation. Syntax that
+/// goes beyond what the specification requires (block scalars with a
+/// chomping indicator or an explicit indentation indicator, for example)
+/// cannot be interpreted with confidence, so rather than fabricate a value
+/// this returns `SkillError::UnsupportedSyntax`. Unknown keys themselves are
+/// silently skipped — the specification allows optional fields.
 fn field(lines: &[&str], key: &'static str, skill: &str) -> Result<Option<String>, SkillError> {
     for (i, line) in lines.iter().enumerate() {
         let Some(rest) = line.strip_prefix(key) else {
@@ -111,8 +115,9 @@ fn field(lines: &[&str], key: &'static str, skill: &str) -> Result<Option<String
             return Ok(Some(join_block(&block, value_part == ">")));
         }
         if value_part.starts_with('|') || value_part.starts_with('>') {
-            // チョンピング指定（`|-`/`|+`）や明示インデント指定（`|2`）などの
-            // ブロックスカラー変種は対応範囲外。値をでっち上げず拒否する。
+            // Block scalar variants such as a chomping indicator (`|-`/`|+`)
+            // or an explicit indentation indicator (`|2`) are out of scope.
+            // Reject rather than fabricate a value.
             return Err(SkillError::UnsupportedSyntax {
                 skill: skill.to_string(),
                 field: key,
@@ -142,7 +147,7 @@ fn field(lines: &[&str], key: &'static str, skill: &str) -> Result<Option<String
     Ok(None)
 }
 
-/// フロントマターを解析し、`(name, description, body)` を返す。
+/// Parses the frontmatter and returns `(name, description, body)`.
 pub fn parse(text: &str, dir_name: &str) -> Result<(String, String, String), SkillError> {
     let rest = text
         .strip_prefix("---")
@@ -151,8 +156,9 @@ pub fn parse(text: &str, dir_name: &str) -> Result<(String, String, String), Ski
         })?;
     let rest = rest.trim_start_matches(['\r', '\n']);
 
-    // `rest` が直接 `---` で始まるなら、開始と終了のデリミタが連続する空の
-    // フロントマター。そうでなければ次の `\n---` を終端として探す。
+    // If `rest` starts directly with `---`, the opening and closing
+    // delimiters are adjacent — empty frontmatter. Otherwise, look for the
+    // next `\n---` as the terminator.
     let (front, after_close) = if let Some(after) = rest.strip_prefix("---") {
         ("", after)
     } else {
@@ -164,10 +170,10 @@ pub fn parse(text: &str, dir_name: &str) -> Result<(String, String, String), Ski
         (&rest[..end], &rest[end + 4..])
     };
 
-    // 終端デリミタが `----` のように 3 本を超えるハイフンで書かれていても、
-    // デリミタ行に直に続く余分なハイフンだけを落とす。本文側の内容は必ず
-    // 改行を挟んでから始まるため、この trim_start_matches が本文を削ること
-    // はない。
+    // Even when the closing delimiter is written with more than three
+    // hyphens, as in `----`, this drops only the extra hyphens directly
+    // following the delimiter line. Body content always begins after a
+    // newline, so this trim_start_matches never eats into the body.
     let after_close = after_close.trim_start_matches('-');
     let body = after_close.trim_start_matches(['\r', '\n']).to_string();
 
@@ -207,19 +213,20 @@ pub fn parse(text: &str, dir_name: &str) -> Result<(String, String, String), Ski
 mod tests {
     use super::*;
 
-    const GOOD: &str = "---\nname: git-commit\ndescription: コミットを作る。\n---\n\n本文。\n";
+    const GOOD: &str = "---\nname: git-commit\ndescription: Creates a commit.\n---\n\nBody text.\n";
 
     #[test]
     fn parses_name_description_and_body() {
-        let (name, desc, body) = parse(GOOD, "git-commit").expect("読めるべき");
+        let (name, desc, body) = parse(GOOD, "git-commit").expect("should be readable");
         assert_eq!(name, "git-commit");
-        assert_eq!(desc, "コミットを作る。");
-        assert_eq!(body.trim(), "本文。");
+        assert_eq!(desc, "Creates a commit.");
+        assert_eq!(body.trim(), "Body text.");
     }
 
     #[test]
     fn rejects_a_name_that_does_not_match_the_directory() {
-        let err = parse(GOOD, "other-dir").expect_err("親ディレクトリ名と不一致は拒否");
+        let err = parse(GOOD, "other-dir")
+            .expect_err("mismatch with the parent directory name should be rejected");
         assert!(matches!(err, SkillError::NameMismatch { .. }));
     }
 
@@ -232,77 +239,83 @@ mod tests {
             "double--hyphen",
             "under_score",
         ] {
-            let text = format!("---\nname: {bad}\ndescription: x\n---\n本文\n");
-            assert!(parse(&text, bad).is_err(), "{bad} は拒否されるべき");
+            let text = format!("---\nname: {bad}\ndescription: x\n---\nbody\n");
+            assert!(parse(&text, bad).is_err(), "{bad} should be rejected");
         }
     }
 
     #[test]
     fn rejects_an_empty_or_oversized_description() {
-        let empty = "---\nname: a\ndescription: \"\"\n---\n本文\n";
-        assert!(parse(empty, "a").is_err(), "空の description は拒否");
+        let empty = "---\nname: a\ndescription: \"\"\n---\nbody\n";
+        assert!(
+            parse(empty, "a").is_err(),
+            "an empty description should be rejected"
+        );
 
         let long = format!(
-            "---\nname: a\ndescription: \"{}\"\n---\n本文\n",
+            "---\nname: a\ndescription: \"{}\"\n---\nbody\n",
             "x".repeat(1025)
         );
         assert!(
             parse(&long, "a").is_err(),
-            "1024 文字超の description は拒否"
+            "a description over 1024 characters should be rejected"
         );
     }
 
     #[test]
     fn rejects_a_file_without_frontmatter() {
-        assert!(parse("# 見出しだけ\n", "a").is_err());
+        assert!(parse("# just a heading\n", "a").is_err());
     }
 
     #[test]
     fn accepts_optional_fields_without_complaint() {
         let text =
-            "---\nname: a\ndescription: x\nlicense: MIT\nallowed-tools: read bash\n---\n本文\n";
-        let (name, _, _) = parse(text, "a").expect("任意フィールドは許容される");
+            "---\nname: a\ndescription: x\nlicense: MIT\nallowed-tools: read bash\n---\nbody\n";
+        let (name, _, _) = parse(text, "a").expect("optional fields should be allowed");
         assert_eq!(name, "a");
     }
 
     #[test]
     fn parses_a_literal_block_scalar_description() {
-        let text = "---\nname: a\ndescription: |\n  line one\n  line two\n---\n本文\n";
-        let (_, desc, _) = parse(text, "a").expect("| ブロックスカラーは読めるべき");
+        let text = "---\nname: a\ndescription: |\n  line one\n  line two\n---\nbody\n";
+        let (_, desc, _) = parse(text, "a").expect("a | block scalar should be readable");
         assert_eq!(desc, "line one\nline two");
     }
 
     #[test]
     fn parses_a_folded_block_scalar_description() {
-        let text = "---\nname: a\ndescription: >\n  folded\n  text\n---\n本文\n";
-        let (_, desc, _) = parse(text, "a").expect("> ブロックスカラーは読めるべき");
+        let text = "---\nname: a\ndescription: >\n  folded\n  text\n---\nbody\n";
+        let (_, desc, _) = parse(text, "a").expect("a > block scalar should be readable");
         assert_eq!(desc, "folded text");
     }
 
     #[test]
     fn parses_a_plain_multiline_continuation() {
-        let text = "---\nname: a\ndescription: this continues\n  on the next line\n---\n本文\n";
-        let (_, desc, _) = parse(text, "a").expect("素の複数行継続は読めるべき");
+        let text = "---\nname: a\ndescription: this continues\n  on the next line\n---\nbody\n";
+        let (_, desc, _) =
+            parse(text, "a").expect("a plain multi-line continuation should be readable");
         assert_eq!(desc, "this continues on the next line");
     }
 
     #[test]
     fn refuses_a_construct_it_does_not_support_instead_of_guessing() {
-        // `|-` はチョンピング指定付きのブロックスカラーで対応範囲外。値を
-        // でっち上げず、必ずエラーで知らせる。
-        let text = "---\nname: a\ndescription: |-\n  text\n---\n本文\n";
-        let err = parse(text, "a").expect_err("未対応の構文は黙って通さず拒否する");
+        // `|-` is a block scalar with a chomping indicator and is out of
+        // scope. Always signal it with an error rather than silently let it
+        // through.
+        let text = "---\nname: a\ndescription: |-\n  text\n---\nbody\n";
+        let err = parse(text, "a")
+            .expect_err("unsupported syntax should be rejected, not silently accepted");
         assert!(matches!(err, SkillError::UnsupportedSyntax { .. }));
     }
 
     #[test]
     fn frontmatter_errors_name_the_failing_skill() {
-        let no_fm = parse("フロントマターが無い\n", "my-skill").expect_err("拒否されるべき");
+        let no_fm = parse("no frontmatter here\n", "my-skill").expect_err("should be rejected");
         assert!(matches!(no_fm, SkillError::NoFrontmatter { ref skill } if skill == "my-skill"));
         assert!(no_fm.to_string().contains("my-skill"));
 
-        let missing = parse("---\ndescription: x\n---\n本文\n", "my-skill")
-            .expect_err("name が無ければ拒否されるべき");
+        let missing = parse("---\ndescription: x\n---\nbody\n", "my-skill")
+            .expect_err("should be rejected when name is missing");
         assert!(matches!(
             missing,
             SkillError::MissingField { ref skill, field } if skill == "my-skill" && field == "name"
@@ -310,10 +323,10 @@ mod tests {
         assert!(missing.to_string().contains("my-skill"));
 
         let bad_len = parse(
-            "---\nname: my-skill\ndescription: \"\"\n---\n本文\n",
+            "---\nname: my-skill\ndescription: \"\"\n---\nbody\n",
             "my-skill",
         )
-        .expect_err("空の description は拒否されるべき");
+        .expect_err("an empty description should be rejected");
         assert!(matches!(
             bad_len,
             SkillError::InvalidDescription { ref skill, .. } if skill == "my-skill"
@@ -323,14 +336,15 @@ mod tests {
 
     #[test]
     fn empty_frontmatter_reports_missing_field_not_no_frontmatter() {
-        let err = parse("---\n---\n本文\n", "a").expect_err("空のフロントマターは拒否されるべき");
+        let err = parse("---\n---\nbody\n", "a").expect_err("empty frontmatter should be rejected");
         assert!(matches!(err, SkillError::MissingField { .. }));
     }
 
     #[test]
     fn a_wide_closing_delimiter_does_not_leak_a_hyphen_into_the_body() {
-        let text = "---\nname: a\ndescription: x\n----\n本文\n";
-        let (_, _, body) = parse(text, "a").expect("幅広の閉じデリミタも読めるべき");
-        assert_eq!(body.trim(), "本文");
+        let text = "---\nname: a\ndescription: x\n----\nbody\n";
+        let (_, _, body) =
+            parse(text, "a").expect("a wide closing delimiter should also be readable");
+        assert_eq!(body.trim(), "body");
     }
 }

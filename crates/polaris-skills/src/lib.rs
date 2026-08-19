@@ -1,4 +1,4 @@
-//! Agent Skills 仕様に準拠した skill の読み込み。独自のフロントマターは足さない。
+//! Loading of skills that conform to the Agent Skills specification. Adds no frontmatter fields of its own.
 
 pub mod discovery;
 pub mod frontmatter;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 pub use discovery::{Discovered, SkipCause, Skipped, discover, discover_in};
 pub use frontmatter::SkillError;
 
-/// 読み込み済みの skill 1 件。
+/// One loaded skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,

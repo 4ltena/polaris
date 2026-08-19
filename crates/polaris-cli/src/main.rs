@@ -593,14 +593,14 @@ mod tests {
             lines[1]
         );
         assert!(
-            lines[1].contains("命名規則"),
+            lines[1].contains("naming rules"),
             "検証に落ちた原因が含まれていない: {}",
             lines[1]
         );
         // 各行が自分の原因だけを運ぶ。全件の原因を全行へ書くような整形は、
         // どの skill がなぜ消えたのかを結局伝えない。
         assert!(
-            !lines[0].contains("命名規則") && !lines[1].contains("権限が無い"),
+            !lines[0].contains("naming rules") && !lines[1].contains("権限が無い"),
             "行ごとの原因が混ざっている: {lines:?}"
         );
     }

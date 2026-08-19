@@ -1,30 +1,34 @@
-//! skill の探索。1 件の破損が全体を巻き込まないよう、読めないものは飛ばす。
-//! ただし読み捨てはしない。飛ばした skill とその理由は `Discovered::skipped`
-//! として呼び出し側へ返す。呼び出し側（将来の CLI）がそれを表示する。
+//! Skill discovery. A single corrupt skill must not take down the whole
+//! search, so anything unreadable is skipped. It is not simply discarded,
+//! though: skipped skills and their reasons are returned to the caller as
+//! `Discovered::skipped`. The caller (the future CLI) is responsible for
+//! displaying them.
 
 use std::path::{Path, PathBuf};
 
 use crate::frontmatter;
 use crate::{Skill, SkillError};
 
-/// skill を 1 件飛ばした理由。`SKILL.md` そのものを読めなかったのか、読めた
-/// が検証に落ちたのかは別の失敗なので、区別して運ぶ。
+/// The reason a single skill was skipped. Whether `SKILL.md` itself could
+/// not be read, versus was read but failed validation, are distinct
+/// failures, so they are carried separately.
 #[derive(Debug, thiserror::Error)]
 pub enum SkipCause {
-    /// `SKILL.md` は存在するが読めない（権限、あるいはパス自体がディレクトリ
-    /// である、など）。パースへ一度も到達していないので `SkillError` は
-    /// 手に入らない。
-    #[error("SKILL.md を読めない: {0}")]
+    /// `SKILL.md` exists but cannot be read (permissions, or the path
+    /// itself is a directory, etc.). Parsing was never reached, so no
+    /// `SkillError` is available.
+    #[error("cannot read SKILL.md: {0}")]
     Unreadable(std::io::Error),
-    /// `SKILL.md` は読めたがフロントマターの検証に落ちた。
+    /// `SKILL.md` was read but failed frontmatter validation.
     #[error(transparent)]
     Invalid(SkillError),
 }
 
-/// 飛ばした skill 1 件。ディレクトリ名と理由を運ぶ。`SkillError` 側が
-/// 自分の識別子を文言に含めているのと同じ理由で、ここでもディレクトリ名を
-/// 明示のフィールドとして持つ — 呼び出し側が理由の種類によらず一貫して
-/// 「どの skill が飛ばされたか」を取り出せるようにするため。
+/// A single skipped skill. Carries the directory name and the reason. For
+/// the same reason `SkillError` includes its own identifier in its message,
+/// this also keeps the directory name as an explicit field — so the caller
+/// can consistently pull out "which skill was skipped" regardless of the
+/// kind of reason.
 #[derive(Debug, thiserror::Error)]
 #[error("{dir_name}: {cause}")]
 pub struct Skipped {
@@ -33,20 +37,22 @@ pub struct Skipped {
     pub cause: SkipCause,
 }
 
-/// `discover`/`discover_in` の結果。読み込めた skill と、読み込めずに飛ばした
-/// skill を理由付きで両方運ぶ。
+/// The result of `discover`/`discover_in`. Carries both the skills that
+/// loaded successfully and, with reasons, the skills that were skipped.
 #[derive(Debug, Default)]
 pub struct Discovered {
     pub skills: Vec<Skill>,
     pub skipped: Vec<Skipped>,
 }
 
-/// 与えられたディレクトリ群を順に走査する。名前が衝突したら先に見つけたものを
-/// 採る。読めない・検証に落ちた skill は `skipped` に理由付きで積んで、探索
-/// 自体は続ける。ディレクトリ内のエントリはファイル名でソートしてから処理する
-/// — `read_dir` の返す順序に実行ごとの再現性はなく、探索結果の順序を
-/// ファイルシステム任せにはできない。探索先ディレクトリ群自体の順序（外側の
-/// ループ）は呼び出し側が渡した並びをそのまま使う。
+/// Walks the given directories in order. On a name collision, the first one
+/// found wins. Skills that cannot be read or fail validation are pushed
+/// onto `skipped` with a reason, and the search itself continues. Entries
+/// within a directory are sorted by file name before processing — the order
+/// `read_dir` returns is not reproducible run to run, so the order of
+/// discovery results cannot be left to the filesystem. The order of the
+/// search directories themselves (the outer loop) is used exactly as the
+/// caller passed it.
 pub fn discover_in(dirs: &[PathBuf]) -> Discovered {
     let mut skills: Vec<Skill> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
@@ -67,10 +73,11 @@ pub fn discover_in(dirs: &[PathBuf]) -> Discovered {
             let manifest = path.join("SKILL.md");
             let text = match std::fs::read_to_string(&manifest) {
                 Ok(text) => text,
-                // `SKILL.md` が無いことは「このディレクトリは skill ではない」
-                // であって、破損した skill ではない。それ以外の読み取り失敗
-                // （権限、あるいはパスがディレクトリであるなど）は、パースへ
-                // 到達する前に skill が消えるのと同じ穴なので報告する。
+                // `SKILL.md` being absent means "this directory is not a
+                // skill," not "this is a corrupt skill." Any other read
+                // failure (permissions, or the path being a directory,
+                // etc.) is reported, since it is the same hole as a skill
+                // vanishing before it ever reaches parsing.
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     skipped.push(Skipped {
@@ -102,7 +109,8 @@ pub fn discover_in(dirs: &[PathBuf]) -> Discovered {
     Discovered { skills, skipped }
 }
 
-/// 既定の 2 箇所と設定で追加された場所を、この順に走査する。
+/// Walks the two default locations plus any places added by configuration,
+/// in this order.
 pub fn discover(project_root: &Path, extra_paths: &[PathBuf]) -> Discovered {
     let mut dirs = vec![project_root.join(".polaris").join("skills")];
     if let Some(home) = std::env::var_os("HOME") {
@@ -118,20 +126,21 @@ mod tests {
 
     fn put(root: &std::path::Path, name: &str, desc: &str, body: &str) {
         let d = root.join(name);
-        std::fs::create_dir_all(&d).expect("作れない");
+        std::fs::create_dir_all(&d).expect("could not create");
         std::fs::write(
             d.join("SKILL.md"),
             format!("---\nname: {name}\ndescription: {desc}\n---\n{body}\n"),
         )
-        .expect("書けない");
+        .expect("could not write");
     }
 
-    /// `HOME` はプロセス全体で共有される。cargo test は同一プロセス内で
-    /// テストを並行に走らせるため、差し替える側どうしを直列化しないと、
-    /// 一方が張った `HOME` をもう一方が読む。
+    /// `HOME` is shared across the whole process. cargo test runs tests
+    /// concurrently within the same process, so unless the tests that swap
+    /// it out are serialized against each other, one test can read the
+    /// `HOME` another test set.
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// `HOME` を差し替え、スコープを抜けたら（パニックしても）元へ戻す。
+    /// Swaps out `HOME`, and restores it on leaving scope (even on panic).
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -139,9 +148,9 @@ mod tests {
 
     impl Drop for HomeGuard {
         fn drop(&mut self) {
-            // SAFETY: HOME_LOCK を保持している間だけ書き換える。この
-            // クレートで HOME を読むのは discover だけであり、その呼び出し
-            // 元テストはすべて同じロックを取る。
+            // SAFETY: only rewritten while holding HOME_LOCK. `discover` is
+            // the only thing in this crate that reads HOME, and every test
+            // that calls it takes this same lock.
             unsafe {
                 match &self.prev {
                     Some(p) => std::env::set_var("HOME", p),
@@ -152,11 +161,12 @@ mod tests {
     }
 
     fn set_home(home: Option<&std::path::Path>) -> HomeGuard {
-        // 直前のテストがロックを保持したままパニックしても、後続を巻き添えに
-        // しない（毒された中身は単なる ()）。
+        // Even if the previous test panicked while holding the lock, don't
+        // drag the next one down with it (the poisoned contents are just
+        // `()`).
         let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("HOME");
-        // SAFETY: 上と同じ。
+        // SAFETY: same as above.
         unsafe {
             match home {
                 Some(h) => std::env::set_var("HOME", h),
@@ -168,55 +178,62 @@ mod tests {
 
     #[test]
     fn the_project_directory_is_searched_before_home() {
-        // 仕様が固定している探索順そのもの。順序を入れ替えると、個人の skill
-        // とプロジェクトの skill が同名で衝突したときの勝者が静かに反転する
-        // —— discover_in の衝突テストは「先に渡された方が勝つ」しか見ないので、
-        // 渡す順序を作る discover 側でひっくり返されると気付けない。
-        let project = tempfile::tempdir().expect("一時");
-        let home = tempfile::tempdir().expect("一時");
+        // This is the search order the specification fixes. If the order
+        // were swapped, the winner of a name collision between a personal
+        // skill and a project skill would silently flip — discover_in's
+        // collision test only checks that "whichever is passed first wins,"
+        // so it would not notice the order being reversed on the discover
+        // side that builds the order to pass.
+        let project = tempfile::tempdir().expect("temp dir");
+        let home = tempfile::tempdir().expect("temp dir");
         put(
             &project.path().join(".polaris").join("skills"),
             "dup",
-            "ぷろじぇくと側",
+            "project side",
             "PROJECT",
         );
         put(
             &home.path().join(".polaris").join("skills"),
             "dup",
-            "ほーむ側",
+            "home side",
             "HOME",
         );
 
         let _guard = set_home(Some(home.path()));
         let found = discover(project.path(), &[]);
 
-        assert_eq!(found.skills.len(), 1, "同名は1件へ解決されるべき");
+        assert_eq!(
+            found.skills.len(),
+            1,
+            "a shared name should resolve to 1 entry"
+        );
         assert_eq!(
             found.skills[0].body.trim(),
             "PROJECT",
-            "探索順が仕様と違う。プロジェクトの skill が ~/.polaris/skills に負けている"
+            "search order differs from the specification: the project's skill lost to ~/.polaris/skills"
         );
     }
 
     #[test]
     fn home_is_searched_before_the_configured_extra_paths() {
-        // 設定で足した場所は3番目。ここでは同時に「追加パスが実際に走査
-        // されている」ことも確かめる。走査されていなければ順序の主張は
-        // 空振りするため、勝者だけを見ても意味が無い。
-        let project = tempfile::tempdir().expect("一時");
-        let home = tempfile::tempdir().expect("一時");
-        let extra = tempfile::tempdir().expect("一時");
+        // Locations added by configuration come third. This also confirms
+        // that the extra path is actually being searched at all — if it
+        // weren't, the order claim would pass vacuously, so looking only at
+        // the winner would be meaningless.
+        let project = tempfile::tempdir().expect("temp dir");
+        let home = tempfile::tempdir().expect("temp dir");
+        let extra = tempfile::tempdir().expect("temp dir");
         put(
             &home.path().join(".polaris").join("skills"),
             "dup",
-            "ほーむ側",
+            "home side",
             "HOME",
         );
-        put(extra.path(), "dup", "設定側", "EXTRA");
+        put(extra.path(), "dup", "configured side", "EXTRA");
         put(
             extra.path(),
             "only-in-extra",
-            "設定でのみ足した場所",
+            "a location added only via configuration",
             "EXTRA-ONLY",
         );
 
@@ -225,32 +242,33 @@ mod tests {
 
         assert!(
             found.skills.iter().any(|s| s.name == "only-in-extra"),
-            "設定の skills.paths が走査されていない: {:?}",
+            "the configured skills.paths was not searched: {:?}",
             found.skills.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
         let dup = found
             .skills
             .iter()
             .find(|s| s.name == "dup")
-            .expect("dup が見つからない");
+            .expect("dup not found");
         assert_eq!(
             dup.body.trim(),
             "HOME",
-            "探索順が仕様と違う。~/.polaris/skills が設定の追加パスに負けている"
+            "search order differs from the specification: ~/.polaris/skills lost to the configured extra path"
         );
     }
 
     #[test]
     fn home_skills_are_found_when_the_project_has_none() {
-        // 上の2つは衝突の勝者を見るので、~/.polaris/skills を丸ごと外しても
-        // 「プロジェクトが勝つ」側は通ってしまう。既定の2番目が実際に
-        // 走査されていること自体を独立に固定する。
-        let project = tempfile::tempdir().expect("一時");
-        let home = tempfile::tempdir().expect("一時");
+        // The two tests above only look at who wins a collision, so even if
+        // ~/.polaris/skills were dropped entirely, the "project wins" side
+        // would still pass. This pins down, independently, that the second
+        // default location is actually searched at all.
+        let project = tempfile::tempdir().expect("temp dir");
+        let home = tempfile::tempdir().expect("temp dir");
         put(
             &home.path().join(".polaris").join("skills"),
             "personal",
-            "個人の skill",
+            "a personal skill",
             "HOME",
         );
 
@@ -261,18 +279,19 @@ mod tests {
         assert_eq!(
             names,
             vec!["personal"],
-            "~/.polaris/skills が走査されていない"
+            "~/.polaris/skills was not searched"
         );
     }
 
     #[test]
     fn a_missing_home_does_not_stop_the_project_from_being_searched() {
-        // HOME が無い環境でも、プロジェクトの skill は読めなければならない。
-        let project = tempfile::tempdir().expect("一時");
+        // Even in an environment with no HOME, the project's skill must
+        // still be readable.
+        let project = tempfile::tempdir().expect("temp dir");
         put(
             &project.path().join(".polaris").join("skills"),
             "alpha",
-            "あるふぁ",
+            "alpha",
             "PROJECT",
         );
 
@@ -286,10 +305,10 @@ mod tests {
 
     #[test]
     fn finds_skills_in_each_directory() {
-        let a = tempfile::tempdir().expect("一時");
-        let b = tempfile::tempdir().expect("一時");
-        put(a.path(), "alpha", "あるふぁ", "A");
-        put(b.path(), "beta", "べーた", "B");
+        let a = tempfile::tempdir().expect("temp dir");
+        let b = tempfile::tempdir().expect("temp dir");
+        put(a.path(), "alpha", "alpha", "A");
+        put(b.path(), "beta", "beta", "B");
 
         let found = discover_in(&[a.path().to_path_buf(), b.path().to_path_buf()]);
         let mut names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
@@ -300,10 +319,10 @@ mod tests {
 
     #[test]
     fn first_directory_wins_on_a_name_collision() {
-        let first = tempfile::tempdir().expect("一時");
-        let second = tempfile::tempdir().expect("一時");
-        put(first.path(), "dup", "さき", "FIRST");
-        put(second.path(), "dup", "あと", "SECOND");
+        let first = tempfile::tempdir().expect("temp dir");
+        let second = tempfile::tempdir().expect("temp dir");
+        put(first.path(), "dup", "first", "FIRST");
+        put(second.path(), "dup", "second", "SECOND");
 
         let found = discover_in(&[first.path().to_path_buf(), second.path().to_path_buf()]);
         assert_eq!(found.skills.len(), 1);
@@ -312,10 +331,10 @@ mod tests {
 
     #[test]
     fn an_invalid_skill_is_skipped_without_killing_the_others() {
-        let root = tempfile::tempdir().expect("一時");
-        put(root.path(), "good", "よい", "OK");
+        let root = tempfile::tempdir().expect("temp dir");
+        put(root.path(), "good", "good", "OK");
         let bad = root.path().join("Bad-Name");
-        std::fs::create_dir_all(&bad).expect("作れない");
+        std::fs::create_dir_all(&bad).expect("could not create");
         std::fs::write(
             bad.join("SKILL.md"),
             "---\nname: Bad-Name\ndescription: x\n---\n",
@@ -326,7 +345,7 @@ mod tests {
         assert_eq!(
             found.skills.len(),
             1,
-            "壊れた skill 1 件で全部が落ちてはいけない"
+            "one corrupt skill must not bring down all of them"
         );
         assert_eq!(found.skills[0].name, "good");
     }
@@ -340,8 +359,8 @@ mod tests {
 
     #[test]
     fn a_directory_without_skill_md_is_ignored() {
-        let root = tempfile::tempdir().expect("一時");
-        std::fs::create_dir_all(root.path().join("notaskill")).expect("作れない");
+        let root = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(root.path().join("notaskill")).expect("could not create");
         let found = discover_in(&[root.path().to_path_buf()]);
         assert!(found.skills.is_empty());
         assert!(found.skipped.is_empty());
@@ -349,70 +368,78 @@ mod tests {
 
     #[test]
     fn a_skipped_skill_names_the_directory_that_failed() {
-        // discover_in が壊れた skill を黙って捨てるだけでは、前段の
-        // frontmatter::parse がどれだけ丁寧に skill 名を運んでも利用者には
-        // 何も届かない。skipped 側にエラーが載り、かつそのエラー文言が
-        // 壊れたディレクトリ名を含むことを確かめる。
-        let root = tempfile::tempdir().expect("一時");
+        // If discover_in silently discarded a corrupt skill, nothing would
+        // reach the caller no matter how carefully frontmatter::parse
+        // upstream carries the skill name. Confirm that an error lands on
+        // the skipped side, and that its message contains the name of the
+        // corrupt directory.
+        let root = tempfile::tempdir().expect("temp dir");
         let bad = root.path().join("Bad-Name");
-        std::fs::create_dir_all(&bad).expect("作れない");
+        std::fs::create_dir_all(&bad).expect("could not create");
         std::fs::write(
             bad.join("SKILL.md"),
             "---\nname: Bad-Name\ndescription: x\n---\n",
         )
-        .expect("書けない");
+        .expect("could not write");
 
         let found = discover_in(&[root.path().to_path_buf()]);
-        assert_eq!(found.skipped.len(), 1, "壊れた skill 1 件が報告されるべき");
+        assert_eq!(
+            found.skipped.len(),
+            1,
+            "one corrupt skill should be reported"
+        );
         let message = found.skipped[0].to_string();
         assert!(
             message.contains("Bad-Name"),
-            "エラーに壊れた skill の名前が含まれていない: {message}"
+            "the error does not contain the name of the corrupt skill: {message}"
         );
     }
 
     #[test]
     fn a_skill_md_that_cannot_be_read_is_reported_not_forgotten() {
-        // SKILL.md をディレクトリにしておくと read_to_string は失敗するが、
-        // これは NotFound ではない — ファイルという名の何かは存在する、
-        // 読めないだけ。パースに一度も到達しないので frontmatter::parse の
-        // エラーは手に入らない。それでも理由付きで skipped に載らなければ、
-        // 「パースに落ちた skill は報告するがそれ以前に読めなかった skill は
-        // 黙って消える」という同じ穴が一歩手前で開いたままになる。
-        let root = tempfile::tempdir().expect("一時");
+        // Making SKILL.md a directory causes read_to_string to fail, but
+        // this is not NotFound — something by that file's name exists, it
+        // just cannot be read. Parsing is never reached, so no
+        // frontmatter::parse error is available either. Even so, if this
+        // is not recorded with a reason in skipped, the same hole opens one
+        // step earlier: "a skill that failed parsing is reported, but a
+        // skill that could not even be read before that point silently
+        // vanishes."
+        let root = tempfile::tempdir().expect("temp dir");
         let bad = root.path().join("unreadable-skill");
-        std::fs::create_dir_all(bad.join("SKILL.md")).expect("作れない");
+        std::fs::create_dir_all(bad.join("SKILL.md")).expect("could not create");
 
         let found = discover_in(&[root.path().to_path_buf()]);
         assert!(found.skills.is_empty());
         assert_eq!(
             found.skipped.len(),
             1,
-            "読めない skill 1 件が報告されるべき"
+            "one unreadable skill should be reported"
         );
         assert_eq!(found.skipped[0].dir_name, "unreadable-skill");
         let message = found.skipped[0].to_string();
         assert!(
             message.contains("unreadable-skill"),
-            "エラーに読めなかった skill の名前が含まれていない: {message}"
+            "the error does not contain the name of the unreadable skill: {message}"
         );
     }
 
     #[test]
     fn processing_order_within_a_directory_is_sorted_not_creation_order() {
-        // 作成順をソート順の逆に近い順にしておく。read_dir が返す順序に
-        // たまたま頼っていても気付けないよう、単調でない順で作る。
-        let root = tempfile::tempdir().expect("一時");
-        put(root.path(), "zeta", "ぜーた", "Z");
-        put(root.path(), "mid", "みっど", "M");
-        put(root.path(), "alpha", "あるふぁ", "A");
+        // Create them in close to the reverse of sorted order, so that any
+        // accidental reliance on the order read_dir happens to return would
+        // not go unnoticed — deliberately a non-monotonic order.
+        let root = tempfile::tempdir().expect("temp dir");
+        put(root.path(), "zeta", "zeta", "Z");
+        put(root.path(), "mid", "mid", "M");
+        put(root.path(), "alpha", "alpha", "A");
 
         let found = discover_in(&[root.path().to_path_buf()]);
         let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["alpha", "mid", "zeta"],
-            "ディレクトリ内の処理順が名前でソートされていない"
+            "processing order within the directory is not sorted by name"
         );
     }
 }

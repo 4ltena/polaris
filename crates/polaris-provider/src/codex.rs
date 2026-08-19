@@ -759,6 +759,74 @@ mod tests {
         );
     }
 
+    /// 上のテストが確かめるのは「結果が Auth である」ことだけで、
+    /// 「速く終わる」ことではない。`complete` の再試行を `loop` へ
+    /// 退化させる変異はコンパイルも通り、上のテストをハングさせる
+    /// だけで、赤い X にはならない。ここでは時間で区切り、かつ
+    /// サーバが実際に受け取ったリクエスト数を数えることで、ループへの
+    /// 退化を高速に・かつ確実に検出する。ループなら 500ms のあいだに
+    /// 2 を超える回数のリクエストが届くはずである。
+    #[tokio::test]
+    async fn a_second_401_stops_retrying_within_a_time_bound() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .mount(&s)
+            .await;
+
+        let t = Tokens::new();
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
+
+        let bound = Duration::from_millis(500);
+        let outcome = tokio::time::timeout(bound, p.complete(req())).await;
+
+        // wiremock はリクエスト記録を既定で有効にしている。タイムアウト
+        // が発火した場合でも、そこまでに届いた回数は意味を持つ
+        // （ループなら 2 を超えているはず）。
+        let received = s
+            .received_requests()
+            .await
+            .expect("リクエスト記録は既定で有効なはず")
+            .len();
+
+        let mut failures = Vec::new();
+        if outcome.is_err() {
+            failures.push(format!(
+                "{bound:?} 以内に終わらなかった（{received} 回受信済み）。再試行がループしている可能性がある"
+            ));
+        }
+        if received != 2 {
+            failures.push(format!(
+                "初回 + 再試行 1 回のちょうど 2 回で止まっていない（{received} 回受信した）"
+            ));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    /// 500 は Auth ではない。再試行の入口を 401 専用に保つ。ここが
+    /// 崩れると、一時的なサーバ障害のたびに `refreshed()` を呼んで
+    /// トークンを消費することになる。
+    #[tokio::test]
+    async fn a_500_response_does_not_trigger_the_refresh_and_retry_path() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&s)
+            .await;
+
+        let t = Tokens::new();
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
+        let err = p.complete(req()).await.expect_err("失敗すべき");
+        assert!(matches!(err, ProviderError::Http(_)), "Http 以外: {err:?}");
+        assert_eq!(
+            t.refreshes.load(Ordering::SeqCst),
+            0,
+            "500 なのに更新（再試行）が起きている"
+        );
+    }
+
     /// 429 はリセット情報を文面へ含める。掴めない拒否は同じ失敗を
     /// 繰り返させる。
     #[tokio::test]

@@ -131,7 +131,11 @@ mod tests {
 
     #[test]
     fn selection_is_capped_and_sorted_by_name_when_it_exceeds_the_limit() {
+        // Descending input order so a truncate-before-sort (or no-sort)
+        // implementation produces a visibly different, wrong result instead
+        // of coincidentally matching sort-then-truncate's output.
         let skills: Vec<Skill> = (0..(MAX_NEAR_UNIVERSAL + 5))
+            .rev()
             .map(|i| {
                 skill(
                     &format!("universal-{i:02}"),
@@ -142,10 +146,13 @@ mod tests {
         let result = near_universal(&skills);
         assert_eq!(result.len(), MAX_NEAR_UNIVERSAL);
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
-        let mut sorted_names = names.clone();
-        sorted_names.sort();
-        assert_eq!(names, sorted_names, "result was not sorted by name");
-        assert_eq!(names[0], "universal-00");
+        let expected: Vec<String> = (0..MAX_NEAR_UNIVERSAL)
+            .map(|i| format!("universal-{i:02}"))
+            .collect();
+        assert_eq!(
+            names, expected,
+            "result was not sorted to name-ascending before being capped to MAX_NEAR_UNIVERSAL"
+        );
     }
 
     #[test]

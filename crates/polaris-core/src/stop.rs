@@ -1,11 +1,12 @@
-//! 停止条件。自動修復は行わない。壊れたまま回り続けるのが最も高くつくため、
-//! 判断は呼び出し側へ返す。
+//! Stop conditions. No automatic recovery is attempted. Continuing to spin
+//! while broken is the most expensive outcome, so the decision is handed
+//! back to the caller.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
-    /// 同一のエラーが 3 回続いた。
+    /// The same error occurred 3 times in a row.
     RepeatedError(String),
-    /// ターン数の上限に達した。
+    /// The turn limit was reached.
     MaxTurns,
 }
 
@@ -39,11 +40,12 @@ impl StopTracker {
         None
     }
 
-    /// 成功したツール呼び出しを記録し、連続エラーのストリークをリセットする。
-    /// これを呼ばないと `last_error` / `streak` はエラーからしか更新されず、
-    /// `error, success, error, success, error` のような系列でも「同一の
-    /// エラーが3回続いた」と判定されてしまう —
-    /// 実際には一度も連続していないのに。
+    /// Records a successful tool call and resets the consecutive-error
+    /// streak. Without calling this, `last_error` / `streak` would only ever
+    /// be updated from errors, so a sequence like
+    /// `error, success, error, success, error` would be judged as "the same
+    /// error occurred 3 times in a row" — even though it never actually
+    /// occurred consecutively.
     pub fn observe_success(&mut self) {
         self.last_error = None;
         self.streak = 0;

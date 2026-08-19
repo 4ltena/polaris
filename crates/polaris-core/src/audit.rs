@@ -1,5 +1,6 @@
-//! 追記専用の監査ログ。署名は付けない。インプロセスでは署名する主体と
-//! 行為する主体が同一であり、署名はログ以上のことを証明しないため。
+//! Append-only audit log. Not signed: in-process, the entity signing and the
+//! entity acting are the same, so a signature would prove nothing beyond
+//! what the log itself already shows.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -17,12 +18,14 @@ impl AuditLog {
         Ok(Self { file })
     }
 
-    /// 1 行を追記する。**ここへ渡るあらゆる文字列は書く直前に伏字化を通る。**
-    /// 欄を増やすときは必ず `screen` を通すこと。通し忘れは、そのまま
-    /// 生の資格情報がログへ落ちる経路になる。`tool` はモデルのツール呼び出し
-    /// からそのまま渡ってくる値であり、閉じた集合ではない（プロンプト
-    /// インジェクションを受けたモデルが任意の文字列を出せる）ため、他の欄と
-    /// 例外なく同じ経路を通す。
+    /// Appends one line. **Every string that reaches here passes through
+    /// redaction immediately before being written.** Whenever a field is
+    /// added, it must be passed through `screen`. Forgetting to do so is
+    /// a direct path for raw credentials to fall into the log. `tool` is a
+    /// value that comes straight from the model's tool call and is not a
+    /// closed set (a model under prompt injection can emit an arbitrary
+    /// string), so it goes through the same path as every other field,
+    /// without exception.
     pub fn record(&mut self, r: &Record<'_>) -> std::io::Result<()> {
         let mut line = serde_json::json!({
             "tool": screen(r.tool),
@@ -40,10 +43,11 @@ impl AuditLog {
     }
 }
 
-/// 監査ログ 1 行の内容。仕様が求める「型、解決後のサンドボックス方針、
-/// 書込先、結果」をこの型が運ぶ。`sandbox` と `target` は「無い」ことと
-/// 「空文字列だった」ことを区別するため `Option` で受け、`None` のときは
-/// 欄ごと省く（[`AuditLog::record`] 側の仕事）。
+/// The content of one audit log line. This type carries the "kind, resolved
+/// sandbox policy, write target, and result" that the spec requires.
+/// `sandbox` and `target` are received as `Option` so that "absent" can be
+/// distinguished from "was an empty string"; when `None`, the field is
+/// omitted entirely (the job of [`AuditLog::record`]).
 pub struct Record<'a> {
     pub tool: &'a str,
     pub detail: &'a str,
@@ -52,9 +56,10 @@ pub struct Record<'a> {
     pub result: &'a str,
 }
 
-/// 監査ログへ書くあらゆる文字列が通る唯一の関門。`FilterResult::Drop`
-/// （行全体が丸ごとシークレットだった場合）は元の文字列を一切書かず
-/// `[DROPPED]` に置き換える。
+/// The single gate through which every string written to the audit log
+/// passes. `FilterResult::Drop` (when the entire line was nothing but a
+/// secret) never writes the original string at all — it's replaced with
+/// `[DROPPED]`.
 fn screen(s: &str) -> String {
     match screen_text(s) {
         FilterResult::Keep(s) | FilterResult::Redacted(s) => s,
@@ -62,35 +67,42 @@ fn screen(s: &str) -> String {
     }
 }
 
-/// `result` 欄だけの上限（バイト）。監査ログの役目は「何をして、どう
-/// 終わったか」を再構成できることであり、成功した呼び出しの本文をまるごと
-/// 複製する場所ではない。特に `read` は成功するとファイル全体を本文として
-/// 返すため、上限を設けないと監査ログがワークスペースの複製先になる。
+/// Ceiling (in bytes) for the `result` field alone. The audit log's job is
+/// to let "what was done and how it ended" be reconstructed — it is not a
+/// place to duplicate the full body of a successful call in its entirety.
+/// In particular, a successful `read` returns the entire file as its body,
+/// so without a ceiling the audit log would become a duplicate of the
+/// workspace.
 ///
-/// `polaris_tools::bash::MAX_OUTPUT_BYTES`（32 KiB）はモデルへ返す一次
-/// チャンネルの上限であり、そちらは応答の実物である必要がある。ここは
-/// 二次的な記録で、読む側が話を再構成し実物を見に行くための手掛かりが
-/// 残ればよいため、より小さい 4 KiB を選ぶ。
+/// `polaris_tools::bash::MAX_OUTPUT_BYTES` (32 KiB) is the ceiling on the
+/// primary channel returned to the model, and that one needs to be the
+/// genuine article of the response. This is a secondary record, and it only
+/// needs to leave enough of a trail for a reader to reconstruct the story
+/// and go look at the genuine article themselves, so we pick a smaller
+/// 4 KiB here.
 const MAX_RESULT_BYTES: usize = 4 * 1024;
 
-/// `detail` 欄だけの上限（バイト）。`detail` は「モデルが送った引数だから
-/// 有界」という理屈で当初は無制限にしていたが誤りだった。`write` の
-/// `content` はファイル全体、`edit` の `old`/`new` もファイルの一部を
-/// まるごと運びうる（`polaris-tools::write_spec` / `edit_spec` 参照）。
-/// これは `read` が成功したときの `result`（ファイル全体の本文）と
-/// 構造的に同じ危険であり、「何を依頼されたか」を再構成できれば足りる
-/// という監査ログの役目も `result` と同一である。あえて別の値を選ぶ理由が
-/// 無いため、`MAX_RESULT_BYTES` と同じ 4 KiB を採用する（値が一致するのは
-/// 決め打ちの結果であり、定数を分けているのは今後どちらかだけ変える必要が
-/// 生じたときに独立して変更できるようにするため）。
+/// Ceiling (in bytes) for the `detail` field alone. `detail` was originally
+/// left unbounded on the reasoning that "it's bounded because it's an
+/// argument the model sent" — that reasoning was wrong. `write`'s `content`
+/// can carry an entire file, and `edit`'s `old`/`new` can also carry an
+/// entire chunk of a file (see `polaris-tools::write_spec` / `edit_spec`).
+/// This is structurally the same hazard as `result` on a successful `read`
+/// (the entire file body), and the audit log's job here — that it suffices
+/// to be able to reconstruct "what was requested" — is identical to
+/// `result`'s. There's no reason to pick a different value, so we adopt the
+/// same 4 KiB as `MAX_RESULT_BYTES` (the values matching is a deliberate
+/// choice; the constants are kept separate so that if either one ever needs
+/// to change on its own, it can be changed independently).
 const MAX_DETAIL_BYTES: usize = MAX_RESULT_BYTES;
 
-/// 欄を上限まで切り詰める。**バイト単位で単純に切ると多バイト文字の
-/// 途中で割れて panic する** ため、文字境界まで戻ってから切る
-/// （`polaris_tools::bash::truncate` と同じ考え方）。切り詰めたことを
-/// 本文へ明記するのは、印の無い部分的な結果は完全な答えとして提示された
-/// 誤った答えになるため。`result` と `detail` の両方がこれを通る
-/// （[`AuditLog::record`] 参照）。
+/// Truncates a field down to the ceiling. **Simply cutting at a raw byte
+/// offset can split a multi-byte character in half and panic**, so we walk
+/// back to a character boundary before cutting (the same approach as
+/// `polaris_tools::bash::truncate`). We spell out in the body that
+/// truncation happened, because an unmarked partial result presented as a
+/// complete answer is a wrong answer. Both `result` and `detail` pass
+/// through this (see [`AuditLog::record`]).
 fn truncate_field(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -100,7 +112,7 @@ fn truncate_field(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!(
-        "{}\n[監査ログでは {} バイトを超えたのでここで切り詰めた。全文は元のツール呼び出しか対象ファイルを確認すること]",
+        "{}\n[truncated here in the audit log for exceeding {} bytes; check the original tool call or target file for the full text]",
         &s[..end],
         max_bytes
     )
@@ -112,9 +124,9 @@ mod tests {
 
     #[test]
     fn redacts_secrets_before_writing() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
+        let dir = tempfile::tempdir().expect("cannot create temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
         log.record(&Record {
             tool: "bash",
             detail: "export API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz012345",
@@ -122,22 +134,22 @@ mod tests {
             target: None,
             result: "ok",
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let body = std::fs::read_to_string(&path).expect("読めない");
+        let body = std::fs::read_to_string(&path).expect("cannot read");
         assert!(
             !body.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
-            "生の値が残っている"
+            "the raw value survived"
         );
-        assert!(body.contains("[REDACTED]"), "伏字化されていない");
-        assert!(body.contains("\"tool\":\"bash\""), "ツール名が無い");
+        assert!(body.contains("[REDACTED]"), "not redacted");
+        assert!(body.contains("\"tool\":\"bash\""), "tool name is missing");
     }
 
     #[test]
     fn appends_one_line_per_record() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
+        let dir = tempfile::tempdir().expect("cannot create temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
         log.record(&Record {
             tool: "read",
             detail: "src/main.rs",
@@ -145,7 +157,7 @@ mod tests {
             target: None,
             result: "ok",
         })
-        .expect("書けない");
+        .expect("cannot write");
         log.record(&Record {
             tool: "read",
             detail: "src/lib.rs",
@@ -153,20 +165,20 @@ mod tests {
             target: None,
             result: "ok",
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let body = std::fs::read_to_string(&path).expect("読めない");
+        let body = std::fs::read_to_string(&path).expect("cannot read");
         assert_eq!(body.lines().count(), 2);
     }
 
     #[test]
     fn redacts_secrets_in_tool_field_too() {
-        // tool はモデルのツール呼び出しからそのまま渡ってくる値であり、
-        // プロンプトインジェクションを受けたモデルが任意の文字列を出しうる。
-        // detail と同じ経路で伏字化されることを確認する。
-        let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
+        // tool is a value that comes straight from the model's tool call,
+        // and a model under prompt injection can emit an arbitrary string.
+        // Confirm it's redacted through the same path as detail.
+        let dir = tempfile::tempdir().expect("cannot create temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
         log.record(&Record {
             tool: "export API_TOKEN=sk-abcdefghijklmnopqrstuvwxyz012345",
             detail: "harmless detail",
@@ -174,28 +186,28 @@ mod tests {
             target: None,
             result: "ok",
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let body = std::fs::read_to_string(&path).expect("読めない");
+        let body = std::fs::read_to_string(&path).expect("cannot read");
         assert!(
             !body.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
-            "tool 内の生の値が残っている"
+            "the raw value inside tool survived"
         );
-        assert!(body.contains("[REDACTED]"), "tool が伏字化されていない");
+        assert!(body.contains("[REDACTED]"), "tool was not redacted");
     }
 
     #[test]
     fn a_record_carries_the_policy_the_target_and_the_result() {
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
-        let root = tempfile::tempdir().expect("一時ディレクトリ");
+        let dir = tempfile::tempdir().expect("temp directory");
+        let root = tempfile::tempdir().expect("temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
 
         let policy = polaris_sandbox::SandboxPolicy::new(
             polaris_sandbox::SandboxMode::WorkspaceWrite,
             &[root.path().to_path_buf()],
         )
-        .expect("方針");
+        .expect("policy");
 
         log.record(&Record {
             tool: "write",
@@ -204,30 +216,31 @@ mod tests {
             target: Some(std::path::Path::new("/w/a.txt")),
             result: "ok",
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let line = std::fs::read_to_string(&path).expect("読めない");
-        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
+        let line = std::fs::read_to_string(&path).expect("cannot read");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("not JSON");
         assert_eq!(v["tool"], "write");
         assert_eq!(v["result"], "ok");
         assert_eq!(v["target"], "/w/a.txt");
         assert!(
             v["sandbox"]
                 .as_str()
-                .expect("sandbox が無い")
+                .expect("sandbox is missing")
                 .contains("workspace-write"),
-            "方針が記録されていない: {v}"
+            "policy was not recorded: {v}"
         );
     }
 
     #[test]
     fn every_new_field_passes_through_the_secret_screen() {
-        // 欄を増やすたびに伏字化を通し忘れる穴が開く。M1 では tool 欄が
-        // 通っていない時期があった。ここでは target と result の双方に
-        // 秘密らしき文字列を入れ、そのまま落ちないことを見る。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // Every time a field is added, a hole opens up where redaction can
+        // be forgotten. In M1 there was a period where the tool field wasn't
+        // passing through it. Here we put secret-looking strings into both
+        // target and result, and check that they don't fall through as-is.
+        let dir = tempfile::tempdir().expect("temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
 
         let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         log.record(&Record {
@@ -237,22 +250,22 @@ mod tests {
             target: Some(std::path::Path::new(secret)),
             result: secret,
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let line = std::fs::read_to_string(&path).expect("読めない");
+        let line = std::fs::read_to_string(&path).expect("cannot read");
         assert!(
             !line.contains(secret),
-            "秘密が生のまま監査ログに落ちている: {line}"
+            "the secret fell into the audit log raw: {line}"
         );
     }
 
     #[test]
     fn an_absent_policy_and_target_are_omitted_rather_than_written_as_empty() {
-        // 空文字列を書くと、「方針が無い」と「方針が空文字列だった」が
-        // 区別できなくなる。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // Writing an empty string would make "there is no policy"
+        // indistinguishable from "the policy was an empty string".
+        let dir = tempfile::tempdir().expect("temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
 
         log.record(&Record {
             tool: "read",
@@ -261,23 +274,25 @@ mod tests {
             target: None,
             result: "ok",
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let line = std::fs::read_to_string(&path).expect("読めない");
-        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
+        let line = std::fs::read_to_string(&path).expect("cannot read");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("not JSON");
         assert!(v.get("sandbox").is_none() || v["sandbox"].is_null(), "{v}");
         assert!(v.get("target").is_none() || v["target"].is_null(), "{v}");
     }
 
     #[test]
     fn writes_dropped_marker_when_entire_detail_is_secret() {
-        // 行全体が裸のシークレットのみで、周囲の文脈が無い場合
-        // screen_text は FilterResult::Drop を返す（secret_screen::tests::
-        // drops_bare_high_entropy_secret_with_no_surrounding_context と同じ
-        // 入力）。record はこの分岐で元の文字列を一切書かず [DROPPED] を書く。
-        let dir = tempfile::tempdir().expect("一時ディレクトリを作れない");
+        // When the entire line is nothing but a bare secret with no
+        // surrounding context, screen_text returns FilterResult::Drop (the
+        // same input as secret_screen::tests::
+        // drops_bare_high_entropy_secret_with_no_surrounding_context). On
+        // this branch, record never writes the original string at all — it
+        // writes [DROPPED].
+        let dir = tempfile::tempdir().expect("cannot create temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
         let bare_secret = "sk-abc123DEF456ghi789XYZ000aaa111";
         assert!(matches!(screen_text(bare_secret), FilterResult::Drop));
 
@@ -288,27 +303,28 @@ mod tests {
             target: None,
             result: "ok",
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let body = std::fs::read_to_string(&path).expect("読めない");
-        assert!(!body.contains(bare_secret), "生の値が残っている");
+        let body = std::fs::read_to_string(&path).expect("cannot read");
+        assert!(!body.contains(bare_secret), "the raw value survived");
         assert!(
             body.contains("[DROPPED]"),
-            "Drop 分岐でマーカーが書かれていない"
+            "the marker wasn't written on the Drop branch"
         );
     }
 
     #[test]
     fn a_result_over_the_ceiling_is_truncated_and_says_so() {
-        // read が成功するとファイル全体を result として渡してくる。
-        // 上限を設けないと監査ログがワークスペースの複製先になる。
+        // A successful read hands back the entire file as result. Without a
+        // ceiling, the audit log would become a duplicate of the workspace.
         //
-        // 空白無しで 20 文字以上続く塊は screen() の高エントロピー判定に
-        // 掛かって丸ごと [DROPPED] になってしまう（それ自体は正しい挙動）ため、
-        // 単語を空白で区切った、ファイル本文らしい内容を使う。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // A run of 20+ characters with no whitespace trips screen()'s
+        // high-entropy detection and gets wholesale [DROPPED] (which is
+        // correct behavior in itself), so we use content that looks like a
+        // file body, with words separated by whitespace.
+        let dir = tempfile::tempdir().expect("temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
 
         let long = "lorem ipsum dolor sit amet ".repeat(MAX_RESULT_BYTES / 10);
         log.record(&Record {
@@ -318,30 +334,31 @@ mod tests {
             target: None,
             result: &long,
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let line = std::fs::read_to_string(&path).expect("読めない");
-        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
-        let recorded = v["result"].as_str().expect("result が無い");
+        let line = std::fs::read_to_string(&path).expect("cannot read");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("not JSON");
+        let recorded = v["result"].as_str().expect("result is missing");
         assert!(
             recorded.len() < long.len(),
-            "切り詰められていない: {} バイト",
+            "was not truncated: {} bytes",
             recorded.len()
         );
         assert!(
-            recorded.contains("切り詰め"),
-            "切り詰めたことが本文に無い: {recorded}"
+            recorded.contains("truncated"),
+            "the body doesn't say it was truncated: {recorded}"
         );
     }
 
     #[test]
     fn truncation_lands_on_a_character_boundary() {
-        // バイト単位で単純に切ると多バイト文字の途中で割れて panic する。
-        // "あ" は 3 バイトなので、MAX_RESULT_BYTES（4096、3 の倍数でない）を
-        // 単純に切ると境界に当たらない位置を必ず踏む。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // Simply cutting at a raw byte offset can split a multi-byte
+        // character in half and panic. "あ" is 3 bytes, so simply cutting at
+        // MAX_RESULT_BYTES (4096, not a multiple of 3) is guaranteed to land
+        // on a position that isn't a boundary.
+        let dir = tempfile::tempdir().expect("temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
 
         let long = "あ".repeat(MAX_RESULT_BYTES / 3 + 10);
         log.record(&Record {
@@ -351,31 +368,33 @@ mod tests {
             target: None,
             result: &long,
         })
-        .expect("書けない（境界の途中で切って panic した可能性がある）");
+        .expect("cannot write (may have panicked from cutting mid-boundary)");
 
-        let line = std::fs::read_to_string(&path).expect("読めない");
-        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
-        let recorded = v["result"].as_str().expect("result が無い");
+        let line = std::fs::read_to_string(&path).expect("cannot read");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("not JSON");
+        let recorded = v["result"].as_str().expect("result is missing");
         assert!(
             recorded.len() <= MAX_RESULT_BYTES + 200,
-            "上限近辺に収まっていない: {} バイト",
+            "not within range of the ceiling: {} bytes",
             recorded.len()
         );
     }
 
     #[test]
     fn a_detail_over_the_ceiling_is_truncated_and_says_so() {
-        // detail は「モデルが送った引数だから有界」という理屈で当初は
-        // 無制限だったが誤り。write の content や edit の old/new は
-        // ファイル全体を運びうる。result と同じ経路（truncate_field）を
-        // 通ることを確認する。
+        // detail was originally left unbounded on the reasoning that "it's
+        // bounded because it's an argument the model sent" — that reasoning
+        // was wrong. write's content and edit's old/new can carry an entire
+        // file. Confirm it passes through the same path as result
+        // (truncate_field).
         //
-        // 空白無しで 20 文字以上続く塊は screen() の高エントロピー判定に
-        // 掛かって丸ごと [DROPPED] になってしまう（それ自体は正しい挙動）ため、
-        // 単語を空白で区切った、ファイル本文らしい内容を使う。
-        let dir = tempfile::tempdir().expect("一時ディレクトリ");
+        // A run of 20+ characters with no whitespace trips screen()'s
+        // high-entropy detection and gets wholesale [DROPPED] (which is
+        // correct behavior in itself), so we use content that looks like a
+        // file body, with words separated by whitespace.
+        let dir = tempfile::tempdir().expect("temp directory");
         let path = dir.path().join("audit.jsonl");
-        let mut log = AuditLog::open(&path).expect("開けない");
+        let mut log = AuditLog::open(&path).expect("cannot open");
 
         let long = "lorem ipsum dolor sit amet ".repeat(MAX_DETAIL_BYTES / 10);
         log.record(&Record {
@@ -385,19 +404,19 @@ mod tests {
             target: None,
             result: "ok",
         })
-        .expect("書けない");
+        .expect("cannot write");
 
-        let line = std::fs::read_to_string(&path).expect("読めない");
-        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON でない");
-        let recorded = v["detail"].as_str().expect("detail が無い");
+        let line = std::fs::read_to_string(&path).expect("cannot read");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("not JSON");
+        let recorded = v["detail"].as_str().expect("detail is missing");
         assert!(
             recorded.len() < long.len(),
-            "切り詰められていない: {} バイト",
+            "was not truncated: {} bytes",
             recorded.len()
         );
         assert!(
-            recorded.contains("切り詰め"),
-            "切り詰めたことが本文に無い: {recorded}"
+            recorded.contains("truncated"),
+            "the body doesn't say it was truncated: {recorded}"
         );
     }
 }

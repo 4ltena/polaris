@@ -1,5 +1,5 @@
-//! メッセージ履歴。M1 では追加のみで、圧縮もディスクへの永続化も持たない。
-//! 永続化と再開は M5 で入れる。
+//! Message history. In M1, this is append-only — no compaction, no
+//! persistence to disk. Persistence and resume land in M5.
 
 use polaris_provider::{Message, ToolCall};
 
@@ -21,15 +21,15 @@ impl Session {
         self.messages.push(Message::assistant(content));
     }
 
-    /// アシスタントのターンを、それが行ったツール呼び出しとともに記録する。
-    /// OpenAI の往復規約では、ツール結果を送る前にこのメッセージ自体が
-    /// `tool_calls` を保持したまま履歴に残っていなければならない。
+    /// Records an assistant turn together with the tool calls it made.
+    /// Under OpenAI's round-trip protocol, this message must remain in the
+    /// history holding its own `tool_calls` before the tool results are sent.
     pub fn push_assistant_tool_calls(&mut self, content: &str, tool_calls: Vec<ToolCall>) {
         self.messages
             .push(Message::assistant_with_tool_calls(content, tool_calls));
     }
 
-    /// ツール結果を、それが応答する呼び出しの id と結び付けて記録する。
+    /// Records a tool result, tying it to the id of the call it responds to.
     pub fn push_tool_result(&mut self, tool_call_id: &str, content: &str) {
         self.messages
             .push(Message::tool_result(tool_call_id, content));

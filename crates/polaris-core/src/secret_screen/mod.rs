@@ -1,48 +1,54 @@
-//! Remna のプライバシーフィルタ。捕捉したイベント（コマンド文字列やウィンドウ
-//! タイトルなど）を暗号化 DB へ保存する **前** に通す純粋ロジック。
+//! Remna's privacy filter. Pure logic that runs **before** a captured event
+//! (a command string, a window title, etc.) is saved to the encrypted DB.
 //!
-//! OS API には一切触れず、`&str` の分類・書き換えのみを行う。呼び出し側は
-//! [`FilterResult::Drop`] を保存せず、[`FilterResult::Redacted`] は伏字化後の
-//! 文字列を保存すること。
+//! Touches no OS API at all — it only classifies and rewrites `&str`. The
+//! caller must not save [`FilterResult::Drop`], and for
+//! [`FilterResult::Redacted`] must save the redacted string.
 //!
-//! このフィルタは補助であり保証ではない。見逃し（伏字化漏れ）より過検出
-//! （通常のコマンドを誤って伏字化・破棄すること）を避ける方向に倒しつつも、
-//! シークレットらしき値は積極的に伏字化・破棄する。
+//! This filter is an aid, not a guarantee. It leans toward avoiding
+//! over-detection (mistakenly redacting or discarding an ordinary command)
+//! rather than misses (failing to redact), while still actively redacting or
+//! discarding values that look like secrets.
 
 use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-/// テキストを screen_text に通した結果。
+/// The result of passing text through screen_text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterResult {
-    /// 機微情報は見つからなかった。そのまま保存してよい。
+    /// No sensitive information was found. Safe to save as-is.
     Keep(String),
-    /// 機微な値を伏字化した。この文字列を保存すること（元の文字列は保存しない）。
+    /// A sensitive value was redacted. Save this string (do not save the original).
     Redacted(String),
-    /// 機微情報らしき内容を検知したが、周囲の文脈から安全に伏字箇所だけを
-    /// 切り出せない（=判定不能）。何も保存しない。
+    /// Content that looks sensitive was detected, but the redacted portion
+    /// cannot safely be carved out from the surrounding context (i.e.
+    /// undecidable). Save nothing.
     Drop,
 }
 
 const PLACEHOLDER: &str = "[REDACTED]";
 
-// --- 伏字化ルール -----------------------------------------------------------
-// いずれも「保持する接頭辞（キャプチャ 1）+ 伏字プレースホルダ」の形で置換する。
-// zsh 側のプローブ（shell/remna-hook.zsh、Task 7 で導入予定）で実証済みの
-// ルールを Rust に移植したもの。
+// --- Redaction rules ---------------------------------------------------------
+// Every one of these replaces in the form "prefix to keep (capture 1) +
+// redaction placeholder". Ported to Rust from rules proven out on the zsh
+// side probe (shell/remna-hook.zsh, scheduled for introduction in Task 7).
 
-/// 値キャプチャ用の共通パターン: ダブルクオート文字列 / シングルクオート文字列
-/// （いずれも空白を含んでよい）、またはクオートなしの非空白ラン。
-/// クオートされた値は空白を含みうる（例: `"correct horse battery staple"`）ため、
-/// 単純な `\S+` だと最初の空白で止まり、値の後半が平文で残ってしまう
-/// （Critical 1 の是正）。
+/// The common pattern for value capture: a double-quoted string / a
+/// single-quoted string (either may contain whitespace), or an unquoted run
+/// of non-whitespace. A quoted value can contain whitespace (e.g.
+/// `"correct horse battery staple"`), so a plain `\S+` would stop at the
+/// first whitespace and leave the rest of the value in plaintext
+/// (fix for Critical 1).
 const VALUE_PATTERN: &str = r#""[^"]*"|'[^']*'|\S+"#;
 
-/// 環境変数代入 `NAME=value` で、NAME が秘密を示す語を含む場合、値だけを伏字化する
-/// （変数名は残す）。キーワード集合は zsh フック・VS Code 拡張の一次フィルタと揃える。
-/// 権威フィルタ（この関数）が一次フィルタより弱いと、P2 でセンサをここへ配線した際に退行する。
-/// PWD は MYSQL_PWD など、末尾ワイルドカードは API_/AUTH_/ACCESS_ 系を拾う。
+/// For an environment variable assignment `NAME=value`, when NAME contains a
+/// word indicating a secret, redacts only the value (keeps the variable
+/// name). The keyword set is kept aligned with the zsh hook / VS Code
+/// extension's primary filter. If this authoritative filter (this function)
+/// were weaker than the primary filter, wiring the sensor to this one in P2
+/// would be a regression. PWD picks up things like MYSQL_PWD, and the
+/// trailing wildcard picks up the API_/AUTH_/ACCESS_ family.
 static ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"(?i)\b([A-Za-z_][A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PWD|CREDENTIAL|KEY|API|AUTH|ACCESS)[A-Za-z0-9_]*=)({VALUE_PATTERN})"#,
@@ -50,16 +56,16 @@ static ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// `Authorization:` ヘッダの値（コロン以降、引用符の手前まで）を丸ごと伏字化する。
+/// Redacts the entire value of an `Authorization:` header (from after the colon up to just before the quote).
 static AUTH_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)(authorization\s*:\s*)([^'"\r\n]+)"#).unwrap());
 
-/// `Authorization:` ヘッダの外に出てくる素の `Bearer <token>`。
+/// A bare `Bearer <token>` appearing outside an `Authorization:` header.
 static BARE_BEARER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)(bearer\s+)(\S+)"#).unwrap());
 
-/// `--password`, `--token`, `--secret`, `--api-key`, `--access-token` 等の
-/// 長いフラグに続く値。
+/// The value following a long flag such as `--password`, `--token`,
+/// `--secret`, `--api-key`, `--access-token`, etc.
 static LONG_FLAG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"(?i)(--(?:password|passwd|token|secret|api[-_]?key|access[-_]?token)[=\s]+)({VALUE_PATTERN})"#,
@@ -67,43 +73,46 @@ static LONG_FLAG: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// curl 形式の Basic 認証 `-u user:pass`。ユーザー名・パスワードそれぞれを
-/// 個別にキャプチャする（`redact_basic_auth` で UID:GID 形との衝突を判定する
-/// ため。Important 5 の是正）。
+/// curl-style Basic auth `-u user:pass`. Captures the username and password
+/// separately (needed by `redact_basic_auth` to judge collision with the
+/// UID:GID form. Fix for Important 5).
 static BASIC_AUTH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(-u\s+)([^:\s]+):(\S+)"#).unwrap());
 
-/// URL に埋め込まれた資格情報 `scheme://user:password@host`。
-/// パスワード部分（キャプチャ 1）だけを伏字化し、ユーザー名・ホストは残す
-/// （Critical 2 の是正）。変数名にキーワードが無い `DATABASE_URL=postgres://...`
-/// のような代入も、この独立したルールで拾える。
+/// Credentials embedded in a URL, `scheme://user:password@host`. Redacts
+/// only the password portion (capture 1), keeping the username and host
+/// (fix for Critical 2). This independent rule also picks up an assignment
+/// like `DATABASE_URL=postgres://...` where the variable name carries no keyword.
 static URL_CREDENTIALS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"://[^:/\s@]+:([^@\s]+)@"#).unwrap());
 
-/// URL に埋め込まれた資格情報のうち、コロン区切りではなく
-/// `scheme://token@host` という単一トークン形（例:
-/// `curl https://secretTokenAbc123@ftp.example.com/file`）。[`URL_CREDENTIALS`]
-/// は `user:password@` の2要素構造だけを見るため、コロンを含まない単一トークン
-/// はこのルールでは拾えず平文で残ってしまう（再レビュー指摘 修正 A）。
+/// Credentials embedded in a URL as a single token form,
+/// `scheme://token@host`, rather than colon-separated (e.g.
+/// `curl https://secretTokenAbc123@ftp.example.com/file`). [`URL_CREDENTIALS`]
+/// only looks at the two-part `user:password@` structure, so a single token
+/// without a colon slips past that rule and stays in plaintext
+/// (re-review finding, fix A).
 ///
-/// キャプチャ 1 が token 本体。`://` の直後から `@` の直前までにコロンが
-/// 一切無い場合にのみマッチする（`user:pass@` はコロンを含むためここには
-/// マッチしない = `URL_CREDENTIALS` と排他的）。
+/// Capture 1 is the token body. Matches only when there is no colon at all
+/// between right after `://` and right before `@` (`user:pass@` contains a
+/// colon, so it does not match here — mutually exclusive with
+/// `URL_CREDENTIALS`).
 ///
-/// マッチした token を無条件に伏字化すると `ssh://git@github.com` の `git` や
-/// `https://anonymous@host` の `anonymous` のような無害なユーザー名まで壊して
-/// しまうため、実際に伏字化するかどうかは
-/// [`redact_url_single_token_credential`] 側でガードする。
+/// Unconditionally redacting every matched token would also destroy
+/// harmless usernames such as `git` in `ssh://git@github.com` or
+/// `anonymous` in `https://anonymous@host`, so whether it's actually
+/// redacted is guarded on the [`redact_url_single_token_credential`] side.
 static URL_SINGLE_TOKEN_CREDENTIAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"://([^:@/\s]+)@"#).unwrap());
 
-/// 高エントロピーらしき裸の文字列（20 文字以上、base64/hex ライクな文字集合）の候補。
-/// 実際に伏字化するかは [`looks_like_secret`] で追加判定する。
+/// A candidate for a bare high-entropy-looking string (20+ characters, a
+/// base64/hex-like character set). Whether it's actually redacted gets an
+/// additional judgment from [`looks_like_secret`].
 static HIGH_ENTROPY_CANDIDATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[A-Za-z0-9+/_=-]{20,}"#).unwrap());
 
-/// キャプチャ 1（保持する接頭辞）+ プレースホルダで置換する。
-/// マッチが 1 件でもあれば true を返す。
+/// Replaces with capture 1 (the prefix to keep) + placeholder.
+/// Returns true if there was even one match.
 fn redact_with_prefix(text: &str, re: &Regex) -> (String, bool) {
     let mut matched = false;
     let out = re.replace_all(text, |caps: &Captures| {
@@ -113,11 +122,13 @@ fn redact_with_prefix(text: &str, re: &Regex) -> (String, bool) {
     (out.into_owned(), matched)
 }
 
-/// マッチ全体のうち指定したキャプチャグループだけをプレースホルダに置換し、
-/// マッチ内でそのグループの前後にある文字列はそのまま残す。
-/// `scheme://user:password@host` のように、伏字化したい値（password）の前後
-/// （`://user:` と `@host` の `@` 側）にも残したい文脈がある場合に使う
-/// （`redact_with_prefix` は接頭辞だけ残してマッチ全体を切り詰めるため使えない）。
+/// Replaces only the specified capture group within the whole match with the
+/// placeholder, leaving the text before and after that group within the
+/// match untouched. Used when there's context to keep both before and after
+/// the value to be redacted (password), as in `scheme://user:password@host`
+/// (the `://user:` side and the `@host` side) — `redact_with_prefix` can't
+/// be used here because it keeps only the prefix and truncates the rest of
+/// the match.
 fn redact_group(text: &str, re: &Regex, group: usize) -> (String, bool) {
     let mut matched = false;
     let out = re.replace_all(text, |caps: &Captures| {
@@ -133,16 +144,18 @@ fn redact_group(text: &str, re: &Regex, group: usize) -> (String, bool) {
     (out.into_owned(), matched)
 }
 
-/// [`URL_SINGLE_TOKEN_CREDENTIAL`] でマッチした `scheme://token@host` の
-/// token 部分を、[`looks_like_secret`] が true か、または 16 文字以上の場合
-/// にのみ伏字化する（再レビュー指摘 修正 A）。
+/// Redacts the token portion of a `scheme://token@host` matched by
+/// [`URL_SINGLE_TOKEN_CREDENTIAL`] only when [`looks_like_secret`] is true,
+/// or the token is 16+ characters long (re-review finding, fix A).
 ///
-/// `ssh://git@github.com` の `git` や `https://anonymous@host` の
-/// `anonymous` のような短い無害なユーザー名は、この両条件のいずれにも
-/// 該当しないため残る。一方 `curl https://secretTokenAbc123@ftp.example.com`
-/// のような token は `looks_like_secret` 判定（英大小文字+数字の混在）で
-/// 捕捉されるほか、文字種に関わらず 16 文字以上あれば長さだけを根拠に
-/// 安全側で伏字化する（制約「迷ったら Redact 寄り」に従うフォールバック）。
+/// A short, harmless username like `git` in `ssh://git@github.com` or
+/// `anonymous` in `https://anonymous@host` satisfies neither condition, so
+/// it's kept. Meanwhile a token like the one in
+/// `curl https://secretTokenAbc123@ftp.example.com` is caught by the
+/// `looks_like_secret` judgment (a mix of upper/lowercase letters and
+/// digits), and regardless of character makeup, anything 16+ characters
+/// long is redacted on length alone, erring on the safe side (a fallback
+/// following the constraint "when in doubt, favor Redact").
 fn redact_url_single_token_credential(text: &str) -> (String, bool) {
     let mut matched = false;
     let out = URL_SINGLE_TOKEN_CREDENTIAL.replace_all(text, |caps: &Captures| {
@@ -150,7 +163,7 @@ fn redact_url_single_token_credential(text: &str) -> (String, bool) {
         let token = caps.get(1).unwrap();
         let token_str = token.as_str();
         if !looks_like_secret(token_str) && token_str.chars().count() < 16 {
-            // 無害なユーザー名の可能性が高いため残す。
+            // Likely a harmless username, so keep it.
             return full.as_str().to_string();
         }
         matched = true;
@@ -163,9 +176,10 @@ fn redact_url_single_token_credential(text: &str) -> (String, bool) {
     (out.into_owned(), matched)
 }
 
-/// curl の Basic 認証 `-u user:pass` を伏字化する。ただし
-/// `docker run -u 1000:1000` のような UID:GID 指定（ユーザー名・パスワード
-/// 双方が数字のみ）は資格情報ではないため伏字化しない（Important 5 の是正）。
+/// Redacts curl-style Basic auth `-u user:pass`. However, a UID:GID
+/// specification like `docker run -u 1000:1000` (both username and password
+/// are digits only) is not a credential and is not redacted
+/// (fix for Important 5).
 fn redact_basic_auth(text: &str) -> (String, bool) {
     let mut matched = false;
     let out = BASIC_AUTH.replace_all(text, |caps: &Captures| {
@@ -173,8 +187,8 @@ fn redact_basic_auth(text: &str) -> (String, bool) {
         let pass = &caps[3];
         let all_digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
         if all_digits(user) && all_digits(pass) {
-            // 両方が数字のみ = UID:GID の指定（例: `docker run -u 1000:1000`）
-            // であって資格情報ではないため、伏字化しない。
+            // Both are digits only = a UID:GID specification
+            // (e.g. `docker run -u 1000:1000`), not a credential, so don't redact.
             return caps[0].to_string();
         }
         matched = true;
@@ -183,23 +197,26 @@ fn redact_basic_auth(text: &str) -> (String, bool) {
     (out.into_owned(), matched)
 }
 
-/// git のコミットハッシュ（短縮 7/8 桁、SHA-1 の 40 桁、SHA-256 の 64 桁）に
-/// 典型的な「長さがちょうど 7/8/40/64 で、全文字が小文字 16 進数」の形か。
+/// Whether a token has the shape typical of a git commit hash (7/8-digit
+/// abbreviated, 40-digit SHA-1, 64-digit SHA-256): "length is exactly
+/// 7/8/40/64, and every character is lowercase hex."
 ///
-/// 注意: これは長さと文字種だけを見た構造的な判定であり、意味的に SHA だと
-/// 確認しているわけではない。40 文字ちょうどの小文字 16 進文字列は、旧形式の
-/// GitHub Personal Access Token 等とも構造的に区別できないため、そのような
-/// 実際のシークレットがこの例外に該当してしまい Keep されうる。これは
-/// 「通常の git コマンドを誤って伏字化しない」ことを優先した意図的なトレード
-/// オフとして許容する。
+/// Note: this is a structural judgment that looks only at length and
+/// character set — it does not semantically confirm the token is a SHA. A
+/// lowercase hex string of exactly 40 characters is structurally
+/// indistinguishable from, say, an old-format GitHub Personal Access Token,
+/// so an actual secret of that shape can fall into this exception and be
+/// Kept. This is accepted as a deliberate trade-off that prioritizes "don't
+/// mistakenly redact an ordinary git command."
 fn is_git_sha_shape(token: &str) -> bool {
     matches!(token.len(), 7 | 8 | 40 | 64)
         && token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
-/// トークンが英小文字と数字だけで構成されているか（ハイフン等の記号や大文字を
-/// 含まない）。`remna-collector-macos` のようなケバブケース識別子はハイフンを
-/// 含むためここには該当せず、誤って伏字化対象にならない。
+/// Whether a token is made up of only lowercase letters and digits (no
+/// symbols like hyphens, no uppercase). A kebab-case identifier like
+/// `remna-collector-macos` contains a hyphen, so it does not qualify here
+/// and is not mistakenly targeted for redaction.
 fn is_lowercase_alnum(token: &str) -> bool {
     token.chars().any(|c| c.is_ascii_lowercase())
         && token
@@ -207,42 +224,54 @@ fn is_lowercase_alnum(token: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
-/// [`looks_like_secret`] の「英小文字+数字のみ」分岐が対象にする最小長。
+/// The minimum length targeted by [`looks_like_secret`]'s "lowercase
+/// letters + digits only" branch.
 ///
-/// これより短い純粋な小文字英数字の文字列（`git`, `anonymous` のような
-/// ありふれた短いユーザー名等）は、文字種の情報量だけではシークレットと区別
-/// できないため対象外とする。既存の高エントロピー候補（[`HIGH_ENTROPY_CANDIDATE`]）
-/// は 20 文字以上でしか呼ばれないため、この下限（16）を導入しても高エントロピー
-/// 経由の既存の判定結果に影響はない。
+/// A pure lowercase-alphanumeric string shorter than this (an ordinary short
+/// username like `git` or `anonymous`, etc.) is excluded, because character
+/// makeup alone doesn't carry enough information to distinguish it from a
+/// secret. The existing high-entropy candidate
+/// ([`HIGH_ENTROPY_CANDIDATE`]) is only ever invoked at 20+ characters, so
+/// introducing this lower bound (16) does not affect existing judgments
+/// made via the high-entropy path.
 ///
-/// この下限は、[`redact_url_single_token_credential`]（修正 A）が
-/// `looks_like_secret` を `scheme://token@host` の token（20 文字未満もあり得る）
-/// に対しても呼ぶようになったことで必要になった。下限が無いと `ssh://git@host`
-/// の `git` のような短い無害なユーザー名まで「秘密らしい」と誤判定してしまう。
+/// This lower bound became necessary once
+/// [`redact_url_single_token_credential`] (fix A) started calling
+/// `looks_like_secret` on the token in `scheme://token@host` too (which can
+/// be under 20 characters). Without a lower bound, a short harmless
+/// username like `git` in `ssh://git@host` would be misjudged as
+/// "secret-looking."
 const LOWERCASE_ALNUM_SECRET_MIN_LEN: usize = 16;
 
-/// 高エントロピー候補のうち、実際に秘密情報らしい見た目のものだけを伏字化する。
+/// Among high-entropy candidates, redacts only the ones that actually look
+/// like secret information.
 ///
-/// 条件は次のいずれか:
-/// - 英大文字・英小文字・数字が全て混在している（典型的なランダムトークン）。
-/// - [`LOWERCASE_ALNUM_SECRET_MIN_LEN`] 文字以上あり、英小文字と数字だけで
-///   構成されており、かつ [`is_git_sha_shape`] の形ではない（=長さが git
-///   コミットハッシュの典型的な長さと一致しない）。全小文字 hex の旧形式
-///   トークンや webhook secret はこちらで捕捉する（Critical 3 の是正: 以前は
-///   「大小英数字の混在」のみを条件にしていたため、全小文字のシークレットを
-///   取りこぼしていた）。
+/// The condition is either of the following:
+/// - Uppercase letters, lowercase letters, and digits are all mixed
+///   together (a typical random token).
+/// - It's [`LOWERCASE_ALNUM_SECRET_MIN_LEN`] characters or longer, made up
+///   of only lowercase letters and digits, and does not have the shape of
+///   [`is_git_sha_shape`] (i.e. its length does not match the typical
+///   length of a git commit hash). All-lowercase hex old-format tokens and
+///   webhook secrets are caught here (fix for Critical 3: previously the
+///   only condition was "a mix of upper/lowercase and digits," which missed
+///   all-lowercase secrets).
 ///
-/// `remna-collector-macos` のような素のケバブケース識別子はハイフンを含み
-/// [`is_lowercase_alnum`] の対象外のため、誤検出しない
-/// （通常のコマンドを誤って伏字化しないための保守的な判定）。
+/// A bare kebab-case identifier like `remna-collector-macos` contains a
+/// hyphen and falls outside [`is_lowercase_alnum`], so it is not falsely
+/// flagged (a conservative judgment aimed at not mistakenly redacting an
+/// ordinary command).
 ///
-/// **意図的な過検出について**: SHA 長（7/8/40/64）以外の全小文字 hex（MD5 等の
-/// 32 文字ハッシュを含む）は、実際のシークレットと構造的に区別できないため
-/// 安全側に倒して Redact する。例えば 32 文字の MD5 ハッシュ値は
-/// [`is_git_sha_shape`] の例外に該当せず、[`LOWERCASE_ALNUM_SECRET_MIN_LEN`]
-/// 以上であれば無条件に秘密情報とみなされる。これはバグではなく、本 crate の
-/// 制約「見逃しを減らす方向に倒す（迷ったら Redact 寄り）」に従う意図的な挙動
-/// である（レビュー指摘: 挙動は変えず、この意図をここに明記する）。
+/// **On deliberate over-detection**: all-lowercase hex outside the SHA
+/// lengths (7/8/40/64) — including a 32-character MD5-style hash — is
+/// structurally indistinguishable from an actual secret, so it's Redacted,
+/// erring on the safe side. For example, a 32-character MD5 hash value does
+/// not fall under the [`is_git_sha_shape`] exception, and at
+/// [`LOWERCASE_ALNUM_SECRET_MIN_LEN`] or longer it is unconditionally
+/// treated as secret information. This is not a bug — it's deliberate
+/// behavior following this crate's constraint "lean toward reducing misses
+/// (when in doubt, favor Redact)" (review finding: behavior is unchanged;
+/// this intent is spelled out here).
 fn looks_like_secret(token: &str) -> bool {
     let has_upper = token.chars().any(|c| c.is_ascii_uppercase());
     let has_lower = token.chars().any(|c| c.is_ascii_lowercase());
@@ -269,8 +298,8 @@ fn redact_high_entropy(text: &str) -> (String, bool) {
     (out.into_owned(), matched)
 }
 
-/// プレースホルダを取り除いた後、英数字が一切残らないか（=行全体が
-/// シークレットそのものだったか）を調べる。
+/// After stripping placeholders, checks whether any alphanumeric characters
+/// remain at all (i.e. whether the entire line was nothing but the secret itself).
 fn nothing_useful_remains(text_with_placeholders: &str) -> bool {
     !text_with_placeholders
         .replace(PLACEHOLDER, "")
@@ -278,38 +307,41 @@ fn nothing_useful_remains(text_with_placeholders: &str) -> bool {
         .any(|c| c.is_alphanumeric())
 }
 
-/// 捕捉したテキスト（コマンド文字列やウィンドウタイトル）を保存前に screen する。
+/// Screens captured text (a command string, a window title) before it's saved.
 ///
-/// - 何も機微な値が見つからなければ [`FilterResult::Keep`]。
-/// - 機微な値を伏字化できれば [`FilterResult::Redacted`]（伏字化後の文字列）。
-/// - 機微らしき内容を検知したが、伏字化した結果コマンドの形すら残らない
-///   （=行全体が丸ごとシークレットだった）場合は [`FilterResult::Drop`]。
+/// - [`FilterResult::Keep`] if no sensitive value is found at all.
+/// - [`FilterResult::Redacted`] (the redacted string) if a sensitive value could be redacted.
+/// - [`FilterResult::Drop`] if sensitive-looking content was detected, but
+///   after redaction not even the shape of a command remains (i.e. the
+///   entire line was nothing but a secret).
 pub fn screen_text(s: &str) -> FilterResult {
     let mut text = s.to_string();
     let mut any_redacted = false;
 
-    // Authorization ヘッダ・裸の Bearer を先に処理する
-    // （後段の高エントロピー判定がトークン単体に重複適用されるのを避けるため）。
+    // Process the Authorization header and bare Bearer first (to avoid the
+    // later high-entropy judgment being applied redundantly to the bare token).
     for re in [&*AUTH_HEADER, &*BARE_BEARER, &*ENV_ASSIGNMENT, &*LONG_FLAG] {
         let (next, matched) = redact_with_prefix(&text, re);
         text = next;
         any_redacted |= matched;
     }
 
-    // URL 埋め込み資格情報（`scheme://user:pass@host`）はマッチ全体ではなく
-    // password 部分だけを消したいので専用の redact_group を使う。
+    // For URL-embedded credentials (`scheme://user:pass@host`), we want to
+    // erase only the password portion rather than the whole match, so use
+    // the dedicated redact_group.
     let (next, matched) = redact_group(&text, &URL_CREDENTIALS, 1);
     text = next;
     any_redacted |= matched;
 
-    // URL 埋め込み資格情報のうちコロン無し単一トークン形（`scheme://token@host`）。
-    // 上のコロン区切りルールとは排他的にマッチするため、順序はどちらが先でも
-    // 干渉しない（修正 A）。
+    // The colon-less single-token form of URL-embedded credentials
+    // (`scheme://token@host`). This matches exclusively of the
+    // colon-separated rule above, so the order between the two doesn't
+    // interfere either way (fix A).
     let (next, matched) = redact_url_single_token_credential(&text);
     text = next;
     any_redacted |= matched;
 
-    // curl の `-u user:pass` は UID:GID との衝突判定が要るため専用関数を使う。
+    // curl's `-u user:pass` needs collision judgment against UID:GID, so use the dedicated function.
     let (next, matched) = redact_basic_auth(&text);
     text = next;
     any_redacted |= matched;
@@ -359,20 +391,25 @@ mod tests {
 
     #[test]
     fn redacts_short_pwd_var() {
-        // MYSQL_PWD=hunter2 は 20 文字未満で高エントロシーにも当たらないが、
-        // PWD 語尾で NAME に一致するため値だけ伏字化される。センサ一次フィルタと同等。
+        // MYSQL_PWD=hunter2 is under 20 characters and doesn't trip
+        // high-entropy detection either, but the PWD suffix matches NAME, so
+        // only the value is redacted. Equivalent to the sensor's primary filter.
         match screen_text("MYSQL_PWD=hunter2 mysql -e 'select 1'") {
             FilterResult::Redacted(s) => {
-                assert!(!s.contains("hunter2"), "PWD の値は伏字化されるべき: {s}");
-                assert!(s.contains("mysql"), "コマンド本体は残る");
+                assert!(
+                    !s.contains("hunter2"),
+                    "the PWD value should be redacted: {s}"
+                );
+                assert!(s.contains("mysql"), "the command body should survive");
             }
             other => panic!("expected redaction, got {other:?}"),
         }
     }
 
-    // --- 追加テスト: brief Step 3 が要求する残りのルール ---------------------
-    // (env代入・Authorizationヘッダに加えて、--token / -u user:pass / 高エントロ
-    // ピー文字列の伏字化、および追加のパス除外パターンを検証する。)
+    // --- Additional tests: remaining rules required by brief Step 3 ---------
+    // (Beyond env assignment and the Authorization header, verifies
+    // redaction of --token / -u user:pass / high-entropy strings, plus
+    // additional path exclusion patterns.)
 
     #[test]
     fn redacts_token_flag() {
@@ -401,7 +438,8 @@ mod tests {
 
     #[test]
     fn drops_bare_high_entropy_secret_with_no_surrounding_context() {
-        // 行全体が裸のシークレットだけの場合、伏字化しても中身が残らないので Drop する。
+        // When the entire line is nothing but a bare secret, redaction
+        // leaves nothing behind, so it Drops.
         match screen_text("sk-abc123DEF456ghi789XYZ000aaa111") {
             FilterResult::Drop => {}
             other => panic!("expected drop, got {other:?}"),
@@ -410,11 +448,13 @@ mod tests {
 
     #[test]
     fn keeps_git_command_with_commit_hash() {
-        // 小文字だけの hex（git のコミットハッシュ等）を高エントロピー判定で
-        // 誤って伏字化しないこと。通常のコマンドを壊さない制約の確認。
-        // 注: 元のテストが使っていたトークンは実は 39 文字（真の SHA-1 は 40 文字）
-        // だったため、Critical 3 で SHA 例外を「長さがちょうど 7/8/40/64」に
-        // 厳密化するのに合わせ、正しい 40 文字の SHA-1 相当に修正した。
+        // Confirms that lowercase-only hex (a git commit hash, etc.) is not
+        // mistakenly redacted by high-entropy detection. A check on the
+        // constraint against breaking ordinary commands.
+        // Note: the token the original test used was actually 39 characters
+        // (a real SHA-1 is 40), so to match Critical 3 tightening the SHA
+        // exception to "length exactly 7/8/40/64," it was fixed to a proper
+        // 40-character SHA-1-equivalent value.
         let sha40 = "8f3a1c2e9b7d4560112233445566778899aabbc0";
         assert_eq!(sha40.len(), 40);
         assert!(matches!(
@@ -423,12 +463,13 @@ mod tests {
         ));
     }
 
-    // --- レビュー指摘の是正テスト（Critical 1〜3, Important 4〜5） -----------
+    // --- Fix-verification tests for review findings (Critical 1-3, Important 4-5) -----------
 
     #[test]
     fn redacts_url_embedded_credentials() {
-        // Critical 2: `scheme://user:password@host` 形式はどの既存ルールにも
-        // 掛からず、変数名にキーワードが無くてもパスワードが平文で残る。
+        // Critical 2: the `scheme://user:password@host` form doesn't trip
+        // any existing rule, so the password stays in plaintext even when
+        // the variable name carries no keyword.
         match screen_text("export DATABASE_URL=postgres://user:pass@host") {
             FilterResult::Redacted(s) => {
                 assert!(!s.contains("pass"), "password should be redacted: {s}");
@@ -453,13 +494,15 @@ mod tests {
 
     #[test]
     fn redacts_full_lowercase_alnum_secret_not_sha_shaped() {
-        // Critical 3: looks_like_secret が「大小英数字の混在」を要求するため、
-        // 全小文字（+数字）のトークンは git SHA でなくても Keep されてしまう。
-        // SHA 例外は「長さがちょうど 7/8/40/64 の全小文字16進数」だけに限定し、
-        // それ以外の高エントロピートークンは伏字化されるべき。
-        // 前後に文脈語（legacy webhook token）を残しつつ、他のどの伏字化ルール
-        // （env代入・フラグ・URL資格情報等）にも掛からない裸のトークンにして、
-        // 高エントロピー判定単体の挙動を検証する。
+        // Critical 3: because looks_like_secret required "a mix of
+        // upper/lowercase and digits," an all-lowercase (+digit) token
+        // would be Kept even when it isn't a git SHA. The SHA exception
+        // should be limited to just "all-lowercase hex of length exactly
+        // 7/8/40/64"; any other high-entropy token should be redacted.
+        // Uses a bare token that keeps surrounding context words (legacy
+        // webhook token) while tripping none of the other redaction rules
+        // (env assignment, flags, URL credentials, etc.), to verify the
+        // behavior of high-entropy detection in isolation.
         let token = "a0b1c2d3e4f5g6h7i8j9a0b1c2d3e4f5g6h7i8j9a0b1c2d3e4";
         assert_eq!(token.len(), 50);
         match screen_text(&format!("legacy webhook token: {token}")) {
@@ -475,8 +518,8 @@ mod tests {
 
     #[test]
     fn keeps_docker_uid_gid_but_redacts_curl_basic_auth() {
-        // Important 5: BASIC_AUTH の `-u user:pass` ルールが
-        // `docker run -u 1000:1000 img` の UID:GID 指定まで伏字化してしまう。
+        // Important 5: BASIC_AUTH's `-u user:pass` rule was also redacting
+        // the UID:GID specification in `docker run -u 1000:1000 img`.
         assert!(
             matches!(
                 screen_text("docker run -u 1000:1000 img"),
@@ -497,21 +540,24 @@ mod tests {
         }
     }
 
-    // --- 再レビュー指摘（修正 A・修正 B）--------------------------------------
+    // --- Re-review findings (fix A, fix B) --------------------------------------
 
     #[test]
     fn redacts_single_token_url_credential() {
-        // 修正 A: `URL_CREDENTIALS` は `user:password@` のコロン区切り2要素形しか
-        // 見ないため、`scheme://token@host`（コロン無しの単一トークン）は素通り
-        // して平文で残ってしまう。
+        // Fix A: `URL_CREDENTIALS` only looks at the colon-separated
+        // two-part `user:password@` form, so `scheme://token@host` (a
+        // colon-less single token) sails through and stays in plaintext.
         //
-        // token は意図的に 16 文字（境界ちょうど）かつ英数字混在だが数字は含まない
-        // 形にしてある。これにより `looks_like_secret`（大小英数字混在 or SHA形
-        // でない全小文字英数字）のどちらの条件にも該当せず、`token.len() >= 16`
-        // という長さフォールバックだけで伏字化されるかを検証できる。また 20 文字
-        // 未満なので、既存の `HIGH_ENTROPY_CANDIDATE`（20文字以上）の高エントロ
-        // ピー判定が偶然カバーしてしまい、修正 A の新規ロジックを経由せずに
-        // グリーンになる、という偽陽性を避けている。
+        // The token is deliberately made 16 characters (exactly at the
+        // boundary) and a mix of letters, but with no digits. This means it
+        // satisfies neither condition of `looks_like_secret` (a mix of
+        // upper/lowercase and digits, or all-lowercase-alnum not shaped
+        // like a SHA), letting us verify whether it's redacted purely by
+        // the `token.len() >= 16` length fallback. It's also under 20
+        // characters, which avoids the false positive of the existing
+        // `HIGH_ENTROPY_CANDIDATE` (20+ characters) high-entropy judgment
+        // happening to cover it and passing green without ever exercising
+        // fix A's new logic.
         let token = "SecretApiTokenAB";
         assert_eq!(token.len(), 16);
         assert!(
@@ -533,9 +579,10 @@ mod tests {
 
     #[test]
     fn keeps_harmless_ssh_and_anonymous_url_usernames() {
-        // 修正 A のガード: token が looks_like_secret でもなく 16 文字未満なら、
-        // `ssh://git@github.com` の `git` や `https://anonymous@host` の
-        // `anonymous` のような無害なユーザー名として残し、誤って壊さない。
+        // Fix A's guard: when a token is neither looks_like_secret nor 16+
+        // characters long, it's kept as a harmless username like `git` in
+        // `ssh://git@github.com` or `anonymous` in `https://anonymous@host`,
+        // rather than mistakenly destroyed.
         match screen_text("git clone ssh://git@github.com/user/repo") {
             FilterResult::Keep(s) => assert!(s.contains("git@github.com")),
             other => panic!("expected keep, got {other:?}"),
@@ -548,10 +595,12 @@ mod tests {
 
     #[test]
     fn redacts_basic_auth_when_second_part_is_non_numeric() {
-        // 修正 B（境界テスト a）: `-u UID:GID` の例外は「両方が数字のみ」の場合に
-        // 限る。GID 側が数字でなければ資格情報の可能性を排除できないため、
-        // 安全側で redact する（`docker run -u 1000:1000` の Keep 自体は既存の
-        // `keeps_docker_uid_gid_but_redacts_curl_basic_auth` で確認済み）。
+        // Fix B (boundary test a): the `-u UID:GID` exception is limited to
+        // the case where both sides are digits only. If the GID side isn't
+        // digits, the possibility of a credential can't be ruled out, so it
+        // redacts, erring on the safe side (the Keep behavior for
+        // `docker run -u 1000:1000` itself is already confirmed by the
+        // existing `keeps_docker_uid_gid_but_redacts_curl_basic_auth`).
         match screen_text("docker run -u 1000:pass img") {
             FilterResult::Redacted(s) => {
                 assert!(
@@ -570,12 +619,15 @@ mod tests {
 
     #[test]
     fn redacts_32_char_lowercase_hex_as_intentional_over_detection() {
-        // 修正 B（境界テスト b）: 32 文字の全小文字16進数（MD5 ハッシュ等）は
-        // `is_git_sha_shape` の SHA 例外（7/8/40/64 文字）に該当しないため、
-        // 実際のシークレットと構造的に区別できず安全側で Redact される。
-        // これはバグではなく、制約「見逃しを減らす方向に倒す（迷ったら Redact
-        // 寄り）」に従う意図的な過検出である（レビュー指摘への対応: 挙動は
-        // 変えず、この意図を doc コメントとテストの両方で明記する）。
+        // Fix B (boundary test b): a 32-character all-lowercase hex string
+        // (an MD5 hash, etc.) does not fall under `is_git_sha_shape`'s SHA
+        // exception (7/8/40/64 characters), so it's structurally
+        // indistinguishable from an actual secret and gets Redacted, erring
+        // on the safe side. This is not a bug — it's deliberate
+        // over-detection following the constraint "lean toward reducing
+        // misses (when in doubt, favor Redact)" (response to a review
+        // finding: behavior is unchanged; this intent is spelled out in
+        // both the doc comment and the test).
         let md5_like = "0123456789abcdef0123456789abcdef";
         assert_eq!(md5_like.len(), 32);
         match screen_text(&format!("md5sum output: {md5_like}")) {
@@ -591,8 +643,9 @@ mod tests {
 
     #[test]
     fn redacts_multi_word_quoted_env_value() {
-        // Critical 1: 値キャプチャが `(\S+)` のままだと最初の空白で止まり、
-        // クオート内の残り（"horse battery staple"）が平文で残ってしまう。
+        // Critical 1: if value capture were left as `(\S+)`, it would stop
+        // at the first whitespace, leaving the rest inside the quotes
+        // ("horse battery staple") in plaintext.
         match screen_text(r#"export DB_PASSWORD="correct horse battery staple""#) {
             FilterResult::Redacted(s) => {
                 assert!(

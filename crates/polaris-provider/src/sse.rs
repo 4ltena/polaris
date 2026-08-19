@@ -1,22 +1,25 @@
-//! SSE(text/event-stream)を逐次デコードする。バイト片を push すると、
-//! 空行で区切られた完成イベントだけを返す。行やブロックの分割に耐える。
+//! Incrementally decodes SSE (text/event-stream). Pushing a byte chunk
+//! returns only the events that are complete so far, delimited by a blank
+//! line. Tolerant of splits across lines or blocks.
 
 pub struct SseDecoder {
     buf: Vec<u8>,
 }
 
 pub struct SseEvent {
-    /// SSE の `event:` フィールド。現行のプロバイダは `data` 側の JSON `type` で
-    /// 分岐するため本体コードからは読まれないが、SSE モデルの一部として保持する
-    /// (テストとデバッグでは参照される)。
+    /// The SSE `event:` field. The current providers branch on the `data`
+    /// side's JSON `type`, so this is never read from production code, but
+    /// it's kept as part of the SSE model (tests and debugging do read
+    /// it).
     #[allow(dead_code)]
     pub event: Option<String>,
     pub data: String,
 }
 
-/// バッファ中で最初に現れる空行区切り(`"\n\n"` または `"\r\n\r\n"`)を探す。
-/// 戻り値は `(区切り開始位置, 区切りのバイト長)`。CRLF 版も LF 版も
-/// 混在しうるため、両方を走査していちばん手前のものを採用する。
+/// Finds the first blank-line separator (`"\n\n"` or `"\r\n\r\n"`) that
+/// appears in the buffer. Returns `(separator start position, separator
+/// byte length)`. CRLF and LF forms can be mixed, so both are scanned and
+/// whichever comes first is used.
 fn find_block_separator(buf: &[u8]) -> Option<(usize, usize)> {
     let lf = buf.windows(2).position(|w| w == b"\n\n");
     let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
@@ -34,13 +37,14 @@ impl SseDecoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
-        // マルチバイト文字が push 境界で分断されうるため、デコードせず
-        // 生バイトのまま蓄積する。完成ブロック(空行終端)だけを
-        // 切り出してからデコードすれば、分断された文字が
-        // U+FFFD 化することはない。
+        // A multibyte character can be split across a push boundary, so we
+        // accumulate raw bytes without decoding. Decoding only after
+        // slicing out a complete block (terminated by a blank line) means
+        // a split character never gets mangled into U+FFFD.
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
-        // 完成ブロック(空行 "\n\n" または "\r\n\r\n" 終端)を順に切り出す。
+        // Slice out complete blocks (terminated by a blank line, "\n\n" or
+        // "\r\n\r\n") one at a time.
         while let Some((idx, sep_len)) = find_block_separator(&self.buf) {
             let block_bytes: Vec<u8> = self.buf[..idx].to_vec();
             self.buf.drain(..idx + sep_len);
@@ -54,7 +58,7 @@ impl SseDecoder {
                 } else if let Some(v) = line.strip_prefix("data:") {
                     data_lines.push(v.strip_prefix(' ').unwrap_or(v));
                 }
-                // コメント行(":" 始まり)や空行は無視。
+                // Comment lines (starting with ":") and blank lines are ignored.
             }
             if !data_lines.is_empty() || event.is_some() {
                 out.push(SseEvent {
@@ -89,9 +93,9 @@ mod tests {
     #[test]
     fn reassembles_across_chunk_boundaries() {
         let mut d = SseDecoder::new();
-        assert!(d.push(b"data: hel").is_empty()); // 途中まで
-        assert!(d.push(b"lo\n").is_empty()); // 行完成だがブロック未終端
-        let evs = d.push(b"\n"); // 空行でブロック確定
+        assert!(d.push(b"data: hel").is_empty()); // partway through
+        assert!(d.push(b"lo\n").is_empty()); // line complete but block not yet terminated
+        let evs = d.push(b"\n"); // blank line finalizes the block
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data, "hello");
     }
@@ -114,23 +118,24 @@ mod tests {
 
     #[test]
     fn reassembles_multibyte_char_split_across_pushes() {
-        // "あ" = E3 81 82。1バイト目のみを先に push し、
-        // 残り2バイトとブロック終端を後続 push で渡す。
+        // "★" = E2 98 85. Push the first two bytes first, then deliver the
+        // remaining byte plus the block terminator in the following push.
         let mut d = SseDecoder::new();
-        assert!(d.push(b"data: \xe3\x81").is_empty());
-        let evs = d.push(b"\x82\n\n");
+        assert!(d.push(b"data: \xe2\x98").is_empty());
+        let evs = d.push(b"\x85\n\n");
         assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].data, "あ");
+        assert_eq!(evs[0].data, "★");
 
-        // 3文字にまたがる分断でも同様に復元できることを確認。
+        // Also confirm that reassembly recovers the same way for a split
+        // spanning a 3-character string.
         let mut d2 = SseDecoder::new();
-        let s = "日本語";
+        let s = "★☆♪";
         let mut line = b"data: ".to_vec();
         line.extend_from_slice(s.as_bytes());
-        let mid = line.len() - 1; // 末尾の"語"(3バイト)の1バイト目・2バイト目までで切る
+        let mid = line.len() - 1; // cut through the 1st and 2nd bytes of the trailing "♪" (3 bytes)
         assert!(d2.push(&line[..mid]).is_empty());
         let evs2 = d2.push(&line[mid..]);
-        // まだブロック終端(空行)がないため、ここでは何も確定しない。
+        // There's no block terminator (blank line) yet, so nothing is finalized here.
         assert!(evs2.is_empty());
         let evs3 = d2.push(b"\n\n");
         assert_eq!(evs3.len(), 1);

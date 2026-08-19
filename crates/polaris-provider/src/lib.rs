@@ -1,5 +1,5 @@
-//! プロバイダ抽象。トランスポートに依存する部分は各実装が持ち、
-//! ここには要求と応答の形だけを置く。
+//! Provider abstraction. Transport-dependent parts live in each
+//! implementation; only the shape of requests and responses lives here.
 
 pub mod codex;
 pub mod openai;
@@ -16,9 +16,10 @@ pub enum Role {
     Tool,
 }
 
-/// 履歴上の 1 メッセージ。`tool_calls` はアシスタントのターンがツールを
-/// 呼んだときだけ非空になり、`tool_call_id` はツール結果メッセージだけが
-/// 持つ。どちらも通常のユーザー/アシスタントの発話では空のままにする。
+/// A single message in the history. `tool_calls` is non-empty only when an
+/// assistant turn called a tool, and `tool_call_id` is carried only by a
+/// tool-result message. Both stay empty for an ordinary user/assistant
+/// utterance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -48,9 +49,10 @@ impl Message {
         }
     }
 
-    /// アシスタントのターンをツール呼び出しとともに記録する。OpenAI の
-    /// 往復規約では、ツール結果を送る前にこのメッセージ自体が
-    /// `tool_calls` を保持したまま履歴に残っていなければならない。
+    /// Records an assistant turn together with its tool calls. Under
+    /// OpenAI's round-trip contract, this message itself must remain in
+    /// the history holding its `tool_calls` before the tool result is
+    /// sent.
     pub fn assistant_with_tool_calls(
         content: impl Into<String>,
         tool_calls: Vec<ToolCall>,
@@ -63,7 +65,7 @@ impl Message {
         }
     }
 
-    /// ツール結果を、それが応答する呼び出しの id と結び付けて記録する。
+    /// Records a tool result, tied to the id of the call it answers.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
@@ -95,11 +97,11 @@ pub struct CompletionResponse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("HTTP エラー: {0}")]
+    #[error("HTTP error: {0}")]
     Http(String),
-    #[error("応答を解釈できない: {0}")]
+    #[error("could not interpret response: {0}")]
     Decode(String),
-    #[error("認証: {0}")]
+    #[error("auth: {0}")]
     Auth(String),
 }
 
@@ -108,25 +110,28 @@ pub trait Provider: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
 }
 
-/// 1 回の要求に使う資格情報。プロバイダはこれ以上のことを知らない。
+/// The credentials used for a single request. The provider knows nothing
+/// beyond this.
 #[derive(Debug, Clone)]
 pub struct Token {
     pub access_token: String,
     pub account_id: String,
-    /// Responses API へ送る `reasoning.effort`。`polaris-auth` の
-    /// `chatgpt_plan_type` から決まる値で、決められなければ `None`。
-    /// `polaris-provider` は `polaris-auth` に依存しないため、値の由来は
-    /// 知らず、渡された文字列をそのまま使うだけである。
+    /// `reasoning.effort` sent to the Responses API. Its value comes from
+    /// `polaris-auth`'s `chatgpt_plan_type`, or is `None` when it can't be
+    /// decided. `polaris-provider` doesn't depend on `polaris-auth`, so it
+    /// has no idea where the value came from — it just uses the string it
+    /// was handed as-is.
     pub effort: Option<String>,
 }
 
-/// トークンの供給元。`token()` は「いま使えるもの」を返し、`refreshed()`
-/// は期限に関わらず更新したものを返す。401 を受けたあとの再試行が後者を
-/// 使う。
+/// The source of tokens. `token()` returns "whatever is currently usable",
+/// and `refreshed()` returns one refreshed regardless of expiry. The retry
+/// after receiving a 401 uses the latter.
 ///
-/// このトレイトを `polaris-provider` に置き、実装を `polaris-cli` に
-/// 置くことで、`polaris-auth` がこのクレートへ依存せずに済む。同時に、
-/// プロバイダのテストが OAuth もファイルもブラウザも要らなくなる。
+/// Placing this trait in `polaris-provider` and its implementation in
+/// `polaris-cli` lets `polaris-auth` avoid depending on this crate. At the
+/// same time, it means provider tests need no OAuth, no file, and no
+/// browser.
 #[async_trait::async_trait]
 pub trait TokenSource: Send + Sync {
     async fn token(&self) -> Result<Token, ProviderError>;
@@ -170,7 +175,7 @@ mod tests {
                 tools: vec![],
             })
             .await
-            .expect("失敗した");
+            .expect("should succeed");
         assert_eq!(res.tool_calls.len(), 1);
         assert_eq!(res.tool_calls[0].name, "read");
     }
@@ -211,19 +216,29 @@ mod tests {
             first: "a".into(),
             second: "b".into(),
         });
-        assert_eq!(s.token().await.expect("取れる").access_token, "a");
-        assert_eq!(s.refreshed().await.expect("取れる").access_token, "b");
+        assert_eq!(
+            s.token().await.expect("should be obtainable").access_token,
+            "a"
+        );
+        assert_eq!(
+            s.refreshed()
+                .await
+                .expect("should be obtainable")
+                .access_token,
+            "b"
+        );
     }
 
-    /// 認証の失敗はモデルの失敗と別の種類である。文面ではなく型で
-    /// 区別できること。文面での判別は、メッセージを直した瞬間に壊れる。
+    /// An auth failure is a different kind from a model failure. They
+    /// must be distinguishable by type, not by wording. Distinguishing by
+    /// wording breaks the moment the message is edited.
     #[test]
     fn an_auth_error_is_its_own_variant() {
-        let e = ProviderError::Auth("ログインしていない".into());
+        let e = ProviderError::Auth("not logged in".into());
         assert!(matches!(e, ProviderError::Auth(_)));
         assert!(
             !matches!(ProviderError::Http("x".into()), ProviderError::Auth(_)),
-            "Http が Auth と一致してしまう"
+            "Http matched Auth"
         );
     }
 }

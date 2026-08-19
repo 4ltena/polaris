@@ -117,6 +117,11 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `skill.rs` — skill tool. Returns the body on an exact name match, otherwise returns a
 - `write.rs` — `write` tool. The actual write happens inside a confined child process.
 
+## `crates/polaris-tools/src/skill`
+
+- `bm25.rs` — BM25 ランキング。トークナイズ・語幹化・同義語展開・スコアリングだけを
+- `near_universal.rs` — 「ほぼ常に関連する」skill の選定。BM25 のスコアリングを一切知らず、
+
 ## `docs`
 
 - `filemap.md` — File map
@@ -131,8 +136,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-17-polaris-m2-write-and-sandbox.md` — polaris M2 実装計画 — write / edit / bash とサンドボックス
 - `2026-08-17-polaris-m3a-skills.md` — polaris M3a Skills ローダと skill ツール Implementation Plan
 - `2026-08-18-polaris-m25-codex-provider.md` — polaris M2.5 Codex プロバイダ 実装計画
+- `2026-08-20-polaris-m3b-bm25-skill-router.md` — polaris M3b BM25 skill ルータ 実装計画
 
 ## `docs/superpowers/specs`
 
 - `2026-08-16-polaris-harness-design.md` — polaris 設計仕様
 - `2026-08-18-polaris-codex-provider-design.md` — polaris Codex プロバイダ 設計
+- `2026-08-20-polaris-skill-bm25-router-design.md` — polaris skill ルータ BM25 化 設計

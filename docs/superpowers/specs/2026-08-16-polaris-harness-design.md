@@ -164,7 +164,7 @@ agents/file-inspector/SKILL.md
 ---
 name: file-inspector
 description: 単一ファイルを読み取り専用で棚卸しし、責務、入出力、対応するテストを返す。
-allowed-tools: read grep
+allowed-tools: read
 metadata:
   polaris-access: read
   polaris-tier: low
@@ -228,6 +228,8 @@ M4 の初期実装では機構そのものを作るところまでとし、オ�
 ### 深さ
 
 深さ1で固定する。いずれの型も `allowed-tools` に `spawn` を含めない。動的な分割は継続波で扱う。
+
+型定義の記述だけに頼らず、ランタイム側でも `spawn` を subagent の利用可能ツールから常に除外する。`allowed-tools` に書き忘れであれ誤ってであれ `spawn` が入っていても、subagent へ渡すツール一覧の構築側で無条件に落とすため、コンパイラ強制ではないにせよ規律違反1点に依存しない。
 
 ### 並列度
 

@@ -12,7 +12,7 @@
 
 | | |
 | --- | --- |
-| ブランチ | `feat/m1-headless-loop`（HEAD `c82e910`） |
+| ブランチ | `main`（HEAD `1353ee5`。`feat/m1-headless-loop` は M3b 完了時にローカルマージ済みで削除済み） |
 | 進行中の計画 | なし |
 | 直近で終えた計画 | `docs/superpowers/plans/2026-08-20-polaris-m3b-bm25-skill-router.md` |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md` |
@@ -72,6 +72,14 @@ Task 1（`bm25.rs`）と Task 2（`near_universal.rs`）は、まだ `lookup` �
 HEAD `c82e910` で `cargo test --workspace` 386 件全緑（`polaris-tools` 109 件、他クレート計 277 件。この文書を書く際に自分で再実行して確認した値）、`cargo clippy --workspace --all-targets -- -D warnings` clean、`cargo fmt --all -- --check` clean、`git status --short` 空。常時コンテキストへの影響はゼロトークン——`near_universal` は `lookup` の戻り値（ツール結果、メッセージ末尾）のみに載り、`assemble_always_on` には一切触れない。この不変条件を `budget.rs` の新規テストで固定した（近傍候補 0 件・4 件・上限 20 件相当のいずれでも `AlwaysOn` のトークン数が変わらないことを確認）。
 
 M3b の受け入れ基準にあった recall 98% という数値そのものは、Rust 側では検証していない——831 件規模のコーパス再現は仕様の「保証しない範囲」に明記した非目標であり、Rust 側の統合テストは個別ケースの回帰防止に留める。
+
+### 大規模 skill/plugin コーパスでの codex・pi との比較、および候補プレビュー圧縮
+
+M3b 完了後、評価に使った実コーパス（831 件、うち macOS の大文字小文字非依存ファイルシステムで 1 件衝突し実質 830 件）を codex・pi（`--model openai-codex/gpt-5.6-sol`）・polaris それぞれのネイティブな skill 探索先へ実ファイルとして設置し、同一タスクを 1 回ずつ実行して実測した。結果は `README.md`「skill/plugin を大量に含めた場合の比較」に記録した。codex は skill 数が多いとき description 抜きの圧縮カタログへ自動的に切り替わる（約 16.5 トークン/skill）が、pi にはこの種の圧縮が無く線形に増え続ける（約 131.9 トークン/skill、830 件時点で初回ターンだけで 110,692 トークン）。polaris の常時コンテキストは 830 件設置後も不変（486〜496 トークン）で、`lookup` を実際に呼ばせた場合のみ、その呼び出し 1 回につきトークンが加わる。
+
+この計測で `lookup` 1 回あたりのコストが常時コンテキストよりずっと大きい実際のレバーであると分かったため、`list_candidates`（`crates/polaris-tools/src/skill.rs`）が候補ごとに description を全文表示していたのを、先頭文のみ（`description_preview`、200 バイト上限）へ変更した。安全性は M3b の評価用コーパスで検証した——先頭文だけに削っても、trigger 形式の近傍候補が量化語入りの判定節を保つ割合は 84 件中 83 件（98.8%）、BM25 が一致させた語がプレビューに残る割合は評価用クエリの該当ペア 41 件中 40 件（97.6%）で、削った分だけ再検索が増えるリスクは小さいと判断した。実コーパス 831 件での候補リスト全体のレンダリングコストは 43,777→20,389 トークン（約 53% 減）、実際の `lookup` 呼び出し 1 回目の増分は同じ 830 件コーパス・同じタスクでの実測で 1,234→624 トークン（約 49% 減）になった。
+
+既存のバイト上限テスト 2 本（`search_results_are_capped_by_bytes_not_only_by_count`、`a_single_candidate_over_the_byte_cap_is_still_returned`）は、description の肥大でバイト上限を試していたが、プレビュー化で 1 件あたりの description の寄与が上限されたため、その経路では上限に到達できなくなった。name の肥大で同じ性質を試す形に書き換えた。新規テスト 5 本（`description_preview` の単体テスト 4 本、検索結果がプレビューだけを含むことを確認する統合テスト 1 本）を追加し、HEAD `1353ee5` で `cargo test --workspace` 391 件全緑、`cargo clippy --workspace --all-targets -- -D warnings` clean、`cargo fmt --all -- --check` clean、`git status --short` 空を確認した。計測に使った一時的なデバッグ出力（実 API 応答の `usage` を stderr へ出す 1 行）は毎回ビルド後に元へ戻し、`cargo build --release -p polaris-cli` で計装なしのバイナリへ戻したことも確認済み。
 
 ## M2 の進捗
 

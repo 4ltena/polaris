@@ -21,6 +21,23 @@ pub const MAX_READ_BYTES: u64 = 5 * 1024 * 1024;
 /// here keeps it handled in the same file as the truncation notice below.
 pub const DEFAULT_LIMIT: usize = 2000;
 
+/// Maximum number of bytes the rendered output is allowed to reach,
+/// independent of `limit`.
+///
+/// `MAX_READ_BYTES` bounds the file this is willing to open at all, but
+/// says nothing about how many of `limit`'s requested lines actually make
+/// it into the response — a model that passes an unusually large `limit`
+/// against a file close to that 5 MiB ceiling would otherwise get the
+/// whole thing back in one call, unbounded by anything but the file's own
+/// size. `bash` already holds its output to a byte cap
+/// (`crate::bash::MAX_OUTPUT_BYTES`) for the same reason; this is that
+/// same shape applied here. Set well above `DEFAULT_LIMIT`'s typical
+/// output (this repository's own source files run at most tens of KB) so
+/// ordinary reads are never affected, and well below `MAX_READ_BYTES` so
+/// the worst case (an explicit huge `limit` against a file near the size
+/// ceiling) is actually bounded rather than merely less likely.
+pub const MAX_READ_OUTPUT_BYTES: usize = 1024 * 1024;
+
 /// `offset` is a 0-based line number; `limit` is the number of lines to
 /// return. The line numbers in the output are 1-based.
 pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolError> {
@@ -81,8 +98,23 @@ pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolErro
     }
 
     let mut out = String::new();
+    // Tracks the 1-based index of the last line actually written, so the
+    // notice below can report the true stopping point regardless of
+    // whether `limit` or `MAX_READ_OUTPUT_BYTES` is what stopped it —
+    // `end` used to be derived purely from `offset`/`limit` and would have
+    // claimed lines were shown that the byte cap had actually left out.
+    let mut last_included = offset;
     for (i, line) in lines.iter().enumerate().skip(offset).take(limit) {
-        out.push_str(&format!("{}\t{}\n", i + 1, line));
+        let rendered = format!("{}\t{}\n", i + 1, line);
+        // Always emit at least one line even if it alone exceeds the cap.
+        // Returning "truncated" without showing any content leaves the
+        // model with no next move at all — the same principle `bash` and
+        // the skill tool's candidate list already apply to their own caps.
+        if last_included > offset && out.len() + rendered.len() > MAX_READ_OUTPUT_BYTES {
+            break;
+        }
+        out.push_str(&rendered);
+        last_included = i + 1;
     }
 
     // Output that happens to return exactly `limit` lines can't be
@@ -93,10 +125,9 @@ pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolErro
     // truncated — an unmarked partial answer is a wrong answer presented as
     // a complete one. Apply the same standard here that the skill body and
     // search results already hold to.
-    let end = offset.saturating_add(limit).min(total);
-    if end < total {
+    if last_included < total {
         out.push_str(&format!(
-            "(showed lines {}-{end} of {total} total. continue with offset={end}.)\n",
+            "(showed lines {}-{last_included} of {total} total. continue with offset={last_included}.)\n",
             offset + 1
         ));
     }
@@ -244,6 +275,50 @@ mod tests {
         // all.
         let err = read(std::path::Path::new("/dev/zero"), 0, 100).expect_err("should be denied");
         assert!(matches!(err, ToolError::NotAFile(_)));
+    }
+
+    #[test]
+    fn a_huge_limit_is_still_bounded_by_the_output_byte_cap() {
+        // A file well under MAX_READ_BYTES, but with enough lines that an
+        // unbounded `limit` would render past MAX_READ_OUTPUT_BYTES. Before
+        // this cap existed, nothing stopped this from coming back whole.
+        let line = "x".repeat(200);
+        let line_count = (MAX_READ_OUTPUT_BYTES / (line.len() + 10)) * 2;
+        let lines: Vec<String> = (0..line_count).map(|_| line.clone()).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let f = fixture(&refs);
+
+        let out = read(f.path(), 0, usize::MAX).expect("can't read");
+
+        assert!(
+            out.len() <= MAX_READ_OUTPUT_BYTES + line.len() + 256,
+            "output exceeds the byte cap: {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("continue with offset="),
+            "missing wording indicating the output was truncated: {}",
+            &out[out.len().saturating_sub(160)..]
+        );
+    }
+
+    #[test]
+    fn a_single_line_over_the_output_byte_cap_is_still_returned() {
+        // Returning "truncated" without showing even one line leaves the
+        // model with no next move at all. Always emit the first line.
+        let huge_line = "x".repeat(MAX_READ_OUTPUT_BYTES + 10);
+        let f = fixture(&[&huge_line]);
+
+        let out = read(f.path(), 0, 100).expect("can't read");
+        assert!(
+            out.starts_with("1\t"),
+            "the first line was not shown: {}",
+            &out[..out.len().min(80)]
+        );
+        assert!(
+            !out.contains("continue with offset="),
+            "says it was truncated even though the only line was shown"
+        );
     }
 
     #[test]

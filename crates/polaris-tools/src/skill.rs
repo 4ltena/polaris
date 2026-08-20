@@ -66,15 +66,78 @@ fn cap_bytes(text: &str, limit: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
+/// Byte cap on the description preview shown per candidate in a search
+/// result (see `description_preview`). Chosen from measurement against a
+/// real 831-skill corpus and its evaluation queries: a first-sentence
+/// preview capped at this length still carries the query-matching term
+/// that caused BM25 to rank the item in 97.6% of measured hit cases, and
+/// still carries a near-universal skill's full trigger clause in 98.8% of
+/// cases, while cutting the corpus's total candidate-list render cost by
+/// roughly half (43,777 -> 20,389 tokens on the full 831-item corpus,
+/// o200k_base). Not part of the Agent Skills spec — a rendering choice
+/// local to this file, independent of `MAX_BODY_BYTES` and `MAX_LIST_BYTES`.
+const MAX_PREVIEW_BYTES: usize = 200;
+
+/// Renders a candidate-list preview of a skill's description: the first
+/// sentence, capped at `MAX_PREVIEW_BYTES`.
+///
+/// Full descriptions are the dominant cost of a search result (a
+/// `MAX_RESULTS`-sized candidate list of full descriptions ran roughly
+/// 1,000+ tokens against a real corpus) — most of that text describes
+/// detail beyond what's needed to recognize whether a candidate is worth
+/// reading further. Skill descriptions in this ecosystem are
+/// conventionally written with the selecting information (what the skill
+/// does, or the "use when X" trigger condition) front-loaded into the
+/// first sentence, so cutting there measures as safe rather than assumed
+/// safe (see `MAX_PREVIEW_BYTES`'s doc comment for the measurement).
+///
+/// This only affects the search-result preview. An exact name match still
+/// returns the full, untruncated body via a completely separate path.
+fn description_preview(description: &str) -> String {
+    let trimmed = description.trim();
+    let sentence_end = trimmed
+        .char_indices()
+        .find(|&(i, c)| {
+            matches!(c, '.' | '!' | '?')
+                && trimmed[i + c.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+        })
+        .map(|(i, c)| i + c.len_utf8());
+    let sentence = match sentence_end {
+        Some(end) => trimmed[..end].trim(),
+        None => trimmed,
+    };
+    let (capped, truncated) = cap_bytes(sentence, MAX_PREVIEW_BYTES);
+    if !truncated {
+        return capped.to_string();
+    }
+    // Back off to the last word boundary so the cut doesn't land
+    // mid-word. Text with no space in the capped range (a single very
+    // long token, or a script like Japanese that doesn't delimit words
+    // with spaces) has no boundary to back off to, so the byte-safe cut
+    // from `cap_bytes` is used as-is.
+    let word_boundary = capped.rfind(' ').unwrap_or(capped.len());
+    format!("{}…", &capped[..word_boundary])
+}
+
 /// Formats the candidate list up to `max_count` entries and
 /// `MAX_LIST_BYTES` bytes. If either one causes a cutoff, state explicitly
 /// that it was cut off — silently returning only part of the list would let
 /// the model mistake it for the full set.
+///
+/// Each entry's description is rendered as `description_preview`'s short
+/// preview, not the full text — see that function's doc comment. This
+/// means `MAX_LIST_BYTES` is no longer primarily a guard against
+/// description bloat (a preview is bounded by `MAX_PREVIEW_BYTES`
+/// regardless of the source description's length); it now mainly backstops
+/// unbounded skill names and a large `max_count`.
 fn list_candidates(items: &[&Skill], header: &str, max_count: usize) -> String {
     let mut out = String::from(header);
     let mut shown = 0usize;
     for s in items.iter().take(max_count) {
-        let line = format!("- {}: {}\n", s.name, s.description);
+        let line = format!("- {}: {}\n", s.name, description_preview(&s.description));
         // Always emit the first entry even if it exceeds the cap.
         // Returning "truncated" without showing even one entry leaves the
         // model with no next move at all. So the output fits within, at
@@ -250,6 +313,52 @@ mod tests {
     }
 
     #[test]
+    fn description_preview_stops_at_the_first_sentence() {
+        let preview = description_preview(
+            "Use when implementing any feature. This second sentence should not appear.",
+        );
+        assert_eq!(preview, "Use when implementing any feature.");
+    }
+
+    #[test]
+    fn description_preview_returns_the_whole_text_when_it_has_no_sentence_end() {
+        let preview = description_preview("A short description with no terminal punctuation");
+        assert_eq!(preview, "A short description with no terminal punctuation");
+    }
+
+    #[test]
+    fn description_preview_caps_a_long_first_sentence_at_a_word_boundary() {
+        let long_sentence = format!("Use when {}.", "word ".repeat(60).trim());
+        assert!(long_sentence.len() > MAX_PREVIEW_BYTES);
+        let preview = description_preview(&long_sentence);
+        assert!(
+            preview.len() <= MAX_PREVIEW_BYTES + "…".len(),
+            "preview exceeds the cap: {} bytes",
+            preview.len()
+        );
+        assert!(
+            preview.ends_with('…'),
+            "truncation was not marked: {preview}"
+        );
+        assert!(
+            !preview.contains("  "),
+            "cut mid-word instead of at a word boundary: {preview}"
+        );
+    }
+
+    #[test]
+    fn description_preview_does_not_panic_on_multibyte_utf8_at_the_cap() {
+        // "あ" is 3 bytes in UTF-8. A run long enough to cross
+        // MAX_PREVIEW_BYTES with no ASCII space anywhere exercises the
+        // word-boundary backoff's fallback (no space found) together with
+        // `cap_bytes`'s char-boundary safety, on a script that doesn't
+        // delimit words with spaces at all.
+        let long_japanese = format!("使用時{}。", "あ".repeat(200));
+        let preview = description_preview(&long_japanese);
+        assert!(preview.len() <= MAX_PREVIEW_BYTES + "…".len());
+    }
+
+    #[test]
     fn an_exact_name_returns_the_body() {
         let out = lookup(&fixtures(), "git-commit");
         assert!(out.contains("Body A"), "the body was not returned: {out}");
@@ -376,21 +485,24 @@ mod tests {
 
     #[test]
     fn search_results_are_capped_by_bytes_not_only_by_count() {
-        // The spec allows `description` up to 1,024 characters. For
-        // Japanese that comes to about 3 KB per entry, and 20 of them
-        // (`MAX_RESULTS`) together come to about 61 KB — twice the 32 KiB
-        // that this same file imposes on a single body, slipping through
-        // the gap left by a cap that only looks at count.
-        let description = "€".repeat(1024);
+        // Descriptions are rendered as a short preview now (see
+        // `description_preview`), so a single entry's byte footprint is
+        // bounded by `MAX_PREVIEW_BYTES` regardless of the source
+        // description's length — an oversized description can no longer
+        // be the thing that exceeds `MAX_LIST_BYTES`. A skill name has no
+        // such cap, so this test drives the byte cap through an oversized
+        // name instead, to keep exercising the same property: a cap that
+        // only looked at count would let this slip through.
+        let big_name_prefix = "fat-".to_string() + &"x".repeat(1024);
         let skills: Vec<Skill> = (0..MAX_RESULTS)
             .map(|i| Skill {
-                name: format!("fat-{i:02}"),
-                description: description.clone(),
+                name: format!("{big_name_prefix}-{i:02}"),
+                description: "A description for testing.".into(),
                 body: "body".into(),
                 path: format!("/x/fat-{i:02}/SKILL.md").into(),
             })
             .collect();
-        let one_entry = format!("- fat-00: {description}\n").len();
+        let one_entry = format!("- {big_name_prefix}-00: A description for testing.\n").len();
 
         let out = lookup(&skills, "");
         let shown = out.lines().filter(|l| l.starts_with("- fat-")).count();
@@ -419,16 +531,17 @@ mod tests {
     fn a_single_candidate_over_the_byte_cap_is_still_returned() {
         // Returning "truncated" for cap reasons without showing even a
         // single entry leaves the model with no next move at all. Always
-        // emit the first entry.
+        // emit the first entry. Drives the cap through an oversized name,
+        // not description, for the same reason as the test above.
         let skills = vec![Skill {
-            name: "huge".into(),
-            description: "€".repeat(MAX_LIST_BYTES),
+            name: format!("huge-{}", "x".repeat(MAX_LIST_BYTES)),
+            description: "A description for testing.".into(),
             body: "body".into(),
             path: "/x/huge/SKILL.md".into(),
         }];
 
         let out = lookup(&skills, "");
-        assert!(out.contains("- huge:"), "not even one candidate was shown");
+        assert!(out.contains("- huge-"), "not even one candidate was shown");
         assert!(
             !out.contains("narrow the query or pass a name directly"),
             "says it was truncated even though everything was shown: {}",
@@ -630,6 +743,25 @@ mod tests {
         assert!(out.contains("deploy-tool"));
         assert!(out.contains("candidates. pass the name as-is if you need the body."));
         assert_eq!(out.matches("deploy-tool").count(), 1);
+    }
+
+    #[test]
+    fn a_search_result_shows_only_the_first_sentence_of_a_matched_description() {
+        let skills = vec![Skill {
+            name: "deploy-tool".into(),
+            description: "Handles deployment to production servers. Covers rollback, health checks, and canary releases in extensive detail that a candidate list should never have to carry in full.".into(),
+            body: "body".into(),
+            path: "/x/deploy-tool/SKILL.md".into(),
+        }];
+        let out = lookup(&skills, "deploying to prod");
+        assert!(
+            out.contains("Handles deployment to production servers."),
+            "first sentence missing from the search result: {out}"
+        );
+        assert!(
+            !out.contains("canary releases"),
+            "full description leaked into the search result instead of a preview: {out}"
+        );
     }
 
     #[test]

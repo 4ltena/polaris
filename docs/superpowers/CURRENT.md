@@ -12,7 +12,7 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `1353ee5`。`feat/m1-headless-loop` は M3b 完了時にローカルマージ済みで削除済み） |
+| ブランチ | `main`（HEAD `b9db4e1`。`feat/m1-headless-loop` は M3b 完了時にローカルマージ済みで削除済み） |
 | 進行中の計画 | なし |
 | 直近で終えた計画 | `docs/superpowers/plans/2026-08-20-polaris-m3b-bm25-skill-router.md` |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md` |
@@ -79,7 +79,19 @@ M3b 完了後、評価に使った実コーパス（831 件、うち macOS の�
 
 この計測で `lookup` 1 回あたりのコストが常時コンテキストよりずっと大きい実際のレバーであると分かったため、`list_candidates`（`crates/polaris-tools/src/skill.rs`）が候補ごとに description を全文表示していたのを、先頭文のみ（`description_preview`、200 バイト上限）へ変更した。安全性は M3b の評価用コーパスで検証した——先頭文だけに削っても、trigger 形式の近傍候補が量化語入りの判定節を保つ割合は 84 件中 83 件（98.8%）、BM25 が一致させた語がプレビューに残る割合は評価用クエリの該当ペア 41 件中 40 件（97.6%）で、削った分だけ再検索が増えるリスクは小さいと判断した。実コーパス 831 件での候補リスト全体のレンダリングコストは 43,777→20,389 トークン（約 53% 減）、実際の `lookup` 呼び出し 1 回目の増分は同じ 830 件コーパス・同じタスクでの実測で 1,234→624 トークン（約 49% 減）になった。
 
-既存のバイト上限テスト 2 本（`search_results_are_capped_by_bytes_not_only_by_count`、`a_single_candidate_over_the_byte_cap_is_still_returned`）は、description の肥大でバイト上限を試していたが、プレビュー化で 1 件あたりの description の寄与が上限されたため、その経路では上限に到達できなくなった。name の肥大で同じ性質を試す形に書き換えた。新規テスト 5 本（`description_preview` の単体テスト 4 本、検索結果がプレビューだけを含むことを確認する統合テスト 1 本）を追加し、HEAD `1353ee5` で `cargo test --workspace` 391 件全緑、`cargo clippy --workspace --all-targets -- -D warnings` clean、`cargo fmt --all -- --check` clean、`git status --short` 空を確認した。計測に使った一時的なデバッグ出力（実 API 応答の `usage` を stderr へ出す 1 行）は毎回ビルド後に元へ戻し、`cargo build --release -p polaris-cli` で計装なしのバイナリへ戻したことも確認済み。
+既存のバイト上限テスト 2 本（`search_results_are_capped_by_bytes_not_only_by_count`、`a_single_candidate_over_the_byte_cap_is_still_returned`）は、description の肥大でバイト上限を試していたが、プレビュー化で 1 件あたりの description の寄与が上限されたため、その経路では上限に到達できなくなった。name の肥大で同じ性質を試す形に書き換えた。新規テスト 5 本（`description_preview` の単体テスト 4 本、検索結果がプレビューだけを含むことを確認する統合テスト 1 本）を追加し、HEAD `1353ee5` で `cargo test --workspace` 391 件全緑を確認した。
+
+### read の出力上限、および候補プレビューの階層化
+
+利用者から「速度は多少犠牲にしてよいのでトークン数を限界まで削る」方針を受け、2 点を追加した。
+
+`read`（`crates/polaris-tools/src/read.rs`）は `MAX_READ_BYTES`（5 MiB）でファイルサイズしか縛っておらず、モデルが巨大な `limit` を指定した場合の出力側は無制限だった——`CURRENT.md` の未着手項目としてすでに記録されていた穴である。`bash` の `MAX_OUTPUT_BYTES` と同じ形で `MAX_READ_OUTPUT_BYTES`（1 MiB、打ち切り通知つき）を追加した。切り詰め通知は実際に書き込んだ行数から導出するよう変更し、`limit` に由来する上限とバイト上限のどちらで止まった場合でも正しい継続位置を報告する。
+
+利用者から「`MAX_RESULTS` と `read` の `DEFAULT_LIMIT` は維持しつつ、他の削減余地とアルゴリズム自体を再考したい」との指示を受け、`list_candidates` の候補リストを階層化した。`MAX_RESULTS`（20）自体は変えず、候補の並び順のうち先頭 `MAX_PREVIEWED_RESULTS`（8）件だけ description プレビューを残し、以降は名前のみを表示する。全件の名前は変わらず見えるため、候補が隠れるわけではない。安全性は M3b の評価用コーパスで検証した——recall した 50 件中 31 件は上位 8 件以内、5 件は 8 件目より後でも名前自体にクエリと一致する語が残っており、名前だけで一致しないのは 1 件（`description_preview` 導入時に既に許容していた `agent-browser`/「screenshot comparison page」の例と同一）だけだった。上限を 10 に広げても、この 1 件は救えないことを確認済み。実コーパス 831 件からランダムに抽出した 20 件の窓 30 個の平均で、候補リストのレンダリングコストは約 474→256 トークンへ下がる。同じ 830 件コーパス・同じタスクでの `lookup` 呼び出し 1 回目の増分は、実測で 624〜660→344 トークンまで下がった（`description_preview` 導入前の当初値 1,234 トークンから累計で約 72% 減）。
+
+新規テスト 2 本（プレビュー上限を超えた候補が名前のみになることを確認する統合テスト、near_universal がプレビュー上限を超えて押し出されても名前が残ることを確認する統合テスト）と `read` 側の新規テスト 2 本（巨大な `limit` が出力バイト上限で打ち切られること、1 行だけでバイト上限を超える場合でも最低 1 行は返ること）を追加した。HEAD `b9db4e1` で `cargo test --workspace` 395 件全緑、`cargo clippy --workspace --all-targets -- -D warnings` clean、`cargo fmt --all -- --check` clean、`git status --short` 空を確認した。計測に使った一時的なデバッグ出力（実 API 応答の `usage` を stderr へ出す 1 行）は毎回ビルド後に元へ戻し、`cargo build --release -p polaris-cli` で計装なしのバイナリへ戻したことも確認済み。
+
+利用者からは、常時コンテキスト本体（システムプロンプト・ツールスキーマ・`ENVIRONMENT_LIMIT`）についても削減余地を洗い出すよう指示があったが、調査の結果これ以上の削減余地は薄いと判断した。`ENVIRONMENT_LIMIT`（200）は実測 24 トークンに対する意図的な 8 倍の安全マージン（`constitution.rs` 自身のコメントに明記）であり、削るのは削減ではなく安全性との取引になる。`bash` の出力上限、`write`/`edit` の戻り値（ファイル内容ではなく短い確認メッセージのみ）はすでに安全な形になっている。
 
 ## M2 の進捗
 

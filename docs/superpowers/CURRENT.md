@@ -16,7 +16,7 @@
 | 進行中の計画 | なし |
 | 直近で終えた計画 | `docs/superpowers/plans/2026-08-20-polaris-m3b-bm25-skill-router.md` |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md` |
-| 版の方針 | v1.0.0 = `hamal`。M1・M2・M2.5 が完了し、タグ付けの条件が揃った。タグ付け自体は利用者の承認を待つ準備段階のまま。M3b は 1.x 側の進捗 |
+| 版の方針 | v1.0.0 = `hamal`（核となる harness、M1・M2・M2.5）。M1・M2・M2.5 が完了し、タグ付けの条件が揃った。タグ付け自体は利用者の承認を待つ準備段階のまま。skill/plugin 分類機（M3b の BM25 ルータと、その後の候補圧縮）は別系統で v0.2 = `Aldebaran`。どちらも実際の git tag はまだ打っていない |
 
 ## マイルストーン
 
@@ -92,6 +92,10 @@ M3b 完了後、評価に使った実コーパス（831 件、うち macOS の�
 新規テスト 2 本（プレビュー上限を超えた候補が名前のみになることを確認する統合テスト、near_universal がプレビュー上限を超えて押し出されても名前が残ることを確認する統合テスト）と `read` 側の新規テスト 2 本（巨大な `limit` が出力バイト上限で打ち切られること、1 行だけでバイト上限を超える場合でも最低 1 行は返ること）を追加した。HEAD `b9db4e1` で `cargo test --workspace` 395 件全緑、`cargo clippy --workspace --all-targets -- -D warnings` clean、`cargo fmt --all -- --check` clean、`git status --short` 空を確認した。計測に使った一時的なデバッグ出力（実 API 応答の `usage` を stderr へ出す 1 行）は毎回ビルド後に元へ戻し、`cargo build --release -p polaris-cli` で計装なしのバイナリへ戻したことも確認済み。
 
 利用者からは、常時コンテキスト本体（システムプロンプト・ツールスキーマ・`ENVIRONMENT_LIMIT`）についても削減余地を洗い出すよう指示があったが、調査の結果これ以上の削減余地は薄いと判断した。`ENVIRONMENT_LIMIT`（200）は実測 24 トークンに対する意図的な 8 倍の安全マージン（`constitution.rs` 自身のコメントに明記）であり、削るのは削減ではなく安全性との取引になる。`bash` の出力上限、`write`/`edit` の戻り値（ファイル内容ではなく短い確認メッセージのみ）はすでに安全な形になっている。
+
+### pi と codex の比
+
+既存の実測値（0・5・830 skill 時点のトークン数）から pi/codex の比を追加で出した。少数の skill では pi が codex の 3.9〜5.8% と大幅に軽いが、830 件では逆転して pi が codex の 249.9%（2.5 倍）になる。5〜830 件の区間（実測点の間隔が広く、0〜5 件の区間よりサンプルが安定している）で見た 1 skill あたりの増分は codex 約 15.55 トークン、pi 約 131.96 トークンで、pi の方が約 8.5 倍重い。この 2 区間の傾きを外挿すると、およそ 260 skill 付近で総量が逆転する計算になるが、5 件と 830 件の間に実測点が無く、codex の圧縮形式への切り替わりタイミングも未確認のため、これは見積もりであり実測ではない。詳細は `README.md`「pi と codex の比」に記録した。
 
 ## M2 の進捗
 

@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "polaris-sandbox",
  "polaris-skills",

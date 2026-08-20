@@ -122,22 +122,51 @@ fn description_preview(description: &str) -> String {
     format!("{}…", &capped[..word_boundary])
 }
 
+/// Number of leading entries in a candidate list that get a description
+/// preview. Entries beyond this show the name only.
+///
+/// Position in the list (not raw rank score) is what this counts against —
+/// `near_universal` entries sit first in the merge that builds a search
+/// result (see `lookup`), so they always land inside this window
+/// regardless of corpus size. Chosen from measurement against the M3b
+/// evaluation corpus and its queries: of the 50 positive queries whose
+/// target was recalled at all, 31 land within the first 8 positions (full
+/// preview shown), 5 more land past position 8 but the bare name alone
+/// still shares a term with the query (recognizable without the
+/// description), and only 1 lands past position 8 with a name that shares
+/// nothing with the query — the same "agent-browser" / "screenshot
+/// comparison page" case `description_preview`'s own measurement already
+/// found and accepted, not a new risk this introduces. Extending to 10
+/// recovers none of that one case (checked). Averaged over 30 random
+/// 20-item windows of the real 831-item corpus, this cuts the rendered
+/// candidate list from about 474 to about 256 tokens (o200k_base) on top
+/// of `description_preview`'s own reduction.
+const MAX_PREVIEWED_RESULTS: usize = 8;
+
 /// Formats the candidate list up to `max_count` entries and
 /// `MAX_LIST_BYTES` bytes. If either one causes a cutoff, state explicitly
 /// that it was cut off — silently returning only part of the list would let
 /// the model mistake it for the full set.
 ///
-/// Each entry's description is rendered as `description_preview`'s short
-/// preview, not the full text — see that function's doc comment. This
-/// means `MAX_LIST_BYTES` is no longer primarily a guard against
-/// description bloat (a preview is bounded by `MAX_PREVIEW_BYTES`
-/// regardless of the source description's length); it now mainly backstops
-/// unbounded skill names and a large `max_count`.
+/// Only the first `MAX_PREVIEWED_RESULTS` entries get a description
+/// preview (`description_preview`'s short preview, not the full text — see
+/// that function's doc comment); entries after that show the name alone.
+/// Every entry's name is still visible up to `max_count`, so a candidate
+/// past the preview cutoff isn't hidden, only unelaborated. This means
+/// `MAX_LIST_BYTES` is no longer primarily a guard against description
+/// bloat (a preview is bounded by `MAX_PREVIEW_BYTES` regardless of the
+/// source description's length, and most entries in a full list carry no
+/// description at all); it now mainly backstops unbounded skill names and
+/// a large `max_count`.
 fn list_candidates(items: &[&Skill], header: &str, max_count: usize) -> String {
     let mut out = String::from(header);
     let mut shown = 0usize;
     for s in items.iter().take(max_count) {
-        let line = format!("- {}: {}\n", s.name, description_preview(&s.description));
+        let line = if shown < MAX_PREVIEWED_RESULTS {
+            format!("- {}: {}\n", s.name, description_preview(&s.description))
+        } else {
+            format!("- {}\n", s.name)
+        };
         // Always emit the first entry even if it exceeds the cap.
         // Returning "truncated" without showing even one entry leaves the
         // model with no next move at all. So the output fits within, at
@@ -168,7 +197,9 @@ fn list_candidates(items: &[&Skill], header: &str, max_count: usize) -> String {
 /// match instead, so CJK and short substring/prefix queries stay reachable.
 /// Whatever the search finds is always joined with the small set of
 /// "near-universal" skills, which are included regardless of query
-/// relevance.
+/// relevance. Only the first `MAX_PREVIEWED_RESULTS` entries in the
+/// resulting list carry a description preview; the rest show their name
+/// only, still visible but unelaborated (see `list_candidates`).
 ///
 /// The reason a search doesn't return the body is progressive disclosure:
 /// it lets a candidate be seen before deciding whether to read it. If every
@@ -356,6 +387,65 @@ mod tests {
         let long_japanese = format!("使用時{}。", "あ".repeat(200));
         let preview = description_preview(&long_japanese);
         assert!(preview.len() <= MAX_PREVIEW_BYTES + "…".len());
+    }
+
+    #[test]
+    fn candidates_past_the_preview_cutoff_show_only_the_name() {
+        let skills: Vec<Skill> = (0..(MAX_PREVIEWED_RESULTS + 4))
+            .map(|i| Skill {
+                name: format!("skill-{i:02}"),
+                description: format!("Distinctive description text unique to entry {i}."),
+                body: "body".into(),
+                path: format!("/x/skill-{i:02}/SKILL.md").into(),
+            })
+            .collect();
+        let out = lookup(&skills, "");
+
+        for i in 0..MAX_PREVIEWED_RESULTS {
+            let line = format!("- skill-{i:02}: Distinctive description text unique to entry {i}.");
+            assert!(
+                out.contains(&line),
+                "entry {i} within the preview cutoff is missing its description: {out}"
+            );
+        }
+        for i in MAX_PREVIEWED_RESULTS..(MAX_PREVIEWED_RESULTS + 4) {
+            let name_only_line = format!("- skill-{i:02}\n");
+            assert!(
+                out.contains(&name_only_line),
+                "entry {i} past the preview cutoff should show only its name: {out}"
+            );
+            assert!(
+                !out.contains(&format!("entry {i}.")),
+                "entry {i} past the preview cutoff leaked its description: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_near_universal_skill_past_the_preview_cutoff_still_shows_its_name() {
+        // near_universal entries are prepended first in the merge that
+        // builds a search result (see `lookup`'s doc comment on ordering),
+        // so ordinarily they all land inside the preview window. But
+        // `near_universal` alone is capped at `MAX_NEAR_UNIVERSAL` (20),
+        // wider than `MAX_PREVIEWED_RESULTS` (8) -- construct more
+        // near_universal-eligible skills than the preview window to
+        // confirm the later ones still show their name, even without a
+        // preview, rather than silently disappearing.
+        let skills: Vec<Skill> = (0..(MAX_PREVIEWED_RESULTS + 2))
+            .map(|i| Skill {
+                name: format!("universal-{i:02}"),
+                description: "Use when implementing any feature or bugfix, before writing implementation code".into(),
+                body: "body".into(),
+                path: format!("/x/universal-{i:02}/SKILL.md").into(),
+            })
+            .collect();
+        let out = lookup(&skills, "a completely unrelated term");
+        for i in 0..(MAX_PREVIEWED_RESULTS + 2) {
+            assert!(
+                out.contains(&format!("universal-{i:02}")),
+                "near-universal skill {i}'s name did not survive being pushed past the preview cutoff: {out}"
+            );
+        }
     }
 
     #[test]

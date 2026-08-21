@@ -28,6 +28,8 @@ use render::{Status, render_chat};
 /// provider or a sandbox policy itself.
 pub struct RunArgs<'a> {
     pub provider: &'a dyn Provider,
+    pub provider_name: String,
+    pub model_name: String,
     pub state_dir: PathBuf,
     pub audit_path: PathBuf,
     pub max_turns: u32,
@@ -71,13 +73,26 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let mut terminal = ratatui::init();
 
     let mut input_buffer = String::new();
+    let mut cumulative_usage = polaris_provider::Usage::default();
     let mut status = Status::Idle;
     let mut key_reader = CrosstermKeyReader;
     let mut fatal_message: Option<String> = None;
 
     let exit_code = 'outer: loop {
         if terminal
-            .draw(|f| render_chat(f, &session, &input_buffer, &status))
+            .draw(|f| {
+                render_chat(
+                    f,
+                    &session,
+                    &input_buffer,
+                    &status,
+                    &render::HeaderInfo {
+                        provider_name: &args.provider_name,
+                        model_name: &args.model_name,
+                        usage: cumulative_usage,
+                    },
+                )
+            })
             .is_err()
         {
             break ExitCode::FAILURE;
@@ -107,7 +122,19 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
 
         status = Status::Thinking;
         if terminal
-            .draw(|f| render_chat(f, &session, &input_buffer, &status))
+            .draw(|f| {
+                render_chat(
+                    f,
+                    &session,
+                    &input_buffer,
+                    &status,
+                    &render::HeaderInfo {
+                        provider_name: &args.provider_name,
+                        model_name: &args.model_name,
+                        usage: cumulative_usage,
+                    },
+                )
+            })
             .is_err()
         {
             break ExitCode::FAILURE;
@@ -137,7 +164,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         )
         .await
         {
-            Ok(_) => {
+            Ok(outcome) => {
+                cumulative_usage.input_tokens += outcome.usage.input_tokens;
+                cumulative_usage.output_tokens += outcome.usage.output_tokens;
+                cumulative_usage.total_tokens += outcome.usage.total_tokens;
                 status = Status::Idle;
                 if let Some(reply) = session.messages.last()
                     && let Err(e) = persist::append_message(&session_path, reply)

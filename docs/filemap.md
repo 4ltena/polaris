@@ -122,6 +122,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `bm25.rs` — BM25 ランキング。トークナイズ・語幹化・同義語展開・スコアリングだけを
 - `near_universal.rs` — 「ほぼ常に関連する」skill の選定。BM25 のスコアリングを一切知らず、
 
+## `crates/polaris-tui`
+
+- `Cargo.toml` — manifest for the polaris-tui crate
+
+## `crates/polaris-tui/src`
+
+- `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
+- `persist.rs` — Session persistence: one JSON `Message` per line.
+
 ## `docs`
 
 - `filemap.md` — File map

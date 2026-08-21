@@ -14,6 +14,7 @@ polaris-core = { path = "../polaris-core" }
 polaris-provider = { path = "../polaris-provider" }
 polaris-sandbox = { path = "../polaris-sandbox" }
 polaris-skills = { path = "../polaris-skills" }
+polaris-tui = { path = "../polaris-tui" }
 async-trait = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }

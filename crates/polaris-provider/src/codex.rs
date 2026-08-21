@@ -122,6 +122,7 @@ pub struct Folder {
     text: String,
     tool_calls: Vec<ToolCall>,
     completed: bool,
+    usage: Option<crate::Usage>,
 }
 
 impl Default for Folder {
@@ -137,6 +138,7 @@ impl Folder {
             text: String::new(),
             tool_calls: Vec::new(),
             completed: false,
+            usage: None,
         }
     }
 
@@ -154,7 +156,19 @@ impl Folder {
 
             match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
                 "response.output_item.done" => self.take_item(&v)?,
-                "response.completed" => self.completed = true,
+                "response.completed" => {
+                    self.completed = true;
+                    self.usage = v.pointer("/response/usage").and_then(|u| {
+                        let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
+                        let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
+                        let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
+                        Some(crate::Usage {
+                            input_tokens,
+                            output_tokens,
+                            total_tokens,
+                        })
+                    });
+                }
                 "response.failed" => {
                     let msg = v
                         .pointer("/response/error/message")
@@ -232,6 +246,7 @@ impl Folder {
         Ok(CompletionResponse {
             text: self.text,
             tool_calls: self.tool_calls,
+            usage: self.usage,
         })
     }
 }
@@ -473,6 +488,40 @@ mod tests {
         let r = f.finish().expect("should succeed since it completed");
         assert!(r.text.is_empty());
         assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn usage_is_captured_from_the_completed_event() {
+        let mut f = Folder::new();
+        f.push(&frame(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 8,
+                        "total_tokens": 20
+                    }
+                }
+            }),
+        ))
+        .expect("push should succeed");
+
+        let res = f.finish().expect("finish should succeed");
+        let usage = res.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.total_tokens, 20);
+    }
+
+    #[test]
+    fn a_completed_event_without_usage_yields_none_not_an_error() {
+        let mut f = Folder::new();
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("push should succeed");
+
+        let res = f.finish().expect("finish should succeed");
+        assert!(res.usage.is_none());
     }
 
     #[test]

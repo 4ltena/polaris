@@ -248,6 +248,8 @@ async fn main() -> ExitCode {
     let model = std::env::var("POLARIS_MODEL").ok();
     let provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| "openai".to_string());
 
+    let model_name: String;
+
     let provider: Box<dyn polaris_provider::Provider> = match provider_name.as_str() {
         "openai" => {
             // Keep the existing setup as-is. Behavior does not change.
@@ -261,6 +263,7 @@ async fn main() -> ExitCode {
                 }
             };
             let model = model.unwrap_or_else(|| "gpt-5.4".to_string());
+            model_name = model.clone();
             match OpenAiProvider::new(base, key, model) {
                 Ok(p) => Box::new(p),
                 Err(e) => {
@@ -278,6 +281,7 @@ async fn main() -> ExitCode {
                 }
             };
             let model = model.unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
+            model_name = model.clone();
             Box::new(polaris_provider::codex::CodexProvider::new(
                 polaris_provider::codex::ENDPOINT_BASE.to_string(),
                 model,
@@ -399,8 +403,8 @@ async fn main() -> ExitCode {
             )
             .await
             {
-                Ok(text) => {
-                    println!("{text}");
+                Ok(outcome) => {
+                    println!("{}", outcome.text);
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -412,6 +416,8 @@ async fn main() -> ExitCode {
         None => {
             polaris_tui::run(polaris_tui::RunArgs {
                 provider: provider.as_ref(),
+                provider_name: provider_name.clone(),
+                model_name: model_name.clone(),
                 state_dir,
                 audit_path,
                 max_turns: args.max_turns,

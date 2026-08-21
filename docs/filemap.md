@@ -159,3 +159,4 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-18-polaris-codex-provider-design.md` — polaris Codex プロバイダ 設計
 - `2026-08-20-polaris-skill-bm25-router-design.md` — polaris skill ルータ BM25 化 設計
 - `2026-08-21-polaris-tui-design.md` — polaris TUI 設計
+- `2026-08-21-polaris-tui-v2-design.md` — polaris TUI v2(v0.4.0 “Regulus”)設計

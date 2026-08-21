@@ -304,8 +304,8 @@ async fn main() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // The audit log and the confined helper's staging location share the
-    // same state directory (see the docs on `default_state_dir`).
-    let state_dir = match default_state_dir(&cwd) {
+    // same state directory (see the docs on `polaris_core::project::state_dir`).
+    let state_dir = match polaris_core::project::state_dir(&cwd) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Can't determine the state directory: {e}");
@@ -469,23 +469,9 @@ fn run_confined_apply() -> ExitCode {
 /// milestone set up, and if its history is split, "look in one place to
 /// see the whole story" no longer holds.
 ///
-/// `<project-id>` only needs to uniquely identify the project — it
-/// doesn't need to let anyone guess the project's identity — so it uses a
-/// hash of the resolved path.
-fn default_state_dir(cwd: &Path) -> io::Result<PathBuf> {
-    let root = polaris_core::project::resolve_root(cwd);
-    let id = project_id(&root);
-
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let dir = Path::new(&home).join(".polaris").join("state").join(id);
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 /// The default audit log path. Placed directly under the state directory.
 fn default_audit_path(cwd: &Path) -> io::Result<PathBuf> {
-    Ok(default_state_dir(cwd)?.join("audit.jsonl"))
+    Ok(polaris_core::project::state_dir(cwd)?.join("audit.jsonl"))
 }
 
 /// Formats each skipped skill as one line. Even if a single skill is
@@ -497,24 +483,6 @@ fn format_skipped_skills(skipped: &[polaris_skills::Skipped]) -> Vec<String> {
         .iter()
         .map(|s| format!("Can't read skill: {s}"))
         .collect()
-}
-
-/// Builds a deterministic project identifier from a canonicalized path.
-///
-/// We don't use the standard library's `DefaultHasher`, since it doesn't
-/// specify its algorithm and can change across Rust versions (which would
-/// split the same project's audit log into a different directory). We
-/// write out FNV-1a directly instead, to pin the algorithm.
-fn project_id(canonical_path: &Path) -> String {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in canonical_path.as_os_str().as_encoded_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{hash:016x}")
 }
 
 #[cfg(test)]
@@ -544,20 +512,6 @@ mod tests {
         // Here we only pin down clap's parse result.
         let args = Args::try_parse_from(["polaris"]).expect("clap should not make prompt required");
         assert!(args.prompt.is_none());
-    }
-
-    #[test]
-    fn project_id_is_deterministic_for_the_same_path() {
-        let a = project_id(Path::new("/w/polaris"));
-        let b = project_id(Path::new("/w/polaris"));
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn project_id_differs_for_different_paths() {
-        let a = project_id(Path::new("/w/polaris"));
-        let b = project_id(Path::new("/w/other"));
-        assert_ne!(a, b);
     }
 
     #[test]
@@ -678,9 +632,9 @@ mod tests {
 
         let (from_root, from_deep, from_other) = with_home(home.path(), || {
             (
-                default_state_dir(project.path()).expect("could not determine the default path"),
-                default_state_dir(&deep).expect("could not determine the default path"),
-                default_state_dir(other.path()).expect("could not determine the default path"),
+                polaris_core::project::state_dir(project.path()).expect("could not determine the default path"),
+                polaris_core::project::state_dir(&deep).expect("could not determine the default path"),
+                polaris_core::project::state_dir(other.path()).expect("could not determine the default path"),
             )
         });
 

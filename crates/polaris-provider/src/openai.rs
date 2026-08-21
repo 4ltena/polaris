@@ -307,7 +307,22 @@ impl Provider for OpenAiProvider {
             }
         }
 
-        Ok(CompletionResponse { text, tool_calls })
+        let usage = v.get("usage").and_then(|u| {
+            let input_tokens = u.get("prompt_tokens")?.as_u64()? as u32;
+            let output_tokens = u.get("completion_tokens")?.as_u64()? as u32;
+            let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
+            Some(crate::Usage {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+            })
+        });
+
+        Ok(CompletionResponse {
+            text,
+            tool_calls,
+            usage,
+        })
     }
 }
 
@@ -701,5 +716,57 @@ mod tests {
         assert_eq!(tool_msg["role"], "tool");
         assert_eq!(tool_msg["tool_call_id"], "c1");
         assert_eq!(tool_msg["content"], "1: hello");
+    }
+
+    #[tokio::test]
+    async fn usage_is_parsed_from_a_normal_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "hi", "tool_calls": null}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(server.uri(), "key".into(), "model".into()).expect("client");
+        let res = provider
+            .complete(CompletionRequest {
+                system: String::new(),
+                messages: vec![Message::user("hi")],
+                tools: vec![],
+            })
+            .await
+            .expect("should succeed");
+
+        let usage = res.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[tokio::test]
+    async fn a_response_without_usage_yields_none_not_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "hi", "tool_calls": null}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(server.uri(), "key".into(), "model".into()).expect("client");
+        let res = provider
+            .complete(CompletionRequest {
+                system: String::new(),
+                messages: vec![Message::user("hi")],
+                tools: vec![],
+            })
+            .await
+            .expect("a missing usage field must not fail the whole response");
+
+        assert!(res.usage.is_none());
     }
 }

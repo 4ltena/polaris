@@ -6,7 +6,8 @@ use polaris_core::session::Session;
 use polaris_provider::Role;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 /// What the bottom-of-screen status line shows while a turn is in flight,
@@ -64,28 +65,132 @@ fn format_tool_result(content: &str) -> String {
     }
 }
 
+fn role_color(role: Role) -> Color {
+    match role {
+        Role::User => Color::Cyan,
+        Role::Assistant => Color::Green,
+        Role::Tool => Color::Yellow,
+    }
+}
+
+/// Turns one line of already-sanitized text into styled spans, recognizing
+/// `**bold**` and `` `inline code` ``. Malformed markdown (an unclosed `**`
+/// or `` ` ``) is not an error — whatever's left over after the last
+/// successfully matched marker is emitted as plain text, so a stray
+/// backtick never breaks rendering.
+fn format_inline(text: &str, base_color: Color) -> Vec<Span<'static>> {
+    let base_style = Style::default().fg(base_color);
+    let mut spans = Vec::new();
+    let mut rest = text;
+
+    loop {
+        // Find whichever marker comes first: **bold** or `code`.
+        let bold_pos = rest.find("**");
+        let code_pos = rest.find('`');
+
+        // Whichever marker starts earlier goes first; a tie or a marker
+        // with no competitor also counts as "first". `bold_first` is only
+        // consulted once we know at least one marker exists (the `(None,
+        // None)` case above already broke out of the loop), so `.unwrap()`
+        // below on the corresponding position is always safe.
+        let bold_first = match (bold_pos, code_pos) {
+            (None, None) => {
+                if !rest.is_empty() {
+                    spans.push(Span::styled(rest.to_string(), base_style));
+                }
+                break;
+            }
+            (Some(b), Some(c)) => b <= c,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+        };
+
+        if bold_first {
+            let start = bold_pos.unwrap();
+            if let Some(end) = rest[start + 2..].find("**") {
+                let end = start + 2 + end;
+                if start > 0 {
+                    spans.push(Span::styled(rest[..start].to_string(), base_style));
+                }
+                spans.push(Span::styled(
+                    rest[start + 2..end].to_string(),
+                    base_style.add_modifier(Modifier::BOLD),
+                ));
+                rest = &rest[end + 2..];
+            } else {
+                // Unclosed `**`: emit the rest as plain text.
+                spans.push(Span::styled(rest.to_string(), base_style));
+                break;
+            }
+        } else {
+            let start = code_pos.unwrap();
+            if let Some(end) = rest[start + 1..].find('`') {
+                let end = start + 1 + end;
+                if start > 0 {
+                    spans.push(Span::styled(rest[..start].to_string(), base_style));
+                }
+                spans.push(Span::styled(
+                    rest[start + 1..end].to_string(),
+                    base_style.bg(Color::DarkGray),
+                ));
+                rest = &rest[end + 1..];
+            } else {
+                // Unclosed backtick: emit the rest as plain text.
+                spans.push(Span::styled(rest.to_string(), base_style));
+                break;
+            }
+        }
+    }
+
+    spans
+}
+
 fn history_lines(session: &Session) -> Vec<Line<'static>> {
     session
         .messages
         .iter()
         .flat_map(|m| -> Vec<Line<'static>> {
+            let color = role_color(m.role);
             match m.role {
-                Role::Tool => vec![Line::from(sanitize(&format_tool_result(&m.content)))],
+                Role::Tool => vec![Line::from(Span::styled(
+                    sanitize(&format_tool_result(&m.content)),
+                    Style::default().fg(color),
+                ))],
                 Role::User | Role::Assistant => {
                     let mut lines = Vec::new();
                     if !m.tool_calls.is_empty() {
                         for call_line in format_tool_calls(&m.tool_calls) {
-                            lines.push(Line::from(sanitize(&call_line)));
+                            lines.push(Line::from(Span::styled(
+                                sanitize(&call_line),
+                                Style::default().fg(color),
+                            )));
                         }
                     }
                     if !m.content.is_empty() {
                         let sanitized = sanitize(&m.content);
                         let prefix = format!("{}: ", label(m.role));
-                        for (i, line) in sanitized.split('\n').enumerate() {
-                            if i == 0 {
-                                lines.push(Line::from(format!("{prefix}{line}")));
+                        let mut in_code_block = false;
+                        for (i, raw_line) in sanitized.split('\n').enumerate() {
+                            if raw_line.trim_start().starts_with("```") {
+                                in_code_block = !in_code_block;
+                                lines.push(Line::from(Span::styled(
+                                    String::new(),
+                                    Style::default().bg(Color::DarkGray),
+                                )));
+                                continue;
+                            }
+                            let text = if i == 0 {
+                                format!("{prefix}{raw_line}")
                             } else {
-                                lines.push(Line::from(line.to_string()));
+                                raw_line.to_string()
+                            };
+                            if in_code_block {
+                                lines.push(Line::from(Span::styled(
+                                    text,
+                                    Style::default().fg(color).bg(Color::DarkGray),
+                                )));
+                            } else {
+                                lines.push(Line::from(format_inline(&text, color)));
                             }
                         }
                     }
@@ -455,6 +560,87 @@ mod tests {
         // The full 500-character body must not appear verbatim; only a
         // prefix of it should.
         assert!(!content.contains(&long_body));
+    }
+
+    #[test]
+    fn bold_text_is_rendered_with_the_bold_modifier() {
+        let mut session = Session::default();
+        session.push_assistant("this is **bold** text");
+
+        let header = HeaderInfo {
+            provider_name: "openai",
+            model_name: "gpt-5.4",
+            usage: polaris_provider::Usage::default(),
+        };
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let bold_cell = (0..buffer.area.width)
+            .flat_map(|x| (0..buffer.area.height).map(move |y| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].symbol() == "b" && {
+                let row: String = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect();
+                row.contains("bold")
+            });
+        let (x, y) = bold_cell.expect("the word 'bold' should appear somewhere");
+        assert!(
+            buffer[(x, y)].modifier.contains(ratatui::style::Modifier::BOLD),
+            "the 'b' in 'bold' should carry the BOLD modifier"
+        );
+    }
+
+    #[test]
+    fn inline_code_and_surrounding_text_both_render_without_the_backticks() {
+        let mut session = Session::default();
+        session.push_assistant("run `cargo test` now");
+
+        let header = HeaderInfo {
+            provider_name: "openai",
+            model_name: "gpt-5.4",
+            usage: polaris_provider::Usage::default(),
+        };
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
+            .expect("draw");
+
+        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(content.contains("cargo test"));
+        assert!(!content.contains('`'));
+    }
+
+    #[test]
+    fn user_and_assistant_lines_use_different_colors() {
+        let mut session = Session::default();
+        session.push_user("hello");
+        session.push_assistant("hi there");
+
+        let header = HeaderInfo {
+            provider_name: "openai",
+            model_name: "gpt-5.4",
+            usage: polaris_provider::Usage::default(),
+        };
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let find_row_color = |needle: &str| {
+            for y in 0..buffer.area.height {
+                let row: String = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect();
+                if row.contains(needle) {
+                    return buffer[(0, y)].fg;
+                }
+            }
+            panic!("row containing {needle:?} not found");
+        };
+        assert_ne!(find_row_color("hello"), find_row_color("hi there"));
     }
 
     #[test]

@@ -84,7 +84,7 @@ pub fn render_chat(frame: &mut Frame, session: &Session, input: &str, status: &S
         Status::Thinking => "thinking...".to_string(),
         Status::Error(e) => format!("error: {e}"),
     };
-    frame.render_widget(Paragraph::new(status_text), status_area);
+    frame.render_widget(Paragraph::new(sanitize(&status_text)), status_area);
 
     frame.render_widget(
         Paragraph::new(sanitize(input)).block(Block::default().borders(Borders::ALL).title("input")),
@@ -215,6 +215,23 @@ mod tests {
         let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         assert!(content.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn a_status_error_with_a_raw_escape_byte_does_not_reach_the_terminal_buffer() {
+        let session = Session::default();
+        let status = Status::Error("\x1b[31mfake\x1b[0m".to_string());
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &status))
+            .expect("draw");
+
+        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(!content.chars().any(|c| c == '\u{1b}'));
+        assert!(content.contains("error: "));
+        assert!(content.contains("fake"));
     }
 
     #[test]

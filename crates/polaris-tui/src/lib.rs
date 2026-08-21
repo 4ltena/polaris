@@ -3,6 +3,7 @@
 
 pub mod approver;
 pub mod input;
+pub mod onboarding;
 pub mod persist;
 pub mod render;
 
@@ -115,7 +116,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
 
         session.push_user(&text);
         let checkpoint = session.messages.len();
-        if let Err(e) = persist::append_message(&session_path, session.messages.last().expect("just pushed")) {
+        if let Err(e) =
+            persist::append_message(&session_path, session.messages.last().expect("just pushed"))
+        {
             fatal_message = Some(format!("Can't persist the message: {e}"));
             break 'outer ExitCode::FAILURE;
         }

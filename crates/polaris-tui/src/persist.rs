@@ -116,7 +116,8 @@ mod tests {
         append_message(&path, &Message::user("good line")).expect("append");
         let mut file = OpenOptions::new().append(true).open(&path).expect("open");
         // Invalid UTF-8 bytes (a lone continuation byte), not valid JSON either way.
-        file.write_all(b"\xff\xfe not valid utf-8\n").expect("write invalid utf-8 line");
+        file.write_all(b"\xff\xfe not valid utf-8\n")
+            .expect("write invalid utf-8 line");
         drop(file);
         append_message(&path, &Message::user("orphaned, after the invalid line")).expect("append");
 

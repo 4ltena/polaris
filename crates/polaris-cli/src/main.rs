@@ -246,54 +246,99 @@ async fn main() -> ExitCode {
     }
 
     let model = std::env::var("POLARIS_MODEL").ok();
-    let provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| "openai".to_string());
+    let mut provider_name =
+        std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| "openai".to_string());
 
     let model_name: String;
 
-    let provider: Box<dyn polaris_provider::Provider> = match provider_name.as_str() {
-        "openai" => {
-            // Keep the existing setup as-is. Behavior does not change.
-            let base = std::env::var("POLARIS_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-            let key = match std::env::var("POLARIS_API_KEY") {
-                Ok(k) => k,
-                Err(_) => {
-                    eprintln!("POLARIS_API_KEY is not set");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let model = model.unwrap_or_else(|| "gpt-5.4".to_string());
-            model_name = model.clone();
-            match OpenAiProvider::new(base, key, model) {
-                Ok(p) => Box::new(p),
-                Err(e) => {
-                    eprintln!("Can't build the client: {e}");
-                    return ExitCode::FAILURE;
+    let provider: Box<dyn polaris_provider::Provider> = loop {
+        match provider_name.as_str() {
+            "openai" => {
+                // Keep the existing setup as-is. Behavior does not change.
+                let base = std::env::var("POLARIS_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+                let key = std::env::var("POLARIS_API_KEY").ok().or_else(|| {
+                    polaris_auth::api_key::default_path().ok().and_then(|p| {
+                        match polaris_auth::api_key::load_from(&p) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                eprintln!("Can't read the saved API key: {e}");
+                                None
+                            }
+                        }
+                    })
+                });
+                let key = match key {
+                    Some(k) => k,
+                    None if args.prompt.is_none() => {
+                        let auth_store_path = match polaris_auth::store::default_path() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("Can't determine where to store credentials: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let api_key_path = match polaris_auth::api_key::default_path() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("Can't determine where to store the API key: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        match polaris_tui::onboarding::run(&auth_store_path, &api_key_path).await {
+                            Ok(polaris_tui::onboarding::Outcome::ApiKeySaved) => continue,
+                            Ok(polaris_tui::onboarding::Outcome::CodexLoggedIn) => {
+                                provider_name = "codex".to_string();
+                                continue;
+                            }
+                            Err(polaris_tui::onboarding::OnboardingError::Cancelled) => {
+                                return ExitCode::SUCCESS;
+                            }
+                            Err(e) => {
+                                eprintln!("{e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("POLARIS_API_KEY is not set");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let model = model.clone().unwrap_or_else(|| "gpt-5.4".to_string());
+                model_name = model.clone();
+                match OpenAiProvider::new(base, key, model) {
+                    Ok(p) => break Box::new(p),
+                    Err(e) => {
+                        eprintln!("Can't build the client: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
-        }
-        "codex" => {
-            let store = match polaris_auth::store::default_path() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("Can't determine where to store credentials: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let model = model.unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
-            model_name = model.clone();
-            Box::new(polaris_provider::codex::CodexProvider::new(
-                polaris_provider::codex::ENDPOINT_BASE.to_string(),
-                model,
-                std::sync::Arc::new(AuthTokens {
-                    issuer: polaris_auth::ISSUER.to_string(),
-                    store,
-                }),
-            ))
-        }
-        other => {
-            eprintln!("POLARIS_PROVIDER is an unknown value {other}. Specify openai or codex");
-            return ExitCode::FAILURE;
+            "codex" => {
+                let store = match polaris_auth::store::default_path() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Can't determine where to store credentials: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let model =
+                    model.unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
+                model_name = model.clone();
+                break Box::new(polaris_provider::codex::CodexProvider::new(
+                    polaris_provider::codex::ENDPOINT_BASE.to_string(),
+                    model,
+                    std::sync::Arc::new(AuthTokens {
+                        issuer: polaris_auth::ISSUER.to_string(),
+                        store,
+                    }),
+                ));
+            }
+            other => {
+                eprintln!("POLARIS_PROVIDER is an unknown value {other}. Specify openai or codex");
+                return ExitCode::FAILURE;
+            }
         }
     };
 
@@ -651,9 +696,12 @@ mod tests {
 
         let (from_root, from_deep, from_other) = with_home(home.path(), || {
             (
-                polaris_core::project::state_dir(project.path()).expect("could not determine the default path"),
-                polaris_core::project::state_dir(&deep).expect("could not determine the default path"),
-                polaris_core::project::state_dir(other.path()).expect("could not determine the default path"),
+                polaris_core::project::state_dir(project.path())
+                    .expect("could not determine the default path"),
+                polaris_core::project::state_dir(&deep)
+                    .expect("could not determine the default path"),
+                polaris_core::project::state_dir(other.path())
+                    .expect("could not determine the default path"),
             )
         });
 

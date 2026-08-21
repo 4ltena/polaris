@@ -22,6 +22,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-auth/src`
 
+- `api_key.rs` — Storage for a plain OpenAI API key at `~/.polaris/api_key.json`.
 - `lib.rs` — Lifecycle of ChatGPT subscription auth (OAuth) and storage of credentials.
 - `login.rs` — Building the authorization URL, and receiving the callback exactly once.
 - `pkce.rs` — PKCE (RFC 7636) verifier and challenge.
@@ -132,6 +133,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `approver.rs` — The `Approver` that runs inside the TUI: draws a modal over the current
 - `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from
 - `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
+- `onboarding.rs` — The onboarding screen: shown by `polaris-cli` when the interactive TUI
 - `persist.rs` — Session persistence: one JSON `Message` per line.
 - `render.rs` — Pure rendering: turns a `Session` + input state into terminal cells.
 

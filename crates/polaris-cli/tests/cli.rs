@@ -4,11 +4,20 @@ use std::process::Command;
 
 /// Launching without an API key should exit stating plainly that the key
 /// is missing. No actual network call is made.
+///
+/// `HOME` is pointed at a temp directory and `POLARIS_BASE_URL` at an
+/// unreachable address so that a developer machine with a real saved key
+/// under `~/.polaris/api_key.json` (from `polaris login` or onboarding)
+/// can never make this test resolve a real key and send a real, billed
+/// request to `https://api.openai.com/v1`.
 #[test]
 fn reports_missing_api_key() {
     let exe = env!("CARGO_BIN_EXE_polaris");
+    let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(exe)
         .args(["-p", "hello"])
+        .env("HOME", home.path())
+        .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .env_remove("POLARIS_API_KEY")
         .output()
         .expect("could not launch");

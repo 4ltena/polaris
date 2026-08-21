@@ -2,8 +2,8 @@
 //! Completely independent of `Credentials`/`auth.json` — the codex OAuth
 //! store is never read or written by this module, and vice versa.
 
-use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use crate::AuthError;
 
@@ -30,8 +30,10 @@ pub fn save_to(path: &Path, key: &str) -> Result<(), AuthError> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let body = serde_json::to_vec_pretty(&Stored { key: key.to_string() })
-        .map_err(|e| AuthError::Decode(format!("could not serialize the API key: {e}")))?;
+    let body = serde_json::to_vec_pretty(&Stored {
+        key: key.to_string(),
+    })
+    .map_err(|e| AuthError::Decode(format!("could not serialize the API key: {e}")))?;
 
     let mut f = std::fs::OpenOptions::new()
         .write(true)

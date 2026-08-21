@@ -108,10 +108,18 @@ fn the_normal_path_without_a_prompt_refuses_the_tui_on_a_non_interactive_termina
 /// unset, still takes the openai path as before. Scolding about the
 /// missing key in openai's own words confirms it hasn't strayed onto the
 /// codex path.
+///
+/// `HOME` is pointed at a temp directory and `POLARIS_BASE_URL` at an
+/// unreachable address so that a developer machine with a real saved key
+/// under `~/.polaris/api_key.json` can never make this test resolve a
+/// real key and send a real, billed request to the OpenAI API.
 #[test]
 fn the_default_provider_is_still_openai() {
+    let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .args(["-p", "x"])
+        .env("HOME", home.path())
+        .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
         .output()
@@ -199,5 +207,34 @@ fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
     assert!(
         !stderr.contains("POLARIS_API_KEY is not set"),
         "did not use the saved key file: {stderr}"
+    );
+}
+
+/// TUI mode with no API key anywhere (env, file) must actually reach
+/// onboarding's own code path, not just fail with the old
+/// "POLARIS_API_KEY is not set" message. We can't complete onboarding
+/// without a real terminal, but we CAN prove the code path was reached:
+/// onboarding's own non-interactive-terminal guard fires with a distinct
+/// message from the chat loop's own guard, so seeing THAT specific
+/// message (not the chat loop's "refusing to start the TUI...") proves
+/// main.rs's onboarding wiring was actually exercised, not skipped.
+#[test]
+fn tui_mode_with_no_key_anywhere_reaches_onboarding() {
+    let home = tempfile::tempdir().expect("temp directory");
+    let out = Command::new(bin())
+        .env("HOME", home.path())
+        .env_remove("POLARIS_PROVIDER")
+        .env_remove("POLARIS_API_KEY")
+        .output()
+        .expect("could not launch");
+
+    assert!(
+        !out.status.success(),
+        "succeeded with no credentials at all"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to start onboarding"),
+        "did not reach onboarding's own guard (got the chat loop's guard instead, or something else): {stderr}"
     );
 }

@@ -38,6 +38,18 @@ pub struct ToolContext<'a> {
     pub approver: &'a mut dyn crate::approval::Approver,
 }
 
+/// What a successful turn produced: the final text, and the token usage
+/// accumulated across every `provider.complete()` call the turn made
+/// (a turn that used a tool calls the provider more than once). A
+/// response whose `usage` came back `None` contributes nothing to this
+/// total rather than failing the turn — usage is a best-effort report,
+/// never something the loop depends on to function.
+#[derive(Debug)]
+pub struct AgentOutcome {
+    pub text: String,
+    pub usage: polaris_provider::Usage,
+}
+
 /// Pass in `always_on` as something [`crate::prompt::assemble_always_on`]
 /// has already assembled. It is not assembled inside the loop, so that the
 /// caller is made to guarantee the same string is sent every turn and the
@@ -51,18 +63,6 @@ pub struct ToolContext<'a> {
 ///
 /// `skills` is not loaded into the always-on context. It's only consulted
 /// when the `skill` tool is invoked.
-/// What a successful turn produced: the final text, and the token usage
-/// accumulated across every `provider.complete()` call the turn made
-/// (a turn that used a tool calls the provider more than once). A
-/// response whose `usage` came back `None` contributes nothing to this
-/// total rather than failing the turn — usage is a best-effort report,
-/// never something the loop depends on to function.
-#[derive(Debug)]
-pub struct AgentOutcome {
-    pub text: String,
-    pub usage: polaris_provider::Usage,
-}
-
 pub async fn run(
     provider: &dyn Provider,
     session: &mut Session,

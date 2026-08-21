@@ -57,8 +57,14 @@ fn format_tool_calls(calls: &[polaris_provider::ToolCall]) -> Vec<String> {
 }
 
 fn format_tool_result(content: &str) -> String {
-    let preview: String = content.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
-    if content.chars().count() > TOOL_RESULT_PREVIEW_CHARS {
+    // Expand tabs before truncating so the 200-char budget is spent on the
+    // form actually rendered. A raw tab is effectively invisible in a
+    // terminal grid (each cell is one character wide), which matters for
+    // tools like `read` whose output separates line numbers from content
+    // with `\t`.
+    let expanded = content.replace('\t', "    ");
+    let preview: String = expanded.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
+    if expanded.chars().count() > TOOL_RESULT_PREVIEW_CHARS {
         format!("→ {preview}...")
     } else {
         format!("→ {preview}")
@@ -152,10 +158,18 @@ fn history_lines(session: &Session) -> Vec<Line<'static>> {
         .flat_map(|m| -> Vec<Line<'static>> {
             let color = role_color(m.role);
             match m.role {
-                Role::Tool => vec![Line::from(Span::styled(
-                    sanitize(&format_tool_result(&m.content)),
-                    Style::default().fg(color),
-                ))],
+                Role::Tool => {
+                    let sanitized = sanitize(&format_tool_result(&m.content));
+                    sanitized
+                        .split('\n')
+                        .map(|line| {
+                            Line::from(Span::styled(
+                                line.to_string(),
+                                Style::default().fg(color),
+                            ))
+                        })
+                        .collect()
+                }
                 Role::User | Role::Assistant => {
                     let mut lines = Vec::new();
                     if !m.tool_calls.is_empty() {
@@ -386,6 +400,38 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_result_with_a_raw_escape_byte_does_not_reach_the_terminal_buffer() {
+        let mut session = Session::default();
+        session.push_assistant_tool_calls(
+            "",
+            vec![polaris_provider::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "echo fake"}),
+            }],
+        );
+        session.push_tool_result("c1", "\x1b[31mfake\x1b[0m");
+
+        let header = HeaderInfo {
+            provider_name: "openai",
+            model_name: "gpt-5.4",
+            usage: polaris_provider::Usage::default(),
+        };
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
+            .expect("draw");
+
+        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(!content.chars().any(|c| c == '\u{1b}'));
+        // The rest of the text should still be visible, just with the
+        // control bytes neutralized rather than the whole tool result
+        // being dropped.
+        assert!(content.contains("fake"));
+    }
+
+    #[test]
     fn ordinary_text_renders_unaffected_by_sanitization() {
         let mut session = Session::default();
         session.push_user("plain ascii and 日本語 text, nothing weird here.");
@@ -529,6 +575,53 @@ mod tests {
         let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
         assert!(content.contains("read"), "the tool name should appear: {content}");
         assert!(content.contains("hello"), "the tool result should appear: {content}");
+    }
+
+    #[test]
+    fn a_multi_line_tool_result_renders_as_multiple_lines_not_one_clipped_line() {
+        let mut session = Session::default();
+        session.push_assistant_tool_calls(
+            "",
+            vec![polaris_provider::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            }],
+        );
+        // Mimics `read`'s real output shape: "{line_number}\t{content}\n"
+        // per line.
+        session.push_tool_result("c1", "1\tfirst line\n2\tsecond line\n3\tthird line\n");
+
+        let header = HeaderInfo {
+            provider_name: "openai",
+            model_name: "gpt-5.4",
+            usage: polaris_provider::Usage::default(),
+        };
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Each physical line of the tool result must land on its own row,
+        // not be squashed onto a single row.
+        assert!(rows.iter().any(|r| r.contains("first line")));
+        assert!(rows.iter().any(|r| r.contains("second line")));
+        assert!(rows.iter().any(|r| r.contains("third line")));
+        // Tabs must be expanded to spaces, not rendered as literal tab
+        // characters (which are invisible in a terminal grid).
+        let full: String = rows.join("\n");
+        assert!(!full.contains('\t'));
+        assert!(rows.iter().any(|r| r.contains("1    first line")));
     }
 
     #[test]

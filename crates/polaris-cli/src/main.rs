@@ -245,11 +245,6 @@ async fn main() -> ExitCode {
         return run_confined_apply();
     }
 
-    let Some(prompt) = args.prompt.clone() else {
-        eprintln!("--prompt is required (see `polaris --help`)");
-        return ExitCode::FAILURE;
-    };
-
     let model = std::env::var("POLARIS_MODEL").ok();
     let provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| "openai".to_string());
 
@@ -298,9 +293,6 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut session = Session::new();
-    session.push_user(&prompt);
-
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // The audit log and the confined helper's staging location share the
@@ -323,15 +315,6 @@ async fn main() -> ExitCode {
             }
         },
     };
-
-    let mut audit = match AuditLog::open(&audit_path) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Can't open the audit log: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut stop = StopTracker::new(args.max_turns);
 
     // The writable root is derived from the project root. Using the working
     // directory as-is would change what's writable just because you launched
@@ -364,14 +347,6 @@ async fn main() -> ExitCode {
     };
 
     let approval_policy: ApprovalPolicy = args.approval.into();
-    let mut gate = Gate::new(approval_policy);
-    let mut approver = TerminalApprover;
-    let mut ctx = ToolContext {
-        sandbox: &sandbox,
-        helper: &helper,
-        gate: &mut gate,
-        approver: &mut approver,
-    };
 
     let constitution = constitution::load(&cwd);
     let environment = constitution::environment_block(&cwd, None);
@@ -391,24 +366,62 @@ async fn main() -> ExitCode {
     // production sends diverge from what the tests measure.
     let always_on = prompt::assemble_always_on(&constitution, &environment, &discovered.skills);
 
-    match agent::run(
-        provider.as_ref(),
-        &mut session,
-        &mut audit,
-        &mut stop,
-        &always_on,
-        &discovered.skills,
-        &mut ctx,
-    )
-    .await
-    {
-        Ok(text) => {
-            println!("{text}");
-            ExitCode::SUCCESS
+    match args.prompt.clone() {
+        Some(prompt) => {
+            let mut session = Session::new();
+            session.push_user(&prompt);
+
+            let mut audit = match AuditLog::open(&audit_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("Can't open the audit log: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut stop = StopTracker::new(args.max_turns);
+            let mut gate = Gate::new(approval_policy);
+            let mut approver = TerminalApprover;
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+
+            match agent::run(
+                provider.as_ref(),
+                &mut session,
+                &mut audit,
+                &mut stop,
+                &always_on,
+                &discovered.skills,
+                &mut ctx,
+            )
+            .await
+            {
+                Ok(text) => {
+                    println!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
+        None => {
+            polaris_tui::run(polaris_tui::RunArgs {
+                provider: provider.as_ref(),
+                state_dir,
+                audit_path,
+                max_turns: args.max_turns,
+                sandbox,
+                helper,
+                approval_policy,
+                always_on: &always_on,
+                skills: &discovered.skills,
+            })
+            .await
         }
     }
 }

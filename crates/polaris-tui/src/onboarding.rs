@@ -10,9 +10,9 @@
 //! (polaris-tui) separate.
 
 use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
@@ -111,7 +111,7 @@ pub fn apply_key_entry_key(buffer: &mut String, key: KeyEvent) -> KeyEntryAction
             if buffer.trim().is_empty() {
                 KeyEntryAction::Continue
             } else {
-                KeyEntryAction::Submit(std::mem::take(buffer))
+                KeyEntryAction::Submit(std::mem::take(buffer).trim().to_string())
             }
         }
         KeyCode::Backspace => {
@@ -149,7 +149,10 @@ impl std::fmt::Display for OnboardingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OnboardingError::NonInteractive => {
-                write!(f, "polaris: refusing to start onboarding on a non-interactive terminal")
+                write!(
+                    f,
+                    "polaris: refusing to start onboarding on a non-interactive terminal"
+                )
             }
             OnboardingError::Cancelled => write!(f, "onboarding cancelled"),
             OnboardingError::Auth(msg) => write!(f, "{msg}"),
@@ -171,8 +174,13 @@ pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome,
     let mut selected = Choice::ChatGpt;
 
     let outcome = 'outer: loop {
-        if terminal.draw(|f| render_choice_screen(f, selected)).is_err() {
-            break 'outer Err(OnboardingError::Auth("failed to draw the terminal".to_string()));
+        if terminal
+            .draw(|f| render_choice_screen(f, selected))
+            .is_err()
+        {
+            break 'outer Err(OnboardingError::Auth(
+                "failed to draw the terminal".to_string(),
+            ));
         }
         let event = match ratatui::crossterm::event::read() {
             Ok(e) => e,
@@ -213,7 +221,9 @@ pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome,
                             .draw(|f| {
                                 let area = f.area();
                                 f.render_widget(
-                                    ratatui::widgets::Paragraph::new(format!("sign-in failed: {e}\n\npress any key to try again")),
+                                    ratatui::widgets::Paragraph::new(format!(
+                                        "sign-in failed: {e}\n\npress any key to try again"
+                                    )),
                                     area,
                                 )
                             })
@@ -229,12 +239,21 @@ pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome,
             Choice::ApiKey => {
                 let mut typed = String::new();
                 let key = 'entry: loop {
-                    if terminal.draw(|f| render_api_key_prompt(f, typed.len())).is_err() {
-                        break 'outer Err(OnboardingError::Auth("failed to draw the terminal".to_string()));
+                    if terminal
+                        .draw(|f| render_api_key_prompt(f, typed.chars().count()))
+                        .is_err()
+                    {
+                        break 'outer Err(OnboardingError::Auth(
+                            "failed to draw the terminal".to_string(),
+                        ));
                     }
                     let event = match ratatui::crossterm::event::read() {
                         Ok(e) => e,
-                        Err(_) => break 'outer Err(OnboardingError::Auth("failed to read a key".to_string())),
+                        Err(_) => {
+                            break 'outer Err(OnboardingError::Auth(
+                                "failed to read a key".to_string(),
+                            ));
+                        }
                     };
                     let ratatui::crossterm::event::Event::Key(key_event) = event else {
                         continue;
@@ -271,7 +290,13 @@ mod tests {
             .draw(|f| render_choice_screen(f, Choice::ChatGpt))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("Sign in with ChatGPT"));
         assert!(content.contains("Provide an OpenAI API key"));
     }
@@ -290,7 +315,13 @@ mod tests {
             .draw(|f| render_api_key_prompt(f, 5))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("*****"));
     }
 
@@ -300,14 +331,25 @@ mod tests {
 
     #[test]
     fn up_down_and_digit_keys_all_toggle_the_choice() {
-        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Char('1'), KeyCode::Char('2')] {
-            assert!(matches!(apply_choice_key(press(code)), ChoiceAction::Toggle));
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+        ] {
+            assert!(matches!(
+                apply_choice_key(press(code)),
+                ChoiceAction::Toggle
+            ));
         }
     }
 
     #[test]
     fn enter_submits_the_choice_screen() {
-        assert!(matches!(apply_choice_key(press(KeyCode::Enter)), ChoiceAction::Submit));
+        assert!(matches!(
+            apply_choice_key(press(KeyCode::Enter)),
+            ChoiceAction::Submit
+        ));
     }
 
     #[test]
@@ -353,7 +395,10 @@ mod tests {
     fn ctrl_c_quits_the_key_entry_screen() {
         let mut buffer = "partial".to_string();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(apply_key_entry_key(&mut buffer, ctrl_c), KeyEntryAction::Quit));
+        assert!(matches!(
+            apply_key_entry_key(&mut buffer, ctrl_c),
+            KeyEntryAction::Quit
+        ));
     }
 
     #[tokio::test]

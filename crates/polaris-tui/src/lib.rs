@@ -3,6 +3,7 @@
 
 pub mod approver;
 pub mod input;
+pub mod onboarding;
 pub mod persist;
 pub mod render;
 

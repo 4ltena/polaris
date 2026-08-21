@@ -16,7 +16,7 @@
 | 進行中の計画 | なし |
 | 直近で終えた計画 | `docs/superpowers/plans/2026-08-20-polaris-m3b-bm25-skill-router.md` |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md` |
-| 版の方針 | v1.0.0 = `hamal`（核となる harness、M1・M2・M2.5）。M1・M2・M2.5 が完了し、タグ付けの条件が揃った。タグ付け自体は利用者の承認を待つ準備段階のまま。skill/plugin 分類機（M3b の BM25 ルータと、その後の候補圧縮）は別系統で v0.2 = `Aldebaran`。どちらも実際の git tag はまだ打っていない |
+| 版の方針 | 当初案の `hamal`/`Aldebaran` 二系統(v1.0.0 と v0.2 に分ける案)は採らず、単一の `vX.Y.Z` を単調に進める方式へ変更。`v0.1.0`(M1・M2・M2.5・M3a)、`v0.2.0`(M3b BM25 ルータ、通称 Aldebaran)、`v0.3.0`(対話 TUI)を実際に git tag 済み。`CHANGELOG.md` が詳細の記録先 |
 
 ## マイルストーン
 

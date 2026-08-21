@@ -190,3 +190,7 @@ polaris
   `y`/`n` で応答できる
 - `Ctrl-C` で終了し、`~/.polaris/state/<project-id>/tui-session.jsonl` が作られていること
 - 同じディレクトリで再度 `polaris` を実行すると、直前の会話が履歴に表示されること
+
+## ライセンス
+
+[MIT License](LICENSE) で公開する。

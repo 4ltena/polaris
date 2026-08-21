@@ -316,7 +316,7 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let model = model.clone().unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
+            let model = model.unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
             model_name = model.clone();
             break Box::new(polaris_provider::codex::CodexProvider::new(
                 polaris_provider::codex::ENDPOINT_BASE.to_string(),

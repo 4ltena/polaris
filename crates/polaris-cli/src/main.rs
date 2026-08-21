@@ -248,7 +248,7 @@ async fn main() -> ExitCode {
     let model = std::env::var("POLARIS_MODEL").ok();
     let provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| "openai".to_string());
 
-    let mut model_name = String::new();
+    let model_name: String;
 
     let provider: Box<dyn polaris_provider::Provider> = match provider_name.as_str() {
         "openai" => {

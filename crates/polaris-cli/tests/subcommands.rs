@@ -169,3 +169,35 @@ fn an_unknown_provider_name_fails_fast() {
         "did not print the name: {stderr}"
     );
 }
+
+/// The api_key.json fallback: with no POLARIS_API_KEY env var but a
+/// previously-saved key file, one-shot mode should succeed in building
+/// the provider (it will still fail later when the fake key is rejected
+/// by a real network call, but that's not what this test checks — it
+/// only checks that key *resolution* used the file instead of failing at
+/// "POLARIS_API_KEY is not set").
+#[test]
+fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
+    let home = tempfile::tempdir().expect("temp directory");
+    let key_path = home.path().join(".polaris").join("api_key.json");
+    std::fs::create_dir_all(key_path.parent().unwrap()).expect("mkdir");
+    std::fs::write(&key_path, r#"{"key":"sk-from-file"}"#).expect("write key file");
+
+    let out = Command::new(bin())
+        .args(["-p", "x"])
+        .env("HOME", home.path())
+        .env_remove("POLARIS_PROVIDER")
+        .env_remove("POLARIS_API_KEY")
+        .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
+        .output()
+        .expect("could not launch");
+
+    // It must NOT fail with the "not set" message — it should get past
+    // key resolution and fail later (e.g. a connection error to the
+    // deliberately-unreachable base URL), proving the file was read.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("POLARIS_API_KEY is not set"),
+        "did not use the saved key file: {stderr}"
+    );
+}

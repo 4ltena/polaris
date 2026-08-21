@@ -51,6 +51,18 @@ pub struct ToolContext<'a> {
 ///
 /// `skills` is not loaded into the always-on context. It's only consulted
 /// when the `skill` tool is invoked.
+/// What a successful turn produced: the final text, and the token usage
+/// accumulated across every `provider.complete()` call the turn made
+/// (a turn that used a tool calls the provider more than once). A
+/// response whose `usage` came back `None` contributes nothing to this
+/// total rather than failing the turn — usage is a best-effort report,
+/// never something the loop depends on to function.
+#[derive(Debug)]
+pub struct AgentOutcome {
+    pub text: String,
+    pub usage: polaris_provider::Usage,
+}
+
 pub async fn run(
     provider: &dyn Provider,
     session: &mut Session,
@@ -59,7 +71,8 @@ pub async fn run(
     always_on: &crate::prompt::AlwaysOn,
     skills: &[polaris_skills::Skill],
     ctx: &mut ToolContext<'_>,
-) -> Result<String, AgentError> {
+) -> Result<AgentOutcome, AgentError> {
+    let mut usage = polaris_provider::Usage::default();
     loop {
         // Call unconditionally every turn. If this were only called on
         // error, a call pattern that never triggers an error would never
@@ -76,9 +89,18 @@ pub async fn run(
             })
             .await?;
 
+        if let Some(u) = res.usage {
+            usage.input_tokens += u.input_tokens;
+            usage.output_tokens += u.output_tokens;
+            usage.total_tokens += u.total_tokens;
+        }
+
         if res.tool_calls.is_empty() {
             session.push_assistant(&res.text);
-            return Ok(res.text);
+            return Ok(AgentOutcome {
+                text: res.text,
+                usage,
+            });
         }
 
         // Before sending the tool results, record this assistant turn
@@ -470,7 +492,8 @@ mod tests {
             &mut ctx,
         )
         .await
-        .expect("should succeed");
+        .expect("should succeed")
+        .text;
         assert_eq!(out, "it was 1 line");
 
         let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("cannot read");
@@ -545,7 +568,8 @@ mod tests {
             &mut ctx,
         )
         .await
-        .expect("shouldn't stop, since the interleaved successes mean this isn't 3 in a row");
+        .expect("shouldn't stop, since the interleaved successes mean this isn't 3 in a row")
+        .text;
         assert_eq!(out, "done");
     }
 
@@ -647,7 +671,8 @@ mod tests {
             &mut ctx,
         )
         .await
-        .expect("should succeed");
+        .expect("should succeed")
+        .text;
         assert_eq!(out, "read it");
 
         let tool_msg = session
@@ -851,7 +876,8 @@ print("wrote")
             &mut ctx,
         )
         .await
-        .expect("the loop failed");
+        .expect("the loop failed")
+        .text;
 
         assert_eq!(out, "wrote it");
         assert_eq!(
@@ -934,7 +960,8 @@ print("wrote")
             &mut ctx,
         )
         .await
-        .expect("the denial failed the whole loop");
+        .expect("the denial failed the whole loop")
+        .text;
 
         assert_eq!(
             out, "I'll write elsewhere instead",
@@ -1046,7 +1073,8 @@ print("wrote")
                 &mut ctx,
             )
             .await
-            .expect("the denial failed the whole loop");
+            .expect("the denial failed the whole loop")
+            .text;
             assert_eq!(out, "elsewhere");
         }
 
@@ -1198,7 +1226,8 @@ print("wrote")
                 &mut ctx,
             )
             .await
-            .expect("the denial failed the whole loop");
+            .expect("the denial failed the whole loop")
+            .text;
             assert_eq!(out, "elsewhere");
         }
 
@@ -1327,7 +1356,8 @@ print("wrote")
                 &mut ctx,
             )
             .await
-            .expect("should succeed");
+            .expect("should succeed")
+            .text;
             assert_eq!(out, "done");
         }
 
@@ -1463,5 +1493,107 @@ print("wrote")
                 .contains("workspace-write"),
             "the audit record's sandbox is missing the policy: {v}"
         );
+    }
+
+    #[tokio::test]
+    async fn usage_accumulates_across_a_tool_calling_turn() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, "hello\n").expect("cannot write");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({ "path": target.to_str().unwrap() }),
+                    }],
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        total_tokens: 15,
+                    }),
+                },
+                CompletionResponse {
+                    text: "it was 1 line".into(),
+                    tool_calls: vec![],
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 20,
+                        output_tokens: 3,
+                        total_tokens: 23,
+                    }),
+                },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("how many lines is a.txt");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let mut stop = StopTracker::new(10);
+
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let outcome = run(
+            &p,
+            &mut session,
+            &mut audit,
+            &mut stop,
+            &always_on,
+            &[],
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(outcome.text, "it was 1 line");
+        assert_eq!(outcome.usage.input_tokens, 30);
+        assert_eq!(outcome.usage.output_tokens, 8);
+        assert_eq!(outcome.usage.total_tokens, 38);
+    }
+
+    #[tokio::test]
+    async fn a_response_with_no_usage_contributes_zero_not_a_failure() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let p = Scripted {
+            replies: Mutex::new(vec![CompletionResponse {
+                text: "done".into(),
+                tool_calls: vec![],
+                usage: None,
+            }]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("hi");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let outcome = run(
+            &p,
+            &mut session,
+            &mut audit,
+            &mut stop,
+            &always_on,
+            &[],
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(outcome.usage.total_tokens, 0);
     }
 }

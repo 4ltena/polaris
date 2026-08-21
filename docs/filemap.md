@@ -151,6 +151,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-18-polaris-m25-codex-provider.md` — polaris M2.5 Codex プロバイダ 実装計画
 - `2026-08-20-polaris-m3b-bm25-skill-router.md` — polaris M3b BM25 skill ルータ 実装計画
 - `2026-08-20-polaris-m4-core.md` — polaris M4 コア（`spawn` と単一波オーケストレーション）実装計画
+- `2026-08-21-polaris-tui-v2.md` — polaris TUI v2 (v0.4.0 "Regulus") Implementation Plan
 - `2026-08-21-polaris-tui.md` — polaris TUI Implementation Plan
 
 ## `docs/superpowers/specs`
@@ -159,3 +160,4 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-18-polaris-codex-provider-design.md` — polaris Codex プロバイダ 設計
 - `2026-08-20-polaris-skill-bm25-router-design.md` — polaris skill ルータ BM25 化 設計
 - `2026-08-21-polaris-tui-design.md` — polaris TUI 設計
+- `2026-08-21-polaris-tui-v2-design.md` — polaris TUI v2(v0.4.0 “Regulus”)設計

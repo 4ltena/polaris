@@ -126,6 +126,137 @@ pub fn apply_key_entry_key(buffer: &mut String, key: KeyEvent) -> KeyEntryAction
     }
 }
 
+use std::io::IsTerminal;
+use std::path::Path;
+
+/// Which credential became available once onboarding completes
+/// successfully. `polaris-cli::main()` uses this to decide which
+/// provider arm to retry.
+#[derive(Debug)]
+pub enum Outcome {
+    ApiKeySaved,
+    CodexLoggedIn,
+}
+
+#[derive(Debug)]
+pub enum OnboardingError {
+    NonInteractive,
+    Cancelled,
+    Auth(String),
+}
+
+impl std::fmt::Display for OnboardingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OnboardingError::NonInteractive => {
+                write!(f, "polaris: refusing to start onboarding on a non-interactive terminal")
+            }
+            OnboardingError::Cancelled => write!(f, "onboarding cancelled"),
+            OnboardingError::Auth(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Shows the onboarding screen and drives it to completion. Owns the
+/// terminal for its own lifetime (enters/leaves the alternate screen
+/// itself via `ratatui::init()`/`ratatui::restore()`), independent of
+/// whatever the caller does with the terminal afterward — the chat loop's
+/// own `run()` re-inits the terminal fresh once this returns.
+pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        return Err(OnboardingError::NonInteractive);
+    }
+
+    let mut terminal = ratatui::init();
+    let mut selected = Choice::ChatGpt;
+
+    let outcome = 'outer: loop {
+        if terminal.draw(|f| render_choice_screen(f, selected)).is_err() {
+            break 'outer Err(OnboardingError::Auth("failed to draw the terminal".to_string()));
+        }
+        let event = match ratatui::crossterm::event::read() {
+            Ok(e) => e,
+            Err(_) => break 'outer Err(OnboardingError::Auth("failed to read a key".to_string())),
+        };
+        let ratatui::crossterm::event::Event::Key(key) = event else {
+            continue;
+        };
+
+        match apply_choice_key(key) {
+            ChoiceAction::Continue => continue,
+            ChoiceAction::Toggle => {
+                selected = selected.toggled();
+                continue;
+            }
+            ChoiceAction::Quit => break 'outer Err(OnboardingError::Cancelled),
+            ChoiceAction::Submit => {}
+        }
+
+        match selected {
+            Choice::ChatGpt => {
+                // Leave the alternate screen before calling into the
+                // existing OAuth flow: `login::run` prints the
+                // authorize-in-your-browser URL via `eprintln!` and opens
+                // a browser, neither of which should happen while the TUI
+                // owns the terminal.
+                ratatui::restore();
+                let result = polaris_auth::login::run(polaris_auth::ISSUER, auth_store_path).await;
+                terminal = ratatui::init();
+                match result {
+                    Ok(_) => break 'outer Ok(Outcome::CodexLoggedIn),
+                    Err(e) => {
+                        // Stay on the choice screen and let the user try
+                        // again rather than exiting the whole process over
+                        // one failed sign-in attempt (e.g. the user closed
+                        // the browser tab without authorizing).
+                        if terminal
+                            .draw(|f| {
+                                let area = f.area();
+                                f.render_widget(
+                                    ratatui::widgets::Paragraph::new(format!("sign-in failed: {e}\n\npress any key to try again")),
+                                    area,
+                                )
+                            })
+                            .is_err()
+                        {
+                            break 'outer Err(OnboardingError::Auth(e.to_string()));
+                        }
+                        let _ = ratatui::crossterm::event::read();
+                        continue;
+                    }
+                }
+            }
+            Choice::ApiKey => {
+                let mut typed = String::new();
+                let key = 'entry: loop {
+                    if terminal.draw(|f| render_api_key_prompt(f, typed.len())).is_err() {
+                        break 'outer Err(OnboardingError::Auth("failed to draw the terminal".to_string()));
+                    }
+                    let event = match ratatui::crossterm::event::read() {
+                        Ok(e) => e,
+                        Err(_) => break 'outer Err(OnboardingError::Auth("failed to read a key".to_string())),
+                    };
+                    let ratatui::crossterm::event::Event::Key(key_event) = event else {
+                        continue;
+                    };
+                    match apply_key_entry_key(&mut typed, key_event) {
+                        KeyEntryAction::Continue => continue,
+                        KeyEntryAction::Quit => break 'outer Err(OnboardingError::Cancelled),
+                        KeyEntryAction::Submit(key) => break 'entry key,
+                    }
+                };
+                match polaris_auth::api_key::save_to(api_key_path, &key) {
+                    Ok(()) => break 'outer Ok(Outcome::ApiKeySaved),
+                    Err(e) => break 'outer Err(OnboardingError::Auth(e.to_string())),
+                }
+            }
+        }
+    };
+
+    ratatui::restore();
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +354,20 @@ mod tests {
         let mut buffer = "partial".to_string();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(apply_key_entry_key(&mut buffer, ctrl_c), KeyEntryAction::Quit));
+    }
+
+    #[tokio::test]
+    async fn a_non_interactive_terminal_is_refused_immediately() {
+        // This test process's own stdin/stdout are not a real TTY under
+        // `cargo test`, so `run()` must hit its own guard and return
+        // NonInteractive rather than trying to draw anything or hang.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let auth_path = dir.path().join("auth.json");
+        let key_path = dir.path().join("api_key.json");
+
+        let err = run(&auth_path, &key_path)
+            .await
+            .expect_err("a non-interactive terminal must be refused");
+        assert!(matches!(err, OnboardingError::NonInteractive));
     }
 }

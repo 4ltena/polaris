@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+polaris-auth = { path = "../polaris-auth" }
 polaris-core = { path = "../polaris-core" }
 polaris-provider = { path = "../polaris-provider" }
 polaris-sandbox = { path = "../polaris-sandbox" }
@@ -15,3 +16,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true }

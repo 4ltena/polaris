@@ -12,6 +12,8 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,20 +31,74 @@ impl Choice {
     }
 }
 
+/// One numbered, two-line option: a marker + title row (highlighted when
+/// selected) and a dim subtitle row underneath, mirroring the layout of
+/// codex's own first-run screen without reusing its wording.
+fn option_lines(
+    number: u8,
+    choice: Choice,
+    selected: Choice,
+    title: &str,
+    subtitle: &str,
+) -> [Line<'static>; 2] {
+    let is_selected = choice == selected;
+    let marker = if is_selected { "> " } else { "  " };
+    let title_style = if is_selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    [
+        Line::from(vec![
+            Span::raw(marker),
+            Span::styled(format!("{number}. {title}"), title_style),
+        ]),
+        Line::styled(
+            format!("     {subtitle}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
 pub fn render_choice_screen(frame: &mut Frame, selected: Choice) {
     let area = frame.area();
-    let marker = |c: Choice| if c == selected { ">" } else { " " };
-    let text = format!(
-        "polaris — a minimal-context coding agent harness\n\n\
-         Sign in to continue.\n\n\
-         {} 1. Sign in with ChatGPT\n\
-         {} 2. Provide an OpenAI API key\n\n\
-         Use \u{2191}/\u{2193} or 1/2, then Enter.",
-        marker(Choice::ChatGpt),
-        marker(Choice::ApiKey),
-    );
+
+    let mut lines = vec![
+        Line::styled(
+            "Welcome to polaris, an improved harness built on codex",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::from("Sign in with ChatGPT to use polaris with your ChatGPT"),
+        Line::from("subscription, or provide your own OpenAI API key for"),
+        Line::from("usage-based billing."),
+        Line::from(""),
+    ];
+    lines.extend(option_lines(
+        1,
+        Choice::ChatGpt,
+        selected,
+        "Sign in with ChatGPT",
+        "Uses your existing ChatGPT Plus, Pro, Business, or Enterprise plan",
+    ));
+    lines.push(Line::from(""));
+    lines.extend(option_lines(
+        2,
+        Choice::ApiKey,
+        selected,
+        "Provide your own API key",
+        "Pay for what you use",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "\u{2191}/\u{2193} or 1/2 to choose, Enter to continue",
+    ));
+
     frame.render_widget(
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("polaris")),
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title("polaris")),
         area,
     );
 }
@@ -284,7 +340,7 @@ mod tests {
 
     #[test]
     fn the_choice_screen_marks_the_selected_option() {
-        let backend = TestBackend::new(60, 12);
+        let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|f| render_choice_screen(f, Choice::ChatGpt))
@@ -297,8 +353,42 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
+        assert!(content.contains("Welcome to polaris"));
         assert!(content.contains("Sign in with ChatGPT"));
-        assert!(content.contains("Provide an OpenAI API key"));
+        assert!(content.contains("Provide your own API key"));
+        assert!(content.contains("Pay for what you use"));
+    }
+
+    #[test]
+    fn the_choice_screen_highlights_whichever_option_is_selected() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_choice_screen(f, Choice::ApiKey))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let find_row = |needle: &str| {
+            for y in 0..buffer.area.height {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                if let Some(x) = row.find(needle) {
+                    return Some(buffer[(x as u16, y)].fg);
+                }
+            }
+            None
+        };
+        assert_eq!(
+            find_row("2. Provide your own API key"),
+            Some(Color::Cyan),
+            "the selected option's marker column should be highlighted"
+        );
+        assert_ne!(
+            find_row("1. Sign in with ChatGPT"),
+            Some(Color::Cyan),
+            "the unselected option should not be highlighted"
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 polaris-core = { path = "../polaris-core" }
 polaris-provider = { path = "../polaris-provider" }
+polaris-sandbox = { path = "../polaris-sandbox" }
+polaris-skills = { path = "../polaris-skills" }
 ratatui = { workspace = true }
 serde_json = { workspace = true }
 

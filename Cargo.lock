@@ -1197,6 +1197,8 @@ version = "0.1.0"
 dependencies = [
  "polaris-core",
  "polaris-provider",
+ "polaris-sandbox",
+ "polaris-skills",
  "ratatui",
  "serde_json",
  "tempfile",

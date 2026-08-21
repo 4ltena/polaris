@@ -5,7 +5,7 @@
 use polaris_core::approval::{Approver, Decision};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEventKind};
 
 use crate::render::render_approval_modal;
 
@@ -21,7 +21,9 @@ pub struct CrosstermKeyReader;
 impl KeyReader for CrosstermKeyReader {
     fn read_key(&mut self) -> std::io::Result<KeyCode> {
         loop {
-            if let ratatui::crossterm::event::Event::Key(k) = ratatui::crossterm::event::read()? {
+            if let ratatui::crossterm::event::Event::Key(k) = ratatui::crossterm::event::read()?
+                && k.kind == KeyEventKind::Press
+            {
                 return Ok(k.code);
             }
         }

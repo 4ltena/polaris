@@ -26,6 +26,40 @@ pub fn resolve_root(start: &Path) -> PathBuf {
     }
 }
 
+/// Builds a deterministic project identifier from a canonicalized path.
+///
+/// We don't use the standard library's `DefaultHasher`, since it doesn't
+/// specify its algorithm and can change across Rust versions (which would
+/// split the same project's audit log into a different directory). We
+/// write out FNV-1a directly instead, to pin the algorithm.
+pub fn project_id(canonical_path: &Path) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in canonical_path.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// The project's state directory: `~/.polaris/state/<project-id>/`, created
+/// if missing. `<project-id>` is derived from the resolved project root
+/// (`resolve_root`), not the working directory — see `project_id`'s docs on
+/// why launch location must not split a project's state across directories.
+pub fn state_dir(cwd: &Path) -> std::io::Result<PathBuf> {
+    let root = resolve_root(cwd);
+    let id = project_id(&root);
+
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set")
+    })?;
+    let dir = Path::new(&home).join(".polaris").join("state").join(id);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +120,19 @@ mod tests {
             resolve_root(&deep),
             deep.canonicalize().expect("canonicalize")
         );
+    }
+
+    #[test]
+    fn project_id_is_deterministic_for_the_same_path() {
+        let a = project_id(Path::new("/w/polaris"));
+        let b = project_id(Path::new("/w/polaris"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn project_id_differs_for_different_paths() {
+        let a = project_id(Path::new("/w/polaris"));
+        let b = project_id(Path::new("/w/other"));
+        assert_ne!(a, b);
     }
 }

@@ -17,6 +17,23 @@ pub enum Status {
     Error(String),
 }
 
+/// Replace ASCII control characters that could smuggle terminal escape /
+/// OSC sequences (most importantly ESC, 0x1B) into the real terminal once
+/// this renders through crossterm. `\n` and `\t` are left alone since they
+/// don't start escape sequences and are needed for readable text; every
+/// other C0 control character (0x00-0x1F) and DEL (0x7F) is replaced with
+/// the Unicode replacement character so the presence of hidden bytes is
+/// still visible rather than silently dropped.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
 fn label(role: Role) -> &'static str {
     match role {
         Role::User => "you",
@@ -30,7 +47,7 @@ fn history_lines(session: &Session) -> Vec<Line<'static>> {
         .messages
         .iter()
         .filter(|m: &&Message| !matches!(m.role, Role::Tool))
-        .map(|m| Line::from(format!("{}: {}", label(m.role), m.content)))
+        .map(|m| Line::from(format!("{}: {}", label(m.role), sanitize(&m.content))))
         .collect()
 }
 
@@ -70,14 +87,17 @@ pub fn render_chat(frame: &mut Frame, session: &Session, input: &str, status: &S
     frame.render_widget(Paragraph::new(status_text), status_area);
 
     frame.render_widget(
-        Paragraph::new(input).block(Block::default().borders(Borders::ALL).title("input")),
+        Paragraph::new(sanitize(input)).block(Block::default().borders(Borders::ALL).title("input")),
         input_area,
     );
 }
 
 pub fn render_approval_modal(frame: &mut Frame, reason: &str) {
     let area = frame.area();
-    let text = format!("Approval required: {reason}\n\n[y] allow   [n] deny");
+    let text = format!(
+        "Approval required: {}\n\n[y] allow   [n] deny",
+        sanitize(reason)
+    );
     frame.render_widget(
         Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("approve?")),
         area,
@@ -148,5 +168,64 @@ mod tests {
 
         let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
         assert!(content.contains("writing to src/main.rs"));
+    }
+
+    #[test]
+    fn a_message_with_a_raw_escape_byte_does_not_reach_the_terminal_buffer() {
+        let mut session = Session::default();
+        session.push_assistant("\x1b[31mfake red\x1b[0m");
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &Status::Idle))
+            .expect("draw");
+
+        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(!content.chars().any(|c| c == '\u{1b}'));
+        // The rest of the text should still be visible, just with the
+        // control bytes neutralized rather than the whole message dropped.
+        assert!(content.contains("fake red"));
+    }
+
+    #[test]
+    fn ordinary_text_renders_unaffected_by_sanitization() {
+        let mut session = Session::default();
+        session.push_user("plain ascii and 日本語 text, nothing weird here.");
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &Status::Idle))
+            .expect("draw");
+
+        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(content.contains("plain ascii and"));
+        assert!(content.contains("nothing weird here."));
+    }
+
+    #[test]
+    fn an_approval_reason_with_a_control_character_is_sanitized() {
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_approval_modal(f, "writing to \x1b]0;pwned\x07src/main.rs"))
+            .expect("draw");
+
+        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(!content.chars().any(|c| c == '\u{1b}'));
+        assert!(content.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn sanitize_replaces_c0_controls_and_del_but_keeps_newline_and_tab() {
+        let input = "a\x00b\x1bc\x7fd\ne\tf";
+        let sanitized = sanitize(input);
+        assert!(!sanitized.contains('\u{0}'));
+        assert!(!sanitized.contains('\u{1b}'));
+        assert!(!sanitized.contains('\u{7f}'));
+        assert!(sanitized.contains('\n'));
+        assert!(sanitized.contains('\t'));
+        assert_eq!(sanitized, "a\u{fffd}b\u{fffd}c\u{fffd}d\ne\tf");
     }
 }

@@ -89,10 +89,23 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolSpec>,
 }
 
+/// Token usage reported by a single provider response. `None` on
+/// `CompletionResponse` means the provider's response didn't carry a
+/// usable `usage` field — never a hard error, since this is a
+/// after-the-fact report, not something the agent loop depends on to
+/// function.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CompletionResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,6 +179,7 @@ mod tests {
                     name: "read".into(),
                     arguments: serde_json::json!({ "path": "src/main.rs" }),
                 }],
+                usage: None,
             },
         });
         let res = p

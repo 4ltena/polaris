@@ -437,10 +437,12 @@ mod tests {
                         name: "read".into(),
                         arguments: serde_json::json!({ "path": target.to_str().unwrap() }),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "it was 1 line".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -493,6 +495,7 @@ mod tests {
                 name: "read".into(),
                 arguments: serde_json::json!({ "path": "/home/u/.ssh/id_rsa" }),
             }],
+            ..Default::default()
         };
         let ok_call = || CompletionResponse {
             text: String::new(),
@@ -501,6 +504,7 @@ mod tests {
                 name: "read".into(),
                 arguments: serde_json::json!({ "path": target.to_str().unwrap() }),
             }],
+            ..Default::default()
         };
 
         let p = Scripted {
@@ -513,6 +517,7 @@ mod tests {
                 CompletionResponse {
                     text: "done".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -554,6 +559,7 @@ mod tests {
                 name: "read".into(),
                 arguments: serde_json::json!({ "path": "/home/u/.ssh/id_rsa" }),
             }],
+            ..Default::default()
         };
         let p = Scripted {
             replies: Mutex::new(vec![call(), call(), call()]),
@@ -608,10 +614,12 @@ mod tests {
                         name: "skill".into(),
                         arguments: serde_json::json!({ "q": "demo" }),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "read it".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -672,10 +680,12 @@ mod tests {
                         name: "skill".into(),
                         arguments: serde_json::json!({ "q": "something" }),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "got it".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -806,10 +816,12 @@ print("wrote")
                         name: "write".into(),
                         arguments: serde_json::Value::Object(args),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "wrote it".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -884,10 +896,12 @@ print("wrote")
                             "content": "body"
                         }),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "I'll write elsewhere instead".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -992,10 +1006,12 @@ print("wrote")
                             "content": "tampered"
                         }),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "elsewhere".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -1142,10 +1158,12 @@ print("wrote")
                             "new": "tampered"
                         }),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "elsewhere".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -1269,10 +1287,12 @@ print("wrote")
                             )
                         }),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "done".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -1374,10 +1394,12 @@ print("wrote")
                             "content": "body"
                         }),
                     }],
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "wrote it".into(),
                     tool_calls: vec![],
+                    ..Default::default()
                 },
             ]),
         };

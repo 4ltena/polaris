@@ -108,10 +108,18 @@ fn the_normal_path_without_a_prompt_refuses_the_tui_on_a_non_interactive_termina
 /// unset, still takes the openai path as before. Scolding about the
 /// missing key in openai's own words confirms it hasn't strayed onto the
 /// codex path.
+///
+/// `HOME` is pointed at a temp directory and `POLARIS_BASE_URL` at an
+/// unreachable address so that a developer machine with a real saved key
+/// under `~/.polaris/api_key.json` can never make this test resolve a
+/// real key and send a real, billed request to the OpenAI API.
 #[test]
 fn the_default_provider_is_still_openai() {
+    let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .args(["-p", "x"])
+        .env("HOME", home.path())
+        .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
         .output()
@@ -167,5 +175,66 @@ fn an_unknown_provider_name_fails_fast() {
     assert!(
         stderr.contains("nonesuch"),
         "did not print the name: {stderr}"
+    );
+}
+
+/// The api_key.json fallback: with no POLARIS_API_KEY env var but a
+/// previously-saved key file, one-shot mode should succeed in building
+/// the provider (it will still fail later when the fake key is rejected
+/// by a real network call, but that's not what this test checks — it
+/// only checks that key *resolution* used the file instead of failing at
+/// "POLARIS_API_KEY is not set").
+#[test]
+fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
+    let home = tempfile::tempdir().expect("temp directory");
+    let key_path = home.path().join(".polaris").join("api_key.json");
+    std::fs::create_dir_all(key_path.parent().unwrap()).expect("mkdir");
+    std::fs::write(&key_path, r#"{"key":"sk-from-file"}"#).expect("write key file");
+
+    let out = Command::new(bin())
+        .args(["-p", "x"])
+        .env("HOME", home.path())
+        .env_remove("POLARIS_PROVIDER")
+        .env_remove("POLARIS_API_KEY")
+        .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
+        .output()
+        .expect("could not launch");
+
+    // It must NOT fail with the "not set" message — it should get past
+    // key resolution and fail later (e.g. a connection error to the
+    // deliberately-unreachable base URL), proving the file was read.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("POLARIS_API_KEY is not set"),
+        "did not use the saved key file: {stderr}"
+    );
+}
+
+/// TUI mode with no API key anywhere (env, file) must actually reach
+/// onboarding's own code path, not just fail with the old
+/// "POLARIS_API_KEY is not set" message. We can't complete onboarding
+/// without a real terminal, but we CAN prove the code path was reached:
+/// onboarding's own non-interactive-terminal guard fires with a distinct
+/// message from the chat loop's own guard, so seeing THAT specific
+/// message (not the chat loop's "refusing to start the TUI...") proves
+/// main.rs's onboarding wiring was actually exercised, not skipped.
+#[test]
+fn tui_mode_with_no_key_anywhere_reaches_onboarding() {
+    let home = tempfile::tempdir().expect("temp directory");
+    let out = Command::new(bin())
+        .env("HOME", home.path())
+        .env_remove("POLARIS_PROVIDER")
+        .env_remove("POLARIS_API_KEY")
+        .output()
+        .expect("could not launch");
+
+    assert!(
+        !out.status.success(),
+        "succeeded with no credentials at all"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to start onboarding"),
+        "did not reach onboarding's own guard (got the chat loop's guard instead, or something else): {stderr}"
     );
 }

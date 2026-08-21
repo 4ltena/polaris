@@ -163,10 +163,7 @@ fn history_lines(session: &Session) -> Vec<Line<'static>> {
                     sanitized
                         .split('\n')
                         .map(|line| {
-                            Line::from(Span::styled(
-                                line.to_string(),
-                                Style::default().fg(color),
-                            ))
+                            Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
                         })
                         .collect()
                 }
@@ -278,7 +275,8 @@ pub fn render_chat(
     frame.render_widget(Paragraph::new(sanitize(&status_text)), status_area);
 
     frame.render_widget(
-        Paragraph::new(sanitize(input)).block(Block::default().borders(Borders::ALL).title("input")),
+        Paragraph::new(sanitize(input))
+            .block(Block::default().borders(Borders::ALL).title("input")),
         input_area,
     );
 }
@@ -318,7 +316,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("you"));
         assert!(content.contains("Cargo.toml"));
     }
@@ -337,7 +341,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Thinking, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("thinking"));
     }
 
@@ -359,7 +369,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("message number 29"));
         assert!(!content.contains("message number 0 "));
     }
@@ -372,7 +388,13 @@ mod tests {
             .draw(|f| render_approval_modal(f, "writing to src/main.rs"))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("writing to src/main.rs"));
     }
 
@@ -392,7 +414,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         // The rest of the text should still be visible, just with the
         // control bytes neutralized rather than the whole message dropped.
@@ -423,7 +451,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         // The rest of the text should still be visible, just with the
         // control bytes neutralized rather than the whole tool result
@@ -447,7 +481,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("plain ascii and"));
         assert!(content.contains("nothing weird here."));
     }
@@ -460,7 +500,13 @@ mod tests {
             .draw(|f| render_approval_modal(f, "writing to \x1b]0;pwned\x07src/main.rs"))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         assert!(content.contains("src/main.rs"));
     }
@@ -481,7 +527,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &status, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         assert!(content.contains("error: "));
         assert!(content.contains("fake"));
@@ -540,7 +592,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("openai"));
         assert!(content.contains("gpt-5.4"));
         assert!(content.contains("140"));
@@ -572,9 +630,21 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(content.contains("read"), "the tool name should appear: {content}");
-        assert!(content.contains("hello"), "the tool result should appear: {content}");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            content.contains("read"),
+            "the tool name should appear: {content}"
+        );
+        assert!(
+            content.contains("hello"),
+            "the tool result should appear: {content}"
+        );
     }
 
     #[test]
@@ -649,7 +719,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         // The full 500-character body must not appear verbatim; only a
         // prefix of it should.
         assert!(!content.contains(&long_body));
@@ -674,13 +750,19 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let bold_cell = (0..buffer.area.width)
             .flat_map(|x| (0..buffer.area.height).map(move |y| (x, y)))
-            .find(|&(x, y)| buffer[(x, y)].symbol() == "b" && {
-                let row: String = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect();
-                row.contains("bold")
+            .find(|&(x, y)| {
+                buffer[(x, y)].symbol() == "b" && {
+                    let row: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    row.contains("bold")
+                }
             });
         let (x, y) = bold_cell.expect("the word 'bold' should appear somewhere");
         assert!(
-            buffer[(x, y)].modifier.contains(ratatui::style::Modifier::BOLD),
+            buffer[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD),
             "the 'b' in 'bold' should carry the BOLD modifier"
         );
     }
@@ -701,7 +783,13 @@ mod tests {
             .draw(|f| render_chat(f, &session, "", &Status::Idle, &header))
             .expect("draw");
 
-        let content = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(content.contains("cargo test"));
         assert!(!content.contains('`'));
     }
@@ -726,7 +814,9 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let find_row_color = |needle: &str| {
             for y in 0..buffer.area.height {
-                let row: String = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect();
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
                 if row.contains(needle) {
                     return buffer[(0, y)].fg;
                 }

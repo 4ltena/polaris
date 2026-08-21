@@ -163,8 +163,16 @@ POLARIS_PROVIDER=codex polaris -p "Cargo.toml は何行か"
 polaris
 ```
 
+プロバイダの資格情報が無い状態で対話TUIを起動すると、資格情報が無いままエラーで終了する代わりに、
+ChatGPTでサインインするかOpenAI APIキーを入力するかを選ぶ画面が出る
+(`POLARIS_PROVIDER` が `openai`、つまり未設定のデフォルトの場合のみ。`codex` を明示した場合はこの画面には入らず、
+従来通りの資格情報エラーになる)。APIキーは
+`~/.polaris/api_key.json` に0600で保存され、次回以降は環境変数無しで使われる
+(`~/.polaris/auth.json` とは別ファイルで、既存のcodexログイン情報には触れない)。
+この画面は対話TUI起動時のみで、一発実行(`polaris -p "..."`)では従来通り即エラーになる。
+
 事前にプロバイダの設定が必要である。`openai` なら `POLARIS_API_KEY`、`codex` なら
-`polaris login` を済ませておくこと。プロバイダが未設定のまま `polaris` を実行すると、
+`polaris login` を済ませておくこと。プロバイダが未設定のまま `polaris -p` を実行すると、
 旧来の「--prompt is required」ではなくプロバイダのエラーで失敗する。
 
 会話は `~/.polaris/state/<project-id>/tui-session.jsonl` に1メッセージ1行で保存され、
@@ -194,6 +202,13 @@ polaris
 自動テストは実端末を必要とする部分(画面描画・キー入力そのもの)を確認できない。
 `polaris` を実行し、以下を目視で確認する。
 
+- `POLARIS_API_KEY`/`~/.polaris/api_key.json`/`~/.polaris/auth.json` いずれも無い状態で `polaris` を実行すると、選択画面が出ること
+- ↑/↓および1/2キーで選択が切り替わり、Enterで確定できること
+- 「OpenAI APIキーを入力」を選ぶと入力欄が出て、入力した文字が伏字(`*`)で表示され、
+  Enterで確定した後そのまま対話が始まること(再実行不要)。終了後 `~/.polaris/api_key.json` が
+  作られていること
+- 「ChatGPTでサインイン」を選ぶとブラウザが開き、認可完了後そのまま対話が始まること
+  (`polaris login` と同じ経路であることの確認)
 - 会話履歴と入力欄が表示され、文字入力・Backspace・Enterで送信できる
 - 送信後 `thinking...` の表示を経て応答が履歴に追加される
 - 書き込みを伴う指示(例:「test.txtというファイルを作って」)で承認モーダルが出て、

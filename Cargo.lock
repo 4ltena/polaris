@@ -1195,6 +1195,7 @@ dependencies = [
 name = "polaris-tui"
 version = "0.1.0"
 dependencies = [
+ "polaris-auth",
  "polaris-core",
  "polaris-provider",
  "polaris-sandbox",
@@ -1202,6 +1203,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

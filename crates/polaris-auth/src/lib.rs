@@ -11,6 +11,7 @@
 //! become invalid. Keeping an independent store makes this accident
 //! impossible in principle.
 
+pub mod api_key;
 pub mod login;
 pub mod pkce;
 pub mod store;

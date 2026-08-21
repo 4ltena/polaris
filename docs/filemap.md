@@ -22,6 +22,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-auth/src`
 
+- `api_key.rs` — Storage for a plain OpenAI API key at `~/.polaris/api_key.json`.
 - `lib.rs` — Lifecycle of ChatGPT subscription auth (OAuth) and storage of credentials.
 - `login.rs` — Building the authorization URL, and receiving the callback exactly once.
 - `pkce.rs` — PKCE (RFC 7636) verifier and challenge.

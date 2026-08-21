@@ -80,18 +80,27 @@ fn logout_never_touches_the_codex_store() {
     );
 }
 
-/// The normal path still requires `--prompt`. Making it optional must not
-/// let a run with no instruction start silently. This is the counterpart
-/// to the three tests above — without it, an implementation that ignores
-/// prompt entirely would pass.
+/// Omitting `--prompt` no longer fails at argument parsing: it now means
+/// "enter the TUI" (see `polaris_tui::run`). Under the test harness,
+/// stdout/stdin are not a real terminal, so the TUI path's own
+/// non-interactive guard refuses to start instead of hanging — this must
+/// not silently succeed, and it must not be confused with the old
+/// "--prompt is required" error (which no longer exists).
 #[test]
-fn the_normal_path_still_requires_a_prompt() {
-    let out = Command::new(bin()).output().expect("could not launch");
+fn the_normal_path_without_a_prompt_refuses_the_tui_on_a_non_interactive_terminal() {
+    // Provider construction now runs unconditionally, even without a
+    // prompt, so a real key must be present or the process would fail
+    // there instead of reaching the TUI's own guard.
+    let out = Command::new(bin())
+        .env("POLARIS_PROVIDER", "openai")
+        .env("POLARIS_API_KEY", "sk-test-not-a-real-key")
+        .output()
+        .expect("could not launch");
     assert!(!out.status.success(), "succeeded with no instruction");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("prompt"),
-        "does not say what's missing: {stderr}"
+        stderr.contains("non-interactive"),
+        "does not say why it refused to start: {stderr}"
     );
 }
 

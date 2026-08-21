@@ -2,3 +2,4 @@
 //! is omitted.
 
 pub mod persist;
+pub mod render;

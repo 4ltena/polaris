@@ -80,7 +80,19 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
 
     let exit_code = 'outer: loop {
         if terminal
-            .draw(|f| render_chat(f, &session, &input_buffer, &status))
+            .draw(|f| {
+                render_chat(
+                    f,
+                    &session,
+                    &input_buffer,
+                    &status,
+                    &render::HeaderInfo {
+                        provider_name: &args.provider_name,
+                        model_name: &args.model_name,
+                        usage: cumulative_usage,
+                    },
+                )
+            })
             .is_err()
         {
             break ExitCode::FAILURE;
@@ -110,7 +122,19 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
 
         status = Status::Thinking;
         if terminal
-            .draw(|f| render_chat(f, &session, &input_buffer, &status))
+            .draw(|f| {
+                render_chat(
+                    f,
+                    &session,
+                    &input_buffer,
+                    &status,
+                    &render::HeaderInfo {
+                        provider_name: &args.provider_name,
+                        model_name: &args.model_name,
+                        usage: cumulative_usage,
+                    },
+                )
+            })
             .is_err()
         {
             break ExitCode::FAILURE;

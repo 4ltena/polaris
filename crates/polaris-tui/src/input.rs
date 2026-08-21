@@ -2,7 +2,7 @@
 //! `run()` so the editing rules (what Enter/Backspace/Ctrl-C do) are
 //! testable without a real terminal.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 pub enum InputAction {
     Continue,
@@ -12,7 +12,16 @@ pub enum InputAction {
 
 /// Applies one key event to the input buffer, returning what the caller
 /// should do next. Mutates `buffer` in place for `Char`/`Backspace`.
+///
+/// On Windows consoles, and with the kitty keyboard protocol on some Unix
+/// terminals, crossterm can deliver both a Press and a Release event for
+/// the same physical keystroke. Only Press is acted on here, or every
+/// typed character would double and Enter would submit twice.
 pub fn apply_key(buffer: &mut String, key: KeyEvent) -> InputAction {
+    if key.kind != KeyEventKind::Press {
+        return InputAction::Continue;
+    }
+
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return InputAction::Quit;
     }
@@ -37,7 +46,6 @@ pub fn apply_key(buffer: &mut String, key: KeyEvent) -> InputAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::crossterm::event::KeyEventKind;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -77,8 +85,23 @@ mod tests {
         assert!(matches!(action, InputAction::Quit));
     }
 
-    // Silence an unused-import warning if KeyEventKind isn't otherwise
-    // referenced by this ratatui version's KeyEvent::new.
-    #[allow(dead_code)]
-    fn _unused(_: KeyEventKind) {}
+    #[test]
+    fn a_key_release_event_is_ignored() {
+        let mut buffer = String::new();
+        let mut release = key(KeyCode::Char('h'));
+        release.kind = KeyEventKind::Release;
+        let action = apply_key(&mut buffer, release);
+        assert!(buffer.is_empty());
+        assert!(matches!(action, InputAction::Continue));
+    }
+
+    #[test]
+    fn a_key_repeat_event_is_ignored() {
+        let mut buffer = String::new();
+        let mut repeat = key(KeyCode::Char('h'));
+        repeat.kind = KeyEventKind::Repeat;
+        let action = apply_key(&mut buffer, repeat);
+        assert!(buffer.is_empty());
+        assert!(matches!(action, InputAction::Continue));
+    }
 }

@@ -47,7 +47,26 @@ fn history_lines(session: &Session) -> Vec<Line<'static>> {
         .messages
         .iter()
         .filter(|m: &&Message| !matches!(m.role, Role::Tool))
-        .map(|m| Line::from(format!("{}: {}", label(m.role), sanitize(&m.content))))
+        .flat_map(|m| {
+            let sanitized = sanitize(&m.content);
+            // `Line` doesn't split on embedded '\n' the way `Paragraph::new(String)`
+            // does, so a multi-paragraph reply must be turned into one `Line` per
+            // physical line here or it collapses onto a single clipped row. The
+            // "{label}: " prefix only goes on the first line of each message so it
+            // doesn't repeat on every continuation line.
+            let prefix = format!("{}: ", label(m.role));
+            sanitized
+                .split('\n')
+                .enumerate()
+                .map(|(i, line)| {
+                    if i == 0 {
+                        Line::from(format!("{prefix}{line}"))
+                    } else {
+                        Line::from(line.to_string())
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -232,6 +251,35 @@ mod tests {
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         assert!(content.contains("error: "));
         assert!(content.contains("fake"));
+    }
+
+    #[test]
+    fn a_multi_line_reply_renders_as_multiple_lines_not_one_clipped_line() {
+        let mut session = Session::default();
+        session.push_assistant("first paragraph\nsecond paragraph\nthird paragraph");
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_chat(f, &session, "", &Status::Idle))
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        // Every physical line of the message must land on its own row of
+        // the rendered buffer, not be squashed onto a single row.
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(rows.iter().any(|r| r.contains("polaris: first paragraph")));
+        assert!(rows.iter().any(|r| r.contains("second paragraph")));
+        assert!(rows.iter().any(|r| r.contains("third paragraph")));
+        // The label prefix should not repeat on continuation lines.
+        assert!(!rows.iter().any(|r| r.contains("polaris: second paragraph")));
     }
 
     #[test]

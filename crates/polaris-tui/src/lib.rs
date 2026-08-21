@@ -61,7 +61,6 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         }
     };
 
-    let mut terminal = ratatui::init();
     if truncated {
         eprintln!(
             "warning: {} had a corrupt line; resumed from the messages before it",
@@ -69,9 +68,12 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         );
     }
 
+    let mut terminal = ratatui::init();
+
     let mut input_buffer = String::new();
     let mut status = Status::Idle;
     let mut key_reader = CrosstermKeyReader;
+    let mut fatal_message: Option<String> = None;
 
     let exit_code = 'outer: loop {
         if terminal
@@ -97,8 +99,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         };
 
         session.push_user(&text);
+        let checkpoint = session.messages.len();
         if let Err(e) = persist::append_message(&session_path, session.messages.last().expect("just pushed")) {
-            eprintln!("Can't persist the message: {e}");
+            fatal_message = Some(format!("Can't persist the message: {e}"));
             break 'outer ExitCode::FAILURE;
         }
 
@@ -139,16 +142,28 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 if let Some(reply) = session.messages.last()
                     && let Err(e) = persist::append_message(&session_path, reply)
                 {
-                    eprintln!("Can't persist the reply: {e}");
+                    fatal_message = Some(format!("Can't persist the reply: {e}"));
                     break 'outer ExitCode::FAILURE;
                 }
             }
             Err(e) => {
+                // The agent loop can return after recording an assistant
+                // message with tool_calls but before every matching
+                // tool-result message is pushed (see AgentError::Stopped /
+                // AgentError::Io in polaris_core::agent::run). Re-sending
+                // that unbalanced tail to the provider on the next turn
+                // would be rejected every time, so roll `session.messages`
+                // back to right after the user's message — the only state
+                // that was ever actually persisted for this turn.
+                session.messages.truncate(checkpoint);
                 status = Status::Error(e.to_string());
             }
         }
     };
 
     ratatui::restore();
+    if let Some(msg) = fatal_message {
+        eprintln!("{msg}");
+    }
     exit_code
 }

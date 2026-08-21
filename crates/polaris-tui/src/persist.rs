@@ -1,8 +1,23 @@
 //! Session persistence: one JSON `Message` per line.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::Path;
+
+/// Splits raw file bytes into lines, keeping the newline convention of
+/// `BufRead::lines()` (split on `\n`, trailing `\r` trimmed) but without
+/// its UTF-8-or-bust behavior: a line with invalid UTF-8 bytes is decoded
+/// lossily rather than propagating an `InvalidData` error out of the
+/// caller.
+fn read_lines_lossy(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|&b| b == b'\n')
+        .map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            String::from_utf8_lossy(line).into_owned()
+        })
+        .collect()
+}
 
 use polaris_core::session::Session;
 use polaris_provider::Message;
@@ -14,16 +29,18 @@ use polaris_provider::Message;
 /// loads as an empty session, not an error — there is nothing to resume
 /// yet on first run.
 pub fn load_session(path: &Path) -> io::Result<(Session, bool)> {
-    let file = match File::open(path) {
-        Ok(f) => f,
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Session::default(), false)),
         Err(e) => return Err(e),
     };
 
     let mut messages = Vec::new();
     let mut truncated = false;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
+    // Decoded lossily rather than via `BufRead::lines()`, which errors out
+    // of this function entirely on the first invalid-UTF-8 byte instead of
+    // going through the same corrupt-line recovery as bad JSON.
+    for line in read_lines_lossy(&bytes) {
         if line.trim().is_empty() {
             continue;
         }
@@ -89,6 +106,30 @@ mod tests {
         assert_eq!(session.messages[0].content, "hi");
         assert_eq!(session.messages[1].content, "hello");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn an_invalid_utf8_line_is_handled_like_a_corrupt_json_line_not_a_hard_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tui-session.jsonl");
+
+        append_message(&path, &Message::user("good line")).expect("append");
+        let mut file = OpenOptions::new().append(true).open(&path).expect("open");
+        // Invalid UTF-8 bytes (a lone continuation byte), not valid JSON either way.
+        file.write_all(b"\xff\xfe not valid utf-8\n").expect("write invalid utf-8 line");
+        drop(file);
+        append_message(&path, &Message::user("orphaned, after the invalid line")).expect("append");
+
+        let (session, truncated) = load_session(&path).expect("load");
+
+        assert!(truncated);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "good line");
+
+        // Reloading again must be clean now that the invalid tail was rewritten away.
+        let (reloaded, truncated_again) = load_session(&path).expect("reload");
+        assert_eq!(reloaded.messages.len(), 1);
+        assert!(!truncated_again);
     }
 
     #[test]

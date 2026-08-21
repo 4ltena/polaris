@@ -130,6 +130,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
 - `persist.rs` — Session persistence: one JSON `Message` per line.
+- `render.rs` — Pure rendering: turns a `Session` + input state into terminal cells.
 
 ## `docs`
 

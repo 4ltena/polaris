@@ -166,6 +166,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-21-polaris-tui-onboarding.md` — polaris TUI Onboarding Screen Implementation Plan
 - `2026-08-21-polaris-tui-v2.md` — polaris TUI v2 Implementation Plan
 - `2026-08-21-polaris-tui.md` — polaris TUI Implementation Plan
+- `2026-08-24-polaris-files-md-autogen.md` — polaris ディレクトリ別 files.md 自動生成 Implementation Plan
 
 ## `docs/superpowers/specs`
 

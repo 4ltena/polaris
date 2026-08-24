@@ -16,6 +16,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `README.md` — polaris
 - `rust-toolchain.toml` — pinned toolchain
 
+## `agents/file-inspector`
+
+- `SKILL.md` — SKILL.md
+
 ## `crates/polaris-auth`
 
 - `Cargo.toml` — manifest for the polaris-auth crate
@@ -59,6 +63,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `project.rs` — Resolves the project root.
 - `prompt.rs` — The single place that assembles the set of things loaded every turn.
 - `session.rs` — Message history. In M1, this is append-only — no compaction, no
+- `spawn.rs` — The `spawn` tool's implementation. Type discovery reuses
 - `stop.rs` — Stop conditions. No automatic recovery is attempted. Continuing to spin
 
 ## `crates/polaris-core/src/secret_screen`

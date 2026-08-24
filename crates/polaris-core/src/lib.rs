@@ -10,4 +10,5 @@ pub mod project;
 pub mod prompt;
 pub mod secret_screen;
 pub mod session;
+pub mod spawn;
 pub mod stop;

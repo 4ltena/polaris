@@ -70,6 +70,7 @@ pub fn all_specs() -> Vec<ToolSpec> {
         edit_spec(),
         bash_spec(),
         skill_spec(),
+        spawn_spec(),
     ]
 }
 
@@ -151,6 +152,44 @@ fn skill_spec() -> ToolSpec {
     }
 }
 
+/// The spec's call example `spawn([{type, task}, ...])` is conceptual
+/// notation. OpenAI-compatible function calling requires the top level of
+/// the schema to be an object (the same reason all five existing tools are
+/// `"type": "object"`), so the array is wrapped under a `"tasks"` key.
+fn spawn_spec() -> ToolSpec {
+    ToolSpec {
+        name: "spawn",
+        description: "Run subagents in parallel as one wave. Each runs a bounded loop and returns a schema-validated result; its steps never enter your context.",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "description": "Type name, from agents/<type>/SKILL.md."
+                            },
+                            "task": {
+                                "type": "string",
+                                "description": "What it should do."
+                            },
+                            "write_root": {
+                                "type": "string",
+                                "description": "Read-write types only: the one directory it may write."
+                            }
+                        },
+                        "required": ["type", "task"]
+                    }
+                }
+            },
+            "required": ["tasks"]
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +232,30 @@ mod tests {
         assert!(
             !param_doc.trim().is_empty(),
             "argument q's description is empty"
+        );
+    }
+
+    #[test]
+    fn spawn_spec_wraps_the_task_array_in_a_top_level_object() {
+        // The spec's `spawn([...])` notation cannot be published as-is:
+        // function calling requires a top-level object. Pin both that the
+        // top level is an object and that the array lives under `tasks`,
+        // since `agent::dispatch`'s `"spawn"` arm reads exactly that key.
+        let specs = all_specs();
+        let spawn = specs.iter().find(|s| s.name == "spawn").expect("no spawn");
+        let json = serde_json::to_value(spawn).expect("can't serialize");
+        assert_eq!(json["parameters"]["type"], "object");
+        assert_eq!(json["parameters"]["required"][0], "tasks");
+        assert_eq!(json["parameters"]["properties"]["tasks"]["type"], "array");
+        let item_required = &json["parameters"]["properties"]["tasks"]["items"]["required"];
+        assert_eq!(item_required[0], "type");
+        assert_eq!(item_required[1], "task");
+        // `write_root` is deliberately not required — it only applies to a
+        // read-write type, and demanding it of every task would make the
+        // read-only case unrepresentable.
+        assert!(
+            item_required[2].is_null(),
+            "write_root must not be required: {item_required}"
         );
     }
 

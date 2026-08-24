@@ -192,6 +192,16 @@ fn with_fullscreen_picker<T>(
     use ratatui::crossterm::execute;
     use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 
+    // Erase the inline viewport's last-drawn frame (header/status/input
+    // box, including whatever slash command was still typed when it was
+    // submitted) before switching away. Leaving it undone means it stays
+    // on the real screen buffer as ordinary scrollback — alternate-screen
+    // switching doesn't touch the main buffer — so the fresh inline
+    // viewport created below on return would be anchored right after it,
+    // making the old frame look like a permanent residue sitting directly
+    // above the new input box.
+    terminal.borrow_mut().clear()?;
+
     execute!(std::io::stdout(), EnterAlternateScreen)?;
     let fullscreen =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;

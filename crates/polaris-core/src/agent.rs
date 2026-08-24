@@ -1899,15 +1899,21 @@ print("wrote")
             .iter()
             .find(|m| m.tool_call_id.is_some())
             .expect("no tool result was pushed");
-        assert!(
-            tool_msg.content.contains(&subagent_result),
-            "the subagent's result did not reach the root: {}",
-            tool_msg.content
+        // The wave result is a JSON array with one entry per task (see
+        // `spawn::run_wave`'s docs on why it is not newline-joined text).
+        let wave: serde_json::Value = serde_json::from_str(&tool_msg.content)
+            .unwrap_or_else(|e| panic!("the wave result is not JSON: {e}: {}", tool_msg.content));
+        let entries = wave.as_array().expect("the wave result is not an array");
+        assert_eq!(entries.len(), 1, "one entry per task: {wave}");
+        assert_eq!(
+            entries[0]["type"], "file-inspector",
+            "the result is not labeled with the type that produced it: {wave}"
         );
-        assert!(
-            tool_msg.content.starts_with("file-inspector:"),
-            "the result is not labeled with the type that produced it: {}",
-            tool_msg.content
+        assert_eq!(entries[0]["ok"], true, "{wave}");
+        assert_eq!(
+            entries[0]["result"],
+            serde_json::from_str::<serde_json::Value>(&subagent_result).expect("not JSON"),
+            "the subagent's result did not reach the root: {wave}"
         );
 
         // Both callers land in the one log — the root's `spawn` call and

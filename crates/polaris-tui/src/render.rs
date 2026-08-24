@@ -132,8 +132,13 @@ fn format_tool_result(content: &str) -> String {
 
 fn role_color(role: Role) -> Color {
     match role {
-        Role::User => Color::Cyan,
-        Role::Assistant => Color::Green,
+        // The user's own input is distinguished by its full-row gray
+        // background (`HistoryLine::shaded`), not by a tinted foreground —
+        // a colored fg on top of the shading reads as two competing cues
+        // for the same thing. The assistant's replies stay on the
+        // terminal's own default foreground too, matching plain
+        // conversational text rather than a status/log color.
+        Role::User | Role::Assistant => Color::Reset,
         Role::Tool => Color::Yellow,
     }
 }
@@ -273,7 +278,16 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
                     }
                     if !m.content.is_empty() {
                         let sanitized = sanitize(&m.content);
-                        let prefix = format!("{}: ", label(m.role));
+                        // The user's own line needs no "you:" label — its
+                        // full-row gray shading already marks it as input,
+                        // the same way codex's own screen has no label on
+                        // the user's echoed line either. The assistant
+                        // keeps its "polaris:" label since its lines are
+                        // otherwise unmarked plain text.
+                        let prefix = match m.role {
+                            Role::User => String::new(),
+                            _ => format!("{}: ", label(m.role)),
+                        };
                         let mut in_code_block = false;
                         for (i, raw_line) in sanitized.split('\n').enumerate() {
                             if raw_line.trim_start().starts_with("```") {
@@ -1063,13 +1077,17 @@ mod tests {
     }
 
     #[test]
-    fn a_user_message_appears_with_its_role_label() {
+    fn a_user_message_appears_unlabeled_and_shaded() {
+        // No "you:" label — the full-row gray shading (`shaded: true`) is
+        // the only marker, matching codex's own unlabeled user line.
         let mut session = Session::default();
         session.push_user("Cargo.toml は何行か");
 
         let content = render_history_to_string(&session.messages, 60);
-        assert!(content.contains("you"));
+        assert!(!content.contains("you:"));
         assert!(content.contains("Cargo.toml"));
+        let lines = history_lines_for(&session.messages);
+        assert!(lines[0].shaded);
     }
 
     #[test]
@@ -1699,7 +1717,13 @@ mod tests {
     }
 
     #[test]
-    fn user_and_assistant_lines_use_different_colors() {
+    fn user_and_assistant_lines_are_distinguished_by_shading_not_color() {
+        // Both roles render in the terminal's own default foreground — no
+        // tinted fg competes with the user line's full-row gray background
+        // as a second, redundant "this is different" cue. The shading
+        // itself (`HistoryLine::shaded`, checked directly on the built
+        // lines rather than the rendered buffer) is what distinguishes
+        // them.
         let mut session = Session::default();
         session.push_user("hello");
         session.push_assistant("hi there");
@@ -1722,7 +1746,9 @@ mod tests {
             }
             panic!("row containing {needle:?} not found");
         };
-        assert_ne!(find_row_color("hello"), find_row_color("hi there"));
+        assert_eq!(find_row_color("hello"), find_row_color("hi there"));
+        assert!(lines.iter().any(|l| l.shaded));
+        assert!(lines.iter().any(|l| !l.shaded));
     }
 
     #[test]

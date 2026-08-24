@@ -105,6 +105,10 @@ fn label(role: Role) -> &'static str {
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
+/// How many rows one spawned subagent's task preview may claim at most,
+/// before the rest is elided with a `...` row.
+const SPAWN_TASK_PREVIEW_LINES: usize = 5;
+
 /// Turns an `AgentEvent` into lines printable the moment it arrives,
 /// mid-turn. Formatting the `diff` carried by a write/edit
 /// `ToolFinished` is Task 6's job — this ignores that field and covers
@@ -126,16 +130,44 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
             )))]
         }
         AgentEvent::SpawnStarted { agent_type, task } => {
+            // `task` is free-form, model-supplied prose (`spawn`'s
+            // `tasks[].task` argument) and is routinely multi-line, unlike
+            // a tool call's `detail`, which is compact JSON and so has its
+            // newlines escaped. `sanitize` deliberately keeps a real `\n`,
+            // and `render_history_into` reserves exactly one terminal row
+            // per `HistoryLine`, so a newline left inside one line would be
+            // written into the middle of a single-row slot. Split it.
+            //
+            // Truncated to the same preview budget as everything else here
+            // *before* splitting, which also bounds the row count; the
+            // explicit line cap then covers the pathological all-newlines
+            // case that the character budget alone would still let through.
             let preview: String = task.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
-            vec![
-                HistoryLine::plain(Line::from(Span::raw(sanitize(&format!(
-                    "⏺ Agent({agent_type}: {preview})"
-                ))))),
-                HistoryLine::plain(Line::from(Span::styled(
-                    "  Backgrounded agent",
-                    Style::default().add_modifier(Modifier::DIM),
-                ))),
-            ]
+            let sanitized = sanitize(&format!("⏺ Agent({agent_type}: {preview})"));
+            let all: Vec<&str> = sanitized.split('\n').collect();
+            let shown = all.len().min(SPAWN_TASK_PREVIEW_LINES);
+            let mut lines: Vec<HistoryLine> = all[..shown]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    // Continuation lines are indented under the first,
+                    // which carries the `⏺ Agent(...)` prefix.
+                    let text = if i == 0 {
+                        (*line).to_string()
+                    } else {
+                        format!("    {line}")
+                    };
+                    HistoryLine::plain(Line::from(Span::raw(text)))
+                })
+                .collect();
+            if all.len() > shown {
+                lines.push(HistoryLine::plain(Line::from(Span::raw("    ..."))));
+            }
+            lines.push(HistoryLine::plain(Line::from(Span::styled(
+                "  Backgrounded agent",
+                Style::default().add_modifier(Modifier::DIM),
+            ))));
+            lines
         }
         AgentEvent::SpawnFinished { agent_type, ok } => {
             let marker = if *ok { "done" } else { "failed" };
@@ -1520,6 +1552,50 @@ mod tests {
         assert!(joined.contains("Agent"));
         assert!(joined.contains("file-inspector"));
         assert!(joined.contains("Backgrounded agent"));
+    }
+
+    #[test]
+    fn a_multi_line_spawn_task_is_split_across_rows_not_left_in_one_line() {
+        // `render_history_into` reserves exactly one terminal row per
+        // `HistoryLine`, so a raw `\n` surviving inside one line would be
+        // written into the middle of a single-row slot. Every physical
+        // line of the task must get its own `HistoryLine` instead.
+        let lines = format_event_for_live_print(&AgentEvent::SpawnStarted {
+            agent_type: "file-inspector".to_string(),
+            task: "first line\nsecond line\nthird line".to_string(),
+        });
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(rows.iter().all(|r| !r.contains('\n')), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("first line")));
+        assert!(rows.iter().any(|r| r.contains("second line")));
+        assert!(rows.iter().any(|r| r.contains("third line")));
+        // The three task lines land on three distinct rows, and the
+        // "Backgrounded agent" follow-up is still its own row after them.
+        assert_eq!(rows.len(), 4);
+        assert!(rows[0].contains("⏺ Agent(file-inspector: first line"));
+        assert!(rows[3].contains("Backgrounded agent"));
+    }
+
+    #[test]
+    fn a_pathologically_multi_line_spawn_task_is_capped_at_a_few_rows() {
+        let lines = format_event_for_live_print(&AgentEvent::SpawnStarted {
+            agent_type: "file-inspector".to_string(),
+            task: "x\n".repeat(80),
+        });
+        // At most the capped task rows, one `...` elision row, and the
+        // "Backgrounded agent" row — never one row per task line.
+        assert_eq!(lines.len(), SPAWN_TASK_PREVIEW_LINES + 2);
+        let last_task_rows: String = lines[SPAWN_TASK_PREVIEW_LINES]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(last_task_rows.contains("..."));
     }
 
     #[test]

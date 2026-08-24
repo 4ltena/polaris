@@ -152,6 +152,29 @@ fn print_new_history(
     Ok(())
 }
 
+/// Prints one mid-turn `AgentEvent` straight into the terminal's own
+/// scrollback, the same one-shot way `print_new_history` prints confirmed
+/// conversation lines. Nothing is remembered about what was printed:
+/// these lines are never reprinted, and the post-turn batch print
+/// deliberately leaves tool activity out (see `render::history_lines_for`)
+/// so it can't appear twice.
+fn print_live_event(
+    terminal: &RefCell<ratatui::Terminal<impl ratatui::backend::Backend>>,
+    event: &polaris_core::AgentEvent,
+) -> std::io::Result<()> {
+    let lines = render::format_event_for_live_print(event);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let height = lines.len() as u16;
+    terminal
+        .borrow_mut()
+        .insert_before(height, |buf| {
+            render::render_history_into(buf, buf.area, &lines)
+        })
+        .map(|_| ())
+}
+
 /// Temporarily switches from the inline viewport to a genuine fullscreen
 /// alternate-screen `Terminal` for the duration of `f` — used around every
 /// picker (`/resume`, `/model`, `/permissions`, `/skills`) and the
@@ -778,9 +801,15 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             // `session` at all now that history is printed once via
             // `print_new_history` rather than redrawn from it every frame,
             // so no snapshot is needed to sidestep `agent_future`'s
-            // mutable borrow of `session` below (mid-turn tool calls
-            // still don't appear live either way — only once the turn
-            // finishes does the next `print_new_history` call show them).
+            // mutable borrow of `session` below. Mid-turn tool activity
+            // reaches the screen through `events_rx` instead, which
+            // carries owned `AgentEvent`s and so borrows nothing.
+            //
+            // Unbounded on purpose: a bounded sender would make
+            // `agent::run` block on a full queue, i.e. let the display
+            // throttle the actual turn. Events are small and a turn's
+            // worth of them is bounded by the turn itself.
+            let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
             let agent_future = agent::run(
                 args.provider.as_ref(),
                 &mut session,
@@ -792,7 +821,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 args.provider.clone(),
                 args.spawn_concurrency,
                 args.spawn_write_concurrency,
-                None,
+                Some(events_tx),
                 &mut ctx,
             );
             tokio::pin!(agent_future);
@@ -803,10 +832,22 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             ticker.tick().await;
             let mut event_stream = ratatui::crossterm::event::EventStream::new();
 
-            loop {
+            let turn_outcome = loop {
                 tokio::select! {
                     biased;
                     result = &mut agent_future => break TurnOutcome::Done(result),
+                    // Ahead of the tick and the key-event arms so a burst
+                    // of tool activity is printed as it happens rather
+                    // than queueing behind cosmetic redraws; behind
+                    // `agent_future` so the turn's own completion (and
+                    // the rollback it may need) is never delayed by
+                    // display work. Anything still queued when the turn
+                    // finishes is drained right after this loop.
+                    Some(event) = events_rx.recv() => {
+                        if print_live_event(&terminal, &event).is_err() {
+                            break TurnOutcome::Fatal;
+                        }
+                    }
                     _ = ticker.tick() => {
                         status = Status::Thinking { elapsed: turn_started.elapsed() };
                         // History is never redrawn from here (see the
@@ -851,7 +892,21 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         }
                     }
                 }
+            };
+
+            // `biased` makes `agent_future` win whenever it and
+            // `events_rx` are ready in the same poll, so the very last
+            // events of a turn can still be sitting in the queue here —
+            // print them rather than silently dropping the final tool's
+            // result marker.
+            let mut final_outcome = turn_outcome;
+            while let Ok(event) = events_rx.try_recv() {
+                if print_live_event(&terminal, &event).is_err() {
+                    final_outcome = TurnOutcome::Fatal;
+                    break;
+                }
             }
+            final_outcome
         };
 
         match outcome {

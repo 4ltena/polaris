@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use polaris_core::AgentEvent;
 use polaris_provider::Role;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -104,29 +105,45 @@ fn label(role: Role) -> &'static str {
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
-fn format_tool_calls(calls: &[polaris_provider::ToolCall]) -> Vec<String> {
-    calls
-        .iter()
-        .map(|c| {
-            let args = serde_json::to_string(&c.arguments).unwrap_or_default();
-            let args_preview: String = args.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
-            format!("⚙ {}({})", c.name, args_preview)
-        })
-        .collect()
-}
-
-fn format_tool_result(content: &str) -> String {
-    // Expand tabs before truncating so the 200-char budget is spent on the
-    // form actually rendered. A raw tab is effectively invisible in a
-    // terminal grid (each cell is one character wide), which matters for
-    // tools like `read` whose output separates line numbers from content
-    // with `\t`.
-    let expanded = content.replace('\t', "    ");
-    let preview: String = expanded.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
-    if expanded.chars().count() > TOOL_RESULT_PREVIEW_CHARS {
-        format!("→ {preview}...")
-    } else {
-        format!("→ {preview}")
+/// Turns an `AgentEvent` into lines printable the moment it arrives,
+/// mid-turn. Formatting the `diff` carried by a write/edit
+/// `ToolFinished` is Task 6's job — this ignores that field and covers
+/// only the start/finish markers for ordinary tool calls and for spawned
+/// subagents.
+pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
+    match event {
+        AgentEvent::ToolStarted { name, detail } => {
+            let preview: String = detail.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
+            vec![HistoryLine::plain(Line::from(Span::raw(sanitize(
+                &format!("⏺ {name}({preview})"),
+            ))))]
+        }
+        AgentEvent::ToolFinished { ok, .. } => {
+            let marker = if *ok { "done" } else { "failed" };
+            vec![HistoryLine::plain(Line::from(Span::styled(
+                format!("  {marker}"),
+                Style::default().add_modifier(Modifier::DIM),
+            )))]
+        }
+        AgentEvent::SpawnStarted { agent_type, task } => {
+            let preview: String = task.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
+            vec![
+                HistoryLine::plain(Line::from(Span::raw(sanitize(&format!(
+                    "⏺ Agent({agent_type}: {preview})"
+                ))))),
+                HistoryLine::plain(Line::from(Span::styled(
+                    "  Backgrounded agent",
+                    Style::default().add_modifier(Modifier::DIM),
+                ))),
+            ]
+        }
+        AgentEvent::SpawnFinished { agent_type, ok } => {
+            let marker = if *ok { "done" } else { "failed" };
+            vec![HistoryLine::plain(Line::from(Span::styled(
+                sanitize(&format!("  {agent_type}: {marker}")),
+                Style::default().add_modifier(Modifier::DIM),
+            )))]
+        }
     }
 }
 
@@ -244,6 +261,13 @@ impl HistoryLine {
 /// messages that haven't been printed to the real terminal yet — the
 /// inline-viewport model prints each new turn once and never redraws it,
 /// unlike the old full-history-every-frame approach this replaces.
+///
+/// Deliberately covers *only* the user's and the assistant's own text.
+/// Tool-call activity (`Message::tool_calls`, `Role::Tool` results) is
+/// printed live, while the turn is still running, from the `AgentEvent`
+/// stream via `format_event_for_live_print` — formatting it here too
+/// would print every tool call a second time when the finished turn's
+/// messages are batch-printed.
 pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryLine> {
     messages
         .iter()
@@ -251,31 +275,9 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
             let color = role_color(m.role);
             let shaded = matches!(m.role, Role::User);
             match m.role {
-                Role::Tool => {
-                    let sanitized = sanitize(&format_tool_result(&m.content));
-                    sanitized
-                        .split('\n')
-                        .map(|line| {
-                            HistoryLine::plain(Line::from(Span::styled(
-                                line.to_string(),
-                                Style::default().fg(color),
-                            )))
-                        })
-                        .collect()
-                }
+                Role::Tool => Vec::new(),
                 Role::User | Role::Assistant => {
                     let mut lines = Vec::new();
-                    if !m.tool_calls.is_empty() {
-                        for call_line in format_tool_calls(&m.tool_calls) {
-                            lines.push(HistoryLine {
-                                line: Line::from(Span::styled(
-                                    sanitize(&call_line),
-                                    Style::default().fg(color),
-                                )),
-                                shaded,
-                            });
-                        }
-                    }
                     if !m.content.is_empty() {
                         let sanitized = sanitize(&m.content);
                         // The user's own line needs no "you:" label — its
@@ -1447,25 +1449,87 @@ mod tests {
         assert!(content.contains("fake red"));
     }
 
-    #[test]
-    fn a_tool_result_with_a_raw_escape_byte_does_not_reach_the_terminal_buffer() {
-        let mut session = Session::default();
-        session.push_assistant_tool_calls(
-            "",
-            vec![polaris_provider::ToolCall {
-                id: "c1".into(),
-                name: "bash".into(),
-                arguments: serde_json::json!({"command": "echo fake"}),
-            }],
-        );
-        session.push_tool_result("c1", "\x1b[31mfake\x1b[0m");
+    /// Concatenates every span of every line back into one string, the
+    /// way the terminal would print them.
+    fn live_print_text(event: &AgentEvent) -> String {
+        format_event_for_live_print(event)
+            .iter()
+            .flat_map(|l| l.line.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
 
-        let content = render_history_to_string(&session.messages, 60);
-        assert!(!content.chars().any(|c| c == '\u{1b}'));
+    #[test]
+    fn a_tool_detail_with_a_raw_escape_byte_does_not_reach_the_terminal_buffer() {
+        // Tool activity no longer goes through `history_lines_for` (it's
+        // printed live instead), so the escape-smuggling guard that used
+        // to be checked on a `Role::Tool` message now belongs on the
+        // live-print path.
+        let text = live_print_text(&AgentEvent::ToolStarted {
+            name: "bash".to_string(),
+            detail: "\x1b[31mfake\x1b[0m".to_string(),
+        });
+        assert!(!text.chars().any(|c| c == '\u{1b}'));
         // The rest of the text should still be visible, just with the
-        // control bytes neutralized rather than the whole tool result
-        // being dropped.
-        assert!(content.contains("fake"));
+        // control bytes neutralized rather than the whole detail being
+        // dropped.
+        assert!(text.contains("fake"));
+    }
+
+    #[test]
+    fn a_tool_started_event_renders_as_a_bullet_line() {
+        let lines = format_event_for_live_print(&AgentEvent::ToolStarted {
+            name: "bash".to_string(),
+            detail: "{\"command\":\"ls\"}".to_string(),
+        });
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("⏺"));
+        assert!(text.contains("bash"));
+        assert!(text.contains("ls"));
+    }
+
+    #[test]
+    fn a_tool_finished_event_reports_success_or_failure() {
+        let ok = live_print_text(&AgentEvent::ToolFinished {
+            name: "bash".to_string(),
+            detail: "hello".to_string(),
+            ok: true,
+            diff: None,
+        });
+        assert!(ok.contains("done"));
+        let failed = live_print_text(&AgentEvent::ToolFinished {
+            name: "bash".to_string(),
+            detail: "boom".to_string(),
+            ok: false,
+            diff: None,
+        });
+        assert!(failed.contains("failed"));
+    }
+
+    #[test]
+    fn a_spawn_started_event_mentions_backgrounded_agent() {
+        let joined = live_print_text(&AgentEvent::SpawnStarted {
+            agent_type: "file-inspector".to_string(),
+            task: "inspect agent.rs".to_string(),
+        });
+        assert!(joined.contains("Agent"));
+        assert!(joined.contains("file-inspector"));
+        assert!(joined.contains("Backgrounded agent"));
+    }
+
+    #[test]
+    fn a_spawn_finished_event_names_the_agent_type_and_its_outcome() {
+        let joined = live_print_text(&AgentEvent::SpawnFinished {
+            agent_type: "file-inspector".to_string(),
+            ok: true,
+        });
+        assert!(joined.contains("file-inspector"));
+        assert!(joined.contains("done"));
     }
 
     #[test]
@@ -1586,7 +1650,11 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_and_its_result_are_shown_in_the_history() {
+    fn tool_calls_and_tool_results_are_left_out_of_the_batch_printed_history() {
+        // Tool activity is printed live from the `AgentEvent` stream
+        // while the turn runs (`format_event_for_live_print`), so the
+        // post-turn batch print must not repeat it — only the user's and
+        // the assistant's own text belongs here.
         let mut session = Session::default();
         session.push_user("what's in a.txt?");
         session.push_assistant_tool_calls(
@@ -1597,22 +1665,24 @@ mod tests {
                 arguments: serde_json::json!({"path": "a.txt"}),
             }],
         );
-        session.push_tool_result("c1", "hello\n");
-        session.push_assistant("a.txt contains \"hello\"");
+        session.push_tool_result("c1", "hello from the tool");
+        session.push_assistant("a.txt contains a greeting");
 
         let content = render_history_to_string(&session.messages, 60);
         assert!(
-            content.contains("read"),
-            "the tool name should appear: {content}"
+            !content.contains("read"),
+            "the tool name must not be reprinted: {content}"
         );
         assert!(
-            content.contains("hello"),
-            "the tool result should appear: {content}"
+            !content.contains("hello from the tool"),
+            "the tool result must not be reprinted: {content}"
         );
+        assert!(content.contains("what's in a.txt?"));
+        assert!(content.contains("a.txt contains a greeting"));
     }
 
     #[test]
-    fn a_multi_line_tool_result_renders_as_multiple_lines_not_one_clipped_line() {
+    fn an_assistant_message_carrying_only_tool_calls_produces_no_history_lines() {
         let mut session = Session::default();
         session.push_assistant_tool_calls(
             "",
@@ -1622,57 +1692,22 @@ mod tests {
                 arguments: serde_json::json!({"path": "a.txt"}),
             }],
         );
-        // Mimics `read`'s real output shape: "{line_number}\t{content}\n"
-        // per line.
-        session.push_tool_result("c1", "1\tfirst line\n2\tsecond line\n3\tthird line\n");
+        session.push_tool_result("c1", "1\tfirst line\n2\tsecond line\n");
 
-        let lines = history_lines_for(&session.messages);
-        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
-            0,
-            0,
-            60,
-            lines.len() as u16,
-        ));
-        let area = buf.area;
-        render_history_into(&mut buf, area, &lines);
-        let rows: Vec<String> = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect();
-
-        // Each physical line of the tool result must land on its own row,
-        // not be squashed onto a single row.
-        assert!(rows.iter().any(|r| r.contains("first line")));
-        assert!(rows.iter().any(|r| r.contains("second line")));
-        assert!(rows.iter().any(|r| r.contains("third line")));
-        // Tabs must be expanded to spaces, not rendered as literal tab
-        // characters (which are invisible in a terminal grid).
-        let full: String = rows.join("\n");
-        assert!(!full.contains('\t'));
-        assert!(rows.iter().any(|r| r.contains("1    first line")));
+        assert!(history_lines_for(&session.messages).is_empty());
     }
 
     #[test]
-    fn a_long_tool_result_is_truncated_in_the_display() {
-        let mut session = Session::default();
-        session.push_assistant_tool_calls(
-            "",
-            vec![polaris_provider::ToolCall {
-                id: "c1".into(),
-                name: "read".into(),
-                arguments: serde_json::json!({"path": "big.txt"}),
-            }],
-        );
+    fn a_long_tool_detail_is_truncated_in_the_live_print() {
         let long_body: String = "x".repeat(500);
-        session.push_tool_result("c1", &long_body);
-
-        let content = render_history_to_string(&session.messages, 60);
+        let text = live_print_text(&AgentEvent::ToolStarted {
+            name: "read".to_string(),
+            detail: long_body.clone(),
+        });
         // The full 500-character body must not appear verbatim; only a
         // prefix of it should.
-        assert!(!content.contains(&long_body));
+        assert!(!text.contains(&long_body));
+        assert!(text.contains(&"x".repeat(TOOL_RESULT_PREVIEW_CHARS)));
     }
 
     #[test]

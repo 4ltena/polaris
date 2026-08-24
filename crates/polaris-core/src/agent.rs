@@ -511,6 +511,8 @@ async fn dispatch(
         });
     }
 
+    let mut pending_diff: Option<crate::events::Diff> = None;
+
     let outcome: Result<String, String> = match call.name.as_str() {
         "read" => {
             let path = call.arguments["path"]
@@ -532,8 +534,21 @@ async fn dispatch(
                 .ok_or_else(|| "content is missing".to_string())?;
             let path = Path::new(path);
             ctx.gate.check(ctx.sandbox, path, ctx.approver)?;
-            polaris_tools::write::write(ctx.sandbox, ctx.helper, path, content)
-                .map_err(|e| e.to_string())
+            // diffを送るため、上書き前の内容を先に読んでおく。読めない
+            // (=存在しない)なら新規ファイル扱い。読み取り自体の失敗は
+            // write本体の成否に影響させない——diff計算はベストエフォート
+            // の副作用であり、読めないことがwrite自体を失敗させる理由に
+            // はならない。
+            let old_content = std::fs::read_to_string(path).ok();
+            let result = polaris_tools::write::write(ctx.sandbox, ctx.helper, path, content)
+                .map_err(|e| e.to_string());
+            if result.is_ok() {
+                let mut diff =
+                    crate::events::compute_diff(old_content.as_deref().unwrap_or(""), content);
+                diff.is_new_file = old_content.is_none();
+                pending_diff = Some(diff);
+            }
+            result
         }
         "edit" => {
             let path = call.arguments["path"]
@@ -547,8 +562,12 @@ async fn dispatch(
                 .ok_or_else(|| "new is missing".to_string())?;
             let path = Path::new(path);
             ctx.gate.check(ctx.sandbox, path, ctx.approver)?;
-            polaris_tools::edit::edit(ctx.sandbox, ctx.helper, path, old, new)
-                .map_err(|e| e.to_string())
+            let result = polaris_tools::edit::edit(ctx.sandbox, ctx.helper, path, old, new)
+                .map_err(|e| e.to_string());
+            if result.is_ok() {
+                pending_diff = Some(crate::events::compute_diff(old, new));
+            }
+            result
         }
         "bash" => {
             let command = call.arguments["command"]
@@ -608,7 +627,7 @@ async fn dispatch(
             name: call.name.clone(),
             detail: call.arguments.to_string(),
             ok: outcome.is_ok(),
-            diff: None, // write/editのdiffはTask 3で埋める
+            diff: pending_diff,
         });
     }
 
@@ -2910,5 +2929,351 @@ print("wrote")
             ),
             "second event was not ToolFinished(read, ok: true): {second:?}"
         );
+    }
+
+    /// A generic success helper for `edit`: discards its payload and
+    /// reports success. `dispatch`'s `"edit"` arm computes the diff from
+    /// `old`/`new` in the tool call's own arguments, not from the file the
+    /// helper writes, so the helper's own semantics don't matter here —
+    /// only that it exits 0.
+    fn edit_success_helper(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("fake-edit-success-helper");
+        std::fs::write(&p, "#!/bin/sh\nset -e\ncat > /dev/null\necho edited\n")
+            .expect("cannot write");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        p
+    }
+
+    #[tokio::test]
+    async fn writing_a_new_file_reports_a_diff_with_only_added_lines() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = write_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        let target = sandbox.writable_roots()[0].join("new.txt");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": target.display().to_string(),
+                            "content": "line1\nline2\n",
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let mut session = Session::new();
+        session.push_user("create new.txt");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        let _started = rx.recv().await.expect("no ToolStarted");
+        let finished = rx.recv().await.expect("no ToolFinished");
+        let crate::events::AgentEvent::ToolFinished { diff, .. } = finished else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        let diff = diff.expect("write should report a diff");
+        assert!(diff.is_new_file);
+        assert_eq!(diff.added, 2);
+        assert_eq!(diff.removed, 0);
+    }
+
+    #[tokio::test]
+    async fn writing_over_an_existing_file_reports_a_diff_against_its_old_content() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = write_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        let target = sandbox.writable_roots()[0].join("existing.txt");
+        std::fs::write(&target, "old line\n").expect("cannot write");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": target.display().to_string(),
+                            "content": "new line\n",
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let mut session = Session::new();
+        session.push_user("overwrite existing.txt");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        let _started = rx.recv().await.expect("no ToolStarted");
+        let finished = rx.recv().await.expect("no ToolFinished");
+        let crate::events::AgentEvent::ToolFinished { diff, .. } = finished else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        let diff = diff.expect("overwriting should report a diff");
+        assert!(!diff.is_new_file);
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+    }
+
+    #[tokio::test]
+    async fn editing_a_file_reports_a_diff_computed_from_the_old_and_new_arguments() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = edit_success_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        let target = sandbox.writable_roots()[0].join("existing.txt");
+        std::fs::write(&target, "a\nb\nc\n").expect("cannot write");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "edit".into(),
+                        arguments: serde_json::json!({
+                            "path": target.display().to_string(),
+                            "old": "a\nb\nc\n",
+                            "new": "a\nB\nc\n",
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let mut session = Session::new();
+        session.push_user("edit existing.txt");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        let _started = rx.recv().await.expect("no ToolStarted");
+        let finished = rx.recv().await.expect("no ToolFinished");
+        let crate::events::AgentEvent::ToolFinished { diff, .. } = finished else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        let diff = diff.expect("edit should report a diff");
+        assert!(!diff.is_new_file);
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+    }
+
+    /// A helper that always fails without the sandbox's special "request
+    /// problem" marker, so `run_mutation` reports it as an ordinary
+    /// `WriteDenied` rather than a `MutationFailed`. Either shape is a
+    /// plain `Err` by the time it reaches `dispatch`, which is all this
+    /// test needs: the gate allows the call through, but the mutation
+    /// itself still fails.
+    fn always_fails_helper(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("fake-write-failure-helper");
+        std::fs::write(&p, "#!/bin/sh\ncat > /dev/null\necho boom >&2\nexit 1\n")
+            .expect("cannot write");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        p
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_reports_no_diff() {
+        // The gate allows the call through (the target is inside the
+        // sandbox root), but the mutation itself fails. No diff should be
+        // reported — diff computation is a best-effort side observation of
+        // a successful mutation, not something owed on failure.
+        let root = tempfile::tempdir().expect("temp directory");
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = always_fails_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        let target = sandbox.writable_roots()[0].join("new.txt");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": target.display().to_string(),
+                            "content": "body",
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "it failed".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let mut session = Session::new();
+        session.push_user("write new.txt");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("the loop failed");
+
+        let _started = rx.recv().await.expect("no ToolStarted");
+        let finished = rx.recv().await.expect("no ToolFinished");
+        let crate::events::AgentEvent::ToolFinished { ok, diff, .. } = finished else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        assert!(!ok, "the failed write should be reported as failed");
+        assert!(diff.is_none(), "a failed write should not report a diff");
     }
 }

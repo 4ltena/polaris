@@ -5,13 +5,34 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// The merged configuration.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Additional places to look for skills. Not included in the 2 default locations.
     pub skills_paths: Vec<PathBuf>,
     /// Additional places to look for subagent types. Not included in the 2 default locations
     /// (`<project_root>/agents`, `<HOME>/.polaris/agents`).
     pub agents_paths: Vec<PathBuf>,
+    /// How many `spawn` tasks a single wave may run concurrently. TOML key:
+    /// `[spawn] concurrency`. Defaults to
+    /// `polaris_spawn::DEFAULT_CONCURRENCY` (8).
+    pub spawn_concurrency: usize,
+    /// Among a wave's concurrently-running tasks, how many may hold a
+    /// `write_root` at once — tighter than `spawn_concurrency` because
+    /// writes contend for I/O and disk in a way reads don't. TOML key:
+    /// `[spawn] write_concurrency`. Defaults to
+    /// `polaris_spawn::DEFAULT_WRITE_CONCURRENCY` (4).
+    pub spawn_write_concurrency: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            skills_paths: Vec::new(),
+            agents_paths: Vec::new(),
+            spawn_concurrency: crate::spawn::DEFAULT_CONCURRENCY,
+            spawn_write_concurrency: crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -20,6 +41,8 @@ struct RawConfig {
     skills: RawSkills,
     #[serde(default)]
     agents: RawAgents,
+    #[serde(default)]
+    spawn: RawSpawn,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,6 +61,18 @@ struct RawAgents {
     /// Same `None` vs `Some(vec![])` distinction as `RawSkills::paths`.
     #[serde(default)]
     paths: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawSpawn {
+    /// `None` here means "inherit the prior stage's value" — unlike
+    /// `RawSkills`/`RawAgents::paths`, there is no meaningful "override
+    /// with an explicit empty" state for a single number, so this stays a
+    /// plain `Option<usize>`.
+    #[serde(default)]
+    concurrency: Option<usize>,
+    #[serde(default)]
+    write_concurrency: Option<usize>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +124,12 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
             }
             if let Some(paths) = raw.agents.paths {
                 merged.agents_paths = paths;
+            }
+            if let Some(n) = raw.spawn.concurrency {
+                merged.spawn_concurrency = n;
+            }
+            if let Some(n) = raw.spawn.write_concurrency {
+                merged.spawn_write_concurrency = n;
             }
         }
     }
@@ -196,5 +237,37 @@ mod tests {
             "did not inherit global despite having no skills section: {:?}",
             c.skills_paths
         );
+    }
+
+    #[test]
+    fn spawn_concurrency_defaults_to_the_documented_constants_when_absent() {
+        let cfg = Config::default();
+        assert_eq!(cfg.spawn_concurrency, crate::spawn::DEFAULT_CONCURRENCY);
+        assert_eq!(
+            cfg.spawn_write_concurrency,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn reads_spawn_concurrency_from_a_single_file() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let p = write(
+            dir.path(),
+            "[spawn]\nconcurrency = 16\nwrite_concurrency = 2\n",
+        );
+        let c = try_load_from(Some(&p), None).expect("should be readable");
+        assert_eq!(c.spawn_concurrency, 16);
+        assert_eq!(c.spawn_write_concurrency, 2);
+    }
+
+    #[test]
+    fn project_without_spawn_section_inherits_global_concurrency() {
+        let g = tempfile::tempdir().expect("temp directory");
+        let pj = tempfile::tempdir().expect("temp directory");
+        let gp = write(g.path(), "[spawn]\nconcurrency = 16\n");
+        let pp = write(pj.path(), "# no spawn section\n");
+        let c = try_load_from(Some(&gp), Some(&pp)).expect("should be readable");
+        assert_eq!(c.spawn_concurrency, 16);
     }
 }

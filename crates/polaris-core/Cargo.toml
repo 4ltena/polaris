@@ -10,6 +10,7 @@ polaris-provider = { path = "../polaris-provider" }
 polaris-sandbox = { path = "../polaris-sandbox" }
 polaris-skills = { path = "../polaris-skills" }
 polaris-tools = { path = "../polaris-tools" }
+futures-util = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

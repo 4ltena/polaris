@@ -99,6 +99,8 @@ pub async fn run(
     skills: &[polaris_skills::Skill],
     agent_types: &[polaris_skills::AgentType],
     provider_pool: Arc<dyn Provider>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
     run_loop(
@@ -111,6 +113,8 @@ pub async fn run(
         skills,
         agent_types,
         provider_pool,
+        spawn_concurrency,
+        spawn_write_concurrency,
         "root",
         ctx,
     )
@@ -133,6 +137,8 @@ pub(crate) async fn run_loop(
     skills: &[polaris_skills::Skill],
     agent_types: &[polaris_skills::AgentType],
     provider_pool: Arc<dyn Provider>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
     caller: &str,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
@@ -188,6 +194,8 @@ pub(crate) async fn run_loop(
                 agent_types,
                 provider_pool.clone(),
                 audit.clone(),
+                spawn_concurrency,
+                spawn_write_concurrency,
                 ctx,
             )
             .await;
@@ -261,12 +269,15 @@ pub(crate) async fn run_loop(
 /// `polaris_tools::bash` docs). It is attempted under confinement, and if
 /// denied, the reason carried in the child's output is returned to the
 /// model as-is.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     call: &polaris_provider::ToolCall,
     skills: &[polaris_skills::Skill],
     agent_types: &[polaris_skills::AgentType],
     provider_pool: Arc<dyn Provider>,
     audit: Arc<Mutex<AuditLog>>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
     ctx: &mut ToolContext<'_>,
 ) -> Result<String, String> {
     match call.name.as_str() {
@@ -353,6 +364,8 @@ async fn dispatch(
                 audit,
                 ctx.sandbox,
                 ctx.helper,
+                spawn_concurrency,
+                spawn_write_concurrency,
             ))
             .await)
         }
@@ -530,6 +543,8 @@ mod tests {
             &[],
             unused_provider_pool(),
             dummy_audit(&dir),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -567,6 +582,8 @@ mod tests {
             &[],
             unused_provider_pool(),
             dummy_audit(&dir),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -603,6 +620,8 @@ mod tests {
             &[],
             unused_provider_pool(),
             dummy_audit(&dir),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -665,6 +684,8 @@ mod tests {
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -743,6 +764,8 @@ mod tests {
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -789,6 +812,8 @@ mod tests {
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -850,6 +875,8 @@ mod tests {
             &skills,
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -918,6 +945,8 @@ mod tests {
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1059,6 +1088,8 @@ print("wrote")
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1145,6 +1176,8 @@ print("wrote")
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1260,6 +1293,8 @@ print("wrote")
                 &[],
                 &[],
                 unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
                 &mut ctx,
             )
             .await
@@ -1415,6 +1450,8 @@ print("wrote")
                 &[],
                 &[],
                 unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
                 &mut ctx,
             )
             .await
@@ -1547,6 +1584,8 @@ print("wrote")
                 &[],
                 &[],
                 unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
                 &mut ctx,
             )
             .await
@@ -1653,6 +1692,8 @@ print("wrote")
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1746,6 +1787,8 @@ print("wrote")
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1792,6 +1835,8 @@ print("wrote")
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             "root",
             &mut ctx,
         )
@@ -1887,6 +1932,8 @@ print("wrote")
             &[],
             &agent_types,
             p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1957,6 +2004,8 @@ print("wrote")
             &[],
             &[],
             unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await

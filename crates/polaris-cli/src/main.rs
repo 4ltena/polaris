@@ -547,6 +547,8 @@ async fn main() -> ExitCode {
                 &discovered.skills,
                 &discovered_agents.agent_types,
                 provider.clone(),
+                config.spawn_concurrency,
+                config.spawn_write_concurrency,
                 &mut ctx,
             )
             .await
@@ -577,6 +579,8 @@ async fn main() -> ExitCode {
                 always_on: &always_on,
                 skills: &discovered.skills,
                 agent_types: &discovered_agents.agent_types,
+                spawn_concurrency: config.spawn_concurrency,
+                spawn_write_concurrency: config.spawn_write_concurrency,
             })
             .await
         }

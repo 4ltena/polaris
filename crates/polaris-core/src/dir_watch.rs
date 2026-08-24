@@ -65,6 +65,7 @@ fn walk(dir: &Path, out: &mut DirSnapshot, recurse: bool) {
 /// を二度書かなくてよい——前後で違う種別のスキャンを取ってしまえば差分
 /// はまるごと嘘になるので、その分岐を1箇所に閉じ込めることそのものが
 /// この型の存在理由である。
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ScanScope {
     Recursive(PathBuf),
     Shallow(PathBuf),

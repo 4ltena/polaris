@@ -112,7 +112,7 @@ pub async fn run(
         session.push_assistant_tool_calls(&res.text, res.tool_calls.clone());
 
         for call in &res.tool_calls {
-            let outcome = dispatch(call, skills, ctx);
+            let outcome = dispatch(call, skills, ctx).await;
             // `result` is exactly the body actually returned to the model
             // (on success) or the error text (on failure).
             let result: &str = match &outcome {
@@ -179,7 +179,7 @@ pub async fn run(
 /// `polaris_tools::bash` docs). It is attempted under confinement, and if
 /// denied, the reason carried in the child's output is returned to the
 /// model as-is.
-fn dispatch(
+async fn dispatch(
     call: &polaris_provider::ToolCall,
     skills: &[polaris_skills::Skill],
     ctx: &mut ToolContext<'_>,
@@ -348,8 +348,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_skill_tool_reads_the_argument_name_its_schema_declares() {
+    #[tokio::test]
+    async fn the_skill_tool_reads_the_argument_name_its_schema_declares() {
         // Take the argument name from the published schema, not a literal.
         // Change the schema's `q` to `query` (while dispatch still reads
         // `q`) and this test alone exposes the mismatch.
@@ -367,8 +367,9 @@ mod tests {
             gate: &mut gate,
             approver: &mut approver,
         };
-        let out =
-            dispatch(&call_with("skill", &param, "demo"), &skills, &mut ctx).unwrap_or_else(|e| {
+        let out = dispatch(&call_with("skill", &param, "demo"), &skills, &mut ctx)
+            .await
+            .unwrap_or_else(|e| {
                 panic!(
                     "dispatch does not read the argument name {param} the public schema declares: {e}"
                 )
@@ -379,8 +380,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_read_tool_reads_the_argument_name_its_schema_declares() {
+    #[tokio::test]
+    async fn the_read_tool_reads_the_argument_name_its_schema_declares() {
         // Apply the same binding as the skill side to read too. read's
         // schema has existed since M1, but nothing tied its declaration to
         // what gets read, either.
@@ -401,6 +402,7 @@ mod tests {
             &[],
             &mut ctx,
         )
+        .await
         .unwrap_or_else(|e| {
             panic!(
                 "dispatch does not read the argument name {param} the public schema declares: {e}"
@@ -409,8 +411,8 @@ mod tests {
         assert!(out.contains("hello"), "the body was not returned: {out}");
     }
 
-    #[test]
-    fn a_read_without_an_explicit_limit_says_it_stopped_early() {
+    #[tokio::test]
+    async fn a_read_without_an_explicit_limit_says_it_stopped_early() {
         // dispatch fills in the default when a call omits limit. The side
         // that receives that default has no way of knowing it was
         // truncated, so the "(showed lines ... of N total ...)" disclaimer
@@ -433,6 +435,7 @@ mod tests {
             &[],
             &mut ctx,
         )
+        .await
         .expect("should be able to read");
 
         assert!(

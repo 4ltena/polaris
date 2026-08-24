@@ -16,8 +16,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tiktoken-rs = { workspace = true }
 toml = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }

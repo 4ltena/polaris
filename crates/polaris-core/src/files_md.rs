@@ -105,6 +105,7 @@ async fn regenerate_one(
         audit.clone(),
         base_sandbox,
         helper,
+        None,
     )
     .await;
     if let TaskOutcome::Failed(msg) = outcome {

@@ -42,6 +42,40 @@ pub async fn run_one(
     audit: Arc<Mutex<AuditLog>>,
     base_sandbox: &SandboxPolicy,
     helper: &Path,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+) -> TaskOutcome {
+    if let Some(tx) = &events {
+        let _ = tx.send(crate::events::AgentEvent::SpawnStarted {
+            agent_type: task.agent_type.clone(),
+            task: task.task.clone(),
+        });
+    }
+
+    let outcome = run_one_inner(task, agent_types, provider, audit, base_sandbox, helper).await;
+
+    if let Some(tx) = &events {
+        let _ = tx.send(crate::events::AgentEvent::SpawnFinished {
+            agent_type: task.agent_type.clone(),
+            ok: matches!(outcome, TaskOutcome::Ok(_)),
+        });
+    }
+
+    outcome
+}
+
+/// The actual subagent execution, unwrapped from `run_one`'s
+/// `SpawnStarted`/`SpawnFinished` notifications so every early-return path
+/// below (unknown type, sandbox resolution failure, schema mismatch, ...)
+/// still reliably reaches the `SpawnFinished` send in `run_one` — the same
+/// reason `dispatch`'s tool arms were restructured into labeled blocks in
+/// an earlier task.
+async fn run_one_inner(
+    task: &SpawnTask,
+    agent_types: &[AgentType],
+    provider: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    base_sandbox: &SandboxPolicy,
+    helper: &Path,
 ) -> TaskOutcome {
     let Some(agent) = agent_types.iter().find(|a| a.name == task.agent_type) else {
         let candidates = polaris_tools::skill::lookup(agent_types, &task.agent_type);
@@ -298,6 +332,7 @@ pub async fn run_wave(
     helper: &Path,
     concurrency: usize,
     write_concurrency: usize,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
 ) -> String {
     if let Err(msg) = check_no_write_root_overlap(&tasks) {
         let entries: Vec<serde_json::Value> = tasks
@@ -319,6 +354,7 @@ pub async fn run_wave(
     let futures = tasks.iter().map(|task| {
         let provider = provider.clone();
         let audit = audit.clone();
+        let events = events.clone();
         let total_permits = &total_permits;
         let write_permits = &write_permits;
         let needs_write = task.write_root.is_some();
@@ -332,7 +368,16 @@ pub async fn run_wave(
             } else {
                 None
             };
-            let outcome = run_one(task, agent_types, provider, audit, base_sandbox, helper).await;
+            let outcome = run_one(
+                task,
+                agent_types,
+                provider,
+                audit,
+                base_sandbox,
+                helper,
+                events,
+            )
+            .await;
             // A successful result has already been parsed as JSON by
             // `validate_output`, so it is embedded as the structure it is
             // rather than as a string holding an escaped copy of itself.
@@ -496,6 +541,7 @@ mod tests {
             audit,
             &full_access(),
             Path::new("/bin/true"),
+            None,
         )
         .await;
 
@@ -541,6 +587,7 @@ mod tests {
             audit_in(dir.path()),
             &full_access(),
             Path::new("/bin/true"),
+            None,
         )
         .await;
 
@@ -583,6 +630,7 @@ mod tests {
             audit_in(dir.path()),
             &full_access(),
             Path::new("/bin/true"),
+            None,
         )
         .await;
         match outcome {
@@ -623,6 +671,7 @@ mod tests {
             audit_in(dir.path()),
             &full_access(),
             Path::new("/bin/true"),
+            None,
         )
         .await;
         match outcome {
@@ -653,6 +702,7 @@ mod tests {
             audit_in(inside.path()),
             &base,
             Path::new("/bin/true"),
+            None,
         )
         .await;
         match outcome {
@@ -710,6 +760,7 @@ mod tests {
             audit_in(dir.path()),
             &full_access(),
             Path::new("/bin/true"),
+            None,
         )
         .await;
         assert!(matches!(outcome, TaskOutcome::Ok(_)), "{outcome:?}");
@@ -751,6 +802,7 @@ mod tests {
             audit_in(dir.path()),
             &full_access(),
             Path::new("/bin/true"),
+            None,
         )
         .await;
 
@@ -803,6 +855,7 @@ mod tests {
             Path::new("/bin/true"),
             DEFAULT_CONCURRENCY,
             DEFAULT_WRITE_CONCURRENCY,
+            None,
         )
         .await;
 
@@ -849,6 +902,7 @@ mod tests {
             Path::new("/bin/true"),
             DEFAULT_CONCURRENCY,
             DEFAULT_WRITE_CONCURRENCY,
+            None,
         )
         .await;
 
@@ -1018,6 +1072,7 @@ mod tests {
             Path::new("/bin/true"),
             DEFAULT_CONCURRENCY,
             DEFAULT_WRITE_CONCURRENCY,
+            None,
         )
         .await;
 
@@ -1079,6 +1134,7 @@ mod tests {
             Path::new("/bin/true"),
             DEFAULT_CONCURRENCY,
             DEFAULT_WRITE_CONCURRENCY,
+            None,
         )
         .await;
 
@@ -1135,6 +1191,7 @@ mod tests {
             Path::new("/bin/true"),
             DEFAULT_CONCURRENCY,
             DEFAULT_WRITE_CONCURRENCY,
+            None,
         )
         .await;
 
@@ -1193,6 +1250,7 @@ mod tests {
             Path::new("/bin/true"),
             DEFAULT_CONCURRENCY,
             DEFAULT_WRITE_CONCURRENCY,
+            None,
         )
         .await;
 
@@ -1243,6 +1301,7 @@ mod tests {
             Path::new("/bin/true"),
             DEFAULT_CONCURRENCY,
             DEFAULT_WRITE_CONCURRENCY,
+            None,
         )
         .await;
         let elapsed = start.elapsed();
@@ -1294,6 +1353,7 @@ mod tests {
             Path::new("/bin/true"),
             1,
             1,
+            None,
         )
         .await;
         let elapsed = start.elapsed();
@@ -1424,6 +1484,7 @@ mod tests {
             Path::new("/bin/true"),
             DEFAULT_CONCURRENCY,
             DEFAULT_WRITE_CONCURRENCY,
+            None,
         )
         .await;
 
@@ -1446,5 +1507,88 @@ mod tests {
         );
         assert_eq!(entries[1]["type"], "ro-fixture");
         assert_eq!(entries[1]["ok"], true, "{out}");
+    }
+
+    #[tokio::test]
+    async fn run_one_reports_spawn_started_and_finished() {
+        let agent_types = vec![readonly_fixture_agent_type()];
+        let provider = counting_mock_provider_returning_valid_output(std::sync::Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let audit = shared_test_audit();
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = SpawnTask {
+            agent_type: "ro-fixture".to_string(),
+            task: "do something".to_string(),
+            write_root: None,
+        };
+
+        let _outcome = run_one(
+            &task,
+            &agent_types,
+            std::sync::Arc::new(provider),
+            audit,
+            &sandbox,
+            std::path::Path::new("/bin/true"),
+            Some(tx),
+        )
+        .await;
+
+        let started = rx.recv().await.unwrap();
+        assert!(matches!(
+            started,
+            crate::events::AgentEvent::SpawnStarted { ref agent_type, .. } if agent_type == "ro-fixture"
+        ));
+        let finished = rx.recv().await.unwrap();
+        assert!(matches!(
+            finished,
+            crate::events::AgentEvent::SpawnFinished { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_subagents_own_tool_calls_never_reach_the_events_channel() {
+        // 深さ1の原則: サブエージェント自身のrun_loop呼び出しには
+        // events: None が渡る(Task 2で確立済み)。run_one自体が送るのは
+        // SpawnStarted/SpawnFinishedの2件だけであることを確認する。
+        let agent_types = vec![readonly_fixture_agent_type()];
+        let provider = counting_mock_provider_returning_valid_output(std::sync::Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let audit = shared_test_audit();
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = SpawnTask {
+            agent_type: "ro-fixture".to_string(),
+            task: "do something".to_string(),
+            write_root: None,
+        };
+
+        let _outcome = run_one(
+            &task,
+            &agent_types,
+            std::sync::Arc::new(provider),
+            audit,
+            &sandbox,
+            std::path::Path::new("/bin/true"),
+            Some(tx),
+        )
+        .await;
+
+        let _started = rx.recv().await.unwrap();
+        let _finished = rx.recv().await.unwrap();
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, 0,
+            "expected exactly 2 events already drained above, none left"
+        );
     }
 }

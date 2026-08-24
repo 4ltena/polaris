@@ -629,6 +629,7 @@ async fn dispatch(
                 ctx.helper,
                 spawn_concurrency,
                 spawn_write_concurrency,
+                events.clone(),
             ))
             .await)
         }

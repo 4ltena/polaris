@@ -132,6 +132,66 @@ pub async fn run(
     .await
 }
 
+/// Called immediately before a `bash` / `write` / `edit` call. Decides
+/// what range of the filesystem to watch, takes the "before" snapshot on
+/// the spot, and returns the pair — the range and the snapshot have to be
+/// produced together, since the "after" scan must cover exactly the same
+/// range or the diff is meaningless.
+///
+/// This is only ever reached for `caller == "root"`, and that guard is a
+/// correctness condition rather than an optimization. The regeneration
+/// this feeds runs the `files-md-writer` subagent, whose own loop calls
+/// `write` to create `files.md`. Let that subagent's tool calls be watched
+/// too and the file it just wrote is seen by the next diff as "a new file
+/// in an existing directory" — which regenerates the very same directory
+/// again. `files_md::targets_to_regenerate` already refuses `files.md`
+/// itself as a trigger, but any *other* file the subagent happened to
+/// touch would still re-enter the loop; keeping the whole mechanism off
+/// for non-root callers stops it before the diff is even taken.
+fn pre_call_snapshot(
+    tool_name: &str,
+    call: &polaris_provider::ToolCall,
+    ctx: &ToolContext<'_>,
+) -> (crate::dir_watch::ScanScope, crate::dir_watch::DirSnapshot) {
+    let scope = match tool_name {
+        // What a shell command will touch cannot be predicted, so the
+        // whole writable root is scanned. Outside workspace-write there is
+        // no root to scan: read-only has none by construction, and
+        // full-access would mean scanning the entire filesystem twice per
+        // call, which is not a cost this feature may impose.
+        "bash" => match ctx.sandbox.mode() {
+            polaris_sandbox::SandboxMode::WorkspaceWrite => {
+                // Even with several writable roots, this watches only the
+                // first. Essentially every real run has exactly one, and
+                // multi-root support is left as a future extension rather
+                // than paid for on every single `bash` call.
+                match ctx.sandbox.writable_roots().first() {
+                    Some(root) => crate::dir_watch::ScanScope::Recursive(root.clone()),
+                    None => crate::dir_watch::ScanScope::None,
+                }
+            }
+            _ => crate::dir_watch::ScanScope::None,
+        },
+        // `write` / `edit` resolve to exactly one path (the same "path"
+        // argument the audit record's `target` is built from), so only its
+        // parent directory needs watching, and only one level deep.
+        "write" | "edit" => {
+            let parent = call.arguments["path"]
+                .as_str()
+                .map(Path::new)
+                .and_then(Path::parent)
+                .map(Path::to_path_buf);
+            match parent {
+                Some(parent) => crate::dir_watch::ScanScope::Shallow(parent),
+                None => crate::dir_watch::ScanScope::None,
+            }
+        }
+        _ => crate::dir_watch::ScanScope::None,
+    };
+    let before = crate::dir_watch::snapshot_for_scope(&scope);
+    (scope, before)
+}
+
 /// ルートの `run` と subagent 実行(Task 9)の両方が使う、ターン取りの
 /// 中核。`system`/`tools` を `AlwaysOn` からではなく直接受け取るのは、
 /// subagent の型ごとに異なるシステムプロンプトとツール部分集合を、
@@ -199,6 +259,14 @@ pub(crate) async fn run_loop(
         session.push_assistant_tool_calls(&res.text, res.tool_calls.clone());
 
         for call in &res.tool_calls {
+            // The `files.md` regeneration hook. It fires *only* for the
+            // root's own tool calls — see `pre_call_snapshot`'s docs for
+            // why `caller == "root"` is a correctness condition and not a
+            // mere optimization.
+            let watched =
+                caller == "root" && matches!(call.name.as_str(), "bash" | "write" | "edit");
+            let pre_snapshot = watched.then(|| pre_call_snapshot(&call.name, call, ctx));
+
             let outcome = dispatch(
                 call,
                 skills,
@@ -210,6 +278,39 @@ pub(crate) async fn run_loop(
                 ctx,
             )
             .await;
+
+            // Deliberately after `dispatch` and before the audit record:
+            // the regeneration runs its own subagent, which writes its own
+            // lines to the same log, and the tool call that caused it
+            // should not be recorded as having happened after its own
+            // consequences. Nothing here can change `outcome` — a failure
+            // to regenerate `files.md` is never allowed to turn a tool call
+            // the model made into a failure (`regenerate_for_changes`
+            // returns `()` and swallows its own errors into the audit log
+            // for exactly this reason).
+            if let Some((scope, before)) = pre_snapshot {
+                let after = crate::dir_watch::snapshot_for_scope(&scope);
+                let changes = crate::dir_watch::diff(&before, &after);
+                if !changes.new_dirs.is_empty() || !changes.new_files_in_existing_dirs.is_empty() {
+                    // Boxed for the same reason the `spawn` arm is: this
+                    // closes the type-level cycle
+                    // `run_loop -> files_md::regenerate_for_changes ->
+                    // spawn::run_one -> run_loop`. It never recurses at
+                    // runtime — the subagent's own calls are guarded out by
+                    // `caller == "root"` above — but the compiler still has
+                    // to give the future a finite size.
+                    Box::pin(crate::files_md::regenerate_for_changes(
+                        &changes,
+                        agent_types,
+                        provider_pool.clone(),
+                        audit.clone(),
+                        ctx.sandbox,
+                        ctx.helper,
+                    ))
+                    .await;
+                }
+            }
+
             // `result` is exactly the body actually returned to the model
             // (on success) or the error text (on failure).
             let result: &str = match &outcome {
@@ -1980,6 +2081,234 @@ print("wrote")
         assert!(
             log.contains("\"tool\":\"spawn\"") && log.contains("\"caller\":\"root\""),
             "the root's spawn call was not recorded: {log}"
+        );
+    }
+
+    /// The real `agents/files-md-writer` from this repository — its type
+    /// definition and the JSON Schema shipped alongside it, not a copy
+    /// written here. `files_md::regenerate_for_changes` looks the type up
+    /// by the exact name `files-md-writer`, so a renamed fixture would
+    /// leave these tests passing against a type production never reaches.
+    fn files_md_writer_agent_type() -> polaris_skills::AgentType {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agents/files-md-writer");
+        let text = std::fs::read_to_string(dir.join("SKILL.md")).expect("cannot read SKILL.md");
+        polaris_skills::agent_type::parse(&text, "files-md-writer", &dir)
+            .expect("agents/files-md-writer does not parse")
+    }
+
+    /// The scripted turns of one `files-md-writer` run: a `read` of
+    /// `reads`, then output matching its schema. The `read` is what makes
+    /// the run observable — a subagent that returns text and touches
+    /// nothing writes no audit line of its own, and the audit log is the
+    /// only place this harness-driven mechanism is visible from outside
+    /// `run_loop`.
+    fn files_md_writer_turns(
+        reads: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> Vec<CompletionResponse> {
+        vec![
+            CompletionResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "sub-1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": reads.display().to_string() }),
+                }],
+                ..Default::default()
+            },
+            CompletionResponse {
+                text: serde_json::json!({
+                    "path": dir.join("files.md").display().to_string(),
+                    "status": "ok"
+                })
+                .to_string(),
+                tool_calls: vec![],
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn bash_call(command: String) -> CompletionResponse {
+        CompletionResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": command }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn final_text(s: &str) -> CompletionResponse {
+        CompletionResponse {
+            text: s.into(),
+            tool_calls: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_root_bash_call_that_creates_a_directory_triggers_files_md_regeneration() {
+        // The whole mechanism end to end: the root runs `mkdir` via `bash`,
+        // the loop diffs the writable root around that call, sees a brand
+        // new directory, and drives the `files-md-writer` subagent for it —
+        // without the model ever having called `spawn`. Nothing about this
+        // is visible in `run_loop`'s return value, so the audit log is the
+        // observation point.
+        let root = tempfile::tempdir().expect("temp directory");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        // The canonical root, so the directory the diff reports is a path
+        // the subagent's own `write_root` can be confined to (on macOS a
+        // temp dir's `/var/...` spelling is a symlink to `/private/var/...`).
+        let newdir = sandbox.writable_roots()[0].join("newdir");
+        // Present in both snapshots, so it is never itself a change.
+        let seed = sandbox.writable_roots()[0].join("seed.txt");
+        std::fs::write(&seed, "seed\n").expect("cannot write");
+
+        // One queue, served in order, exactly as production shares one
+        // provider between the root and its subagents: the root's `bash`
+        // turn, then the regeneration subagent's two turns, then the root's
+        // closing turn.
+        let mut replies = vec![bash_call(format!("mkdir {}", newdir.display()))];
+        replies.extend(files_md_writer_turns(&seed, &newdir));
+        replies.push(final_text("done"));
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(replies),
+        });
+
+        // The audit log lives outside the watched root on purpose —
+        // written inside it, the log file itself would show up in the diff.
+        let logs = tempfile::tempdir().expect("temp directory");
+        let audit_path = logs.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut session = Session::new();
+        session.push_user("make a newdir");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: std::path::Path::new("/bin/true"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let out = run(
+            p.as_ref(),
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[files_md_writer_agent_type()],
+            p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            &mut ctx,
+        )
+        .await
+        .expect("the root loop failed")
+        .text;
+        assert_eq!(out, "done", "the root loop did not reach its closing turn");
+
+        assert!(newdir.is_dir(), "the bash call did not actually run");
+
+        let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        assert!(
+            log.contains("\"caller\":\"files-md-writer\""),
+            "the files-md-writer subagent never ran for the new directory: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_directory_creating_call_from_a_subagent_does_not_trigger_regeneration() {
+        // The guard that keeps the mechanism from feeding itself. This is
+        // the identical scenario as the test above — same sandbox, same
+        // `mkdir`, same discovered type — differing only in `caller`. If
+        // the `caller == "root"` condition were dropped, the
+        // `files-md-writer` subagent's own `write` of `files.md` (and any
+        // other file it touched) would be diffed too and could regenerate
+        // the very directory it was writing into.
+        let root = tempfile::tempdir().expect("temp directory");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        let newdir = sandbox.writable_roots()[0].join("newdir");
+
+        // Only the root's own two turns are queued. Were the hook to fire
+        // here, it would consume the closing reply as the regeneration
+        // subagent's turn — so both the queue position (the loop no longer
+        // ends on "done") and the audit log (a `files-md-writer` line, for
+        // its own tool call or for the failure `files_md` records) would
+        // give it away.
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(vec![
+                bash_call(format!("mkdir {}", newdir.display())),
+                final_text("done"),
+            ]),
+        });
+
+        let logs = tempfile::tempdir().expect("temp directory");
+        let audit_path = logs.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut session = Session::new();
+        session.push_user("make a newdir");
+        let mut stop = StopTracker::new(10);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: std::path::Path::new("/bin/true"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let out = run_loop(
+            p.as_ref(),
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            "system prompt",
+            &polaris_tools::all_specs(),
+            &[],
+            &[files_md_writer_agent_type()],
+            p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            // The only difference from the test above.
+            "some-subagent",
+            &mut ctx,
+        )
+        .await
+        .expect("the subagent loop failed")
+        .text;
+
+        assert!(newdir.is_dir(), "the bash call did not actually run");
+
+        // Nothing attributable to the regeneration may appear: neither the
+        // subagent's own tool calls (`"caller":"files-md-writer"`) nor the
+        // failure line `files_md` records when a run it started goes wrong.
+        let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        assert!(
+            !log.contains("files-md-writer"),
+            "regeneration fired for a non-root caller: {log}"
+        );
+        // The same fact seen from the reply queue: the closing reply was
+        // still there for the loop's own second turn, so nothing else
+        // consumed a turn in between.
+        assert_eq!(
+            out, "done",
+            "the closing reply was consumed by something else — the hook fired \
+             for a non-root caller"
         );
     }
 

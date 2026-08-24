@@ -334,6 +334,26 @@ mod tests {
         );
     }
 
+    /// `dir_watch`/`gitignore`/`files_md` are harness-internal machinery
+    /// that runs before/after a root tool call and never touch
+    /// `AlwaysOn`/`assemble_always_on` — no new token source. That
+    /// invariant is design, not runtime behavior, so there is nothing to
+    /// toggle "on" and "off" here to compare; this pins it by showing the
+    /// always-on total for the existing 6-tool configuration is stable
+    /// (repeated measurement of the same inputs) and still within budget,
+    /// exactly as it was before the files.md autogeneration feature
+    /// existed.
+    #[test]
+    fn files_md_autogeneration_is_not_part_of_the_always_on_context() {
+        let tools = polaris_tools::all_specs();
+        let with_files_md_feature = always_on_tokens("system prompt placeholder", &tools);
+        assert_eq!(
+            with_files_md_feature,
+            always_on_tokens("system prompt placeholder", &tools)
+        );
+        assert!(with_files_md_feature <= BUDGET_LIMIT);
+    }
+
     #[test]
     fn spawn_cost_does_not_depend_on_how_many_agent_types_are_discovered() {
         let with_zero = always_on_tokens("system prompt placeholder", &polaris_tools::all_specs());

@@ -100,6 +100,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-skills/src`
 
+- `agent_type.rs` — subagent 型の定義（`agents/<type>/SKILL.md`）の解析と discovery。
 - `discovery.rs` — Skill discovery. A single corrupt skill must not take down the whole
 - `frontmatter.rs` — SKILL.md frontmatter parsing. Validates only the constraints the specification lays down; adds no constraints of its own.
 - `lib.rs` — Loading of skills that conform to the Agent Skills specification. Adds no frontmatter fields of its own.

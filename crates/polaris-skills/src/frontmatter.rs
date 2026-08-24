@@ -26,7 +26,7 @@ pub enum SkillError {
 }
 
 /// The specification's naming rule: lowercase alphanumerics and hyphens only, no leading or trailing hyphen, no consecutive hyphens, 1 to 64 characters.
-fn name_is_valid(name: &str) -> bool {
+pub(crate) fn name_is_valid(name: &str) -> bool {
     if name.is_empty() || name.chars().count() > NAME_MAX {
         return false;
     }
@@ -100,7 +100,11 @@ fn join_block(block_lines: &[&str], fold: bool) -> String {
 /// cannot be interpreted with confidence, so rather than fabricate a value
 /// this returns `SkillError::UnsupportedSyntax`. Unknown keys themselves are
 /// silently skipped — the specification allows optional fields.
-fn field(lines: &[&str], key: &'static str, skill: &str) -> Result<Option<String>, SkillError> {
+pub(crate) fn field(
+    lines: &[&str],
+    key: &'static str,
+    skill: &str,
+) -> Result<Option<String>, SkillError> {
     for (i, line) in lines.iter().enumerate() {
         let Some(rest) = line.strip_prefix(key) else {
             continue;
@@ -145,6 +149,54 @@ fn field(lines: &[&str], key: &'static str, skill: &str) -> Result<Option<String
         return Ok(Some(combined));
     }
     Ok(None)
+}
+
+/// `parse` の前半——`---` 区切りを見つけてフロントマター本体を行配列に
+/// 分解し、本文と共に返す。`name`/`description` の抽出はまだ行わない。
+/// `agent_type.rs` が `allowed-tools`/`metadata` を読むために、この行
+/// 配列がもう一度必要になる。
+pub(crate) fn front_lines_and_body<'a>(
+    text: &'a str,
+    dir_name: &str,
+) -> Result<(Vec<&'a str>, String), SkillError> {
+    let rest = text
+        .strip_prefix("---")
+        .ok_or_else(|| SkillError::NoFrontmatter {
+            skill: dir_name.to_string(),
+        })?;
+    let rest = rest.trim_start_matches(['\r', '\n']);
+
+    let (front, after_close) = if let Some(after) = rest.strip_prefix("---") {
+        ("", after)
+    } else {
+        let end = rest
+            .find("\n---")
+            .ok_or_else(|| SkillError::NoFrontmatter {
+                skill: dir_name.to_string(),
+            })?;
+        (&rest[..end], &rest[end + 4..])
+    };
+
+    let after_close = after_close.trim_start_matches('-');
+    let body = after_close.trim_start_matches(['\r', '\n']).to_string();
+    let front_lines: Vec<&str> = front.lines().collect();
+    Ok((front_lines, body))
+}
+
+/// `agent_type.rs` が、`name`/`description` は既存の検証込みで、
+/// `allowed-tools`/`metadata` は生の行配列で、両方必要とするための橋渡し。
+pub(crate) fn parse_fields(
+    text: &str,
+    dir_name: &str,
+) -> Result<(String, String, String), SkillError> {
+    parse(text, dir_name)
+}
+
+/// `agent_type.rs` が `allowed-tools`/`metadata` を読むための行配列だけを
+/// 返す。`parse`/`parse_fields` が行う `name`/`description` の検証は
+/// 行わない——それは呼び出し側が `parse_fields` で別途行う。
+pub(crate) fn front_lines<'a>(text: &'a str, dir_name: &str) -> Result<Vec<&'a str>, SkillError> {
+    front_lines_and_body(text, dir_name).map(|(lines, _)| lines)
 }
 
 /// Parses the frontmatter and returns `(name, description, body)`.

@@ -61,6 +61,8 @@ pub struct Diff {
 
 具体的なハンク構造は`similar`クレート(新規依存、`unified_diff`/`grouped_ops`相当のAPI)の出力形式に合わせて実装時に確定する。
 
+**設計時に見つけた漏れ、ここで確定させる**: ライブイベント表示を追加しても、既存の`print_new_history`(ターン完了後に`session.messages`から履歴をまとめて印字する経路)はそのまま残る。何も手当てしないと、ツール呼び出し・ツール結果が「ライブ表示で1回・ターン完了後の一括印字でもう1回」と二重に表示されてしまう。これを避けるため、`history_lines_for`(`crates/polaris-tui/src/render.rs`)を、`Role::User`/`Role::Assistant`の**本文テキストのみ**を対象とし、`tool_calls`と`Role::Tool`メッセージは(ライブイベント側で既に表示済みのため)出力しない形に変更する。ユーザー・アシスタントの本文テキストは今まで通りターン完了後にまとめて印字する(これはライブ化のスコープ外——本文は分割送信せず、完成した1つのメッセージとして表示する)。
+
 ### 2. イベント送信経路(`crates/polaris-core/src/agent.rs`)
 
 `run`/`run_loop`/`dispatch`のシグネチャへ`events: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>`を追加する(既存の`agent_types`/`provider_pool`と同様、`Arc`ではなく`Option`——送信先が無ければ`if let Some(tx) = &events { let _ = tx.send(...); }`で無視するだけ)。`polaris-cli`(一発実行)は`None`を渡すだけで済み、既存の呼び出し・既存のテストは無修正。

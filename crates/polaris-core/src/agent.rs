@@ -544,7 +544,18 @@ async fn dispatch(
             // write本体の成否に影響させない——diff計算はベストエフォート
             // の副作用であり、読めないことがwrite自体を失敗させる理由に
             // はならない。
-            let old_content = std::fs::read_to_string(path).ok();
+            //
+            // ただし`polaris_tools::read`が常に拒否するパス(`.env`、秘密鍵
+            // 等)はここでも読まない。`Gate::check`は`SandboxMode::FullAccess`
+            // では`is_denied`を見ずに`Allowed`を返すため、素の
+            // `read_to_string`だとreadツールなら決して見せない内容が
+            // diffとして端末に出てしまう。読めなかった場合と同じ扱い
+            // (=diffなし)にして、write本体の可否には手を触れない。
+            let old_content = if polaris_tools::path_policy::is_denied(path) {
+                None
+            } else {
+                std::fs::read_to_string(path).ok()
+            };
             let result = polaris_tools::write::write(ctx.sandbox, ctx.helper, path, content)
                 .map_err(|e| e.to_string());
             if result.is_ok() {
@@ -641,6 +652,13 @@ async fn dispatch(
             name: call.name.clone(),
             detail: call.arguments.to_string(),
             ok: outcome.is_ok(),
+            // 成功なら本文、失敗ならエラーメッセージ——どちらも
+            // `Result<String, String>`の中身をそのまま渡し、短く切るのは
+            // 表示側(`format_event_for_live_print`)に任せる。
+            result: match &outcome {
+                Ok(body) => body.clone(),
+                Err(msg) => msg.clone(),
+            },
             diff: pending_diff,
         });
     }
@@ -2997,6 +3015,238 @@ print("wrote")
             ),
             "second event was not ToolFinished(read, ok: true): {second:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_finished_carries_the_real_result_text() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        std::fs::write(dir.path().join("a.txt"), "hello from the file").expect("cannot write");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({
+                            "path": dir.path().join("a.txt").display().to_string(),
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("read a.txt");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        let _started = rx.recv().await.expect("no ToolStarted");
+        let finished = rx.recv().await.expect("no ToolFinished");
+        let crate::events::AgentEvent::ToolFinished { result, .. } = finished else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        assert!(
+            result.contains("hello from the file"),
+            "the event carried no real result text: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_tool_puts_its_error_message_in_the_finished_event() {
+        let dir = tempfile::tempdir().expect("temp directory");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("read nothing");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        let _started = rx.recv().await.expect("no ToolStarted");
+        let finished = rx.recv().await.expect("no ToolFinished");
+        let crate::events::AgentEvent::ToolFinished { ok, result, .. } = finished else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        assert!(!ok);
+        assert!(
+            result.contains("path is missing"),
+            "the failure message was not carried: {result:?}"
+        );
+    }
+
+    /// `FullAccess`では`Gate::predict`が`is_denied`を見る前に`Allowed`を
+    /// 返す。diff用の事前readがその隙を突いて`.env`の中身を端末に流さない
+    /// ことを固定する。
+    #[tokio::test]
+    async fn a_write_to_a_denied_path_does_not_echo_its_old_content_in_the_diff() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join(".env");
+        std::fs::write(&target, "SECRET_TOKEN=hunter2\n").expect("cannot write");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": target.display().to_string(),
+                            "content": "SECRET_TOKEN=changed\n",
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("overwrite .env");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        // `FullAccess`なので`Gate`は`.env`でも素通しする。関心は書き込みの
+        // 可否ではなく、diffに旧内容が乗らないことだけ。
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = write_helper(helper_dir.path());
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::FullAccess, &[])
+                .expect("policy");
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        let _started = rx.recv().await.expect("no ToolStarted");
+        let finished = rx.recv().await.expect("no ToolFinished");
+        let crate::events::AgentEvent::ToolFinished {
+            ok, diff, result, ..
+        } = finished
+        else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        assert!(
+            ok,
+            "the denylist must not change whether the write runs: {result}"
+        );
+        if let Some(d) = diff {
+            for line in d.hunks.iter().flat_map(|h| &h.lines) {
+                let text = match line {
+                    crate::events::DiffLine::Context(s)
+                    | crate::events::DiffLine::Added(s)
+                    | crate::events::DiffLine::Removed(s) => s,
+                };
+                assert!(
+                    !text.contains("hunter2"),
+                    "the old content of a denied path leaked into the diff: {text:?}"
+                );
+            }
+            assert_eq!(d.removed, 0, "no old line may be read back from .env");
+        }
     }
 
     /// A generic success helper for `edit`: discards its payload and

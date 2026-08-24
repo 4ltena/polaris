@@ -7,7 +7,6 @@ pub mod budget;
 pub mod config;
 pub mod constitution;
 mod dir_watch;
-#[allow(dead_code)]
 mod events;
 mod files_md;
 mod gitignore;

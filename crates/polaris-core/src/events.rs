@@ -13,6 +13,10 @@ pub enum AgentEvent {
         name: String,
         detail: String,
         ok: bool,
+        /// ツールの実行結果本文。成功なら`Ok(String)`の中身、失敗なら
+        /// `Err(String)`のメッセージ——どちらもTUIが短いプレビューを
+        /// 出すためだけに使う。
+        result: String,
         diff: Option<Diff>,
     },
     SpawnStarted {
@@ -45,6 +49,14 @@ pub struct Diff {
     pub removed: usize,
 }
 
+/// 差分計算に与える時間の上限。`dispatch`は非同期ランタイムのスレッド上で
+/// 同期的にこの関数を呼ぶため、上限がないと巨大ファイルの全面書き換え
+/// (Myers差分はO(N·D)で、全面置換ではD≈N)が終わるまでTUI全体——ステータス
+/// 表示、Escによる中断、イベントのライブ出力——が止まる。`similar`の
+/// deadlineは期限を過ぎると近似解に切り替えるので、精度を落として応答性を
+/// 保つ方向に劣化する。
+const DIFF_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// `old`/`new`を行単位で比較し、前後3行のコンテキスト付きハンク列を返す。
 /// `is_new_file`は常に`false`で返す——ファイルが実際に新規かどうかは
 /// 呼び出し側(`dispatch`、Task 3)が知っている情報であり、ここでは
@@ -52,7 +64,9 @@ pub struct Diff {
 pub fn compute_diff(old: &str, new: &str) -> Diff {
     use similar::{ChangeTag, TextDiff};
 
-    let text_diff = TextDiff::from_lines(old, new);
+    let text_diff = TextDiff::configure()
+        .timeout(DIFF_TIME_BUDGET)
+        .diff_lines(old, new);
     let mut hunks = Vec::new();
     let mut added = 0usize;
     let mut removed = 0usize;
@@ -61,7 +75,10 @@ pub fn compute_diff(old: &str, new: &str) -> Diff {
         let mut lines = Vec::new();
         for op in &group {
             for change in text_diff.iter_changes(op) {
-                let text = change.value().trim_end_matches('\n').to_string();
+                // `\r`も落とす。CRLF入力で`\r`が残るとTUIの`sanitize`が
+                // 制御文字として`�`に置き換え、全行の末尾に化けた文字が
+                // 並ぶ。
+                let text = change.value().trim_end_matches(['\r', '\n']).to_string();
                 match change.tag() {
                     ChangeTag::Equal => lines.push(DiffLine::Context(text)),
                     ChangeTag::Insert => {
@@ -111,6 +128,17 @@ mod tests {
         let diff = compute_diff("", "a\nb\nc\n");
         assert_eq!(diff.added, 3);
         assert_eq!(diff.removed, 0);
+    }
+
+    #[test]
+    fn crlf_input_leaves_no_carriage_return_on_any_diff_line() {
+        let diff = compute_diff("a\r\nb\r\nc\r\n", "a\r\nB\r\nc\r\n");
+        for line in diff.hunks.iter().flat_map(|h| &h.lines) {
+            let text = match line {
+                DiffLine::Context(s) | DiffLine::Added(s) | DiffLine::Removed(s) => s,
+            };
+            assert!(!text.contains('\r'), "a CR survived in {text:?}");
+        }
     }
 
     #[test]

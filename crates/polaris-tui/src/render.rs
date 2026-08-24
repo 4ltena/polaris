@@ -116,6 +116,46 @@ const MAX_DIFF_LINES_SHOWN: usize = 40;
 /// before the rest is elided with a `...` row.
 const SPAWN_TASK_PREVIEW_LINES: usize = 5;
 
+/// A tool result's live preview, already sanitized and split into rows.
+/// Empty when the result carries nothing worth a row (an empty body, or a
+/// body of nothing but whitespace).
+///
+/// The truncation matches the batch-print era's `format_tool_result`: tabs
+/// expanded first so the budget is spent on what is actually rendered, then
+/// `TOOL_RESULT_PREVIEW_CHARS` characters, then `...` if anything was cut.
+/// Rows are capped at `SPAWN_TASK_PREVIEW_LINES` for the same reason they
+/// are there — the character budget alone still lets 200 newlines through.
+fn format_tool_result_preview(result: &str) -> Vec<String> {
+    if result.trim().is_empty() {
+        return Vec::new();
+    }
+    let expanded = result.replace('\t', "    ");
+    let preview: String = expanded.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
+    let body = if expanded.chars().count() > TOOL_RESULT_PREVIEW_CHARS {
+        format!("  → {preview}...")
+    } else {
+        format!("  → {preview}")
+    };
+    let sanitized = sanitize(&body);
+    let all: Vec<&str> = sanitized.split('\n').collect();
+    let shown = all.len().min(SPAWN_TASK_PREVIEW_LINES);
+    let mut rows: Vec<String> = all[..shown]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                (*line).to_string()
+            } else {
+                format!("    {line}")
+            }
+        })
+        .collect();
+    if all.len() > shown {
+        rows.push("    ...".to_string());
+    }
+    rows
+}
+
 /// Turns an `AgentEvent` into lines printable the moment it arrives,
 /// mid-turn. A write/edit `ToolFinished` carrying a `diff` renders its
 /// added/removed lines (capped at `MAX_DIFF_LINES_SHOWN`, combined across
@@ -130,12 +170,25 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
                 &format!("⏺ {name}({preview})"),
             ))))]
         }
-        AgentEvent::ToolFinished { ok, diff, .. } => {
+        AgentEvent::ToolFinished {
+            ok, result, diff, ..
+        } => {
             let marker = if *ok { "done" } else { "failed" };
             let mut lines = vec![HistoryLine::plain(Line::from(Span::styled(
                 format!("  {marker}"),
                 Style::default().add_modifier(Modifier::DIM),
             )))];
+            // 結果本文の短いプレビュー。切り詰め方はバッチ表示時代の
+            // `format_tool_result`と同じ——タブを展開してから
+            // `TOOL_RESULT_PREVIEW_CHARS`文字で切り、続きがあれば`...`。
+            // `sanitize`は`\n`を残すので、1行=1行分の枠しかない
+            // `HistoryLine`に流し込む前に行へ割る。
+            for row in format_tool_result_preview(result) {
+                lines.push(HistoryLine::plain(Line::from(Span::styled(
+                    row,
+                    Style::default().add_modifier(Modifier::DIM),
+                ))));
+            }
             if let Some(d) = diff {
                 let kind = if d.is_new_file { "Created" } else { "Updated" };
                 lines.push(HistoryLine::plain(Line::from(Span::styled(
@@ -1577,6 +1630,7 @@ mod tests {
             name: "bash".to_string(),
             detail: "hello".to_string(),
             ok: true,
+            result: String::new(),
             diff: None,
         });
         assert!(ok.contains("done"));
@@ -1584,9 +1638,84 @@ mod tests {
             name: "bash".to_string(),
             detail: "boom".to_string(),
             ok: false,
+            result: String::new(),
             diff: None,
         });
         assert!(failed.contains("failed"));
+    }
+
+    #[test]
+    fn a_tool_finished_event_previews_its_result_text() {
+        let text = live_print_text(&AgentEvent::ToolFinished {
+            name: "read".to_string(),
+            detail: "{\"path\":\"a.txt\"}".to_string(),
+            ok: true,
+            result: "     1\thello from the file".to_string(),
+            diff: None,
+        });
+        assert!(text.contains("done"));
+        assert!(text.contains("hello from the file"));
+        // タブは展開されてから切り詰められる
+        assert!(!text.contains('\t'));
+    }
+
+    #[test]
+    fn a_long_tool_result_preview_is_truncated_at_the_shared_budget() {
+        let text = live_print_text(&AgentEvent::ToolFinished {
+            name: "bash".to_string(),
+            detail: "{}".to_string(),
+            ok: true,
+            result: "x".repeat(TOOL_RESULT_PREVIEW_CHARS * 3),
+            diff: None,
+        });
+        assert!(text.contains(&"x".repeat(TOOL_RESULT_PREVIEW_CHARS)));
+        assert!(!text.contains(&"x".repeat(TOOL_RESULT_PREVIEW_CHARS + 1)));
+        assert!(text.contains("..."));
+    }
+
+    #[test]
+    fn a_failed_tool_previews_its_error_message() {
+        let text = live_print_text(&AgentEvent::ToolFinished {
+            name: "write".to_string(),
+            detail: "{}".to_string(),
+            ok: false,
+            result: "permission denied".to_string(),
+            diff: None,
+        });
+        assert!(text.contains("failed"));
+        assert!(text.contains("permission denied"));
+    }
+
+    #[test]
+    fn an_empty_tool_result_adds_no_preview_row() {
+        let lines = format_event_for_live_print(&AgentEvent::ToolFinished {
+            name: "write".to_string(),
+            detail: "{}".to_string(),
+            ok: true,
+            result: String::new(),
+            diff: None,
+        });
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn a_multiline_tool_result_preview_is_split_into_rows_and_capped() {
+        let lines = format_event_for_live_print(&AgentEvent::ToolFinished {
+            name: "bash".to_string(),
+            detail: "{}".to_string(),
+            ok: true,
+            result: (0..50)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            diff: None,
+        });
+        for l in &lines {
+            let text: String = l.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(!text.contains('\n'), "a row still carries a newline");
+        }
+        // done行 + プレビュー(最大SPAWN_TASK_PREVIEW_LINES行 + 省略行)
+        assert!(lines.len() <= 1 + SPAWN_TASK_PREVIEW_LINES + 1);
     }
 
     #[test]
@@ -1607,6 +1736,7 @@ mod tests {
             name: "write".to_string(),
             detail: "{\"path\":\"a.txt\"}".to_string(),
             ok: true,
+            result: String::new(),
             diff: Some(diff),
         };
         let joined = live_print_text(&event);
@@ -1630,6 +1760,7 @@ mod tests {
             name: "write".to_string(),
             detail: "{\"path\":\"big.txt\"}".to_string(),
             ok: true,
+            result: String::new(),
             diff: Some(diff),
         };
         let lines = format_event_for_live_print(&event);

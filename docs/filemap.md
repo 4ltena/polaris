@@ -11,6 +11,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `.`
 
+- `CHANGELOG.md` — 変更履歴
 - `Cargo.toml` — workspace definition and shared dependencies
 - `README.md` — polaris
 - `rust-toolchain.toml` — pinned toolchain
@@ -21,6 +22,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-auth/src`
 
+- `api_key.rs` — Storage for a plain OpenAI API key at `~/.polaris/api_key.json`.
 - `lib.rs` — Lifecycle of ChatGPT subscription auth (OAuth) and storage of credentials.
 - `login.rs` — Building the authorization URL, and receiving the callback exactly once.
 - `pkce.rs` — PKCE (RFC 7636) verifier and challenge.
@@ -122,6 +124,22 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `bm25.rs` — BM25 ランキング。トークナイズ・語幹化・同義語展開・スコアリングだけを
 - `near_universal.rs` — 「ほぼ常に関連する」skill の選定。BM25 のスコアリングを一切知らず、
 
+## `crates/polaris-tui`
+
+- `Cargo.toml` — manifest for the polaris-tui crate
+
+## `crates/polaris-tui/src`
+
+- `approver.rs` — The `Approver` that runs inside the TUI: draws a modal over the current
+- `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from
+- `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
+- `onboarding.rs` — The onboarding screen: shown by `polaris-cli` when the interactive TUI
+- `persist.rs` — Session persistence: one JSON `Message` per line.
+- `render.rs` — Pure rendering: turns a `Session` + input state into terminal cells.
+- `sessions.rs` — Enumerates saved conversations under `~/.polaris/sessions/` for the
+- `slash.rs` — Slash commands: local, client-side commands recognized when the input
+- `time.rs` — A tiny, dependency-free UTC timestamp formatter — just enough to
+
 ## `docs`
 
 - `filemap.md` — File map
@@ -138,9 +156,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-18-polaris-m25-codex-provider.md` — polaris M2.5 Codex プロバイダ 実装計画
 - `2026-08-20-polaris-m3b-bm25-skill-router.md` — polaris M3b BM25 skill ルータ 実装計画
 - `2026-08-20-polaris-m4-core.md` — polaris M4 コア（`spawn` と単一波オーケストレーション）実装計画
+- `2026-08-21-polaris-tui-onboarding.md` — polaris TUI Onboarding Screen Implementation Plan
+- `2026-08-21-polaris-tui-v2.md` — polaris TUI v2 Implementation Plan
+- `2026-08-21-polaris-tui.md` — polaris TUI Implementation Plan
 
 ## `docs/superpowers/specs`
 
 - `2026-08-16-polaris-harness-design.md` — polaris 設計仕様
 - `2026-08-18-polaris-codex-provider-design.md` — polaris Codex プロバイダ 設計
 - `2026-08-20-polaris-skill-bm25-router-design.md` — polaris skill ルータ BM25 化 設計
+- `2026-08-21-polaris-tui-design.md` — polaris TUI 設計
+- `2026-08-21-polaris-tui-onboarding-design.md` — polaris TUI 初回起動オンボーディング画面 設計
+- `2026-08-21-polaris-tui-v2-design.md` — polaris TUI v2 設計

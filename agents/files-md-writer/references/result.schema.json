@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "required": ["path", "status"],
+  "properties": {
+    "path": { "type": "string" },
+    "status": { "type": "string", "enum": ["ok"] }
+  }
+}

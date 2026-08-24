@@ -454,4 +454,20 @@ mod tests {
         assert_eq!(d.skipped.len(), 1);
         assert_eq!(d.skipped[0].dir_name, "broken");
     }
+
+    #[test]
+    fn discover_agent_types_in_finds_the_files_md_writer_type() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let agents_dir = repo_root.join("agents");
+        let d = discover_agent_types_in(&[agents_dir]);
+        assert!(
+            d.agent_types.iter().any(|a| a.name == "files-md-writer"),
+            "files-md-writer not found among: {:?}",
+            d.agent_types.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+        assert!(d.skipped.is_empty(), "unexpected skips: {:?}", d.skipped);
+    }
 }

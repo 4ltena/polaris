@@ -40,6 +40,15 @@ impl Named for polaris_skills::Skill {
     }
 }
 
+impl Named for polaris_skills::AgentType {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
 mod bm25;
 mod near_universal;
 

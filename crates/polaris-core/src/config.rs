@@ -9,12 +9,17 @@ use serde::Deserialize;
 pub struct Config {
     /// Additional places to look for skills. Not included in the 2 default locations.
     pub skills_paths: Vec<PathBuf>,
+    /// Additional places to look for subagent types. Not included in the 2 default locations
+    /// (`<project_root>/agents`, `<HOME>/.polaris/agents`).
+    pub agents_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     skills: RawSkills,
+    #[serde(default)]
+    agents: RawAgents,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -24,6 +29,13 @@ struct RawSkills {
     /// (= override the prior stage with an empty list). Leaving this as a
     /// plain `Vec` would make the two indistinguishable, taking away the
     /// project's ability to deliberately empty out the global list.
+    #[serde(default)]
+    paths: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAgents {
+    /// Same `None` vs `Some(vec![])` distinction as `RawSkills::paths`.
     #[serde(default)]
     paths: Option<Vec<PathBuf>>,
 }
@@ -71,10 +83,13 @@ fn read_one(path: &Path) -> Result<Option<RawConfig>, ConfigError> {
 pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Config, ConfigError> {
     let mut merged = Config::default();
     for path in [global, project].into_iter().flatten() {
-        if let Some(raw) = read_one(path)?
-            && let Some(paths) = raw.skills.paths
-        {
-            merged.skills_paths = paths;
+        if let Some(raw) = read_one(path)? {
+            if let Some(paths) = raw.skills.paths {
+                merged.skills_paths = paths;
+            }
+            if let Some(paths) = raw.agents.paths {
+                merged.agents_paths = paths;
+            }
         }
     }
     Ok(merged)
@@ -156,6 +171,12 @@ mod tests {
             "explicit empty list did not override the global one: {:?}",
             c.skills_paths
         );
+    }
+
+    #[test]
+    fn agents_paths_defaults_to_empty_when_the_key_is_absent() {
+        let cfg = Config::default();
+        assert!(cfg.agents_paths.is_empty());
     }
 
     #[test]

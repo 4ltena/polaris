@@ -502,6 +502,11 @@ async fn main() -> ExitCode {
         eprintln!("{line}");
     }
 
+    let discovered_agents = polaris_skills::discover_agent_types(&cwd, &config.agents_paths);
+    for s in &discovered_agents.skipped {
+        eprintln!("agent type skipped: {s}");
+    }
+
     // What rides along on every turn is assembled here exactly once. The
     // assembly itself lives in polaris-core, and the budget tests call the
     // same function. Reassembling or appending to it here would make what

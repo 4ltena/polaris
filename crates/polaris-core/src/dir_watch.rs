@@ -5,38 +5,32 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)]
 const SKIP_DIR_NAMES: &[&str] = &[".git", "target", "node_modules"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct DirSnapshot {
     pub dirs: BTreeSet<PathBuf>,
     pub files: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct DirChanges {
     pub new_dirs: Vec<PathBuf>,
     pub new_files_in_existing_dirs: Vec<PathBuf>,
 }
 
-#[allow(dead_code)]
 pub(crate) fn snapshot_recursive(root: &Path) -> DirSnapshot {
     let mut out = DirSnapshot::default();
     walk(root, &mut out, true);
     out
 }
 
-#[allow(dead_code)]
 pub(crate) fn snapshot_shallow(dir: &Path) -> DirSnapshot {
     let mut out = DirSnapshot::default();
     walk(dir, &mut out, false);
     out
 }
 
-#[allow(dead_code)]
 fn walk(dir: &Path, out: &mut DirSnapshot, recurse: bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -64,7 +58,30 @@ fn walk(dir: &Path, out: &mut DirSnapshot, recurse: bool) {
     }
 }
 
-#[allow(dead_code)]
+/// ツール呼び出しの前後で何をスキャンするかという「対象範囲」と、その
+/// 範囲が再帰スキャンか1階層スキャンかを1つの型にまとめる。呼び出し側
+/// (`agent::run_loop`)が `bash` か `write`/`edit` かで作り分け、事後の
+/// 再スキャンはこの型が自分の種別を覚えているので、呼び出し側は同じ分岐
+/// を二度書かなくてよい——前後で違う種別のスキャンを取ってしまえば差分
+/// はまるごと嘘になるので、その分岐を1箇所に閉じ込めることそのものが
+/// この型の存在理由である。
+pub(crate) enum ScanScope {
+    Recursive(PathBuf),
+    Shallow(PathBuf),
+    /// スキャンすべき対象がない場合。`bash` かつ書込許可ルートを持たない
+    /// (read-only / full-access)場合や、`write`/`edit` の `path` 引数が
+    /// 読めない場合がこれにあたる。
+    None,
+}
+
+pub(crate) fn snapshot_for_scope(scope: &ScanScope) -> DirSnapshot {
+    match scope {
+        ScanScope::Recursive(root) => snapshot_recursive(root),
+        ScanScope::Shallow(dir) => snapshot_shallow(dir),
+        ScanScope::None => DirSnapshot::default(),
+    }
+}
+
 pub(crate) fn diff(before: &DirSnapshot, after: &DirSnapshot) -> DirChanges {
     let new_dirs: Vec<PathBuf> = after.dirs.difference(&before.dirs).cloned().collect();
     let new_dir_set: BTreeSet<&PathBuf> = new_dirs.iter().collect();
@@ -125,6 +142,29 @@ mod tests {
         assert!(snap.files.contains(&root.path().join("top.txt")));
         assert!(snap.dirs.contains(&root.path().join("sub")));
         assert!(!snap.files.contains(&root.path().join("sub/deep.txt")));
+    }
+
+    #[test]
+    fn a_none_scope_scans_nothing_at_all() {
+        // The scope `bash` gets when there is no writable root to watch.
+        // It has to come back empty rather than falling back to scanning
+        // something — an empty snapshot on both sides yields an empty
+        // diff, which is exactly "nothing observed".
+        let snap = snapshot_for_scope(&ScanScope::None);
+        assert_eq!(snap, DirSnapshot::default());
+    }
+
+    #[test]
+    fn a_scope_remembers_whether_it_is_recursive_or_shallow() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("sub/deep.txt"), "x").unwrap();
+
+        let recursive = snapshot_for_scope(&ScanScope::Recursive(root.path().to_path_buf()));
+        let shallow = snapshot_for_scope(&ScanScope::Shallow(root.path().to_path_buf()));
+
+        assert!(recursive.files.contains(&root.path().join("sub/deep.txt")));
+        assert!(!shallow.files.contains(&root.path().join("sub/deep.txt")));
     }
 
     #[test]

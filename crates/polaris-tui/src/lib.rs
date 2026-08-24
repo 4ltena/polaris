@@ -57,6 +57,12 @@ pub struct RunArgs<'a> {
     pub skills: &'a [Skill],
     /// The subagent types `spawn` can resolve a task against.
     pub agent_types: &'a [polaris_skills::AgentType],
+    /// How many `spawn` tasks a single wave may run concurrently, and how
+    /// many of those may hold a `write_root` at once — from
+    /// `Config::spawn_concurrency` / `Config::spawn_write_concurrency`
+    /// (see `polaris_core::config`).
+    pub spawn_concurrency: usize,
+    pub spawn_write_concurrency: usize,
 }
 
 /// Collapses a leading `$HOME` to `~`, for the footer only (see
@@ -552,6 +558,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 args.skills,
                 args.agent_types,
                 args.provider.clone(),
+                args.spawn_concurrency,
+                args.spawn_write_concurrency,
                 &mut ctx,
             );
             tokio::pin!(agent_future);

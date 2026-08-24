@@ -1531,6 +1531,7 @@ name = "polaris-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "polaris-provider",
  "polaris-sandbox",
  "polaris-skills",

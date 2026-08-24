@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use polaris_provider::Provider;
 use polaris_sandbox::{SandboxMode, SandboxPolicy};
@@ -92,6 +92,12 @@ pub async fn run_one(
         // audit handles are simply the ones it was given.
         &[],
         provider.clone(),
+        // A subagent's tool list never contains `spawn` (depth is fixed
+        // at 1 — see above), so these two never actually gate anything
+        // for it; the constants are passed only because `run_loop`'s
+        // signature requires some value.
+        DEFAULT_CONCURRENCY,
+        DEFAULT_WRITE_CONCURRENCY,
         &agent.name,
         &mut ctx,
     )
@@ -132,6 +138,8 @@ pub async fn run_one(
                     &[],
                     &[],
                     provider.clone(),
+                    DEFAULT_CONCURRENCY,
+                    DEFAULT_WRITE_CONCURRENCY,
                     &agent.name,
                     &mut ctx2,
                 )
@@ -199,17 +207,50 @@ fn resolve_subagent_sandbox(
     }
 }
 
-/// One wave. Task 9 runs the wave sequentially; Task 10 parallelizes it
-/// and adds write-target collision checking.
+/// The default number of tasks a wave may run concurrently, and the
+/// (tighter) default among those that hold a `write_root`. Both are
+/// overridable via `Config::spawn_concurrency` /
+/// `Config::spawn_write_concurrency` — see `config.rs`.
+pub const DEFAULT_CONCURRENCY: usize = 8;
+pub const DEFAULT_WRITE_CONCURRENCY: usize = 4;
+
+/// One wave, run in parallel (Task 10 — Task 9 ran it sequentially), with
+/// write-target collision checking upfront.
 ///
 /// The result is a JSON array with exactly one entry per task, in the
-/// order the tasks were given. It is built with `serde_json` rather than
-/// by joining formatted lines, because a subagent's own output is only
-/// guaranteed to *match its schema* — nothing stops it from containing a
-/// newline, or text shaped exactly like another task's entry. Hand-framed
-/// `"{type}: {text}"` lines would let one subagent forge an entry
-/// attributed to a type that never ran; inside a JSON array such content
-/// can only ever be a string value belonging to the entry it came from.
+/// order the tasks were given — *task* order, not completion order, since
+/// the tasks are polled concurrently and may finish in any order, and the
+/// array's shape must not depend on scheduling. `futures_util::join_all`
+/// guarantees this: it returns each future's output in the order the
+/// futures were given it, whatever order they actually complete in. It is
+/// built with `serde_json` rather than by joining formatted lines, because
+/// a subagent's own output is only guaranteed to *match its schema* —
+/// nothing stops it from containing a newline, or text shaped exactly
+/// like another task's entry. Hand-framed `"{type}: {text}"` lines would
+/// let one subagent forge an entry attributed to a type that never ran;
+/// inside a JSON array such content can only ever be a string value
+/// belonging to the entry it came from.
+///
+/// Deliberately *not* `tokio::spawn`, despite `spawn`'s obvious name
+/// association with this function: `ToolContext::approver` is a `&mut dyn
+/// Approver`, and a plain `dyn Trait` (no `+ Send` bound — nothing else in
+/// this codebase needs one) cannot cross the `Send + 'static` boundary
+/// `tokio::spawn` requires. `join_all` instead polls every task's future
+/// concurrently within this one async call — genuine concurrency for the
+/// `.await` points that dominate a task's wall-clock time (provider round
+/// trips), just not literal OS-thread parallelism. That is what the
+/// `Semaphore`s below bound either way: how many tasks may be *in
+/// flight*, not how many OS threads run them.
+///
+/// When two or more tasks in the wave declare the same `write_root`, the
+/// whole wave is rejected before any task runs — running some of them
+/// concurrently against the same writable root would race, and there is
+/// no way to retroactively undo the ones that already started. That
+/// rejection is not one of the per-task entries above (nothing ran, so
+/// there is nothing to attribute it to); it is its own small JSON object,
+/// `{"ok": false, "error": "..."}`, kept as real JSON rather than a bare
+/// string so callers never have to special-case parsing the wave result.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_wave(
     tasks: Vec<SpawnTask>,
     agent_types: &[AgentType],
@@ -217,38 +258,77 @@ pub async fn run_wave(
     audit: Arc<Mutex<AuditLog>>,
     base_sandbox: &SandboxPolicy,
     helper: &Path,
+    concurrency: usize,
+    write_concurrency: usize,
 ) -> String {
-    let mut entries = Vec::with_capacity(tasks.len());
-    for task in &tasks {
-        let outcome = run_one(
-            task,
-            agent_types,
-            provider.clone(),
-            audit.clone(),
-            base_sandbox,
-            helper,
-        )
-        .await;
-        entries.push(match outcome {
+    if let Err(msg) = check_no_write_root_overlap(&tasks) {
+        return serde_json::json!({ "ok": false, "error": msg }).to_string();
+    }
+
+    let total_permits = Semaphore::new(concurrency);
+    let write_permits = Semaphore::new(write_concurrency);
+
+    let futures = tasks.iter().map(|task| {
+        let provider = provider.clone();
+        let audit = audit.clone();
+        let total_permits = &total_permits;
+        let write_permits = &write_permits;
+        let needs_write = task.write_root.is_some();
+        async move {
+            // Held across `run_one`'s whole `.await` — that is the point:
+            // the permit bounds how many tasks are *running* at once, not
+            // how many have merely been polled for the first time.
+            let _total = total_permits.acquire().await.expect("semaphore closed");
+            let _write = if needs_write {
+                Some(write_permits.acquire().await.expect("semaphore closed"))
+            } else {
+                None
+            };
+            let outcome = run_one(task, agent_types, provider, audit, base_sandbox, helper).await;
             // A successful result has already been parsed as JSON by
             // `validate_output`, so it is embedded as the structure it is
             // rather than as a string holding an escaped copy of itself.
             // The fallback cannot be reached from `run_one`'s success
             // path; it exists so that this function never has to unwrap.
-            TaskOutcome::Ok(text) => serde_json::json!({
-                "type": task.agent_type,
-                "ok": true,
-                "result": serde_json::from_str::<serde_json::Value>(&text)
-                    .unwrap_or(serde_json::Value::String(text)),
-            }),
-            TaskOutcome::Failed(msg) => serde_json::json!({
-                "type": task.agent_type,
-                "ok": false,
-                "error": msg,
-            }),
-        });
-    }
+            match outcome {
+                TaskOutcome::Ok(text) => serde_json::json!({
+                    "type": task.agent_type,
+                    "ok": true,
+                    "result": serde_json::from_str::<serde_json::Value>(&text)
+                        .unwrap_or(serde_json::Value::String(text)),
+                }),
+                TaskOutcome::Failed(msg) => serde_json::json!({
+                    "type": task.agent_type,
+                    "ok": false,
+                    "error": msg,
+                }),
+            }
+        }
+    });
+
+    let entries: Vec<serde_json::Value> = futures_util::future::join_all(futures).await;
     serde_json::Value::Array(entries).to_string()
+}
+
+/// Rejects a wave upfront, before any task runs, if two or more tasks
+/// declare the same `write_root`. Concurrent tasks racing against the
+/// same writable root is exactly what parallelizing the wave must not
+/// permit — checked before any task is polled, so a rejected wave never
+/// leaves a partially-run state behind.
+fn check_no_write_root_overlap(tasks: &[SpawnTask]) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for t in tasks {
+        let Some(root) = t.write_root.as_deref() else {
+            continue;
+        };
+        if seen.contains(&root) {
+            return Err(format!(
+                "spawn rejected: overlapping write_root {root:?} across tasks in the same wave"
+            ));
+        }
+        seen.push(root);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -648,6 +728,8 @@ mod tests {
             audit_in(dir.path()),
             &full_access(),
             Path::new("/bin/true"),
+            DEFAULT_CONCURRENCY,
+            DEFAULT_WRITE_CONCURRENCY,
         )
         .await;
 
@@ -692,6 +774,8 @@ mod tests {
             audit_in(dir.path()),
             &full_access(),
             Path::new("/bin/true"),
+            DEFAULT_CONCURRENCY,
+            DEFAULT_WRITE_CONCURRENCY,
         )
         .await;
 
@@ -713,5 +797,187 @@ mod tests {
         assert_eq!(entries[1]["type"], "file-inspector");
         assert_eq!(entries[1]["ok"], true);
         assert_eq!(entries[1]["result"]["responsibility"], "The entry point.");
+    }
+
+    // --- Task 10 fixtures: parallel execution and write-root collision. ---
+    //
+    // Module-level `fn`s rather than per-test closures — Task 12 is
+    // expected to reuse fixtures like these by name.
+
+    /// A read-only type reusing `file-inspector`'s schema/body, renamed so
+    /// tests can spawn it under a name distinct from the real type.
+    fn readonly_fixture_agent_type() -> AgentType {
+        let mut a = file_inspector();
+        a.name = "ro-fixture".into();
+        a
+    }
+
+    /// A read-write type reusing `file-inspector`'s schema/body (the
+    /// schema is irrelevant to what these fixtures exercise — collision
+    /// detection and concurrency — so nothing here validates against it
+    /// unless a test's provider actually produces output).
+    fn readwrite_fixture_agent_type() -> AgentType {
+        let mut a = read_write_type();
+        a.name = "rw-fixture".into();
+        a
+    }
+
+    /// Builds a fresh audit log backed by its own temp directory, for
+    /// tests that don't otherwise need one lying around. The directory is
+    /// intentionally leaked (never removed) — it only has to outlive this
+    /// one test process, and a short-lived log file is not worth threading
+    /// a `TempDir` handle through call sites just to keep it alive.
+    fn shared_test_audit() -> Arc<Mutex<AuditLog>> {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let path = dir.path().join("audit.jsonl");
+        std::mem::forget(dir);
+        Arc::new(Mutex::new(AuditLog::open(&path).expect("cannot open")))
+    }
+
+    /// A provider that counts every call it receives and otherwise
+    /// answers with an empty response. Used where a test asserts the
+    /// provider was *not* called (or was called a specific number of
+    /// times) and does not care what it would have said.
+    struct CountingProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        reply: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CountingProvider {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(match &self.reply {
+                Some(body) => text(body),
+                None => CompletionResponse::default(),
+            })
+        }
+    }
+
+    fn counting_mock_provider(calls: Arc<std::sync::atomic::AtomicUsize>) -> CountingProvider {
+        CountingProvider { calls, reply: None }
+    }
+
+    /// Same counter, but answers with output that matches
+    /// `readonly_fixture_agent_type`'s (i.e. `file-inspector`'s) output
+    /// schema, so the wave entry for each call comes back `"ok": true`.
+    fn counting_mock_provider_returning_valid_output(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> CountingProvider {
+        CountingProvider {
+            calls,
+            reply: Some(
+                serde_json::json!({
+                    "path": "a.rs",
+                    "responsibility": "ok",
+                    "test_file": null
+                })
+                .to_string(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_write_roots_reject_the_whole_wave_without_running_any_task() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = counting_mock_provider(call_count.clone());
+        let agent_types = vec![readwrite_fixture_agent_type()];
+        let tasks = vec![
+            SpawnTask {
+                agent_type: "rw-fixture".to_string(),
+                task: "a".to_string(),
+                write_root: Some(dir.path().display().to_string()),
+            },
+            SpawnTask {
+                agent_type: "rw-fixture".to_string(),
+                task: "b".to_string(),
+                write_root: Some(dir.path().display().to_string()),
+            },
+        ];
+        let base_sandbox =
+            SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[dir.path().to_path_buf()])
+                .expect("policy");
+        let audit = shared_test_audit();
+
+        let out = run_wave(
+            tasks,
+            &agent_types,
+            Arc::new(provider),
+            audit,
+            &base_sandbox,
+            Path::new("/bin/true"),
+            DEFAULT_CONCURRENCY,
+            DEFAULT_WRITE_CONCURRENCY,
+        )
+        .await;
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the provider must not be reached once the wave is rejected: {out}"
+        );
+
+        // Not a per-task JSON array (nothing ran) — its own small JSON
+        // object, still real JSON so callers never special-case parsing.
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("rejection is not JSON: {e}: {out}"));
+        assert_eq!(parsed["ok"], false, "{out}");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .expect("the rejection carries no error text")
+                .contains("overlapping write_root"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_non_overlapping_tasks_both_run() {
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = counting_mock_provider_returning_valid_output(call_count.clone());
+        let agent_types = vec![readonly_fixture_agent_type()];
+        let tasks = vec![
+            SpawnTask {
+                agent_type: "ro-fixture".to_string(),
+                task: "a".to_string(),
+                write_root: None,
+            },
+            SpawnTask {
+                agent_type: "ro-fixture".to_string(),
+                task: "b".to_string(),
+                write_root: None,
+            },
+        ];
+        let base_sandbox = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("policy");
+        let audit = shared_test_audit();
+
+        let out = run_wave(
+            tasks,
+            &agent_types,
+            Arc::new(provider),
+            audit,
+            &base_sandbox,
+            Path::new("/bin/true"),
+            DEFAULT_CONCURRENCY,
+            DEFAULT_WRITE_CONCURRENCY,
+        )
+        .await;
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "{out}"
+        );
+
+        let entries = wave_entries(&out);
+        assert_eq!(entries.len(), 2, "one entry per task, in order: {out}");
+        assert_eq!(entries[0]["type"], "ro-fixture");
+        assert_eq!(entries[0]["ok"], true, "{out}");
+        assert_eq!(entries[1]["type"], "ro-fixture");
+        assert_eq!(entries[1]["ok"], true, "{out}");
     }
 }

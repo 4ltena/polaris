@@ -1264,4 +1264,131 @@ mod tests {
             assert_eq!(entries[i]["ok"], true, "{out}");
         }
     }
+
+    // --- Task 12: direct verification of M4 acceptance criteria that can
+    // be pinned purely by tests. Criteria 5/6 (success rate and turn count
+    // vs. Codex CLI on a fixed task set) require measurement work out of
+    // scope for this implementation plan — see `usage-measurement-clean-revert`.
+
+    /// Acceptance criterion 2: a single subagent call description stays
+    /// under 100 bytes. Pins the spec's "~60 bytes per task" estimate for a
+    /// typical call — not an upper bound the implementation enforces for
+    /// every possible input (a long enough path can still exceed it).
+    #[test]
+    fn one_task_call_description_stays_under_100_bytes() {
+        let task = serde_json::json!({
+            "type": "file-inspector",
+            "task": "crates/polaris-core/src/agent.rs"
+        });
+        let bytes = serde_json::to_string(&task).unwrap().len();
+        assert!(bytes <= 100, "task call is {bytes} bytes: {task}");
+    }
+
+    /// Acceptance criterion 3: the sandbox policy `resolve_subagent_sandbox`
+    /// builds for a read-write subagent is enforced by the real sandbox
+    /// (`polaris_sandbox::run_confined`), not merely constructed correctly
+    /// — same shape as `polaris-sandbox`'s own
+    /// `a_write_outside_the_root_is_denied_by_the_real_sandbox`.
+    #[tokio::test]
+    async fn a_readwrite_subagent_sandbox_denies_writes_outside_its_declared_root_via_the_real_sandbox()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let agent = readwrite_fixture_agent_type();
+        let task = SpawnTask {
+            agent_type: agent.name.clone(),
+            task: "x".to_string(),
+            write_root: Some(root.path().display().to_string()),
+        };
+        let base_sandbox =
+            SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()]).unwrap();
+        let sandbox = resolve_subagent_sandbox(&agent, &task, &base_sandbox).unwrap();
+
+        let target = outside.path().canonicalize().unwrap().join("nope.txt");
+        let out = polaris_sandbox::run_confined(
+            &sandbox,
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), format!("echo pwned > {}", target.display())],
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            out.status, 0,
+            "a write outside the subagent's root succeeded: {out:?}"
+        );
+        assert!(!target.exists());
+    }
+
+    /// Acceptance criterion 4: adding `spawn` to the tool catalog does not
+    /// perturb the cache-prefix invariant — `all_specs()` is a static list
+    /// (`spawn_spec()` is a constant-shaped `ToolSpec`, not derived from
+    /// `agent_types`), so repeated calls are byte-for-byte identical
+    /// regardless of what subagent types discovery happens to find. This
+    /// pins that structural fact rather than exercising new behavior.
+    #[test]
+    fn spawn_spec_is_identical_across_calls_regardless_of_discovered_agent_types() {
+        let a = polaris_tools::all_specs();
+        let b = polaris_tools::all_specs();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
+    }
+
+    /// A wave is not stopped by one task naming an unknown type: the other
+    /// task's entry is still `"ok": true`, and — checked via the call
+    /// counter, not just the JSON shape — its subagent provider was
+    /// actually invoked rather than skipped.
+    #[tokio::test]
+    async fn one_unknown_type_does_not_stop_the_other_task_in_the_wave() {
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = counting_mock_provider_returning_valid_output(call_count.clone());
+        let agent_types = vec![readonly_fixture_agent_type()];
+        let tasks = vec![
+            SpawnTask {
+                agent_type: "does-not-exist".to_string(),
+                task: "a".to_string(),
+                write_root: None,
+            },
+            SpawnTask {
+                agent_type: "ro-fixture".to_string(),
+                task: "b".to_string(),
+                write_root: None,
+            },
+        ];
+        let base_sandbox = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).unwrap();
+        let audit = shared_test_audit();
+
+        let out = run_wave(
+            tasks,
+            &agent_types,
+            Arc::new(provider),
+            audit,
+            &base_sandbox,
+            Path::new("/bin/true"),
+            DEFAULT_CONCURRENCY,
+            DEFAULT_WRITE_CONCURRENCY,
+        )
+        .await;
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the surviving task's subagent provider was not actually invoked: {out}"
+        );
+
+        let entries = wave_entries(&out);
+        assert_eq!(entries.len(), 2, "one entry per task, in order: {out}");
+        assert_eq!(entries[0]["type"], "does-not-exist");
+        assert_eq!(entries[0]["ok"], false, "{out}");
+        assert!(
+            entries[0]["error"]
+                .as_str()
+                .expect("a failed entry carries no error text")
+                .contains("unknown subagent type"),
+            "{out}"
+        );
+        assert_eq!(entries[1]["type"], "ro-fixture");
+        assert_eq!(entries[1]["ok"], true, "{out}");
+    }
 }

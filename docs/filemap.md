@@ -20,6 +20,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `SKILL.md` — SKILL.md
 
+## `agents/files-md-writer`
+
+- `SKILL.md` — files.md
+
 ## `crates/polaris-auth`
 
 - `Cargo.toml` — manifest for the polaris-auth crate

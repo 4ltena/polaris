@@ -13,6 +13,8 @@ mod dir_watch;
 // (without `cfg(test)`) where none of that applies, so without this the
 // module reads as entirely dead code.
 #[allow(dead_code)]
+mod files_md;
+#[allow(dead_code)]
 mod gitignore;
 pub mod project;
 pub mod prompt;

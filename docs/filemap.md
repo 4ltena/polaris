@@ -64,6 +64,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `config.rs` — Loads config files. Not existing is normal; being malformed is not.
 - `constitution.rs` — The part of the always-on context that the harness does not own. The
 - `dir_watch.rs` — `bash`/`write`/`edit` 呼び出しの前後でファイルシステムを比較し、新規
+- `files_md.rs` — `dir_watch` が検出した変更を、実際に `files.md` を書く subagent の
 - `gitignore.rs` — `files.md`(ハーネスが自動生成する、コミット対象外のファイル)を
 - `lib.rs` — Entry point for polaris-core. Ties together the budget, constitution, and prompt modules.
 - `project.rs` — Resolves the project root.

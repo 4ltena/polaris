@@ -1005,4 +1005,37 @@ mod named_generic_tests {
         let out = super::lookup(&items, "widget");
         assert!(out.contains("handles widget-shaped requests"), "{out}");
     }
+
+    #[test]
+    fn a_truncated_body_with_no_path_still_reads_sensibly() {
+        // `Fixture` overrides neither `body()` nor `path()`, so this
+        // exercises both `Named` defaults at once: `body()` falls back to
+        // `description()`, and `path()` stays `None`. An oversized
+        // description makes the exact-match branch actually truncate, which
+        // is the only way to reach the `match s.path() { .. }` arm in
+        // `lookup` at all -- the `None` arm has to render a sensible notice
+        // on its own, without a path to point the reader at.
+        let big_description = "x".repeat(super::MAX_BODY_BYTES + 100);
+        let items = vec![Fixture {
+            name: "widget".to_string(),
+            description: big_description.clone(),
+        }];
+        let out = super::lookup(&items, "widget");
+        assert!(
+            out.len() < big_description.len(),
+            "the body was not truncated: output {} bytes, description {} bytes",
+            out.len(),
+            big_description.len()
+        );
+        assert!(
+            out.contains("truncated"),
+            "missing wording indicating truncation: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+        assert!(
+            !out.contains("read"),
+            "mentioned reading a path even though path() returns None: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+    }
 }

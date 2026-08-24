@@ -549,6 +549,7 @@ async fn main() -> ExitCode {
                 provider.clone(),
                 config.spawn_concurrency,
                 config.spawn_write_concurrency,
+                None,
                 &mut ctx,
             )
             .await

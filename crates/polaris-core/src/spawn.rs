@@ -99,6 +99,7 @@ pub async fn run_one(
         DEFAULT_CONCURRENCY,
         DEFAULT_WRITE_CONCURRENCY,
         &agent.name,
+        None,
         &mut ctx,
     )
     .await;
@@ -151,6 +152,7 @@ pub async fn run_one(
                     DEFAULT_CONCURRENCY,
                     DEFAULT_WRITE_CONCURRENCY,
                     &agent.name,
+                    None,
                     &mut ctx2,
                 )
                 .await;

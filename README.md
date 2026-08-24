@@ -90,6 +90,100 @@ POLARIS_API_KEY=sk-... polaris -p "Cargo.toml は何行か"
 - `review` — 非対話のコードレビュー実行。one-shot 経路の上に乗せられる
   見込みだが、レビュー用プロンプトの設計を要するため今回は見送った
 
+## subagent（`spawn` ツール）
+
+`spawn` は、下請けのエージェントを1波でまとめて走らせるツールである。各
+subagent は自分専用のシステムプロンプト、許可ツールの部分集合、サンドボックス、
+ターン数と壁時計の上限を持った独立したループで動き、型が宣言した JSON Schema
+に照合済みの結果だけを親へ返す。途中で読んだファイルや失敗したツール呼び出しは
+親のコンテキストへ一切入らない。常時コンテキストを 990 トークンに保つという
+制約と、大きな調査を分担させたいという要求は本来ぶつかるが、`spawn` は後者を
+前者の外側へ追い出すことで両立させる。
+
+深さは1に固定してある。subagent へ渡すツール一覧からは `spawn` を無条件で
+除くため、subagent がさらに subagent を起動する経路は存在しない。
+
+戻り値はタスク1件につき1要素の JSON 配列で、順序は与えたタスクの順に一致する。
+
+```json
+[
+  {"type": "file-inspector", "ok": true,  "result": {"path": "src/agent.rs", "responsibility": "..."}},
+  {"type": "file-inspector", "ok": false, "error": "schema mismatch after retry (SchemaMismatch): ..."}
+]
+```
+
+同じ波の2つのタスクが重なる `write_root` を宣言した場合は、1件も走らせずに波
+全体を却下する。その場合も形は変わらず、全要素が `"ok": false` の配列を返す。
+
+### 設定
+
+`~/.polaris/config.toml` と `<project-root>/.polaris/config.toml` を読み、
+後者が優先する。
+
+| キー | 既定値 | 意味 |
+| --- | --- | --- |
+| `[agents] paths` | `[]` | subagent 型を探す追加ディレクトリ。既定の2か所（`<project-root>/agents`、`~/.polaris/agents`）は常に探すので、ここへ書くのはそれ以外の場所だけでよい。 |
+| `[spawn] concurrency` | `8` | 1波が同時に走らせるタスク数の上限。 |
+| `[spawn] write_concurrency` | `4` | 同時に走るタスクのうち、`write_root` を持つものの上限。書き込みは読み取りより I/O が競合するため `concurrency` より狭く取ってある。 |
+
+```toml
+[agents]
+paths = ["/Users/me/shared/agents"]
+
+[spawn]
+concurrency = 8
+write_concurrency = 4
+```
+
+### subagent 型の書き方
+
+1つの型は `agents/<型名>/SKILL.md` 1ファイルで定義する。ディレクトリ名と
+frontmatter の `name` は一致していなければならない。リポジトリに同梱の
+`agents/file-inspector/SKILL.md` がそのまま最小の実例である。
+
+```markdown
+---
+name: file-inspector
+description: 単一ファイルを読み取り専用で棚卸しし、責務、入出力、対応するテストを返す。
+allowed-tools: read
+metadata:
+  polaris-access: read
+  polaris-tier: low
+  polaris-wall-seconds: "360"
+  polaris-max-turns: "12"
+  polaris-continuation: "denied"
+  polaris-output: references/result.schema.json
+---
+
+あなたは単一ファイルを棚卸しする subagent である。与えられたパスを
+`read` で読み、次の JSON だけを出力として返す。他のテキストを含めない。
+```
+
+frontmatter 直後の本文が、その型のシステムプロンプトになる。`allowed-tools`
+は空白区切りで、ここに書いた名前のうち `spawn` を除いたものだけが実際に渡る。
+
+`metadata:` の6キーはすべて必須で、1つでも欠けるとその型は読み込まれず、
+起動時に理由付きで読み飛ばした旨が標準エラーへ出る。
+
+| キー | 取りうる値 | 意味 |
+| --- | --- | --- |
+| `polaris-access` | `read` / `read-write` | サンドボックスの強さ。`read` は読み取り専用で固定する。`read-write` の型は、呼び出し側が `write_root` を指定しなければ実行を拒否する。その `write_root` が親自身の書き込み可能ルートの外にある場合も拒否する。 |
+| `polaris-tier` | 任意の文字列 | 型の重さの分類。現時点では読み取るだけで、実行時の挙動には影響しない。 |
+| `polaris-wall-seconds` | 秒数 | 1タスクの壁時計上限。超えるとそのタスクだけが失敗として返る。 |
+| `polaris-max-turns` | ターン数 | 1タスクのターン上限。スキーマ不一致による1回の再試行も同じ予算から引く。 |
+| `polaris-continuation` | `denied` / `allowed` | 波をまたいだ継続の可否。下記の制限を参照。 |
+| `polaris-output` | 相対パス | 結果を照合する JSON Schema のファイル。型自身のディレクトリの内側に限る。絶対パスや `../` で外へ出る指定は読み込み時に拒否する。 |
+
+出力がスキーマに合わなかった場合、検証エラーを添えて1回だけ再試行する。2回目も
+合わなければそのタスクは失敗として返る。再試行は同じターン予算と同じ壁時計を
+引き継ぐので、`polaris-max-turns: 12` の型が実際に24ターン使うことはない。
+
+### 現時点の制限
+
+`polaris-continuation: allowed` は frontmatter として受理され `AgentType` にも
+保持されるが、実行時には参照していない。波をまたいで同じ subagent を継続させる
+経路そのものが未実装であり、`allowed` と書いても `denied` と同じ挙動になる。
+
 ## skill/plugin を大量に含めた場合の比較
 
 *skill/plugin 分類機（BM25 ルータ、`crates/polaris-tools/src/skill.rs` 以下）の版: v0.2 “Aldebaran”*

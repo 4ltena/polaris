@@ -107,6 +107,16 @@ pub async fn run_one(
         Ok(outcome) => match validate_output(agent, &outcome.text) {
             Ok(()) => TaskOutcome::Ok(outcome.text),
             Err(first_err) => {
+                // The "retry once, then stop" rule belongs to the tracker,
+                // not to this function: `observe_schema_mismatch` returns
+                // `None` on the first miss and `StopReason::SchemaMismatch`
+                // on the second. Consulting it is what keeps that rule
+                // single-sourced — counting the retries inline here left
+                // `stop.rs`'s copy of the identical policy with no call
+                // site at all, free to drift away from what actually runs.
+                if let Some(reason) = stop.observe_schema_mismatch() {
+                    return TaskOutcome::Failed(format!("{reason:?}: {first_err}"));
+                }
                 // Retry exactly once, with the validation error attached.
                 session.push_user(&format!(
                     "Your previous output did not match the required schema: {first_err}. \
@@ -147,9 +157,23 @@ pub async fn run_one(
                 match retry {
                     Ok(outcome2) => match validate_output(agent, &outcome2.text) {
                         Ok(()) => TaskOutcome::Ok(outcome2.text),
-                        Err(second_err) => TaskOutcome::Failed(format!(
-                            "schema mismatch after retry: {second_err}"
-                        )),
+                        // The second miss. The tracker, not a counter
+                        // kept here, is what declares the run over; the
+                        // reason it names is folded into the text the
+                        // model sees. The `None` arm cannot be reached
+                        // with the current rule, and exists so that
+                        // loosening that rule cannot silently turn this
+                        // into an extra attempt the type never budgeted.
+                        Err(second_err) => {
+                            TaskOutcome::Failed(match stop.observe_schema_mismatch() {
+                                Some(reason) => format!(
+                                    "schema mismatch after retry ({reason:?}): {second_err}"
+                                ),
+                                None => {
+                                    format!("schema mismatch after retry: {second_err}")
+                                }
+                            })
+                        }
                     },
                     Err(e) => TaskOutcome::Failed(e.to_string()),
                 }
@@ -255,10 +279,13 @@ pub const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 /// whole wave is rejected before any task runs — running some of them
 /// concurrently against the same writable root would race, and there is
 /// no way to retroactively undo the ones that already started. That
-/// rejection is not one of the per-task entries above (nothing ran, so
-/// there is nothing to attribute it to); it is its own small JSON object,
-/// `{"ok": false, "error": "..."}`, kept as real JSON rather than a bare
-/// string so callers never have to special-case parsing the wave result.
+/// rejection still comes back in the *same* shape as any other wave
+/// result: one entry per task, each `"ok": false` and carrying the shared
+/// rejection reason. The only consumer of this string is a model parsing
+/// it at runtime, and a second top-level shape reachable only on one
+/// failure path is exactly the kind of thing a parser gets wrong — the
+/// entries just say, truthfully, that none of these tasks produced a
+/// result and why.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_wave(
     tasks: Vec<SpawnTask>,
@@ -271,7 +298,17 @@ pub async fn run_wave(
     write_concurrency: usize,
 ) -> String {
     if let Err(msg) = check_no_write_root_overlap(&tasks) {
-        return serde_json::json!({ "ok": false, "error": msg }).to_string();
+        let entries: Vec<serde_json::Value> = tasks
+            .iter()
+            .map(|task| {
+                serde_json::json!({
+                    "type": task.agent_type,
+                    "ok": false,
+                    "error": msg,
+                })
+            })
+            .collect();
+        return serde_json::Value::Array(entries).to_string();
     }
 
     let total_permits = Semaphore::new(concurrency);
@@ -514,6 +551,15 @@ mod tests {
                 assert!(
                     e.contains("responsibility"),
                     "the reason does not name the missing field: {e}"
+                );
+                // Direct evidence that the retry budget came from
+                // `StopTracker::observe_schema_mismatch` rather than from
+                // a counter kept inline here: only the tracker produces
+                // this reason, so its name appearing in the failure means
+                // the stop condition was actually consulted.
+                assert!(
+                    e.contains("SchemaMismatch"),
+                    "the stop condition was never consulted: {e}"
                 );
             }
             TaskOutcome::Ok(b) => panic!("output not matching the schema was accepted: {b}"),
@@ -979,18 +1025,27 @@ mod tests {
             "the provider must not be reached once the wave is rejected: {out}"
         );
 
-        // Not a per-task JSON array (nothing ran) — its own small JSON
-        // object, still real JSON so callers never special-case parsing.
-        let parsed: serde_json::Value = serde_json::from_str(&out)
-            .unwrap_or_else(|e| panic!("rejection is not JSON: {e}: {out}"));
-        assert_eq!(parsed["ok"], false, "{out}");
-        assert!(
-            parsed["error"]
-                .as_str()
-                .expect("the rejection carries no error text")
-                .contains("overlapping write_root"),
-            "{out}"
-        );
+        // The same top-level shape as any other wave result: one entry
+        // per task. Nothing ran, so every entry is a failure carrying the
+        // shared rejection reason — a second shape reachable only here is
+        // what the model would have to special-case.
+        let entries = wave_entries(&out);
+        assert_eq!(entries.len(), 2, "one entry per rejected task: {out}");
+        for entry in &entries {
+            assert_eq!(entry["type"], "rw-fixture", "{out}");
+            assert_eq!(entry["ok"], false, "{out}");
+            assert!(
+                entry["error"]
+                    .as_str()
+                    .expect("the rejection carries no error text")
+                    .contains("overlapping write_root"),
+                "{out}"
+            );
+            assert!(
+                entry["result"].is_null(),
+                "a rejected task must not carry a result: {out}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1086,14 +1141,13 @@ mod tests {
             0,
             "a nested write_root escaped the overlap check: {out}"
         );
-        let parsed: serde_json::Value = serde_json::from_str(&out)
-            .unwrap_or_else(|e| panic!("rejection is not JSON: {e}: {out}"));
-        assert_eq!(parsed["ok"], false, "{out}");
+        let entries = wave_entries(&out);
+        assert_eq!(entries.len(), 2, "one entry per rejected task: {out}");
         assert!(
-            parsed["error"]
-                .as_str()
-                .expect("the rejection carries no error text")
-                .contains("overlapping write_root"),
+            entries.iter().all(|e| e["ok"] == false
+                && e["error"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("overlapping write_root"))),
             "{out}"
         );
     }

@@ -40,10 +40,21 @@ pub struct ToolContext<'a> {
     pub approver: &'a mut dyn crate::approval::Approver,
 }
 
-/// For subagents. There is nobody to ask, so this always allows. The
-/// enforcement that matters is the sandbox's writable roots (which `spawn`
-/// builds as the same object as the declaration), so allowing here does not
-/// weaken safety.
+/// The `Approver` a subagent is given. Despite the name, it does not make
+/// a subagent's writes auto-approved: `spawn` pairs it with
+/// [`crate::approval::ApprovalPolicy::Never`], and under that policy
+/// [`crate::approval::Gate::check`] returns `Err` for anything the
+/// predicate flags as needing approval *before* it ever reaches an
+/// `Approver`. So this `ask` is unreachable in production, and a subagent
+/// write outside its declared root is refused by the gate — and by the
+/// sandbox behind it, whose writable roots `spawn` builds as the same
+/// object as the declaration — rather than waved through here.
+///
+/// It exists because `ToolContext` requires *some* `Approver`, and a
+/// subagent runs in the background with nobody to prompt. `Allow` is the
+/// honest answer for the one case that could reach it (a policy other than
+/// `Never`, which `spawn` never sets): there is no user to consult, so
+/// there is no approval to report.
 pub(crate) struct AutoApprove;
 
 impl crate::approval::Approver for AutoApprove {

@@ -141,6 +141,7 @@ pub async fn run(
                 sandbox: is_mutation.then_some(ctx.sandbox),
                 target: target.as_deref(),
                 result,
+                caller: "root",
             })?;
             match outcome {
                 Ok(body) => {

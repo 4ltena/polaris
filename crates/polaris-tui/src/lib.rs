@@ -792,6 +792,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 args.provider.clone(),
                 args.spawn_concurrency,
                 args.spawn_write_concurrency,
+                None,
                 &mut ctx,
             );
             tokio::pin!(agent_future);

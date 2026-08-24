@@ -112,6 +112,7 @@ pub async fn run(
     provider_pool: Arc<dyn Provider>,
     spawn_concurrency: usize,
     spawn_write_concurrency: usize,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
     run_loop(
@@ -127,6 +128,7 @@ pub async fn run(
         spawn_concurrency,
         spawn_write_concurrency,
         "root",
+        events,
         ctx,
     )
     .await
@@ -296,6 +298,7 @@ pub(crate) async fn run_loop(
     spawn_concurrency: usize,
     spawn_write_concurrency: usize,
     caller: &str,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
     let mut usage = polaris_provider::Usage::default();
@@ -360,6 +363,7 @@ pub(crate) async fn run_loop(
                 audit.clone(),
                 spawn_concurrency,
                 spawn_write_concurrency,
+                events.clone(),
                 ctx,
             )
             .await;
@@ -497,9 +501,17 @@ async fn dispatch(
     audit: Arc<Mutex<AuditLog>>,
     spawn_concurrency: usize,
     spawn_write_concurrency: usize,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<String, String> {
-    match call.name.as_str() {
+    if let Some(tx) = &events {
+        let _ = tx.send(crate::events::AgentEvent::ToolStarted {
+            name: call.name.clone(),
+            detail: call.arguments.to_string(),
+        });
+    }
+
+    let outcome: Result<String, String> = match call.name.as_str() {
         "read" => {
             let path = call.arguments["path"]
                 .as_str()
@@ -589,7 +601,18 @@ async fn dispatch(
             .await)
         }
         other => Err(format!("unknown tool: {other}")),
+    };
+
+    if let Some(tx) = &events {
+        let _ = tx.send(crate::events::AgentEvent::ToolFinished {
+            name: call.name.clone(),
+            detail: call.arguments.to_string(),
+            ok: outcome.is_ok(),
+            diff: None, // write/editのdiffはTask 3で埋める
+        });
     }
+
+    outcome
 }
 
 #[cfg(test)]
@@ -764,6 +787,7 @@ mod tests {
             dummy_audit(&dir),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -803,6 +827,7 @@ mod tests {
             dummy_audit(&dir),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -841,6 +866,7 @@ mod tests {
             dummy_audit(&dir),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -905,6 +931,7 @@ mod tests {
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -985,6 +1012,7 @@ mod tests {
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -1033,6 +1061,7 @@ mod tests {
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -1096,6 +1125,7 @@ mod tests {
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -1166,6 +1196,7 @@ mod tests {
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -1309,6 +1340,7 @@ print("wrote")
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -1397,6 +1429,7 @@ print("wrote")
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -1514,6 +1547,7 @@ print("wrote")
                 unused_provider_pool(),
                 crate::spawn::DEFAULT_CONCURRENCY,
                 crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                None,
                 &mut ctx,
             )
             .await
@@ -1671,6 +1705,7 @@ print("wrote")
                 unused_provider_pool(),
                 crate::spawn::DEFAULT_CONCURRENCY,
                 crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                None,
                 &mut ctx,
             )
             .await
@@ -1805,6 +1840,7 @@ print("wrote")
                 unused_provider_pool(),
                 crate::spawn::DEFAULT_CONCURRENCY,
                 crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                None,
                 &mut ctx,
             )
             .await
@@ -1913,6 +1949,7 @@ print("wrote")
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -2008,6 +2045,7 @@ print("wrote")
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -2057,6 +2095,7 @@ print("wrote")
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             "root",
+            None,
             &mut ctx,
         )
         .await
@@ -2153,6 +2192,7 @@ print("wrote")
             p.clone(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -2318,6 +2358,7 @@ print("wrote")
             p.clone(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -2419,6 +2460,7 @@ print("wrote")
             p.clone(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -2498,6 +2540,7 @@ print("wrote")
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             // The only difference from the test above.
             "some-subagent",
+            None,
             &mut ctx,
         )
         .await
@@ -2710,6 +2753,7 @@ print("wrote")
             p.clone(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
@@ -2787,11 +2831,84 @@ print("wrote")
             unused_provider_pool(),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             &mut ctx,
         )
         .await
         .expect("should succeed");
 
         assert_eq!(outcome.usage.total_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn read_dispatches_tool_started_and_finished_events_in_order() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        std::fs::write(dir.path().join("a.txt"), "hello").expect("cannot write");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({
+                            "path": dir.path().join("a.txt").display().to_string(),
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("read a.txt");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        let first = rx.recv().await.expect("no first event");
+        assert!(
+            matches!(first, crate::events::AgentEvent::ToolStarted { ref name, .. } if name == "read"),
+            "first event was not ToolStarted(read): {first:?}"
+        );
+        let second = rx.recv().await.expect("no second event");
+        assert!(
+            matches!(
+                second,
+                crate::events::AgentEvent::ToolFinished { ref name, ok: true, .. } if name == "read"
+            ),
+            "second event was not ToolFinished(read, ok: true): {second:?}"
+        );
     }
 }

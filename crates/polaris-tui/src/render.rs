@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use polaris_core::AgentEvent;
+use polaris_core::{AgentEvent, DiffLine};
 use polaris_provider::Role;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -105,13 +105,21 @@ fn label(role: Role) -> &'static str {
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
+/// The most diff lines (context/added/removed, combined across all hunks)
+/// shown live for one `ToolFinished { diff: Some(_), .. }` event, before the
+/// rest is elided with a notice row — the live-print analog of
+/// `TOOL_RESULT_PREVIEW_CHARS`, bounding how much screen a single write/edit
+/// can claim mid-turn.
+const MAX_DIFF_LINES_SHOWN: usize = 40;
+
 /// How many rows one spawned subagent's task preview may claim at most,
 /// before the rest is elided with a `...` row.
 const SPAWN_TASK_PREVIEW_LINES: usize = 5;
 
 /// Turns an `AgentEvent` into lines printable the moment it arrives,
-/// mid-turn. Formatting the `diff` carried by a write/edit
-/// `ToolFinished` is Task 6's job — this ignores that field and covers
+/// mid-turn. A write/edit `ToolFinished` carrying a `diff` renders its
+/// added/removed lines (capped at `MAX_DIFF_LINES_SHOWN`, combined across
+/// all hunks) right below the done/failed marker; every other event covers
 /// only the start/finish markers for ordinary tool calls and for spawned
 /// subagents.
 pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
@@ -122,12 +130,50 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
                 &format!("⏺ {name}({preview})"),
             ))))]
         }
-        AgentEvent::ToolFinished { ok, .. } => {
+        AgentEvent::ToolFinished { ok, diff, .. } => {
             let marker = if *ok { "done" } else { "failed" };
-            vec![HistoryLine::plain(Line::from(Span::styled(
+            let mut lines = vec![HistoryLine::plain(Line::from(Span::styled(
                 format!("  {marker}"),
                 Style::default().add_modifier(Modifier::DIM),
-            )))]
+            )))];
+            if let Some(d) = diff {
+                let kind = if d.is_new_file { "Created" } else { "Updated" };
+                lines.push(HistoryLine::plain(Line::from(Span::styled(
+                    sanitize(&format!(
+                        "  {kind} — Added {} lines, removed {} lines",
+                        d.added, d.removed
+                    )),
+                    Style::default().add_modifier(Modifier::DIM),
+                ))));
+                let mut shown = 0usize;
+                'hunks: for hunk in &d.hunks {
+                    for dl in &hunk.lines {
+                        if shown >= MAX_DIFF_LINES_SHOWN {
+                            lines.push(HistoryLine::plain(Line::from(Span::styled(
+                                "  ...(省略)",
+                                Style::default().add_modifier(Modifier::DIM),
+                            ))));
+                            break 'hunks;
+                        }
+                        let (prefix, style) = match dl {
+                            DiffLine::Context(_) => {
+                                ("  ", Style::default().add_modifier(Modifier::DIM))
+                            }
+                            DiffLine::Added(_) => ("+ ", Style::default().fg(Color::Green)),
+                            DiffLine::Removed(_) => ("- ", Style::default().fg(Color::Red)),
+                        };
+                        let text = match dl {
+                            DiffLine::Context(s) | DiffLine::Added(s) | DiffLine::Removed(s) => s,
+                        };
+                        lines.push(HistoryLine::plain(Line::from(Span::styled(
+                            sanitize(&format!("{prefix}{text}")),
+                            style,
+                        ))));
+                        shown += 1;
+                    }
+                }
+            }
+            lines
         }
         AgentEvent::SpawnStarted { agent_type, task } => {
             // `task` is free-form, model-supplied prose (`spawn`'s
@@ -1541,6 +1587,58 @@ mod tests {
             diff: None,
         });
         assert!(failed.contains("failed"));
+    }
+
+    #[test]
+    fn a_tool_finished_event_with_a_diff_renders_added_and_removed_lines_with_a_header() {
+        let diff = polaris_core::Diff {
+            is_new_file: false,
+            hunks: vec![polaris_core::DiffHunk {
+                lines: vec![
+                    polaris_core::DiffLine::Context("unchanged".to_string()),
+                    polaris_core::DiffLine::Removed("old line".to_string()),
+                    polaris_core::DiffLine::Added("new line".to_string()),
+                ],
+            }],
+            added: 1,
+            removed: 1,
+        };
+        let event = AgentEvent::ToolFinished {
+            name: "write".to_string(),
+            detail: "{\"path\":\"a.txt\"}".to_string(),
+            ok: true,
+            diff: Some(diff),
+        };
+        let joined = live_print_text(&event);
+        assert!(joined.contains("Added 1 lines, removed 1 lines"));
+        assert!(joined.contains("old line"));
+        assert!(joined.contains("new line"));
+    }
+
+    #[test]
+    fn a_diff_longer_than_the_cap_is_truncated_with_a_notice() {
+        let many_added: Vec<polaris_core::DiffLine> = (0..100)
+            .map(|i| polaris_core::DiffLine::Added(format!("line {i}")))
+            .collect();
+        let diff = polaris_core::Diff {
+            is_new_file: true,
+            hunks: vec![polaris_core::DiffHunk { lines: many_added }],
+            added: 100,
+            removed: 0,
+        };
+        let event = AgentEvent::ToolFinished {
+            name: "write".to_string(),
+            detail: "{\"path\":\"big.txt\"}".to_string(),
+            ok: true,
+            diff: Some(diff),
+        };
+        let lines = format_event_for_live_print(&event);
+        // Header row + done/failed row + up to MAX_DIFF_LINES_SHOWN diff
+        // rows + one elision row — well under the 100 lines the diff
+        // itself carries.
+        assert!(lines.len() < 100);
+        let joined = live_print_text(&event);
+        assert!(joined.contains("省略"));
     }
 
     #[test]

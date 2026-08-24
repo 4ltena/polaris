@@ -514,10 +514,11 @@ async fn dispatch(
     let mut pending_diff: Option<crate::events::Diff> = None;
 
     let outcome: Result<String, String> = match call.name.as_str() {
-        "read" => {
-            let path = call.arguments["path"]
-                .as_str()
-                .ok_or_else(|| "path is missing".to_string())?;
+        "read" => 'read: {
+            let path = match call.arguments["path"].as_str() {
+                Some(p) => p,
+                None => break 'read Err("path is missing".to_string()),
+            };
             let offset = call.arguments["offset"].as_u64().unwrap_or(0) as usize;
             let limit = call.arguments["limit"]
                 .as_u64()
@@ -525,15 +526,19 @@ async fn dispatch(
                 .unwrap_or(polaris_tools::read::DEFAULT_LIMIT);
             polaris_tools::read::read(Path::new(path), offset, limit).map_err(|e| e.to_string())
         }
-        "write" => {
-            let path = call.arguments["path"]
-                .as_str()
-                .ok_or_else(|| "path is missing".to_string())?;
-            let content = call.arguments["content"]
-                .as_str()
-                .ok_or_else(|| "content is missing".to_string())?;
+        "write" => 'write: {
+            let path = match call.arguments["path"].as_str() {
+                Some(p) => p,
+                None => break 'write Err("path is missing".to_string()),
+            };
+            let content = match call.arguments["content"].as_str() {
+                Some(c) => c,
+                None => break 'write Err("content is missing".to_string()),
+            };
             let path = Path::new(path);
-            ctx.gate.check(ctx.sandbox, path, ctx.approver)?;
+            if let Err(e) = ctx.gate.check(ctx.sandbox, path, ctx.approver) {
+                break 'write Err(e);
+            }
             // diffを送るため、上書き前の内容を先に読んでおく。読めない
             // (=存在しない)なら新規ファイル扱い。読み取り自体の失敗は
             // write本体の成否に影響させない——diff計算はベストエフォート
@@ -550,18 +555,23 @@ async fn dispatch(
             }
             result
         }
-        "edit" => {
-            let path = call.arguments["path"]
-                .as_str()
-                .ok_or_else(|| "path is missing".to_string())?;
-            let old = call.arguments["old"]
-                .as_str()
-                .ok_or_else(|| "old is missing".to_string())?;
-            let new = call.arguments["new"]
-                .as_str()
-                .ok_or_else(|| "new is missing".to_string())?;
+        "edit" => 'edit: {
+            let path = match call.arguments["path"].as_str() {
+                Some(p) => p,
+                None => break 'edit Err("path is missing".to_string()),
+            };
+            let old = match call.arguments["old"].as_str() {
+                Some(o) => o,
+                None => break 'edit Err("old is missing".to_string()),
+            };
+            let new = match call.arguments["new"].as_str() {
+                Some(n) => n,
+                None => break 'edit Err("new is missing".to_string()),
+            };
             let path = Path::new(path);
-            ctx.gate.check(ctx.sandbox, path, ctx.approver)?;
+            if let Err(e) = ctx.gate.check(ctx.sandbox, path, ctx.approver) {
+                break 'edit Err(e);
+            }
             let result = polaris_tools::edit::edit(ctx.sandbox, ctx.helper, path, old, new)
                 .map_err(|e| e.to_string());
             if result.is_ok() {
@@ -569,32 +579,35 @@ async fn dispatch(
             }
             result
         }
-        "bash" => {
-            let command = call.arguments["command"]
-                .as_str()
-                .ok_or_else(|| "command is missing".to_string())?;
+        "bash" => 'bash: {
+            let command = match call.arguments["command"].as_str() {
+                Some(c) => c,
+                None => break 'bash Err("command is missing".to_string()),
+            };
             polaris_tools::bash::run(ctx.sandbox, command).map_err(|e| e.to_string())
         }
-        "skill" => {
-            let q = call.arguments["q"]
-                .as_str()
-                .ok_or_else(|| "q is missing".to_string())?;
+        "skill" => 'skill: {
+            let q = match call.arguments["q"].as_str() {
+                Some(q) => q,
+                None => break 'skill Err("q is missing".to_string()),
+            };
             Ok(polaris_tools::skill::lookup(skills, q))
         }
-        "spawn" => {
-            let tasks_json = call.arguments["tasks"]
-                .as_array()
-                .ok_or_else(|| "tasks is missing".to_string())?;
+        "spawn" => 'spawn: {
+            let tasks_json = match call.arguments["tasks"].as_array() {
+                Some(t) => t,
+                None => break 'spawn Err("tasks is missing".to_string()),
+            };
             let mut tasks = Vec::with_capacity(tasks_json.len());
             for t in tasks_json {
-                let agent_type = t["type"]
-                    .as_str()
-                    .ok_or_else(|| "tasks[].type is missing".to_string())?
-                    .to_string();
-                let task = t["task"]
-                    .as_str()
-                    .ok_or_else(|| "tasks[].task is missing".to_string())?
-                    .to_string();
+                let agent_type = match t["type"].as_str() {
+                    Some(a) => a.to_string(),
+                    None => break 'spawn Err("tasks[].type is missing".to_string()),
+                };
+                let task = match t["task"].as_str() {
+                    Some(task) => task.to_string(),
+                    None => break 'spawn Err("tasks[].task is missing".to_string()),
+                };
                 let write_root = t["write_root"].as_str().map(str::to_string);
                 tasks.push(crate::spawn::SpawnTask {
                     agent_type,
@@ -3275,5 +3288,170 @@ print("wrote")
         };
         assert!(!ok, "the failed write should be reported as failed");
         assert!(diff.is_none(), "a failed write should not report a diff");
+    }
+
+    #[tokio::test]
+    async fn a_gate_denied_write_still_sends_a_tool_finished_event() {
+        // `?` inside a `match` arm early-returns the whole `dispatch`
+        // function, skipping the `ToolFinished` send that comes after the
+        // `match`. A gate denial must not be able to do that: the TUI's
+        // live progress display pairs every `ToolStarted` with a
+        // `ToolFinished`, and a denial that never resolves would show up
+        // as a row stuck "in progress" forever.
+        let root = tempfile::tempdir().expect("temp directory");
+        let outside = tempfile::tempdir().expect("temp directory");
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = write_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+
+        let target = outside
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("pwned.txt");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write".into(),
+                        arguments: serde_json::json!({
+                            "path": target.display().to_string(),
+                            "content": "body"
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "I'll write elsewhere instead".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let mut session = Session::new();
+        session.push_user("write outside");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        // Set to Never, closing off the path that would slip through via
+        // approval, so the gate denies the write outright.
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("the denial failed the whole loop");
+
+        let started = rx.recv().await.expect("no ToolStarted");
+        assert!(
+            matches!(started, crate::events::AgentEvent::ToolStarted { ref name, .. } if name == "write"),
+            "first event was not ToolStarted(write): {started:?}"
+        );
+        let finished = rx.recv().await.expect(
+            "no ToolFinished — a gate denial must not skip the event that follows ToolStarted",
+        );
+        let crate::events::AgentEvent::ToolFinished { ok, .. } = finished else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        assert!(!ok, "a gate-denied write should be reported as failed");
+    }
+
+    #[tokio::test]
+    async fn a_missing_argument_tool_call_still_sends_a_tool_finished_event() {
+        // Same guarantee as above, but for the other `?` early-return
+        // source in `dispatch`'s arms: extracting a required argument
+        // that the model simply didn't provide.
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let mut session = Session::new();
+        session.push_user("read something");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .expect("a missing argument should come back as a tool result, not a loop failure");
+
+        let started = rx.recv().await.expect("no ToolStarted");
+        assert!(
+            matches!(started, crate::events::AgentEvent::ToolStarted { ref name, .. } if name == "read"),
+            "first event was not ToolStarted(read): {started:?}"
+        );
+        let finished = rx.recv().await.expect(
+            "no ToolFinished — a missing-argument error must not skip the event that follows ToolStarted",
+        );
+        let crate::events::AgentEvent::ToolFinished { ok, .. } = finished else {
+            panic!("expected ToolFinished, got {finished:?}");
+        };
+        assert!(!ok, "a missing-argument call should be reported as failed");
     }
 }

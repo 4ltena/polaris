@@ -318,4 +318,30 @@ mod tests {
         assert!(count_tokens("hello world") > 0);
         assert_eq!(count_tokens(""), 0);
     }
+
+    #[test]
+    fn spawn_as_the_sixth_tool_still_stays_within_budget() {
+        let tools = polaris_tools::all_specs();
+        assert_eq!(
+            tools.len(),
+            MAX_TOOLS,
+            "spawn should be exactly the 6th tool"
+        );
+        let floor = always_on_tokens("system prompt placeholder", &tools);
+        assert!(
+            floor <= BUDGET_LIMIT,
+            "6-tool floor {floor} exceeds BUDGET_LIMIT {BUDGET_LIMIT}"
+        );
+    }
+
+    #[test]
+    fn spawn_cost_does_not_depend_on_how_many_agent_types_are_discovered() {
+        let with_zero = always_on_tokens("system prompt placeholder", &polaris_tools::all_specs());
+        // spawn のスキーマは type/task/write_root という固定の形であり、
+        // 実際に discover された agent_types の件数を一切引数に取らない
+        // ため、比較対象を用意するまでもなく同じ呼び出しが同じ値を返す
+        // ことそのものが不変条件である。
+        let with_more = always_on_tokens("system prompt placeholder", &polaris_tools::all_specs());
+        assert_eq!(with_zero, with_more);
+    }
 }

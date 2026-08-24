@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use polaris_skills::Skill;
+use super::Named;
 
 /// この選定が返す件数の安全弁。測定したコーパス（831 件）では 4 件しか
 /// 該当しなかったが、将来 trigger 形式の skill が異常に多いコーパスが来
@@ -60,15 +60,15 @@ static QUANT_RE: LazyLock<Regex> =
 
 /// 3 条件（trigger 形式、量化語、固有名詞なし）をすべて満たす skill を
 /// 選ぶ。`MAX_NEAR_UNIVERSAL` を超えた場合は name の昇順で先頭のみ返す。
-pub fn near_universal(skills: &[Skill]) -> Vec<&Skill> {
-    let mut selected: Vec<&Skill> = skills
+pub fn near_universal<T: Named>(items: &[T]) -> Vec<&T> {
+    let mut selected: Vec<&T> = items
         .iter()
         .filter(|s| {
-            let desc = s.description.trim();
+            let desc = s.description().trim();
             TRIGGER_RE.is_match(desc) && QUANT_RE.is_match(desc) && !names_specific_tech(desc)
         })
         .collect();
-    selected.sort_by(|a, b| a.name.cmp(&b.name));
+    selected.sort_by(|a, b| a.name().cmp(b.name()));
     selected.truncate(MAX_NEAR_UNIVERSAL);
     selected
 }
@@ -76,6 +76,7 @@ pub fn near_universal(skills: &[Skill]) -> Vec<&Skill> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polaris_skills::Skill;
 
     fn skill(name: &str, description: &str) -> Skill {
         Skill {
@@ -126,7 +127,7 @@ mod tests {
 
     #[test]
     fn an_empty_skill_set_returns_an_empty_vec() {
-        assert!(near_universal(&[]).is_empty());
+        assert!(near_universal::<Skill>(&[]).is_empty());
     }
 
     #[test]

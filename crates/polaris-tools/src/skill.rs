@@ -1,7 +1,53 @@
 //! skill tool. Returns the body on an exact name match, otherwise returns a
 //! list of candidates.
 
-use polaris_skills::Skill;
+/// BM25・近傍選定・`lookup` の整形ロジックが必要とする最小の形。
+/// `Skill` と、M4 で追加する subagent の型定義の両方がこれを実装する
+/// ことで、検索・整形のコードを2箇所に複製せずに済む。
+///
+/// `body`/`path` はデフォルト実装を持つ。BM25 と `near_universal` は
+/// `name`/`description` しか使わないので、この2つだけが両方の実装先で
+/// 必須になる。`lookup` の完全一致時の全文返却だけは本文と参照先パスを
+/// 要求するため、名前と説明以外を持たない最小実装（`named_generic_tests`
+/// の `Fixture` など）でも動くよう、既定値（本文は `description` を、
+/// パスは `None` を返す）を用意している。`Skill` はどちらも実データで
+/// 上書きする。
+pub trait Named {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+
+    fn body(&self) -> &str {
+        self.description()
+    }
+
+    fn path(&self) -> Option<&std::path::Path> {
+        None
+    }
+}
+
+impl Named for polaris_skills::Skill {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn body(&self) -> &str {
+        &self.body
+    }
+    fn path(&self) -> Option<&std::path::Path> {
+        Some(&self.path)
+    }
+}
+
+impl Named for polaris_skills::AgentType {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
 
 mod bm25;
 mod near_universal;
@@ -158,14 +204,14 @@ const MAX_PREVIEWED_RESULTS: usize = 8;
 /// source description's length, and most entries in a full list carry no
 /// description at all); it now mainly backstops unbounded skill names and
 /// a large `max_count`.
-fn list_candidates(items: &[&Skill], header: &str, max_count: usize) -> String {
+fn list_candidates<T: Named>(items: &[&T], header: &str, max_count: usize) -> String {
     let mut out = String::from(header);
     let mut shown = 0usize;
     for s in items.iter().take(max_count) {
         let line = if shown < MAX_PREVIEWED_RESULTS {
-            format!("- {}: {}\n", s.name, description_preview(&s.description))
+            format!("- {}: {}\n", s.name(), description_preview(s.description()))
         } else {
-            format!("- {}\n", s.name)
+            format!("- {}\n", s.name())
         };
         // Always emit the first entry even if it exceeds the cap.
         // Returning "truncated" without showing even one entry leaves the
@@ -204,8 +250,8 @@ fn list_candidates(items: &[&Skill], header: &str, max_count: usize) -> String {
 /// The reason a search doesn't return the body is progressive disclosure:
 /// it lets a candidate be seen before deciding whether to read it. If every
 /// body were returned, searching would be pointless.
-pub fn lookup(skills: &[Skill], q: &str) -> String {
-    if skills.is_empty() {
+pub fn lookup<T: Named>(items: &[T], q: &str) -> String {
+    if items.is_empty() {
         return "no skill was found at all. there is no SKILL.md at the search location."
             .to_string();
     }
@@ -218,14 +264,17 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
     // check.
     let q = q.trim();
 
-    if let Some(s) = skills.iter().find(|s| s.name == q) {
-        let (body, truncated) = cap_bytes(&s.body, MAX_BODY_BYTES);
-        let mut out = format!("# {}\n\n{}\n", s.name, body);
+    if let Some(s) = items.iter().find(|s| s.name() == q) {
+        let (body, truncated) = cap_bytes(s.body(), MAX_BODY_BYTES);
+        let mut out = format!("# {}\n\n{}\n", s.name(), body);
         if truncated {
-            out.push_str(&format!(
-                "\n(the body was truncated at {MAX_BODY_BYTES} bytes. read {} directly for the full text.)\n",
-                s.path.display()
-            ));
+            out.push_str(&match s.path() {
+                Some(path) => format!(
+                    "\n(the body was truncated at {MAX_BODY_BYTES} bytes. read {} directly for the full text.)\n",
+                    path.display()
+                ),
+                None => format!("\n(the body was truncated at {MAX_BODY_BYTES} bytes.)\n"),
+            });
         }
         return out;
     }
@@ -239,7 +288,7 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
     // interpretation was made and apply the same count cap as any other
     // result.
     if q.is_empty() {
-        let all: Vec<&Skill> = skills.iter().collect();
+        let all: Vec<&T> = items.iter().collect();
         return list_candidates(
             &all,
             "q is empty, so listing the skills that exist. pass a name or term to narrow it down.\n",
@@ -247,7 +296,7 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
         );
     }
 
-    let index = bm25::Bm25::new(skills);
+    let index = bm25::Bm25::new(items);
     let mut ranked = index.rank(q, MAX_RESULTS);
 
     // BM25's tokenizer only extracts ASCII [a-z0-9]+ tokens, so a query
@@ -260,11 +309,11 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
     // search behavior.
     if ranked.is_empty() {
         let needle = q.to_lowercase();
-        ranked = skills
+        ranked = items
             .iter()
             .filter(|s| {
-                s.name.to_lowercase().contains(&needle)
-                    || s.description.to_lowercase().contains(&needle)
+                s.name().to_lowercase().contains(&needle)
+                    || s.description().to_lowercase().contains(&needle)
             })
             .take(MAX_RESULTS)
             .collect();
@@ -285,15 +334,15 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
     // Dedup relies on `polaris-skills`'s discovery guaranteeing unique
     // names within a single loaded skill set (first name wins on a
     // collision) -- `lookup` itself does not re-enforce that here.
-    let mut combined: Vec<&Skill> = near_universal::near_universal(skills);
+    let mut combined: Vec<&T> = near_universal::near_universal(items);
     for r in ranked.iter() {
-        if !combined.iter().any(|s| s.name == r.name) {
+        if !combined.iter().any(|s| s.name() == r.name()) {
             combined.push(r);
         }
     }
 
     if combined.is_empty() {
-        let all: Vec<&Skill> = skills.iter().collect();
+        let all: Vec<&T> = items.iter().collect();
         // q is an arbitrary-length string written by the model. Echoing it
         // back as-is would turn an uncapped input into uncapped output, and
         // it stays in history to be resent every turn. Cut it to a length
@@ -325,6 +374,7 @@ pub fn lookup(skills: &[Skill], q: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polaris_skills::Skill;
 
     fn fixtures() -> Vec<polaris_skills::Skill> {
         vec![
@@ -480,7 +530,7 @@ mod tests {
         // were removed, a query against an empty set would fall into the
         // `combined.is_empty()` path and produce output without this
         // wording, which is what lets this difference be detected.
-        let empty_set = lookup(&[], "something");
+        let empty_set = lookup::<Skill>(&[], "something");
         assert!(
             empty_set.contains("no skill was found at all"),
             "missing the wording that says not a single skill exists: {empty_set}"
@@ -932,5 +982,69 @@ mod tests {
         }];
         let out = lookup(&skills, "紹介文");
         assert!(out.contains("profile-generator"));
+    }
+}
+
+#[cfg(test)]
+mod named_generic_tests {
+    use super::Named;
+
+    /// `Skill` 以外の型でも `lookup` 等が動くことを保証するためだけの、
+    /// テスト専用の最小実装。
+    struct Fixture {
+        name: String,
+        description: String,
+    }
+
+    impl Named for Fixture {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            &self.description
+        }
+    }
+
+    #[test]
+    fn lookup_works_for_any_named_type_not_just_skill() {
+        let items = vec![Fixture {
+            name: "widget".to_string(),
+            description: "handles widget-shaped requests".to_string(),
+        }];
+        let out = super::lookup(&items, "widget");
+        assert!(out.contains("handles widget-shaped requests"), "{out}");
+    }
+
+    #[test]
+    fn a_truncated_body_with_no_path_still_reads_sensibly() {
+        // `Fixture` overrides neither `body()` nor `path()`, so this
+        // exercises both `Named` defaults at once: `body()` falls back to
+        // `description()`, and `path()` stays `None`. An oversized
+        // description makes the exact-match branch actually truncate, which
+        // is the only way to reach the `match s.path() { .. }` arm in
+        // `lookup` at all -- the `None` arm has to render a sensible notice
+        // on its own, without a path to point the reader at.
+        let big_description = "x".repeat(super::MAX_BODY_BYTES + 100);
+        let items = vec![Fixture {
+            name: "widget".to_string(),
+            description: big_description.clone(),
+        }];
+        let out = super::lookup(&items, "widget");
+        assert!(
+            out.len() < big_description.len(),
+            "the body was not truncated: output {} bytes, description {} bytes",
+            out.len(),
+            big_description.len()
+        );
+        assert!(
+            out.contains("truncated"),
+            "missing wording indicating truncation: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+        assert!(
+            !out.contains("read"),
+            "mentioned reading a path even though path() returns None: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
     }
 }

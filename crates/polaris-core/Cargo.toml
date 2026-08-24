@@ -10,14 +10,15 @@ polaris-provider = { path = "../polaris-provider" }
 polaris-sandbox = { path = "../polaris-sandbox" }
 polaris-skills = { path = "../polaris-skills" }
 polaris-tools = { path = "../polaris-tools" }
+futures-util = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tiktoken-rs = { workspace = true }
 toml = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }

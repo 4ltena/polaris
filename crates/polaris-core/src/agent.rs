@@ -7,8 +7,10 @@
 //! get the order wrong and the next turn's send is rejected by the API.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use polaris_provider::{CompletionRequest, Provider};
+use tokio::sync::Mutex;
 
 use crate::audit::{AuditLog, Record};
 use crate::session::Session;
@@ -38,6 +40,29 @@ pub struct ToolContext<'a> {
     pub approver: &'a mut dyn crate::approval::Approver,
 }
 
+/// The `Approver` a subagent is given. Despite the name, it does not make
+/// a subagent's writes auto-approved: `spawn` pairs it with
+/// [`crate::approval::ApprovalPolicy::Never`], and under that policy
+/// [`crate::approval::Gate::check`] returns `Err` for anything the
+/// predicate flags as needing approval *before* it ever reaches an
+/// `Approver`. So this `ask` is unreachable in production, and a subagent
+/// write outside its declared root is refused by the gate — and by the
+/// sandbox behind it, whose writable roots `spawn` builds as the same
+/// object as the declaration — rather than waved through here.
+///
+/// It exists because `ToolContext` requires *some* `Approver`, and a
+/// subagent runs in the background with nobody to prompt. `Allow` is the
+/// honest answer for the one case that could reach it (a policy other than
+/// `Never`, which `spawn` never sets): there is no user to consult, so
+/// there is no approval to report.
+pub(crate) struct AutoApprove;
+
+impl crate::approval::Approver for AutoApprove {
+    fn ask(&mut self, _reason: &str) -> crate::approval::Decision {
+        crate::approval::Decision::Allow
+    }
+}
+
 /// What a successful turn produced: the final text, and the token usage
 /// accumulated across every `provider.complete()` call the turn made
 /// (a turn that used a tool calls the provider more than once). A
@@ -63,13 +88,69 @@ pub struct AgentOutcome {
 ///
 /// `skills` is not loaded into the always-on context. It's only consulted
 /// when the `skill` tool is invoked.
+///
+/// `audit` is shared rather than borrowed exclusively: the `spawn` tool
+/// runs subagents whose own loops write to the very same log (that is what
+/// `Record::caller` distinguishes), so the handle has to be reachable from
+/// inside a tool call. It is locked around each individual `record()` and
+/// never held across a turn — hold it for a whole loop and the first
+/// `spawn` call would wait forever on a lock its own caller holds.
+///
+/// `agent_types` and `provider_pool` exist only for that same `spawn`
+/// arm: they are what a wave of subagents is resolved and run against.
+/// A subagent is handed an empty `agent_types` (depth is fixed at 1), and
+/// its tool list never contains `spawn` in the first place.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     provider: &dyn Provider,
     session: &mut Session,
-    audit: &mut AuditLog,
+    audit: Arc<Mutex<AuditLog>>,
     stop: &mut StopTracker,
     always_on: &crate::prompt::AlwaysOn,
     skills: &[polaris_skills::Skill],
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
+    ctx: &mut ToolContext<'_>,
+) -> Result<AgentOutcome, AgentError> {
+    run_loop(
+        provider,
+        session,
+        audit,
+        stop,
+        always_on.system(),
+        always_on.tools(),
+        skills,
+        agent_types,
+        provider_pool,
+        spawn_concurrency,
+        spawn_write_concurrency,
+        "root",
+        ctx,
+    )
+    .await
+}
+
+/// ルートの `run` と subagent 実行(Task 9)の両方が使う、ターン取りの
+/// 中核。`system`/`tools` を `AlwaysOn` からではなく直接受け取るのは、
+/// subagent の型ごとに異なるシステムプロンプトとツール部分集合を、
+/// ルート用に不変設計された `AlwaysOn` に混ぜないため — `prompt.rs` の
+/// `AlwaysOn` のdoc commentを参照。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_loop(
+    provider: &dyn Provider,
+    session: &mut Session,
+    audit: Arc<Mutex<AuditLog>>,
+    stop: &mut StopTracker,
+    system: &str,
+    tools: &[polaris_tools::ToolSpec],
+    skills: &[polaris_skills::Skill],
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
+    caller: &str,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
     let mut usage = polaris_provider::Usage::default();
@@ -80,12 +161,18 @@ pub async fn run(
         if let Some(r) = stop.observe_turn() {
             return Err(AgentError::Stopped(r));
         }
+        // A no-op for the root tracker (`StopTracker::new` never sets a
+        // wall-clock deadline), and meaningful for a subagent tracker
+        // built with `StopTracker::with_wall_seconds` (Task 9).
+        if let Some(r) = stop.observe_wall_clock() {
+            return Err(AgentError::Stopped(r));
+        }
 
         let res = provider
             .complete(CompletionRequest {
-                system: always_on.system().to_string(),
+                system: system.to_string(),
                 messages: session.messages.clone(),
-                tools: always_on.tools().to_vec(),
+                tools: tools.to_vec(),
             })
             .await?;
 
@@ -112,7 +199,17 @@ pub async fn run(
         session.push_assistant_tool_calls(&res.text, res.tool_calls.clone());
 
         for call in &res.tool_calls {
-            let outcome = dispatch(call, skills, ctx);
+            let outcome = dispatch(
+                call,
+                skills,
+                agent_types,
+                provider_pool.clone(),
+                audit.clone(),
+                spawn_concurrency,
+                spawn_write_concurrency,
+                ctx,
+            )
+            .await;
             // `result` is exactly the body actually returned to the model
             // (on success) or the error text (on failure).
             let result: &str = match &outcome {
@@ -135,12 +232,17 @@ pub async fn run(
             } else {
                 None
             };
-            audit.record(&Record {
+            // Held for exactly one `record()`. A subagent started by the
+            // `spawn` call just above has already returned by now, so
+            // there is no lock to contend with here — and holding it any
+            // longer would be the deadlock described on `run`.
+            audit.lock().await.record(&Record {
                 tool: &call.name,
                 detail: &call.arguments.to_string(),
                 sandbox: is_mutation.then_some(ctx.sandbox),
                 target: target.as_deref(),
                 result,
+                caller,
             })?;
             match outcome {
                 Ok(body) => {
@@ -178,9 +280,15 @@ pub async fn run(
 /// `polaris_tools::bash` docs). It is attempted under confinement, and if
 /// denied, the reason carried in the child's output is returned to the
 /// model as-is.
-fn dispatch(
+#[allow(clippy::too_many_arguments)]
+async fn dispatch(
     call: &polaris_provider::ToolCall,
     skills: &[polaris_skills::Skill],
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
     ctx: &mut ToolContext<'_>,
 ) -> Result<String, String> {
     match call.name.as_str() {
@@ -234,6 +342,44 @@ fn dispatch(
                 .ok_or_else(|| "q is missing".to_string())?;
             Ok(polaris_tools::skill::lookup(skills, q))
         }
+        "spawn" => {
+            let tasks_json = call.arguments["tasks"]
+                .as_array()
+                .ok_or_else(|| "tasks is missing".to_string())?;
+            let mut tasks = Vec::with_capacity(tasks_json.len());
+            for t in tasks_json {
+                let agent_type = t["type"]
+                    .as_str()
+                    .ok_or_else(|| "tasks[].type is missing".to_string())?
+                    .to_string();
+                let task = t["task"]
+                    .as_str()
+                    .ok_or_else(|| "tasks[].task is missing".to_string())?
+                    .to_string();
+                let write_root = t["write_root"].as_str().map(str::to_string);
+                tasks.push(crate::spawn::SpawnTask {
+                    agent_type,
+                    task,
+                    write_root,
+                });
+            }
+            // Boxed to break the type-level cycle
+            // `run_loop -> dispatch -> run_wave -> run_one -> run_loop`.
+            // Depth is fixed at 1 so this never recurses at runtime (a
+            // subagent's tool list has no `spawn` in it), but the compiler
+            // still has to give the future a finite size.
+            Ok(Box::pin(crate::spawn::run_wave(
+                tasks,
+                agent_types,
+                provider_pool,
+                audit,
+                ctx.sandbox,
+                ctx.helper,
+                spawn_concurrency,
+                spawn_write_concurrency,
+            ))
+            .await)
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -243,6 +389,41 @@ mod tests {
     use super::*;
     use polaris_provider::{CompletionResponse, ToolCall};
     use std::sync::Mutex;
+
+    /// The tests share one audit log per temp directory, wrapped exactly
+    /// the way production wraps it (see `run`'s docs on why it is shared
+    /// rather than borrowed exclusively).
+    fn shared_audit(path: &std::path::Path) -> Arc<tokio::sync::Mutex<AuditLog>> {
+        Arc::new(tokio::sync::Mutex::new(
+            AuditLog::open(path).expect("cannot open"),
+        ))
+    }
+
+    fn dummy_audit(dir: &tempfile::TempDir) -> Arc<tokio::sync::Mutex<AuditLog>> {
+        shared_audit(&dir.path().join("audit.jsonl"))
+    }
+
+    /// A provider that panics if it is ever asked to complete anything.
+    /// `provider_pool` only ever reaches the `spawn` arm, and no test in
+    /// this module exercises it — `spawn`'s own behavior is covered in
+    /// `crate::spawn`'s tests. Panicking rather than returning a default
+    /// makes any accidental use of this argument visible instead of
+    /// silently producing an empty turn.
+    struct NeverCalled;
+
+    #[async_trait::async_trait]
+    impl Provider for NeverCalled {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            panic!("the provider pool was used by a test that should never reach the spawn arm")
+        }
+    }
+
+    fn unused_provider_pool() -> Arc<dyn Provider> {
+        Arc::new(NeverCalled)
+    }
 
     /// A test approver. Always allows, and counts how many times it was asked.
     struct AlwaysAllow {
@@ -347,11 +528,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_skill_tool_reads_the_argument_name_its_schema_declares() {
+    #[tokio::test]
+    async fn the_skill_tool_reads_the_argument_name_its_schema_declares() {
         // Take the argument name from the published schema, not a literal.
         // Change the schema's `q` to `query` (while dispatch still reads
         // `q`) and this test alone exposes the mismatch.
+        let dir = tempfile::tempdir().expect("temp directory");
         let skills = vec![polaris_skills::Skill {
             name: "demo".into(),
             description: "description".into(),
@@ -366,20 +548,30 @@ mod tests {
             gate: &mut gate,
             approver: &mut approver,
         };
-        let out =
-            dispatch(&call_with("skill", &param, "demo"), &skills, &mut ctx).unwrap_or_else(|e| {
-                panic!(
-                    "dispatch does not read the argument name {param} the public schema declares: {e}"
-                )
-            });
+        let out = dispatch(
+            &call_with("skill", &param, "demo"),
+            &skills,
+            &[],
+            unused_provider_pool(),
+            dummy_audit(&dir),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            &mut ctx,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "dispatch does not read the argument name {param} the public schema declares: {e}"
+            )
+        });
         assert!(
             out.contains("demo body"),
             "the body was not returned: {out}"
         );
     }
 
-    #[test]
-    fn the_read_tool_reads_the_argument_name_its_schema_declares() {
+    #[tokio::test]
+    async fn the_read_tool_reads_the_argument_name_its_schema_declares() {
         // Apply the same binding as the skill side to read too. read's
         // schema has existed since M1, but nothing tied its declaration to
         // what gets read, either.
@@ -398,8 +590,14 @@ mod tests {
         let out = dispatch(
             &call_with("read", &param, target.to_str().expect("path")),
             &[],
+            &[],
+            unused_provider_pool(),
+            dummy_audit(&dir),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
+        .await
         .unwrap_or_else(|e| {
             panic!(
                 "dispatch does not read the argument name {param} the public schema declares: {e}"
@@ -408,8 +606,8 @@ mod tests {
         assert!(out.contains("hello"), "the body was not returned: {out}");
     }
 
-    #[test]
-    fn a_read_without_an_explicit_limit_says_it_stopped_early() {
+    #[tokio::test]
+    async fn a_read_without_an_explicit_limit_says_it_stopped_early() {
         // dispatch fills in the default when a call omits limit. The side
         // that receives that default has no way of knowing it was
         // truncated, so the "(showed lines ... of N total ...)" disclaimer
@@ -430,8 +628,14 @@ mod tests {
         let out = dispatch(
             &call_with("read", "path", target.to_str().expect("path")),
             &[],
+            &[],
+            unused_provider_pool(),
+            dummy_audit(&dir),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
+        .await
         .expect("should be able to read");
 
         assert!(
@@ -471,7 +675,7 @@ mod tests {
 
         let mut session = Session::new();
         session.push_user("how many lines is a.txt");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
 
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
@@ -485,10 +689,14 @@ mod tests {
         let out = run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -547,7 +755,7 @@ mod tests {
 
         let mut session = Session::new();
         session.push_user("read it");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(50);
 
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
@@ -561,10 +769,14 @@ mod tests {
         let out = run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -591,7 +803,7 @@ mod tests {
 
         let mut session = Session::new();
         session.push_user("read it");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(50);
 
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
@@ -605,10 +817,14 @@ mod tests {
         let err = run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -650,7 +866,7 @@ mod tests {
 
         let mut session = Session::new();
         session.push_user("read demo's body");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
@@ -664,10 +880,14 @@ mod tests {
         let out = run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &skills,
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -716,7 +936,7 @@ mod tests {
         };
         let mut session = Session::new();
         session.push_user("look up a skill");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
@@ -730,10 +950,14 @@ mod tests {
         run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -854,7 +1078,7 @@ print("wrote")
         let dir = tempfile::tempdir().expect("temp directory");
         let mut session = Session::new();
         session.push_user("create a.txt");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
@@ -869,10 +1093,14 @@ print("wrote")
         let out = run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -935,7 +1163,7 @@ print("wrote")
         let dir = tempfile::tempdir().expect("temp directory");
         let mut session = Session::new();
         session.push_user("write outside");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         // Set to Never, closing off the path that would slip through via
@@ -953,10 +1181,14 @@ print("wrote")
         let out = run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1046,7 +1278,7 @@ print("wrote")
         let dir = tempfile::tempdir().expect("temp directory");
         let mut session = Session::new();
         session.push_user("rewrite hardlink.txt");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
@@ -1066,10 +1298,14 @@ print("wrote")
             let out = run(
                 &p,
                 &mut session,
-                &mut audit,
+                audit.clone(),
                 &mut stop,
                 &always_on,
                 &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
                 &mut ctx,
             )
             .await
@@ -1199,7 +1435,7 @@ print("wrote")
         let dir = tempfile::tempdir().expect("temp directory");
         let mut session = Session::new();
         session.push_user("edit hardlink.txt");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
@@ -1219,10 +1455,14 @@ print("wrote")
             let out = run(
                 &p,
                 &mut session,
-                &mut audit,
+                audit.clone(),
                 &mut stop,
                 &always_on,
                 &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
                 &mut ctx,
             )
             .await
@@ -1329,7 +1569,7 @@ print("wrote")
         let dir = tempfile::tempdir().expect("temp directory");
         let mut session = Session::new();
         session.push_user("create proof.txt and tell me what's in it");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
@@ -1349,10 +1589,14 @@ print("wrote")
             let out = run(
                 &p,
                 &mut session,
-                &mut audit,
+                audit.clone(),
                 &mut stop,
                 &always_on,
                 &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
                 &mut ctx,
             )
             .await
@@ -1438,7 +1682,7 @@ print("wrote")
         let audit_path = dir.path().join("audit.jsonl");
         let mut session = Session::new();
         session.push_user("create audited.txt");
-        let mut audit = AuditLog::open(&audit_path).expect("cannot open");
+        let audit = shared_audit(&audit_path);
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
@@ -1453,10 +1697,14 @@ print("wrote")
         run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1530,7 +1778,7 @@ print("wrote")
 
         let mut session = Session::new();
         session.push_user("how many lines is a.txt");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
 
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
@@ -1544,10 +1792,14 @@ print("wrote")
         let outcome = run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await
@@ -1557,6 +1809,178 @@ print("wrote")
         assert_eq!(outcome.usage.input_tokens, 30);
         assert_eq!(outcome.usage.output_tokens, 8);
         assert_eq!(outcome.usage.total_tokens, 38);
+    }
+
+    #[tokio::test]
+    async fn run_loop_produces_the_same_result_as_run_for_an_equivalent_call() {
+        // `run_loop` is the core `run` delegates to (Task 8). This pins
+        // down that calling it directly, with the same pieces `run` would
+        // have derived from `AlwaysOn` and passed along, produces the same
+        // outcome as `run` itself.
+        let p = Scripted {
+            replies: Mutex::new(vec![CompletionResponse {
+                text: "hello from run_loop".into(),
+                tool_calls: vec![],
+                ..Default::default()
+            }]),
+        };
+        let mut session = Session::new();
+        session.push_user("hi");
+        let dir = tempfile::tempdir().expect("temp directory");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let result = run_loop(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            "system prompt",
+            &polaris_tools::all_specs(),
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            "root",
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "hello from run_loop");
+    }
+
+    #[tokio::test]
+    async fn the_spawn_arm_runs_a_subagent_and_returns_its_result_to_the_root() {
+        // The whole chain in one go: the root's loop calls `spawn`,
+        // `dispatch` builds the wave, the subagent runs its own loop
+        // against the same provider and the same audit log, and its
+        // schema-validated result comes back as an ordinary tool result.
+        //
+        // This is also the regression test for the audit lock's
+        // granularity. Take the lock for a whole loop instead of per
+        // record (see `run`'s docs) and this test does not fail — it
+        // hangs, because the subagent waits on a lock the root holds.
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("a.rs");
+        std::fs::write(&target, "fn main() {}\n").expect("cannot write");
+
+        let agents_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agents/file-inspector");
+        let agent_text =
+            std::fs::read_to_string(agents_dir.join("SKILL.md")).expect("cannot read SKILL.md");
+        let agent_types = vec![
+            polaris_skills::agent_type::parse(&agent_text, "file-inspector", &agents_dir)
+                .expect("agents/file-inspector does not parse"),
+        ];
+
+        let subagent_result = serde_json::json!({
+            "path": target.to_str().expect("path"),
+            "responsibility": "The entry point.",
+            "test_file": null
+        })
+        .to_string();
+
+        // One queue, served in order: the root's spawn call, the
+        // subagent's single (final) turn, then the root's closing turn.
+        // Production shares one provider between root and subagents the
+        // same way, which is why `provider_pool` below is this same object.
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "spawn".into(),
+                        arguments: serde_json::json!({
+                            "tasks": [{
+                                "type": "file-inspector",
+                                "task": "inspect a.rs"
+                            }]
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: subagent_result.clone(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "the subagent reported back".into(),
+                    tool_calls: vec![],
+                    ..Default::default()
+                },
+            ]),
+        });
+
+        let mut session = Session::new();
+        session.push_user("inspect a.rs with a subagent");
+        let audit_path = dir.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let out = run(
+            p.as_ref(),
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &agent_types,
+            p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            &mut ctx,
+        )
+        .await
+        .expect("the root loop failed")
+        .text;
+        assert_eq!(out, "the subagent reported back");
+
+        let tool_msg = session
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.is_some())
+            .expect("no tool result was pushed");
+        // The wave result is a JSON array with one entry per task (see
+        // `spawn::run_wave`'s docs on why it is not newline-joined text).
+        let wave: serde_json::Value = serde_json::from_str(&tool_msg.content)
+            .unwrap_or_else(|e| panic!("the wave result is not JSON: {e}: {}", tool_msg.content));
+        let entries = wave.as_array().expect("the wave result is not an array");
+        assert_eq!(entries.len(), 1, "one entry per task: {wave}");
+        assert_eq!(
+            entries[0]["type"], "file-inspector",
+            "the result is not labeled with the type that produced it: {wave}"
+        );
+        assert_eq!(entries[0]["ok"], true, "{wave}");
+        assert_eq!(
+            entries[0]["result"],
+            serde_json::from_str::<serde_json::Value>(&subagent_result).expect("not JSON"),
+            "the subagent's result did not reach the root: {wave}"
+        );
+
+        // Both callers land in the one log — the root's `spawn` call and
+        // nothing bypassing `AuditLog::record` on the subagent's side.
+        let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        assert!(
+            log.contains("\"tool\":\"spawn\"") && log.contains("\"caller\":\"root\""),
+            "the root's spawn call was not recorded: {log}"
+        );
     }
 
     #[tokio::test]
@@ -1572,7 +1996,7 @@ print("wrote")
 
         let mut session = Session::new();
         session.push_user("hi");
-        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
@@ -1585,10 +2009,14 @@ print("wrote")
         let outcome = run(
             &p,
             &mut session,
-            &mut audit,
+            audit.clone(),
             &mut stop,
             &always_on,
             &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             &mut ctx,
         )
         .await

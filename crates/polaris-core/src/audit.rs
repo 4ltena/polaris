@@ -31,6 +31,7 @@ impl AuditLog {
             "tool": screen(r.tool),
             "detail": truncate_field(&screen(r.detail), MAX_DETAIL_BYTES),
             "result": truncate_field(&screen(r.result), MAX_RESULT_BYTES),
+            "caller": screen(r.caller),
         });
         if let Some(p) = r.sandbox {
             line["sandbox"] = serde_json::Value::String(screen(&p.describe()));
@@ -54,6 +55,10 @@ pub struct Record<'a> {
     pub sandbox: Option<&'a polaris_sandbox::SandboxPolicy>,
     pub target: Option<&'a Path>,
     pub result: &'a str,
+    /// 呼び出し主体。ルートは `"root"`、subagent はその型名。全ての新規
+    /// フィールドは screen を経由するという既存の不変条件に従い、必ず
+    /// screen(r.caller) を通す。
+    pub caller: &'a str,
 }
 
 /// The single gate through which every string written to the audit log
@@ -133,6 +138,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: "ok",
+            caller: "root",
         })
         .expect("cannot write");
 
@@ -156,6 +162,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: "ok",
+            caller: "root",
         })
         .expect("cannot write");
         log.record(&Record {
@@ -164,6 +171,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: "ok",
+            caller: "root",
         })
         .expect("cannot write");
 
@@ -185,6 +193,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: "ok",
+            caller: "root",
         })
         .expect("cannot write");
 
@@ -215,6 +224,7 @@ mod tests {
             sandbox: Some(&policy),
             target: Some(std::path::Path::new("/w/a.txt")),
             result: "ok",
+            caller: "root",
         })
         .expect("cannot write");
 
@@ -249,6 +259,7 @@ mod tests {
             sandbox: None,
             target: Some(std::path::Path::new(secret)),
             result: secret,
+            caller: "root",
         })
         .expect("cannot write");
 
@@ -273,6 +284,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: "ok",
+            caller: "root",
         })
         .expect("cannot write");
 
@@ -302,6 +314,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: "ok",
+            caller: "root",
         })
         .expect("cannot write");
 
@@ -333,6 +346,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: &long,
+            caller: "root",
         })
         .expect("cannot write");
 
@@ -367,6 +381,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: &long,
+            caller: "root",
         })
         .expect("cannot write (may have panicked from cutting mid-boundary)");
 
@@ -378,6 +393,36 @@ mod tests {
             "not within range of the ceiling: {} bytes",
             recorded.len()
         );
+    }
+
+    #[test]
+    fn caller_distinguishes_root_from_a_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).unwrap();
+        log.record(&Record {
+            tool: "read",
+            detail: "{}",
+            sandbox: None,
+            target: None,
+            result: "ok",
+            caller: "root",
+        })
+        .unwrap();
+        log.record(&Record {
+            tool: "read",
+            detail: "{}",
+            sandbox: None,
+            target: None,
+            result: "ok",
+            caller: "file-inspector",
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"caller\":\"root\""));
+        assert!(lines[1].contains("\"caller\":\"file-inspector\""));
     }
 
     #[test]
@@ -403,6 +448,7 @@ mod tests {
             sandbox: None,
             target: None,
             result: "ok",
+            caller: "root",
         })
         .expect("cannot write");
 

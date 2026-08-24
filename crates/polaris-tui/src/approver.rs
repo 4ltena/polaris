@@ -2,6 +2,8 @@
 //! frame and blocks on a single keypress. Generic over `KeyReader` so
 //! tests can feed keys without a real terminal.
 
+use std::cell::RefCell;
+
 use polaris_core::approval::{Approver, Decision};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
@@ -30,8 +32,16 @@ impl KeyReader for CrosstermKeyReader {
     }
 }
 
+/// `terminal` is shared via `RefCell`, not held exclusively, because the
+/// main loop's agent turn now redraws the screen concurrently with
+/// `agent::run` (see `lib.rs`'s `tokio::select!` around the turn) —
+/// something that borrows the same terminal to animate the status row
+/// while `agent::run` is in flight, including while it's inside a call to
+/// `ask` here. Both sides only ever borrow it for the duration of one
+/// synchronous `draw` call, never across an `.await`, so runtime aliasing
+/// never actually occurs even though the type allows it.
 pub struct TuiApprover<'a, B: Backend, R: KeyReader> {
-    pub terminal: &'a mut Terminal<B>,
+    pub terminal: &'a RefCell<Terminal<B>>,
     pub reader: &'a mut R,
 }
 
@@ -41,6 +51,7 @@ impl<'a, B: Backend, R: KeyReader> Approver for TuiApprover<'a, B, R> {
         // approval gate that silently allows on I/O trouble is not a gate.
         if self
             .terminal
+            .borrow_mut()
             .draw(|f| render_approval_modal(f, reason))
             .is_err()
         {
@@ -76,10 +87,10 @@ mod tests {
     #[test]
     fn y_allows() {
         let backend = TestBackend::new(40, 10);
-        let mut terminal = Terminal::new(backend).expect("terminal");
+        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
         let mut reader = ScriptedReader(VecDeque::from([KeyCode::Char('y')]));
         let mut approver = TuiApprover {
-            terminal: &mut terminal,
+            terminal: &terminal,
             reader: &mut reader,
         };
 
@@ -89,10 +100,10 @@ mod tests {
     #[test]
     fn n_denies() {
         let backend = TestBackend::new(40, 10);
-        let mut terminal = Terminal::new(backend).expect("terminal");
+        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
         let mut reader = ScriptedReader(VecDeque::from([KeyCode::Char('n')]));
         let mut approver = TuiApprover {
-            terminal: &mut terminal,
+            terminal: &terminal,
             reader: &mut reader,
         };
 
@@ -102,14 +113,14 @@ mod tests {
     #[test]
     fn an_unrecognized_key_is_ignored_until_y_or_n_comes() {
         let backend = TestBackend::new(40, 10);
-        let mut terminal = Terminal::new(backend).expect("terminal");
+        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
         let mut reader = ScriptedReader(VecDeque::from([
             KeyCode::Char('x'),
             KeyCode::Up,
             KeyCode::Char('y'),
         ]));
         let mut approver = TuiApprover {
-            terminal: &mut terminal,
+            terminal: &terminal,
             reader: &mut reader,
         };
 

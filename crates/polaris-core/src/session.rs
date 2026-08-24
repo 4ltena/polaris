@@ -3,7 +3,7 @@
 
 use polaris_provider::{Message, ToolCall};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Session {
     pub messages: Vec<Message>,
 }

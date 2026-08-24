@@ -1,7 +1,7 @@
 //! Entry point for the `polaris` binary. Decides the endpoint from environment
 //! variables, assembles the always-on context, and runs the agent loop once.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -73,6 +73,31 @@ enum Command {
     Login,
     /// Delete the stored credentials. Does not touch `~/.codex/`.
     Logout,
+    /// Run one instruction non-interactively. Equivalent to `--prompt`,
+    /// offered as its own subcommand to match `codex exec`. Reads the
+    /// instruction from stdin if omitted.
+    Exec {
+        /// The instruction to run. Read from stdin if omitted (or if `-`
+        /// is given explicitly).
+        prompt: Option<String>,
+    },
+    /// Run a command inside polaris's own sandbox policy, without going
+    /// through the agent loop. Mirrors `codex sandbox` — useful for
+    /// checking what a given `--sandbox` mode would allow.
+    Sandbox {
+        /// The program and its arguments to run under confinement.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Diagnose the local polaris installation: which credentials are
+    /// saved, which provider would be picked with no `POLARIS_PROVIDER`
+    /// set, and whether this platform's sandbox backend is available.
+    Doctor,
+    /// Generate a shell completion script and print it to stdout.
+    Completion {
+        /// The shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
 }
 
 /// The possible values for `--sandbox`. We can't make
@@ -193,9 +218,9 @@ impl polaris_provider::TokenSource for AuthTokens {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
-    match args.command {
+    match args.command.take() {
         Some(Command::Login) => {
             let store = match polaris_auth::store::default_path() {
                 Ok(p) => p,
@@ -238,6 +263,62 @@ async fn main() -> ExitCode {
                 }
             };
         }
+        Some(Command::Exec { prompt }) => {
+            // Falls through to the same one-shot path `--prompt` already
+            // takes below, rather than duplicating provider resolution,
+            // sandbox setup, and the agent loop. `-` explicitly requests
+            // stdin, matching `codex exec`'s own convention.
+            args.prompt = Some(match prompt {
+                Some(p) if p != "-" => p,
+                _ => {
+                    let mut buf = String::new();
+                    if let Err(e) = io::stdin().read_to_string(&mut buf) {
+                        eprintln!("Can't read the instruction from stdin: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    buf
+                }
+            });
+        }
+        Some(Command::Sandbox { command }) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let policy = match build_sandbox_policy(&cwd, args.sandbox.into()) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Can't build the sandbox policy: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let program = Path::new(&command[0]);
+            return match polaris_sandbox::run_confined(&policy, program, &command[1..], None) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    // A shell exit status is a small non-negative int in
+                    // practice; ExitCode::from wants a u8, so anything
+                    // outside that range collapses to FAILURE rather than
+                    // silently wrapping.
+                    match u8::try_from(outcome.status) {
+                        Ok(code) => ExitCode::from(code),
+                        Err(_) => ExitCode::FAILURE,
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some(Command::Doctor) => return run_doctor().await,
+        Some(Command::Completion { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut <Args as clap::CommandFactory>::command(),
+                "polaris",
+                &mut io::stdout(),
+            );
+            return ExitCode::SUCCESS;
+        }
         None => {}
     }
 
@@ -246,8 +327,18 @@ async fn main() -> ExitCode {
     }
 
     let model = std::env::var("POLARIS_MODEL").ok();
-    let mut provider_name =
-        std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| "openai".to_string());
+    let mut provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| {
+        let has_openai_key = std::env::var("POLARIS_API_KEY").is_ok()
+            || polaris_auth::api_key::default_path()
+                .ok()
+                .and_then(|p| polaris_auth::api_key::load_from(&p).ok().flatten())
+                .is_some();
+        let has_saved_codex_credentials = polaris_auth::store::default_path()
+            .ok()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        default_provider_name(has_openai_key, has_saved_codex_credentials).to_string()
+    });
 
     let model_name: String;
 
@@ -354,6 +445,19 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Every saved conversation lives here, across every project — see the
+    // docs on `polaris_core::project::sessions_dir`. Only the interactive
+    // TUI path below actually uses it (one-shot `-p`/`exec` runs don't
+    // persist a resumable conversation), but it's resolved here alongside
+    // `state_dir` since both fail the same way (missing `HOME`).
+    let sessions_dir = match polaris_core::project::sessions_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Can't determine the sessions directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let audit_path = match args.audit {
         Some(p) => p,
         None => match default_audit_path(&cwd) {
@@ -365,18 +469,7 @@ async fn main() -> ExitCode {
         },
     };
 
-    // The writable root is derived from the project root. Using the working
-    // directory as-is would change what's writable just because you launched
-    // from deep inside the repository (see the docs on
-    // `polaris_core::project::resolve_root`).
-    let root = polaris_core::project::resolve_root(&cwd);
-    let sandbox_mode: SandboxMode = args.sandbox.into();
-    let writable_roots: Vec<PathBuf> = if sandbox_mode == SandboxMode::WorkspaceWrite {
-        vec![root]
-    } else {
-        Vec::new()
-    };
-    let sandbox = match SandboxPolicy::new(sandbox_mode, &writable_roots) {
+    let sandbox = match build_sandbox_policy(&cwd, args.sandbox.into()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Can't build the sandbox policy: {e}");
@@ -463,7 +556,9 @@ async fn main() -> ExitCode {
                 provider: provider.as_ref(),
                 provider_name: provider_name.clone(),
                 model_name: model_name.clone(),
+                cwd: cwd.clone(),
                 state_dir,
+                sessions_dir,
                 audit_path,
                 max_turns: args.max_turns,
                 sandbox,
@@ -538,6 +633,121 @@ fn default_audit_path(cwd: &Path) -> io::Result<PathBuf> {
     Ok(polaris_core::project::state_dir(cwd)?.join("audit.jsonl"))
 }
 
+/// Builds the sandbox policy for a run. The writable root is derived from
+/// the project root, not `cwd` as-is — using `cwd` directly would change
+/// what's writable just because you launched from deep inside the
+/// repository (see the docs on `polaris_core::project::resolve_root`).
+/// Shared between the normal run path and the standalone `sandbox`
+/// subcommand so the two can never disagree about what a given
+/// `--sandbox` mode actually allows.
+fn build_sandbox_policy(
+    cwd: &Path,
+    sandbox_mode: SandboxMode,
+) -> Result<SandboxPolicy, polaris_sandbox::SandboxError> {
+    let root = polaris_core::project::resolve_root(cwd);
+    let writable_roots: Vec<PathBuf> = if sandbox_mode == SandboxMode::WorkspaceWrite {
+        vec![root]
+    } else {
+        Vec::new()
+    };
+    SandboxPolicy::new(sandbox_mode, &writable_roots)
+}
+
+/// `polaris doctor`. Diagnoses the local installation: read-only checks
+/// only, and never prints the credential contents themselves — only
+/// whether each file exists and parses.
+async fn run_doctor() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    println!("polaris doctor\n");
+
+    println!("Credentials:");
+    match polaris_auth::store::default_path() {
+        Ok(p) => {
+            let status = if !p.exists() {
+                "not found".to_string()
+            } else {
+                match std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<polaris_auth::Credentials>(&s).ok())
+                {
+                    Some(_) => "present, readable".to_string(),
+                    None => "present, but could not be parsed".to_string(),
+                }
+            };
+            println!("  {} (ChatGPT sign-in): {status}", p.display());
+        }
+        Err(e) => println!("  Can't determine the credentials path: {e}"),
+    }
+    match polaris_auth::api_key::default_path() {
+        Ok(p) => {
+            let status = match polaris_auth::api_key::load_from(&p) {
+                Ok(Some(_)) => "present, readable".to_string(),
+                Ok(None) => "not found".to_string(),
+                Err(e) => format!("present, but could not be read: {e}"),
+            };
+            println!("  {} (API key): {status}", p.display());
+        }
+        Err(e) => println!("  Can't determine the API key path: {e}"),
+    }
+    let env_key_set = std::env::var("POLARIS_API_KEY").is_ok();
+    println!(
+        "  POLARIS_API_KEY environment variable: {}",
+        if env_key_set { "set" } else { "not set" }
+    );
+
+    println!("\nProvider resolution:");
+    match std::env::var("POLARIS_PROVIDER") {
+        Ok(p) => println!("  POLARIS_PROVIDER is set explicitly: {p}"),
+        Err(_) => {
+            let has_openai_key = env_key_set
+                || polaris_auth::api_key::default_path()
+                    .ok()
+                    .and_then(|p| polaris_auth::api_key::load_from(&p).ok().flatten())
+                    .is_some();
+            let has_saved_codex_credentials = polaris_auth::store::default_path()
+                .ok()
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            let chosen = default_provider_name(has_openai_key, has_saved_codex_credentials);
+            println!("  POLARIS_PROVIDER is not set; would default to: {chosen}");
+        }
+    }
+
+    println!("\nSandbox:");
+    for (label, mode) in [
+        ("read-only", SandboxMode::ReadOnly),
+        ("workspace-write", SandboxMode::WorkspaceWrite),
+    ] {
+        match build_sandbox_policy(&cwd, mode) {
+            Ok(policy) => println!("  {label}: available ({})", policy.describe()),
+            Err(e) => println!("  {label}: NOT available ({e})"),
+        }
+    }
+
+    println!("\nState:");
+    match polaris_core::project::state_dir(&cwd) {
+        Ok(d) => println!("  state directory: {}", d.display()),
+        Err(e) => println!("  Can't determine the state directory: {e}"),
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// When `POLARIS_PROVIDER` isn't set, decides which provider arm to try
+/// first. Prefers `openai` if a key is available (env var or the saved
+/// `api_key.json`), since that's the arm onboarding itself lives on. If no
+/// openai key exists but the user already signed in with ChatGPT (saved
+/// `~/.polaris/auth.json`, from `polaris login` or onboarding), prefer
+/// `codex` instead of re-triggering onboarding from scratch. With neither
+/// credential present, default to `openai` so onboarding fires.
+fn default_provider_name(has_openai_key: bool, has_saved_codex_credentials: bool) -> &'static str {
+    if !has_openai_key && has_saved_codex_credentials {
+        "codex"
+    } else {
+        "openai"
+    }
+}
+
 /// Formats each skipped skill as one line. Even if a single skill is
 /// broken, this display logic — kept separate from the eprintln! call so
 /// it can be tested without side effects — makes sure the fact that it
@@ -552,6 +762,30 @@ fn format_skipped_skills(skipped: &[polaris_skills::Skipped]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_provider_prefers_openai_when_its_key_is_available() {
+        assert_eq!(default_provider_name(true, true), "openai");
+        assert_eq!(default_provider_name(true, false), "openai");
+    }
+
+    #[test]
+    fn default_provider_falls_back_to_saved_codex_credentials() {
+        // The bug this pins down: signing in with ChatGPT through
+        // onboarding saves `~/.polaris/auth.json` but nothing sets
+        // `POLARIS_PROVIDER`. Without this fallback, the next launch
+        // defaults straight back to "openai", finds no key, and reopens
+        // onboarding even though the user already signed in.
+        assert_eq!(default_provider_name(false, true), "codex");
+    }
+
+    #[test]
+    fn default_provider_falls_back_to_openai_when_neither_credential_exists() {
+        // openai is the arm that owns onboarding; codex's own arm just
+        // fails lazily on first use. With nothing saved anywhere, we want
+        // onboarding to fire, so this must stay "openai".
+        assert_eq!(default_provider_name(false, false), "openai");
+    }
 
     #[test]
     fn confined_apply_parses_without_a_prompt() {

@@ -52,10 +52,24 @@ pub fn state_dir(cwd: &Path) -> std::io::Result<PathBuf> {
     let root = resolve_root(cwd);
     let id = project_id(&root);
 
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set")
-    })?;
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
     let dir = Path::new(&home).join(".polaris").join("state").join(id);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The directory holding every saved TUI conversation, across every
+/// project: `~/.polaris/sessions/`, created if missing. Unlike
+/// `state_dir`, this is not scoped to one project's hashed id — `/resume`
+/// needs to list conversations from every directory polaris has ever run
+/// in, not just the current one, so conversations live in one shared
+/// pool and carry their originating directory as metadata instead (see
+/// `polaris-tui::persist::SessionMeta`).
+pub fn sessions_dir() -> std::io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
+    let dir = Path::new(&home).join(".polaris").join("sessions");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -134,5 +148,30 @@ mod tests {
         let a = project_id(Path::new("/w/polaris"));
         let b = project_id(Path::new("/w/other"));
         assert_ne!(a, b);
+    }
+
+    // `sessions_dir` reads `HOME`, which is process-global state — swapping
+    // it races with any other test doing the same unless serialized.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn sessions_dir_is_shared_across_projects_not_hashed_per_project() {
+        let home = tempfile::tempdir().expect("temp directory");
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HOME");
+        // SAFETY: serialized by `HOME_LOCK`; restored before the guard drops.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let dir = sessions_dir().expect("sessions dir");
+
+        match prev {
+            Some(p) => unsafe { std::env::set_var("HOME", p) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_eq!(dir, home.path().join(".polaris").join("sessions"));
+        assert!(dir.is_dir());
     }
 }

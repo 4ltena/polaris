@@ -121,6 +121,23 @@ pub enum ProviderError {
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
+
+    /// Switches which model subsequent `complete` calls use. Takes `&self`
+    /// (not `&mut self`) so it can be called through the same shared
+    /// `&dyn Provider` reference the rest of the harness already holds —
+    /// implementations that support it (`OpenAiProvider`, `CodexProvider`)
+    /// use interior mutability. The default no-op is for implementations
+    /// that don't need to support switching (test doubles, anything with
+    /// a fixed model).
+    fn set_model(&self, _model: &str) {}
+
+    /// Switches the reasoning effort subsequent `complete` calls request,
+    /// same `&self`-via-interior-mutability reasoning as `set_model`.
+    /// `CodexProvider` otherwise derives this from the account's plan
+    /// type (`Token::effort`) — an explicit `set_effort` call overrides
+    /// that for the rest of the session. `None` restores the default
+    /// (plan-derived for `CodexProvider`; unset for `OpenAiProvider`).
+    fn set_effort(&self, _effort: Option<&str>) {}
 }
 
 /// The credentials used for a single request. The provider knows nothing

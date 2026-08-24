@@ -136,6 +136,9 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `onboarding.rs` — The onboarding screen: shown by `polaris-cli` when the interactive TUI
 - `persist.rs` — Session persistence: one JSON `Message` per line.
 - `render.rs` — Pure rendering: turns a `Session` + input state into terminal cells.
+- `sessions.rs` — Enumerates saved conversations under `~/.polaris/sessions/` for the
+- `slash.rs` — Slash commands: local, client-side commands recognized when the input
+- `time.rs` — A tiny, dependency-free UTC timestamp formatter — just enough to
 
 ## `docs`
 
@@ -154,7 +157,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-20-polaris-m3b-bm25-skill-router.md` — polaris M3b BM25 skill ルータ 実装計画
 - `2026-08-20-polaris-m4-core.md` — polaris M4 コア（`spawn` と単一波オーケストレーション）実装計画
 - `2026-08-21-polaris-tui-onboarding.md` — polaris TUI Onboarding Screen Implementation Plan
-- `2026-08-21-polaris-tui-v2.md` — polaris TUI v2 (v0.4.0 "Regulus") Implementation Plan
+- `2026-08-21-polaris-tui-v2.md` — polaris TUI v2 Implementation Plan
 - `2026-08-21-polaris-tui.md` — polaris TUI Implementation Plan
 
 ## `docs/superpowers/specs`
@@ -164,4 +167,4 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-20-polaris-skill-bm25-router-design.md` — polaris skill ルータ BM25 化 設計
 - `2026-08-21-polaris-tui-design.md` — polaris TUI 設計
 - `2026-08-21-polaris-tui-onboarding-design.md` — polaris TUI 初回起動オンボーディング画面 設計
-- `2026-08-21-polaris-tui-v2-design.md` — polaris TUI v2(v0.4.0 “Regulus”)設計
+- `2026-08-21-polaris-tui-v2-design.md` — polaris TUI v2 設計

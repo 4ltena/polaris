@@ -5,8 +5,11 @@ pub mod edit;
 pub mod path_policy;
 pub mod predicate;
 pub mod read;
+mod schema_validate;
 pub mod skill;
 pub mod write;
+
+pub use schema_validate::validate;
 
 use serde::Serialize;
 

@@ -117,6 +117,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `path_policy.rs` — Decides which paths reading is denied on. Leans toward avoiding missed
 - `predicate.rs` — Predicts ahead of time whether a write will be denied.
 - `read.rs` — read tool. Line numbers are attached to the output so the model can
+- `schema_validate.rs` — subagent の結果を、型が宣言した JSON Schema に照合するだけの薄い
 - `skill.rs` — skill tool. Returns the body on an exact name match, otherwise returns a
 - `write.rs` — `write` tool. The actual write happens inside a confined child process.
 

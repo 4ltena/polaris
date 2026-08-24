@@ -4,7 +4,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)]
 fn find_repo_root(starting_dir: &Path) -> PathBuf {
     let mut current = starting_dir;
     loop {
@@ -18,7 +17,6 @@ fn find_repo_root(starting_dir: &Path) -> PathBuf {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn ensure_pattern_ignored(starting_dir: &Path, pattern: &str) -> std::io::Result<()> {
     let root = find_repo_root(starting_dir);
     let gitignore_path = root.join(".gitignore");

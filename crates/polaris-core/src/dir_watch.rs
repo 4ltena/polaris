@@ -68,7 +68,14 @@ fn walk(dir: &Path, out: &mut DirSnapshot, recurse: bool) {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ScanScope {
     Recursive(PathBuf),
-    Shallow(PathBuf),
+    /// Each listed directory, one level deep, merged into a single
+    /// snapshot. It is a list rather than a single directory because
+    /// `write` needs to watch both the target's parent *and* that parent's
+    /// own parent: `polaris_sandbox`'s helper does `create_dir_all` before
+    /// writing, so `write` to `sub/a.txt` genuinely creates `sub` — and a
+    /// directory never appears inside its own listing, so scanning `sub`
+    /// alone can never see that `sub` itself is new.
+    Shallow(Vec<PathBuf>),
     /// スキャンすべき対象がない場合。`bash` かつ書込許可ルートを持たない
     /// (read-only / full-access)場合や、`write`/`edit` の `path` 引数が
     /// 読めない場合がこれにあたる。
@@ -78,7 +85,15 @@ pub(crate) enum ScanScope {
 pub(crate) fn snapshot_for_scope(scope: &ScanScope) -> DirSnapshot {
     match scope {
         ScanScope::Recursive(root) => snapshot_recursive(root),
-        ScanScope::Shallow(dir) => snapshot_shallow(dir),
+        ScanScope::Shallow(dirs) => {
+            let mut out = DirSnapshot::default();
+            for dir in dirs {
+                let one = snapshot_shallow(dir);
+                out.dirs.extend(one.dirs);
+                out.files.extend(one.files);
+            }
+            out
+        }
         ScanScope::None => DirSnapshot::default(),
     }
 }
@@ -162,10 +177,40 @@ mod tests {
         std::fs::write(root.path().join("sub/deep.txt"), "x").unwrap();
 
         let recursive = snapshot_for_scope(&ScanScope::Recursive(root.path().to_path_buf()));
-        let shallow = snapshot_for_scope(&ScanScope::Shallow(root.path().to_path_buf()));
+        let shallow = snapshot_for_scope(&ScanScope::Shallow(vec![root.path().to_path_buf()]));
 
         assert!(recursive.files.contains(&root.path().join("sub/deep.txt")));
         assert!(!shallow.files.contains(&root.path().join("sub/deep.txt")));
+    }
+
+    #[test]
+    fn a_shallow_scope_merges_every_directory_it_lists_without_recursing() {
+        // What `write` needs: the target's parent and that parent's own
+        // parent, in one snapshot. Neither is scanned recursively, and a
+        // directory that does not exist contributes nothing rather than
+        // failing the whole scan.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("sub/deeper")).unwrap();
+        std::fs::write(root.path().join("sub/mid.txt"), "x").unwrap();
+        std::fs::write(root.path().join("sub/deeper/deep.txt"), "x").unwrap();
+        std::fs::write(root.path().join("top.txt"), "x").unwrap();
+
+        let snap = snapshot_for_scope(&ScanScope::Shallow(vec![
+            root.path().join("sub"),
+            root.path().to_path_buf(),
+            root.path().join("does-not-exist"),
+        ]));
+
+        assert!(snap.files.contains(&root.path().join("top.txt")));
+        assert!(snap.files.contains(&root.path().join("sub/mid.txt")));
+        assert!(snap.dirs.contains(&root.path().join("sub")));
+        assert!(snap.dirs.contains(&root.path().join("sub/deeper")));
+        assert!(
+            !snap
+                .files
+                .contains(&root.path().join("sub/deeper/deep.txt")),
+            "a listed directory was scanned recursively: {snap:?}"
+        );
     }
 
     #[test]

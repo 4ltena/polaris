@@ -117,7 +117,15 @@ async fn regenerate_one(
             caller: "harness",
         });
     }
-    let _ = crate::gitignore::ensure_pattern_ignored(dir, "**/files.md");
+    // Bounded by the sandbox's own writable root: this is the one harness
+    // write that does not go through the sandbox helper, so nothing else
+    // would stop it from walking up to a `.git` outside the writable root
+    // and appending there. With no writable root at all (read-only, or
+    // full-access, which declares none) there is no bound to enforce, so
+    // registration is skipped rather than aimed at an unbounded search.
+    if let Some(root) = base_sandbox.writable_roots().first() {
+        let _ = crate::gitignore::ensure_pattern_ignored(dir, root, "**/files.md");
+    }
 }
 
 #[cfg(test)]

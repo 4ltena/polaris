@@ -342,7 +342,7 @@ async fn main() -> ExitCode {
 
     let model_name: String;
 
-    let provider: Box<dyn polaris_provider::Provider> = loop {
+    let provider: std::sync::Arc<dyn polaris_provider::Provider> = loop {
         match provider_name.as_str() {
             "openai" => {
                 // Keep the existing setup as-is. Behavior does not change.
@@ -399,7 +399,7 @@ async fn main() -> ExitCode {
                 let model = model.clone().unwrap_or_else(|| "gpt-5.4".to_string());
                 model_name = model.clone();
                 match OpenAiProvider::new(base, key, model) {
-                    Ok(p) => break Box::new(p),
+                    Ok(p) => break std::sync::Arc::new(p),
                     Err(e) => {
                         eprintln!("Can't build the client: {e}");
                         return ExitCode::FAILURE;
@@ -417,7 +417,7 @@ async fn main() -> ExitCode {
                 let model =
                     model.unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
                 model_name = model.clone();
-                break Box::new(polaris_provider::codex::CodexProvider::new(
+                break std::sync::Arc::new(polaris_provider::codex::CodexProvider::new(
                     polaris_provider::codex::ENDPOINT_BASE.to_string(),
                     model,
                     std::sync::Arc::new(AuthTokens {
@@ -518,8 +518,11 @@ async fn main() -> ExitCode {
             let mut session = Session::new();
             session.push_user(&prompt);
 
-            let mut audit = match AuditLog::open(&audit_path) {
-                Ok(a) => a,
+            // Exactly one handle, shared with whatever subagents `spawn`
+            // starts — see `agent::run`'s docs. The root never holds the
+            // lock across a turn; `run_loop` takes it per audit record.
+            let audit = match AuditLog::open(&audit_path) {
+                Ok(a) => std::sync::Arc::new(tokio::sync::Mutex::new(a)),
                 Err(e) => {
                     eprintln!("Can't open the audit log: {e}");
                     return ExitCode::FAILURE;
@@ -538,10 +541,12 @@ async fn main() -> ExitCode {
             match agent::run(
                 provider.as_ref(),
                 &mut session,
-                &mut audit,
+                audit.clone(),
                 &mut stop,
                 &always_on,
                 &discovered.skills,
+                &discovered_agents.agent_types,
+                provider.clone(),
                 &mut ctx,
             )
             .await
@@ -558,7 +563,7 @@ async fn main() -> ExitCode {
         }
         None => {
             polaris_tui::run(polaris_tui::RunArgs {
-                provider: provider.as_ref(),
+                provider: provider.clone(),
                 provider_name: provider_name.clone(),
                 model_name: model_name.clone(),
                 cwd: cwd.clone(),
@@ -571,6 +576,7 @@ async fn main() -> ExitCode {
                 approval_policy,
                 always_on: &always_on,
                 skills: &discovered.skills,
+                agent_types: &discovered_agents.agent_types,
             })
             .await
         }

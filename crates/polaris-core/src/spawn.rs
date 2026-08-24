@@ -173,6 +173,18 @@ fn validate_output(agent: &AgentType, text: &str) -> Result<(), String> {
     polaris_tools::validate(&schema, &instance)
 }
 
+/// Canonicalizes a declared `write_root`. Shared by `resolve_subagent_sandbox`
+/// (which needs the canonical form to check containment against the
+/// parent's own writable roots) and `check_no_write_root_overlap` (which
+/// needs it so two tasks naming the same directory by different spellings
+/// — `/w` vs `/w/` vs `./w` — or one nested inside the other are compared
+/// as the real filesystem paths they resolve to, not as strings).
+fn canonicalize_write_root(root: &str) -> Result<PathBuf, String> {
+    PathBuf::from(root)
+        .canonicalize()
+        .map_err(|e| format!("write_root {root} does not exist: {e}"))
+}
+
 /// Maps a type's `access` onto an actual sandbox policy. For read-write,
 /// the `write_root` the task declared is confined to what the parent's own
 /// writable roots already cover — the invariant checked here is that no
@@ -192,10 +204,7 @@ fn resolve_subagent_sandbox(
                     agent.name
                 ));
             };
-            let root_path = PathBuf::from(root);
-            let canonical = root_path
-                .canonicalize()
-                .map_err(|e| format!("write_root {root} does not exist: {e}"))?;
+            let canonical = canonicalize_write_root(root)?;
             if !base_sandbox.contains(&canonical) {
                 return Err(format!(
                     "write_root {root} is outside the parent's own writable roots"
@@ -311,22 +320,38 @@ pub async fn run_wave(
 }
 
 /// Rejects a wave upfront, before any task runs, if two or more tasks
-/// declare the same `write_root`. Concurrent tasks racing against the
-/// same writable root is exactly what parallelizing the wave must not
-/// permit — checked before any task is polled, so a rejected wave never
-/// leaves a partially-run state behind.
+/// declare `write_root`s that resolve to the same directory, or to one
+/// nested inside the other. Concurrent tasks racing against the same (or
+/// an overlapping) writable root is exactly what parallelizing the wave
+/// must not permit — checked before any task is polled, so a rejected
+/// wave never leaves a partially-run state behind.
+///
+/// Comparison is by canonicalized path containment, not string equality:
+/// `/w`, `/w/`, and `./w` all name the same directory, and `/w/sub` names
+/// one nested inside `/w` — a task confined to `/w` and a task confined to
+/// `/w/sub` can still race on the same files even though the two strings
+/// never compare equal. A root that fails to canonicalize (e.g. it
+/// doesn't exist) is left out of this comparison entirely —
+/// `resolve_subagent_sandbox` refuses it on its own, with a clearer
+/// "does not exist" reason, once that task actually runs.
 fn check_no_write_root_overlap(tasks: &[SpawnTask]) -> Result<(), String> {
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: Vec<(&str, PathBuf)> = Vec::new();
     for t in tasks {
         let Some(root) = t.write_root.as_deref() else {
             continue;
         };
-        if seen.contains(&root) {
+        let Ok(canonical) = canonicalize_write_root(root) else {
+            continue;
+        };
+        if let Some((other_root, _)) = seen
+            .iter()
+            .find(|(_, other)| canonical.starts_with(other) || other.starts_with(&canonical))
+        {
             return Err(format!(
-                "spawn rejected: overlapping write_root {root:?} across tasks in the same wave"
+                "spawn rejected: overlapping write_root {root:?} and {other_root:?} across tasks in the same wave"
             ));
         }
-        seen.push(root);
+        seen.push((root, canonical));
     }
     Ok(())
 }
@@ -804,12 +829,20 @@ mod tests {
     // Module-level `fn`s rather than per-test closures — Task 12 is
     // expected to reuse fixtures like these by name.
 
+    /// A read-only type reusing `file-inspector`'s schema/body, renamed to
+    /// whatever `name` the caller needs — e.g. a distinct name per task, so
+    /// a test can prove result ordering by checking each entry's `"type"`
+    /// rather than relying on identical entries being indistinguishable.
+    fn named_readonly_fixture(name: &str) -> AgentType {
+        let mut a = file_inspector();
+        a.name = name.to_string();
+        a
+    }
+
     /// A read-only type reusing `file-inspector`'s schema/body, renamed so
     /// tests can spawn it under a name distinct from the real type.
     fn readonly_fixture_agent_type() -> AgentType {
-        let mut a = file_inspector();
-        a.name = "ro-fixture".into();
-        a
+        named_readonly_fixture("ro-fixture")
     }
 
     /// A read-write type reusing `file-inspector`'s schema/body (the
@@ -838,9 +871,17 @@ mod tests {
     /// answers with an empty response. Used where a test asserts the
     /// provider was *not* called (or was called a specific number of
     /// times) and does not care what it would have said.
+    ///
+    /// `delay`, when set, is awaited (via `tokio::time::sleep`) before the
+    /// call is counted or answered — the minimal extension needed to prove
+    /// `run_wave`'s concurrency is real rather than incidental: a wave of
+    /// tasks that each spend `delay` "in flight" finishes in close to
+    /// `delay` total when they genuinely overlap, and in close to
+    /// `n * delay` when the concurrency limit forces them to queue.
     struct CountingProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
         reply: Option<String>,
+        delay: Option<std::time::Duration>,
     }
 
     #[async_trait::async_trait]
@@ -849,6 +890,9 @@ mod tests {
             &self,
             _req: CompletionRequest,
         ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            if let Some(d) = self.delay {
+                tokio::time::sleep(d).await;
+            }
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(match &self.reply {
                 Some(body) => text(body),
@@ -858,7 +902,11 @@ mod tests {
     }
 
     fn counting_mock_provider(calls: Arc<std::sync::atomic::AtomicUsize>) -> CountingProvider {
-        CountingProvider { calls, reply: None }
+        CountingProvider {
+            calls,
+            reply: None,
+            delay: None,
+        }
     }
 
     /// Same counter, but answers with output that matches
@@ -866,6 +914,15 @@ mod tests {
     /// schema, so the wave entry for each call comes back `"ok": true`.
     fn counting_mock_provider_returning_valid_output(
         calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> CountingProvider {
+        counting_mock_provider_with_delay(calls, std::time::Duration::ZERO)
+    }
+
+    /// Same as `counting_mock_provider_returning_valid_output`, but each
+    /// call sleeps `delay` first — see `CountingProvider::delay`'s docs.
+    fn counting_mock_provider_with_delay(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        delay: std::time::Duration,
     ) -> CountingProvider {
         CountingProvider {
             calls,
@@ -877,6 +934,7 @@ mod tests {
                 })
                 .to_string(),
             ),
+            delay: Some(delay),
         }
     }
 
@@ -979,5 +1037,231 @@ mod tests {
         assert_eq!(entries[0]["ok"], true, "{out}");
         assert_eq!(entries[1]["type"], "ro-fixture");
         assert_eq!(entries[1]["ok"], true, "{out}");
+    }
+
+    #[tokio::test]
+    async fn overlapping_write_roots_are_detected_after_canonicalization_even_when_nested() {
+        // `/w` and `/w/sub` never compare equal as strings, but the second
+        // sandbox ends up nested inside (and racing against) the first
+        // once tasks run concurrently — the check has to compare resolved
+        // paths, not the raw declarations.
+        let dir = tempfile::tempdir().expect("temp directory");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("cannot create the nested directory");
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = counting_mock_provider(call_count.clone());
+        let agent_types = vec![readwrite_fixture_agent_type()];
+        let tasks = vec![
+            SpawnTask {
+                agent_type: "rw-fixture".to_string(),
+                task: "a".to_string(),
+                write_root: Some(dir.path().display().to_string()),
+            },
+            SpawnTask {
+                agent_type: "rw-fixture".to_string(),
+                task: "b".to_string(),
+                write_root: Some(sub.display().to_string()),
+            },
+        ];
+        let base_sandbox =
+            SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[dir.path().to_path_buf()])
+                .expect("policy");
+        let audit = shared_test_audit();
+
+        let out = run_wave(
+            tasks,
+            &agent_types,
+            Arc::new(provider),
+            audit,
+            &base_sandbox,
+            Path::new("/bin/true"),
+            DEFAULT_CONCURRENCY,
+            DEFAULT_WRITE_CONCURRENCY,
+        )
+        .await;
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a nested write_root escaped the overlap check: {out}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("rejection is not JSON: {e}: {out}"));
+        assert_eq!(parsed["ok"], false, "{out}");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .expect("the rejection carries no error text")
+                .contains("overlapping write_root"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuinely_disjoint_write_roots_are_not_flagged_as_overlapping() {
+        // The flip side of the nested-path test: canonicalization must not
+        // make the check *more* trigger-happy than plain string equality
+        // was — two real, unrelated directories still run.
+        let a_dir = tempfile::tempdir().expect("temp directory");
+        let b_dir = tempfile::tempdir().expect("temp directory");
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = counting_mock_provider_returning_valid_output(call_count.clone());
+        let agent_types = vec![readwrite_fixture_agent_type()];
+        let tasks = vec![
+            SpawnTask {
+                agent_type: "rw-fixture".to_string(),
+                task: "a".to_string(),
+                write_root: Some(a_dir.path().display().to_string()),
+            },
+            SpawnTask {
+                agent_type: "rw-fixture".to_string(),
+                task: "b".to_string(),
+                write_root: Some(b_dir.path().display().to_string()),
+            },
+        ];
+        let base_sandbox = SandboxPolicy::new(
+            SandboxMode::WorkspaceWrite,
+            &[a_dir.path().to_path_buf(), b_dir.path().to_path_buf()],
+        )
+        .expect("policy");
+        let audit = shared_test_audit();
+
+        let out = run_wave(
+            tasks,
+            &agent_types,
+            Arc::new(provider),
+            audit,
+            &base_sandbox,
+            Path::new("/bin/true"),
+            DEFAULT_CONCURRENCY,
+            DEFAULT_WRITE_CONCURRENCY,
+        )
+        .await;
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "disjoint write_roots were wrongly rejected as overlapping: {out}"
+        );
+        let entries = wave_entries(&out);
+        assert_eq!(entries.len(), 2, "{out}");
+        assert!(entries.iter().all(|e| e["ok"] == true), "{out}");
+    }
+
+    #[tokio::test]
+    async fn tasks_within_the_concurrency_limit_run_genuinely_concurrently() {
+        // If `run_wave` were still sequential (or the semaphore were a
+        // no-op), N tasks each "spending" `delay` would take roughly
+        // `N * delay`. Run enough of them, all within the default
+        // concurrency limit, and assert the wave finishes far closer to
+        // one `delay` than to `n * delay`.
+        let delay = std::time::Duration::from_millis(200);
+        let n = 5usize;
+        assert!(
+            n < DEFAULT_CONCURRENCY,
+            "the test assumes every task fits under the default limit at once"
+        );
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = counting_mock_provider_with_delay(call_count.clone(), delay);
+        let agent_types = vec![readonly_fixture_agent_type()];
+        let tasks: Vec<SpawnTask> = (0..n)
+            .map(|i| SpawnTask {
+                agent_type: "ro-fixture".to_string(),
+                task: format!("task {i}"),
+                write_root: None,
+            })
+            .collect();
+        let base_sandbox = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("policy");
+        let audit = shared_test_audit();
+
+        let start = std::time::Instant::now();
+        let out = run_wave(
+            tasks,
+            &agent_types,
+            Arc::new(provider),
+            audit,
+            &base_sandbox,
+            Path::new("/bin/true"),
+            DEFAULT_CONCURRENCY,
+            DEFAULT_WRITE_CONCURRENCY,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), n);
+        assert!(
+            elapsed < delay * 2,
+            "{n} tasks each taking {delay:?} finished in {elapsed:?} — expected close to \
+             one {delay:?} if they ran concurrently (a sequential loop would take roughly {:?})",
+            delay * n as u32
+        );
+        let entries = wave_entries(&out);
+        assert_eq!(entries.len(), n, "{out}");
+        assert!(entries.iter().all(|e| e["ok"] == true), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_concurrency_limit_of_one_serializes_tasks_but_keeps_results_correct_and_ordered() {
+        // The test that actually proves the semaphore bounds concurrency
+        // rather than being a no-op: force `concurrency: 1` and confirm
+        // the wave takes close to `n * delay` (genuinely serialized), and
+        // — distinct types per task, so the result order is actually
+        // checkable — that every entry still lands in task order.
+        let delay = std::time::Duration::from_millis(150);
+        let names = ["fixture-0", "fixture-1", "fixture-2"];
+        let n = names.len();
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = counting_mock_provider_with_delay(call_count.clone(), delay);
+        let agent_types: Vec<AgentType> = names.iter().map(|n| named_readonly_fixture(n)).collect();
+        let tasks: Vec<SpawnTask> = names
+            .iter()
+            .map(|name| SpawnTask {
+                agent_type: name.to_string(),
+                task: format!("inspect for {name}"),
+                write_root: None,
+            })
+            .collect();
+        let base_sandbox = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).expect("policy");
+        let audit = shared_test_audit();
+
+        let start = std::time::Instant::now();
+        let out = run_wave(
+            tasks,
+            &agent_types,
+            Arc::new(provider),
+            audit,
+            &base_sandbox,
+            Path::new("/bin/true"),
+            1,
+            1,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), n);
+        // A generous lower bound: genuinely serialized N tasks take at
+        // least (N-1) additional delays beyond the first. Concurrent
+        // execution under a limit of 1 is a contradiction in terms, so
+        // there is no scheduling noise this could plausibly fall under.
+        let min_serial = delay * (n as u32 - 1);
+        assert!(
+            elapsed >= min_serial,
+            "{n} tasks with concurrency=1 finished in {elapsed:?} — expected at least \
+             {min_serial:?} if they were genuinely serialized rather than run concurrently"
+        );
+
+        let entries = wave_entries(&out);
+        assert_eq!(entries.len(), n, "{out}");
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(
+                entries[i]["type"], *name,
+                "result order was not preserved under concurrency=1: {out}"
+            );
+            assert_eq!(entries[i]["ok"], true, "{out}");
+        }
     }
 }

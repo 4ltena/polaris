@@ -125,11 +125,19 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
             if let Some(paths) = raw.agents.paths {
                 merged.agents_paths = paths;
             }
+            // Floored to 1: `spawn::run_wave` builds a `Semaphore::new(n)`
+            // from these directly, and a semaphore with 0 permits means
+            // every task in the wave parks on `acquire()` forever — a
+            // silent hang, not a config error a user would ever see.
+            // Flooring rather than rejecting keeps a config file with
+            // `concurrency = 0` usable (as "as serialized as this build
+            // allows") instead of turning it into a hard failure at
+            // startup.
             if let Some(n) = raw.spawn.concurrency {
-                merged.spawn_concurrency = n;
+                merged.spawn_concurrency = n.max(1);
             }
             if let Some(n) = raw.spawn.write_concurrency {
-                merged.spawn_write_concurrency = n;
+                merged.spawn_write_concurrency = n.max(1);
             }
         }
     }
@@ -269,5 +277,24 @@ mod tests {
         let pp = write(pj.path(), "# no spawn section\n");
         let c = try_load_from(Some(&gp), Some(&pp)).expect("should be readable");
         assert_eq!(c.spawn_concurrency, 16);
+    }
+
+    #[test]
+    fn a_declared_concurrency_of_zero_is_floored_to_one_not_left_as_a_deadlock() {
+        // `Semaphore::new(0)` means every task in a wave parks on
+        // `acquire()` forever — this has to be caught here, at config
+        // load, rather than surfacing as a silent hang deep inside
+        // `spawn::run_wave`.
+        let dir = tempfile::tempdir().expect("temp directory");
+        let p = write(
+            dir.path(),
+            "[spawn]\nconcurrency = 0\nwrite_concurrency = 0\n",
+        );
+        let c = try_load_from(Some(&p), None).expect("should be readable");
+        assert_eq!(c.spawn_concurrency, 1, "concurrency = 0 was not floored");
+        assert_eq!(
+            c.spawn_write_concurrency, 1,
+            "write_concurrency = 0 was not floored"
+        );
     }
 }

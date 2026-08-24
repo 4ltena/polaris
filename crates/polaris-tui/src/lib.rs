@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -34,7 +35,10 @@ use render::{Status, render_chat};
 /// same way the one-shot path builds it. `polaris-tui` never constructs a
 /// provider or a sandbox policy itself.
 pub struct RunArgs<'a> {
-    pub provider: &'a dyn Provider,
+    /// Shared rather than borrowed: `agent::run` needs both a `&dyn
+    /// Provider` for the root's own turns and an owned handle it can hand
+    /// to a wave of subagents (see `agent::run`'s `provider_pool`).
+    pub provider: Arc<dyn Provider>,
     pub provider_name: String,
     pub model_name: String,
     pub cwd: PathBuf,
@@ -51,6 +55,14 @@ pub struct RunArgs<'a> {
     pub approval_policy: ApprovalPolicy,
     pub always_on: &'a AlwaysOn,
     pub skills: &'a [Skill],
+    /// The subagent types `spawn` can resolve a task against.
+    pub agent_types: &'a [polaris_skills::AgentType],
+    /// How many `spawn` tasks a single wave may run concurrently, and how
+    /// many of those may hold a `write_root` at once — from
+    /// `Config::spawn_concurrency` / `Config::spawn_write_concurrency`
+    /// (see `polaris_core::config`).
+    pub spawn_concurrency: usize,
+    pub spawn_write_concurrency: usize,
 }
 
 /// Collapses a leading `$HOME` to `~`, for the footer only (see
@@ -112,8 +124,11 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         .join(format!("{}.jsonl", new_session_id()));
     let mut meta_path = session_path.with_extension("meta.json");
 
-    let mut audit = match AuditLog::open(&args.audit_path) {
-        Ok(a) => a,
+    // One handle for the whole process, shared with any subagent `spawn`
+    // starts — see `agent::run`'s docs on why the audit log is shared
+    // rather than borrowed exclusively.
+    let audit = match AuditLog::open(&args.audit_path) {
+        Ok(a) => Arc::new(tokio::sync::Mutex::new(a)),
         Err(e) => {
             eprintln!("Can't open the audit log: {e}");
             return ExitCode::FAILURE;
@@ -290,7 +305,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             handle_model(
                                 &terminal,
                                 &mut key_reader,
-                                args.provider,
+                                args.provider.as_ref(),
                                 &mut model_name,
                                 &mut effort_name,
                                 &mut status,
@@ -402,7 +417,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     handle_model(
                         &terminal,
                         &mut key_reader,
-                        args.provider,
+                        args.provider.as_ref(),
                         &mut model_name,
                         &mut effort_name,
                         &mut status,
@@ -535,12 +550,16 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             // time, shimmer) actually needs to animate every tick.
             let render_snapshot = session.clone();
             let agent_future = agent::run(
-                args.provider,
+                args.provider.as_ref(),
                 &mut session,
-                &mut audit,
+                audit.clone(),
                 &mut stop,
                 args.always_on,
                 args.skills,
+                args.agent_types,
+                args.provider.clone(),
+                args.spawn_concurrency,
+                args.spawn_write_concurrency,
                 &mut ctx,
             );
             tokio::pin!(agent_future);

@@ -16,6 +16,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `README.md` — polaris
 - `rust-toolchain.toml` — pinned toolchain
 
+## `agents/file-inspector`
+
+- `SKILL.md` — SKILL.md
+
 ## `crates/polaris-auth`
 
 - `Cargo.toml` — manifest for the polaris-auth crate
@@ -59,6 +63,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `project.rs` — Resolves the project root.
 - `prompt.rs` — The single place that assembles the set of things loaded every turn.
 - `session.rs` — Message history. In M1, this is append-only — no compaction, no
+- `spawn.rs` — The `spawn` tool's implementation. Type discovery reuses
 - `stop.rs` — Stop conditions. No automatic recovery is attempted. Continuing to spin
 
 ## `crates/polaris-core/src/secret_screen`
@@ -100,6 +105,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-skills/src`
 
+- `agent_type.rs` — subagent 型の定義（`agents/<type>/SKILL.md`）の解析と discovery。
 - `discovery.rs` — Skill discovery. A single corrupt skill must not take down the whole
 - `frontmatter.rs` — SKILL.md frontmatter parsing. Validates only the constraints the specification lays down; adds no constraints of its own.
 - `lib.rs` — Loading of skills that conform to the Agent Skills specification. Adds no frontmatter fields of its own.
@@ -116,6 +122,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `path_policy.rs` — Decides which paths reading is denied on. Leans toward avoiding missed
 - `predicate.rs` — Predicts ahead of time whether a write will be denied.
 - `read.rs` — read tool. Line numbers are attached to the output so the model can
+- `schema_validate.rs` — subagent の結果を、型が宣言した JSON Schema に照合するだけの薄い
 - `skill.rs` — skill tool. Returns the body on an exact name match, otherwise returns a
 - `write.rs` — `write` tool. The actual write happens inside a confined child process.
 

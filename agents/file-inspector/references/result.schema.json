@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["path", "responsibility"],
+  "properties": {
+    "path": { "type": "string" },
+    "responsibility": { "type": "string" },
+    "test_file": { "type": ["string", "null"] }
+  }
+}

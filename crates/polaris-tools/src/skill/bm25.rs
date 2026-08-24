@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use polaris_skills::Skill;
+use super::Named;
 
 const K1: f64 = 1.5;
 const B: f64 = 0.75;
@@ -87,30 +87,30 @@ pub(crate) fn expand_query(q: &str) -> String {
     }
 }
 
-fn doc_tokens(skill: &Skill) -> Vec<String> {
-    let name_text = skill.name.replace(['-', '_', ':'], " ");
+fn doc_tokens<T: Named>(skill: &T) -> Vec<String> {
+    let name_text = skill.name().replace(['-', '_', ':'], " ");
     let name_toks = tokenize(&name_text, true);
     let mut doc = Vec::with_capacity(name_toks.len() * NAME_WEIGHT);
     for _ in 0..NAME_WEIGHT {
         doc.extend(name_toks.iter().cloned());
     }
-    doc.extend(tokenize(&skill.description, true));
+    doc.extend(tokenize(skill.description(), true));
     doc
 }
 
 /// 呼び出しごとに組み立てる BM25 インデックス。skill 数は数百〜千のオー
 /// ダーであり、`lookup` の呼び出しをまたいだキャッシュは持たない。
-pub(crate) struct Bm25<'a> {
-    skills: &'a [Skill],
+pub(crate) struct Bm25<'a, T: Named> {
+    items: &'a [T],
     doc_len: Vec<usize>,
     avgdl: f64,
     idf: HashMap<String, f64>,
     tf: Vec<HashMap<String, u32>>,
 }
 
-impl<'a> Bm25<'a> {
-    pub(crate) fn new(skills: &'a [Skill]) -> Self {
-        let docs: Vec<Vec<String>> = skills.iter().map(doc_tokens).collect();
+impl<'a, T: Named> Bm25<'a, T> {
+    pub(crate) fn new(items: &'a [T]) -> Self {
+        let docs: Vec<Vec<String>> = items.iter().map(doc_tokens).collect();
         let doc_len: Vec<usize> = docs.iter().map(Vec::len).collect();
         let avgdl = if docs.is_empty() {
             0.0
@@ -146,7 +146,7 @@ impl<'a> Bm25<'a> {
             .collect();
 
         Bm25 {
-            skills,
+            items,
             doc_len,
             avgdl,
             idf,
@@ -157,11 +157,11 @@ impl<'a> Bm25<'a> {
     /// クエリを同義語展開してからランキングする。スコア 0（クエリと共通
     /// トークンが一つも無い）の skill は候補から除外する。同点は name の
     /// 昇順で安定させる。
-    pub(crate) fn rank(&self, q: &str, k: usize) -> Vec<&'a Skill> {
+    pub(crate) fn rank(&self, q: &str, k: usize) -> Vec<&'a T> {
         let expanded = expand_query(q);
         let qtoks = tokenize(&expanded, true);
         let mut scored: Vec<(f64, usize)> = Vec::new();
-        for i in 0..self.skills.len() {
+        for i in 0..self.items.len() {
             let mut s = 0.0;
             let dl = self.doc_len[i] as f64;
             for term in &qtoks {
@@ -179,12 +179,12 @@ impl<'a> Bm25<'a> {
         scored.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.skills[a.1].name.cmp(&self.skills[b.1].name))
+                .then_with(|| self.items[a.1].name().cmp(self.items[b.1].name()))
         });
         scored
             .into_iter()
             .take(k)
-            .map(|(_, i)| &self.skills[i])
+            .map(|(_, i)| &self.items[i])
             .collect()
     }
 }
@@ -192,6 +192,7 @@ impl<'a> Bm25<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polaris_skills::Skill;
 
     #[test]
     fn stemming_strips_a_recognized_suffix_when_long_enough() {

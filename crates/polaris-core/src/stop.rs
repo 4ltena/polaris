@@ -8,6 +8,10 @@ pub enum StopReason {
     RepeatedError(String),
     /// The turn limit was reached.
     MaxTurns,
+    /// A subagent's declared wall-clock budget (seconds) was exceeded.
+    WallSeconds(u32),
+    /// A subagent's output failed schema validation twice in a row.
+    SchemaMismatch,
 }
 
 pub struct StopTracker {
@@ -15,6 +19,9 @@ pub struct StopTracker {
     streak: u32,
     turns: u32,
     max_turns: u32,
+    wall_seconds: Option<u32>,
+    started: Option<std::time::Instant>,
+    schema_mismatches: u32,
 }
 
 impl StopTracker {
@@ -24,6 +31,18 @@ impl StopTracker {
             streak: 0,
             turns: 0,
             max_turns,
+            wall_seconds: None,
+            started: None,
+            schema_mismatches: 0,
+        }
+    }
+
+    /// subagent 用。壁時計の起点はこの呼び出し時点になる。
+    pub fn with_wall_seconds(max_turns: u32, wall_seconds: u32) -> Self {
+        Self {
+            wall_seconds: Some(wall_seconds),
+            started: Some(std::time::Instant::now()),
+            ..Self::new(max_turns)
         }
     }
 
@@ -57,6 +76,27 @@ impl StopTracker {
             return Some(StopReason::MaxTurns);
         }
         None
+    }
+
+    /// 壁時計を持たないトラッカー(ルート)では常に `None`。
+    pub fn observe_wall_clock(&mut self) -> Option<StopReason> {
+        let (limit, started) = (self.wall_seconds?, self.started?);
+        if started.elapsed().as_secs() >= u64::from(limit) {
+            Some(StopReason::WallSeconds(limit))
+        } else {
+            None
+        }
+    }
+
+    /// 2回連続の不一致で停止する。1回目は `None` を返し、呼び出し側が
+    /// 検証エラーを添えて1回だけ再試行する運びになる。
+    pub fn observe_schema_mismatch(&mut self) -> Option<StopReason> {
+        self.schema_mismatches += 1;
+        if self.schema_mismatches >= 2 {
+            Some(StopReason::SchemaMismatch)
+        } else {
+            None
+        }
     }
 }
 
@@ -102,5 +142,37 @@ mod tests {
         let mut t = StopTracker::new(2);
         assert!(t.observe_turn().is_none());
         assert!(matches!(t.observe_turn(), Some(StopReason::MaxTurns)));
+    }
+
+    #[test]
+    fn wall_clock_trips_after_the_declared_seconds() {
+        let start = std::time::Instant::now();
+        let mut t = StopTracker::with_wall_seconds(100, 0); // 0秒 = 即座に超過
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let r = t.observe_wall_clock();
+        assert!(matches!(r, Some(StopReason::WallSeconds(0))));
+        let _ = start; // 経過確認は表示上の意図のみ、アサーション自体は上のmatchesで完結
+    }
+
+    #[test]
+    fn wall_clock_does_not_trip_before_the_declared_seconds() {
+        let mut t = StopTracker::with_wall_seconds(100, 3600);
+        assert_eq!(t.observe_wall_clock(), None);
+    }
+
+    #[test]
+    fn a_tracker_without_wall_seconds_never_trips_on_wall_clock() {
+        let mut t = StopTracker::new(100);
+        assert_eq!(t.observe_wall_clock(), None);
+    }
+
+    #[test]
+    fn schema_mismatch_trips_on_the_second_occurrence() {
+        let mut t = StopTracker::new(100);
+        assert_eq!(t.observe_schema_mismatch(), None);
+        assert_eq!(
+            t.observe_schema_mismatch(),
+            Some(StopReason::SchemaMismatch)
+        );
     }
 }

@@ -1,6 +1,6 @@
 # polaris 現況
 
-最終更新 2026-08-20
+最終更新 2026-08-21
 
 ## この文書の役割
 
@@ -12,11 +12,11 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `b9db4e1`。`feat/m1-headless-loop` は M3b 完了時にローカルマージ済みで削除済み） |
-| 進行中の計画 | なし |
-| 直近で終えた計画 | `docs/superpowers/plans/2026-08-20-polaris-m3b-bm25-skill-router.md` |
-| 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md` |
-| 版の方針 | 当初案の `hamal`/`Aldebaran` 二系統(v1.0.0 と v0.2 に分ける案)は採らず、単一の `vX.Y.Z` を単調に進める方式へ変更。`v0.1.0`(M1・M2・M2.5・M3a)、`v0.2.0`(M3b BM25 ルータ、通称 Aldebaran)、`v0.3.0`(対話 TUI)を実際に git tag 済み。`CHANGELOG.md` が詳細の記録先 |
+| ブランチ | `main`。`v0.4.0`「`Regulus`」を git tag 済み(push はまだ)。未統合の worktree は `worktree-feat-m4-core` の1件のみ。詳細は「## 未統合の worktree」節 |
+| 進行中の計画 | worktree `worktree-feat-m4-core`（HEAD `0b80a0f`）: `docs/superpowers/plans/2026-08-20-polaris-m4-core.md` の Task 1 が fix round 1/5 の途中で止まっている |
+| 直近で終えた計画（main に統合済み） | `docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」として git tag 済み）、`docs/superpowers/plans/2026-08-21-polaris-tui-v2.md`・`docs/superpowers/plans/2026-08-21-polaris-tui-onboarding.md`(TUI v2・オンボーディング)に加え、codex互換サブコマンド・スラッシュコマンド16個・非同期イベントループ化・`/resume`・`/model`(2段階ピッカー)・`/permissions`・`/skills`・`/fork`・`/export`・`/pwd`・ロゴ変更・effort値バグ修正まで、まとめて `v0.4.0`「`Regulus`」として git tag 済み(下記「版の方針」参照) |
+| 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md` |
+| 版の方針 | 当初案の `hamal`/`Aldebaran` 二系統(v1.0.0 と v0.2 に分ける案)は採らず、単一の `vX.Y.Z` を単調に進める方式へ変更。`v0.1.0`(通称 `hamal`)、`v0.2.0`(通称 `Aldebaran`)、`v0.3.0`(対話 TUI、通称 `Castor`)、`v0.4.0`(TUI v2以降の全機能、通称 `Regulus`)を実際に git tag 済み。M4 のコードネームは当初 `Castor`/`v0.3.0` を予定していたが、対話 TUI が先に `v0.3.0`/`Castor` を占めたため `Spica` へ変更した。M4 は他の実装計画とまとめて `v0.5.0` になる見込みだが、含める範囲が固まっていないため `v0.5.0` という版番号自体はまだ確定させない。ツール呼び出しのライブ表示改良(Claude Code CLI の `⏺` 表示を参考にする案)は `v0.5.0` 以降へ持ち越し。`CHANGELOG.md` が詳細の記録先 |
 
 ## マイルストーン
 
@@ -27,8 +27,8 @@
 | M2.5 | Codex プロバイダ（ChatGPT サブスク OAuth） | 完了 |
 | M3a | skills ローダと skill ツール | 完了 |
 | M3b | BM25 ルータと評価コーパス | 完了 |
-| M4 | subagent、波、継続波 | 未着手 |
-| M5 | TUI、圧縮、マルチプロバイダ、セッション永続化 | 未着手 |
+| M4（通称 `Spica`。他の実装計画とまとめて `v0.5.0` になる見込みだが版番号は未確定） | subagent、波、継続波 | 着手済み・停滞中（worktree `worktree-feat-m4-core`、Task 1/12 が fix round 1/5 の途中。main には未統合） |
+| M5 | TUI、圧縮、マルチプロバイダ、セッション永続化 | TUI 部分は完了（v0.3.0「`Castor`」として git tag 済み、加えて TUI v2・TUI onboarding が main へマージ済み・`v0.4.0`「`Regulus`」として未タグ・未push）。圧縮・マルチプロバイダは未着手 |
 
 M1・M2・M2.5 が揃い、v1.0.0 (`hamal`) の水準に達した。API キーを持たない利用者でも `polaris login` から ChatGPT のサブスクリプション認証だけで実モデルへ繋げる経路ができたことで、M1 の受け入れ基準のうち唯一無人では確認できなかった「実キーでの一発実行」を、キー無しで満たせるようになった。タグ付け自体は利用者の承認を待つ準備段階のまま。M3 以降は 1.x として積む。M3a を M2 より先に進めたのも利用者の指示による。
 
@@ -96,6 +96,123 @@ M3b 完了後、評価に使った実コーパス（831 件、うち macOS の�
 ### pi と codex の比
 
 既存の実測値（0・5・830 skill 時点のトークン数）から pi/codex の比を追加で出した。少数の skill では pi が codex の 3.9〜5.8% と大幅に軽いが、830 件では逆転して pi が codex の 249.9%（2.5 倍）になる。5〜830 件の区間（実測点の間隔が広く、0〜5 件の区間よりサンプルが安定している）で見た 1 skill あたりの増分は codex 約 15.55 トークン、pi 約 131.96 トークンで、pi の方が約 8.5 倍重い。この 2 区間の傾きを外挿すると、およそ 260 skill 付近で総量が逆転する計算になるが、5 件と 830 件の間に実測点が無く、codex の圧縮形式への切り替わりタイミングも未確認のため、これは見積もりであり実測ではない。詳細は `README.md`「pi と codex の比」に記録した。
+
+## v0.4.0「Regulus」の進捗(TUI v2 + TUI onboarding + codex 互換サブコマンド + TUI スラッシュコマンド)
+
+M3b 完了後、対話 TUI（新規クレート `polaris-tui`、`ratatui` + `crossterm`）を実装し `v0.3.0`(通称 `Castor`)として git tag 済み。セッション永続化(`~/.polaris/state/<project-id>/tui-session.jsonl`)、承認モーダル、端末エスケープシーケンス注入対策を含む。詳細は `CHANGELOG.md` の `[0.3.0] "Castor"` に記録済み。`Castor` は当初 M4(subagent・波・継続波)向けに予定していたコードネームだったが、対話 TUI が先に `v0.3.0` を占めたため、M4 のコードネームは `Spica` へ変更した(`docs/superpowers/specs/2026-08-16-polaris-harness-design.md` のリリース方針節を参照)。
+
+続けて3件を実装した。
+
+- **TUI v2**(ステータスバー、ツール呼び出しのインライン可視化、太字/コードの簡易 Markdown 整形)。`worktree-feat-tui-v2` で実装し `865e5e3` で main へマージ、最終レビュー指摘への対応も `f76fc33` で完了
+- **TUI onboarding**(資格情報が一切無い状態で対話 TUI を起動すると `POLARIS_API_KEY is not set` で即終了する代わりに、ChatGPT サインイン/API キー入力の選択画面を出す)。`worktree-feat-tui-onboarding` で実装し `c24c1f7` で main へマージ。マージ直前に画面の文言・レイアウトをコードネーム未定のまま独自の英語コピー(codex の文言を複製せず、選択肢2つ・番号+上下キー選択+サブタイトル行という構造のみ踏襲)へ書き換えた
+- **codex 互換サブコマンド**(`exec`・`sandbox`・`doctor`・`completion`)。利用者指示「regulusとしての実装スコープで、codexのコマンドを使えるようにする」を受け、実際の `codex` CLI(0.148.0、24 サブコマンド)を `codex <sub> --help` で調べたうえで、polaris の既存アーキテクチャ(単一の one-shot 実行経路、`polaris-sandbox` クレート)に素直に載る4件だけを移植した。`mcp`/`app`/`cloud`/`resume` 系など残り約20件は、polaris に対応する基盤が無い(MCP クライアント不在、GUI/クラウド不在)か、別途設計を要する(複数セッション管理、レビュー用プロンプト)ことを理由に対象外とし、README「サブコマンド」節に対象外の一覧と理由を明記した。新規テスト21件(ユニット3件+CLI統合18件)
+- **TUI スラッシュコマンド**(`/help`・`/status`・`/clear`・`/quit`)。利用者から「入力欄で `/` を打っても予測変換が出ず、`/` 付きの入力がそのままモデルへの指示として送られてしまう」という報告を受け、実際に `codex` の対話 TUI を tmux 経由で起動して `/` の挙動を実地で観察した(バイナリ文字列の推測ではなく、実際に認証してチャット入力へ到達し、`/` を打って出るポップアップと各プレフィックスの補完結果を1つずつ記録)。codex 側は約27個のスラッシュコマンドを持つが、polaris の既存アーキテクチャで完結する4個だけを実装した——`/model`・`/mcp`・`/resume`・`/review` 等は、対話的なモデル選択 UI・MCP クライアント・複数セッション管理・レビュー用プロンプトという、polaris にまだ無い基盤を要するため見送った。新規モジュール `crates/polaris-tui/src/slash.rs`(コマンド定義・前方一致検索・パース、ユニットテスト10本)。入力欄が `/` で始まる間、`render_chat` が候補ポップアップ(コマンド名+説明、1文字ごとに絞り込み)を入力欄の直上に描画する。スラッシュコマンドは `session.messages` にもモデルへの送信にも永続化ファイルにも一切触れない——`polaris-tui::persist::clear_session`(新設、`/clear` 用)を除き既存コードへの変更は `render_chat`/`Status` への `Notice`/`suggestions` 追加のみ。実バイナリを tmux で起動し、`/` の入力→絞り込み→`/status`(ローカルで notice 表示、モデルに送らないことを「0 messages」の表示で確認)→`/quit` まで人間と同じ操作で動作確認した
+
+続けて利用者から「slash直後ではなく、入力に応じてリアルの codex のようにサジェストを出していきたい」との指示を受け、`codex` の実際のピッカーを tmux でさらに詳しく観察したところ、`↑`/`↓` でハイライト行(太字シアン+説明が通常輝度、他の行は説明が dim)を移動でき、Enter は入力文字列そのものではなく**ハイライトされている行を直接実行する**(`/fast` をハイライトしたまま Enter を押すと "Service tier set to priority" が実行された)ことを確認した。これに合わせて `selected_suggestion: usize` を `run()` のループ状態に追加し、ポップアップが出ている間は `↑`/`↓`/Enter を `apply_key` より前に横取りして処理するようにした(型名 `slash::action_for(name)` を新設——`COMMANDS` 由来の既知の名前を直接 `Action` へ変換する)。`render_chat` は `selected_suggestion: usize` を追加引数に取り、ハイライト行を codex と同じ配色で描画する。フルネームを最後まで打ってから Enter する従来の操作も、その時点でポップアップの候補が1件(それ自身)に絞られてハイライトされているため、そのまま動く。実バイナリを tmux で再確認し、`/` → Down(ハイライトが `/help` から `/status` へ移動)→ Enter(入力欄に1文字も追加せず `/status` が実行され「0 messages」の notice が出る)まで確認した。テスト2本を追加(`action_for` が `COMMANDS` の全名前を解決できること、`parse` と整合すること)
+
+さらに利用者から「フロントエンド TUI 部分だけ、codex をそのままにできないか」との指示を受け、`AskUserQuestion` で範囲を確認した(「orchestia」は前の会話の `codex-orchestia` との混同で、TUI の話としては無関係と判明。「そのまま」はコード移植ではなく、polaris 独自実装のまま見た目・挙動を codex へ近づける、の意)。`codex` の実際のチャット画面を tmux で観察し、枠付きヘッダーボックス(`>_ OpenAI Codex (v0.148.0)` / `model: ... /model to change` / `directory: ...`)、枠の無い `›` プロンプト+入力欄下のフッター行(`{model} default · {cwd}`)という構造を確認した。polaris 側は文言を独自にしたまま同じ構造だけを取り入れた——`HeaderInfo` に `cwd: &str` を追加(`RunArgs` にも `cwd: PathBuf` を追加し `main.rs` から配線)、ヘッダーを単一行から「polaris」タイトル付きの枠付きボックス(モデル名・プロバイダー名・累積トークンを1行にまとめた内容)へ変更、入力欄の枠を廃して `› ` プロンプト+空欄時のグレー表示プレースホルダー("Ask polaris to do anything")へ変更、入力欄の下に `{model} · {cwd}` のフッター行を追加した。既存テスト15箇所の `HeaderInfo` リテラルに `cwd` フィールドを追加。レイアウトの固定行数が 5→8 行に増えたことで揺れた既存テスト1本(`the_header_shows_provider_model_and_usage`、60列では新ヘッダー行がトークン数の手前で切れていた)は表示幅を80列へ広げて対処。実バイナリを tmux で再起動し、ヘッダーボックス・プレースホルダー・フッター・スラッシュ候補ポップアップが新レイアウトの下でも揃って正しく表示されることを確認した。codex 側で観察した「経過秒数付き "Working" 表示 + Esc での途中中断」は、polaris の現在のイベントループがブロッキング `read()` に依存しており途中終了を割り込ませる仕組みが無いため、この回では対象外とし別途の課題として繰り越した
+
+続けて利用者から「コマンドを再現しきれていない。また `/` を打った段階ではサジェストが出るが、そこから先数文字入力した際にはサジェストが出ない」との報告を受けた。`tmux-verify-reference-cli-behavior`(このセッション中に distil したスキル)の手順で1文字ずつ送って再現を試みたところ、ライブ絞り込み自体は`/s`→`/st`→`/sta`のどの段階でも正しく動作しており、コードにバグは無かった。原因は別のところにあった——polaris の4コマンド(`help`・`status`・`clear`・`quit`)は codex の約27個に対して語彙が極端に狭く、`/model`・`/resume`・`/mcp` など polaris に無いコマンド名を打ち始めるとすぐ候補がゼロになり、「ポップアップが消えた」ように見える。「サジェストが出ない」という報告は「絞り込みが壊れている」のではなく「コマンドが足りない」ことの症状だった、という理解に至った。
+
+これを受けてコマンドを4→8個へ拡張した。追加は `/skills`(このプロジェクトで発見された skill 一覧。`args.skills` として既に main.rs から渡っている `polaris_skills::Skill` を再利用するだけで実装できた)、`/new`(`/clear` のエイリアス——polaris は1プロジェクト1セッションの設計であり「新しいチャットを始める」と「会話を消去する」を区別する状態を持たないため)、`/init`(カレントディレクトリに `AGENTS.md` の雛形を作成。存在する場合は上書きしない)、`/logout`(`polaris_auth::logout` を呼び保存済み資格情報を削除。main.rs の `Command::Logout` サブコマンドと同じ実装を再利用)。`apply_slash_action` に `skills: &[Skill]` と `cwd: &Path` の2引数を追加(呼び出し2箇所を機械的に更新)。`/diff`・`/model`・`/mcp`・`/resume`・`/review`・`/compact` 等の残り約19個は前回同様、対応する基盤(複数行ローカル出力表示、対話的モデル選択、MCPクライアント、複数セッション管理、レビュー用プロンプト、会話圧縮)が無いため見送ったまま——README「スラッシュコマンド」節に理由を記載した。
+
+`apply_slash_action` は今回追加した4コマンドについて初めて直接のユニットテストを持った(`/help`・`/status`・`/clear`・`/quit` は元々 tmux での手動確認のみで、`apply_slash_action` 自体の自動テストが無かった、という既存の隙間だったと判明——今回まとめて埋めた)。`/logout` だけは `polaris_auth::store::default_path()` を関数内部で直接解決しており(`main.rs` の `Command::Login`/`Command::Logout` と同じ流儀)、`HOME` 環境変数へ依存するためユニットテストからは検証しづらく、実バイナリでの tmux 確認のみに留めた。新規テスト6本(`skills` の空/非空、`init` の作成/非上書き、`clear`/`new` が session とファイルの両方を空にすること、`Unknown` が名前を含むこと)。`cargo test --workspace` は475→482件全緑(polaris-tui: 56→63)、clippy clean、fmt はこのセッションで触った範囲は全て clean(既存の無関係3件のみ残存)。実バイナリを tmux で再起動し、8個のコマンドが `/` で全件表示されること、`/new` を1文字ずつ打って `/n`→`/ne`→`/new` の各段階でライブ絞り込みが効くこと、`/init` が実際にプロジェクト直下へ `AGENTS.md` を作成することを確認した。
+
+利用者からさらに「実装されていないコマンド(`/model`・`/usage` など)を試していた」ことが判明し(前回の「絞り込みが壊れて見える」報告の実体はこれだった)、「実装されていないコマンドについて追加したい」との指示を受けた。これを受け `/model`・`/diff`・`/review` の3件を追加し、コマンド数は8→11個になった。
+
+- **`/model`** — 現在のモデル・プロバイダと変更方法(`POLARIS_MODEL` + 再起動)を表示するだけの読み取り専用コマンド。codex の `/model` は対話的な選択式ピッカーだが、polaris はモデルをセッション途中で切り替える経路自体を持たないため、「本来の機能」を偽って実装するより「変更方法を教える」に留めた
+- **`/diff`** — `git diff` の出力を表示する。これまで local な出力の表示先が「1行の `Status::Notice`」しか無く、複数行を要する `/diff` は前回まで見送っていた。今回、`render_chat` に `local_lines: &[Line<'static>]` を新規追加し、既存の `history_lines(session)` の末尾へ結合してから既存のスクロール・オフセット計算に載せる形にした——新しいレイアウト領域は増やさず、`session.messages` にも一切触れない(モデルへは送られない、`/clear`・`/new` で一緒に消える)。出力は200行で打ち切り、その旨を明示する行を足す(既存の「切り詰めたら打ち切ったと本文で述べる」という決めごとを踏襲)。`sanitize`(制御文字の無害化)を `render.rs` から `pub(crate)` に上げて再利用した——外部コマンドの出力を経由する初めてのローカル表示なので、エスケープシーケンス注入対策を初めから外さない
+- **`/review`** — 他の10個と違い「ローカルで完結する」コマンドではない。codex の `/review` は "review my current changes and find issues" に相当する固定プロンプトを実際にモデルへ送る機能であり、polaris 側もこれを再現するには session/エージェントループへ実際に投げる必要がある。`slash::Action::Review(String)`(空文字列可の追加指示)を新設し、`run()` 側で「ハイライトされた候補を Enter で確定」「フルネームを打って Enter で確定」の両経路とも、`apply_slash_action` を呼ぶ前に横取りして `review_prompt(extra)` へ展開し、通常の `session.push_user(&text)` 以降の流れ(モデルへの送信・永続化・agent::run())へそのまま合流させる形にした。これに伴い、`Action::Review` を含む一部コマンドが今後「実引数」を持つ可能性を見込み、`parse()` を「先頭の空白区切り1語だけをコマンド名として照合し、残りは引数」という形へ変更した(`/status now` が `Unknown` にならず `Status` として通るようになる副次効果も生んだ)
+
+新規テスト9本(`/model` の表示内容、`/diff` のGitリポジトリ外/クリーンなリポジトリ/実際の変更ありの3パターン、`/clear` が `local_lines` も一緒に空にすること、`review_prompt` の素の指示文/追加指示付きの2パターン、`parse` が `/review <追加指示>` を正しく分離すること、他コマンドが引数付きでも `Unknown` にならないこと)。`cargo test --workspace` は482→491件全緑(polaris-tui: 63→72)、clippy は `render_chat` の引数が8個になり `too_many_arguments` に新たに抵触したため `#[allow(clippy::too_many_arguments)]` を追加(`apply_slash_action` と同じ扱い)、fmt はこのセッションで触った範囲は全て clean(既存の無関係3件のみ残存)。実バイナリを tmux で再起動し、`/` で11個全件が表示されること、`/diff` が実際のpolarisリポジトリの実差分(2120行、200行に打ち切り)を履歴領域に表示すること、`/model` が表示されること、`/review` が実際にモデルへの送信(`thinking...`表示)まで到達することを確認した。
+
+続けて利用者から「codex、orchestia の TUI をより深く調査し、UI をなるべく反映させられるようにする」との指示を受けた。まず `orchestia` コマンドを調査したところ `/Users/kn/.local/bin/orchestia` は実体として `codex` バイナリそのもの(`codex --help` と出力が同一)であり、独自の TUI を持たないことを確認した——先の会話で確定していた「orchestia は TUI の話としては無関係」という理解を裏付けた。改めて `codex` の実チャット画面を tmux で fake API key を使い最後まで(サインイン→ディレクトリ信頼確認→メイン画面)遷移させ、`-e` 付きで ANSI 情報ごと観察した。前回把握していた「枠付きヘッダーボックス+枠無し入力欄+フッター行」という構造に加え、今回さらに次を確認した——(1) ヘッダーボックスは太字シアンの `>_` アイコン+太字タイトル(`OpenAI Codex (v0.148.0)`、バージョンは dim)を1行目に置き、枠線自体が dim スタイルで描画されている、(2) `model:`/`directory:` の各ラベルは同じ文字幅にパディングされ値が縦に揃っている、(3) フッターは一様なグレーではなく、モデル名が暖色(`rgb(246,226,183)`)・ディレクトリが淡い緑(`rgb(171,223,167)`)の2色構成で、中黒(`·`)は dim、(4) 入力欄のプロンプト `›` は太字+dim の同時適用、(5) ターン送信後は「thinking」の代わりに文字ごとに輝度が変化するグラデーション付き `Working` 表示+`(経過秒 · esc to interrupt)` が出る——これは前回同様、polaris の現在のブロッキング `read()` イベントループでは実現できないため今回も対象外のまま繰り越した。
+
+(1)〜(4)を反映し、`render.rs` のヘッダー/フッターを再設計した。ヘッダーボックスの内容を単一行から codex と同型の5行構成(`›_ polaris` 太字シアン見出し行、空行、`model:` 行、`directory:` 行、`tokens:` 行——ラベル部分をすべて11文字幅パディングして縦に揃え、枠線に `Modifier::DIM` を付与)へ変更し、レイアウトの `header_area` を `Constraint::Length(3)` から `Length(7)` へ拡張した。フッターは `Line`+複数 `Span` 構成へ変更し、モデル名を `Color::Rgb(246,226,183)`、ディレクトリを `Color::Rgb(171,223,167)`、中黒区切りを dim スタイルにした。入力欄のプロンプト `› ` に `Modifier::DIM` を追加(既存の `BOLD` と併用)。ヘッダーが3→7行に伸びたことで表示幅の狭い既存テストの多く(`TestBackend::new(60, 10)` 等)で履歴領域が0行になり失敗したため、影響を受けたテストのバックエンド高さを機械的に引き上げて対処した(新規テストは追加せず、既存71件がそのまま緑のまま通る形に収めた)。`cargo test --workspace` 491件全緑、clippy clean、fmt はこのセッションで触った範囲は全て clean(既存の無関係3件のみ残存)。実バイナリを tmux で再起動し、ヘッダーボックス(dim枠+太字見出し+ラベル揃え)・フッターの2色配色・`/` ポップアップが新レイアウトの下でも正しく表示されることを確認した。
+
+続けて利用者から「現在、自動で一つの対話が開いている。そうではなく、どこのディレクトリにいても無で起動し、`/resume`で対話を読み取れるようにする。対話一覧は対象ディレクトリごとにジャンル分けする」との指示を受けた。指示文の「`~/.codex`の中に会話は全て保存し」という一文が本物の `codex` の実ディレクトリを指すのか polaris 独自のディレクトリを指すのか曖昧だったため、`AskUserQuestion` で確認し「`~/.polaris`(推奨)」を選んでもらった——本物の `codex` のデータには一切触れない設計に確定した。
+
+これは「1プロジェクト1セッション、常に同じファイルへ追記・`/clear`で上書き」という既存の永続化モデル自体を変える必要のある変更だった。新しい設計は次の通り。
+
+- **保存先をプロジェクトごとのハッシュ化ディレクトリから、全プロジェクト共有の1箇所へ移した**——`polaris_core::project::sessions_dir()`(新設)が `~/.polaris/sessions/` を返す。既存の `state_dir()`(監査ログ・サンドボックス用ヘルパーのステージング領域)は変更なしでプロジェクトごとのまま残した——チャット会話の保存先だけを分離した
+- **1会話=1ファイルペアへ変更**——`<会話id>.jsonl`(メッセージ本体、既存の `persist::load_session`/`append_message` をそのまま再利用)+ `<会話id>.meta.json`(起動元ディレクトリと開始時刻。`persist::SessionMeta`・`write_meta_if_absent`・`read_meta` を新設。`serde_json::Value` ではなく型付き構造体にするため `serde`(derive機能込み、ワークスペース既存の依存)を `polaris-tui` の直接依存に追加)。メタ書き込みは最初のメッセージを実際に送るまで遅延される(`write_meta_if_absent` は2回目以降呼んでも無視される単なる存在チェック)——起動しただけで何も送らずに終了した空セッションが `/resume` の一覧を汚さないようにするため
+- **起動時は常に空の `Session::default()`**——旧来の「起動時に `state_dir` の1ファイルを自動読込」を削除した。会話idは `{13桁ゼロ埋めミリ秒}-{プロセスID}-{カウンタ}`(`new_session_id()`、ファイル名としてソート可能)で、起動のたびに新規発行される
+- **`/resume`(新規スラッシュコマンド)**——フルスクリーンのピッカーを開く。`sessions::list_sessions`(新規モジュール)が `~/.polaris/sessions/` を走査し、`.meta.json` はあるが対応する `.jsonl` が空(=送信せず終了したセッション)のものは除外する。`sessions::grouped` が起動元ディレクトリでグループ化し、今いるディレクトリのグループを常に先頭へ、それ以外は「そのディレクトリで最後に会話した日時」の新しい順に並べる(各グループ内は新しい会話が先頭)。日時表示用に依存追加無しの UTC タイムスタンプ整形(`time.rs` 新設、Howard Hinnant の `civil_from_days` を移植)を書いた。ピッカー自体(`render::render_resume_picker`)は `/` ポップアップと同じ操作感(`↑`/`↓`で移動、Enterで確定、Escでキャンセル)。既存の `approver.rs` が承認モーダル用に持っていた `KeyReader` トレイト抽象化(実端末無しでテストできるようにする仕組み)を再利用し、`run_resume_picker`/`handle_resume` を `Backend`/`KeyReader` についてジェネリックにしたことで、`ScriptedReader`(キー入力を事前に仕込んだテスト用リーダー)を使ったユニットテストで実際にピッカーを駆動する挙動まで検証できた
+- **`/new` の意味を変更**——旧来は `/clear` の別名(同じファイルをその場で空にする、元に戻せない)だったが、複数会話を持てるようになったことで「消す」と「新しく始める」を区別できるようになったため、`/new` は今の会話をファイルごと残したまま新しい会話id・ファイルへ切り替える動作にした(`handle_new_session`、新設)。`/clear` は変更なし(その場で空にする、`apply_slash_action` に残ったまま)。`New`/`Resume` はどちらも `run()` 側でディスパッチ前に横取りされる(`Review` と同じ扱い)ため、`apply_slash_action` 内の対応する match アームは「本来ここには来ないはずの防御的フォールバック」になった(元々 `Review` 用にあった同種のアームへ統合)
+
+`main.rs` に `sessions_dir` を新規解決して `RunArgs` へ配線した。新規テスト23本(`project::sessions_dir` の1本、`persist` のメタ読み書き4本、`sessions::list_sessions`/`grouped` の8本、`render::render_resume_picker` の2本、`time::format_unix_millis` の3本、`lib.rs` の `handle_resume`/`handle_new_session` まわり5本)。`cargo test --workspace` 513件全緑(polaris-tui: 72→93、polaris-core: 89→90)、clippy clean(`sessions.rs` の `sort_by` を `sort_by_key` へ直す1件のみ指摘があり対応)、fmt はこのセッションで触った範囲は全て clean(既存の無関係2件のみ残存)、`docs/filemap.md` を新規ファイル(`sessions.rs`・`time.rs`)ぶん再生成した。実バイナリを tmux で2つの偽プロジェクトディレクトリ(`proj-a`・`proj-b`)を使って検証した——`proj-a` で起動すると常に空の状態から始まること、メッセージ送信で `~/.polaris/sessions/` にファイルペアが実際に作られること、`proj-b` で別の会話を送った後 `proj-a` へ戻って `/resume` を開くと `proj-a` のグループが先頭(自身の会話がハイライト済み)、`proj-b` のグループがその下という指示通りの並びで表示されること、Enter で選ぶと実際に過去の会話が読み込まれ履歴領域に表示されることを確認した。
+- 前回のプロバイダ解決バグ修正(`default_provider_name`)も同じ作業ツリーにまとめて乗っている
+
+**main へはまだマージしていない——変更一式が作業ツリーに未コミットのまま。**
+
+この4件をまとめて `v0.4.0`「`Regulus`」として出荷する方針にした(利用者指示、本節執筆時点)。onboarding のプランは元々「バージョンアップの対象ではない」と明記していたが、この方針転換でその前提を上書きしている。**`Regulus` の範囲(この4件で締めるか、さらに何か積むか)がまだ確定していないため、タグ付け・`CHANGELOG.md` への `[0.4.0]` エントリ追加・`git push` のいずれもまだ行っていない。**
+
+続けて利用者から「codexの実コードをgithubから読み込み、tui部分を完全に揃えたい」との指示を受けた。「orchestia実装時にはできていた」という言及があり、実際に `gh repo view openai/codex` で確認のうえ `git clone --depth 1 https://github.com/openai/codex.git`(スクラッチパッド配下、読み取り専用)して `codex-rs/tui` を実地で調査した。結果、`codex-rs/tui` は492ファイル・約27万行(`bottom_pane` だけで5.8万行、`chatwidget` だけで5.7万行)——MCP・複数エージェントピッカー(`agent_picker.rs`・`agents_overview.rs`)・クラウドタスク・プラグイン・IDE連携・画像表示・ペット・キーマップエディタまで含む、フル機能のマルチエージェントIDE級TUIだと判明した。文字通りの「完全一致」はpolaris自体の設計方針(最小コンテキストの単一エージェント)と矛盾しかつ非現実的と判断し、`AskUserQuestion` で範囲を確認した——「対象を絞って本物のソースで裏取り」(polarisが既に持つ画面要素に限定し、tmuxでの推測ではなく実ソースで検証する)を選んでもらい、「バージョンは次へ進める」は「進めない方針にする」(手動入力)という回答を得た。あわせて `status_indicator_widget.rs` を読んだところ、codexのspinner/経過秒/esc中断は `FrameRequester` による非同期(tokio)前提の再描画に依存しており、polaris-tuiの現状のブロッキング同期ループでは実現不可能——「見た目を似せる」以前にイベントループ自体の作り直しが要る、という根本的な前提を確認した。3段階の計画(Phase 0: 非同期イベントループ化 / Phase 1: shimmer・経過秒・esc中断 / Phase 2: `/resume` の表記調整)を提示し、承認を得て実装した。
+
+- **Phase 0(非同期イベントループ化)**: `crossterm` を(`ratatui` 経由の再エクスポートだけでなく)`event-stream` フィーチャー付きで `polaris-tui` の直接依存に追加(ワークスペースの `Cargo.toml` にも新規追加)。`terminal: ratatui::DefaultTerminal` を `RefCell<ratatui::DefaultTerminal>` へ変更——ターン実行中に `agent::run` と再描画を並行させる必要があり、かつ承認モーダル(`TuiApprover`)も同じターミナルへ同期的に描画するため、単純な `&mut` の排他所有では両立できない(`approver.rs` の `TuiApprover::terminal` フィールドも `&RefCell<Terminal<B>>` へ変更。単一タスクの協調的実行なので実行時のエイリアシングは発生しないことをコメントで明記)。ターン本体は `tokio::pin!(agent_future)` した `agent::run(...)` を `tokio::select!` で 100ms tick(`tokio::time::interval`)・`crossterm::event::EventStream`(Escキー検知用)と競わせる形に書き換えた。`agent_future` は `&mut session` を握ったままなので、tick時の再描画は生の `session` を読めない(借用が衝突する)——ターン開始直前に `session.clone()` した `render_snapshot` を再描画専用に使う設計にした(`Session` に `Clone` を新規導出。副作用として、ターン中のツール呼び出しは今回もライブ表示されず、ターン完了後にまとめて表示されるまま——このスコープではステータス行のアニメーションだけを対象にしたため)。Escを押すと `agent_future` を(pin先の変数ごと)スコープを抜けてドロップすることで実際にキャンセルされる(Rustの非同期は「誰もpollしなくなった瞬間に進行が止まる」ため、ドロップ=キャンセルとして機能する。ただしツールが起動済みのOSサブプロセスまでは殺さない、「待つのをやめる」だけの中断であることをコメントで明記)。中断後は失敗時と同じロールバック(`session.messages.truncate(checkpoint)`)を行い `Status::Notice("interrupted")` を表示する
+- **Phase 1(shimmer・経過秒・esc中断の表示)**: `render::Status::Thinking` を単位無しから `Thinking { elapsed: Duration }` へ変更。`shimmer.rs` を実際に読み、そのアルゴリズム(プロセス開始起点ではなくターン開始からの経過秒による2秒周期スイープ、半値幅5文字のコサイン型グラデーション)を `render.rs` に移植した(`render.rs` は元々「時計を読まない、呼び出し元から時間をもらう」という既存方針(`shimmer_spans` は `Instant` ではなく `elapsed: Duration` を引数に取る)を踏襲。色はcodexの実端末色検出(`terminal_palette`)までは移植せず、固定のグレー→白のRGBブレンドで近似した——「対象を絞る」の範囲内と判断)。ステータス行は `"Working"`(shimmer)+`" (Ns · esc to interrupt)"`(dim)という構成にした
+- **Phase 2(`/resume` の表記調整)**: `time.rs` に `format_relative(then_millis, now_millis) -> String` を追加(`"42s ago"`/`"35m ago"`/`"2h ago"`/`"3d ago"`、30日超は既存の絶対表記へfallback)——codexの実物 `/resume` ピッカー(`resume_picker.rs` とそのテストスナップショット)を読み、相対時刻表記であることを確認したうえで移植した。ピッカーの選択マーカーを `›`(U+203A)から `❯`(U+276F、codexの実際のグリフと同一)へ変更し、画面下部にヒントバー `"enter to resume · esc to cancel"` を追加した(codexは `"enter to resume · esc to start new · ctrl + c to quit · tab to toggle sort"` だが、polarisには対応する機能が無い部分は削って2項目のみに絞った)。`render_resume_picker` は `now_millis: u128` を呼び出し元(`lib.rs`)から受け取る形に変更(`render.rs` は時計を読まない既存方針を踏襲)
+
+新規テスト12本(`time::format_relative` 4本、`render::shimmer_spans` 2本、`Status::Thinking` の表示内容1本、`/resume` ピッカーの新表記(相対時刻・ヒントバー)1本、他は既存テストの更新分)。`cargo test --workspace` 515→524件全緑(polaris-tui: 93→98)、clippy clean、fmtはこのセッションで触った範囲は全てclean(既存の無関係1ファイル・2箇所のみ残存)。実バイナリをtmuxで検証した——(1) 偽の到達不能ホスト(`POLARIS_BASE_URL=http://10.255.255.1:1`)へ向けてターン送信し、shimmerの輝度グラデーションが文字ごとに実際に動いていること(`Working` の各文字が異なるRGB値で描画される)、経過秒表示が `0s`→`1s` と実際にカウントアップすること、Escキーで即座に `"interrupted"` へ遷移しその後も `/status` 等が正常に動作する(イベントループがハングしない)ことを確認、(2) `~/.polaris/sessions/` に手でセッションを1件仕込んだ状態で `/resume` を開き、`43s ago`(相対時刻)・`❯` マーカー・`enter to resume · esc to cancel`(ヒントバー)が実際に表示されEnterで正しく再開できることを確認した。
+
+**「バージョンは進めない方針にする」との利用者指示により、この作業を含めてもタグ付け・`CHANGELOG.md` への `[0.4.0]` エントリ追加・`git push` のいずれも行っていない。**
+
+続けて利用者から「ui部分はかなり模倣されている。ただ、/コマンドが実装しきれていない。デスクトップの画像も参照しつつ、tui部分のコードを読み込み、これらの模倣についてさらに検討する」との指示を受けた。デスクトップ上の4枚のスクリーンショット(`model選択.png`・`skill1.png`・`skill2.png`・`通常時.png`)を確認したところ、次が判明した——(1) `/model`は実際には対話的ピッカー(番号付き選択肢+太字シアンハイライト+`(current)`表示+`↑`/`↓`+Enter確定/Esc戻る)であり、polarisの現状(読み取り専用の1行表示)とは踏み込み方が違う、(2) フッターは`gpt-5.6-sol high · ~/File/projects/...`——モデル名の後ろにreasoning effortが入り、パスは`~`で短縮表示されている(polarisは絶対パスのまま)、(3) `/skills`も対話的ピッカー、`@`メンションという`/`コマンドとは別の入力トリガーが存在する。あわせて `codex-rs/tui/src/slash_command.rs` を実際に読み、canonicalなコマンド定義(`SlashCommand` enum)を確認したところ、codexは実際には約65個のスラッシュコマンドを持っていた(前回tmuxで見えていたのは氷山の一角)。全てを実装対象から除外理由つきで仕分けたうえで、`AskUserQuestion` で2点確認した——低・中コストな追加候補(`/pwd`・`exit`エイリアス・`/export`・`/permissions`ピッカー・`/fork`、およびフッターの`~`短縮)は「全て実装する」、`/model`の真の対話切替(プロバイダをセッション中に作り直すアーキテクチャ変更が要る規模)は「今回は見送り」を選んでもらった。
+
+- **`/pwd`**: 現在の作業ディレクトリを絶対パスで表示するだけの読み取り専用コマンド
+- **`exit`エイリアス**: `/quit`と同じ`Action::Quit`へ解決されるよう`parse()`に追加(`/q`と同様、`COMMANDS`一覧には載せない裏コマンド)
+- **`/export`**: 会話をmarkdownとしてファイルへ書き出す。`export_markdown(session)`(新設)が`## You`/`## polaris`/`## tool result`の見出し+本文というシンプルな構成で組み立てる。宛先は`/export notes.md`のように指定でき、省略時は`polaris-export-<ミリ秒タイムスタンプ>.md`をカレントディレクトリに書く
+- **`/permissions`**: `ApprovalPolicy`(Never/OnRequest/Always)を対話的に選び直すピッカー。デスクトップの`model選択.png`で確認した「番号+太字シアンハイライト+`(current)`表示」というレイアウトをそのまま`render_permissions_picker`(新設)に適用した——`/resume`の`❯`マーカー・ヒントバー規約とも揃えてある。`New`/`Resume`/`Fork`と同じ理由で`run()`側の2箇所で横取りされる(`apply_slash_action`はここでも防御的フォールバックのみ)。選んだポリシーは`args.approval_policy`を直接ではなく、`run()`内のローカル`let mut approval_policy`(新設)に反映される——`args`自体を可変にせずに済むようにするため
+- **`/fork`**: 今の会話を新しいid/ファイルへ複製する。`/new`と実装の骨格は同じだが、空で始まる`/new`と違い、複製元の全メッセージをその場で(遅延書き込みではなく即座に)新ファイルへ書く——複製直後に何も送らないまま終了しても`/resume`の一覧から消えないようにするため
+- **フッターの`~`短縮**: `abbreviate_home(&args.cwd)`(新設、`$HOME`読み取りのため`lib.rs`側に置き、`render.rs`の「時計もHOME環境変数も読まない」という既存の純粋性方針は保った)を`HeaderInfo`の新フィールド`cwd_short`として渡し、フッターだけに使う。ヘッダーボックスの`directory:`行は絶対パスのまま据え置いた(codexが header 側も短縮しているという根拠は無かったため)
+
+新規テスト16本(`slash.rs`側の`/export`・`/permissions`・`/fork`・`/pwd`・`exit`パース6本、`render.rs`側の`render_permissions_picker`表示2本、`lib.rs`側の`/pwd`・`/export`(2パターン)・`handle_fork`・`handle_permissions`(2パターン)・`abbreviate_home`(2パターン)8本)。`cargo test --workspace` 524→535件全緑(polaris-tui: 98→109)、clippy は`abbreviate_home`内の`redundant_guards`指摘1件のみ(`Some(rest) if rest.is_empty()`を`Some("")`へ修正して対応)、fmtはこのセッションで触った範囲は全てclean(既存の無関係1ファイル・2箇所のみ残存)。実バイナリをtmuxで検証した——`$HOME`配下のディレクトリで起動しフッターが`~/projects/demo`と短縮表示されること、`/permissions`でDown→Enterにより実際に`Always`へ切り替わり通知が出ること、`/pwd`が絶対パスを表示すること、`/export`が実際にmarkdownファイルを書き出し中身が`## You`/本文を含むこと、`/fork`が新しい会話ファイルを作り元のファイルはそのまま残ることを確認した。
+
+**「バージョンは進めない方針にする」という前回からの指示は継続しており、この作業を含めてもタグ付け・`CHANGELOG.md` への `[0.4.0]` エントリ追加・`git push` のいずれも行っていない。**
+
+続けて利用者から「modelやskillsのコマンドについても実装したい。加えて、一番先頭にある>_のロゴについて変更あんを考えたい」との指示を受けた。前回「`/model`の真の対話切替は別途アーキテクチャ検討が要る規模」として見送っていたが、明示的な再指示のため実装した。
+
+- **アーキテクチャ変更**: `polaris_provider::Provider` トレイトに `fn set_model(&self, model: &str)`(デフォルト実装は no-op)を追加。`&mut self` ではなく `&self` にしたのが要——これにより `RunArgs.provider: &'a dyn Provider` という既存の「共有参照」の形のまま、内部可変性(`OpenAiProvider`/`CodexProvider` の `model` フィールドをそれぞれ `String` から `std::sync::RwLock<String>` へ変更)でモデル切り替えを実現した。`RunArgs` がプロバイダを所有し直す(`Box<dyn Provider>` 化する)という前回懸念していた規模の変更は不要だった——テスト用の `Canned`/`Scripted` プロバイダはデフォルト実装のままで無改修
+- **`/model`**: `render::MODEL_CATALOG`(新設、固定6件——デスクトップの `model選択.png` に写っていたモデル名からreasoning effortの次元とニッチな `gpt-daybreak-blue-latest` を除いたもの)を対象にした対話的ピッカー。`New`/`Resume`/`Permissions`/`Fork` と同じ理由で `run()` 側の2箇所で横取りされる。選択すると `provider.set_model(picked)` で実際の送信先を切り替え、`run()` 内のローカル `let mut model_name`(新設、ヘッダー/フッター/通知の表示用)も同時に更新する
+- **`/skills`**: 一覧を「6件+"+N more"に切り詰めた1行 `Status::Notice`」から、発見された全skillを表示するフルスクリーンピッカーへ変更(`render_skills_picker`、新設)。codexの`/skills`が持つ「有効/無効切り替え」機能はpolarisに対応する状態が無いため、Enter/Esc双方が単に閉じるだけの閲覧専用にした
+- **`>_`ロゴの変更**: ヘッダー1行目のアイコンを、codexの実際の`>_`(端末プロンプト)をそのまま流用していた`›_`から、`polaris`(北極星)という名前にちなんだ金色の`✦`へ変更した。`AskUserQuestion`で4案(現状維持/星単体/星+プロンプトの複合/アイコン無し)をASCIIモックアップ付きで提示し、「北極星モチーフ(✦)」を選んでもらった。色は既存のシアン(対話可能なヒント・ピッカーのハイライトに使う意味を持つ色)と衝突しないよう、固定の識別マークとして暖色の金(`Rgb(250, 204, 21)`)にした
+
+新規テスト9本(`polaris-provider`側の`set_model`実HTTPリクエスト検証1本、`polaris-tui`側の`render_model_picker`/`render_skills_picker`表示4本、`handle_model`(切替/キャンセル)2本、`run_skills_picker`(空/一覧+クローズ)2本)。`cargo test --workspace` 535→540件全緑(polaris-provider: 57→58、polaris-tui: 109→113)、clippy clean、fmtはこのセッションで触った範囲は全てclean(既存の無関係1ファイル・2箇所のみ残存)。実バイナリをtmuxで検証した——モック用HTTPサーバー(Python)を127.0.0.1:8991に立て`POLARIS_BASE_URL`で向け、`/model`で`gpt-5.6-sol`を選択後に実際にメッセージを送信し、サーバー側が受け取ったリクエストbodyの`model`フィールドが`gpt-5.6-sol`に切り替わっていることを確認、`/skills`のフルスクリーン表示とEnterでの正常なクローズを確認、新ロゴ`✦ polaris`(金色)がヘッダーに正しく描画されることを確認した。
+
+**「バージョンは進めない方針にする」は継続しており、この作業を含めてもタグ付け・`CHANGELOG.md` への `[0.4.0]` エントリ追加・`git push` のいずれも行っていない。**
+
+続けて利用者から「モデル選択について。modelを選んだ後(enterした後)、次でeffortを表示する段階を用意。desktopに配置している2枚の画像を参照。なお、max,ultraだけ別ページに分けることはせずまとめて表示する」との指示を受けた。デスクトップに新たに置かれた2枚のスクリーンショット(`Screenshot 2026-08-24 at 9.34.48.png`・`9.35.00.png`)を確認したところ、codexの実際の`/model`は2段階ウィザードだった——1画面目でモデルを選ぶと、2画面目「Select Reasoning Level for {model}」でreasoning effortを選ばせる。codex側はこの2画面目をさらに「Low/Medium/High/Extra high + More reasoning...」の主画面と、そこから開く「Advanced Reasoning」副画面(Max/Ultra、"⚠ Consumes usage limits faster"の警告付き)の2つに分けているが、今回の指示は明示的に「まとめて1つに表示する」だった。
+
+- **`polaris_provider::Provider`にeffort対応を追加**: `fn set_effort(&self, effort: Option<&str>)`(デフォルトno-op)を新設。`OpenAiProvider`は`effort: RwLock<Option<String>>`を追加し、`Some`のとき`reasoning_effort`フィールドをbodyに足す(`None`で外す)。`CodexProvider`は元々`Token::effort`(ChatGPTのプラン種別から自動決定される値)を`reasoning.effort`として送っていたが、新設した`effort_override: RwLock<Option<String>>`が設定されていればそちらを優先する(`token.effort`にフォールバック)よう`attempt()`を変更した
+- **`render::EFFORT_CATALOG`**(新設、`(名前, 説明)`のタプル6件固定)を`low`→`ultra`まで1つのフラットな配列として定義し、`render_effort_picker`で番号付きピッカーとして描画。`DEFAULT_EFFORT`(=`"low"`)は`EFFORT_CATALOG[0].0`から導出、`(default)`ラベルは常にlow行に付き、現在選択中のeffortには別途`(current)`が付く(同じ行なら`(default, current)`とまとめる——2枚目のスクリーンショットで"Low (default)"と"High (current)"が別々のラベルだったことを踏まえた実装)
+- **`handle_model`を2段階ウィザードへ再設計**: `run_model_picker`(既存)→`run_effort_picker`(新設)の順に呼び、両方confirmされて初めて`provider.set_model`/`set_effort`と表示用の`model_name`/`effort_name`(いずれも`run()`のローカル状態、新設)を更新する。Escの意味を画面ごとに変えた——2画面目でのEscは1画面目(モデル一覧)へ戻るだけ(ウィザード全体はキャンセルしない)、1画面目でのEscはウィザード全体をキャンセルする。これはピッカー自身が表示する"esc to go back"というヒント文言と整合させた設計
+- **フッター表示の拡張**: `render::HeaderInfo`に`effort_name`フィールドを追加し、フッターを`{model} {effort} · {cwd}`(スクリーンショットで確認した実際の表記`gpt-5.6-sol high · ~/File/projects/...`と同型)に変更した
+
+新規テスト9本(`polaris-provider`側の`set_effort`実HTTPリクエスト検証2本(`OpenAiProvider`/`CodexProvider`各1本)、`polaris-tui`側の`render_effort_picker`表示3本、`handle_model`の2段階ウィザード動作(通し/1画面目でキャンセル/2画面目Escで1画面目へ戻る)3本、フッター表示1本)。`cargo test --workspace` 540→544件全緑(polaris-provider: 58→60、polaris-tui: 113→118)、clippy clean、fmtはこのセッションで触った範囲は全てclean(既存の無関係1ファイル・2箇所のみ残存)。実バイナリをtmuxで検証した——モック用HTTPサーバーを127.0.0.1:8992に立て、`/model`でモデル選択後にeffort画面が開き6段階全てが1画面に表示されること、`max`を選んで実際にメッセージを送信すると`POLARIS_BASE_URL`宛のリクエストbodyの`reasoning_effort`が`max`になっていること、フッターが`gpt-5.4 max · ...`と表示されること、2画面目でEscを押すと1画面目のモデル一覧へ戻り、そこでさらにEscを押すと元の`max`設定を保ったままウィザード全体がキャンセルされることを確認した。
+
+**「バージョンは進めない方針にする」は継続しており、この作業を含めてもタグ付け・`CHANGELOG.md` への `[0.4.0]` エントリ追加・`git push` のいずれも行っていない。**
+
+続けて利用者から「5.6sol, extra highを選んだところerror: provider: HTTP error: status 400 Bad Request: { "error": { "message": "Invalid value: 'extra high'. Supporte」となったため修正する」との実際のバグ報告を受けた。原因は単純だった——`render::EFFORT_CATALOG`の表示名(`"extra high"`、空白入り)をそのまま`provider.set_effort()`経由でAPIへ送っていたため、空白を含むリテラル文字列がそのままreasoning effortの値として送信され、実サーバーに拒否されていた。
+
+根拠を探したところ、`polaris-auth`の既存コード(`effort_for_plan_type`、このセッションより前から存在)が既に「`"low"`/`"xhigh"`という空白なしのトークンだけが実際にAPIへ送る値として正しい」ことの一次証拠になっていた(ChatGPTのプラン種別からreasoning effortを自動決定するロジックで、plus→`"low"`、pro系→`"xhigh"`と、既にこの2つの具体的な文字列を使っていた)。これを踏まえ、`render::effort_wire_value(name: &str) -> &str`(新設)を追加し、ピッカーの表示名(UI用・`(current)`判定用)と実際にAPIへ送る値を分離した——`"low"`/`"medium"`/`"high"`はそのまま、`"extra high"`は`"xhigh"`へ、`"max"`/`"ultra"`(ChatGPTアプリ側だけの上位プラン向け表示で、API側にリテラルな受理値が存在するという根拠がどこにも無い)も同じく`"xhigh"`(確認できている最高値)へ変換する。`handle_model`側は`provider.set_effort(Some(render::effort_wire_value(picked_effort)))`という形で呼び出し、`effort_name`(footer/通知表示用)は引き続き表示名のまま保持する——実際に送る値だけが変わる設計にした。
+
+新規テスト6本(`render.rs`側の`effort_wire_value`3本——全エントリが空白を含まないことの網羅チェック、既に安全な値がそのまま通ること、`extra high`/`max`/`ultra`が全て`xhigh`へ変換されること、`lib.rs`側の`handle_model`が実際に表示名でなく変換後の値をproviderへ渡すことを確認する回帰テスト1本)。`cargo test --workspace` 544→548件全緑(polaris-tui: 118→122)、clippy clean、fmtはこのセッションで触った範囲は全てclean(既存の無関係1ファイル・2箇所のみ残存)。実バイナリをtmuxで検証した——モック用HTTPサーバー(空白を含むeffort値を受け取ると実際に400を返すよう再現)を127.0.0.1:8993に立て、`/model`→`extra high`選択→メッセージ送信で以前は再現していた400が発生せず、サーバー側が受け取った`reasoning_effort`が`'xhigh'`(空白なし)になっていることを確認した。
+
+**「バージョンは進めない方針にする」は継続しており、この作業を含めてもタグ付け・`CHANGELOG.md` への `[0.4.0]` エントリ追加・`git push` のいずれも行っていない。**
+
+本節執筆時点での作業ツリーの状態: `cargo test --workspace` 548件全緑、`cargo clippy --workspace --all-targets -- -D warnings` clean、`cargo fmt --all -- --check` は無関係な既存1ファイル(`polaris-provider/src/openai.rs`、diff2箇所)のみ残存。未コミットの変更は `CHANGELOG.md`・`Cargo.toml`(ワークスペース)・`Cargo.lock`・`README.md`・`crates/polaris-cli/Cargo.toml`・`crates/polaris-cli/src/main.rs`・`crates/polaris-cli/tests/subcommands.rs`・`crates/polaris-core/src/project.rs`・`crates/polaris-core/src/session.rs`・`crates/polaris-provider/src/codex.rs`・`crates/polaris-provider/src/lib.rs`・`crates/polaris-provider/src/openai.rs`・`crates/polaris-tui/Cargo.toml`・`crates/polaris-tui/src/approver.rs`・`crates/polaris-tui/src/lib.rs`・`crates/polaris-tui/src/persist.rs`・`crates/polaris-tui/src/render.rs`・`crates/polaris-tui/src/time.rs`・新規 `crates/polaris-tui/src/slash.rs`・新規 `crates/polaris-tui/src/sessions.rs`・`docs/filemap.md`・`docs/superpowers/CURRENT.md`・TUI v2/harness-design 関連のドキュメント3件、および「Castor/Spica/Regulus 命名」作業も同じ作業ツリーにまとめて乗っている。
+
+続けて利用者から「claude code のgithub repoも取得し解析した上で、この表示部分の改良(ツール呼び出しのライブ表示)を検討したい。なお、表示改良は次のバージョンに進めたいので、今の実装でバージョンを確定させる」との指示を受けた。これを受けて`v0.4.0`「`Regulus`」を本節執筆時点の実装内容で確定させた——`CHANGELOG.md`に`[0.4.0]`エントリを追加し(TUI v2・オンボーディング・codex互換サブコマンド・スラッシュコマンド全16個・非同期化・`/resume`・`/model`(2段階ピッカー)・`/permissions`・`/skills`・`/fork`・`/export`・`/pwd`・ロゴ変更・effort値バグ修正をまとめて記載)、`c24c1f7`以降の全ての未コミット変更を1コミットにまとめ、`v0.4.0`として git tag した(push はまだ行っていない——別途明示的な承認が要る)。ツール呼び出しのライブ表示改良(Claude Code CLI自身の`⏺`表示を参考にする案)は次のバージョン(`v0.5.0`以降)へ持ち越す。
+
+## 未統合の worktree
+
+`git worktree list` で確認できる、main 未統合の作業は1件のみ(TUI onboarding は上記の通り本日 main へ統合済み)。
+
+- **`worktree-feat-m4-core`**（HEAD `0b80a0f`、パス `.claude/worktrees/feat-m4-core`）。`docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（全12タスク）のうち Task 1（`skill` 検索を `Named` トレイトへ汎化）のみ着手。台帳(`.superpowers/sdd/2026-08-20-polaris-m4-core/progress.md`)によれば、実装→レビュー(Needs fixes、Important 1件: `lookup` の None 分岐にテストが無い)→fix round 1/5 を再開したところで記録が止まっている。ワークツリーには `crates/polaris-tools/src/skill.rs` への未コミットの差分(+33行)が残ったままで、コミットもレビュー結果の記録も無い。**このセッションで新たに作業した形跡ではなく、以前のセッションで中断されたまま放置されている状態。** 再開するか、破棄して仕切り直すかは利用者判断が要る
+
+## main の `cargo fmt --check` drift
+
+M3b 完了時点(HEAD `b9db4e1`)では「fmt clean」だったが、TUI・TUI v2 の実装コミット群のどこかで rustfmt を通さないまま入った差分が蓄積していた。TUI onboarding のマージ作業の一環で `cargo fmt -p polaris-tui` を実行し、`polaris-tui` 配下(`persist.rs`・`render.rs`・`onboarding.rs`)の drift は解消済み。HEAD `c24c1f7` で `cargo fmt --all -- --check` を実測すると残り3件(`polaris-core/src/project.rs` 1件、`polaris-provider/src/openai.rs` 2件)——いずれも TUI/onboarding 作業とは無関係な既存ファイルで、まだ直っていない。`cargo test --workspace` は452件全緑、`cargo clippy --workspace --all-targets -- -D warnings` は clean。
 
 ## M2 の進捗
 
@@ -287,6 +404,7 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 - 憲法の見出しフォールバックが `## ` でしか止まらず、`# ` や `---` で次節が始まる AGENTS.md では EOF まで拾う
 - `with_home` の SAFETY コメントが mutex の効き目を実際より広く書いている。`tempfile::tempdir()` が lock の外で `TMPDIR` を読む
 - `edit` が書込可能ルートの外にある存在しないファイルを指したとき、`MutationFailed`（方針の問題ではない）を返す。ENOENT であり読み取りは開いているので嘘ではないが、承認ゲートが先に発火するためエージェント経由では到達しない。1 往復ぶんの損である
+- `codex` の実際のTUIは、ターン実行中「Working (Ns · esc to interrupt)」という経過秒数付きの表示を出し、Escで途中中断できる。polaris の `polaris-tui::run()` は `ratatui::crossterm::event::read()` によるブロッキング待ちで駆動しており、`agent::run().await` の実行中に別のキー入力を割り込ませる経路が無い(タイマー表示・中断のどちらにもポーリングかバックグラウンドタスクへの再構成が要る)。実装すればターン中の応答性が上がるが、イベントループの構造そのものを変える規模のため、この回のスコープには含めなかった
 
 ## 進め方
 
@@ -296,10 +414,16 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-ブランチを締める。M3b の作業領域を消し、`superpowers:finishing-a-development-branch`
-へ渡す。push とマージは利用者の承認を待つ。
+本節は2026-08-24、`v0.4.0`「`Regulus`」を確定・git tag した直後に書き直した。まだ push していない。
 
-そのうえで v1.0.0 のタグ付けの判断へ進み、M4（subagent、波、継続波）へ移る。
+優先度順:
+
+1. **`git push` の実施を利用者に確認する。** タグ付け・CHANGELOG反映・コミットは完了済みだが、push は別途明示的な承認が要るという標準ルールに従い、まだ行っていない
+2. **ツール呼び出しのライブ表示改良を計画する(`v0.5.0`以降)。** 利用者から「Claude Code CLI自身の`⏺`から始まる表示(ファイル更新・削除ごとのまとまり、ナレーション文、"Allowed by auto mode classifier"等)を模倣したい」との要望があり、Claude Code の実際のGitHubリポジトリを取得・解析したうえで検討する予定(現在はターン実行中`Working`のみでツール呼び出しの途中経過が一切見えない、という指摘が起点)。実現には`polaris_core::agent::run`にイベント通知の仕組み(コールバック等)を追加し、`agent::run`が`&mut Session`を握ったまま実行される現在の構造(ライブ再描画時に`session.clone()`スナップショットしか読めない、`lib.rs`の`tokio::select!`まわりの制約)を踏まえた設計が要る
+3. **main の `cargo fmt --all -- --check` drift(残り2ファイル、`project.rs`・`openai.rs`)を直す。** onboarding マージ時に `polaris-tui` 配下の drift は解消済みだが、この2ファイルは未対応のまま
+4. **`worktree-feat-m4-core` の扱いを決める。** Task 1 のレビュー指摘への fix round 1/5 を再開したところで記録が止まっており、以前のセッションからの中断状態。再開するか、レビュー指摘(`lookup` の None 分岐のテスト不在)を踏まえて仕切り直すかは利用者判断が要る
+
+そのうえで v1.0.0 のタグ付けの判断へ進む。
 
 キャッシュヒット率の記録は、タグ準備の前に入れる。設計が主張する「接頭辞を動かさないからキャッシュが効く」という性質を観測に変える作業であり、遅れても失われない。
 

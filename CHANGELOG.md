@@ -2,7 +2,34 @@
 
 [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) と [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
-## [0.3.0] — 2026-08-21
+## [0.4.0] — 2026-08-24 "Regulus"
+
+対話TUIを大幅に拡張した。TUI v2(ステータスバー・ツール呼び出しの可視化・Markdown整形)、初回起動時のオンボーディング画面、codex互換サブコマンド、対話中のスラッシュコマンド群、非同期イベントループ化によるライブなステータス表示を追加した。`codex`の実際のソースコード(GitHubから取得)とデスクトップのスクリーンショットを繰り返し参照し、対応する画面要素の見た目・操作感を検証したうえで移植した。
+
+### 追加
+
+- TUI v2: 画面下部のステータスバー(プロバイダ・モデル・累積トークン使用量)、ツール呼び出しの会話履歴内可視化(`⚙ ツール名(引数)` / `→ 結果`)、`**太字**`・`` `インラインコード` ``・フェンス付きコードブロックの簡易Markdown整形
+- オンボーディング画面: プロバイダの資格情報が一切無い状態で対話TUIを起動すると、ChatGPTサインインまたはAPIキー入力を選べる画面を表示する(`POLARIS_PROVIDER`未設定時のみ)。APIキーは`~/.polaris/api_key.json`に0600で保存
+- codex互換サブコマンド: `exec`・`sandbox`・`doctor`・`completion`(bash/zsh/fish/powershell/elvish)
+- TUIスラッシュコマンド(全16個): `/help`・`/status`・`/skills`・`/new`・`/resume`・`/clear`・`/init`・`/model`・`/diff`・`/review`・`/permissions`・`/fork`・`/export`・`/pwd`・`/logout`・`/quit`
+- `/model`: モデル選択→reasoning effort選択の2段階ピッカー(low/medium/high/extra high/max/ultra)。`polaris_provider::Provider`に`set_model`/`set_effort`(内部可変性で実現)を追加し、セッション中に実際に送信モデル・reasoning effortを切り替えられるようにした
+- `/resume`: 保存済み会話を起動元ディレクトリ別にグループ化して選べるフルスクリーンピッカー(今いるディレクトリのグループが常に先頭)。会話の永続化先を「プロジェクトごとのディレクトリ」から全プロジェクト共有の`~/.polaris/sessions/`へ移行し、1会話=1ファイルペア(`<id>.jsonl` + `<id>.meta.json`)へ再設計
+- `/permissions`・`/skills`: 対話的ピッカー(承認ポリシーの変更、発見済みskillのフルスクリーン一覧)
+- ターン実行中のステータス行にshimmerアニメーション付き経過秒表示+esc中断機能。イベントループを非同期化(`tokio::select!`)して実現
+- ヘッダーボックス(dimスタイルの枠線+`✦ polaris`見出し+`model:`/`directory:`/`tokens:`各行)、2色構成のフッター(モデル名・reasoning effort・作業ディレクトリの`~`短縮表示)
+
+### 変更
+
+- セッション永続化モデルを「プロジェクトごとに1つの会話を自動再開」から「常に空の状態で起動し`/resume`で選ぶ」方式へ変更
+- `/new`の意味を「その場で消去して再開」から「新しい会話へ切り替え、元の会話は保存したまま残す」へ変更(元の会話は引き続き`/resume`から辿れる)
+- プロバイダ解決: `POLARIS_PROVIDER`未指定時、保存済みcodex資格情報の有無を見て既定プロバイダを決めるようにした
+
+### 修正
+
+- プロバイダ未指定時、保存済みcodex資格情報があってもデフォルトが常に`openai`に解決されていた不具合
+- `/model`のreasoning effortピッカーで表示名(`"extra high"`等、空白入り)をそのままAPIへ送信し実際に`400 Invalid value`を引き起こしていた不具合。APIへ送る値と画面表示名を分離して修正
+
+## [0.3.0] — 2026-08-21 "Castor"
 
 対話TUIを追加した。`polaris` を `--prompt` なしで実行すると、スクロール可能な会話履歴と入力欄を持つ対話セッションに入る。一発実行(`polaris -p "..."`)の挙動は変わらない。
 

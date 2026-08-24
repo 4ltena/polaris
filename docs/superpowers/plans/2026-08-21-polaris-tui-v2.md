@@ -1,4 +1,6 @@
-# polaris TUI v2 (v0.4.0 "Regulus") Implementation Plan
+# polaris TUI v2 Implementation Plan
+
+> **Version note:** part of `v0.4.0` ("Regulus" — the codename is on the release, not on this feature by itself). See `docs/superpowers/CURRENT.md` for the current scope of that release.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

@@ -257,7 +257,15 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct CodexProvider {
     base: String,
-    model: String,
+    // `RwLock`, not a plain `String`/`Option<String>` — `set_model`/
+    // `set_effort` take `&self` so they can be called through the same
+    // shared `&dyn Provider` the rest of the harness already holds (see
+    // the trait's docs).
+    model: std::sync::RwLock<String>,
+    // An explicit `/model` effort choice, taking precedence over the
+    // account-plan-derived `Token::effort` when set — see
+    // `attempt`'s docs.
+    effort_override: std::sync::RwLock<Option<String>>,
     tokens: Arc<dyn crate::TokenSource>,
     client: reqwest::Client,
     idle: Duration,
@@ -276,7 +284,8 @@ impl CodexProvider {
     ) -> Self {
         Self {
             base,
-            model,
+            model: std::sync::RwLock::new(model),
+            effort_override: std::sync::RwLock::new(None),
             tokens,
             client: reqwest::Client::new(),
             idle,
@@ -291,13 +300,22 @@ impl CodexProvider {
     /// practice a refreshed token never actually carries a different plan
     /// determination, but keeping the correspondence "this attempt's body
     /// uses the effort of the token this attempt used" is less error-prone
-    /// than having the caller reuse a body across attempts).
+    /// than having the caller reuse a body across attempts) — but an
+    /// explicit `set_effort` call (via `/model`) always wins over the
+    /// token's plan-derived value when one has been made.
     async fn attempt(
         &self,
         token: &crate::Token,
         req: &CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
-        let body = build_body(&self.model, req, token.effort.as_deref());
+        let model = self.model.read().expect("model lock poisoned").clone();
+        let override_effort = self
+            .effort_override
+            .read()
+            .expect("effort lock poisoned")
+            .clone();
+        let effort = override_effort.as_deref().or(token.effort.as_deref());
+        let body = build_body(&model, req, effort);
         let resp = self
             .client
             .post(format!("{}/responses", self.base))
@@ -372,6 +390,14 @@ impl Provider for CodexProvider {
             }
             other => other,
         }
+    }
+
+    fn set_model(&self, model: &str) {
+        *self.model.write().expect("model lock poisoned") = model.to_string();
+    }
+
+    fn set_effort(&self, effort: Option<&str>) {
+        *self.effort_override.write().expect("effort lock poisoned") = effort.map(str::to_string);
     }
 }
 
@@ -841,6 +867,30 @@ mod tests {
         let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
         let r = p.complete(req()).await.expect("should succeed");
         assert_eq!(r.text, "ok");
+    }
+
+    /// `set_effort` must override the account-plan-derived effort
+    /// (`Tokens` here always returns `effort: None`, so any effort seen
+    /// on the wire had to come from the override, not the token).
+    #[tokio::test]
+    async fn set_effort_overrides_the_plan_derived_effort() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+                frame("response.output_item.done", message_item("ok")),
+                frame("response.completed", serde_json::json!({})),
+            ])))
+            .mount(&s)
+            .await;
+
+        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
+        p.set_effort(Some("xhigh"));
+        p.complete(req()).await.expect("should succeed");
+
+        let received = s.received_requests().await.expect("recorded");
+        let body: Value = received[0].body_json().expect("json");
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
     /// On receiving a 401, refresh and retry exactly once, and succeed.

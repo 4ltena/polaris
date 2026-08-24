@@ -1,7 +1,8 @@
-# polaris TUI v2(v0.4.0 “Regulus”)設計
+# polaris TUI v2 設計
 
 日付: 2026-08-21
 ステータス: ドラフト(ユーザーレビュー待ち)
+版: `v0.4.0`(通称 `Regulus`)に含める予定。`Regulus` は版番号(`v0.4.0`)自体に付く通称であり、TUI v2 単体には付けない——同じ `v0.4.0` に TUI onboarding も含める。詳細は `docs/superpowers/CURRENT.md` を参照
 
 ## 背景
 

@@ -230,6 +230,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -293,6 +302,7 @@ checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags",
  "crossterm_winapi",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix 0.38.44",
@@ -1112,6 +1122,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
+ "clap_complete",
  "polaris-auth",
  "polaris-core",
  "polaris-provider",
@@ -1195,12 +1206,16 @@ dependencies = [
 name = "polaris-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "crossterm",
+ "futures-util",
  "polaris-auth",
  "polaris-core",
  "polaris-provider",
  "polaris-sandbox",
  "polaris-skills",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

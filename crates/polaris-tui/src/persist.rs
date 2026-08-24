@@ -21,6 +21,7 @@ fn read_lines_lossy(bytes: &[u8]) -> Vec<String> {
 
 use polaris_core::session::Session;
 use polaris_provider::Message;
+use serde::{Deserialize, Serialize};
 
 /// Loads a session from `path`. Returns `(session, true)` when a corrupt
 /// line was found; everything from that line onward is dropped both from
@@ -66,6 +67,44 @@ pub fn append_message(path: &Path, message: &Message) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(message).expect("Message always serializes");
     writeln!(file, "{line}")
+}
+
+/// Empties the persisted session file. Used by the `/clear` slash command
+/// — the in-memory `Session` is cleared by the caller; this keeps the file
+/// on disk from resurrecting the old conversation on the next launch.
+pub fn clear_session(path: &Path) -> io::Result<()> {
+    rewrite(path, &[])
+}
+
+/// Recorded once per saved conversation, alongside its `<id>.jsonl`
+/// message log — the directory it was started from and when, so
+/// `/resume` can group and sort conversations without re-deriving that
+/// from the messages themselves.
+#[derive(Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub cwd: String,
+    pub started_at_millis: u128,
+}
+
+/// Writes `<id>.meta.json` next to a session's message log, but only if
+/// it doesn't exist yet. Session creation is lazy — nothing touches disk
+/// until the first message is actually sent — so this is called before
+/// every append, not just the first one; the existence check makes every
+/// call after the first a no-op instead of re-stamping `started_at`.
+pub fn write_meta_if_absent(meta_path: &Path, meta: &SessionMeta) -> io::Result<()> {
+    if meta_path.exists() {
+        return Ok(());
+    }
+    let json = serde_json::to_string(meta).expect("SessionMeta always serializes");
+    std::fs::write(meta_path, json)
+}
+
+/// Reads back a session's metadata. `None` (not an error) when the file
+/// is missing or unparseable — a `/resume` listing skips a corrupt or
+/// incomplete entry rather than failing the whole list.
+pub fn read_meta(meta_path: &Path) -> Option<SessionMeta> {
+    let bytes = std::fs::read(meta_path).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn rewrite(path: &Path, messages: &[Message]) -> io::Result<()> {
@@ -154,5 +193,66 @@ mod tests {
         let (reloaded, truncated_again) = load_session(&path).expect("reload");
         assert_eq!(reloaded.messages.len(), 1);
         assert!(!truncated_again);
+    }
+
+    #[test]
+    fn meta_written_once_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("abc.meta.json");
+
+        write_meta_if_absent(
+            &path,
+            &SessionMeta {
+                cwd: "/tmp/example".to_string(),
+                started_at_millis: 1_705_311_000_000,
+            },
+        )
+        .expect("write meta");
+
+        let meta = read_meta(&path).expect("meta should parse");
+        assert_eq!(meta.cwd, "/tmp/example");
+        assert_eq!(meta.started_at_millis, 1_705_311_000_000);
+    }
+
+    #[test]
+    fn a_second_write_meta_if_absent_call_does_not_overwrite_the_first() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("abc.meta.json");
+
+        write_meta_if_absent(
+            &path,
+            &SessionMeta {
+                cwd: "/tmp/first".to_string(),
+                started_at_millis: 100,
+            },
+        )
+        .expect("first write");
+        write_meta_if_absent(
+            &path,
+            &SessionMeta {
+                cwd: "/tmp/second".to_string(),
+                started_at_millis: 200,
+            },
+        )
+        .expect("second write is a no-op");
+
+        let meta = read_meta(&path).expect("meta should parse");
+        assert_eq!(meta.cwd, "/tmp/first");
+        assert_eq!(meta.started_at_millis, 100);
+    }
+
+    #[test]
+    fn read_meta_on_a_missing_file_is_none_not_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("missing.meta.json");
+        assert!(read_meta(&path).is_none());
+    }
+
+    #[test]
+    fn read_meta_on_a_corrupt_file_is_none_not_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("corrupt.meta.json");
+        std::fs::write(&path, b"{not valid json").expect("write corrupt meta");
+        assert!(read_meta(&path).is_none());
     }
 }

@@ -51,7 +51,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct OpenAiProvider {
     base_url: String,
     api_key: String,
-    model: String,
+    // `RwLock`, not a plain `String`/`Option<String>` — `set_model`/
+    // `set_effort` take `&self` so they can be called through the same
+    // shared `&dyn Provider` the rest of the harness already holds (see
+    // the trait's docs).
+    model: std::sync::RwLock<String>,
+    effort: std::sync::RwLock<Option<String>>,
     client: reqwest::Client,
 }
 
@@ -87,7 +92,8 @@ impl OpenAiProvider {
         Ok(Self {
             base_url,
             api_key,
-            model,
+            model: std::sync::RwLock::new(model),
+            effort: std::sync::RwLock::new(None),
             client,
         })
     }
@@ -170,12 +176,16 @@ impl Provider for OpenAiProvider {
 
         let tools = tool_wire_shape(&req.tools);
 
+        let model = self.model.read().expect("model lock poisoned").clone();
         let mut body = serde_json::json!({
-            "model": self.model,
+            "model": model,
             "messages": messages,
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
+        }
+        if let Some(effort) = self.effort.read().expect("effort lock poisoned").as_deref() {
+            body["reasoning_effort"] = Value::String(effort.to_string());
         }
 
         let resp = self
@@ -323,6 +333,14 @@ impl Provider for OpenAiProvider {
             tool_calls,
             usage,
         })
+    }
+
+    fn set_model(&self, model: &str) {
+        *self.model.write().expect("model lock poisoned") = model.to_string();
+    }
+
+    fn set_effort(&self, effort: Option<&str>) {
+        *self.effort.write().expect("effort lock poisoned") = effort.map(str::to_string);
     }
 }
 
@@ -634,6 +652,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_model_changes_the_model_sent_on_the_next_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "gpt-5.4".into())
+            .expect("client should be constructible");
+        p.complete(CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+        })
+        .await
+        .expect("should succeed");
+
+        p.set_model("gpt-5.6-sol");
+        p.complete(CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+        })
+        .await
+        .expect("should succeed");
+
+        let received = server.received_requests().await.expect("recorded");
+        assert_eq!(received.len(), 2);
+        let first: Value = received[0].body_json().expect("json");
+        let second: Value = received[1].body_json().expect("json");
+        assert_eq!(first["model"], "gpt-5.4");
+        assert_eq!(second["model"], "gpt-5.6-sol");
+    }
+
+    #[tokio::test]
+    async fn set_effort_adds_reasoning_effort_to_the_body_and_none_clears_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "gpt-5.4".into())
+            .expect("client should be constructible");
+        fn empty_request() -> CompletionRequest {
+            CompletionRequest {
+                system: String::new(),
+                messages: vec![],
+                tools: vec![],
+            }
+        }
+
+        p.complete(empty_request()).await.expect("should succeed");
+
+        p.set_effort(Some("high"));
+        p.complete(empty_request()).await.expect("should succeed");
+
+        p.set_effort(None);
+        p.complete(empty_request()).await.expect("should succeed");
+
+        let received = server.received_requests().await.expect("recorded");
+        assert_eq!(received.len(), 3);
+        let bodies: Vec<Value> = received.iter().map(|r| r.body_json().unwrap()).collect();
+        assert!(bodies[0].get("reasoning_effort").is_none());
+        assert_eq!(bodies[1]["reasoning_effort"], "high");
+        assert!(bodies[2].get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
     async fn serializes_tool_round_trip_to_the_wire_shape_openai_requires() {
         // A test that only looks at types misses an actual drift in the
         // wire format. Here we directly verify the raw request body
@@ -730,7 +823,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenAiProvider::new(server.uri(), "key".into(), "model".into()).expect("client");
+        let provider =
+            OpenAiProvider::new(server.uri(), "key".into(), "model".into()).expect("client");
         let res = provider
             .complete(CompletionRequest {
                 system: String::new(),
@@ -757,7 +851,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenAiProvider::new(server.uri(), "key".into(), "model".into()).expect("client");
+        let provider =
+            OpenAiProvider::new(server.uri(), "key".into(), "model".into()).expect("client");
         let res = provider
             .complete(CompletionRequest {
                 system: String::new(),

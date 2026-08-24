@@ -7,10 +7,11 @@ use std::time::Duration;
 use polaris_core::{AgentEvent, DiffLine};
 use polaris_provider::Role;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 /// What the bottom-of-screen status line shows while a turn is in flight,
 /// idle, or after a failed turn.
@@ -750,16 +751,26 @@ pub fn render_footer(
     );
 
     // Places the real terminal cursor at `cursor`'s position within the
-    // typed text, right after the "\u{203a} " prompt — `Line::width()`
-    // already accounts for CJK/wide characters the same way the rendered
-    // text itself does, so this stays in sync without a separate
-    // width-measuring dependency.
-    let prefix_width = Line::from("\u{203a} ").width() as u16;
-    let typed_width = Line::from(sanitize(&input[..cursor])).width() as u16;
-    frame.set_cursor_position(ratatui::layout::Position::new(
-        input_area.x + prefix_width + typed_width,
-        input_area.y,
-    ));
+    // typed text, right after the "\u{203a} " prompt. Terminal emulators
+    // anchor the OS/IME preedit (未確定文字) popup to this reported
+    // position, not to wherever text visually appears — if the app never
+    // reports where the caret actually is, the cursor stays wherever the
+    // last raw write left it, which produced an IME composition window
+    // floating at the screen's bottom edge instead of sitting after the
+    // typed text. `"› "`'s display width is 2 (both cells are
+    // single-width), matching the literal used in `input_line` above;
+    // `UnicodeWidthStr::width` (not `.chars().count()`) accounts for wide
+    // (CJK) characters already typed before `cursor` so the reported
+    // column lines up with what's actually drawn; the `.min(...)` clamp
+    // keeps it from running past the row's right edge.
+    let prefix_width: u16 = 2;
+    let typed_width = sanitize(&input[..cursor]).width() as u16;
+    let cursor_x = input_area
+        .x
+        .saturating_add(prefix_width)
+        .saturating_add(typed_width)
+        .min(input_area.right().saturating_sub(1));
+    frame.set_cursor_position(Position::new(cursor_x, input_area.y));
 
     // Two-tone footer matching codex's own status line: the model name in
     // a warm tan, the working directory in a soft green, separated by a
@@ -1236,6 +1247,43 @@ mod tests {
             .draw(|f| render_footer(f, input, cursor, &Status::Idle, &header, &[], 0))
             .expect("draw");
         terminal.get_cursor_position().expect("cursor position")
+    }
+
+    /// Regression test for the IME-preedit-shows-at-the-bottom bug: the
+    /// terminal cursor must land exactly after the typed text in the
+    /// input row, not stay wherever a prior raw write left it (which
+    /// `Frame::set_cursor_position` never being called defaulted to
+    /// "hidden, unpositioned" — see `terminal.rs`'s `try_draw`).
+    #[test]
+    fn the_cursor_lands_right_after_the_typed_input_text() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| {
+                render_footer(f, "hello", 5, &Status::Idle, &test_header(), &[], 0);
+            })
+            .expect("draw");
+        // "› " (width 2) + "hello" (width 5) = column 7, on the input row
+        // (status(1) + suggestions(0) = row 1).
+        terminal.backend_mut().assert_cursor_position((7, 1));
+    }
+
+    /// Wide (CJK) characters must count as 2 columns each, or the cursor
+    /// — and thus the IME popup a terminal anchors to it — would land
+    /// short of the actual caret whenever any wide character was already
+    /// typed, exactly the scenario a real Japanese IME composition hits.
+    #[test]
+    fn the_cursor_accounts_for_wide_characters_already_typed() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let input = "helloこんにちは";
+        terminal
+            .draw(|f| {
+                render_footer(f, input, input.len(), &Status::Idle, &test_header(), &[], 0);
+            })
+            .expect("draw");
+        // "› "(2) + "hello"(5) + "こんにちは"(5 chars * width 2 = 10) = 17.
+        terminal.backend_mut().assert_cursor_position((17, 1));
     }
 
     fn test_header() -> HeaderInfo<'static> {

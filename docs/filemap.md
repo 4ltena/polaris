@@ -174,6 +174,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-21-polaris-tui-v2.md` — polaris TUI v2 Implementation Plan
 - `2026-08-21-polaris-tui.md` — polaris TUI Implementation Plan
 - `2026-08-24-polaris-files-md-autogen.md` — polaris ディレクトリ別 files.md 自動生成 Implementation Plan
+- `2026-08-24-polaris-tui-live-tool-progress.md` — polaris TUI ライブツール進捗・diff表示 Implementation Plan
 
 ## `docs/superpowers/specs`
 
@@ -184,3 +185,4 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-21-polaris-tui-onboarding-design.md` — polaris TUI 初回起動オンボーディング画面 設計
 - `2026-08-21-polaris-tui-v2-design.md` — polaris TUI v2 設計
 - `2026-08-24-polaris-files-md-autogen-design.md` — polaris ディレクトリ別 `files.md` 自動生成 設計書
+- `2026-08-24-polaris-tui-live-tool-progress-design.md` — polaris TUI ライブツール進捗・diff表示 設計書

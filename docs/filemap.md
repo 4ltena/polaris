@@ -175,3 +175,4 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-21-polaris-tui-design.md` — polaris TUI 設計
 - `2026-08-21-polaris-tui-onboarding-design.md` — polaris TUI 初回起動オンボーディング画面 設計
 - `2026-08-21-polaris-tui-v2-design.md` — polaris TUI v2 設計
+- `2026-08-24-polaris-files-md-autogen-design.md` — polaris ディレクトリ別 `files.md` 自動生成 設計書

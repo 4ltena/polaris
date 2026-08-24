@@ -72,6 +72,37 @@ pub async fn run(
     skills: &[polaris_skills::Skill],
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
+    run_loop(
+        provider,
+        session,
+        audit,
+        stop,
+        always_on.system(),
+        always_on.tools(),
+        skills,
+        "root",
+        ctx,
+    )
+    .await
+}
+
+/// ルートの `run` と subagent 実行(Task 9)の両方が使う、ターン取りの
+/// 中核。`system`/`tools` を `AlwaysOn` からではなく直接受け取るのは、
+/// subagent の型ごとに異なるシステムプロンプトとツール部分集合を、
+/// ルート用に不変設計された `AlwaysOn` に混ぜないため — `prompt.rs` の
+/// `AlwaysOn` のdoc commentを参照。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_loop(
+    provider: &dyn Provider,
+    session: &mut Session,
+    audit: &mut AuditLog,
+    stop: &mut StopTracker,
+    system: &str,
+    tools: &[polaris_tools::ToolSpec],
+    skills: &[polaris_skills::Skill],
+    caller: &str,
+    ctx: &mut ToolContext<'_>,
+) -> Result<AgentOutcome, AgentError> {
     let mut usage = polaris_provider::Usage::default();
     loop {
         // Call unconditionally every turn. If this were only called on
@@ -80,12 +111,18 @@ pub async fn run(
         if let Some(r) = stop.observe_turn() {
             return Err(AgentError::Stopped(r));
         }
+        // A no-op for the root tracker (`StopTracker::new` never sets a
+        // wall-clock deadline), and meaningful for a subagent tracker
+        // built with `StopTracker::with_wall_seconds` (Task 9).
+        if let Some(r) = stop.observe_wall_clock() {
+            return Err(AgentError::Stopped(r));
+        }
 
         let res = provider
             .complete(CompletionRequest {
-                system: always_on.system().to_string(),
+                system: system.to_string(),
                 messages: session.messages.clone(),
-                tools: always_on.tools().to_vec(),
+                tools: tools.to_vec(),
             })
             .await?;
 
@@ -141,7 +178,7 @@ pub async fn run(
                 sandbox: is_mutation.then_some(ctx.sandbox),
                 target: target.as_deref(),
                 result,
-                caller: "root",
+                caller,
             })?;
             match outcome {
                 Ok(body) => {
@@ -1561,6 +1598,47 @@ print("wrote")
         assert_eq!(outcome.usage.input_tokens, 30);
         assert_eq!(outcome.usage.output_tokens, 8);
         assert_eq!(outcome.usage.total_tokens, 38);
+    }
+
+    #[tokio::test]
+    async fn run_loop_produces_the_same_result_as_run_for_an_equivalent_call() {
+        // `run_loop` is the core `run` delegates to (Task 8). This pins
+        // down that calling it directly, with the same pieces `run` would
+        // have derived from `AlwaysOn` and passed along, produces the same
+        // outcome as `run` itself.
+        let p = Scripted {
+            replies: Mutex::new(vec![CompletionResponse {
+                text: "hello from run_loop".into(),
+                tool_calls: vec![],
+                ..Default::default()
+            }]),
+        };
+        let mut session = Session::new();
+        session.push_user("hi");
+        let dir = tempfile::tempdir().expect("temp directory");
+        let mut audit = AuditLog::open(&dir.path().join("audit.jsonl")).expect("cannot open");
+        let mut stop = StopTracker::new(10);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let result = run_loop(
+            &p,
+            &mut session,
+            &mut audit,
+            &mut stop,
+            "system prompt",
+            &polaris_tools::all_specs(),
+            &[],
+            "root",
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "hello from run_loop");
     }
 
     #[tokio::test]

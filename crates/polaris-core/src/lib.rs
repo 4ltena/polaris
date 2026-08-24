@@ -7,6 +7,8 @@ pub mod budget;
 pub mod config;
 pub mod constitution;
 mod dir_watch;
+#[allow(dead_code)]
+mod events;
 mod files_md;
 mod gitignore;
 pub mod project;
@@ -15,3 +17,5 @@ pub mod secret_screen;
 pub mod session;
 pub mod spawn;
 pub mod stop;
+
+pub use events::{AgentEvent, Diff, DiffHunk, DiffLine, compute_diff};

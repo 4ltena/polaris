@@ -212,8 +212,21 @@ fn pre_call_snapshot(
             _ => crate::dir_watch::ScanScope::None,
         },
         // `write` / `edit` resolve to exactly one path (the same "path"
-        // argument the audit record's `target` is built from), so only its
-        // parent directory needs watching, and only one level deep.
+        // argument the audit record's `target` is built from), so only the
+        // directories immediately around it need watching, one level deep.
+        //
+        // Both the target's parent *and* that parent's own parent are
+        // watched. `polaris_sandbox`'s helper runs `create_dir_all` before
+        // writing, so a `write` to `sub/a.txt` genuinely creates `sub` on
+        // disk — and a directory never appears inside its own listing, so
+        // watching `sub` alone can never report `sub` as new. The new file
+        // would land in `new_files_in_existing_dirs` instead, and
+        // `targets_to_regenerate` drops that because `sub/files.md` does
+        // not exist yet: the directory would silently never get a
+        // `files.md`, and no later `bash` call could recover it either
+        // (`sub` is in the "before" snapshot by then, so it never looks new
+        // again). Catching exactly this case is the reason the spec chose
+        // filesystem diffing over parsing `mkdir` out of command strings.
         //
         // The path is anchored to the working directory first, through the
         // very same `polaris_tools::predicate::absolutize` the tools' own
@@ -241,7 +254,20 @@ fn pre_call_snapshot(
                 .and_then(|p| p.parent().map(Path::to_path_buf))
                 .filter(|p| !p.as_os_str().is_empty());
             match parent {
-                Some(parent) => crate::dir_watch::ScanScope::Shallow(parent),
+                Some(parent) => {
+                    let mut dirs = vec![parent.clone()];
+                    // The grandparent, so that a parent the write itself
+                    // created shows up as a new entry somewhere. Skipped
+                    // when there is none (the filesystem root) or when it
+                    // is the same directory, which would only scan twice.
+                    if let Some(grandparent) = parent.parent()
+                        && grandparent != parent
+                        && !grandparent.as_os_str().is_empty()
+                    {
+                        dirs.push(grandparent.to_path_buf());
+                    }
+                    crate::dir_watch::ScanScope::Shallow(dirs)
+                }
                 None => crate::dir_watch::ScanScope::None,
             }
         }
@@ -2322,6 +2348,98 @@ print("wrote")
     }
 
     #[tokio::test]
+    async fn a_root_write_into_a_not_yet_existing_directory_regenerates_for_that_new_directory() {
+        // `polaris_sandbox`'s helper runs `create_dir_all` before writing,
+        // so a `write` to `sub/new.txt` genuinely creates `sub`. Watching
+        // only `sub` could never notice: a directory never appears inside
+        // its own listing, so `sub` would never reach `new_dirs`, the file
+        // would land in `new_files_in_existing_dirs`, and
+        // `targets_to_regenerate` would drop it because `sub/files.md` does
+        // not exist yet — the directory would silently never get one, and
+        // no later `bash` call could recover it either. Watching `sub`'s
+        // own parent as well is what closes that gap.
+        let root = tempfile::tempdir().expect("temp directory");
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = write_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        // The grandparent needs existing content for its diff to mean
+        // anything, and it doubles as something the subagent can read.
+        let seed = sandbox.writable_roots()[0].join("seed.txt");
+        std::fs::write(&seed, "seed\n").expect("cannot write");
+        let sub = sandbox.writable_roots()[0].join("sub");
+        let target = sub.join("new.txt");
+        assert!(!sub.exists(), "the directory must not exist beforehand");
+
+        let mut replies = vec![CompletionResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": target.display().to_string(),
+                    "content": "body"
+                }),
+            }],
+            ..Default::default()
+        }];
+        replies.extend(files_md_writer_turns(&seed, &sub));
+        replies.push(final_text("done"));
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(replies),
+        });
+
+        let logs = tempfile::tempdir().expect("temp directory");
+        let audit_path = logs.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut session = Session::new();
+        session.push_user("create sub/new.txt");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let out = run(
+            p.as_ref(),
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[files_md_writer_agent_type()],
+            p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            &mut ctx,
+        )
+        .await
+        .expect("the root loop failed")
+        .text;
+        assert_eq!(out, "done", "the root loop did not reach its closing turn");
+
+        assert!(
+            target.is_file(),
+            "the write did not actually create the file"
+        );
+        assert!(sub.is_dir(), "the write did not actually create sub/");
+
+        let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        assert!(
+            log.contains("\"caller\":\"files-md-writer\""),
+            "no regeneration ran for the directory the write created: {log}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_same_directory_creating_call_from_a_subagent_does_not_trigger_regeneration() {
         // The guard that keeps the mechanism from feeding itself. This is
         // the identical scenario as the test above — same sandbox, same
@@ -2432,9 +2550,13 @@ print("wrote")
         let call = call_with("write", "path", "README.md");
         let (scope, before) = pre_call_snapshot("write", &call, &ctx);
 
+        // The working directory, plus its own parent so that a directory
+        // the write itself created can be seen as new.
+        let mut expected = vec![cwd.clone()];
+        expected.extend(cwd.parent().map(Path::to_path_buf));
         assert_eq!(
             scope,
-            crate::dir_watch::ScanScope::Shallow(cwd.clone()),
+            crate::dir_watch::ScanScope::Shallow(expected),
             "a bare filename was not anchored to the working directory the \
              write itself resolves against"
         );
@@ -2449,9 +2571,9 @@ print("wrote")
         // What the buggy form did, pinned so the contrast is not merely
         // asserted in prose: the empty parent yields nothing at all.
         assert_eq!(
-            crate::dir_watch::snapshot_for_scope(&crate::dir_watch::ScanScope::Shallow(
+            crate::dir_watch::snapshot_for_scope(&crate::dir_watch::ScanScope::Shallow(vec![
                 std::path::PathBuf::new()
-            )),
+            ])),
             crate::dir_watch::DirSnapshot::default()
         );
 
@@ -2459,7 +2581,10 @@ print("wrote")
         let absolute = cwd.join("sub").join("a.txt");
         let call = call_with("write", "path", absolute.to_str().expect("path"));
         let (scope, _) = pre_call_snapshot("write", &call, &ctx);
-        assert_eq!(scope, crate::dir_watch::ScanScope::Shallow(cwd.join("sub")));
+        assert_eq!(
+            scope,
+            crate::dir_watch::ScanScope::Shallow(vec![cwd.join("sub"), cwd.clone()])
+        );
     }
 
     #[test]
@@ -2590,9 +2715,14 @@ print("wrote")
         .await
         .expect("the root loop failed");
 
+        // Directories only: the regeneration also registers `**/files.md`
+        // in a `.gitignore` at the writable root, which is a file sitting
+        // alongside them.
         assert_eq!(
             std::fs::read_dir(&sandbox.writable_roots()[0])
                 .expect("cannot read the root")
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                 .count(),
             over,
             "the bash call did not create every directory"

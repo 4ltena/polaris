@@ -132,6 +132,45 @@ pub async fn run(
     .await
 }
 
+/// The most directories one tool call may set `files.md` regeneration
+/// going for. Each target is a full serial subagent run — a provider round
+/// trip the model's tool result waits on — so an unbounded count is not a
+/// performance detail but a hang: `mkdir -p` chains, an archive
+/// extraction, or a `git clone` can drop hundreds of directories in at
+/// once. This number is set to comfortably cover a normal nested `mkdir`
+/// while still bounding the pathological case; what exceeds it is dropped
+/// and said so in the audit log (see the call site).
+const MAX_REGENERATION_TARGETS_PER_CALL: usize = 32;
+
+/// Trims `changes` so that at most `cap` directories can be regenerated
+/// from it, and reports how many entries were dropped.
+///
+/// New directories are kept first: a brand new directory has no `files.md`
+/// at all, whereas a new file in an existing directory only refreshes one
+/// that already exists. When something has to be dropped, dropping the
+/// refresh is the smaller loss.
+///
+/// The cap counts detected entries, not the targets
+/// `files_md::targets_to_regenerate` derives from them — that function may
+/// additionally pick up a parent directory per entry, so the true number of
+/// subagent runs can exceed `cap`, by a bounded factor rather than the
+/// unbounded one this exists to prevent. Counting entries here keeps the
+/// cap enforced before any subagent is started, which is the property that
+/// matters, without duplicating that function's target-selection rules.
+fn cap_changes(
+    mut changes: crate::dir_watch::DirChanges,
+    cap: usize,
+) -> (crate::dir_watch::DirChanges, usize) {
+    let total = changes.new_dirs.len() + changes.new_files_in_existing_dirs.len();
+    if total <= cap {
+        return (changes, 0);
+    }
+    changes.new_dirs.truncate(cap);
+    let remaining = cap - changes.new_dirs.len();
+    changes.new_files_in_existing_dirs.truncate(remaining);
+    (changes, total - cap)
+}
+
 /// Called immediately before a `bash` / `write` / `edit` call. Decides
 /// what range of the filesystem to watch, takes the "before" snapshot on
 /// the spot, and returns the pair — the range and the snapshot have to be
@@ -175,12 +214,32 @@ fn pre_call_snapshot(
         // `write` / `edit` resolve to exactly one path (the same "path"
         // argument the audit record's `target` is built from), so only its
         // parent directory needs watching, and only one level deep.
+        //
+        // The path is anchored to the working directory first, through the
+        // very same `polaris_tools::predicate::absolutize` the tools' own
+        // path resolution uses, and against the same base (`current_dir`) —
+        // the actual write happens in a child process that inherits that
+        // cwd and resolves the relative path against it, so watching
+        // anywhere else would watch a directory the write never touches.
+        //
+        // Without this, a bare filename — `{"path": "README.md"}`, which is
+        // simply how a model names a new top-level file — has
+        // `Path::parent() == Some("")`, `read_dir("")` fails, and both
+        // snapshots come back empty: the diff is empty every time and the
+        // hook is a silent no-op for the most ordinary case there is.
         "write" | "edit" => {
             let parent = call.arguments["path"]
                 .as_str()
                 .map(Path::new)
-                .and_then(Path::parent)
-                .map(Path::to_path_buf);
+                .map(|p| match std::env::current_dir() {
+                    Ok(cwd) => polaris_tools::predicate::absolutize(&cwd, p),
+                    // No cwd to anchor to. An absolute path is still
+                    // usable as-is; a relative one is not, and the branch
+                    // below turns its empty parent into `None`.
+                    Err(_) => p.to_path_buf(),
+                })
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .filter(|p| !p.as_os_str().is_empty());
             match parent {
                 Some(parent) => crate::dir_watch::ScanScope::Shallow(parent),
                 None => crate::dir_watch::ScanScope::None,
@@ -279,38 +338,6 @@ pub(crate) async fn run_loop(
             )
             .await;
 
-            // Deliberately after `dispatch` and before the audit record:
-            // the regeneration runs its own subagent, which writes its own
-            // lines to the same log, and the tool call that caused it
-            // should not be recorded as having happened after its own
-            // consequences. Nothing here can change `outcome` — a failure
-            // to regenerate `files.md` is never allowed to turn a tool call
-            // the model made into a failure (`regenerate_for_changes`
-            // returns `()` and swallows its own errors into the audit log
-            // for exactly this reason).
-            if let Some((scope, before)) = pre_snapshot {
-                let after = crate::dir_watch::snapshot_for_scope(&scope);
-                let changes = crate::dir_watch::diff(&before, &after);
-                if !changes.new_dirs.is_empty() || !changes.new_files_in_existing_dirs.is_empty() {
-                    // Boxed for the same reason the `spawn` arm is: this
-                    // closes the type-level cycle
-                    // `run_loop -> files_md::regenerate_for_changes ->
-                    // spawn::run_one -> run_loop`. It never recurses at
-                    // runtime — the subagent's own calls are guarded out by
-                    // `caller == "root"` above — but the compiler still has
-                    // to give the future a finite size.
-                    Box::pin(crate::files_md::regenerate_for_changes(
-                        &changes,
-                        agent_types,
-                        provider_pool.clone(),
-                        audit.clone(),
-                        ctx.sandbox,
-                        ctx.helper,
-                    ))
-                    .await;
-                }
-            }
-
             // `result` is exactly the body actually returned to the model
             // (on success) or the error text (on failure).
             let result: &str = match &outcome {
@@ -345,6 +372,60 @@ pub(crate) async fn run_loop(
                 result,
                 caller,
             })?;
+
+            // Deliberately *after* the record above: the regeneration runs
+            // its own subagent, whose tool calls write their own lines to
+            // this same log, and a reader should find the `bash` / `write`
+            // that caused them already recorded above rather than below.
+            // Cause before effect. Reordering is safe because the `?` on
+            // the record is the only fallible expression here and does not
+            // depend on any of this.
+            //
+            // Nothing here can change `outcome` — a failure to regenerate
+            // `files.md` is never allowed to turn a tool call the model
+            // made into a failure (`regenerate_for_changes` returns `()`
+            // and folds its own errors into the audit log for exactly this
+            // reason).
+            if let Some((scope, before)) = pre_snapshot {
+                let after = crate::dir_watch::snapshot_for_scope(&scope);
+                let full = crate::dir_watch::diff(&before, &after);
+                let (changes, skipped) = cap_changes(full, MAX_REGENERATION_TARGETS_PER_CALL);
+                if skipped > 0 {
+                    // Truncating silently would be worse than the fan-out
+                    // it prevents: `files.md` would simply be missing for
+                    // some directories with nothing anywhere saying why.
+                    let _ = audit.lock().await.record(&Record {
+                        tool: "files-md-writer",
+                        detail: &call.arguments.to_string(),
+                        sandbox: None,
+                        target: None,
+                        result: &format!(
+                            "files.md regeneration capped at {MAX_REGENERATION_TARGETS_PER_CALL} \
+                             directories for this call; {skipped} skipped"
+                        ),
+                        caller: "harness",
+                    });
+                }
+                if !changes.new_dirs.is_empty() || !changes.new_files_in_existing_dirs.is_empty() {
+                    // Boxed for the same reason the `spawn` arm is: this
+                    // closes the type-level cycle
+                    // `run_loop -> files_md::regenerate_for_changes ->
+                    // spawn::run_one -> run_loop`. It never recurses at
+                    // runtime — the subagent's own calls are guarded out by
+                    // `caller == "root"` above — but the compiler still has
+                    // to give the future a finite size.
+                    Box::pin(crate::files_md::regenerate_for_changes(
+                        &changes,
+                        agent_types,
+                        provider_pool.clone(),
+                        audit.clone(),
+                        ctx.sandbox,
+                        ctx.helper,
+                    ))
+                    .await;
+                }
+            }
+
             match outcome {
                 Ok(body) => {
                     // It succeeded, so reset the consecutive-error streak.
@@ -2221,9 +2302,22 @@ print("wrote")
         assert!(newdir.is_dir(), "the bash call did not actually run");
 
         let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        let cause = log
+            .lines()
+            .position(|l| l.contains("\"tool\":\"bash\""))
+            .unwrap_or_else(|| panic!("the causing bash call was not recorded: {log}"));
+        let effect = log
+            .lines()
+            .position(|l| l.contains("\"caller\":\"files-md-writer\""))
+            .unwrap_or_else(|| {
+                panic!("the files-md-writer subagent never ran for the new directory: {log}")
+            });
+        // Cause before effect. The regeneration's own lines must land below
+        // the call that caused them, not above it — anyone reading this log
+        // later reconstructs the run from its order.
         assert!(
-            log.contains("\"caller\":\"files-md-writer\""),
-            "the files-md-writer subagent never ran for the new directory: {log}"
+            cause < effect,
+            "the regeneration was recorded ahead of the bash call that caused it: {log}"
         );
     }
 
@@ -2309,6 +2403,223 @@ print("wrote")
             out, "done",
             "the closing reply was consumed by something else — the hook fired \
              for a non-root caller"
+        );
+    }
+
+    #[test]
+    fn a_write_to_a_bare_filename_watches_the_working_directory_not_an_empty_path() {
+        // The regression test for the silent no-op: `{"path": "README.md"}`
+        // — a model naming a new top-level file the ordinary way — has
+        // `Path::parent() == Some("")`. `read_dir("")` fails, so both
+        // snapshots come back empty, the diff is empty every time, and the
+        // hook never fires for what is probably its most common case.
+        //
+        // This is checked at `pre_call_snapshot` rather than through the
+        // whole loop on purpose: the correct answer here is defined
+        // relative to the process's working directory, and there is exactly
+        // one of those for the whole test binary — moving it would leak
+        // into every other test running in parallel. So the scope and the
+        // snapshot it produces are inspected directly instead.
+        let cwd = std::env::current_dir().expect("cwd");
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let call = call_with("write", "path", "README.md");
+        let (scope, before) = pre_call_snapshot("write", &call, &ctx);
+
+        assert_eq!(
+            scope,
+            crate::dir_watch::ScanScope::Shallow(cwd.clone()),
+            "a bare filename was not anchored to the working directory the \
+             write itself resolves against"
+        );
+        // And the scope is a live one, not merely a well-formed value: an
+        // unreadable directory would snapshot as empty on both sides and
+        // leave the diff permanently blank, which is exactly the defect.
+        assert!(
+            !before.files.is_empty(),
+            "the working directory snapshotted as empty, so no diff taken \
+             around this call could ever report anything"
+        );
+        // What the buggy form did, pinned so the contrast is not merely
+        // asserted in prose: the empty parent yields nothing at all.
+        assert_eq!(
+            crate::dir_watch::snapshot_for_scope(&crate::dir_watch::ScanScope::Shallow(
+                std::path::PathBuf::new()
+            )),
+            crate::dir_watch::DirSnapshot::default()
+        );
+
+        // An absolute path is unaffected by the anchoring.
+        let absolute = cwd.join("sub").join("a.txt");
+        let call = call_with("write", "path", absolute.to_str().expect("path"));
+        let (scope, _) = pre_call_snapshot("write", &call, &ctx);
+        assert_eq!(scope, crate::dir_watch::ScanScope::Shallow(cwd.join("sub")));
+    }
+
+    #[test]
+    fn the_cap_keeps_new_directories_first_and_reports_what_it_dropped() {
+        let dirs: Vec<PathBuf> = (0..5).map(|i| PathBuf::from(format!("/d{i}"))).collect();
+        let files: Vec<PathBuf> = (0..5).map(|i| PathBuf::from(format!("/f{i}"))).collect();
+        let changes = crate::dir_watch::DirChanges {
+            new_dirs: dirs.clone(),
+            new_files_in_existing_dirs: files.clone(),
+        };
+
+        // Under the cap: untouched, nothing dropped.
+        let (kept, skipped) = cap_changes(
+            crate::dir_watch::DirChanges {
+                new_dirs: dirs.clone(),
+                new_files_in_existing_dirs: files.clone(),
+            },
+            10,
+        );
+        assert_eq!(skipped, 0);
+        assert_eq!(kept.new_dirs, dirs);
+        assert_eq!(kept.new_files_in_existing_dirs, files);
+
+        // Over the cap: new directories survive first, since a brand new
+        // directory has no `files.md` at all while a new file in an
+        // existing one only refreshes a `files.md` that already exists.
+        let (kept, skipped) = cap_changes(changes, 7);
+        assert_eq!(skipped, 3);
+        assert_eq!(kept.new_dirs, dirs);
+        assert_eq!(kept.new_files_in_existing_dirs, files[..2].to_vec());
+
+        // A cap smaller than the directories alone still trims them.
+        let (kept, skipped) = cap_changes(
+            crate::dir_watch::DirChanges {
+                new_dirs: dirs.clone(),
+                new_files_in_existing_dirs: files.clone(),
+            },
+            3,
+        );
+        assert_eq!(skipped, 7);
+        assert_eq!(kept.new_dirs, dirs[..3].to_vec());
+        assert!(kept.new_files_in_existing_dirs.is_empty());
+    }
+
+    /// Answers the first call with one fixed `bash` call and every call
+    /// after it with output matching `files-md-writer`'s schema, counting
+    /// every call it receives. One regeneration run is exactly one call, so
+    /// the counter measures how many subagent runs a single tool call set
+    /// going.
+    struct BashThenAlwaysOk {
+        command: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BashThenAlwaysOk {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if n == 0 {
+                bash_call(self.command.clone())
+            } else {
+                final_text(r#"{"path":"files.md","status":"ok"}"#)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn one_tool_call_cannot_start_more_regeneration_runs_than_the_cap() {
+        // A single `bash` call can drop an unbounded number of directories
+        // at once — `mkdir -p` chains, an archive extraction, a clone. Each
+        // one would otherwise be a full serial subagent run that the
+        // model's tool result waits on, so the count has to be bounded
+        // before any of them start.
+        let root = tempfile::tempdir().expect("temp directory");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        let over = MAX_REGENERATION_TARGETS_PER_CALL + 8;
+        let names: Vec<String> = (0..over)
+            .map(|i| {
+                sandbox.writable_roots()[0]
+                    .join(format!("d{i:03}"))
+                    .display()
+                    .to_string()
+            })
+            .collect();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p: Arc<dyn Provider> = Arc::new(BashThenAlwaysOk {
+            command: format!("mkdir {}", names.join(" ")),
+            calls: calls.clone(),
+        });
+
+        let logs = tempfile::tempdir().expect("temp directory");
+        let audit_path = logs.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut session = Session::new();
+        session.push_user("make a lot of directories");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: std::path::Path::new("/bin/true"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        run(
+            p.as_ref(),
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[files_md_writer_agent_type()],
+            p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            &mut ctx,
+        )
+        .await
+        .expect("the root loop failed");
+
+        assert_eq!(
+            std::fs::read_dir(&sandbox.writable_roots()[0])
+                .expect("cannot read the root")
+                .count(),
+            over,
+            "the bash call did not create every directory"
+        );
+
+        // The root spends two calls of its own (the `bash` turn and the
+        // closing turn); everything in between is one regeneration run per
+        // call.
+        let total = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            total - 2,
+            MAX_REGENERATION_TARGETS_PER_CALL,
+            "{over} new directories started {} regeneration runs — the cap of \
+             {MAX_REGENERATION_TARGETS_PER_CALL} was not enforced",
+            total - 2
+        );
+
+        // Trimming silently would be worse than the fan-out: `files.md`
+        // would just be missing for some directories with nothing saying why.
+        let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        assert!(
+            log.lines().any(|l| l.contains("regeneration capped")
+                && l.contains(&format!(
+                    "{} skipped",
+                    over - MAX_REGENERATION_TARGETS_PER_CALL
+                ))),
+            "the truncation was not recorded: {log}"
         );
     }
 

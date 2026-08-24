@@ -7,6 +7,7 @@ pub mod budget;
 pub mod config;
 pub mod constitution;
 mod dir_watch;
+mod gitignore;
 pub mod project;
 pub mod prompt;
 pub mod secret_screen;

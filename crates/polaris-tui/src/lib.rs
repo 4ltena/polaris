@@ -29,7 +29,7 @@ use polaris_skills::Skill;
 
 use approver::{CrosstermKeyReader, TuiApprover};
 use input::{InputAction, apply_key};
-use render::{Status, render_chat};
+use render::Status;
 
 /// Everything `run()` needs, already built by `polaris-cli::main()` the
 /// same way the one-shot path builds it. `polaris-tui` never constructs a
@@ -86,6 +86,105 @@ fn abbreviate_home(path: &std::path::Path) -> String {
     }
 }
 
+/// The inline viewport's fixed height: a border row, up to
+/// `render::MAX_DISPLAYED_SUGGESTIONS` suggestion rows, one "N more" row,
+/// the status row, the input row, and the footer row, all summed.
+/// `ratatui`'s `Viewport::Inline(height)` fixes this at `Terminal`
+/// construction — it can't grow per-frame the way the old fullscreen
+/// layout's suggestions region could, which is why the suggestions popup
+/// is capped (see `render::MAX_DISPLAYED_SUGGESTIONS`'s doc) instead of
+/// sizing to fit an unbounded match list.
+const INLINE_VIEWPORT_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1;
+
+/// Prints every `session.messages` entry and every `local_lines` entry
+/// added since the last call, once each, via `terminal.insert_before`.
+/// This is the one-shot analogue of the old full-redraw history pane: each
+/// line is printed to the real terminal exactly once and never touched
+/// again, which is what lets it live in the terminal's own scrollback.
+/// Advances `printed_messages`/`printed_local_lines` to the new lengths —
+/// callers that reset a session wholesale (`/resume`, `/new`, `/fork`,
+/// `/clear`) must reset both counters to 0 first so the *next* call here
+/// reprints the (new) session from scratch, since a resumed/forked session
+/// has never been printed to this particular terminal.
+fn print_new_history(
+    terminal: &RefCell<ratatui::Terminal<impl ratatui::backend::Backend>>,
+    session: &polaris_core::session::Session,
+    local_lines: &[ratatui::text::Line<'static>],
+    printed_messages: &mut usize,
+    printed_local_lines: &mut usize,
+) -> std::io::Result<()> {
+    // A session that's now *shorter* than what's already been printed
+    // (`/clear`, `/new`) can only mean it was reset out from under us —
+    // reprint from scratch. This alone doesn't catch `/resume` loading a
+    // same-or-longer *different* session, which is why every `/resume`
+    // call site also resets both counters explicitly right after loading.
+    if *printed_messages > session.messages.len() {
+        *printed_messages = 0;
+    }
+    if *printed_local_lines > local_lines.len() {
+        *printed_local_lines = 0;
+    }
+    if session.messages.len() > *printed_messages {
+        let lines = render::history_lines_for(&session.messages[*printed_messages..]);
+        if !lines.is_empty() {
+            let height = lines.len() as u16;
+            terminal.borrow_mut().insert_before(height, |buf| {
+                render::render_history_into(buf, buf.area, &lines)
+            })?;
+        }
+        *printed_messages = session.messages.len();
+    }
+    if local_lines.len() > *printed_local_lines {
+        let new_lines = &local_lines[*printed_local_lines..];
+        let height = new_lines.len() as u16;
+        terminal.borrow_mut().insert_before(height, |buf| {
+            let owned: Vec<render::HistoryLine> = new_lines
+                .iter()
+                .map(|l| render::HistoryLine {
+                    line: l.clone(),
+                    shaded: false,
+                })
+                .collect();
+            render::render_history_into(buf, buf.area, &owned)
+        })?;
+        *printed_local_lines = local_lines.len();
+    }
+    Ok(())
+}
+
+/// Temporarily switches from the inline viewport to a genuine fullscreen
+/// alternate-screen `Terminal` for the duration of `f` — used around every
+/// picker (`/resume`, `/model`, `/permissions`, `/skills`) and the
+/// approval modal, all of which are designed for a full-screen layout
+/// (`render::render_resume_picker` etc.) rather than the small inline
+/// viewport footer the rest of the loop draws into. `ratatui::Terminal`
+/// can't change its own `Viewport` after construction — it's fixed at
+/// `Terminal::with_options` time — so this swaps in a whole new `Terminal`
+/// for the picker's duration and swaps the original inline one back
+/// afterward, rather than trying to resize the existing one in place.
+fn with_fullscreen_picker<T>(
+    terminal: &RefCell<ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>>,
+    f: impl FnOnce() -> T,
+) -> std::io::Result<T> {
+    use ratatui::crossterm::execute;
+    use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    let fullscreen =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+    *terminal.borrow_mut() = fullscreen;
+
+    let result = f();
+
+    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    let inline = ratatui::try_init_with_options(ratatui::TerminalOptions {
+        viewport: ratatui::Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+    })?;
+    *terminal.borrow_mut() = inline;
+
+    Ok(result)
+}
+
 fn now_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -140,7 +239,52 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // the status row while it's in flight), including while `agent::run`
     // is synchronously inside an approval prompt that also draws to this
     // same terminal (see `approver::TuiApprover`'s docs).
-    let terminal = RefCell::new(ratatui::init());
+    //
+    // An inline viewport, not the alternate screen `ratatui::init()` used
+    // to enter — matching codex's own terminal integration (verified by
+    // driving a real `codex` session in `tmux` and confirming its header
+    // and each conversation turn land in the terminal's *own* scrollback,
+    // recoverable by scrolling the terminal itself, while only a small
+    // fixed region at the bottom is ever repainted). The header and every
+    // conversation turn are printed once via `terminal.insert_before(...)`
+    // (see `print_new_history` below) and never redrawn; only the small
+    // `INLINE_VIEWPORT_HEIGHT`-tall region (suggestions/status/input/
+    // footer, drawn by `render::render_footer`) is redrawn every frame.
+    // `ratatui::init_with_options` enables raw mode but — unlike `init()`
+    // — deliberately does not enter the alternate screen, which is what
+    // makes real scrollback possible.
+    let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
+        viewport: ratatui::Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+    }));
+    // How many `session.messages` / `local_lines` entries have already
+    // been printed to the real scrollback via `insert_before`. Only the
+    // delta past this point gets printed on each call to
+    // `print_new_history` — printing is one-shot, never a redraw, so
+    // re-printing an already-printed line would duplicate it in the
+    // user's terminal history instead of updating anything in place.
+    let mut printed_messages = 0usize;
+    let mut printed_local_lines = 0usize;
+    if terminal
+        .borrow_mut()
+        .insert_before(render::HEADER_HEIGHT, |buf| {
+            render::render_header_into(
+                buf,
+                buf.area,
+                &render::HeaderInfo {
+                    provider_name: &args.provider_name,
+                    model_name: &args.model_name,
+                    usage: polaris_provider::Usage::default(),
+                    cwd: &args.cwd.display().to_string(),
+                    cwd_short: "",
+                    effort_name: "",
+                },
+            )
+        })
+        .is_err()
+    {
+        ratatui::restore();
+        return ExitCode::FAILURE;
+    }
 
     let cwd_display = args.cwd.display().to_string();
     // Shown only in the footer — verified against a real codex
@@ -188,12 +332,27 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         if selected_suggestion >= suggestions.len() {
             selected_suggestion = 0;
         }
+        // Print anything new since the last iteration (typically the
+        // previous turn's assistant reply, or a `/resume`/`/new`/`/fork`
+        // reset) before redrawing the small footer viewport — printing is
+        // one-shot and must happen before the footer draw so the newly
+        // printed lines appear above it, not interleaved mid-frame.
+        if print_new_history(
+            &terminal,
+            &session,
+            &local_lines,
+            &mut printed_messages,
+            &mut printed_local_lines,
+        )
+        .is_err()
+        {
+            break ExitCode::FAILURE;
+        }
         if terminal
             .borrow_mut()
             .draw(|f| {
-                render_chat(
+                render::render_footer(
                     f,
-                    &session,
                     &input_buffer,
                     &status,
                     &render::HeaderInfo {
@@ -206,7 +365,6 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     },
                     &suggestions,
                     selected_suggestion,
-                    &local_lines,
                 )
             })
             .is_err()
@@ -254,18 +412,32 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             review_text = Some(review_prompt(&extra));
                         }
                         slash::Action::Resume => {
-                            handle_resume(
-                                &terminal,
-                                &mut key_reader,
-                                &args.sessions_dir,
-                                &cwd_display,
-                                &mut session,
-                                &mut session_path,
-                                &mut meta_path,
-                                &mut session_started_at_millis,
-                                &mut status,
-                                &mut local_lines,
-                            );
+                            if with_fullscreen_picker(&terminal, || {
+                                handle_resume(
+                                    &terminal,
+                                    &mut key_reader,
+                                    &args.sessions_dir,
+                                    &cwd_display,
+                                    &mut session,
+                                    &mut session_path,
+                                    &mut meta_path,
+                                    &mut session_started_at_millis,
+                                    &mut status,
+                                    &mut local_lines,
+                                )
+                            })
+                            .is_err()
+                            {
+                                break ExitCode::FAILURE;
+                            }
+                            // A resumed session may be the same length as
+                            // (or longer than) what's already printed but
+                            // still a genuinely *different* conversation —
+                            // the length-shrunk check inside
+                            // `print_new_history` can't detect that case,
+                            // so reset explicitly here.
+                            printed_messages = 0;
+                            printed_local_lines = 0;
                             continue;
                         }
                         slash::Action::New => {
@@ -293,27 +465,45 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         slash::Action::Permissions => {
-                            handle_permissions(
-                                &terminal,
-                                &mut key_reader,
-                                &mut approval_policy,
-                                &mut status,
-                            );
+                            if with_fullscreen_picker(&terminal, || {
+                                handle_permissions(
+                                    &terminal,
+                                    &mut key_reader,
+                                    &mut approval_policy,
+                                    &mut status,
+                                )
+                            })
+                            .is_err()
+                            {
+                                break ExitCode::FAILURE;
+                            }
                             continue;
                         }
                         slash::Action::Model => {
-                            handle_model(
-                                &terminal,
-                                &mut key_reader,
-                                args.provider.as_ref(),
-                                &mut model_name,
-                                &mut effort_name,
-                                &mut status,
-                            );
+                            if with_fullscreen_picker(&terminal, || {
+                                handle_model(
+                                    &terminal,
+                                    &mut key_reader,
+                                    args.provider.as_ref(),
+                                    &mut model_name,
+                                    &mut effort_name,
+                                    &mut status,
+                                )
+                            })
+                            .is_err()
+                            {
+                                break ExitCode::FAILURE;
+                            }
                             continue;
                         }
                         slash::Action::Skills => {
-                            run_skills_picker(&terminal, &mut key_reader, args.skills);
+                            if with_fullscreen_picker(&terminal, || {
+                                run_skills_picker(&terminal, &mut key_reader, args.skills)
+                            })
+                            .is_err()
+                            {
+                                break ExitCode::FAILURE;
+                            }
                             status = Status::Idle;
                             continue;
                         }
@@ -366,18 +556,29 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             match slash::parse(&typed) {
                 Some(slash::Action::Review(extra)) => review_prompt(&extra),
                 Some(slash::Action::Resume) => {
-                    handle_resume(
-                        &terminal,
-                        &mut key_reader,
-                        &args.sessions_dir,
-                        &cwd_display,
-                        &mut session,
-                        &mut session_path,
-                        &mut meta_path,
-                        &mut session_started_at_millis,
-                        &mut status,
-                        &mut local_lines,
-                    );
+                    if with_fullscreen_picker(&terminal, || {
+                        handle_resume(
+                            &terminal,
+                            &mut key_reader,
+                            &args.sessions_dir,
+                            &cwd_display,
+                            &mut session,
+                            &mut session_path,
+                            &mut meta_path,
+                            &mut session_started_at_millis,
+                            &mut status,
+                            &mut local_lines,
+                        )
+                    })
+                    .is_err()
+                    {
+                        break ExitCode::FAILURE;
+                    }
+                    // Same reasoning as the popup-selection path above: a
+                    // resumed session's length alone can't be trusted to
+                    // signal "this is a different conversation."
+                    printed_messages = 0;
+                    printed_local_lines = 0;
                     continue;
                 }
                 Some(slash::Action::New) => {
@@ -405,27 +606,45 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     continue;
                 }
                 Some(slash::Action::Permissions) => {
-                    handle_permissions(
-                        &terminal,
-                        &mut key_reader,
-                        &mut approval_policy,
-                        &mut status,
-                    );
+                    if with_fullscreen_picker(&terminal, || {
+                        handle_permissions(
+                            &terminal,
+                            &mut key_reader,
+                            &mut approval_policy,
+                            &mut status,
+                        )
+                    })
+                    .is_err()
+                    {
+                        break ExitCode::FAILURE;
+                    }
                     continue;
                 }
                 Some(slash::Action::Model) => {
-                    handle_model(
-                        &terminal,
-                        &mut key_reader,
-                        args.provider.as_ref(),
-                        &mut model_name,
-                        &mut effort_name,
-                        &mut status,
-                    );
+                    if with_fullscreen_picker(&terminal, || {
+                        handle_model(
+                            &terminal,
+                            &mut key_reader,
+                            args.provider.as_ref(),
+                            &mut model_name,
+                            &mut effort_name,
+                            &mut status,
+                        )
+                    })
+                    .is_err()
+                    {
+                        break ExitCode::FAILURE;
+                    }
                     continue;
                 }
                 Some(slash::Action::Skills) => {
-                    run_skills_picker(&terminal, &mut key_reader, args.skills);
+                    if with_fullscreen_picker(&terminal, || {
+                        run_skills_picker(&terminal, &mut key_reader, args.skills)
+                    })
+                    .is_err()
+                    {
+                        break ExitCode::FAILURE;
+                    }
                     status = Status::Idle;
                     continue;
                 }
@@ -480,12 +699,26 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         status = Status::Thinking {
             elapsed: Duration::ZERO,
         };
+        // Print the user's own message immediately — otherwise it wouldn't
+        // appear until the *next* top-of-loop print, which only happens
+        // after the assistant's reply finishes too, making the user's own
+        // input look laggy instead of showing up the instant it's sent.
+        if print_new_history(
+            &terminal,
+            &session,
+            &local_lines,
+            &mut printed_messages,
+            &mut printed_local_lines,
+        )
+        .is_err()
+        {
+            break ExitCode::FAILURE;
+        }
         if terminal
             .borrow_mut()
             .draw(|f| {
-                render_chat(
+                render::render_footer(
                     f,
-                    &session,
                     &input_buffer,
                     &status,
                     &render::HeaderInfo {
@@ -500,7 +733,6 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     // Submit branch, so there's nothing to suggest against.
                     &[],
                     0,
-                    &local_lines,
                 )
             })
             .is_err()
@@ -541,14 +773,14 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             // which is what "esc to interrupt" means in practice — this
             // doesn't kill an already-spawned OS subprocess a tool call
             // may have started, only stops *waiting* on the turn.
-            // Taken before `agent_future` starts borrowing `session`
-            // mutably below — the tick-redraw branch can't read the live
-            // `session` while that borrow is held, so it redraws from
-            // this snapshot instead. This means mid-turn tool calls
-            // don't appear in the history pane live as they run (only
-            // once the turn finishes); only the status row (elapsed
-            // time, shimmer) actually needs to animate every tick.
-            let render_snapshot = session.clone();
+            // The tick-redraw branch below only redraws the footer
+            // (status row's elapsed-time/shimmer) — it never needs to read
+            // `session` at all now that history is printed once via
+            // `print_new_history` rather than redrawn from it every frame,
+            // so no snapshot is needed to sidestep `agent_future`'s
+            // mutable borrow of `session` below (mid-turn tool calls
+            // still don't appear live either way — only once the turn
+            // finishes does the next `print_new_history` call show them).
             let agent_future = agent::run(
                 args.provider.as_ref(),
                 &mut session,
@@ -576,12 +808,16 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     result = &mut agent_future => break TurnOutcome::Done(result),
                     _ = ticker.tick() => {
                         status = Status::Thinking { elapsed: turn_started.elapsed() };
+                        // History is never redrawn from here (see the
+                        // comment above `agent_future`) — only the status
+                        // row's shimmer/elapsed time animates, so this
+                        // only needs the footer redrawn, never a new
+                        // `print_new_history` call.
                         if terminal
                             .borrow_mut()
                             .draw(|f| {
-                                render_chat(
+                                render::render_footer(
                                     f,
-                                    &render_snapshot,
                                     &input_buffer,
                                     &status,
                                     &render::HeaderInfo {
@@ -594,7 +830,6 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                     },
                                     &[],
                                     0,
-                                    &local_lines,
                                 )
                             })
                             .is_err()

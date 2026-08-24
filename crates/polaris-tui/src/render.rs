@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use polaris_core::session::Session;
 use polaris_provider::Role;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -211,19 +210,51 @@ fn format_inline(text: &str, base_color: Color) -> Vec<Span<'static>> {
     spans
 }
 
-fn history_lines(session: &Session) -> Vec<Line<'static>> {
-    session
-        .messages
+/// One already-formatted, sanitized line of conversation history, plus
+/// whether it should render with a full-row gray background. `shaded` is
+/// true only for a user's own input, once it's scrolled into history —
+/// matching codex's own styling (verified against a real screenshot: the
+/// user's echoed input line sits on a gray block, every other line —
+/// assistant output, tool activity — stays on the terminal's default
+/// background). A `Paragraph`'s own background fill only covers the exact
+/// character cells it draws text into, not a whole row, so shading a full
+/// row needs one row-height `Paragraph` per `HistoryLine` rather than one
+/// `Paragraph` for a whole block of lines — see `render_history_into`.
+pub struct HistoryLine {
+    pub line: Line<'static>,
+    pub shaded: bool,
+}
+
+impl HistoryLine {
+    fn plain(line: Line<'static>) -> Self {
+        Self {
+            line,
+            shaded: false,
+        }
+    }
+}
+
+/// Formats a slice of already-existing messages into printable lines. Takes
+/// a slice (not the whole `Session`) so a caller can format only the
+/// messages that haven't been printed to the real terminal yet — the
+/// inline-viewport model prints each new turn once and never redraws it,
+/// unlike the old full-history-every-frame approach this replaces.
+pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryLine> {
+    messages
         .iter()
-        .flat_map(|m| -> Vec<Line<'static>> {
+        .flat_map(|m| -> Vec<HistoryLine> {
             let color = role_color(m.role);
+            let shaded = matches!(m.role, Role::User);
             match m.role {
                 Role::Tool => {
                     let sanitized = sanitize(&format_tool_result(&m.content));
                     sanitized
                         .split('\n')
                         .map(|line| {
-                            Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
+                            HistoryLine::plain(Line::from(Span::styled(
+                                line.to_string(),
+                                Style::default().fg(color),
+                            )))
                         })
                         .collect()
                 }
@@ -231,10 +262,13 @@ fn history_lines(session: &Session) -> Vec<Line<'static>> {
                     let mut lines = Vec::new();
                     if !m.tool_calls.is_empty() {
                         for call_line in format_tool_calls(&m.tool_calls) {
-                            lines.push(Line::from(Span::styled(
-                                sanitize(&call_line),
-                                Style::default().fg(color),
-                            )));
+                            lines.push(HistoryLine {
+                                line: Line::from(Span::styled(
+                                    sanitize(&call_line),
+                                    Style::default().fg(color),
+                                )),
+                                shaded,
+                            });
                         }
                     }
                     if !m.content.is_empty() {
@@ -244,10 +278,13 @@ fn history_lines(session: &Session) -> Vec<Line<'static>> {
                         for (i, raw_line) in sanitized.split('\n').enumerate() {
                             if raw_line.trim_start().starts_with("```") {
                                 in_code_block = !in_code_block;
-                                lines.push(Line::from(Span::styled(
-                                    String::new(),
-                                    Style::default().bg(Color::DarkGray),
-                                )));
+                                lines.push(HistoryLine {
+                                    line: Line::from(Span::styled(
+                                        String::new(),
+                                        Style::default().bg(Color::DarkGray),
+                                    )),
+                                    shaded: false,
+                                });
                                 continue;
                             }
                             let text = if i == 0 {
@@ -256,12 +293,18 @@ fn history_lines(session: &Session) -> Vec<Line<'static>> {
                                 raw_line.to_string()
                             };
                             if in_code_block {
-                                lines.push(Line::from(Span::styled(
-                                    text,
-                                    Style::default().fg(color).bg(Color::DarkGray),
-                                )));
+                                lines.push(HistoryLine {
+                                    line: Line::from(Span::styled(
+                                        text,
+                                        Style::default().fg(color).bg(Color::DarkGray),
+                                    )),
+                                    shaded: false,
+                                });
                             } else {
-                                lines.push(Line::from(format_inline(&text, color)));
+                                lines.push(HistoryLine {
+                                    line: Line::from(format_inline(&text, color)),
+                                    shaded,
+                                });
                             }
                         }
                     }
@@ -270,6 +313,56 @@ fn history_lines(session: &Session) -> Vec<Line<'static>> {
             }
         })
         .collect()
+}
+
+/// Renders each `HistoryLine` into its own single-row slice of `buf`. One
+/// `Paragraph` per row, not one `Paragraph` for the whole block — a
+/// `Paragraph`'s background fill (`buf.set_style` over its full render
+/// area, then text drawn on top) only covers the *entire area it's given*,
+/// so giving each shaded row its own one-row area is what makes the gray
+/// background span the full terminal width rather than stopping at the
+/// text's own last character.
+pub fn render_history_into(
+    buf: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    lines: &[HistoryLine],
+) {
+    use ratatui::widgets::Widget;
+    for (i, hl) in lines.iter().enumerate() {
+        let y_offset = i as u16;
+        if y_offset >= area.height {
+            break;
+        }
+        let row = ratatui::layout::Rect {
+            x: area.x,
+            y: area.y + y_offset,
+            width: area.width,
+            height: 1,
+        };
+        let style = if hl.shaded {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        Paragraph::new(hl.line.clone())
+            .style(style)
+            .render(row, buf);
+        // Belt-and-braces: force the background on every cell of the row
+        // directly, rather than relying solely on `Paragraph`'s own style
+        // fill (`buf.set_style` over the render area) to survive intact
+        // once this buffer is later flushed to a real terminal via
+        // `Terminal::insert_before` — a real-terminal check (not caught by
+        // any `TestBackend`-based test, since `TestBackend` records styled
+        // cells directly with no ANSI round-trip to lose) found the fill
+        // alone doesn't reliably reach the terminal for a shaded row once
+        // scrolled into real scrollback, while explicitly setting each
+        // cell's `bg` here does.
+        if hl.shaded {
+            for x in row.x..row.x + row.width {
+                buf[(x, row.y)].set_bg(Color::DarkGray);
+            }
+        }
+    }
 }
 
 /// What the status-bar header shows: which provider/model is in use, and
@@ -298,51 +391,15 @@ pub struct HeaderInfo<'a> {
     pub cwd_short: &'a str,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn render_chat(
-    frame: &mut Frame,
-    session: &Session,
-    input: &str,
-    status: &Status,
-    header: &HeaderInfo,
-    suggestions: &[&crate::slash::SlashCommand],
-    selected_suggestion: usize,
-    local_lines: &[Line<'static>],
-) {
-    let area = frame.area();
-    // Zero height when there's nothing to show, so the layout collapses
-    // back to the plain split the moment the input stops starting with
-    // `/` — this row only exists while it has content.
-    let suggestions_height = if suggestions.is_empty() {
-        0
-    } else {
-        suggestions.len() as u16 + 1
-    };
-    let [
-        header_area,
-        history_area,
-        status_area,
-        suggestions_area,
-        input_area,
-        footer_area,
-    ] = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(suggestions_height),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-
-    // A bordered header box shaped after codex's own: a dim border, a
-    // bold title line, then dim-labeled `model:`/`directory:`/`tokens:`
-    // rows with their labels padded to the same width so the values line
-    // up in a column, matching codex's own layout without reusing its
-    // wording — polaris has no interactive model picker, so this states
-    // the provider next to the model name instead.
+/// Builds the bordered header box's lines — a dim border, a bold title
+/// line, then dim-labeled `model:`/`directory:`/`tokens:` rows. Shared by
+/// the one-shot startup print (`insert_before`, see `lib.rs`) and by tests
+/// that want to check its content directly; there's exactly one caller
+/// site for the actual print, since — unlike the old full-redraw model —
+/// the header is now printed once and never redrawn.
+pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let header_lines = vec![
+    vec![
         // A north-star glyph, not codex's own `>_` terminal-prompt mark —
         // "polaris" names the North Star, so the header's one brand mark
         // draws on that instead of reusing codex's. Gold rather than the
@@ -382,38 +439,73 @@ pub fn render_chat(
                 dim,
             ),
         ]),
-    ];
-    frame.render_widget(
-        Paragraph::new(header_lines)
-            .block(Block::default().borders(Borders::ALL).border_style(dim)),
-        header_area,
-    );
+    ]
+}
 
-    // `local_lines` are appended after the real conversation — output from
-    // a slash command like `/diff` that's shown to the user but never
-    // touches `session.messages` or the model. Sharing this Paragraph and
-    // its scroll-to-bottom logic with the real history means it doesn't
-    // need its own layout region or its own "is there more than fits"
-    // math.
-    let mut lines = history_lines(session);
-    lines.extend(local_lines.iter().cloned());
-    // Pin the view to the newest messages: once there are more lines than
-    // fit, scroll so the last line lands on the last visible row. Without
-    // this, a Paragraph always renders from line 0 and the most recent
-    // reply — the thing a chat screen exists to show — scrolls off the
-    // bottom out of view as the conversation grows.
-    //
-    // The block below reserves a top border row, so the actual visible
-    // text area is one row shorter than `history_area` itself.
-    let visible_rows = history_area.height.saturating_sub(1) as usize;
-    let scroll_offset = lines.len().saturating_sub(visible_rows) as u16;
+/// The header box's fixed print height: 5 content lines + top/bottom
+/// border rows (`Borders::ALL`).
+pub const HEADER_HEIGHT: u16 = 7;
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::TOP))
-            .scroll((scroll_offset, 0)),
-        history_area,
-    );
+/// Renders `header_lines(header)` into `buf`, bordered — used for the
+/// one-shot startup print via `insert_before`. `area` must be
+/// `HEADER_HEIGHT` rows tall.
+pub fn render_header_into(
+    buf: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    header: &HeaderInfo,
+) {
+    use ratatui::widgets::Widget;
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    Paragraph::new(header_lines(header))
+        .block(Block::default().borders(Borders::ALL).border_style(dim))
+        .render(area, buf);
+}
+
+/// The most suggestion rows shown at once — the popup can't grow the
+/// inline viewport's fixed height (ratatui's `Viewport::Inline` height is
+/// fixed at `Terminal` construction, see `lib.rs`'s `INLINE_VIEWPORT_HEIGHT`),
+/// so a query matching more than this many slash commands shows the first
+/// `MAX_DISPLAYED_SUGGESTIONS` plus a "+N more" row instead of growing
+/// without bound the way the old full-redraw layout allowed.
+pub const MAX_DISPLAYED_SUGGESTIONS: usize = 8;
+
+/// Everything redrawn every frame: the suggestions popup (while typing a
+/// `/command`), the status row (idle / thinking-with-shimmer / error /
+/// notice), the input line, and the footer (`model effort · cwd`). This is
+/// what lives inside the fixed-height inline viewport — the header and the
+/// conversation history are printed once, outside it, via `insert_before`
+/// (see `lib.rs`), never redrawn here. Replaces the old `render_chat`,
+/// which drew the header and full history inline with everything else on
+/// every frame; splitting it out is what makes the header/history land in
+/// the terminal's own real scrollback instead of being repainted away.
+pub fn render_footer(
+    frame: &mut Frame,
+    input: &str,
+    status: &Status,
+    header: &HeaderInfo,
+    suggestions: &[&crate::slash::SlashCommand],
+    selected_suggestion: usize,
+) {
+    let area = frame.area();
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    // Zero height when there's nothing to show, so the layout collapses
+    // back to the plain split the moment the input stops starting with
+    // `/` — this row only exists while it has content. `+1` for the extra
+    // "+N more" row once truncated.
+    let shown = suggestions.len().min(MAX_DISPLAYED_SUGGESTIONS);
+    let truncated = suggestions.len() > MAX_DISPLAYED_SUGGESTIONS;
+    let suggestions_height = if suggestions.is_empty() {
+        0
+    } else {
+        shown as u16 + 1 + u16::from(truncated)
+    };
+    let [status_area, suggestions_area, input_area, footer_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(suggestions_height),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
     let status_line = match status {
         Status::Idle => Line::from(""),
@@ -435,9 +527,13 @@ pub fn render_chat(
         // cyan, its description full-brightness; every other row's
         // description is dimmed. `\u{2191}/\u{2193}` moves the highlight,
         // Enter accepts whichever row is currently marked — typing the
-        // full name is still possible but no longer required.
-        let lines: Vec<Line> = suggestions
+        // full name is still possible but no longer required. Capped at
+        // `MAX_DISPLAYED_SUGGESTIONS` (see its doc) since the inline
+        // viewport's height can't grow to fit an unbounded match list the
+        // way the old fullscreen layout could.
+        let mut lines: Vec<Line> = suggestions
             .iter()
+            .take(shown)
             .enumerate()
             .map(|(i, c)| {
                 let is_selected = i == selected_suggestion;
@@ -461,6 +557,12 @@ pub fn render_chat(
                 ])
             })
             .collect();
+        if truncated {
+            lines.push(Line::from(Span::styled(
+                format!("  \u{2026} {} more, keep typing", suggestions.len() - shown),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
         frame.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::TOP)),
             suggestions_area,
@@ -469,7 +571,11 @@ pub fn render_chat(
 
     // No box around the input line — a bare `\u{203a} ` prompt, matching
     // codex's own composer, with a dim placeholder while empty instead of
-    // an empty bordered box.
+    // an empty bordered box. The whole row is shaded gray (via the
+    // `Paragraph`'s own `.style()`, which fills its entire render area —
+    // not just the styled Spans' own cells) matching codex's own input-box
+    // styling, and matching how a submitted line looks once it's printed
+    // into history (`HistoryLine::shaded`, set for `Role::User`).
     let input_line = if input.is_empty() {
         Line::from(vec![
             Span::styled(
@@ -490,7 +596,10 @@ pub fn render_chat(
             Span::raw(sanitize(input)),
         ])
     };
-    frame.render_widget(Paragraph::new(input_line), input_area);
+    frame.render_widget(
+        Paragraph::new(input_line).style(Style::default().bg(Color::DarkGray)),
+        input_area,
+    );
 
     // Two-tone footer matching codex's own status line: the model name in
     // a warm tan, the working directory in a soft green, separated by a
@@ -900,63 +1009,76 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    #[test]
-    fn a_user_message_appears_with_its_role_label() {
-        let mut session = Session::default();
-        session.push_user("Cargo.toml は何行か");
+    /// Renders `messages` the same way `print_new_history` does in
+    /// production (`history_lines_for` then `render_history_into`), into a
+    /// buffer tall enough to hold every line with no clipping — the
+    /// one-shot print model has no "does it fit" concept the way the old
+    /// bounded/scrolled history pane did, so tests don't need to reason
+    /// about a viewport height either.
+    fn render_history_to_string(messages: &[polaris_provider::Message], width: u16) -> String {
+        let lines = history_lines_for(messages);
+        let height = (lines.len() as u16).max(1);
+        let mut buf =
+            ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, height));
+        let area = buf.area;
+        render_history_into(&mut buf, area, &lines);
+        buf.content.iter().map(|c| c.symbol()).collect::<String>()
+    }
 
-        let header = HeaderInfo {
+    /// Renders the always-redrawn footer (suggestions/status/input/footer)
+    /// via a real `Frame`, the same way `lib.rs`'s per-frame `draw()` call
+    /// does.
+    fn render_footer_to_string(
+        input: &str,
+        status: &Status,
+        header: &HeaderInfo,
+        suggestions: &[&crate::slash::SlashCommand],
+        selected_suggestion: usize,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_footer(f, input, status, header, suggestions, selected_suggestion))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+    }
+
+    fn test_header() -> HeaderInfo<'static> {
+        HeaderInfo {
             cwd: "/tmp/example",
             cwd_short: "~/example",
             effort_name: "low",
             provider_name: "openai",
             model_name: "gpt-5.4",
             usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
+        }
+    }
 
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+    #[test]
+    fn a_user_message_appears_with_its_role_label() {
+        let mut session = Session::default();
+        session.push_user("Cargo.toml は何行か");
+
+        let content = render_history_to_string(&session.messages, 60);
         assert!(content.contains("you"));
         assert!(content.contains("Cargo.toml"));
     }
 
     #[test]
     fn the_status_line_shows_thinking_while_a_turn_is_in_flight() {
-        let session = Session::default();
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
+        let header = test_header();
         let status = Status::Thinking {
             elapsed: Duration::from_secs(3),
         };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &status, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_footer_to_string("", &status, &header, &[], 0, 60, 6);
         assert!(content.contains("Working"));
         assert!(content.contains("3s"));
         assert!(content.contains("esc to interrupt"));
@@ -978,35 +1100,25 @@ mod tests {
     }
 
     #[test]
-    fn history_longer_than_the_screen_scrolls_to_show_the_newest_message() {
+    fn history_longer_than_the_old_screen_height_is_never_clipped() {
+        // The one-shot print model (`insert_before`, see `lib.rs`) has no
+        // bounded viewport to scroll within — every message is printed
+        // once, unbounded, into the terminal's own real scrollback. This
+        // replaces the old test of the same name's intent
+        // ("does the newest message stay visible"), which assumed a fixed
+        // history pane height that no longer exists: the *point* of this
+        // whole feature is that history isn't clipped by screen height at
+        // all anymore, so the correct assertion is now the opposite of
+        // the old one — the earliest message is still present, not
+        // scrolled away.
         let mut session = Session::default();
         for i in 0..30 {
             session.push_user(&format!("message number {i}"));
         }
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_history_to_string(&session.messages, 60);
         assert!(content.contains("message number 29"));
-        assert!(!content.contains("message number 0 "));
+        assert!(content.contains("message number 0 "));
     }
 
     #[test]
@@ -1310,27 +1422,7 @@ mod tests {
         let mut session = Session::default();
         session.push_assistant("\x1b[31mfake red\x1b[0m");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_history_to_string(&session.messages, 60);
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         // The rest of the text should still be visible, just with the
         // control bytes neutralized rather than the whole message dropped.
@@ -1350,27 +1442,7 @@ mod tests {
         );
         session.push_tool_result("c1", "\x1b[31mfake\x1b[0m");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_history_to_string(&session.messages, 60);
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         // The rest of the text should still be visible, just with the
         // control bytes neutralized rather than the whole tool result
@@ -1383,27 +1455,7 @@ mod tests {
         let mut session = Session::default();
         session.push_user("plain ascii and 日本語 text, nothing weird here.");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_history_to_string(&session.messages, 60);
         assert!(content.contains("plain ascii and"));
         assert!(content.contains("nothing weird here."));
     }
@@ -1429,30 +1481,10 @@ mod tests {
 
     #[test]
     fn a_status_error_with_a_raw_escape_byte_does_not_reach_the_terminal_buffer() {
-        let session = Session::default();
+        let header = test_header();
         let status = Status::Error("\x1b[31mfake\x1b[0m".to_string());
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &status, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_footer_to_string("", &status, &header, &[], 0, 60, 6);
         assert!(!content.chars().any(|c| c == '\u{1b}'));
         assert!(content.contains("error: "));
         assert!(content.contains("fake"));
@@ -1463,27 +1495,21 @@ mod tests {
         let mut session = Session::default();
         session.push_assistant("first paragraph\nsecond paragraph\nthird paragraph");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let buffer = terminal.backend().buffer();
+        let lines = history_lines_for(&session.messages);
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
+            0,
+            0,
+            60,
+            lines.len() as u16,
+        ));
+        let area = buf.area;
+        render_history_into(&mut buf, area, &lines);
         // Every physical line of the message must land on its own row of
         // the rendered buffer, not be squashed onto a single row.
-        let rows: Vec<String> = (0..buffer.area.height)
+        let rows: Vec<String> = (0..buf.area.height)
             .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect();
@@ -1497,7 +1523,6 @@ mod tests {
 
     #[test]
     fn the_header_shows_provider_model_and_usage() {
-        let session = Session::default();
         let header = HeaderInfo {
             cwd: "/tmp/example",
             cwd_short: "~/example",
@@ -1514,19 +1539,12 @@ mod tests {
         // Wide enough that the header box's one content line ("model: ...
         // tokens: in ... / out ... / total ...") isn't cut off before the
         // usage numbers this test asserts on.
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
+        let mut buf =
+            ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, HEADER_HEIGHT));
+        let area = buf.area;
+        render_header_into(&mut buf, area, &header);
 
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = buf.content.iter().map(|c| c.symbol()).collect::<String>();
         assert!(content.contains("openai"));
         assert!(content.contains("gpt-5.4"));
         assert!(content.contains("140"));
@@ -1534,7 +1552,6 @@ mod tests {
 
     #[test]
     fn the_footer_shows_the_model_and_effort_together() {
-        let session = Session::default();
         let header = HeaderInfo {
             cwd: "/tmp/example",
             cwd_short: "~/example",
@@ -1543,19 +1560,7 @@ mod tests {
             model_name: "gpt-5.6-sol",
             usage: polaris_provider::Usage::default(),
         };
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_footer_to_string("", &Status::Idle, &header, &[], 0, 80, 3);
         // Matches the verified screenshot's footer shape: "{model}
         // {effort} · {cwd}".
         assert!(content.contains("gpt-5.6-sol high"));
@@ -1577,27 +1582,7 @@ mod tests {
         session.push_tool_result("c1", "hello\n");
         session.push_assistant("a.txt contains \"hello\"");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 15);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_history_to_string(&session.messages, 60);
         assert!(
             content.contains("read"),
             "the tool name should appear: {content}"
@@ -1623,25 +1608,19 @@ mod tests {
         // per line.
         session.push_tool_result("c1", "1\tfirst line\n2\tsecond line\n3\tthird line\n");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 15);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let buffer = terminal.backend().buffer();
-        let rows: Vec<String> = (0..buffer.area.height)
+        let lines = history_lines_for(&session.messages);
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
+            0,
+            0,
+            60,
+            lines.len() as u16,
+        ));
+        let area = buf.area;
+        render_history_into(&mut buf, area, &lines);
+        let rows: Vec<String> = (0..buf.area.height)
             .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect();
@@ -1672,27 +1651,7 @@ mod tests {
         let long_body: String = "x".repeat(500);
         session.push_tool_result("c1", &long_body);
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 15);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_history_to_string(&session.messages, 60);
         // The full 500-character body must not appear verbatim; only a
         // prefix of it should.
         assert!(!content.contains(&long_body));
@@ -1703,34 +1662,26 @@ mod tests {
         let mut session = Session::default();
         session.push_assistant("this is **bold** text");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let buffer = terminal.backend().buffer();
-        let bold_cell = (0..buffer.area.width)
-            .flat_map(|x| (0..buffer.area.height).map(move |y| (x, y)))
+        let lines = history_lines_for(&session.messages);
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
+            0,
+            0,
+            60,
+            lines.len() as u16,
+        ));
+        let area = buf.area;
+        render_history_into(&mut buf, area, &lines);
+        let bold_cell = (0..buf.area.width)
+            .flat_map(|x| (0..buf.area.height).map(move |y| (x, y)))
             .find(|&(x, y)| {
-                buffer[(x, y)].symbol() == "b" && {
-                    let row: String = (0..buffer.area.width)
-                        .map(|x| buffer[(x, y)].symbol())
-                        .collect();
+                buf[(x, y)].symbol() == "b" && {
+                    let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
                     row.contains("bold")
                 }
             });
         let (x, y) = bold_cell.expect("the word 'bold' should appear somewhere");
         assert!(
-            buffer[(x, y)]
+            buf[(x, y)]
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD),
             "the 'b' in 'bold' should carry the BOLD modifier"
@@ -1742,27 +1693,7 @@ mod tests {
         let mut session = Session::default();
         session.push_assistant("run `cargo test` now");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = render_history_to_string(&session.messages, 60);
         assert!(content.contains("cargo test"));
         assert!(!content.contains('`'));
     }
@@ -1773,28 +1704,20 @@ mod tests {
         session.push_user("hello");
         session.push_assistant("hi there");
 
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage::default(),
-        };
-        let backend = TestBackend::new(60, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_chat(f, &session, "", &Status::Idle, &header, &[], 0, &[]))
-            .expect("draw");
-
-        let buffer = terminal.backend().buffer();
+        let lines = history_lines_for(&session.messages);
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
+            0,
+            0,
+            60,
+            lines.len() as u16,
+        ));
+        let area = buf.area;
+        render_history_into(&mut buf, area, &lines);
         let find_row_color = |needle: &str| {
-            for y in 0..buffer.area.height {
-                let row: String = (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect();
+            for y in 0..buf.area.height {
+                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
                 if row.contains(needle) {
-                    return buffer[(0, y)].fg;
+                    return buf[(0, y)].fg;
                 }
             }
             panic!("row containing {needle:?} not found");

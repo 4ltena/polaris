@@ -3,7 +3,7 @@
 //! subagent 固有の `allowed-tools`/`metadata` を独自に解析する。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::frontmatter::{self, SkillError};
 
@@ -42,6 +42,37 @@ pub enum AgentTypeError {
     },
     #[error("{agent}'s SKILL.md has a malformed metadata line: {line}")]
     MalformedMetadataLine { agent: String, line: String },
+    #[error(
+        "{agent}'s polaris-output ({value}) points outside the agent's own directory. It must be a relative path to a file under agents/{agent}/"
+    )]
+    OutputSchemaEscapesAgentDirectory { agent: String, value: String },
+}
+
+/// Resolves `.` and `..` components without touching the filesystem.
+///
+/// `canonicalize` cannot be used for the containment check below: at parse
+/// time the declared schema file need not exist yet, and `dir_path` is
+/// whatever discovery walked with — possibly relative to a working
+/// directory this process never had. A purely lexical normalization is
+/// enough for what is being checked, which is that the *declared* path
+/// cannot name somewhere else. (A symlink inside the agent's own directory
+/// could still redirect the read; that is the type author's own directory
+/// pointing at their own choice of file, not an escape granted by the
+/// declaration.)
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(Component::ParentDir);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// `metadata:` ブロック配下の、2スペースインデントされた `key: value` 行
@@ -160,7 +191,22 @@ pub fn parse(text: &str, dir_name: &str, dir_path: &Path) -> Result<AgentType, A
             });
         }
     };
-    let output_schema = dir_path.join(required_metadata(&metadata, dir_name, "polaris-output")?);
+    // `polaris-output` names a file the *parent* process later reads and
+    // feeds to a JSON Schema validator, so where it is allowed to point is
+    // a trust boundary, not a convenience. `Path::join` replaces the whole
+    // path when the right-hand side is absolute, so `polaris-output:
+    // /etc/passwd` would silently resolve to `/etc/passwd`; `../` walks out
+    // just as easily. Confine it to the agent's own directory.
+    let declared_output = required_metadata(&metadata, dir_name, "polaris-output")?;
+    let output_schema = dir_path.join(declared_output);
+    let normalized_dir = normalize_lexically(dir_path);
+    let normalized_output = normalize_lexically(&output_schema);
+    if !normalized_output.starts_with(&normalized_dir) || normalized_output == normalized_dir {
+        return Err(AgentTypeError::OutputSchemaEscapesAgentDirectory {
+            agent: dir_name.to_string(),
+            value: declared_output.to_string(),
+        });
+    }
 
     Ok(AgentType {
         name,
@@ -312,6 +358,83 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The same valid frontmatter, with `polaris-output` swapped for
+    /// whatever the caller wants to try declaring.
+    fn text_with_output(value: &str) -> String {
+        valid_text().replace("references/result.schema.json", value)
+    }
+
+    #[test]
+    fn an_ordinary_relative_output_schema_resolves_under_the_agent_directory() {
+        // The control for the two rejection tests below: the normal case
+        // is unaffected by the containment check.
+        let a = parse(
+            &text_with_output("references/result.schema.json"),
+            "file-inspector",
+            Path::new("agents/file-inspector"),
+        )
+        .unwrap();
+        assert_eq!(
+            a.output_schema,
+            Path::new("agents/file-inspector/references/result.schema.json")
+        );
+    }
+
+    #[test]
+    fn an_absolute_output_schema_is_rejected() {
+        // `Path::join` discards the left-hand side entirely when the right
+        // is absolute, so without the check this type's `output_schema`
+        // would simply *be* `/etc/passwd` — a file the unsandboxed parent
+        // then reads and hands to the schema validator.
+        let err = parse(
+            &text_with_output("/etc/passwd"),
+            "file-inspector",
+            Path::new("agents/file-inspector"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentTypeError::OutputSchemaEscapesAgentDirectory { .. }
+            ),
+            "an absolute polaris-output was accepted: {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_output_schema_escaping_via_parent_components_is_rejected() {
+        let err = parse(
+            &text_with_output("../../../etc/passwd"),
+            "file-inspector",
+            Path::new("agents/file-inspector"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentTypeError::OutputSchemaEscapesAgentDirectory { .. }
+            ),
+            "a ../-escaping polaris-output was accepted: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_parent_component_that_stays_inside_the_agent_directory_is_still_accepted() {
+        // The check rejects escaping, not `..` as a character sequence.
+        // `references/../result.schema.json` never leaves the directory, so
+        // refusing it would be over-broad.
+        let a = parse(
+            &text_with_output("references/../result.schema.json"),
+            "file-inspector",
+            Path::new("agents/file-inspector"),
+        )
+        .unwrap();
+        assert_eq!(
+            a.output_schema,
+            Path::new("agents/file-inspector/references/../result.schema.json")
+        );
     }
 
     #[test]

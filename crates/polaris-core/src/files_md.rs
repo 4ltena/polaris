@@ -188,4 +188,67 @@ mod tests {
 
         assert_eq!(targets, vec![dir]);
     }
+
+    /// The real `agents/files-md-writer` from this repository — the actual
+    /// type definition this module dispatches to, not a hand-rolled copy
+    /// that could drift from it. Mirrors `spawn.rs`'s own
+    /// `file_inspector()` fixture pattern.
+    fn files_md_writer_fixture_agent_type_for_files_md_tests() -> AgentType {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agents/files-md-writer");
+        let text = std::fs::read_to_string(dir.join("SKILL.md")).expect("cannot read SKILL.md");
+        polaris_skills::agent_type::parse(&text, "files-md-writer", &dir)
+            .expect("agents/files-md-writer does not parse")
+    }
+
+    /// Acceptance criterion: a failure inside the `files-md-writer`
+    /// subagent must never panic or propagate back to the caller of
+    /// `regenerate_for_changes` — the function's `()` return type already
+    /// guarantees "no error path" at the signature level; this proves the
+    /// guarantee holds even when the provider genuinely fails on every
+    /// call, and that the failure still lands in the audit log rather than
+    /// vanishing silently.
+    #[tokio::test]
+    async fn a_failing_subagent_provider_does_not_panic_or_propagate_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let new_dir = root.path().join("newdir");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let changes = changes_with(vec![new_dir.clone()], vec![]);
+
+        struct AlwaysErrors;
+        #[async_trait::async_trait]
+        impl Provider for AlwaysErrors {
+            async fn complete(
+                &self,
+                _req: polaris_provider::CompletionRequest,
+            ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError>
+            {
+                Err(polaris_provider::ProviderError::Http("boom".into()))
+            }
+        }
+
+        let agent_types = vec![files_md_writer_fixture_agent_type_for_files_md_tests()];
+        let audit_path = root.path().join("audit.jsonl");
+        let audit = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::audit::AuditLog::open(&audit_path).unwrap(),
+        ));
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .unwrap();
+
+        // Not panicking is itself the assertion this test makes.
+        regenerate_for_changes(
+            &changes,
+            &agent_types,
+            std::sync::Arc::new(AlwaysErrors),
+            audit,
+            &sandbox,
+            std::path::Path::new("/bin/true"),
+        )
+        .await;
+
+        let log_text = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(log_text.contains("\"tool\":\"files-md-writer\""));
+    }
 }

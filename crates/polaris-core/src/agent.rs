@@ -977,6 +977,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_call_with_no_events_channel_behaves_identically_to_before() {
+        // `events: None` is the polaris-cli one-shot code path. Every other
+        // test in this module already exercises it (none of them pass
+        // `Some`), so their continuing to pass unmodified after the
+        // `events` channel was threaded through `run`/`run_loop`/
+        // `dispatch`/`spawn::run_one`/`run_wave` is the primary evidence
+        // for this acceptance criterion. This test pins the narrower claim
+        // directly: passing `None` all the way through does not panic and
+        // still returns the same successful outcome it always did.
+        let dir = tempfile::tempdir().expect("temp directory");
+        let p = Scripted {
+            replies: Mutex::new(vec![CompletionResponse {
+                text: "done".into(),
+                tool_calls: vec![],
+                ..Default::default()
+            }]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("hello");
+        let audit = dummy_audit(&dir);
+        let mut stop = StopTracker::new(10);
+
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let out = run(
+            &p,
+            &mut session,
+            audit,
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
+            &mut ctx,
+        )
+        .await
+        .expect("events: None must not cause run to fail")
+        .text;
+
+        assert_eq!(out, "done");
+    }
+
+    #[tokio::test]
     async fn interleaved_success_does_not_trip_the_repeated_error_stop() {
         // A regression test through the loop, paired with the unit test on
         // the stop.rs side. Reproduces "the same error 3 times" as 5 errors

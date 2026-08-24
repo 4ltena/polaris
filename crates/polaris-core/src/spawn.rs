@@ -1591,4 +1591,66 @@ mod tests {
             "expected exactly 2 events already drained above, none left"
         );
     }
+
+    #[tokio::test]
+    async fn a_subagent_that_actually_calls_a_tool_still_only_emits_started_and_finished() {
+        // Task 4's other non-leakage test (above) proves `run_one` itself
+        // sends only 2 events, but its subagent never calls a tool — the
+        // provider hands back matching JSON on the first turn, so there is
+        // nothing internal that *could* have leaked. This test closes that
+        // gap from a different angle: the scripted subagent here calls
+        // `read` before returning its final JSON (the same fixture
+        // `a_subagent_that_uses_a_tool_and_returns_matching_json_succeeds`
+        // uses to prove audit attribution), while `run_one` is given a
+        // live events channel. If `run_one`'s inner `run_loop` call ever
+        // stopped passing `events: None` down to the subagent's own turn,
+        // the `read` call's events would show up here alongside
+        // SpawnStarted/SpawnFinished.
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("a.rs");
+        std::fs::write(&target, "fn main() {}\n").expect("cannot write");
+
+        let result = serde_json::json!({
+            "path": target.to_str().expect("path"),
+            "responsibility": "The entry point.",
+            "test_file": null
+        })
+        .to_string();
+
+        let provider = scripted(vec![read_call(&target), text(&result)]);
+        let audit = audit_in(dir.path());
+        let task = SpawnTask {
+            agent_type: "file-inspector".into(),
+            task: format!("inspect {}", target.display()),
+            write_root: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = run_one(
+            &task,
+            &[file_inspector()],
+            provider,
+            audit,
+            &full_access(),
+            Path::new("/bin/true"),
+            Some(tx),
+        )
+        .await;
+
+        match outcome {
+            TaskOutcome::Ok(body) => assert_eq!(body, result),
+            TaskOutcome::Failed(e) => panic!("the subagent failed: {e}"),
+        }
+
+        let _started = rx.recv().await.unwrap();
+        let _finished = rx.recv().await.unwrap();
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, 0,
+            "the subagent's own `read` call must not have reached the parent's events channel"
+        );
+    }
 }

@@ -325,6 +325,12 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // box's own `directory:` row keeps the unabbreviated `cwd_display`.
     let cwd_footer_display = abbreviate_home(&args.cwd);
     let mut input_buffer = String::new();
+    // Byte offset into `input_buffer`, always on a UTF-8 char boundary —
+    // see `input::apply_key`.
+    let mut input_cursor: usize = 0;
+    // Session-local Up/Down recall of previously submitted input. Not
+    // persisted — see `input::History`.
+    let mut input_history = input::History::new();
     // A local copy, not `args.approval_policy` directly — `/permissions`
     // needs to be able to change it for the rest of the session, and
     // `args` isn't mutable (nor should adding one slash command make it
@@ -387,6 +393,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 render::render_footer(
                     f,
                     &input_buffer,
+                    input_cursor,
                     &status,
                     &render::HeaderInfo {
                         provider_name: &args.provider_name,
@@ -439,6 +446,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 KeyCode::Enter => {
                     let action = slash::action_for(suggestions[selected_suggestion].name);
                     input_buffer.clear();
+                    input_cursor = 0;
                     selected_suggestion = 0;
                     match action {
                         slash::Action::Review(extra) => {
@@ -567,17 +575,45 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             }
         }
 
+        // Up/Down recall previously submitted input, shell-history style —
+        // only once the popup above hasn't already claimed them (it
+        // `continue`s before reaching here whenever `suggestions` is
+        // non-empty).
+        if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
+            use ratatui::crossterm::event::KeyCode;
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(recalled) = input_history.older(&input_buffer) {
+                        input_buffer = recalled.to_string();
+                        input_cursor = input_buffer.len();
+                    }
+                    continue;
+                }
+                KeyCode::Down => {
+                    if let Some(recalled) = input_history.newer() {
+                        input_buffer = recalled.to_string();
+                        input_cursor = input_buffer.len();
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         let text = if let Some(t) = review_text {
             t
         } else {
-            let typed = match apply_key(&mut input_buffer, key) {
+            let typed = match apply_key(&mut input_buffer, &mut input_cursor, key) {
                 InputAction::Continue => {
                     selected_suggestion = 0;
                     continue;
                 }
                 InputAction::Quit => break ExitCode::SUCCESS,
                 InputAction::Submit(text) if text.trim().is_empty() => continue,
-                InputAction::Submit(text) => text,
+                InputAction::Submit(text) => {
+                    input_history.record(&text);
+                    text
+                }
             };
             // Slash commands are local: handled here and never reach
             // `session.messages`, the model, or the persisted session
@@ -753,6 +789,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 render::render_footer(
                     f,
                     &input_buffer,
+                    input_cursor,
                     &status,
                     &render::HeaderInfo {
                         provider_name: &args.provider_name,
@@ -871,6 +908,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 render::render_footer(
                                     f,
                                     &input_buffer,
+                                    input_cursor,
                                     &status,
                                     &render::HeaderInfo {
                                         provider_name: &args.provider_name,

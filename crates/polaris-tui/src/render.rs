@@ -628,6 +628,7 @@ pub const MAX_DISPLAYED_SUGGESTIONS: usize = 8;
 pub fn render_footer(
     frame: &mut Frame,
     input: &str,
+    cursor: usize,
     status: &Status,
     header: &HeaderInfo,
     suggestions: &[&crate::slash::SlashCommand],
@@ -747,6 +748,18 @@ pub fn render_footer(
         Paragraph::new(input_line).style(Style::default().bg(Color::DarkGray)),
         input_area,
     );
+
+    // Places the real terminal cursor at `cursor`'s position within the
+    // typed text, right after the "\u{203a} " prompt — `Line::width()`
+    // already accounts for CJK/wide characters the same way the rendered
+    // text itself does, so this stays in sync without a separate
+    // width-measuring dependency.
+    let prefix_width = Line::from("\u{203a} ").width() as u16;
+    let typed_width = Line::from(sanitize(&input[..cursor])).width() as u16;
+    frame.set_cursor_position(ratatui::layout::Position::new(
+        input_area.x + prefix_width + typed_width,
+        input_area.y,
+    ));
 
     // Two-tone footer matching codex's own status line: the model name in
     // a warm tan, the working directory in a soft green, separated by a
@@ -1187,7 +1200,17 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_footer(f, input, status, header, suggestions, selected_suggestion))
+            .draw(|f| {
+                render_footer(
+                    f,
+                    input,
+                    input.len(),
+                    status,
+                    header,
+                    suggestions,
+                    selected_suggestion,
+                )
+            })
             .expect("draw");
         terminal
             .backend()
@@ -1196,6 +1219,23 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>()
+    }
+
+    /// Renders the footer with an explicit cursor byte-offset and returns
+    /// where the real terminal cursor landed.
+    fn render_footer_cursor_position(
+        input: &str,
+        cursor: usize,
+        width: u16,
+        height: u16,
+    ) -> ratatui::layout::Position {
+        let header = test_header();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_footer(f, input, cursor, &Status::Idle, &header, &[], 0))
+            .expect("draw");
+        terminal.get_cursor_position().expect("cursor position")
     }
 
     fn test_header() -> HeaderInfo<'static> {
@@ -1233,6 +1273,35 @@ mod tests {
         assert!(content.contains("Working"));
         assert!(content.contains("3s"));
         assert!(content.contains("esc to interrupt"));
+    }
+
+    #[test]
+    fn the_cursor_lands_right_after_the_prompt_prefix_when_the_buffer_is_empty() {
+        let pos = render_footer_cursor_position("", 0, 60, 6);
+        // status(1) + suggestions(0, empty when no popup) puts the input
+        // row at index 1.
+        assert_eq!(pos.y, 1);
+        assert_eq!(pos.x, Line::from("\u{203a} ").width() as u16);
+    }
+
+    #[test]
+    fn the_cursor_tracks_a_mid_buffer_offset_not_always_the_end() {
+        let full = render_footer_cursor_position("hello", 5, 60, 6);
+        let mid = render_footer_cursor_position("hello", 2, 60, 6);
+        assert_eq!(full.x - mid.x, 3);
+    }
+
+    #[test]
+    fn the_cursor_accounts_for_wide_characters_before_it() {
+        // Hiragana "あ" occupies 2 terminal columns, unlike the following
+        // "b" — the cursor after both must be 2 (prefix) + 2 (wide) + 1
+        // columns ahead of the prefix-only position, not 2 (prefix) + 2
+        // (one char each).
+        let input = "\u{3042}b";
+        let after_wide_char = "\u{3042}".len();
+        let pos = render_footer_cursor_position(input, after_wide_char, 60, 6);
+        let prefix = render_footer_cursor_position(input, 0, 60, 6);
+        assert_eq!(pos.x - prefix.x, 2);
     }
 
     #[test]

@@ -328,10 +328,6 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let mut history: Vec<render::HistoryLine> = Vec::new();
     // How far back the user has scrolled the history region — 0 always
     // means "following the tail" (see `render::visible_history_window`).
-    // Not yet mutated anywhere — a later task wires scroll keybindings
-    // (Up/Down) into the main loop; until then this is read-only, which
-    // `cargo clippy -D warnings` would otherwise flag as `unused_mut`.
-    #[allow(unused_mut)]
     let mut scroll_offset: usize = 0;
     let startup_width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
     history.extend(render::header_history_lines(
@@ -635,6 +631,24 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             }
         }
 
+        // Up/Down scroll the conversation history — only reachable once
+        // the slash-popup above hasn't already claimed these keys (it
+        // `continue`s whenever `suggestions` is non-empty).
+        if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
+            use ratatui::crossterm::event::KeyCode;
+            match key.code {
+                KeyCode::Up => {
+                    scroll_offset = scroll_offset.saturating_add(1);
+                    continue;
+                }
+                KeyCode::Down => {
+                    scroll_offset = scroll_offset.saturating_sub(1);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         let text = if let Some(t) = review_text {
             t
         } else {
@@ -647,6 +661,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 InputAction::Submit(text) if text.trim().is_empty() => continue,
                 InputAction::Submit(text) => {
                     input_history.record(&text);
+                    scroll_offset = 0;
                     text
                 }
             };
@@ -2716,5 +2731,25 @@ mod tests {
         let p = review_prompt("the auth module");
         assert!(p.starts_with(REVIEW_INSTRUCTION));
         assert!(p.contains("the auth module"));
+    }
+
+    #[test]
+    fn scroll_offset_saturates_at_zero_going_down() {
+        let mut scroll_offset: usize = 0;
+        scroll_offset = scroll_offset.saturating_sub(1);
+        assert_eq!(scroll_offset, 0);
+    }
+
+    #[test]
+    fn scroll_offset_grows_unbounded_going_up_since_the_window_clamps_it() {
+        // Mirrors what the Up-key handler in run() does — the clamp lives in
+        // visible_history_window (Task 1), not here, by design (see that
+        // task's doc comment).
+        let mut scroll_offset: usize = 0;
+        for _ in 0..1000 {
+            scroll_offset = scroll_offset.saturating_add(1);
+        }
+        assert_eq!(scroll_offset, 1000);
+        assert_eq!(render::visible_history_window(50, scroll_offset, 10), 0..10);
     }
 }

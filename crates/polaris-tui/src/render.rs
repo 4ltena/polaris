@@ -11,7 +11,7 @@ use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// What the bottom-of-screen status line shows while a turn is in flight,
 /// idle, or after a failed turn.
@@ -376,6 +376,7 @@ fn format_inline(text: &str, base_color: Color) -> Vec<Span<'static>> {
 /// character cells it draws text into, not a whole row, so shading a full
 /// row needs one row-height `Paragraph` per `HistoryLine` rather than one
 /// `Paragraph` for a whole block of lines — see `render_history_into`.
+#[derive(Clone)]
 pub struct HistoryLine {
     pub line: Line<'static>,
     pub shaded: bool,
@@ -502,6 +503,149 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
             }
         })
         .collect()
+}
+
+/// Moves `current` into `rows`, first dropping any trailing spaces —
+/// they were speculatively attached to `current` by the wrap loop below
+/// in case more content landed on the same row; once a row is actually
+/// being closed out, they'd only show up as invisible-but-present
+/// trailing whitespace.
+fn push_row_trimmed(rows: &mut Vec<Vec<(char, Style)>>, current: &mut Vec<(char, Style)>) {
+    while matches!(current.last(), Some((' ', _))) {
+        current.pop();
+    }
+    rows.push(std::mem::take(current));
+}
+
+/// Reflows any `HistoryLine` whose display width exceeds `width` into
+/// several `HistoryLine`s, so a narrow terminal shows the full text across
+/// multiple rows instead of `render_history_into` clipping it at the
+/// window's right edge. Breaks at whitespace where possible (the space
+/// itself is dropped at the break rather than carried to the next row's
+/// start); a single word longer than `width` is hard-broken mid-word as a
+/// fallback. Per-span styling (bold, dim, background) is preserved
+/// exactly, split at wherever a row boundary lands inside it, and every
+/// wrapped row inherits the original line's `shaded` flag.
+///
+/// Called fresh every frame from the current `history_area.width` (see
+/// `lib.rs`'s `draw_frame`) rather than cached, since the width can
+/// change between frames (a terminal resize). This re-walks the whole
+/// `history` buffer each time, which is fine at the scale a single
+/// interactive session actually reaches — there is no windowing here
+/// (unlike `visible_history_window`, which only looks at the *result*'s
+/// length) because a line's wrapped row count isn't known until it's
+/// wrapped, so the scroll math downstream needs the full reflowed list.
+///
+/// `width` of `0` is a no-op (nothing can fit) — callers should not call
+/// this with a zero-width area to begin with.
+pub fn wrap_history_lines(history: &[HistoryLine], width: u16) -> Vec<HistoryLine> {
+    let width = width as usize;
+    if width == 0 {
+        return history.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(history.len());
+    for hl in history {
+        let total_width: usize = hl.line.spans.iter().map(|s| s.content.width()).sum();
+        if total_width <= width {
+            out.push(HistoryLine {
+                line: hl.line.clone(),
+                shaded: hl.shaded,
+            });
+            continue;
+        }
+
+        let chars: Vec<(char, Style)> = hl
+            .line
+            .spans
+            .iter()
+            .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+            .collect();
+
+        let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+        let mut current: Vec<(char, Style)> = Vec::new();
+        let mut current_width = 0usize;
+        let mut i = 0;
+        while i < chars.len() {
+            let word_start = i;
+            while i < chars.len() && chars[i].0 != ' ' {
+                i += 1;
+            }
+            let word_end = i;
+            let space_start = i;
+            while i < chars.len() && chars[i].0 == ' ' {
+                i += 1;
+            }
+            let space_end = i;
+
+            let word_width: usize = chars[word_start..word_end]
+                .iter()
+                .map(|(c, _)| c.width().unwrap_or(0))
+                .sum();
+
+            if word_width > width {
+                // The word alone can't fit even on an empty row — hard-break
+                // it character by character rather than looping forever.
+                for &(c, style) in &chars[word_start..word_end] {
+                    let cw = c.width().unwrap_or(0);
+                    if current_width + cw > width && !current.is_empty() {
+                        push_row_trimmed(&mut rows, &mut current);
+                        current_width = 0;
+                    }
+                    current.push((c, style));
+                    current_width += cw;
+                }
+            } else {
+                if current_width + word_width > width && !current.is_empty() {
+                    push_row_trimmed(&mut rows, &mut current);
+                    current_width = 0;
+                }
+                current.extend(chars[word_start..word_end].iter().copied());
+                current_width += word_width;
+            }
+
+            // Trailing spaces travel with the row they fit on; a space that
+            // would push past `width` is simply dropped rather than
+            // starting the next row with leading whitespace.
+            for &(c, style) in &chars[space_start..space_end] {
+                let cw = c.width().unwrap_or(0);
+                if current_width + cw > width {
+                    break;
+                }
+                current.push((c, style));
+                current_width += cw;
+            }
+        }
+        if !current.is_empty() || rows.is_empty() {
+            push_row_trimmed(&mut rows, &mut current);
+        }
+
+        for row in rows {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut buf = String::new();
+            let mut buf_style: Option<Style> = None;
+            for (c, style) in row {
+                if buf_style != Some(style) {
+                    if !buf.is_empty() {
+                        spans.push(Span::styled(
+                            std::mem::take(&mut buf),
+                            buf_style.unwrap_or_default(),
+                        ));
+                    }
+                    buf_style = Some(style);
+                }
+                buf.push(c);
+            }
+            if !buf.is_empty() {
+                spans.push(Span::styled(buf, buf_style.unwrap_or_default()));
+            }
+            out.push(HistoryLine {
+                line: Line::from(spans),
+                shaded: hl.shaded,
+            });
+        }
+    }
+    out
 }
 
 /// Which `history` indices are currently visible, given how far the user
@@ -1545,6 +1689,94 @@ mod tests {
     #[test]
     fn shimmer_spans_on_empty_text_is_empty() {
         assert!(shimmer_spans("", Duration::ZERO).is_empty());
+    }
+
+    fn plain_history_line(text: &str) -> HistoryLine {
+        HistoryLine::plain(Line::from(text.to_string()))
+    }
+
+    #[test]
+    fn a_short_line_passes_through_unwrapped() {
+        let history = vec![plain_history_line("short")];
+        let wrapped = wrap_history_lines(&history, 20);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0].line.to_string(), "short");
+    }
+
+    #[test]
+    fn a_long_line_wraps_at_a_word_boundary() {
+        let history = vec![plain_history_line("one two three four")];
+        // Width 9 fits "one two" (7) but not "one two three" (13).
+        let wrapped = wrap_history_lines(&history, 9);
+        let texts: Vec<String> = wrapped.iter().map(|l| l.line.to_string()).collect();
+        assert_eq!(texts, vec!["one two", "three", "four"]);
+        assert!(
+            texts.iter().all(|t| t.chars().count() <= 9),
+            "no row should exceed the given width: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_word_longer_than_the_width_is_hard_broken() {
+        let history = vec![plain_history_line("supercalifragilistic")];
+        let wrapped = wrap_history_lines(&history, 5);
+        let texts: Vec<String> = wrapped.iter().map(|l| l.line.to_string()).collect();
+        assert_eq!(texts.join(""), "supercalifragilistic");
+        assert!(texts.iter().all(|t| t.chars().count() <= 5));
+        assert!(texts.len() > 1);
+    }
+
+    #[test]
+    fn wrapping_preserves_the_shaded_flag_on_every_row() {
+        let history = vec![HistoryLine {
+            line: Line::from("one two three four five".to_string()),
+            shaded: true,
+        }];
+        let wrapped = wrap_history_lines(&history, 8);
+        assert!(wrapped.len() > 1, "the line should have actually wrapped");
+        assert!(wrapped.iter().all(|l| l.shaded));
+    }
+
+    #[test]
+    fn wrapping_preserves_per_span_style_across_the_break() {
+        let line = Line::from(vec![
+            Span::styled("bold word ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("plain word"),
+        ]);
+        let history = vec![HistoryLine::plain(line)];
+        let wrapped = wrap_history_lines(&history, 10);
+        assert_eq!(wrapped.len(), 2);
+        assert!(
+            wrapped[0]
+                .line
+                .spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "the first row (\"bold word\") should stay bold"
+        );
+        assert!(
+            wrapped[1]
+                .line
+                .spans
+                .iter()
+                .all(|s| !s.style.add_modifier.contains(Modifier::BOLD)),
+            "the second row (\"plain word\") should not be bold"
+        );
+    }
+
+    #[test]
+    fn a_zero_width_is_a_no_op() {
+        let history = vec![plain_history_line("anything at all")];
+        let wrapped = wrap_history_lines(&history, 0);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0].line.to_string(), "anything at all");
+    }
+
+    #[test]
+    fn an_already_narrow_history_of_many_lines_is_unaffected() {
+        let history = vec![plain_history_line("a"), plain_history_line("b")];
+        let wrapped = wrap_history_lines(&history, 40);
+        assert_eq!(wrapped.len(), 2);
     }
 
     #[test]

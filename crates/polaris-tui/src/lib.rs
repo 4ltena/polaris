@@ -41,6 +41,11 @@ pub struct RunArgs<'a> {
     pub provider: Arc<dyn Provider>,
     pub provider_name: String,
     pub model_name: String,
+    /// Seeds the footer's displayed effort when the caller already knows a
+    /// plan-derived override (see `polaris-cli`'s `effort_for_stored_plan`)
+    /// — otherwise `run()` falls back to `render::DEFAULT_EFFORT`, same as
+    /// before this field existed.
+    pub initial_effort_name: Option<String>,
     pub cwd: PathBuf,
     pub state_dir: PathBuf,
     /// Where every saved conversation lives, across every project —
@@ -404,10 +409,14 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // that actually changes what gets sent; this is only the display copy
     // shown in the header/footer/notices.
     let mut model_name = args.model_name.clone();
-    // No `RunArgs` field to seed this from — nothing before `/model` is
-    // ever chosen sets an effort, so this starts at the same default
+    // Seeded from `args.initial_effort_name` when the caller already knows
+    // a plan-derived override (e.g. Plus accounts default to "high" — see
+    // `polaris-cli`'s `effort_for_stored_plan`); otherwise the same default
     // `render::render_effort_picker` itself marks `(default)`.
-    let mut effort_name = render::DEFAULT_EFFORT.to_string();
+    let mut effort_name = args
+        .initial_effort_name
+        .clone()
+        .unwrap_or_else(|| render::DEFAULT_EFFORT.to_string());
     let mut cumulative_usage = polaris_provider::Usage::default();
     let mut status = Status::Idle;
     let mut key_reader = CrosstermKeyReader;

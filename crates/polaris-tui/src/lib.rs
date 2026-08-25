@@ -7,6 +7,13 @@ pub mod input;
 pub mod onboarding;
 pub mod persist;
 pub mod render;
+// Not yet constructed/read outside its own unit tests -- later tasks (2,
+// 3, 4, 5, 8, 11) wire mouse events into `Selection`/`TextPos`. `cargo
+// clippy --all-targets` still compiles the plain `lib` target (without
+// `cfg(test)`), where none of that applies, so without this the module
+// reads as entirely dead code until that wiring lands.
+#[allow(dead_code)]
+mod selection;
 pub mod sessions;
 pub mod slash;
 mod time;

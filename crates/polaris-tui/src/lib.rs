@@ -96,7 +96,9 @@ fn abbreviate_home(path: &std::path::Path) -> String {
 /// growing to fit content, which is why the suggestions popup is capped
 /// (see `render::MAX_DISPLAYED_SUGGESTIONS`'s doc) instead of sizing to
 /// fit an unbounded match list.
-const FOOTER_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1;
+// status(1) + suggestions(MAX_DISPLAYED_SUGGESTIONS + "+N more" row, 1) +
+// input pad-above(1) + input(1) + input pad-below(1) + footer(1).
+const FOOTER_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1 + 1;
 
 /// How many `scroll_offset` lines one mouse/trackpad wheel tick moves —
 /// a single line per tick feels sluggish for wheel input, unlike a key

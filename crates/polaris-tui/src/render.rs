@@ -868,9 +868,18 @@ pub fn render_footer(
     } else {
         shown as u16 + 1 + u16::from(truncated)
     };
-    let [status_area, suggestions_area, input_area, footer_area] = Layout::vertical([
+    let [
+        status_area,
+        suggestions_area,
+        input_pad_top_area,
+        input_area,
+        input_pad_bottom_area,
+        footer_area,
+    ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(suggestions_height),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -972,9 +981,21 @@ pub fn render_footer(
             Span::raw(sanitize(input)),
         ])
     };
+    // One blank shaded row directly above and below the input line —
+    // widens the input box's visual weight beyond a single thin text row,
+    // without adding any text of their own.
+    let pad_style = Style::default().bg(Color::DarkGray);
+    frame.render_widget(
+        Paragraph::new(Line::raw("")).style(pad_style),
+        input_pad_top_area,
+    );
     frame.render_widget(
         Paragraph::new(input_line).style(Style::default().bg(Color::DarkGray)),
         input_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::raw("")).style(pad_style),
+        input_pad_bottom_area,
     );
 
     // Places the real terminal cursor at `cursor`'s position within the
@@ -1501,8 +1522,8 @@ mod tests {
             })
             .expect("draw");
         // "› " (width 2) + "hello" (width 5) = column 7, on the input row
-        // (status(1) + suggestions(0) = row 1).
-        terminal.backend_mut().assert_cursor_position((7, 1));
+        // (status(1) + suggestions(0) + pad-above(1) = row 2).
+        terminal.backend_mut().assert_cursor_position((7, 2));
     }
 
     /// Wide (CJK) characters must count as 2 columns each, or the cursor
@@ -1529,7 +1550,7 @@ mod tests {
             })
             .expect("draw");
         // "› "(2) + "hello"(5) + "こんにちは"(5 chars * width 2 = 10) = 17.
-        terminal.backend_mut().assert_cursor_position((17, 1));
+        terminal.backend_mut().assert_cursor_position((17, 2));
     }
 
     fn test_header() -> HeaderInfo<'static> {
@@ -1616,30 +1637,66 @@ mod tests {
         // Matches codex's own input-box styling — confirmed against a real
         // screenshot — where the whole composer row is shaded, not just
         // the cells the prompt/typed text happen to occupy.
-        let backend = TestBackend::new(60, 6);
+        let backend = TestBackend::new(60, 7);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|f| render_footer(f, f.area(), "hi", 2, &Status::Idle, &test_header(), &[], 0))
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        // Row 1 is the input row (status(1) + suggestions(0) = row 1).
+        // Row 2 is the input row: status(1) + suggestions(0) + pad-above(1)
+        // = row 2.
         // "› hi" ends well before column 50 on a 60-wide backend, but the
         // shading should still reach all the way to the row's right edge.
         assert_eq!(
-            buffer[(2, 1)].bg,
+            buffer[(2, 2)].bg,
             Color::DarkGray,
             "the prompt/typed-text cells should be shaded"
         );
         assert_eq!(
-            buffer[(50, 1)].bg,
+            buffer[(50, 2)].bg,
             Color::DarkGray,
             "empty space past the typed text should also be shaded, all the way to the row's edge"
         );
         assert_eq!(
-            buffer[(59, 1)].bg,
+            buffer[(59, 2)].bg,
             Color::DarkGray,
             "the row's last column should be shaded too"
         );
+    }
+
+    #[test]
+    fn the_input_row_has_a_shaded_blank_row_above_and_below_it() {
+        // Widens the visual weight of the input box — a single text row of
+        // shading read as too thin. The blank rows carry no text, just
+        // the same DarkGray fill across the whole width.
+        let backend = TestBackend::new(60, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_footer(f, f.area(), "hi", 2, &Status::Idle, &test_header(), &[], 0))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        // status(1, row 0) + suggestions(0) + pad-above(row 1) + input(row 2)
+        // + pad-below(row 3) + footer(row 4).
+        for x in [0u16, 30, 59] {
+            assert_eq!(
+                buffer[(x, 1)].bg,
+                Color::DarkGray,
+                "the row above the input line should be shaded at column {x}"
+            );
+            assert_eq!(
+                buffer[(x, 3)].bg,
+                Color::DarkGray,
+                "the row below the input line should be shaded at column {x}"
+            );
+        }
+        // Both pad rows carry no visible text.
+        let row_text = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        assert_eq!(row_text(1).trim(), "");
+        assert_eq!(row_text(3).trim(), "");
     }
 
     #[test]
@@ -1657,9 +1714,9 @@ mod tests {
     #[test]
     fn the_cursor_lands_right_after_the_prompt_prefix_when_the_buffer_is_empty() {
         let pos = render_footer_cursor_position("", 0, 60, 6);
-        // status(1) + suggestions(0, empty when no popup) puts the input
-        // row at index 1.
-        assert_eq!(pos.y, 1);
+        // status(1) + suggestions(0, empty when no popup) + pad-above(1)
+        // puts the input row at index 2.
+        assert_eq!(pos.y, 2);
         assert_eq!(pos.x, Line::from("\u{203a} ").width() as u16);
     }
 

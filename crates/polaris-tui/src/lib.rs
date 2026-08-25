@@ -235,9 +235,14 @@ fn draw_frame(
     ])
     .areas(area);
 
+    // Reflowed fresh every frame from the current width — a narrow window
+    // (or one just resized) always gets a wrap matching its actual size,
+    // rather than clipping any line wider than `history_area.width`. See
+    // `wrap_history_lines`'s own doc comment for why this isn't cached.
+    let wrapped = render::wrap_history_lines(history, history_area.width);
     let window =
-        render::visible_history_window(history.len(), scroll_offset, history_area.height as usize);
-    render::render_history_into(frame.buffer_mut(), history_area, &history[window]);
+        render::visible_history_window(wrapped.len(), scroll_offset, history_area.height as usize);
+    render::render_history_into(frame.buffer_mut(), history_area, &wrapped[window]);
 
     render::render_footer(
         frame,
@@ -1855,6 +1860,61 @@ mod tests {
             !rows[..footer_start]
                 .iter()
                 .any(|r| r.contains("Ask polaris to do anything"))
+        );
+    }
+
+    #[test]
+    fn draw_frame_wraps_a_history_line_wider_than_a_narrow_window_instead_of_clipping_it() {
+        // A window half as wide as normal (30 columns) must still show the
+        // full text of a long line, across multiple wrapped rows, rather
+        // than clipping it at the window's right edge.
+        let backend = ratatui::backend::TestBackend::new(30, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let long_text = "one two three four five six seven eight nine ten";
+        let history = vec![render::HistoryLine {
+            line: ratatui::text::Line::from(long_text),
+            shaded: false,
+        }];
+        terminal
+            .draw(|f| {
+                draw_frame(
+                    f,
+                    &history,
+                    0,
+                    "",
+                    0,
+                    &Status::Idle,
+                    &render::HeaderInfo {
+                        provider_name: "openai",
+                        model_name: "gpt-5.4",
+                        usage: polaris_provider::Usage::default(),
+                        cwd: "/tmp",
+                        cwd_short: "~",
+                        effort_name: "low",
+                    },
+                    &[],
+                    0,
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined: String = rows.join(" ");
+        for word in long_text.split(' ') {
+            assert!(
+                joined.contains(word),
+                "{word:?} from the long line should still appear somewhere on screen: {rows:?}"
+            );
+        }
+        assert!(
+            !rows.iter().any(|r| r.contains(long_text)),
+            "the full text should NOT fit on a single 30-column row unwrapped: {rows:?}"
         );
     }
 

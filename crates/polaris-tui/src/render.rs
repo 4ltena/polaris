@@ -357,7 +357,7 @@ fn format_inline(text: &str, base_color: Color) -> Vec<Span<'static>> {
                 }
                 spans.push(Span::styled(
                     rest[start + 1..end].to_string(),
-                    base_style.bg(Color::DarkGray),
+                    base_style.fg(CODE_TEXT_COLOR),
                 ));
                 rest = &rest[end + 1..];
             } else {
@@ -2643,6 +2643,20 @@ mod tests {
         let content = render_history_to_string(&session.messages, 60);
         assert!(content.contains("cargo test"));
         assert!(!content.contains('`'));
+    }
+
+    #[test]
+    fn inline_code_uses_the_code_text_color_not_a_background() {
+        let spans = format_inline("run `git commit` now", Color::Reset);
+        let code_span = spans
+            .iter()
+            .find(|s| s.content.contains("git commit"))
+            .expect("the inline code span should be present");
+        assert!(
+            code_span.style.bg.is_none(),
+            "inline code should carry no background tint"
+        );
+        assert_eq!(code_span.style.fg, Some(CODE_TEXT_COLOR));
     }
 
     #[test]

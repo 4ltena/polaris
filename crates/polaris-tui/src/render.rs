@@ -463,6 +463,23 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
         .collect()
 }
 
+/// Which `history` indices are currently visible, given how far the user
+/// has scrolled back. `scroll_offset == 0` always means "showing the
+/// newest `visible_height` lines" — the caller never has to special-case
+/// "am I following the tail," since this recomputes from `history_len`
+/// fresh every frame (see `lib.rs`'s unified draw loop).
+pub fn visible_history_window(
+    history_len: usize,
+    scroll_offset: usize,
+    visible_height: usize,
+) -> std::ops::Range<usize> {
+    let max_scroll = history_len.saturating_sub(visible_height);
+    let effective_scroll = scroll_offset.min(max_scroll);
+    let end = history_len - effective_scroll;
+    let start = end.saturating_sub(visible_height);
+    start..end
+}
+
 /// Renders each `HistoryLine` into its own single-row slice of `buf`. One
 /// `Paragraph` per row, not one `Paragraph` for the whole block — a
 /// `Paragraph`'s background fill (`buf.set_style` over its full render
@@ -1365,6 +1382,32 @@ mod tests {
     #[test]
     fn shimmer_spans_on_empty_text_is_empty() {
         assert!(shimmer_spans("", Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn the_window_shows_everything_when_history_is_shorter_than_the_viewport() {
+        assert_eq!(visible_history_window(3, 0, 10), 0..3);
+    }
+
+    #[test]
+    fn the_window_shows_the_last_n_lines_when_scroll_offset_is_zero() {
+        assert_eq!(visible_history_window(100, 0, 10), 90..100);
+    }
+
+    #[test]
+    fn a_positive_scroll_offset_shifts_the_window_up() {
+        assert_eq!(visible_history_window(100, 5, 10), 85..95);
+    }
+
+    #[test]
+    fn scroll_offset_is_clamped_at_the_oldest_line() {
+        // Can't scroll further back than showing line 0 at the window's top.
+        assert_eq!(visible_history_window(100, 1000, 10), 0..10);
+    }
+
+    #[test]
+    fn a_zero_height_window_is_always_empty() {
+        assert_eq!(visible_history_window(50, 0, 0), 50..50);
     }
 
     #[test]

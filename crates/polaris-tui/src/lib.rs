@@ -283,6 +283,57 @@ fn draw_frame(
     );
 }
 
+/// The terminal's current (width, height), or a fallback if the size
+/// can't be read (matches the fallback other `run()` call sites already
+/// use — see e.g. `abbreviate_home`'s caller).
+fn terminal_size(terminal: &RefCell<ratatui::DefaultTerminal>) -> (u16, u16) {
+    terminal
+        .borrow()
+        .size()
+        .map(|s| (s.width, s.height))
+        .unwrap_or((80, 24))
+}
+
+fn terminal_width(terminal: &RefCell<ratatui::DefaultTerminal>) -> u16 {
+    terminal_size(terminal).0
+}
+
+fn terminal_height(terminal: &RefCell<ratatui::DefaultTerminal>) -> u16 {
+    terminal_size(terminal).1
+}
+
+/// The history area's height, given the terminal's total height — mirrors
+/// `draw_frame`'s own `Layout::vertical([Constraint::Min(0),
+/// Constraint::Length(FOOTER_HEIGHT)])` split without needing a `Frame`
+/// to do it (mouse-event handling runs outside the `draw` closure).
+///
+/// Duplicates a layout `draw_frame` already computes inline — a future
+/// refactor could have `draw_frame` itself call these helpers, but that's
+/// out of scope for this plan.
+fn area_height_for_history(footer_height: u16, terminal_height: u16) -> u16 {
+    terminal_height.saturating_sub(footer_height)
+}
+
+/// `wrap_history_lines(history, width).len()` — a thin name so call sites
+/// above read as "the wrapped length for selection purposes" rather than
+/// repeating the full `wrap_history_lines(...).len()` expression three
+/// times.
+fn wrapped_len_for_selection(history: &[render::HistoryLine], width: u16) -> usize {
+    render::wrap_history_lines(history, width).len()
+}
+
+/// `visible_history_window`, given everything needed to reproduce exactly
+/// what `draw_frame` used for the current frame.
+fn current_window(
+    history: &[render::HistoryLine],
+    scroll_offset: usize,
+    width: u16,
+    history_area_height: u16,
+) -> std::ops::Range<usize> {
+    let wrapped_len = wrapped_len_for_selection(history, width);
+    render::visible_history_window(wrapped_len, scroll_offset, history_area_height as usize)
+}
+
 pub async fn run(args: RunArgs<'_>) -> ExitCode {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         eprintln!("polaris: refusing to start the TUI on a non-interactive terminal");
@@ -391,6 +442,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // How far back the user has scrolled the history region — 0 always
     // means "following the tail" (see `render::visible_history_window`).
     let mut scroll_offset: usize = 0;
+    // Mouse drag-to-select over the conversation history — see
+    // `selection.rs`. `None` means no active or finalized selection.
+    let mut selection: Option<selection::Selection> = None;
     let startup_width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
     history.extend(render::header_history_lines(
         &render::HeaderInfo {
@@ -511,6 +565,72 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 }
                 MouseEventKind::ScrollDown => {
                     scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                }
+                MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
+                    let history_area_height =
+                        area_height_for_history(FOOTER_HEIGHT, terminal_height(&terminal));
+                    if mouse.row < history_area_height {
+                        let pos = selection::text_pos_from_screen(
+                            wrapped_len_for_selection(&history, terminal_width(&terminal)),
+                            current_window(
+                                &history,
+                                scroll_offset,
+                                terminal_width(&terminal),
+                                history_area_height,
+                            ),
+                            ratatui::layout::Rect::new(
+                                0,
+                                0,
+                                terminal_width(&terminal),
+                                history_area_height,
+                            ),
+                            mouse.row,
+                            mouse.column,
+                        );
+                        selection = Some(selection::Selection {
+                            anchor: pos,
+                            cursor: pos,
+                            dragging: true,
+                        });
+                    }
+                }
+                MouseEventKind::Drag(ratatui::crossterm::event::MouseButton::Left) => {
+                    if let Some(sel) = selection.as_mut()
+                        && sel.dragging
+                    {
+                        let history_area_height =
+                            area_height_for_history(FOOTER_HEIGHT, terminal_height(&terminal));
+                        let width = terminal_width(&terminal);
+                        let wrapped_len = wrapped_len_for_selection(&history, width);
+                        let window =
+                            current_window(&history, scroll_offset, width, history_area_height);
+                        sel.cursor = selection::text_pos_from_screen(
+                            wrapped_len,
+                            window,
+                            ratatui::layout::Rect::new(0, 0, width, history_area_height),
+                            mouse.row,
+                            mouse.column,
+                        );
+                        if mouse.row == 0 {
+                            scroll_offset = scroll_offset.saturating_add(1);
+                        } else if mouse.row + 1 >= history_area_height {
+                            scroll_offset = scroll_offset.saturating_sub(1);
+                        }
+                    }
+                }
+                MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left) => {
+                    if let Some(sel) = selection.as_mut() {
+                        sel.dragging = false;
+                        let width = terminal_width(&terminal);
+                        let wrapped = render::wrap_history_lines(&history, width);
+                        let text = selection::extract_text(&wrapped, sel);
+                        if !text.is_empty() {
+                            status = Status::Notice(apply_selection_copy(
+                                &text,
+                                clipboard::copy_to_clipboard,
+                            ));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1789,9 +1909,6 @@ fn apply_copy_action(
 /// (Tasks 8/11) already has it from `selection::extract_text`, and is
 /// expected to only call this when `text` is non-empty (an empty/zero-
 /// width selection copies nothing and shows no notice at all).
-// Not yet called from production code — Tasks 8/11 wire it into the
-// idle/mid-turn loops on `Up`. Remove this allow once those callers land.
-#[allow(dead_code)]
 fn apply_selection_copy(text: &str, copy_fn: impl FnOnce(&str) -> Result<(), String>) -> String {
     match copy_fn(text) {
         Ok(()) => "copied selection to the clipboard".to_string(),

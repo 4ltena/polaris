@@ -2,7 +2,7 @@
 
 [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) と [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
-## [0.4.0] — 2026-08-24 "Regulus"
+## [0.4.0] — 2026-08-24 "Acubens"
 
 対話TUIを大幅に拡張した。TUI v2(ステータスバー・ツール呼び出しの可視化・Markdown整形)、初回起動時のオンボーディング画面、codex互換サブコマンド、対話中のスラッシュコマンド群、非同期イベントループ化によるライブなステータス表示を追加した。`codex`の実際のソースコード(GitHubから取得)とデスクトップのスクリーンショットを繰り返し参照し、対応する画面要素の見た目・操作感を検証したうえで移植した。
 

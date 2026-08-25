@@ -945,39 +945,35 @@ pub fn render_footer(
 
     // No box around the input line — a bare `\u{203a} ` prompt, matching
     // codex's own composer, with a dim placeholder while empty instead of
-    // an empty bordered box. The gray shading is applied per-span (`.bg`
-    // on the prompt and the text/placeholder spans themselves), not via
-    // the `Paragraph`'s own `.style()` — that fills the *entire* render
-    // area regardless of content, shading empty space past the typed
-    // text all the way to the row's right edge. Matches how a submitted
-    // line looks once it's printed into history (`HistoryLine::shaded`,
-    // set for `Role::User`) — there too, only the actual row content is
-    // filled (see `render_history_into`'s explicit per-cell `bg` set,
-    // which is bounded by `row.width`, not by text length, but a full
-    // history row's "content" already spans the display's whole width by
-    // design, unlike the live input row here).
-    let dark_gray_bg = Style::default().bg(Color::DarkGray);
+    // an empty bordered box. The whole row is shaded gray (via the
+    // `Paragraph`'s own `.style()`, which fills its entire render area —
+    // not just the styled Spans' own cells), matching codex's own
+    // input-box styling and how a submitted line looks once it's printed
+    // into history (`HistoryLine::shaded`, set for `Role::User`).
     let input_line = if input.is_empty() {
         Line::from(vec![
             Span::styled(
                 "\u{203a} ",
-                dark_gray_bg.add_modifier(Modifier::BOLD | Modifier::DIM),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
             ),
             Span::styled(
                 "Ask polaris to do anything",
-                dark_gray_bg.fg(Color::DarkGray),
+                Style::default().fg(Color::DarkGray),
             ),
         ])
     } else {
         Line::from(vec![
             Span::styled(
                 "\u{203a} ",
-                dark_gray_bg.add_modifier(Modifier::BOLD | Modifier::DIM),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
             ),
-            Span::styled(sanitize(input), dark_gray_bg),
+            Span::raw(sanitize(input)),
         ])
     };
-    frame.render_widget(Paragraph::new(input_line), input_area);
+    frame.render_widget(
+        Paragraph::new(input_line).style(Style::default().bg(Color::DarkGray)),
+        input_area,
+    );
 
     // Places the real terminal cursor at `cursor`'s position within the
     // typed text, right after the "\u{203a} " prompt. Terminal emulators
@@ -1614,7 +1610,10 @@ mod tests {
     }
 
     #[test]
-    fn the_input_rows_gray_shading_stops_after_the_typed_text_not_the_whole_row() {
+    fn the_input_rows_gray_shading_spans_the_whole_row_not_just_the_typed_text() {
+        // Matches codex's own input-box styling — confirmed against a real
+        // screenshot — where the whole composer row is shaded, not just
+        // the cells the prompt/typed text happen to occupy.
         let backend = TestBackend::new(60, 6);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -1622,16 +1621,22 @@ mod tests {
             .expect("draw");
         let buffer = terminal.backend().buffer();
         // Row 1 is the input row (status(1) + suggestions(0) = row 1).
-        // "› hi" ends well before column 50 on a 60-wide backend.
+        // "› hi" ends well before column 50 on a 60-wide backend, but the
+        // shading should still reach all the way to the row's right edge.
         assert_eq!(
             buffer[(2, 1)].bg,
             Color::DarkGray,
-            "the prompt/typed-text cells should still be shaded"
+            "the prompt/typed-text cells should be shaded"
         );
-        assert_ne!(
+        assert_eq!(
             buffer[(50, 1)].bg,
             Color::DarkGray,
-            "empty space far past the typed text should not be shaded"
+            "empty space past the typed text should also be shaded, all the way to the row's edge"
+        );
+        assert_eq!(
+            buffer[(59, 1)].bg,
+            Color::DarkGray,
+            "the row's last column should be shaded too"
         );
     }
 

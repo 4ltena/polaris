@@ -106,11 +106,12 @@ fn label(role: Role) -> &'static str {
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
-/// A tool result preview's text color — distinguishes it visually from
-/// ordinary status text without a background tint (which read as
-/// unwanted shading when applied to arbitrary command output, e.g. a
-/// `bash` "git commit").
-const TOOL_RESULT_PREVIEW_COLOR: Color = Color::Rgb(0x98, 0x9d, 0xcc);
+/// The color code (tool result previews, markdown-fenced code blocks in
+/// replies) is shown in — distinguishes it visually from ordinary text
+/// without a background tint, which read as unwanted shading when
+/// applied to arbitrary command output, e.g. a `bash` "git commit", or
+/// to a whole fenced block in a reply.
+const CODE_TEXT_COLOR: Color = Color::Rgb(0x98, 0x9d, 0xcc);
 
 /// The most diff lines (context/added/removed, combined across all hunks)
 /// shown live for one `ToolFinished { diff: Some(_), .. }` event, before the
@@ -193,7 +194,7 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
             for row in format_tool_result_preview(result) {
                 lines.push(HistoryLine::plain(Line::from(Span::styled(
                     row,
-                    Style::default().fg(TOOL_RESULT_PREVIEW_COLOR),
+                    Style::default().fg(CODE_TEXT_COLOR),
                 ))));
             }
             if let Some(d) = diff {
@@ -461,10 +462,7 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
                             if raw_line.trim_start().starts_with("```") {
                                 in_code_block = !in_code_block;
                                 lines.push(HistoryLine {
-                                    line: Line::from(Span::styled(
-                                        String::new(),
-                                        Style::default().bg(Color::DarkGray),
-                                    )),
+                                    line: Line::from(String::new()),
                                     shaded: false,
                                 });
                                 continue;
@@ -478,7 +476,7 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
                                 lines.push(HistoryLine {
                                     line: Line::from(Span::styled(
                                         text,
-                                        Style::default().fg(color).bg(Color::DarkGray),
+                                        Style::default().fg(CODE_TEXT_COLOR),
                                     )),
                                     shaded: false,
                                 });
@@ -2277,7 +2275,7 @@ mod tests {
                 .line
                 .spans
                 .iter()
-                .all(|s| s.style.fg == Some(TOOL_RESULT_PREVIEW_COLOR)),
+                .all(|s| s.style.fg == Some(CODE_TEXT_COLOR)),
             "the preview row's text should use the tinted foreground color"
         );
     }
@@ -2610,6 +2608,30 @@ mod tests {
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD),
             "the 'b' in 'bold' should carry the BOLD modifier"
+        );
+    }
+
+    #[test]
+    fn a_fenced_code_block_uses_the_code_text_color_not_a_background() {
+        let mut session = Session::default();
+        session.push_assistant("```\nfn main() {}\n```");
+
+        let lines = history_lines_for(&session.messages);
+        let code_line = lines
+            .iter()
+            .find(|l| l.line.spans.iter().any(|s| s.content.contains("fn main")))
+            .expect("the code-block content row should be present");
+        assert!(
+            code_line.line.spans.iter().all(|s| s.style.bg.is_none()),
+            "the code-block row should carry no background tint"
+        );
+        assert!(
+            code_line
+                .line
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(CODE_TEXT_COLOR)),
+            "the code-block row's text should use the code text color"
         );
     }
 

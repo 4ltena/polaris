@@ -607,6 +607,34 @@ pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
     ]
 }
 
+/// `header_lines(header)`, framed with a hand-built box-drawing border, as
+/// plain `HistoryLine`s — the header's one-shot equivalent of
+/// `history_lines_for`. Used once at startup (see `lib.rs`'s `run()`) to
+/// seed `history`, replacing the old `insert_before(HEADER_HEIGHT,
+/// render_header_into)` call. Always returns exactly `HEADER_HEIGHT` rows.
+pub fn header_history_lines(header: &HeaderInfo, width: u16) -> Vec<HistoryLine> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let w = width as usize;
+    let inner = w.saturating_sub(2);
+
+    let top = format!("\u{250c}{}\u{2510}", "\u{2500}".repeat(inner));
+    let bottom = format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner));
+
+    let mut out = Vec::with_capacity(HEADER_HEIGHT as usize);
+    out.push(HistoryLine::plain(Line::styled(top, dim)));
+    for content in header_lines(header) {
+        let content_width = content.width();
+        let pad = inner.saturating_sub(content_width);
+        let mut spans = vec![Span::styled("\u{2502}", dim)];
+        spans.extend(content.spans);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled("\u{2502}", dim));
+        out.push(HistoryLine::plain(Line::from(spans)));
+    }
+    out.push(HistoryLine::plain(Line::styled(bottom, dim)));
+    out
+}
+
 /// The header box's fixed print height: 5 content lines + top/bottom
 /// border rows (`Borders::ALL`).
 pub const HEADER_HEIGHT: u16 = 7;
@@ -1312,6 +1340,37 @@ mod tests {
             model_name: "gpt-5.4",
             usage: polaris_provider::Usage::default(),
         }
+    }
+
+    #[test]
+    fn header_history_lines_matches_render_header_into_content_and_width() {
+        let header = test_header();
+        let width = 60u16;
+
+        let lines = header_history_lines(&header, width);
+        assert_eq!(lines.len(), HEADER_HEIGHT as usize);
+
+        // Top and bottom rows are a full-width box-drawing border.
+        let top = lines[0].line.to_string();
+        let bottom = lines[lines.len() - 1].line.to_string();
+        assert!(top.starts_with('\u{250c}') && top.ends_with('\u{2510}'));
+        assert!(bottom.starts_with('\u{2514}') && bottom.ends_with('\u{2518}'));
+        assert_eq!(top.chars().count(), width as usize);
+        assert_eq!(bottom.chars().count(), width as usize);
+
+        // Every content row is framed with the same `│ ... │` as the border
+        // rows imply, and each content row's *text* matches header_lines'
+        // plain (unbordered) content exactly.
+        let plain = header_lines(&header);
+        for (i, plain_line) in plain.iter().enumerate() {
+            let framed = lines[1 + i].line.to_string();
+            assert!(framed.starts_with('\u{2502}') && framed.ends_with('\u{2502}'));
+            assert!(framed.contains(&plain_line.to_string()));
+            assert_eq!(framed.chars().count(), width as usize);
+        }
+
+        // No row is shaded — the header box isn't a user/assistant line.
+        assert!(lines.iter().all(|hl| !hl.shaded));
     }
 
     #[test]

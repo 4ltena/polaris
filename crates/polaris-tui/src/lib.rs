@@ -146,49 +146,6 @@ fn append_live_event(event: &polaris_core::AgentEvent, history: &mut Vec<render:
     history.extend(render::format_event_for_live_print(event));
 }
 
-/// Temporarily switches from the inline viewport to a genuine fullscreen
-/// alternate-screen `Terminal` for the duration of `f` — used around every
-/// picker (`/resume`, `/model`, `/permissions`, `/skills`) and the
-/// approval modal, all of which are designed for a full-screen layout
-/// (`render::render_resume_picker` etc.) rather than the small inline
-/// viewport footer the rest of the loop draws into. `ratatui::Terminal`
-/// can't change its own `Viewport` after construction — it's fixed at
-/// `Terminal::with_options` time — so this swaps in a whole new `Terminal`
-/// for the picker's duration and swaps the original inline one back
-/// afterward, rather than trying to resize the existing one in place.
-fn with_fullscreen_picker<T>(
-    terminal: &RefCell<ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>>,
-    f: impl FnOnce() -> T,
-) -> std::io::Result<T> {
-    use ratatui::crossterm::execute;
-    use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-
-    // Erase the inline viewport's last-drawn frame (header/status/input
-    // box, including whatever slash command was still typed when it was
-    // submitted) before switching away. Leaving it undone means it stays
-    // on the real screen buffer as ordinary scrollback — alternate-screen
-    // switching doesn't touch the main buffer — so the fresh inline
-    // viewport created below on return would be anchored right after it,
-    // making the old frame look like a permanent residue sitting directly
-    // above the new input box.
-    terminal.borrow_mut().clear()?;
-
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
-    let fullscreen =
-        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
-    *terminal.borrow_mut() = fullscreen;
-
-    let result = f();
-
-    execute!(std::io::stdout(), LeaveAlternateScreen)?;
-    let inline = ratatui::try_init_with_options(ratatui::TerminalOptions {
-        viewport: ratatui::Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
-    })?;
-    *terminal.borrow_mut() = inline;
-
-    Ok(result)
-}
-
 fn now_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -474,24 +431,18 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             review_text = Some(review_prompt(&extra));
                         }
                         slash::Action::Resume => {
-                            if with_fullscreen_picker(&terminal, || {
-                                handle_resume(
-                                    &terminal,
-                                    &mut key_reader,
-                                    &args.sessions_dir,
-                                    &cwd_display,
-                                    &mut session,
-                                    &mut session_path,
-                                    &mut meta_path,
-                                    &mut session_started_at_millis,
-                                    &mut status,
-                                    &mut local_lines,
-                                )
-                            })
-                            .is_err()
-                            {
-                                break ExitCode::FAILURE;
-                            }
+                            handle_resume(
+                                &terminal,
+                                &mut key_reader,
+                                &args.sessions_dir,
+                                &cwd_display,
+                                &mut session,
+                                &mut session_path,
+                                &mut meta_path,
+                                &mut session_started_at_millis,
+                                &mut status,
+                                &mut local_lines,
+                            );
                             // A resumed session may be the same length as
                             // (or longer than) what's already printed but
                             // still a genuinely *different* conversation —
@@ -534,45 +485,27 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         slash::Action::Permissions => {
-                            if with_fullscreen_picker(&terminal, || {
-                                handle_permissions(
-                                    &terminal,
-                                    &mut key_reader,
-                                    &mut approval_policy,
-                                    &mut status,
-                                )
-                            })
-                            .is_err()
-                            {
-                                break ExitCode::FAILURE;
-                            }
+                            handle_permissions(
+                                &terminal,
+                                &mut key_reader,
+                                &mut approval_policy,
+                                &mut status,
+                            );
                             continue;
                         }
                         slash::Action::Model => {
-                            if with_fullscreen_picker(&terminal, || {
-                                handle_model(
-                                    &terminal,
-                                    &mut key_reader,
-                                    args.provider.as_ref(),
-                                    &mut model_name,
-                                    &mut effort_name,
-                                    &mut status,
-                                )
-                            })
-                            .is_err()
-                            {
-                                break ExitCode::FAILURE;
-                            }
+                            handle_model(
+                                &terminal,
+                                &mut key_reader,
+                                args.provider.as_ref(),
+                                &mut model_name,
+                                &mut effort_name,
+                                &mut status,
+                            );
                             continue;
                         }
                         slash::Action::Skills => {
-                            if with_fullscreen_picker(&terminal, || {
-                                run_skills_picker(&terminal, &mut key_reader, args.skills)
-                            })
-                            .is_err()
-                            {
-                                break ExitCode::FAILURE;
-                            }
+                            run_skills_picker(&terminal, &mut key_reader, args.skills);
                             status = Status::Idle;
                             continue;
                         }
@@ -675,24 +608,18 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             match slash::parse(&typed) {
                 Some(slash::Action::Review(extra)) => review_prompt(&extra),
                 Some(slash::Action::Resume) => {
-                    if with_fullscreen_picker(&terminal, || {
-                        handle_resume(
-                            &terminal,
-                            &mut key_reader,
-                            &args.sessions_dir,
-                            &cwd_display,
-                            &mut session,
-                            &mut session_path,
-                            &mut meta_path,
-                            &mut session_started_at_millis,
-                            &mut status,
-                            &mut local_lines,
-                        )
-                    })
-                    .is_err()
-                    {
-                        break ExitCode::FAILURE;
-                    }
+                    handle_resume(
+                        &terminal,
+                        &mut key_reader,
+                        &args.sessions_dir,
+                        &cwd_display,
+                        &mut session,
+                        &mut session_path,
+                        &mut meta_path,
+                        &mut session_started_at_millis,
+                        &mut status,
+                        &mut local_lines,
+                    );
                     // Same reasoning as the popup-selection path above: a
                     // resumed session's length alone can't be trusted to
                     // signal "this is a different conversation."
@@ -732,45 +659,27 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     continue;
                 }
                 Some(slash::Action::Permissions) => {
-                    if with_fullscreen_picker(&terminal, || {
-                        handle_permissions(
-                            &terminal,
-                            &mut key_reader,
-                            &mut approval_policy,
-                            &mut status,
-                        )
-                    })
-                    .is_err()
-                    {
-                        break ExitCode::FAILURE;
-                    }
+                    handle_permissions(
+                        &terminal,
+                        &mut key_reader,
+                        &mut approval_policy,
+                        &mut status,
+                    );
                     continue;
                 }
                 Some(slash::Action::Model) => {
-                    if with_fullscreen_picker(&terminal, || {
-                        handle_model(
-                            &terminal,
-                            &mut key_reader,
-                            args.provider.as_ref(),
-                            &mut model_name,
-                            &mut effort_name,
-                            &mut status,
-                        )
-                    })
-                    .is_err()
-                    {
-                        break ExitCode::FAILURE;
-                    }
+                    handle_model(
+                        &terminal,
+                        &mut key_reader,
+                        args.provider.as_ref(),
+                        &mut model_name,
+                        &mut effort_name,
+                        &mut status,
+                    );
                     continue;
                 }
                 Some(slash::Action::Skills) => {
-                    if with_fullscreen_picker(&terminal, || {
-                        run_skills_picker(&terminal, &mut key_reader, args.skills)
-                    })
-                    .is_err()
-                    {
-                        break ExitCode::FAILURE;
-                    }
+                    run_skills_picker(&terminal, &mut key_reader, args.skills);
                     status = Status::Idle;
                     continue;
                 }

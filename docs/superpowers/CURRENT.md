@@ -12,12 +12,12 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `a094280`、`origin/main`と同期・push済み）。`v0.1.0`〜`v0.5.0`はすべてタグ・push済み。`v0.5.0`「`Acubens`」ではなく`v0.4.0`「`Acubens`」・`v0.5.0`「`Regulus`」——版の方針参照。main HEADにはさらに`v0.6.0`「`Spica`」候補(TUIフルスクリーン化計画、全9タスク完了・最終レビュー済み)のコミットも既に統合済みだが、**こちらは意図的に未タグ・未CHANGELOG・未push**(利用者の指示で「v0.5.0まで」に限定してpushしたため。コード自体はリモートに乗っているが、リリースとしては未公開の扱い) |
+| ブランチ | `main`（HEAD `21b89cf`）。`origin/main`は`a094280`(v0.5.0 CHANGELOG)まで同期・push済み。それ以降のローカル3コミット(`3dcb979` CURRENT.md更新、`21b89cf` v0.6.0 CHANGELOG追加)は**利用者の指示で意図的に未push**。`v0.1.0`〜`v0.6.0`まですべてタグ付け済み(ローカル)だが、pushはv0.5.0までで止めている——`v0.6.0`のコード自体は(v0.5.0 push時に)main経由で既にリモートへ乗っているが、タグ・CHANGELOGはリモート未反映 |
 | 進行中の計画 | なし。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktree自体は別の生きたClaude Codeセッション(pid確認済み)がロックしているため未削除のまま残っている——次回セッションで pid が生きていなければ `git worktree remove` で片付けてよい |
-| 直近で終えた計画（main に統合済み・タグ済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
-| 直近で終えた計画（main に統合済み・未タグ） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」候補。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み）。SDD台帳は完了に伴い削除済み |
+| 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
+| 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md`、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress-design.md`、`docs/superpowers/specs/2026-08-25-polaris-tui-fullscreen-scroll-design.md` |
-| 版の方針 | 単一の `vX.Y.Z` を単調に進める方式。2026-08-25、コードネームを「黄道十二星座を明るさ順ではなく神話的な繋がり(各星座の伝統的な星名)で単調に辿る」方式へ確定。確定した対応表: `v0.1.0`=`hamal`(おひつじ座、tag・push済み)、`v0.2.0`=`Aldebaran`(おうし座、tag・push済み)、`v0.3.0`=`Castor`(ふたご座、tag・push済み)、`v0.4.0`=`Acubens`(かに座、tag・push済み)、`v0.5.0`=`Regulus`(しし座、tag・push済み——M4 core・files.md自動生成・ライブ表示改良・Viewport::Inline化)、`v0.6.0`=`Spica`(おとめ座、main統合済みだが**未タグ・未push**——TUIフルスクリーン化)、`v0.7.0`=`Zubenelgenubi`(てんびん座)、`v0.8.0`=`Antares`(さそり座)、`v0.9.0`=`Rukbat`(いて座)、`v0.10.0`=`Algedi`(やぎ座)、`v0.11.0`=`Sadalmelik`(みずがめ座)、`v0.12.0`=`Alrescha`(うお座)。**`v0.6.0`のタグ付け・CHANGELOG反映は利用者の明示的な承認が要る、標準ルール通り**(pushは既にmain経由で完了しているが、リリースとしての確定はまだ) |
+| 版の方針 | 単一の `vX.Y.Z` を単調に進める方式。2026-08-25、コードネームを「黄道十二星座を明るさ順ではなく神話的な繋がり(各星座の伝統的な星名)で単調に辿る」方式へ確定。確定した対応表: `v0.1.0`=`hamal`(おひつじ座、tag・push済み)、`v0.2.0`=`Aldebaran`(おうし座、tag・push済み)、`v0.3.0`=`Castor`(ふたご座、tag・push済み)、`v0.4.0`=`Acubens`(かに座、tag・push済み)、`v0.5.0`=`Regulus`(しし座、tag・push済み——M4 core・files.md自動生成・ライブ表示改良・Viewport::Inline化)、`v0.6.0`=`Spica`(おとめ座、tag済み・**push未実施**——TUIフルスクリーン化・入力欄編集機能拡張)、`v0.7.0`=`Zubenelgenubi`(てんびん座)、`v0.8.0`=`Antares`(さそり座)、`v0.9.0`=`Rukbat`(いて座)、`v0.10.0`=`Algedi`(やぎ座)、`v0.11.0`=`Sadalmelik`(みずがめ座)、`v0.12.0`=`Alrescha`(うお座)。**`v0.6.0`分の push(main分・タグ分とも)は利用者の明示的な承認が要る、標準ルール通り** |
 
 ## マイルストーン
 
@@ -30,8 +30,8 @@
 | M3b | BM25 ルータと評価コーパス | 完了 |
 | M4（`v0.5.0`「`Regulus`」の一部） | subagent、`spawn`、単一波オーケストレーション（継続波は明示的にスコープ外） | 完了。tag・push済み |
 | files.md自動生成・ツール呼び出しライブ表示改良（`v0.5.0`「`Regulus`」の一部） | ディレクトリ別`files.md`の決定的自動生成、`AgentEvent` 通知機構、ツール呼び出し・spawn の逐次表示、write/edit の実差分表示 | 完了。tag・push済み |
-| TUIフルスクリーン化(`v0.6.0`「`Spica`」候補) | `Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定表示、`with_fullscreen_picker`廃止 | 実装完了・全9タスク＋最終レビュー修正wave完了・main統合済み。**未タグ・未CHANGELOG**(pushはmain経由で完了) |
-| M5 | TUI、圧縮、マルチプロバイダ、セッション永続化 | TUI 部分は完了（v0.1.0〜v0.5.0すべてtag・push済み、v0.6.0候補もmain統合済み）。圧縮・マルチプロバイダは未着手 |
+| TUIフルスクリーン化・入力欄編集拡張(`v0.6.0`「`Spica`」) | `Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定表示、`with_fullscreen_picker`廃止、左右カーソル移動、Ctrl+P/N入力履歴 | 完了。tag・CHANGELOG済み、**push未実施**(利用者の指示待ち) |
+| M5 | TUI、圧縮、マルチプロバイダ、セッション永続化 | TUI 部分は完了（v0.1.0〜v0.6.0すべてtag済み、v0.5.0まではpush済み）。圧縮・マルチプロバイダは未着手 |
 
 M1・M2・M2.5 が揃い、v1.0.0 (`hamal`) の水準に達した。API キーを持たない利用者でも `polaris login` から ChatGPT のサブスクリプション認証だけで実モデルへ繋げる経路ができたことで、M1 の受け入れ基準のうち唯一無人では確認できなかった「実キーでの一発実行」を、キー無しで満たせるようになった。タグ付け自体は利用者の承認を待つ準備段階のまま。M3 以降は 1.x として積む。M3a を M2 より先に進めたのも利用者の指示による。
 
@@ -417,11 +417,11 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-25、`v0.4.0`「`Acubens`」・`v0.5.0`「`Regulus`」のタグ・CHANGELOG・pushが完了した直後に書き直した。`cargo test --workspace`(684件全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
+本節は2026-08-25、`v0.6.0`「`Spica`」のCHANGELOG追記・git tagが完了した直後に書き直した(push は利用者の指示で意図的に保留)。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
 
 優先度順:
 
-1. **`v0.6.0`「`Spica`」の確定(CHANGELOG追記・git tag・追加push)を利用者に確認する。** TUIフルスクリーン化(全9タスク＋最終レビュー修正wave)は実装完了・main統合済み・コード自体はpush済みだが、タグ付け・CHANGELOG反映は利用者の明示的な承認が要るため、まだ行っていない
+1. **`v0.6.0`分の`git push`(main分3コミット・`v0.6.0`タグ分)の実施を利用者に確認する。** タグ・CHANGELOGは確定済みだが、push自体はまだ明示的な承認を得ていない
 2. **`worktree-feat-tui-live-progress`の後始末。** 別の生きたセッションのロックで`git worktree remove`が拒否された。そのセッションが終了していれば片付ける
 
 そのうえで v1.0.0 のタグ付けの判断へ進む。

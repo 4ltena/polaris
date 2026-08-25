@@ -328,8 +328,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // Byte offset into `input_buffer`, always on a UTF-8 char boundary —
     // see `input::apply_key`.
     let mut input_cursor: usize = 0;
-    // Session-local Up/Down recall of previously submitted input. Not
-    // persisted — see `input::History`.
+    // Session-local Ctrl+P/Ctrl+N recall of previously submitted input.
+    // Not persisted — see `input::History`.
     let mut input_history = input::History::new();
     // A local copy, not `args.approval_policy` directly — `/permissions`
     // needs to be able to change it for the rest of the session, and
@@ -576,21 +576,24 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             }
         }
 
-        // Up/Down recall previously submitted input, shell-history style —
-        // only once the popup above hasn't already claimed them (it
-        // `continue`s before reaching here whenever `suggestions` is
-        // non-empty).
+        // Ctrl+P/Ctrl+N recall previously submitted input, shell-history
+        // style — the classic readline/Emacs previous-history/next-history
+        // bindings. Not bound to bare Up/Down: those are claimed by
+        // scrolling the conversation history once the slash-popup isn't
+        // showing (see the Up/Down handling further below), and the
+        // scroll design was the one already approved for those keys.
         if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
-            use ratatui::crossterm::event::KeyCode;
+            use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Char('p') if ctrl => {
                     if let Some(recalled) = input_history.older(&input_buffer) {
                         input_buffer = recalled.to_string();
                         input_cursor = input_buffer.len();
                     }
                     continue;
                 }
-                KeyCode::Down => {
+                KeyCode::Char('n') if ctrl => {
                     if let Some(recalled) = input_history.newer() {
                         input_buffer = recalled.to_string();
                         input_cursor = input_buffer.len();

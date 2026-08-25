@@ -751,12 +751,18 @@ pub fn render_footer(
         // full name is still possible but no longer required. Capped at
         // `MAX_DISPLAYED_SUGGESTIONS` (see its doc) since the inline
         // viewport's height can't grow to fit an unbounded match list the
-        // way the old fullscreen layout could.
-        let mut lines: Vec<Line> = suggestions
+        // way the old fullscreen layout could. `window_start` slides the
+        // visible page so the selection is always inside it — pinning to
+        // the first `shown` items regardless of `selected_suggestion`
+        // used to leave the highlight scrolled off-screen once it moved
+        // past the first page.
+        let window_start = selected_suggestion.saturating_sub(shown.saturating_sub(1));
+        let window_end = (window_start + shown).min(suggestions.len());
+        let mut lines: Vec<Line> = suggestions[window_start..window_end]
             .iter()
-            .take(shown)
             .enumerate()
-            .map(|(i, c)| {
+            .map(|(local_i, c)| {
+                let i = window_start + local_i;
                 let is_selected = i == selected_suggestion;
                 let marker = if is_selected { "\u{203a} " } else { "  " };
                 let name_style = if is_selected {
@@ -778,9 +784,10 @@ pub fn render_footer(
                 ])
             })
             .collect();
-        if truncated {
+        let below = suggestions.len() - window_end;
+        if below > 0 {
             lines.push(Line::from(Span::styled(
-                format!("  \u{2026} {} more, keep typing", suggestions.len() - shown),
+                format!("  \u{2026} {below} more, keep typing"),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -792,35 +799,39 @@ pub fn render_footer(
 
     // No box around the input line — a bare `\u{203a} ` prompt, matching
     // codex's own composer, with a dim placeholder while empty instead of
-    // an empty bordered box. The whole row is shaded gray (via the
-    // `Paragraph`'s own `.style()`, which fills its entire render area —
-    // not just the styled Spans' own cells) matching codex's own input-box
-    // styling, and matching how a submitted line looks once it's printed
-    // into history (`HistoryLine::shaded`, set for `Role::User`).
+    // an empty bordered box. The gray shading is applied per-span (`.bg`
+    // on the prompt and the text/placeholder spans themselves), not via
+    // the `Paragraph`'s own `.style()` — that fills the *entire* render
+    // area regardless of content, shading empty space past the typed
+    // text all the way to the row's right edge. Matches how a submitted
+    // line looks once it's printed into history (`HistoryLine::shaded`,
+    // set for `Role::User`) — there too, only the actual row content is
+    // filled (see `render_history_into`'s explicit per-cell `bg` set,
+    // which is bounded by `row.width`, not by text length, but a full
+    // history row's "content" already spans the display's whole width by
+    // design, unlike the live input row here).
+    let dark_gray_bg = Style::default().bg(Color::DarkGray);
     let input_line = if input.is_empty() {
         Line::from(vec![
             Span::styled(
                 "\u{203a} ",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+                dark_gray_bg.add_modifier(Modifier::BOLD | Modifier::DIM),
             ),
             Span::styled(
                 "Ask polaris to do anything",
-                Style::default().fg(Color::DarkGray),
+                dark_gray_bg.fg(Color::DarkGray),
             ),
         ])
     } else {
         Line::from(vec![
             Span::styled(
                 "\u{203a} ",
-                Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+                dark_gray_bg.add_modifier(Modifier::BOLD | Modifier::DIM),
             ),
-            Span::raw(sanitize(input)),
+            Span::styled(sanitize(input), dark_gray_bg),
         ])
     };
-    frame.render_widget(
-        Paragraph::new(input_line).style(Style::default().bg(Color::DarkGray)),
-        input_area,
-    );
+    frame.render_widget(Paragraph::new(input_line), input_area);
 
     // Places the real terminal cursor at `cursor`'s position within the
     // typed text, right after the "\u{203a} " prompt. Terminal emulators
@@ -1431,6 +1442,51 @@ mod tests {
         assert!(content.contains("Cargo.toml"));
         let lines = history_lines_for(&session.messages);
         assert!(lines[0].shaded);
+    }
+
+    #[test]
+    fn the_suggestion_window_scrolls_to_keep_the_selection_visible() {
+        // 16 real commands, more than MAX_DISPLAYED_SUGGESTIONS (8) — the
+        // window must scroll to follow selection past the first page,
+        // not stay pinned to the first 8 forever.
+        let all: Vec<&crate::slash::SlashCommand> = crate::slash::COMMANDS.iter().collect();
+        let last = all.len() - 1;
+        let header = test_header();
+        let content = render_footer_to_string("/", &Status::Idle, &header, &all, last, 80, 20);
+        assert!(
+            content.contains(all[last].name),
+            "the selected (last) command's name should be visible once scrolled to: {content}"
+        );
+    }
+
+    #[test]
+    fn the_suggestion_window_still_shows_the_first_page_when_selection_is_near_the_top() {
+        let all: Vec<&crate::slash::SlashCommand> = crate::slash::COMMANDS.iter().collect();
+        let header = test_header();
+        let content = render_footer_to_string("/", &Status::Idle, &header, &all, 0, 80, 20);
+        assert!(content.contains(all[0].name));
+    }
+
+    #[test]
+    fn the_input_rows_gray_shading_stops_after_the_typed_text_not_the_whole_row() {
+        let backend = TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_footer(f, f.area(), "hi", 2, &Status::Idle, &test_header(), &[], 0))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        // Row 1 is the input row (status(1) + suggestions(0) = row 1).
+        // "› hi" ends well before column 50 on a 60-wide backend.
+        assert_eq!(
+            buffer[(2, 1)].bg,
+            Color::DarkGray,
+            "the prompt/typed-text cells should still be shaded"
+        );
+        assert_ne!(
+            buffer[(50, 1)].bg,
+            Color::DarkGray,
+            "empty space far past the typed text should not be shaded"
+        );
     }
 
     #[test]

@@ -106,6 +106,12 @@ fn label(role: Role) -> &'static str {
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
+/// A tool result preview's text color — distinguishes it visually from
+/// ordinary status text without a background tint (which read as
+/// unwanted shading when applied to arbitrary command output, e.g. a
+/// `bash` "git commit").
+const TOOL_RESULT_PREVIEW_COLOR: Color = Color::Rgb(0x98, 0x9d, 0xcc);
+
 /// The most diff lines (context/added/removed, combined across all hunks)
 /// shown live for one `ToolFinished { diff: Some(_), .. }` event, before the
 /// rest is elided with a notice row — the live-print analog of
@@ -187,7 +193,7 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
             for row in format_tool_result_preview(result) {
                 lines.push(HistoryLine::plain(Line::from(Span::styled(
                     row,
-                    Style::default().add_modifier(Modifier::DIM),
+                    Style::default().fg(TOOL_RESULT_PREVIEW_COLOR),
                 ))));
             }
             if let Some(d) = diff {
@@ -2245,12 +2251,12 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_result_preview_row_carries_no_background() {
+    fn a_tool_result_preview_row_carries_no_background_and_a_tinted_foreground() {
         // A tool result preview covers arbitrary command output (e.g. a
         // `bash` "git commit"), not just source code read via `read` — a
         // DarkGray background applied indiscriminately to every preview
         // line looked like unwanted shading bleeding outside the input
-        // prompt. Plain dim text only, no background tint.
+        // prompt. Distinguished by foreground color instead (#989DCC).
         let lines = format_event_for_live_print(&AgentEvent::ToolFinished {
             name: "read".to_string(),
             detail: "{}".to_string(),
@@ -2265,6 +2271,14 @@ mod tests {
         assert!(
             preview_line.line.spans.iter().all(|s| s.style.bg.is_none()),
             "the preview row should carry no background tint"
+        );
+        assert!(
+            preview_line
+                .line
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(TOOL_RESULT_PREVIEW_COLOR)),
+            "the preview row's text should use the tinted foreground color"
         );
     }
 

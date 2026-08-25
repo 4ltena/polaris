@@ -400,6 +400,33 @@ impl HistoryLine {
 /// stream via `format_event_for_live_print` — formatting it here too
 /// would print every tool call a second time when the finished turn's
 /// messages are batch-printed.
+/// Recognizes a block-level `#`-`######` heading or a `-`/`*` bullet at the
+/// start of a line and returns the line with its marker replaced/stripped,
+/// plus whether it was a heading (the caller bolds the whole line for a
+/// heading; a bullet's substituted `•` needs no extra styling). Only
+/// called outside a fenced code block — a `#`/`-` inside one is literal
+/// text, not markdown.
+fn strip_block_markdown(raw_line: &str) -> (String, bool) {
+    let trimmed = raw_line.trim_start();
+    let indent = &raw_line[..raw_line.len() - trimmed.len()];
+
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        return (format!("{indent}\u{2022} {rest}"), false);
+    }
+
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes)
+        && let Some(rest) = trimmed[hashes..].strip_prefix(' ')
+    {
+        return (rest.to_string(), true);
+    }
+
+    (raw_line.to_string(), false)
+}
+
 pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryLine> {
     messages
         .iter()
@@ -435,12 +462,12 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
                                 });
                                 continue;
                             }
-                            let text = if i == 0 {
-                                format!("{prefix}{raw_line}")
-                            } else {
-                                raw_line.to_string()
-                            };
                             if in_code_block {
+                                let text = if i == 0 {
+                                    format!("{prefix}{raw_line}")
+                                } else {
+                                    raw_line.to_string()
+                                };
                                 lines.push(HistoryLine {
                                     line: Line::from(Span::styled(
                                         text,
@@ -449,8 +476,20 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
                                     shaded: false,
                                 });
                             } else {
+                                let (body, is_heading) = strip_block_markdown(raw_line);
+                                let text = if i == 0 {
+                                    format!("{prefix}{body}")
+                                } else {
+                                    body
+                                };
+                                let mut spans = format_inline(&text, color);
+                                if is_heading {
+                                    for span in &mut spans {
+                                        span.style = span.style.add_modifier(Modifier::BOLD);
+                                    }
+                                }
                                 lines.push(HistoryLine {
-                                    line: Line::from(format_inline(&text, color)),
+                                    line: Line::from(spans),
                                     shaded,
                                 });
                             }
@@ -2251,6 +2290,178 @@ mod tests {
         let content = render_history_to_string(&session.messages, 60);
         assert!(content.contains("cargo test"));
         assert!(!content.contains('`'));
+    }
+
+    #[test]
+    fn a_level_1_heading_strips_the_hash_and_renders_bold() {
+        let mut session = Session::default();
+        session.push_assistant("# Title");
+
+        let lines = history_lines_for(&session.messages);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "polaris: Title");
+        assert!(
+            lines[0]
+                .line
+                .spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "every span of a heading line should be bold"
+        );
+    }
+
+    #[test]
+    fn heading_levels_2_through_6_all_strip_their_hashes() {
+        let mut session = Session::default();
+        for level in 2..=6 {
+            session.push_assistant(&format!("{} h{level}", "#".repeat(level)));
+        }
+
+        let lines = history_lines_for(&session.messages);
+        for (i, line) in lines.iter().enumerate() {
+            let text: String = line.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, format!("polaris: h{}", i + 2));
+        }
+    }
+
+    #[test]
+    fn a_bold_span_inside_a_heading_is_still_bold_and_the_markers_are_gone() {
+        let mut session = Session::default();
+        session.push_assistant("## has **emphasis** inside");
+
+        let lines = history_lines_for(&session.messages);
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "polaris: has emphasis inside");
+        assert!(!text.contains('*'));
+        assert!(
+            lines[0]
+                .line
+                .spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn a_hash_without_a_following_space_is_not_a_heading() {
+        let mut session = Session::default();
+        session.push_assistant("#nothashheading");
+
+        let lines = history_lines_for(&session.messages);
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "polaris: #nothashheading");
+        assert!(
+            !lines[0]
+                .line
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn a_hash_inside_a_code_block_is_not_treated_as_a_heading() {
+        let mut session = Session::default();
+        session.push_assistant("```\n# not a heading\n```");
+
+        let lines = history_lines_for(&session.messages);
+        let inside = lines
+            .iter()
+            .find(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .any(|s| s.content.contains("not a heading"))
+            })
+            .expect("the code-block line should be present");
+        let text: String = inside
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "# not a heading");
+    }
+
+    #[test]
+    fn a_top_level_bullet_renders_with_a_bullet_marker_and_no_dash() {
+        let mut session = Session::default();
+        session.push_assistant("- first item");
+
+        let lines = history_lines_for(&session.messages);
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "polaris: \u{2022} first item");
+    }
+
+    #[test]
+    fn a_star_bullet_also_renders_with_a_bullet_marker() {
+        let mut session = Session::default();
+        session.push_assistant("* first item");
+
+        let lines = history_lines_for(&session.messages);
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "polaris: \u{2022} first item");
+    }
+
+    #[test]
+    fn a_nested_bullet_keeps_its_leading_indentation() {
+        let mut session = Session::default();
+        session.push_assistant("top\n  - nested item");
+
+        let lines = history_lines_for(&session.messages);
+        assert_eq!(lines.len(), 2);
+        let text: String = lines[1]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "  \u{2022} nested item");
+    }
+
+    #[test]
+    fn a_dash_inside_a_code_block_is_not_treated_as_a_bullet() {
+        let mut session = Session::default();
+        session.push_assistant("```\n- not a bullet\n```");
+
+        let lines = history_lines_for(&session.messages);
+        let inside = lines
+            .iter()
+            .find(|l| l.line.spans.iter().any(|s| s.content.contains("bullet")))
+            .expect("the code-block line should be present");
+        let text: String = inside
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "- not a bullet");
     }
 
     #[test]

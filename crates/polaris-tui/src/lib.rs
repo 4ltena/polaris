@@ -96,83 +96,54 @@ fn abbreviate_home(path: &std::path::Path) -> String {
 /// sizing to fit an unbounded match list.
 const INLINE_VIEWPORT_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1;
 
-/// Prints every `session.messages` entry and every `local_lines` entry
-/// added since the last call, once each, via `terminal.insert_before`.
-/// This is the one-shot analogue of the old full-redraw history pane: each
-/// line is printed to the real terminal exactly once and never touched
-/// again, which is what lets it live in the terminal's own scrollback.
-/// Advances `printed_messages`/`printed_local_lines` to the new lengths —
-/// callers that reset a session wholesale (`/resume`, `/new`, `/fork`,
-/// `/clear`) must reset both counters to 0 first so the *next* call here
-/// reprints the (new) session from scratch, since a resumed/forked session
-/// has never been printed to this particular terminal.
-fn print_new_history(
-    terminal: &RefCell<ratatui::Terminal<impl ratatui::backend::Backend>>,
+/// Appends every `session.messages` entry and every `local_lines` entry
+/// added since the last call to `history`, once each — the in-memory
+/// analogue of the old `insert_before`-based one-shot terminal print.
+/// Advances `printed_messages`/`printed_local_lines` to the new lengths.
+/// Callers that reset a session wholesale (`/resume`, `/new`, `/fork`,
+/// `/clear`) must reset both counters to 0 *and* clear `history` — see
+/// each call site in `run()`.
+fn append_new_history(
     session: &polaris_core::session::Session,
     local_lines: &[ratatui::text::Line<'static>],
     printed_messages: &mut usize,
     printed_local_lines: &mut usize,
-) -> std::io::Result<()> {
+    history: &mut Vec<render::HistoryLine>,
+) {
     // A session that's now *shorter* than what's already been printed
     // (`/clear`, `/new`) can only mean it was reset out from under us —
     // reprint from scratch. This alone doesn't catch `/resume` loading a
     // same-or-longer *different* session, which is why every `/resume`
-    // call site also resets both counters explicitly right after loading.
+    // call site also resets both counters (and `history`) explicitly.
     if *printed_messages > session.messages.len() {
         *printed_messages = 0;
+        history.clear();
     }
     if *printed_local_lines > local_lines.len() {
         *printed_local_lines = 0;
+        history.clear();
     }
     if session.messages.len() > *printed_messages {
         let lines = render::history_lines_for(&session.messages[*printed_messages..]);
-        if !lines.is_empty() {
-            let height = lines.len() as u16;
-            terminal.borrow_mut().insert_before(height, |buf| {
-                render::render_history_into(buf, buf.area, &lines)
-            })?;
-        }
+        history.extend(lines);
         *printed_messages = session.messages.len();
     }
     if local_lines.len() > *printed_local_lines {
         let new_lines = &local_lines[*printed_local_lines..];
-        let height = new_lines.len() as u16;
-        terminal.borrow_mut().insert_before(height, |buf| {
-            let owned: Vec<render::HistoryLine> = new_lines
-                .iter()
-                .map(|l| render::HistoryLine {
-                    line: l.clone(),
-                    shaded: false,
-                })
-                .collect();
-            render::render_history_into(buf, buf.area, &owned)
-        })?;
+        history.extend(new_lines.iter().map(|l| render::HistoryLine {
+            line: l.clone(),
+            shaded: false,
+        }));
         *printed_local_lines = local_lines.len();
     }
-    Ok(())
 }
 
-/// Prints one mid-turn `AgentEvent` straight into the terminal's own
-/// scrollback, the same one-shot way `print_new_history` prints confirmed
-/// conversation lines. Nothing is remembered about what was printed:
-/// these lines are never reprinted, and the post-turn batch print
-/// deliberately leaves tool activity out (see `render::history_lines_for`)
-/// so it can't appear twice.
-fn print_live_event(
-    terminal: &RefCell<ratatui::Terminal<impl ratatui::backend::Backend>>,
-    event: &polaris_core::AgentEvent,
-) -> std::io::Result<()> {
-    let lines = render::format_event_for_live_print(event);
-    if lines.is_empty() {
-        return Ok(());
-    }
-    let height = lines.len() as u16;
-    terminal
-        .borrow_mut()
-        .insert_before(height, |buf| {
-            render::render_history_into(buf, buf.area, &lines)
-        })
-        .map(|_| ())
+/// Appends one mid-turn `AgentEvent`'s formatted lines to `history` — the
+/// in-memory analogue of the old one-shot live print. `history_lines_for`
+/// deliberately leaves tool activity out of its own output (see its own
+/// doc comment) so appending this separately can't duplicate it.
+fn append_live_event(event: &polaris_core::AgentEvent, history: &mut Vec<render::HistoryLine>) {
+    history.extend(render::format_event_for_live_print(event));
 }
 
 /// Temporarily switches from the inline viewport to a genuine fullscreen
@@ -279,10 +250,11 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // and each conversation turn land in the terminal's *own* scrollback,
     // recoverable by scrolling the terminal itself, while only a small
     // fixed region at the bottom is ever repainted). The header and every
-    // conversation turn are printed once via `terminal.insert_before(...)`
-    // (see `print_new_history` below) and never redrawn; only the small
-    // `INLINE_VIEWPORT_HEIGHT`-tall region (suggestions/status/input/
-    // footer, drawn by `render::render_footer`) is redrawn every frame.
+    // conversation turn are appended once to the in-memory `history`
+    // buffer (see `append_new_history` below) and never touched again;
+    // only the small `INLINE_VIEWPORT_HEIGHT`-tall region (suggestions/
+    // status/input/footer, drawn by `render::render_footer`) is redrawn
+    // every frame. `history` isn't rendered yet — that's a later task.
     // `ratatui::init_with_options` enables raw mode but — unlike `init()`
     // — deliberately does not enter the alternate screen, which is what
     // makes real scrollback possible.
@@ -290,34 +262,30 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         viewport: ratatui::Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
     }));
     // How many `session.messages` / `local_lines` entries have already
-    // been printed to the real scrollback via `insert_before`. Only the
-    // delta past this point gets printed on each call to
-    // `print_new_history` — printing is one-shot, never a redraw, so
-    // re-printing an already-printed line would duplicate it in the
-    // user's terminal history instead of updating anything in place.
+    // been appended to `history`. Only the delta past this point gets
+    // appended on each call to `append_new_history` — appending is
+    // one-shot, never a redraw, so re-appending an already-appended line
+    // would duplicate it in `history` instead of updating anything in
+    // place.
     let mut printed_messages = 0usize;
     let mut printed_local_lines = 0usize;
-    if terminal
-        .borrow_mut()
-        .insert_before(render::HEADER_HEIGHT, |buf| {
-            render::render_header_into(
-                buf,
-                buf.area,
-                &render::HeaderInfo {
-                    provider_name: &args.provider_name,
-                    model_name: &args.model_name,
-                    usage: polaris_provider::Usage::default(),
-                    cwd: &args.cwd.display().to_string(),
-                    cwd_short: "",
-                    effort_name: "",
-                },
-            )
-        })
-        .is_err()
-    {
-        ratatui::restore();
-        return ExitCode::FAILURE;
-    }
+    // The in-memory scrollable history buffer — accumulates every line
+    // that used to be printed one-shot to the terminal's native scrollback
+    // via `insert_before`. Not yet rendered (see `render::visible_history_window`
+    // and the fullscreen draw loop, wired up in a later task).
+    let mut history: Vec<render::HistoryLine> = Vec::new();
+    let startup_width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+    history.extend(render::header_history_lines(
+        &render::HeaderInfo {
+            provider_name: &args.provider_name,
+            model_name: &args.model_name,
+            usage: polaris_provider::Usage::default(),
+            cwd: &args.cwd.display().to_string(),
+            cwd_short: "",
+            effort_name: "",
+        },
+        startup_width,
+    ));
 
     let cwd_display = args.cwd.display().to_string();
     // Shown only in the footer — verified against a real codex
@@ -376,17 +344,13 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         // reset) before redrawing the small footer viewport — printing is
         // one-shot and must happen before the footer draw so the newly
         // printed lines appear above it, not interleaved mid-frame.
-        if print_new_history(
-            &terminal,
+        append_new_history(
             &session,
             &local_lines,
             &mut printed_messages,
             &mut printed_local_lines,
-        )
-        .is_err()
-        {
-            break ExitCode::FAILURE;
-        }
+            &mut history,
+        );
         if terminal
             .borrow_mut()
             .draw(|f| {
@@ -476,10 +440,11 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             // (or longer than) what's already printed but
                             // still a genuinely *different* conversation —
                             // the length-shrunk check inside
-                            // `print_new_history` can't detect that case,
+                            // `append_new_history` can't detect that case,
                             // so reset explicitly here.
                             printed_messages = 0;
                             printed_local_lines = 0;
+                            history.clear();
                             continue;
                         }
                         slash::Action::New => {
@@ -492,6 +457,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &mut status,
                                 &mut local_lines,
                             );
+                            printed_messages = 0;
+                            printed_local_lines = 0;
+                            history.clear();
                             continue;
                         }
                         slash::Action::Fork => {
@@ -504,6 +472,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &mut session_started_at_millis,
                                 &mut status,
                             );
+                            printed_messages = 0;
+                            printed_local_lines = 0;
+                            history.clear();
                             continue;
                         }
                         slash::Action::Permissions => {
@@ -652,6 +623,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     // signal "this is a different conversation."
                     printed_messages = 0;
                     printed_local_lines = 0;
+                    history.clear();
                     continue;
                 }
                 Some(slash::Action::New) => {
@@ -664,6 +636,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &mut status,
                         &mut local_lines,
                     );
+                    printed_messages = 0;
+                    printed_local_lines = 0;
+                    history.clear();
                     continue;
                 }
                 Some(slash::Action::Fork) => {
@@ -676,6 +651,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &mut session_started_at_millis,
                         &mut status,
                     );
+                    printed_messages = 0;
+                    printed_local_lines = 0;
+                    history.clear();
                     continue;
                 }
                 Some(slash::Action::Permissions) => {
@@ -776,17 +754,13 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         // appear until the *next* top-of-loop print, which only happens
         // after the assistant's reply finishes too, making the user's own
         // input look laggy instead of showing up the instant it's sent.
-        if print_new_history(
-            &terminal,
+        append_new_history(
             &session,
             &local_lines,
             &mut printed_messages,
             &mut printed_local_lines,
-        )
-        .is_err()
-        {
-            break ExitCode::FAILURE;
-        }
+            &mut history,
+        );
         if terminal
             .borrow_mut()
             .draw(|f| {
@@ -850,8 +824,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             // may have started, only stops *waiting* on the turn.
             // The tick-redraw branch below only redraws the footer
             // (status row's elapsed-time/shimmer) — it never needs to read
-            // `session` at all now that history is printed once via
-            // `print_new_history` rather than redrawn from it every frame,
+            // `session` at all now that history is appended once via
+            // `append_new_history` rather than redrawn from it every frame,
             // so no snapshot is needed to sidestep `agent_future`'s
             // mutable borrow of `session` below. Mid-turn tool activity
             // reaches the screen through `events_rx` instead, which
@@ -896,9 +870,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     // display work. Anything still queued when the turn
                     // finishes is drained right after this loop.
                     Some(event) = events_rx.recv() => {
-                        if print_live_event(&terminal, &event).is_err() {
-                            break TurnOutcome::Fatal;
-                        }
+                        append_live_event(&event, &mut history);
                     }
                     _ = ticker.tick() => {
                         status = Status::Thinking { elapsed: turn_started.elapsed() };
@@ -906,7 +878,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         // comment above `agent_future`) — only the status
                         // row's shimmer/elapsed time animates, so this
                         // only needs the footer redrawn, never a new
-                        // `print_new_history` call.
+                        // `append_new_history` call.
                         if terminal
                             .borrow_mut()
                             .draw(|f| {
@@ -953,14 +925,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             // events of a turn can still be sitting in the queue here —
             // print them rather than silently dropping the final tool's
             // result marker.
-            let mut final_outcome = turn_outcome;
             while let Ok(event) = events_rx.try_recv() {
-                if print_live_event(&terminal, &event).is_err() {
-                    final_outcome = TurnOutcome::Fatal;
-                    break;
-                }
+                append_live_event(&event, &mut history);
             }
-            final_outcome
+            turn_outcome
         };
 
         match outcome {
@@ -1622,6 +1590,89 @@ mod tests {
         fn read_key(&mut self) -> std::io::Result<KeyCode> {
             Ok(self.0.pop_front().unwrap_or(KeyCode::Null))
         }
+    }
+
+    #[test]
+    fn append_new_history_appends_only_the_unprinted_tail() {
+        let mut session = polaris_core::session::Session::default();
+        session.push_user("first");
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut history = Vec::new();
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        let after_first = history.len();
+        assert!(after_first > 0);
+
+        session.push_assistant("reply");
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert!(
+            history.len() > after_first,
+            "the assistant reply should have been appended, not reprinted from scratch"
+        );
+
+        // Calling again with nothing new appends nothing.
+        let stable = history.len();
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(history.len(), stable);
+    }
+
+    #[test]
+    fn append_new_history_self_corrects_when_the_session_shrinks() {
+        let mut session = polaris_core::session::Session::default();
+        session.push_user("first");
+        session.push_assistant("reply");
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut history = Vec::new();
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(printed_messages, 2);
+
+        // Simulates /clear: the session shrinks out from under the counters.
+        session.messages.clear();
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(printed_messages, 0);
+    }
+
+    #[test]
+    fn append_live_event_appends_formatted_lines() {
+        let mut history = Vec::new();
+        let event = polaris_core::AgentEvent::ToolStarted {
+            name: "read".to_string(),
+            detail: "Cargo.toml".to_string(),
+        };
+        append_live_event(&event, &mut history);
+        assert!(!history.is_empty());
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -113,6 +113,12 @@ fn abbreviate_home(path: &std::path::Path) -> String {
 // input pad-above(1) + input(1) + input pad-below(1) + footer(1).
 const FOOTER_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1 + 1;
 
+/// How many `scroll_offset` lines one mouse/trackpad wheel tick moves —
+/// a single line per tick feels sluggish for wheel input, unlike a key
+/// press (see `PageUp`/`PageDown`'s own `+1`, which is a deliberate,
+/// discrete step).
+const MOUSE_SCROLL_LINES: usize = 3;
+
 /// How long a `Ctrl+O` copy confirmation stays visible mid-turn before the
 /// `Thinking` animation resumes — see `mid_turn_notice_until` in `run()`.
 /// Long enough for a normal glance-at-the-screen reaction, short enough
@@ -345,17 +351,18 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
         viewport: ratatui::Viewport::Fullscreen,
     }));
-    // Deliberately never enables mouse capture (`EnableMouseCapture`) — the
-    // terminal's own native mouse handling stays untouched, so drag-select
-    // and copy work exactly as they do in any ordinary terminal program.
-    // Enabling it would let a wheel-scroll feature work, but at the cost of
-    // the terminal routing every mouse event (including drag-select) to
-    // this process instead of handling it locally — the two can't coexist
-    // (codex's own TUI makes the same trade: see its `codex-rs` source,
-    // which has no mouse-handling code anywhere in the workspace). Scroll
-    // via PageUp/PageDown instead; copy the last reply via `Ctrl+O`/`/copy`
-    // (see `clipboard.rs`), which doesn't depend on terminal selection at
-    // all.
+    // Trackpad/mouse wheel scrolling of the conversation history, and mouse
+    // drag-to-select (see `selection.rs`) — without this, crossterm never
+    // emits `Event::Mouse` at all. This blocks the terminal's own native
+    // mouse handling (including drag-select) while polaris is running — see
+    // `selection.rs`'s module doc for why polaris implements its own
+    // selection instead of relying on that. Best-effort: a terminal that
+    // doesn't support mouse reporting just keeps not sending mouse events,
+    // same as before.
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableMouseCapture
+    );
     // A thin bar cursor, not the terminal's default (usually a full
     // blinking block) — a block cursor fully inverts whatever glyph sits
     // in that cell, so parking it over the empty input box's placeholder
@@ -496,6 +503,19 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             Ok(e) => e,
             Err(_) => break ExitCode::FAILURE,
         };
+        if let ratatui::crossterm::event::Event::Mouse(mouse) = &event {
+            use ratatui::crossterm::event::MouseEventKind;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    scroll_offset = scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
+                }
+                MouseEventKind::ScrollDown => {
+                    scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                }
+                _ => {}
+            }
+            continue;
+        }
         let ratatui::crossterm::event::Event::Key(key) = event else {
             continue;
         };
@@ -1169,7 +1189,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         }
                     }
                     maybe_event = event_stream.next() => {
-                        use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+                        use ratatui::crossterm::event::{
+                            Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+                        };
                         match maybe_event {
                             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                                 // Esc interrupts the in-flight turn;
@@ -1233,6 +1255,17 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                     _ => {}
                                 }
                             }
+                            Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    scroll_offset =
+                                        scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    scroll_offset =
+                                        scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                                }
+                                _ => {}
+                            },
                             Some(Ok(_)) => {}
                             Some(Err(_)) | None => break TurnOutcome::Fatal,
                         }
@@ -1299,6 +1332,15 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::cursor::SetCursorStyle::DefaultUserShape
+    );
+    // Undoes the EnableMouseCapture set at startup — best-effort, same as
+    // the enable itself. Otherwise mouse reporting mode would leak into
+    // whatever the user's shell does next (e.g. text selection with the
+    // mouse would stop working until they open and close another
+    // mouse-reporting program).
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture
     );
     if let Some(msg) = fatal_message {
         eprintln!("{msg}");

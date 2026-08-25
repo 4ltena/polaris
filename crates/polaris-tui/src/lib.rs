@@ -254,6 +254,7 @@ fn draw_frame(
     header: &render::HeaderInfo,
     suggestions: &[&crate::slash::SlashCommand],
     selected_suggestion: usize,
+    selection: &Option<selection::Selection>,
 ) {
     let area = frame.area();
     let [history_area, footer_area] = ratatui::layout::Layout::vertical([
@@ -269,7 +270,10 @@ fn draw_frame(
     let wrapped = render::wrap_history_lines(history, history_area.width);
     let window =
         render::visible_history_window(wrapped.len(), scroll_offset, history_area.height as usize);
-    render::render_history_into(frame.buffer_mut(), history_area, &wrapped[window]);
+    render::render_history_into(frame.buffer_mut(), history_area, &wrapped[window.clone()]);
+    if let Some(sel) = selection {
+        render::apply_selection_highlight(frame.buffer_mut(), history_area, window, &wrapped, sel);
+    }
 
     render::render_footer(
         frame,
@@ -546,6 +550,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     },
                     &suggestions,
                     selected_suggestion,
+                    &selection,
                 )
             })
             .is_err()
@@ -1152,6 +1157,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     // Submit branch, so there's nothing to suggest against.
                     &[],
                     0,
+                    &selection,
                 )
             })
             .is_err()
@@ -1301,6 +1307,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                     },
                                     &[],
                                     0,
+                                    &selection,
                                 )
                             })
                             .is_err()
@@ -1365,6 +1372,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                                     },
                                                     &[],
                                                     0,
+                                                    &selection,
                                                 )
                                             })
                                             .is_err()
@@ -2149,6 +2157,7 @@ mod tests {
                     },
                     &[],
                     0,
+                    &None,
                 )
             })
             .expect("draw");
@@ -2207,6 +2216,7 @@ mod tests {
                     },
                     &[],
                     0,
+                    &None,
                 )
             })
             .expect("draw");
@@ -2228,6 +2238,66 @@ mod tests {
         assert!(
             !rows.iter().any(|r| r.contains(long_text)),
             "the full text should NOT fit on a single 30-column row unwrapped: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn draw_frame_highlights_an_active_selection() {
+        // Tall enough that `FOOTER_HEIGHT` doesn't eat the whole viewport
+        // and leave zero rows for the history area (matches the height the
+        // other `draw_frame` tests in this module use).
+        let backend = ratatui::backend::TestBackend::new(40, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        // `HistoryLine::plain` is private to `render.rs` — this test lives in
+        // `lib.rs`'s own test module, a different module, so it must build
+        // `HistoryLine` via its public fields directly (both `line` and
+        // `shaded` are `pub`), matching how the two existing `draw_frame`
+        // tests in this same module already do it (grep `render::HistoryLine {`
+        // in `lib.rs`).
+        let history = vec![render::HistoryLine {
+            line: ratatui::text::Line::from("select me"),
+            shaded: false,
+        }];
+        let sel = Some(selection::Selection {
+            anchor: selection::TextPos { line: 0, col: 0 },
+            cursor: selection::TextPos { line: 0, col: 6 },
+            dragging: false,
+        });
+        terminal
+            .draw(|f| {
+                draw_frame(
+                    f,
+                    &history,
+                    0,
+                    "",
+                    0,
+                    &Status::Idle,
+                    &render::HeaderInfo {
+                        provider_name: "openai",
+                        model_name: "gpt-5.4",
+                        usage: polaris_provider::Usage::default(),
+                        cwd: "/tmp",
+                        cwd_short: "~",
+                        effort_name: "low",
+                    },
+                    &[],
+                    0,
+                    &sel,
+                )
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        assert!(
+            buf[(0, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "the first selected column should be highlighted"
+        );
+        assert!(
+            !buf[(7, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "a column past the selection should not be highlighted"
         );
     }
 

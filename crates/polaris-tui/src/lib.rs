@@ -98,6 +98,12 @@ fn abbreviate_home(path: &std::path::Path) -> String {
 /// fit an unbounded match list.
 const FOOTER_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1;
 
+/// How many `scroll_offset` lines one mouse/trackpad wheel tick moves —
+/// a single line per tick feels sluggish for wheel input, unlike a key
+/// press (see `PageUp`/`PageDown`'s own `+1`, which is a deliberate,
+/// discrete step).
+const MOUSE_SCROLL_LINES: usize = 3;
+
 /// Appends every `session.messages` entry and every `local_lines` entry
 /// added since the last call to `history`, once each — the in-memory
 /// analogue of the old `insert_before`-based one-shot terminal print.
@@ -324,6 +330,14 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
         viewport: ratatui::Viewport::Fullscreen,
     }));
+    // Trackpad/mouse wheel scrolling of the conversation history — without
+    // this, crossterm never emits `Event::Mouse` at all, so wheel input
+    // silently did nothing. Best-effort: a terminal that doesn't support
+    // mouse reporting just keeps not sending mouse events, same as before.
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableMouseCapture
+    );
     // A thin bar cursor, not the terminal's default (usually a full
     // blinking block) — a block cursor fully inverts whatever glyph sits
     // in that cell, so parking it over the empty input box's placeholder
@@ -460,6 +474,19 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             Ok(e) => e,
             Err(_) => break ExitCode::FAILURE,
         };
+        if let ratatui::crossterm::event::Event::Mouse(mouse) = &event {
+            use ratatui::crossterm::event::MouseEventKind;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    scroll_offset = scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
+                }
+                MouseEventKind::ScrollDown => {
+                    scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                }
+                _ => {}
+            }
+            continue;
+        }
         let ratatui::crossterm::event::Event::Key(key) = event else {
             continue;
         };
@@ -1095,7 +1122,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         }
                     }
                     maybe_event = event_stream.next() => {
-                        use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind};
+                        use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
                         match maybe_event {
                             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                                 // Esc interrupts the in-flight turn;
@@ -1116,6 +1143,19 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                     _ => {}
                                 }
                             }
+                            // Mouse wheel scrolling also works while a turn
+                            // is running, same as PageUp/PageDown above.
+                            Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    scroll_offset =
+                                        scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    scroll_offset =
+                                        scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                                }
+                                _ => {}
+                            },
                             Some(Ok(_)) => {}
                             Some(Err(_)) | None => break TurnOutcome::Fatal,
                         }
@@ -1182,6 +1222,15 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::cursor::SetCursorStyle::DefaultUserShape
+    );
+    // Undoes the EnableMouseCapture set at startup — best-effort, same as
+    // the enable itself. Otherwise mouse reporting mode would leak into
+    // whatever the user's shell does next (e.g. text selection with the
+    // mouse would stop working until they open and close another
+    // mouse-reporting program).
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture
     );
     if let Some(msg) = fatal_message {
         eprintln!("{msg}");

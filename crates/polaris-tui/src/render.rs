@@ -671,8 +671,10 @@ pub const MAX_DISPLAYED_SUGGESTIONS: usize = 8;
 /// which drew the header and full history inline with everything else on
 /// every frame; splitting it out is what makes the header/history land in
 /// the terminal's own real scrollback instead of being repainted away.
+#[allow(clippy::too_many_arguments)]
 pub fn render_footer(
     frame: &mut Frame,
+    area: ratatui::layout::Rect,
     input: &str,
     cursor: usize,
     status: &Status,
@@ -680,7 +682,6 @@ pub fn render_footer(
     suggestions: &[&crate::slash::SlashCommand],
     selected_suggestion: usize,
 ) {
-    let area = frame.area();
     let dim = Style::default().add_modifier(Modifier::DIM);
     // Zero height when there's nothing to show, so the layout collapses
     // back to the plain split the moment the input stops starting with
@@ -1259,6 +1260,7 @@ mod tests {
             .draw(|f| {
                 render_footer(
                     f,
+                    f.area(),
                     input,
                     input.len(),
                     status,
@@ -1289,7 +1291,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_footer(f, input, cursor, &Status::Idle, &header, &[], 0))
+            .draw(|f| render_footer(f, f.area(), input, cursor, &Status::Idle, &header, &[], 0))
             .expect("draw");
         terminal.get_cursor_position().expect("cursor position")
     }
@@ -1305,7 +1307,16 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|f| {
-                render_footer(f, "hello", 5, &Status::Idle, &test_header(), &[], 0);
+                render_footer(
+                    f,
+                    f.area(),
+                    "hello",
+                    5,
+                    &Status::Idle,
+                    &test_header(),
+                    &[],
+                    0,
+                );
             })
             .expect("draw");
         // "› " (width 2) + "hello" (width 5) = column 7, on the input row
@@ -1324,7 +1335,16 @@ mod tests {
         let input = "helloこんにちは";
         terminal
             .draw(|f| {
-                render_footer(f, input, input.len(), &Status::Idle, &test_header(), &[], 0);
+                render_footer(
+                    f,
+                    f.area(),
+                    input,
+                    input.len(),
+                    &Status::Idle,
+                    &test_header(),
+                    &[],
+                    0,
+                );
             })
             .expect("draw");
         // "› "(2) + "hello"(5) + "こんにちは"(5 chars * width 2 = 10) = 17.

@@ -187,7 +187,9 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
             for row in format_tool_result_preview(result) {
                 lines.push(HistoryLine::plain(Line::from(Span::styled(
                     row,
-                    Style::default().add_modifier(Modifier::DIM),
+                    Style::default()
+                        .add_modifier(Modifier::DIM)
+                        .bg(Color::DarkGray),
                 ))));
             }
             if let Some(d) = diff {
@@ -2005,6 +2007,33 @@ mod tests {
         });
         assert!(text.contains("failed"));
         assert!(text.contains("permission denied"));
+    }
+
+    #[test]
+    fn a_tool_result_preview_row_is_shaded_like_code() {
+        // Distinguishes a code/output preview visually from ordinary dim
+        // log text — the same DarkGray background inline code and fenced
+        // code blocks already use, so a `read` preview reads as "this is
+        // code" rather than looking like a plain status line.
+        let lines = format_event_for_live_print(&AgentEvent::ToolFinished {
+            name: "read".to_string(),
+            detail: "{}".to_string(),
+            ok: true,
+            result: "fn main() {}".to_string(),
+            diff: None,
+        });
+        let preview_line = lines
+            .iter()
+            .find(|l| l.line.spans.iter().any(|s| s.content.contains("fn main")))
+            .expect("the result preview row should be present");
+        assert!(
+            preview_line
+                .line
+                .spans
+                .iter()
+                .any(|s| s.style.bg == Some(Color::DarkGray)),
+            "the preview row should carry a code-style background"
+        );
     }
 
     #[test]

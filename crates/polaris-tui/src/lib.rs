@@ -206,6 +206,47 @@ fn new_session_id() -> String {
     format!("{:013}-{}-{n:04}", now_millis(), std::process::id())
 }
 
+/// Splits `frame.area()` into the scrollable history region (top) and the
+/// fixed-height footer region (bottom, `INLINE_VIEWPORT_HEIGHT` rows),
+/// renders the current `visible_history_window` slice of `history` into
+/// the first, and calls `render_footer` with the second. This is the one
+/// draw routine every redraw point in `run()` shares — see this plan's
+/// Task 6.
+#[allow(clippy::too_many_arguments)]
+fn draw_frame(
+    frame: &mut ratatui::Frame,
+    history: &[render::HistoryLine],
+    scroll_offset: usize,
+    input: &str,
+    cursor: usize,
+    status: &Status,
+    header: &render::HeaderInfo,
+    suggestions: &[&crate::slash::SlashCommand],
+    selected_suggestion: usize,
+) {
+    let area = frame.area();
+    let [history_area, footer_area] = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Min(0),
+        ratatui::layout::Constraint::Length(INLINE_VIEWPORT_HEIGHT),
+    ])
+    .areas(area);
+
+    let window =
+        render::visible_history_window(history.len(), scroll_offset, history_area.height as usize);
+    render::render_history_into(frame.buffer_mut(), history_area, &history[window]);
+
+    render::render_footer(
+        frame,
+        footer_area,
+        input,
+        cursor,
+        status,
+        header,
+        suggestions,
+        selected_suggestion,
+    );
+}
+
 pub async fn run(args: RunArgs<'_>) -> ExitCode {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         eprintln!("polaris: refusing to start the TUI on a non-interactive terminal");
@@ -259,7 +300,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // — deliberately does not enter the alternate screen, which is what
     // makes real scrollback possible.
     let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
-        viewport: ratatui::Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+        viewport: ratatui::Viewport::Fullscreen,
     }));
     // How many `session.messages` / `local_lines` entries have already
     // been appended to `history`. Only the delta past this point gets
@@ -274,6 +315,13 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // via `insert_before`. Not yet rendered (see `render::visible_history_window`
     // and the fullscreen draw loop, wired up in a later task).
     let mut history: Vec<render::HistoryLine> = Vec::new();
+    // How far back the user has scrolled the history region — 0 always
+    // means "following the tail" (see `render::visible_history_window`).
+    // Not yet mutated anywhere — a later task wires scroll keybindings
+    // (Up/Down) into the main loop; until then this is read-only, which
+    // `cargo clippy -D warnings` would otherwise flag as `unused_mut`.
+    #[allow(unused_mut)]
+    let mut scroll_offset: usize = 0;
     let startup_width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
     history.extend(render::header_history_lines(
         &render::HeaderInfo {
@@ -354,9 +402,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         if terminal
             .borrow_mut()
             .draw(|f| {
-                render::render_footer(
+                draw_frame(
                     f,
-                    f.area(),
+                    &history,
+                    scroll_offset,
                     &input_buffer,
                     input_cursor,
                     &status,
@@ -764,9 +813,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         if terminal
             .borrow_mut()
             .draw(|f| {
-                render::render_footer(
+                draw_frame(
                     f,
-                    f.area(),
+                    &history,
+                    scroll_offset,
                     &input_buffer,
                     input_cursor,
                     &status,
@@ -882,9 +932,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         if terminal
                             .borrow_mut()
                             .draw(|f| {
-                                render::render_footer(
+                                draw_frame(
                                     f,
-                                    f.area(),
+                                    &history,
+                                    scroll_offset,
                                     &input_buffer,
                                     input_cursor,
                                     &status,
@@ -1590,6 +1641,60 @@ mod tests {
         fn read_key(&mut self) -> std::io::Result<KeyCode> {
             Ok(self.0.pop_front().unwrap_or(KeyCode::Null))
         }
+    }
+
+    #[test]
+    fn draw_frame_puts_the_footer_in_the_bottom_inline_viewport_height_rows() {
+        let backend = ratatui::backend::TestBackend::new(60, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let history = vec![render::HistoryLine {
+            line: ratatui::text::Line::from("line from history"),
+            shaded: false,
+        }];
+        terminal
+            .draw(|f| {
+                draw_frame(
+                    f,
+                    &history,
+                    0,
+                    "",
+                    0,
+                    &Status::Idle,
+                    &render::HeaderInfo {
+                        provider_name: "openai",
+                        model_name: "gpt-5.4",
+                        usage: polaris_provider::Usage::default(),
+                        cwd: "/tmp",
+                        cwd_short: "~",
+                        effort_name: "low",
+                    },
+                    &[],
+                    0,
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rows[0].contains("line from history"));
+        // The footer's placeholder text lands in the bottom INLINE_VIEWPORT_HEIGHT
+        // rows, not the top history region.
+        let footer_start = 30 - INLINE_VIEWPORT_HEIGHT as usize;
+        assert!(
+            rows[footer_start..]
+                .iter()
+                .any(|r| r.contains("Ask polaris to do anything"))
+        );
+        assert!(
+            !rows[..footer_start]
+                .iter()
+                .any(|r| r.contains("Ask polaris to do anything"))
+        );
     }
 
     #[test]

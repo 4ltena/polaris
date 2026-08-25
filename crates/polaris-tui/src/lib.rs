@@ -392,6 +392,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             .draw(|f| {
                 render::render_footer(
                     f,
+                    f.area(),
                     &input_buffer,
                     input_cursor,
                     &status,
@@ -788,6 +789,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             .draw(|f| {
                 render::render_footer(
                     f,
+                    f.area(),
                     &input_buffer,
                     input_cursor,
                     &status,
@@ -907,6 +909,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             .draw(|f| {
                                 render::render_footer(
                                     f,
+                                    f.area(),
                                     &input_buffer,
                                     input_cursor,
                                     &status,

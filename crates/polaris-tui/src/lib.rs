@@ -1127,6 +1127,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 cumulative_usage.input_tokens += result.usage.input_tokens;
                 cumulative_usage.output_tokens += result.usage.output_tokens;
                 cumulative_usage.total_tokens += result.usage.total_tokens;
+                cumulative_usage.cached_tokens += result.usage.cached_tokens;
                 status = Status::Idle;
                 if let Some(reply) = session.messages.last()
                     && let Err(e) = persist::append_message(&session_path, reply)
@@ -1626,9 +1627,10 @@ fn apply_slash_action(
         }
         slash::Action::Status => {
             *status = Status::Notice(format!(
-                "{provider_name} / {model_name} — tokens: in {} / out {} / total {} — {} messages",
+                "{provider_name} / {model_name} — tokens: in {} / out {} / cache {} / total {} — {} messages",
                 cumulative_usage.input_tokens,
                 cumulative_usage.output_tokens,
+                cumulative_usage.cached_tokens,
                 cumulative_usage.total_tokens,
                 session.messages.len(),
             ));
@@ -2547,6 +2549,44 @@ mod tests {
             Some("gpt-5.4".to_string())
         );
         assert!(matches!(status, Status::Notice(_)));
+    }
+
+    #[test]
+    fn status_includes_the_cached_token_count() {
+        let mut session = Session::default();
+        let mut status = Status::Idle;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session_path = dir.path().join("session.jsonl");
+        let mut local_lines = Vec::new();
+        let usage = polaris_provider::Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            cached_tokens: 80,
+        };
+
+        apply_slash_action(
+            slash::Action::Status,
+            &mut session,
+            &session_path,
+            &mut status,
+            "openai",
+            "gpt-5.4",
+            usage,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+
+        match status {
+            Status::Notice(n) => {
+                assert!(n.contains("cache 80"), "expected a cache figure in: {n}");
+                assert!(n.contains("in 100"));
+                assert!(n.contains("out 20"));
+                assert!(n.contains("total 120"));
+            }
+            _ => panic!("expected a Notice"),
+        }
     }
 
     #[test]

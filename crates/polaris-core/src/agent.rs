@@ -2112,6 +2112,7 @@ print("wrote")
                         input_tokens: 10,
                         output_tokens: 5,
                         total_tokens: 15,
+                        cached_tokens: 0,
                     }),
                 },
                 CompletionResponse {
@@ -2121,6 +2122,7 @@ print("wrote")
                         input_tokens: 20,
                         output_tokens: 3,
                         total_tokens: 23,
+                        cached_tokens: 0,
                     }),
                 },
             ]),

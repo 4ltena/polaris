@@ -321,10 +321,15 @@ impl Provider for OpenAiProvider {
             let input_tokens = u.get("prompt_tokens")?.as_u64()? as u32;
             let output_tokens = u.get("completion_tokens")?.as_u64()? as u32;
             let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
+            let cached_tokens = u
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
             Some(crate::Usage {
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                cached_tokens,
             })
         });
 
@@ -838,6 +843,42 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+        assert_eq!(
+            usage.cached_tokens, 0,
+            "a response with no prompt_tokens_details must not fail to parse, just report 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_tokens_is_parsed_from_prompt_tokens_details() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "hi", "tool_calls": null}}],
+                "usage": {
+                    "prompt_tokens": 2006,
+                    "completion_tokens": 300,
+                    "total_tokens": 2306,
+                    "prompt_tokens_details": {"cached_tokens": 1920}
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAiProvider::new(server.uri(), "key".into(), "model".into()).expect("client");
+        let res = provider
+            .complete(CompletionRequest {
+                system: String::new(),
+                messages: vec![Message::user("hi")],
+                tools: vec![],
+            })
+            .await
+            .expect("should succeed");
+
+        let usage = res.usage.expect("usage should be present");
+        assert_eq!(usage.cached_tokens, 1920);
     }
 
     #[tokio::test]

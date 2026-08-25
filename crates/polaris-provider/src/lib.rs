@@ -99,6 +99,13 @@ pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    /// How many of `input_tokens` were served from the provider's prompt
+    /// cache — `usage.prompt_tokens_details.cached_tokens` (Chat
+    /// Completions) or `usage.input_tokens_details.cached_tokens`
+    /// (Responses API / Codex). `0` both when truly zero and when the
+    /// provider's response didn't carry the field at all — this is a
+    /// display-only figure, not something the agent loop depends on.
+    pub cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Default)]

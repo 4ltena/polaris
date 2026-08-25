@@ -162,10 +162,15 @@ impl Folder {
                         let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
                         let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
                         let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
+                        let cached_tokens = u
+                            .pointer("/input_tokens_details/cached_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as u32;
                         Some(crate::Usage {
                             input_tokens,
                             output_tokens,
                             total_tokens,
+                            cached_tokens,
                         })
                     });
                 }
@@ -538,6 +543,33 @@ mod tests {
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 8);
         assert_eq!(usage.total_tokens, 20);
+        assert_eq!(
+            usage.cached_tokens, 0,
+            "a completed event with no input_tokens_details must not fail to parse, just report 0"
+        );
+    }
+
+    #[test]
+    fn cached_tokens_is_parsed_from_input_tokens_details() {
+        let mut f = Folder::new();
+        f.push(&frame(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "usage": {
+                        "input_tokens": 9708,
+                        "output_tokens": 167,
+                        "total_tokens": 9875,
+                        "input_tokens_details": {"cached_tokens": 5578}
+                    }
+                }
+            }),
+        ))
+        .expect("push should succeed");
+
+        let res = f.finish().expect("finish should succeed");
+        let usage = res.usage.expect("usage should be present");
+        assert_eq!(usage.cached_tokens, 5578);
     }
 
     #[test]

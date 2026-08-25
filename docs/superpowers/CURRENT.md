@@ -1,6 +1,6 @@
 # polaris 現況
 
-最終更新 2026-08-21
+最終更新 2026-08-24
 
 ## この文書の役割
 
@@ -12,11 +12,12 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`。`v0.4.0`「`Regulus`」を git tag 済み(push はまだ)。未統合の worktree は `worktree-feat-m4-core` の1件のみ。詳細は「## 未統合の worktree」節 |
-| 進行中の計画 | worktree `worktree-feat-m4-core`（HEAD `0b80a0f`）: `docs/superpowers/plans/2026-08-20-polaris-m4-core.md` の Task 1 が fix round 1/5 の途中で止まっている |
-| 直近で終えた計画（main に統合済み） | `docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」として git tag 済み）、`docs/superpowers/plans/2026-08-21-polaris-tui-v2.md`・`docs/superpowers/plans/2026-08-21-polaris-tui-onboarding.md`(TUI v2・オンボーディング)に加え、codex互換サブコマンド・スラッシュコマンド16個・非同期イベントループ化・`/resume`・`/model`(2段階ピッカー)・`/permissions`・`/skills`・`/fork`・`/export`・`/pwd`・ロゴ変更・effort値バグ修正まで、まとめて `v0.4.0`「`Regulus`」として git tag 済み(下記「版の方針」参照) |
-| 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md` |
-| 版の方針 | 当初案の `hamal`/`Aldebaran` 二系統(v1.0.0 と v0.2 に分ける案)は採らず、単一の `vX.Y.Z` を単調に進める方式へ変更。`v0.1.0`(通称 `hamal`)、`v0.2.0`(通称 `Aldebaran`)、`v0.3.0`(対話 TUI、通称 `Castor`)、`v0.4.0`(TUI v2以降の全機能、通称 `Regulus`)を実際に git tag 済み。M4 のコードネームは当初 `Castor`/`v0.3.0` を予定していたが、対話 TUI が先に `v0.3.0`/`Castor` を占めたため `Spica` へ変更した。M4 は他の実装計画とまとめて `v0.5.0` になる見込みだが、含める範囲が固まっていないため `v0.5.0` という版番号自体はまだ確定させない。ツール呼び出しのライブ表示改良(Claude Code CLI の `⏺` 表示を参考にする案)は `v0.5.0` 以降へ持ち越し。`CHANGELOG.md` が詳細の記録先 |
+| ブランチ | `main`（HEAD `dbd592c`）。`v0.4.0`「`Regulus`」は git tag 済み・push 未実施のまま。M4 core（subagent/`spawn`/単一波、通称 `Spica`）と、ツール呼び出しのライブ表示改良（`AgentEvent` 通知経由、Claude Code CLI 風の逐次表示・write/edit の差分表示）の両方が main へマージ済み・**未タグ・未 CHANGELOG 反映・未 push**。未統合の worktree は `worktree-feat-tui-live-progress` の1件のみ。詳細は「## 未統合の worktree」節 |
+| 進行中の計画 | worktree `worktree-feat-tui-live-progress`（HEAD `9d71fa3`、main から2コミット先行）: フルスクリーンピッカーの自前スクロール＋固定フッターの設計spec追加と、IME preedit のカーソル位置修正。まだ実装計画段階、main には未統合 |
+| 直近で終えた計画（main に統合済み・未タグ） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（全12タスク完了。`spawn` ツール・単一波オーケストレーション・書込先衝突検査・並列実行・受け入れ基準の直接検証まで）と `docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（`polaris_core::agent::run`/`dispatch` からの `AgentEvent`（`ToolStarted`/`ToolFinished`/`SpawnStarted`/`SpawnFinished`）通知、write/edit の実差分計算・TUI側でのライブ描画、複数行 spawn プレビューの行分割、フルスクリーンピッカー切替前のインラインviewportクリア）。両計画とも `.superpowers/sdd/<計画名>/progress.md` の完了・削除まで確認済み（このセッションの前半で参照していた `.superpowers/sdd/2026-08-20-polaris-m4-core/progress.md` は、別セッションが計画を完了させた際の後始末で既に削除されている） |
+| 直近で終えた計画（main に統合済み・タグ済み） | `docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」として git tag 済み）、`docs/superpowers/plans/2026-08-21-polaris-tui-v2.md`・`docs/superpowers/plans/2026-08-21-polaris-tui-onboarding.md`(TUI v2・オンボーディング)に加え、codex互換サブコマンド・スラッシュコマンド16個・非同期イベントループ化・`/resume`・`/model`(2段階ピッカー)・`/permissions`・`/skills`・`/fork`・`/export`・`/pwd`・ロゴ変更・effort値バグ修正まで、まとめて `v0.4.0`「`Regulus`」として git tag 済み(下記「版の方針」参照) |
+| 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md`、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress-design.md` |
+| 版の方針 | 当初案の `hamal`/`Aldebaran` 二系統(v1.0.0 と v0.2 に分ける案)は採らず、単一の `vX.Y.Z` を単調に進める方式へ変更。`v0.1.0`(通称 `hamal`)、`v0.2.0`(通称 `Aldebaran`)、`v0.3.0`(対話 TUI、通称 `Castor`)、`v0.4.0`(TUI v2以降の全機能、通称 `Regulus`)を実際に git tag 済み。利用者の指示で M4（`spawn`/subagent）とツール呼び出しライブ表示改良の両方を `v0.5.0`「`Spica`」としてまとめる方針が確定し、両方とも実装・main統合が完了した。**`v0.5.0` のタグ付け・CHANGELOG反映・push はまだ行っていない（利用者の明示的な承認が要る、標準ルール通り）** |
 
 ## マイルストーン
 
@@ -27,8 +28,9 @@
 | M2.5 | Codex プロバイダ（ChatGPT サブスク OAuth） | 完了 |
 | M3a | skills ローダと skill ツール | 完了 |
 | M3b | BM25 ルータと評価コーパス | 完了 |
-| M4（通称 `Spica`。他の実装計画とまとめて `v0.5.0` になる見込みだが版番号は未確定） | subagent、波、継続波 | 着手済み・停滞中（worktree `worktree-feat-m4-core`、Task 1/12 が fix round 1/5 の途中。main には未統合） |
-| M5 | TUI、圧縮、マルチプロバイダ、セッション永続化 | TUI 部分は完了（v0.3.0「`Castor`」として git tag 済み、加えて TUI v2・TUI onboarding が main へマージ済み・`v0.4.0`「`Regulus`」として未タグ・未push）。圧縮・マルチプロバイダは未着手 |
+| M4（通称 `Spica`、`v0.5.0` の一部） | subagent、`spawn`、単一波オーケストレーション（継続波は明示的にスコープ外） | 実装完了・main統合済み。**未タグ・未CHANGELOG・未push** |
+| ツール呼び出しライブ表示改良（`v0.5.0` の一部） | `AgentEvent` 通知機構、ツール呼び出し・spawn の逐次表示、write/edit の実差分表示 | 実装完了・main統合済み。**未タグ・未CHANGELOG・未push** |
+| M5 | TUI、圧縮、マルチプロバイダ、セッション永続化 | TUI 部分は完了（v0.3.0「`Castor`」として git tag 済み、加えて TUI v2・TUI onboarding が main へマージ済み・`v0.4.0`「`Regulus`」として tag 済み・未push）。フルスクリーンピッカーの自前スクロール＋固定フッターは worktree `worktree-feat-tui-live-progress` で設計spec段階、未着手。圧縮・マルチプロバイダは未着手 |
 
 M1・M2・M2.5 が揃い、v1.0.0 (`hamal`) の水準に達した。API キーを持たない利用者でも `polaris login` から ChatGPT のサブスクリプション認証だけで実モデルへ繋げる経路ができたことで、M1 の受け入れ基準のうち唯一無人では確認できなかった「実キーでの一発実行」を、キー無しで満たせるようになった。タグ付け自体は利用者の承認を待つ準備段階のまま。M3 以降は 1.x として積む。M3a を M2 より先に進めたのも利用者の指示による。
 
@@ -206,9 +208,11 @@ M3b 完了後、対話 TUI（新規クレート `polaris-tui`、`ratatui` + `cro
 
 ## 未統合の worktree
 
-`git worktree list` で確認できる、main 未統合の作業は1件のみ(TUI onboarding は上記の通り本日 main へ統合済み)。
+`git worktree list` で確認できる、main 未統合の作業は1件のみ。
 
-- **`worktree-feat-m4-core`**（HEAD `0b80a0f`、パス `.claude/worktrees/feat-m4-core`）。`docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（全12タスク）のうち Task 1（`skill` 検索を `Named` トレイトへ汎化）のみ着手。台帳(`.superpowers/sdd/2026-08-20-polaris-m4-core/progress.md`)によれば、実装→レビュー(Needs fixes、Important 1件: `lookup` の None 分岐にテストが無い)→fix round 1/5 を再開したところで記録が止まっている。ワークツリーには `crates/polaris-tools/src/skill.rs` への未コミットの差分(+33行)が残ったままで、コミットもレビュー結果の記録も無い。**このセッションで新たに作業した形跡ではなく、以前のセッションで中断されたまま放置されている状態。** 再開するか、破棄して仕切り直すかは利用者判断が要る
+- **`worktree-feat-tui-live-progress`**（HEAD `9d71fa3`、パス `.claude/worktrees/feat-tui-live-progress`、`locked`）。main（`dbd592c`）から2コミット先行: `0afcd8a`(IME preedit のカーソル位置修正)、`9d71fa3`(フルスクリーンピッカーの自前スクロール＋固定フッターの設計spec追加)。作業ツリーはクリーン(未コミット差分なし)。実装計画はまだ書かれていない設計spec段階。
+
+**過去に存在した `worktree-feat-m4-core` は、このセッションが中断・再開する間に別のセッションが `docs/superpowers/plans/2026-08-20-polaris-m4-core.md` の全12タスクを完了させ、main へマージし、削除した。** このセッションは自分の再開時点でその worktree もSDD台帳(`.superpowers/sdd/2026-08-20-polaris-m4-core/progress.md`)も既に消えていることを確認し、Task 2 の実装のために再ディスパッチしていたsubagent(停止扱いになっていたもの)を、目的の worktree が存在せず作業がmainへ既に統合済みと確認したうえで、再開せずに破棄した。
 
 ## main の `cargo fmt --check` drift
 
@@ -414,14 +418,13 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-24、`v0.4.0`「`Regulus`」を確定・git tag した直後に書き直した。まだ push していない。
+本節は2026-08-24、v0.5.0「Spica」の両半分(M4 core + ツール呼び出しライブ表示改良)がmain統合済みと確認した直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean、旧繰り越しの`project.rs`/`openai.rs`のdriftも作業のどこかで解消済み)を実測で確認済み。
 
 優先度順:
 
-1. **`git push` の実施を利用者に確認する。** タグ付け・CHANGELOG反映・コミットは完了済みだが、push は別途明示的な承認が要るという標準ルールに従い、まだ行っていない
-2. **ツール呼び出しのライブ表示改良を計画する(`v0.5.0`以降)。** 利用者から「Claude Code CLI自身の`⏺`から始まる表示(ファイル更新・削除ごとのまとまり、ナレーション文、"Allowed by auto mode classifier"等)を模倣したい」との要望があり、Claude Code の実際のGitHubリポジトリを取得・解析したうえで検討する予定(現在はターン実行中`Working`のみでツール呼び出しの途中経過が一切見えない、という指摘が起点)。実現には`polaris_core::agent::run`にイベント通知の仕組み(コールバック等)を追加し、`agent::run`が`&mut Session`を握ったまま実行される現在の構造(ライブ再描画時に`session.clone()`スナップショットしか読めない、`lib.rs`の`tokio::select!`まわりの制約)を踏まえた設計が要る
-3. **main の `cargo fmt --all -- --check` drift(残り2ファイル、`project.rs`・`openai.rs`)を直す。** onboarding マージ時に `polaris-tui` 配下の drift は解消済みだが、この2ファイルは未対応のまま
-4. **`worktree-feat-m4-core` の扱いを決める。** Task 1 のレビュー指摘への fix round 1/5 を再開したところで記録が止まっており、以前のセッションからの中断状態。再開するか、レビュー指摘(`lookup` の None 分岐のテスト不在)を踏まえて仕切り直すかは利用者判断が要る
+1. **`v0.5.0`「`Spica`」の確定(CHANGELOG追記・git tag)を利用者に確認する。** M4 core(`spawn`・単一波オーケストレーション)とツール呼び出しライブ表示改良の両方が実装完了・main統合済みだが、タグ付け・CHANGELOG反映・push はいずれも標準ルール通り利用者の明示的な承認が要るため、まだ行っていない
+2. **`git push`(`v0.4.0`「`Regulus`」分、および確定すれば`v0.5.0`分)の実施を利用者に確認する。** `v0.4.0`は既にtag済み・push未実施のまま残っている
+3. **`worktree-feat-tui-live-progress`(フルスクリーンピッカーの自前スクロール＋固定フッター)の扱いを決める。** 設計spec段階(実装計画はまだ無い)。次のマイルストーンとして計画を書くか、優先度を見直すかは利用者判断が要る
 
 そのうえで v1.0.0 のタグ付けの判断へ進む。
 

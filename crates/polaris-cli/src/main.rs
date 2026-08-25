@@ -207,6 +207,18 @@ fn model_for_stored_plan(store_path: &Path) -> Option<String> {
     polaris_auth::model_for_plan_type(plan.as_deref()).map(|s| s.to_string())
 }
 
+/// Same stored-credentials read as `model_for_stored_plan`, but for the
+/// TUI footer's displayed effort: seeds `RunArgs::initial_effort_name` so
+/// the footer shows the actual plan-derived effort (e.g. "high" for Plus)
+/// from the first frame, instead of always starting at
+/// `render::DEFAULT_EFFORT` regardless of what's really sent to the API.
+/// Returns `None` (defer to `render::DEFAULT_EFFORT`) under the same
+/// conditions as `model_for_stored_plan`.
+fn effort_for_stored_plan(store_path: &Path) -> Option<String> {
+    let creds = polaris_auth::store::load_from(store_path).ok().flatten()?;
+    effort_for(&creds.access_token)
+}
+
 #[async_trait::async_trait]
 impl polaris_provider::TokenSource for AuthTokens {
     async fn token(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
@@ -359,6 +371,12 @@ async fn main() -> ExitCode {
     });
 
     let model_name: String;
+    // Seeds the TUI footer's displayed effort — `None` means "let it show
+    // render::DEFAULT_EFFORT", same as before this existed. Only the codex
+    // branch sets this (to the same chatgpt_plan_type-derived value
+    // effort_for_stored_plan/effort_for send to the API); the openai
+    // branch has no such server-side plan-based effort to reflect.
+    let mut initial_effort_name: Option<String> = None;
 
     let provider: std::sync::Arc<dyn polaris_provider::Provider> = loop {
         match provider_name.as_str() {
@@ -439,6 +457,7 @@ async fn main() -> ExitCode {
                     .or_else(|| model_for_stored_plan(&store))
                     .unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
                 model_name = model.clone();
+                initial_effort_name = effort_for_stored_plan(&store);
                 break std::sync::Arc::new(polaris_provider::codex::CodexProvider::new(
                     polaris_provider::codex::ENDPOINT_BASE.to_string(),
                     model,
@@ -591,6 +610,7 @@ async fn main() -> ExitCode {
                 provider: provider.clone(),
                 provider_name: provider_name.clone(),
                 model_name: model_name.clone(),
+                initial_effort_name: initial_effort_name.clone(),
                 cwd: cwd.clone(),
                 state_dir,
                 sessions_dir,
@@ -822,6 +842,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = dir.path().join("auth.json");
         assert_eq!(model_for_stored_plan(&store), None);
+    }
+
+    #[test]
+    fn effort_for_stored_plan_defers_when_nothing_is_stored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = dir.path().join("auth.json");
+        assert_eq!(effort_for_stored_plan(&store), None);
     }
 
     #[test]

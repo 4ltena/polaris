@@ -7,10 +7,11 @@ use std::time::Duration;
 use polaris_core::{AgentEvent, DiffLine};
 use polaris_provider::Role;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 /// What the bottom-of-screen status line shows while a turn is in flight,
 /// idle, or after a failed turn.
@@ -462,6 +463,23 @@ pub fn history_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryL
         .collect()
 }
 
+/// Which `history` indices are currently visible, given how far the user
+/// has scrolled back. `scroll_offset == 0` always means "showing the
+/// newest `visible_height` lines" — the caller never has to special-case
+/// "am I following the tail," since this recomputes from `history_len`
+/// fresh every frame (see `lib.rs`'s unified draw loop).
+pub fn visible_history_window(
+    history_len: usize,
+    scroll_offset: usize,
+    visible_height: usize,
+) -> std::ops::Range<usize> {
+    let max_scroll = history_len.saturating_sub(visible_height);
+    let effective_scroll = scroll_offset.min(max_scroll);
+    let end = history_len - effective_scroll;
+    let start = end.saturating_sub(visible_height);
+    start..end
+}
+
 /// Renders each `HistoryLine` into its own single-row slice of `buf`. One
 /// `Paragraph` per row, not one `Paragraph` for the whole block — a
 /// `Paragraph`'s background fill (`buf.set_style` over its full render
@@ -496,14 +514,14 @@ pub fn render_history_into(
             .render(row, buf);
         // Belt-and-braces: force the background on every cell of the row
         // directly, rather than relying solely on `Paragraph`'s own style
-        // fill (`buf.set_style` over the render area) to survive intact
-        // once this buffer is later flushed to a real terminal via
-        // `Terminal::insert_before` — a real-terminal check (not caught by
-        // any `TestBackend`-based test, since `TestBackend` records styled
-        // cells directly with no ANSI round-trip to lose) found the fill
-        // alone doesn't reliably reach the terminal for a shaded row once
-        // scrolled into real scrollback, while explicitly setting each
-        // cell's `bg` here does.
+        // fill (`buf.set_style` over the render area). There's no
+        // `Terminal::insert_before`/scrollback round-trip to lose the fill
+        // to anymore — this buffer is the self-managed `Viewport::Fullscreen`
+        // frame itself (see `lib.rs`), diffed and flushed to the real
+        // terminal fresh every frame — but the explicit per-cell `bg` set
+        // here is cheap and was kept as a guard against `Paragraph`'s own
+        // fill not covering the full row width in some terminal/backend
+        // combination.
         if hl.shaded {
             for x in row.x..row.x + row.width {
                 buf[(x, row.y)].set_bg(Color::DarkGray);
@@ -538,12 +556,11 @@ pub struct HeaderInfo<'a> {
     pub cwd_short: &'a str,
 }
 
-/// Builds the bordered header box's lines — a dim border, a bold title
-/// line, then dim-labeled `model:`/`directory:`/`tokens:` rows. Shared by
-/// the one-shot startup print (`insert_before`, see `lib.rs`) and by tests
-/// that want to check its content directly; there's exactly one caller
-/// site for the actual print, since — unlike the old full-redraw model —
-/// the header is now printed once and never redrawn.
+/// Builds the header box's unbordered content lines — a bold title line,
+/// then dim-labeled `model:`/`directory:`/`tokens:` rows (no border; see
+/// `header_history_lines` for the bordered version actually seeded into
+/// `history`). Shared by `header_history_lines` and by tests that want to
+/// check its content directly, without the border framing in the way.
 pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     vec![
@@ -589,44 +606,62 @@ pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
     ]
 }
 
+/// `header_lines(header)`, framed with a hand-built box-drawing border, as
+/// plain `HistoryLine`s — the header's one-shot equivalent of
+/// `history_lines_for`. Used at startup and by every conversation-view
+/// reset (see `lib.rs`'s `run()` and `reset_conversation_view`) to (re-)seed
+/// `history`; there is no separate `render_header_into`/`insert_before`
+/// print anymore — the header lives in `history` like everything else.
+/// Always returns exactly `HEADER_HEIGHT` rows.
+pub fn header_history_lines(header: &HeaderInfo, width: u16) -> Vec<HistoryLine> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let w = width as usize;
+    let inner = w.saturating_sub(2);
+
+    let top = format!("\u{250c}{}\u{2510}", "\u{2500}".repeat(inner));
+    let bottom = format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner));
+
+    let mut out = Vec::with_capacity(HEADER_HEIGHT as usize);
+    out.push(HistoryLine::plain(Line::styled(top, dim)));
+    for content in header_lines(header) {
+        let content_width = content.width();
+        let pad = inner.saturating_sub(content_width);
+        let mut spans = vec![Span::styled("\u{2502}", dim)];
+        spans.extend(content.spans);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled("\u{2502}", dim));
+        out.push(HistoryLine::plain(Line::from(spans)));
+    }
+    out.push(HistoryLine::plain(Line::styled(bottom, dim)));
+    out
+}
+
 /// The header box's fixed print height: 5 content lines + top/bottom
 /// border rows (`Borders::ALL`).
 pub const HEADER_HEIGHT: u16 = 7;
 
-/// Renders `header_lines(header)` into `buf`, bordered — used for the
-/// one-shot startup print via `insert_before`. `area` must be
-/// `HEADER_HEIGHT` rows tall.
-pub fn render_header_into(
-    buf: &mut ratatui::buffer::Buffer,
-    area: ratatui::layout::Rect,
-    header: &HeaderInfo,
-) {
-    use ratatui::widgets::Widget;
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    Paragraph::new(header_lines(header))
-        .block(Block::default().borders(Borders::ALL).border_style(dim))
-        .render(area, buf);
-}
-
-/// The most suggestion rows shown at once — the popup can't grow the
-/// inline viewport's fixed height (ratatui's `Viewport::Inline` height is
-/// fixed at `Terminal` construction, see `lib.rs`'s `INLINE_VIEWPORT_HEIGHT`),
-/// so a query matching more than this many slash commands shows the first
-/// `MAX_DISPLAYED_SUGGESTIONS` plus a "+N more" row instead of growing
-/// without bound the way the old full-redraw layout allowed.
+/// The most suggestion rows shown at once — the footer region has a fixed
+/// `Constraint::Length` in `draw_frame`'s (`lib.rs`) vertical layout split
+/// and can't grow per-frame to fit content, so a query matching more than
+/// this many slash commands shows the first `MAX_DISPLAYED_SUGGESTIONS`
+/// plus a "+N more" row instead of growing without bound the way the
+/// scrollable history region above it can.
 pub const MAX_DISPLAYED_SUGGESTIONS: usize = 8;
 
 /// Everything redrawn every frame: the suggestions popup (while typing a
 /// `/command`), the status row (idle / thinking-with-shimmer / error /
 /// notice), the input line, and the footer (`model effort · cwd`). This is
-/// what lives inside the fixed-height inline viewport — the header and the
-/// conversation history are printed once, outside it, via `insert_before`
-/// (see `lib.rs`), never redrawn here. Replaces the old `render_chat`,
-/// which drew the header and full history inline with everything else on
-/// every frame; splitting it out is what makes the header/history land in
-/// the terminal's own real scrollback instead of being repainted away.
+/// the footer region of `draw_frame`'s (`lib.rs`) fullscreen layout split —
+/// the fixed-height bottom slice below the scrollable history region, which
+/// renders `history` separately via `render_history_into`. Replaces the old
+/// `render_chat`, which drew the header and full history inline with
+/// everything else on every frame; splitting it out is what makes the
+/// header/history scrollable as their own region instead of being
+/// repainted (and losing scroll position) with the footer every frame.
+#[allow(clippy::too_many_arguments)]
 pub fn render_footer(
     frame: &mut Frame,
+    area: ratatui::layout::Rect,
     input: &str,
     cursor: usize,
     status: &Status,
@@ -634,7 +669,6 @@ pub fn render_footer(
     suggestions: &[&crate::slash::SlashCommand],
     selected_suggestion: usize,
 ) {
-    let area = frame.area();
     let dim = Style::default().add_modifier(Modifier::DIM);
     // Zero height when there's nothing to show, so the layout collapses
     // back to the plain split the moment the input stops starting with
@@ -750,16 +784,26 @@ pub fn render_footer(
     );
 
     // Places the real terminal cursor at `cursor`'s position within the
-    // typed text, right after the "\u{203a} " prompt — `Line::width()`
-    // already accounts for CJK/wide characters the same way the rendered
-    // text itself does, so this stays in sync without a separate
-    // width-measuring dependency.
-    let prefix_width = Line::from("\u{203a} ").width() as u16;
-    let typed_width = Line::from(sanitize(&input[..cursor])).width() as u16;
-    frame.set_cursor_position(ratatui::layout::Position::new(
-        input_area.x + prefix_width + typed_width,
-        input_area.y,
-    ));
+    // typed text, right after the "\u{203a} " prompt. Terminal emulators
+    // anchor the OS/IME preedit (未確定文字) popup to this reported
+    // position, not to wherever text visually appears — if the app never
+    // reports where the caret actually is, the cursor stays wherever the
+    // last raw write left it, which produced an IME composition window
+    // floating at the screen's bottom edge instead of sitting after the
+    // typed text. `"› "`'s display width is 2 (both cells are
+    // single-width), matching the literal used in `input_line` above;
+    // `UnicodeWidthStr::width` (not `.chars().count()`) accounts for wide
+    // (CJK) characters already typed before `cursor` so the reported
+    // column lines up with what's actually drawn; the `.min(...)` clamp
+    // keeps it from running past the row's right edge.
+    let prefix_width: u16 = 2;
+    let typed_width = sanitize(&input[..cursor]).width() as u16;
+    let cursor_x = input_area
+        .x
+        .saturating_add(prefix_width)
+        .saturating_add(typed_width)
+        .min(input_area.right().saturating_sub(1));
+    frame.set_cursor_position(Position::new(cursor_x, input_area.y));
 
     // Two-tone footer matching codex's own status line: the model name in
     // a warm tan, the working directory in a soft green, separated by a
@@ -1203,6 +1247,7 @@ mod tests {
             .draw(|f| {
                 render_footer(
                     f,
+                    f.area(),
                     input,
                     input.len(),
                     status,
@@ -1233,9 +1278,64 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_footer(f, input, cursor, &Status::Idle, &header, &[], 0))
+            .draw(|f| render_footer(f, f.area(), input, cursor, &Status::Idle, &header, &[], 0))
             .expect("draw");
         terminal.get_cursor_position().expect("cursor position")
+    }
+
+    /// Regression test for the IME-preedit-shows-at-the-bottom bug: the
+    /// terminal cursor must land exactly after the typed text in the
+    /// input row, not stay wherever a prior raw write left it (which
+    /// `Frame::set_cursor_position` never being called defaulted to
+    /// "hidden, unpositioned" — see `terminal.rs`'s `try_draw`).
+    #[test]
+    fn the_cursor_lands_right_after_the_typed_input_text() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| {
+                render_footer(
+                    f,
+                    f.area(),
+                    "hello",
+                    5,
+                    &Status::Idle,
+                    &test_header(),
+                    &[],
+                    0,
+                );
+            })
+            .expect("draw");
+        // "› " (width 2) + "hello" (width 5) = column 7, on the input row
+        // (status(1) + suggestions(0) = row 1).
+        terminal.backend_mut().assert_cursor_position((7, 1));
+    }
+
+    /// Wide (CJK) characters must count as 2 columns each, or the cursor
+    /// — and thus the IME popup a terminal anchors to it — would land
+    /// short of the actual caret whenever any wide character was already
+    /// typed, exactly the scenario a real Japanese IME composition hits.
+    #[test]
+    fn the_cursor_accounts_for_wide_characters_already_typed() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let input = "helloこんにちは";
+        terminal
+            .draw(|f| {
+                render_footer(
+                    f,
+                    f.area(),
+                    input,
+                    input.len(),
+                    &Status::Idle,
+                    &test_header(),
+                    &[],
+                    0,
+                );
+            })
+            .expect("draw");
+        // "› "(2) + "hello"(5) + "こんにちは"(5 chars * width 2 = 10) = 17.
+        terminal.backend_mut().assert_cursor_position((17, 1));
     }
 
     fn test_header() -> HeaderInfo<'static> {
@@ -1247,6 +1347,37 @@ mod tests {
             model_name: "gpt-5.4",
             usage: polaris_provider::Usage::default(),
         }
+    }
+
+    #[test]
+    fn header_history_lines_matches_render_header_into_content_and_width() {
+        let header = test_header();
+        let width = 60u16;
+
+        let lines = header_history_lines(&header, width);
+        assert_eq!(lines.len(), HEADER_HEIGHT as usize);
+
+        // Top and bottom rows are a full-width box-drawing border.
+        let top = lines[0].line.to_string();
+        let bottom = lines[lines.len() - 1].line.to_string();
+        assert!(top.starts_with('\u{250c}') && top.ends_with('\u{2510}'));
+        assert!(bottom.starts_with('\u{2514}') && bottom.ends_with('\u{2518}'));
+        assert_eq!(top.chars().count(), width as usize);
+        assert_eq!(bottom.chars().count(), width as usize);
+
+        // Every content row is framed with the same `│ ... │` as the border
+        // rows imply, and each content row's *text* matches header_lines'
+        // plain (unbordered) content exactly.
+        let plain = header_lines(&header);
+        for (i, plain_line) in plain.iter().enumerate() {
+            let framed = lines[1 + i].line.to_string();
+            assert!(framed.starts_with('\u{2502}') && framed.ends_with('\u{2502}'));
+            assert!(framed.contains(&plain_line.to_string()));
+            assert_eq!(framed.chars().count(), width as usize);
+        }
+
+        // No row is shaded — the header box isn't a user/assistant line.
+        assert!(lines.iter().all(|hl| !hl.shaded));
     }
 
     #[test]
@@ -1317,6 +1448,32 @@ mod tests {
     #[test]
     fn shimmer_spans_on_empty_text_is_empty() {
         assert!(shimmer_spans("", Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn the_window_shows_everything_when_history_is_shorter_than_the_viewport() {
+        assert_eq!(visible_history_window(3, 0, 10), 0..3);
+    }
+
+    #[test]
+    fn the_window_shows_the_last_n_lines_when_scroll_offset_is_zero() {
+        assert_eq!(visible_history_window(100, 0, 10), 90..100);
+    }
+
+    #[test]
+    fn a_positive_scroll_offset_shifts_the_window_up() {
+        assert_eq!(visible_history_window(100, 5, 10), 85..95);
+    }
+
+    #[test]
+    fn scroll_offset_is_clamped_at_the_oldest_line() {
+        // Can't scroll further back than showing line 0 at the window's top.
+        assert_eq!(visible_history_window(100, 1000, 10), 0..10);
+    }
+
+    #[test]
+    fn a_zero_height_window_is_always_empty() {
+        assert_eq!(visible_history_window(50, 0, 0), 50..50);
     }
 
     #[test]
@@ -1975,35 +2132,6 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("third paragraph")));
         // The label prefix should not repeat on continuation lines.
         assert!(!rows.iter().any(|r| r.contains("polaris: second paragraph")));
-    }
-
-    #[test]
-    fn the_header_shows_provider_model_and_usage() {
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage {
-                input_tokens: 100,
-                output_tokens: 40,
-                total_tokens: 140,
-            },
-        };
-
-        // Wide enough that the header box's one content line ("model: ...
-        // tokens: in ... / out ... / total ...") isn't cut off before the
-        // usage numbers this test asserts on.
-        let mut buf =
-            ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, HEADER_HEIGHT));
-        let area = buf.area;
-        render_header_into(&mut buf, area, &header);
-
-        let content = buf.content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(content.contains("openai"));
-        assert!(content.contains("gpt-5.4"));
-        assert!(content.contains("140"));
     }
 
     #[test]

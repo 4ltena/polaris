@@ -737,6 +737,65 @@ pub fn render_history_into(
     }
 }
 
+/// Overlays a selection's highlight onto an already-rendered `Buffer` —
+/// call this immediately after `render_history_into` has drawn `lines`
+/// into `area`. Only reverses video (`Modifier::REVERSED`); never touches
+/// `fg`/`bg`, so existing colors (role color, `CODE_TEXT_COLOR`, shaded
+/// rows) show through unchanged, just inverted — matching how ordinary
+/// terminal selection highlighting looks. `wrapped`/`window` are the same
+/// values `draw_frame` already computed for `render_history_into` itself.
+pub fn apply_selection_highlight(
+    buf: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    window: std::ops::Range<usize>,
+    wrapped: &[HistoryLine],
+    sel: &crate::selection::Selection,
+) {
+    for (line_idx, start_col, end_col) in crate::selection::highlighted_columns(wrapped, sel) {
+        if !window.contains(&line_idx) {
+            continue;
+        }
+        let y_offset = (line_idx - window.start) as u16;
+        if y_offset >= area.height {
+            continue;
+        }
+        let row_y = area.y + y_offset;
+
+        // start_col/end_col are character indices into the line's full
+        // text; walk the same way `wrap_history_lines` does to turn them
+        // into display columns (a full-width character occupies 2 cells).
+        let Some(hl) = wrapped.get(line_idx) else {
+            continue;
+        };
+        let mut char_idx = 0usize;
+        let mut display_col: u16 = 0;
+        'spans: for span in &hl.line.spans {
+            for c in span.content.chars() {
+                // `UnicodeWidthChar` is already imported unqualified at the
+                // top of render.rs (see its `use unicode_width::{...}`) —
+                // call `.width()` directly, matching `wrap_history_lines`'s
+                // own style.
+                let w = c.width().unwrap_or(0) as u16;
+                if char_idx >= start_col && char_idx < end_col {
+                    for dx in 0..w {
+                        let x = area.x + display_col + dx;
+                        if x >= area.x + area.width {
+                            break 'spans;
+                        }
+                        buf[(x, row_y)]
+                            .set_style(Style::default().add_modifier(Modifier::REVERSED));
+                    }
+                }
+                display_col += w;
+                char_idx += 1;
+                if char_idx >= end_col {
+                    break 'spans;
+                }
+            }
+        }
+    }
+}
+
 /// What the status-bar header shows: which provider/model is in use, and
 /// the token usage accumulated so far this session. This is a read-only
 /// snapshot handed in by the caller each frame — `render.rs` never tracks
@@ -2989,6 +3048,94 @@ mod tests {
         assert_eq!(find_row_color("hello"), find_row_color("hi there"));
         assert!(lines.iter().any(|l| l.shaded));
         assert!(lines.iter().any(|l| !l.shaded));
+    }
+
+    #[test]
+    fn apply_selection_highlight_reverses_only_the_selected_cells() {
+        use crate::selection::{Selection, TextPos};
+        let wrapped = vec![HistoryLine::plain(Line::from("hello world"))];
+        let area = ratatui::layout::Rect::new(0, 0, 20, 5);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_history_into(&mut buf, area, &wrapped);
+
+        let sel = Selection {
+            anchor: TextPos { line: 0, col: 2 },
+            cursor: TextPos { line: 0, col: 7 },
+            dragging: false,
+        };
+        apply_selection_highlight(&mut buf, area, 0..1, &wrapped, &sel);
+
+        for x in 0..2 {
+            assert!(
+                !buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "column {x} should not be highlighted"
+            );
+        }
+        for x in 2..7 {
+            assert!(
+                buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "column {x} should be highlighted"
+            );
+        }
+        for x in 7..20 {
+            assert!(
+                !buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "column {x} should not be highlighted"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_selection_highlight_ignores_lines_outside_the_visible_window() {
+        use crate::selection::{Selection, TextPos};
+        let wrapped = vec![
+            HistoryLine::plain(Line::from("scrolled off the top")),
+            HistoryLine::plain(Line::from("visible line")),
+        ];
+        let area = ratatui::layout::Rect::new(0, 0, 30, 5);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        // window is 1..2 -- only wrapped[1] is on screen, at row 0.
+        render_history_into(&mut buf, area, &wrapped[1..2]);
+
+        let sel = Selection {
+            anchor: TextPos { line: 0, col: 0 },
+            cursor: TextPos { line: 0, col: 5 },
+            dragging: false,
+        };
+        apply_selection_highlight(&mut buf, area, 1..2, &wrapped, &sel);
+
+        for x in 0..30 {
+            assert!(
+                !buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "column {x} should not be highlighted — line 0 is scrolled off"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_selection_highlight_preserves_existing_colors() {
+        use crate::selection::{Selection, TextPos};
+        let wrapped = vec![HistoryLine::plain(Line::from(Span::styled(
+            "colored text",
+            Style::default().fg(Color::Red),
+        )))];
+        let area = ratatui::layout::Rect::new(0, 0, 20, 5);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_history_into(&mut buf, area, &wrapped);
+
+        let sel = Selection {
+            anchor: TextPos { line: 0, col: 0 },
+            cursor: TextPos { line: 0, col: 7 },
+            dragging: false,
+        };
+        apply_selection_highlight(&mut buf, area, 0..1, &wrapped, &sel);
+
+        assert_eq!(
+            buf[(0, 0)].fg,
+            Color::Red,
+            "the red fg color must survive the highlight"
+        );
+        assert!(buf[(0, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

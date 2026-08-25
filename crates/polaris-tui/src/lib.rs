@@ -86,23 +86,41 @@ fn abbreviate_home(path: &std::path::Path) -> String {
     }
 }
 
-/// The inline viewport's fixed height: a border row, up to
-/// `render::MAX_DISPLAYED_SUGGESTIONS` suggestion rows, one "N more" row,
-/// the status row, the input row, and the footer row, all summed.
-/// `ratatui`'s `Viewport::Inline(height)` fixes this at `Terminal`
-/// construction — it can't grow per-frame the way the old fullscreen
-/// layout's suggestions region could, which is why the suggestions popup
-/// is capped (see `render::MAX_DISPLAYED_SUGGESTIONS`'s doc) instead of
-/// sizing to fit an unbounded match list.
-const INLINE_VIEWPORT_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1;
+/// The footer region's fixed height within `draw_frame`'s fullscreen
+/// layout: a border row, up to `render::MAX_DISPLAYED_SUGGESTIONS`
+/// suggestion rows, one "N more" row, the status row, the input row, and
+/// the footer row, all summed. This is a `Constraint::Length` given to
+/// the vertical split in `draw_frame`, not a `Terminal`-level viewport
+/// setting (there's no separate inline viewport anymore — see `run()`'s
+/// `Viewport::Fullscreen` comment) — it's still fixed rather than
+/// growing to fit content, which is why the suggestions popup is capped
+/// (see `render::MAX_DISPLAYED_SUGGESTIONS`'s doc) instead of sizing to
+/// fit an unbounded match list.
+const FOOTER_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1;
 
 /// Appends every `session.messages` entry and every `local_lines` entry
 /// added since the last call to `history`, once each — the in-memory
 /// analogue of the old `insert_before`-based one-shot terminal print.
 /// Advances `printed_messages`/`printed_local_lines` to the new lengths.
-/// Callers that reset a session wholesale (`/resume`, `/new`, `/fork`,
-/// `/clear`) must reset both counters to 0 *and* clear `history` — see
-/// each call site in `run()`.
+///
+/// The shrink-guard below (`*printed_messages > session.messages.len()`,
+/// and its `local_lines` twin) fires whenever a caller resets a session
+/// out from under this function without resetting the two counters —
+/// today that's only `/clear`'s `apply_slash_action` branch, which clears
+/// `session.messages`/`local_lines` but has no access to `history` to
+/// re-seed. Deliberately, this function does *not* try to re-seed the
+/// header itself when that guard fires: doing so would need a
+/// `HeaderInfo`/width threaded all the way into a function whose only
+/// other job is diffing two counters against two slices, for the sake of
+/// one caller. Instead every wholesale-reset path calls
+/// `reset_conversation_view` explicitly (see its own doc and every call
+/// site in `run()`, including the one right after `/clear`'s
+/// `apply_slash_action` call) *before* falling through to the next
+/// `append_new_history` call, so by the time this function's own
+/// shrink-guard would fire, it instead finds `history` already correctly
+/// re-seeded and `printed_messages`/`printed_local_lines` already at 0 —
+/// meaning the guard is a no-op safety net on that path, not the
+/// mechanism actually doing the reset.
 fn append_new_history(
     session: &polaris_core::session::Session,
     local_lines: &[ratatui::text::Line<'static>],
@@ -138,12 +156,41 @@ fn append_new_history(
     }
 }
 
+/// Clears `history` and immediately re-seeds it with the header box, and
+/// resets `scroll_offset` back to 0 (following the tail) — the one place
+/// every conversation-view reset (`/resume`, `/new`, `/fork`, `/clear`)
+/// goes through, so the header can't be dropped by a bare `history.clear()`
+/// and a stale scroll position can't survive into a different, possibly
+/// much shorter, conversation. Callers still separately reset
+/// `printed_messages`/`printed_local_lines` to 0 — this only owns
+/// `history`/`scroll_offset`, not the counters `append_new_history` reads.
+fn reset_conversation_view(
+    history: &mut Vec<render::HistoryLine>,
+    scroll_offset: &mut usize,
+    header: &render::HeaderInfo,
+    width: u16,
+) {
+    history.clear();
+    history.extend(render::header_history_lines(header, width));
+    *scroll_offset = 0;
+}
+
 /// Appends one mid-turn `AgentEvent`'s formatted lines to `history` — the
 /// in-memory analogue of the old one-shot live print. `history_lines_for`
 /// deliberately leaves tool activity out of its own output (see its own
-/// doc comment) so appending this separately can't duplicate it.
-fn append_live_event(event: &polaris_core::AgentEvent, history: &mut Vec<render::HistoryLine>) {
+/// doc comment) so appending this separately can't duplicate it. Returns
+/// how many lines were just appended, so a caller that's scrolled back
+/// (`scroll_offset > 0`) can advance `scroll_offset` by the same amount
+/// and keep the *viewed content* fixed instead of letting the window
+/// silently shift under the user by the number of newly appended lines
+/// (see the two call sites in `run()`).
+fn append_live_event(
+    event: &polaris_core::AgentEvent,
+    history: &mut Vec<render::HistoryLine>,
+) -> usize {
+    let before = history.len();
     history.extend(render::format_event_for_live_print(event));
+    history.len() - before
 }
 
 fn now_millis() -> u128 {
@@ -164,7 +211,7 @@ fn new_session_id() -> String {
 }
 
 /// Splits `frame.area()` into the scrollable history region (top) and the
-/// fixed-height footer region (bottom, `INLINE_VIEWPORT_HEIGHT` rows),
+/// fixed-height footer region (bottom, `FOOTER_HEIGHT` rows),
 /// renders the current `visible_history_window` slice of `history` into
 /// the first, and calls `render_footer` with the second. This is the one
 /// draw routine every redraw point in `run()` shares — see this plan's
@@ -184,7 +231,7 @@ fn draw_frame(
     let area = frame.area();
     let [history_area, footer_area] = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Min(0),
-        ratatui::layout::Constraint::Length(INLINE_VIEWPORT_HEIGHT),
+        ratatui::layout::Constraint::Length(FOOTER_HEIGHT),
     ])
     .areas(area);
 
@@ -252,14 +299,16 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // frame, `draw_frame` renders `render::visible_history_window`'s slice
     // of that buffer (governed by `scroll_offset` below) into the top
     // region and `render::render_footer` (suggestions/status/input/footer)
-    // into the fixed `INLINE_VIEWPORT_HEIGHT`-tall bottom region — the one
+    // into the fixed `FOOTER_HEIGHT`-tall bottom region — the one
     // draw routine every redraw point in this loop shares.
     // `ratatui::init_with_options` enables raw mode but — regardless of
     // `Viewport` — does not itself enter the alternate screen, so that's
-    // done explicitly here (`EnterAlternateScreen`) with the matching
-    // `LeaveAlternateScreen` at this function's single `ratatui::restore()`
-    // cleanup point below, so a fullscreen redraw never overwrites the
-    // user's real shell scrollback and always hands it back on exit.
+    // done explicitly here (`EnterAlternateScreen`). `ratatui::restore()`
+    // at this function's single cleanup point below already leaves the
+    // alternate screen again on its own (confirmed against ratatui
+    // 0.29.0's source), so nothing else needs to undo this call — a
+    // fullscreen redraw never overwrites the user's real shell scrollback
+    // and always hands it back on exit.
     if let Err(e) = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::terminal::EnterAlternateScreen
@@ -449,9 +498,22 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             // the length-shrunk check inside
                             // `append_new_history` can't detect that case,
                             // so reset explicitly here.
+                            let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                            reset_conversation_view(
+                                &mut history,
+                                &mut scroll_offset,
+                                &render::HeaderInfo {
+                                    provider_name: &args.provider_name,
+                                    model_name: &model_name,
+                                    usage: cumulative_usage,
+                                    cwd: &cwd_display,
+                                    cwd_short: &cwd_footer_display,
+                                    effort_name: &effort_name,
+                                },
+                                width,
+                            );
                             printed_messages = 0;
                             printed_local_lines = 0;
-                            history.clear();
                             continue;
                         }
                         slash::Action::New => {
@@ -464,9 +526,22 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &mut status,
                                 &mut local_lines,
                             );
+                            let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                            reset_conversation_view(
+                                &mut history,
+                                &mut scroll_offset,
+                                &render::HeaderInfo {
+                                    provider_name: &args.provider_name,
+                                    model_name: &model_name,
+                                    usage: cumulative_usage,
+                                    cwd: &cwd_display,
+                                    cwd_short: &cwd_footer_display,
+                                    effort_name: &effort_name,
+                                },
+                                width,
+                            );
                             printed_messages = 0;
                             printed_local_lines = 0;
-                            history.clear();
                             continue;
                         }
                         slash::Action::Fork => {
@@ -479,9 +554,22 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &mut session_started_at_millis,
                                 &mut status,
                             );
+                            let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                            reset_conversation_view(
+                                &mut history,
+                                &mut scroll_offset,
+                                &render::HeaderInfo {
+                                    provider_name: &args.provider_name,
+                                    model_name: &model_name,
+                                    usage: cumulative_usage,
+                                    cwd: &cwd_display,
+                                    cwd_short: &cwd_footer_display,
+                                    effort_name: &effort_name,
+                                },
+                                width,
+                            );
                             printed_messages = 0;
                             printed_local_lines = 0;
-                            history.clear();
                             continue;
                         }
                         slash::Action::Permissions => {
@@ -510,6 +598,14 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         action => {
+                            // `apply_slash_action` clears `session.messages`/
+                            // `local_lines` for `Clear` but has no access to
+                            // `history`/`scroll_offset` to re-seed the header
+                            // and reset the scroll position — do that here
+                            // instead of relying on `append_new_history`'s
+                            // shrink-guard to (not) do it (see that
+                            // function's doc comment).
+                            let clear_view = matches!(action, slash::Action::Clear);
                             match apply_slash_action(
                                 action,
                                 &mut session,
@@ -522,7 +618,28 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &args.cwd,
                                 &mut local_lines,
                             ) {
-                                SlashOutcome::Continue => continue,
+                                SlashOutcome::Continue => {
+                                    if clear_view {
+                                        let width =
+                                            terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                                        reset_conversation_view(
+                                            &mut history,
+                                            &mut scroll_offset,
+                                            &render::HeaderInfo {
+                                                provider_name: &args.provider_name,
+                                                model_name: &model_name,
+                                                usage: cumulative_usage,
+                                                cwd: &cwd_display,
+                                                cwd_short: &cwd_footer_display,
+                                                effort_name: &effort_name,
+                                            },
+                                            width,
+                                        );
+                                        printed_messages = 0;
+                                        printed_local_lines = 0;
+                                    }
+                                    continue;
+                                }
                                 SlashOutcome::Quit => break ExitCode::SUCCESS,
                                 SlashOutcome::Fatal(msg) => {
                                     fatal_message = Some(msg);
@@ -623,9 +740,22 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     // Same reasoning as the popup-selection path above: a
                     // resumed session's length alone can't be trusted to
                     // signal "this is a different conversation."
+                    let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                    reset_conversation_view(
+                        &mut history,
+                        &mut scroll_offset,
+                        &render::HeaderInfo {
+                            provider_name: &args.provider_name,
+                            model_name: &model_name,
+                            usage: cumulative_usage,
+                            cwd: &cwd_display,
+                            cwd_short: &cwd_footer_display,
+                            effort_name: &effort_name,
+                        },
+                        width,
+                    );
                     printed_messages = 0;
                     printed_local_lines = 0;
-                    history.clear();
                     continue;
                 }
                 Some(slash::Action::New) => {
@@ -638,9 +768,22 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &mut status,
                         &mut local_lines,
                     );
+                    let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                    reset_conversation_view(
+                        &mut history,
+                        &mut scroll_offset,
+                        &render::HeaderInfo {
+                            provider_name: &args.provider_name,
+                            model_name: &model_name,
+                            usage: cumulative_usage,
+                            cwd: &cwd_display,
+                            cwd_short: &cwd_footer_display,
+                            effort_name: &effort_name,
+                        },
+                        width,
+                    );
                     printed_messages = 0;
                     printed_local_lines = 0;
-                    history.clear();
                     continue;
                 }
                 Some(slash::Action::Fork) => {
@@ -653,9 +796,22 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &mut session_started_at_millis,
                         &mut status,
                     );
+                    let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                    reset_conversation_view(
+                        &mut history,
+                        &mut scroll_offset,
+                        &render::HeaderInfo {
+                            provider_name: &args.provider_name,
+                            model_name: &model_name,
+                            usage: cumulative_usage,
+                            cwd: &cwd_display,
+                            cwd_short: &cwd_footer_display,
+                            effort_name: &effort_name,
+                        },
+                        width,
+                    );
                     printed_messages = 0;
                     printed_local_lines = 0;
-                    history.clear();
                     continue;
                 }
                 Some(slash::Action::Permissions) => {
@@ -684,6 +840,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     continue;
                 }
                 Some(action) => {
+                    // Same reasoning as the popup-selection path above:
+                    // `apply_slash_action` can't re-seed `history`'s header
+                    // or reset `scroll_offset` itself for `Clear`.
+                    let clear_view = matches!(action, slash::Action::Clear);
                     match apply_slash_action(
                         action,
                         &mut session,
@@ -696,7 +856,27 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &args.cwd,
                         &mut local_lines,
                     ) {
-                        SlashOutcome::Continue => continue,
+                        SlashOutcome::Continue => {
+                            if clear_view {
+                                let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                                reset_conversation_view(
+                                    &mut history,
+                                    &mut scroll_offset,
+                                    &render::HeaderInfo {
+                                        provider_name: &args.provider_name,
+                                        model_name: &model_name,
+                                        usage: cumulative_usage,
+                                        cwd: &cwd_display,
+                                        cwd_short: &cwd_footer_display,
+                                        effort_name: &effort_name,
+                                    },
+                                    width,
+                                );
+                                printed_messages = 0;
+                                printed_local_lines = 0;
+                            }
+                            continue;
+                        }
                         SlashOutcome::Quit => break ExitCode::SUCCESS,
                         SlashOutcome::Fatal(msg) => {
                             fatal_message = Some(msg);
@@ -855,7 +1035,16 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     // display work. Anything still queued when the turn
                     // finishes is drained right after this loop.
                     Some(event) = events_rx.recv() => {
-                        append_live_event(&event, &mut history);
+                        let appended = append_live_event(&event, &mut history);
+                        // The user is scrolled back, not following the
+                        // tail — advance `scroll_offset` by however many
+                        // lines just landed so the *viewed content* stays
+                        // fixed under them instead of the window silently
+                        // sliding by `appended` lines (see
+                        // `append_live_event`'s doc).
+                        if scroll_offset > 0 {
+                            scroll_offset += appended;
+                        }
                     }
                     _ = ticker.tick() => {
                         status = Status::Thinking { elapsed: turn_started.elapsed() };
@@ -894,10 +1083,23 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     maybe_event = event_stream.next() => {
                         use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind};
                         match maybe_event {
-                            Some(Ok(Event::Key(key)))
-                                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc =>
-                            {
-                                break TurnOutcome::Interrupted;
+                            Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                                // Esc interrupts the in-flight turn; Up/Down
+                                // still scroll the conversation history
+                                // while a turn is running, the same
+                                // saturating-add/sub as the idle-loop
+                                // handler above — previously every key but
+                                // Esc was silently discarded here.
+                                match key.code {
+                                    KeyCode::Esc => break TurnOutcome::Interrupted,
+                                    KeyCode::Up => {
+                                        scroll_offset = scroll_offset.saturating_add(1);
+                                    }
+                                    KeyCode::Down => {
+                                        scroll_offset = scroll_offset.saturating_sub(1);
+                                    }
+                                    _ => {}
+                                }
                             }
                             Some(Ok(_)) => {}
                             Some(Err(_)) | None => break TurnOutcome::Fatal,
@@ -912,7 +1114,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             // print them rather than silently dropping the final tool's
             // result marker.
             while let Ok(event) = events_rx.try_recv() {
-                append_live_event(&event, &mut history);
+                let appended = append_live_event(&event, &mut history);
+                if scroll_offset > 0 {
+                    scroll_offset += appended;
+                }
             }
             turn_outcome
         };
@@ -952,14 +1157,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         }
     };
 
+    // Already leaves the alternate screen entered above, on its own
+    // (confirmed against ratatui 0.29.0's source) — no separate explicit
+    // `LeaveAlternateScreen` call is needed here.
     ratatui::restore();
-    // Best-effort — the process is already exiting, so there's nothing
-    // meaningful to fail out to; leaving the terminal in the alternate
-    // screen would be worse than a swallowed error here.
-    let _ = ratatui::crossterm::execute!(
-        std::io::stdout(),
-        ratatui::crossterm::terminal::LeaveAlternateScreen
-    );
     if let Some(msg) = fatal_message {
         eprintln!("{msg}");
     }
@@ -1624,9 +1825,9 @@ mod tests {
             })
             .collect();
         assert!(rows[0].contains("line from history"));
-        // The footer's placeholder text lands in the bottom INLINE_VIEWPORT_HEIGHT
+        // The footer's placeholder text lands in the bottom FOOTER_HEIGHT
         // rows, not the top history region.
-        let footer_start = 30 - INLINE_VIEWPORT_HEIGHT as usize;
+        let footer_start = 30 - FOOTER_HEIGHT as usize;
         assert!(
             rows[footer_start..]
                 .iter()

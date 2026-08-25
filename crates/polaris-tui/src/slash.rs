@@ -16,7 +16,7 @@
 //! `/memories`, `/theme`, `/pets`, `/ide`, `/plan`, `/goal`, `/agents`,
 //! `/subagents`, `/side`, `/btw`, `/ps`, `/stop`, `/title`,
 //! `/statusline`, `/feedback`, `/personality`, `/experimental`,
-//! `/approve`, `/mention`, `/copy`, `/usage` (duplicates `/status`'s
+//! `/approve`, `/mention`, `/usage` (duplicates `/status`'s
 //! token display), `/rename` and `/archive`/`/delete` (need a title/
 //! lifecycle concept `/resume`'s picker doesn't have yet). `/model` now
 //! does switch the model mid-session — `polaris_provider::Provider`
@@ -89,6 +89,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "show the current working directory",
     },
     SlashCommand {
+        name: "copy",
+        description: "copy the last reply to the clipboard",
+    },
+    SlashCommand {
         name: "logout",
         description: "log out and remove stored ChatGPT credentials",
     },
@@ -155,6 +159,11 @@ pub enum Action {
     /// model.
     Export(String),
     Pwd,
+    /// Copies the last reply's text to the system clipboard via an OSC 52
+    /// escape sequence — no native clipboard crate, works over SSH/tmux the
+    /// same way it does locally. Mirrors codex's own `/copy` (and its
+    /// `Ctrl+O` hotkey, wired up alongside this in `run()`).
+    Copy,
     Logout,
     Quit,
     Unknown(String),
@@ -198,6 +207,7 @@ pub fn parse(line: &str) -> Option<Action> {
         "fork" => Action::Fork,
         "export" => Action::Export(extra),
         "pwd" => Action::Pwd,
+        "copy" => Action::Copy,
         "logout" => Action::Logout,
         "quit" | "exit" | "q" => Action::Quit,
         _ => Action::Unknown(trimmed.to_ascii_lowercase()),
@@ -257,6 +267,7 @@ mod tests {
             _ => panic!("expected Export"),
         }
         assert!(matches!(parse("/pwd"), Some(Action::Pwd)));
+        assert!(matches!(parse("/copy"), Some(Action::Copy)));
         assert!(matches!(parse("/logout"), Some(Action::Logout)));
         assert!(matches!(parse("/quit"), Some(Action::Quit)));
         assert!(matches!(parse("/exit"), Some(Action::Quit)));

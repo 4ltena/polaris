@@ -106,6 +106,25 @@ fn label(role: Role) -> &'static str {
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
+/// Turns a tool call's JSON `arguments` string into a call-style preview —
+/// `key=value, key2=value2` — instead of showing raw JSON (braces, quoted
+/// keys, colons). Falls back to the raw text unchanged when `detail` isn't
+/// a JSON object (parse failure, or a bare array/string/number), so nothing
+/// is ever hidden. Key order follows `serde_json::Value`'s own iteration
+/// order (alphabetical — the default `Map` has no order-preserving
+/// feature enabled), which is stable but not necessarily the call's
+/// original argument order.
+fn format_tool_call_args(detail: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(detail) {
+        Ok(serde_json::Value::Object(map)) => map
+            .iter()
+            .map(|(k, v)| format!("{k}={}", serde_json::to_string(v).unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => detail.to_string(),
+    }
+}
+
 /// The color code (tool result previews, markdown-fenced code blocks in
 /// replies) is shown in — distinguishes it visually from ordinary text
 /// without a background tint, which read as unwanted shading when
@@ -173,7 +192,8 @@ fn format_tool_result_preview(result: &str) -> Vec<String> {
 pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
     match event {
         AgentEvent::ToolStarted { name, detail } => {
-            let preview: String = detail.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
+            let args = format_tool_call_args(detail);
+            let preview: String = args.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
             vec![HistoryLine::plain(Line::from(Span::raw(sanitize(
                 &format!("⏺ {name}({preview})"),
             ))))]
@@ -2241,6 +2261,54 @@ mod tests {
         assert!(text.contains("⏺"));
         assert!(text.contains("bash"));
         assert!(text.contains("ls"));
+    }
+
+    #[test]
+    fn a_tool_started_events_json_arguments_render_as_key_equals_value() {
+        // The bug this pins down: raw JSON like `{"limit":50,"path":"a.txt"}`
+        // showed up verbatim — braces, quoted keys, colons — instead of a
+        // readable call-style preview.
+        let lines = format_event_for_live_print(&AgentEvent::ToolStarted {
+            name: "read".to_string(),
+            detail: "{\"path\":\"a.txt\",\"limit\":50}".to_string(),
+        });
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "⏺ read(limit=50, path=\"a.txt\")");
+    }
+
+    #[test]
+    fn a_tool_started_event_with_no_arguments_renders_empty_parens() {
+        let lines = format_event_for_live_print(&AgentEvent::ToolStarted {
+            name: "list_skills".to_string(),
+            detail: "{}".to_string(),
+        });
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "⏺ list_skills()");
+    }
+
+    #[test]
+    fn non_object_tool_call_detail_falls_back_to_the_raw_text() {
+        let lines = format_event_for_live_print(&AgentEvent::ToolStarted {
+            name: "weird".to_string(),
+            detail: "not json".to_string(),
+        });
+        let text: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "⏺ weird(not json)");
     }
 
     #[test]

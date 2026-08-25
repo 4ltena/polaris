@@ -1456,6 +1456,7 @@ name = "polaris-tui"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "crossterm",
  "futures-util",
  "polaris-auth",

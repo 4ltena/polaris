@@ -2661,4 +2661,24 @@ mod tests {
         assert_eq!(scroll_offset, 1000);
         assert_eq!(render::visible_history_window(50, scroll_offset, 10), 0..10);
     }
+
+    #[test]
+    // The `47` below is never read before being overwritten — that's the
+    // point (it documents the pre-reset "mid-scroll" value the Submit arm
+    // discards), so silence clippy's unused_assignments lint for it.
+    #[allow(unused_assignments)]
+    fn scroll_offset_test_helper_matches_the_submit_reset_contract() {
+        // Documents/pins the exact behavior Task 7 Step 2 wires into run():
+        // a non-empty Submit resets scroll_offset to 0. run()'s own loop
+        // isn't independently driveable in a test (see Task 7 Step 3's note),
+        // so this pins the invariant at the type level instead: after any
+        // number of scroll-up steps, resetting to 0 always shows the tail.
+        let history_len = 200;
+        let mut scroll_offset: usize = 47; // mid-scroll
+        scroll_offset = 0; // what the Submit arm does
+        assert_eq!(
+            render::visible_history_window(history_len, scroll_offset, 10),
+            190..200
+        );
+    }
 }

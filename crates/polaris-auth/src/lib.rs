@@ -94,11 +94,11 @@ pub fn needs_refresh(c: &Credentials, now: u64) -> bool {
 /// alone (it carries only categories like `plus`/`pro`/`prolite`/`team`/
 /// `enterprise`). Making that distinction needs a separate rate-limit/credits
 /// API, and this login scope has no path to fetch it. Since we can't
-/// distinguish them, we round every pro-family value up to xhigh — rounding
-/// down would needlessly force weak reasoning on users on Pro's higher
-/// tiers, while rounding up would only wrongly push Plus users into a heavy
-/// setting. Between the two, we prioritized letting pro-family users get the
-/// capability they're paying for.
+/// distinguish them, we round every pro-family value up to xhigh.
+///
+/// Plus gets `high` — a deliberate choice to give Plus users strong
+/// reasoning by default, accepting the tradeoff that this reaches Plus's
+/// tighter rate limit sooner than a lower effort would.
 ///
 /// For a value that is neither `plus` nor `pro*` (`free`, `team`,
 /// `enterprise`, etc.) or when it couldn't be fetched at all, this returns
@@ -106,8 +106,24 @@ pub fn needs_refresh(c: &Credentials, now: u64) -> bool {
 /// the behavior for a category not covered here.
 pub fn effort_for_plan_type(plan_type: Option<&str>) -> Option<&'static str> {
     match plan_type {
-        Some("plus") => Some("low"),
+        Some("plus") => Some("high"),
         Some(s) if s.starts_with("pro") => Some("xhigh"),
+        _ => None,
+    }
+}
+
+/// Determines the default model from `chatgpt_plan_type`, the same way
+/// `effort_for_plan_type` determines the default reasoning effort.
+///
+/// Only Plus gets an override (to `gpt-5.6-terra`, paired with the `high`
+/// effort above). Pro-family and every other/unmapped plan return `None`
+/// and defer to the caller's own default model
+/// (`polaris_provider::codex::DEFAULT_MODEL`) — there's no equivalent
+/// "round up" reasoning for model choice the way there is for effort, so
+/// this stays narrow rather than guessing.
+pub fn model_for_plan_type(plan_type: Option<&str>) -> Option<&'static str> {
+    match plan_type {
+        Some("plus") => Some("gpt-5.6-terra"),
         _ => None,
     }
 }
@@ -188,8 +204,23 @@ mod tests {
     }
 
     #[test]
-    fn plus_gets_a_low_effort() {
-        assert_eq!(effort_for_plan_type(Some("plus")), Some("low"));
+    fn plus_gets_a_high_effort() {
+        assert_eq!(effort_for_plan_type(Some("plus")), Some("high"));
+    }
+
+    #[test]
+    fn plus_gets_the_terra_model() {
+        assert_eq!(model_for_plan_type(Some("plus")), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn pro_and_unmapped_plans_get_no_model_override() {
+        // Pro-family already gets the strongest effort; overriding its
+        // model too isn't part of this — it keeps whatever the caller's
+        // own default model is (see DEFAULT_MODEL in polaris-provider).
+        assert_eq!(model_for_plan_type(Some("pro")), None);
+        assert_eq!(model_for_plan_type(Some("team")), None);
+        assert_eq!(model_for_plan_type(None), None);
     }
 
     /// Pro's usage tiers (5x/20x) can't be distinguished from plan_type

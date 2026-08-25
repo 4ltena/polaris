@@ -189,6 +189,24 @@ fn effort_for(access_token: &str) -> Option<String> {
     polaris_auth::effort_for_plan_type(plan.as_deref()).map(|s| s.to_string())
 }
 
+/// Determines the default model from the stored credentials' `chatgpt_plan_type`
+/// claim, the same way `effort_for` determines the default effort — but
+/// unlike `effort_for` (called per-request, inside `TokenSource::token`,
+/// where a fresh access token is already guaranteed), this runs once at
+/// startup before any model string is picked, so it reads the store
+/// directly rather than through the async refresh path. A stale-but-still
+/// generally-valid stored token is fine here: `chatgpt_plan_type` doesn't
+/// change from one refresh to the next, and this is only ever choosing a
+/// *default* — an explicit `--model`/`POLARIS_MODEL` always wins over it
+/// (see the caller). Returns `None` (defer to `DEFAULT_MODEL`) whenever
+/// there's no stored login, the store can't be read, or the plan doesn't
+/// map to an override.
+fn model_for_stored_plan(store_path: &Path) -> Option<String> {
+    let creds = polaris_auth::store::load_from(store_path).ok().flatten()?;
+    let plan = polaris_auth::token::plan_type_from_access_token(&creds.access_token);
+    polaris_auth::model_for_plan_type(plan.as_deref()).map(|s| s.to_string())
+}
+
 #[async_trait::async_trait]
 impl polaris_provider::TokenSource for AuthTokens {
     async fn token(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
@@ -414,8 +432,12 @@ async fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                let model =
-                    model.unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
+                // Precedence: an explicit --model/POLARIS_MODEL always
+                // wins; otherwise the stored account's plan may override
+                // the default (see model_for_stored_plan's doc comment).
+                let model = model
+                    .or_else(|| model_for_stored_plan(&store))
+                    .unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
                 model_name = model.clone();
                 break std::sync::Arc::new(polaris_provider::codex::CodexProvider::new(
                     polaris_provider::codex::ENDPOINT_BASE.to_string(),
@@ -793,6 +815,13 @@ mod tests {
         // defaults straight back to "openai", finds no key, and reopens
         // onboarding even though the user already signed in.
         assert_eq!(default_provider_name(false, true), "codex");
+    }
+
+    #[test]
+    fn model_for_stored_plan_defers_when_nothing_is_stored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = dir.path().join("auth.json");
+        assert_eq!(model_for_stored_plan(&store), None);
     }
 
     #[test]

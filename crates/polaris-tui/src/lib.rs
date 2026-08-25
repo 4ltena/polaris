@@ -319,6 +319,18 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
         viewport: ratatui::Viewport::Fullscreen,
     }));
+    // A thin bar cursor, not the terminal's default (usually a full
+    // blinking block) — a block cursor fully inverts whatever glyph sits
+    // in that cell, so parking it over the empty input box's placeholder
+    // text ("Ask polaris to do anything") made the caret look like a
+    // blinking capital "A" rather than a caret. A bar sits between
+    // characters instead of on top of one, so this can't happen
+    // regardless of what's under it. Best-effort: an unsupported terminal
+    // just keeps its own default cursor shape, which is cosmetic only.
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::cursor::SetCursorStyle::BlinkingBar
+    );
     // How many `session.messages` / `local_lines` entries have already
     // been appended to `history`. Only the delta past this point gets
     // appended on each call to `append_new_history` — appending is
@@ -357,8 +369,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // Byte offset into `input_buffer`, always on a UTF-8 char boundary —
     // see `input::apply_key`.
     let mut input_cursor: usize = 0;
-    // Session-local Ctrl+P/Ctrl+N recall of previously submitted input.
-    // Not persisted — see `input::History`.
+    // Session-local Up/Down recall of previously submitted input. Not
+    // persisted — see `input::History`.
     let mut input_history = input::History::new();
     // A local copy, not `args.approval_policy` directly — `/permissions`
     // needs to be able to change it for the rest of the session, and
@@ -653,24 +665,21 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             }
         }
 
-        // Ctrl+P/Ctrl+N recall previously submitted input, shell-history
-        // style — the classic readline/Emacs previous-history/next-history
-        // bindings. Not bound to bare Up/Down: those are claimed by
-        // scrolling the conversation history once the slash-popup isn't
-        // showing (see the Up/Down handling further below), and the
-        // scroll design was the one already approved for those keys.
+        // Up/Down recall previously submitted input, shell-history style —
+        // matching ordinary terminals/shells. Only reachable once the
+        // slash-popup above hasn't already claimed these keys (it
+        // `continue`s whenever `suggestions` is non-empty).
         if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
-            use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            use ratatui::crossterm::event::KeyCode;
             match key.code {
-                KeyCode::Char('p') if ctrl => {
+                KeyCode::Up => {
                     if let Some(recalled) = input_history.older(&input_buffer) {
                         input_buffer = recalled.to_string();
                         input_cursor = input_buffer.len();
                     }
                     continue;
                 }
-                KeyCode::Char('n') if ctrl => {
+                KeyCode::Down => {
                     if let Some(recalled) = input_history.newer() {
                         input_buffer = recalled.to_string();
                         input_cursor = input_buffer.len();
@@ -681,17 +690,17 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             }
         }
 
-        // Up/Down scroll the conversation history — only reachable once
-        // the slash-popup above hasn't already claimed these keys (it
-        // `continue`s whenever `suggestions` is non-empty).
+        // PageUp/PageDown scroll the conversation history — not claimed by
+        // the slash-popup or by input-history recall, so these are always
+        // reachable when the input box has focus.
         if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
             use ratatui::crossterm::event::KeyCode;
             match key.code {
-                KeyCode::Up => {
+                KeyCode::PageUp => {
                     scroll_offset = scroll_offset.saturating_add(1);
                     continue;
                 }
-                KeyCode::Down => {
+                KeyCode::PageDown => {
                     scroll_offset = scroll_offset.saturating_sub(1);
                     continue;
                 }
@@ -1084,18 +1093,19 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind};
                         match maybe_event {
                             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                                // Esc interrupts the in-flight turn; Up/Down
-                                // still scroll the conversation history
-                                // while a turn is running, the same
-                                // saturating-add/sub as the idle-loop
-                                // handler above — previously every key but
-                                // Esc was silently discarded here.
+                                // Esc interrupts the in-flight turn;
+                                // PageUp/PageDown still scroll the
+                                // conversation history while a turn is
+                                // running, the same saturating-add/sub as
+                                // the idle-loop handler above — previously
+                                // every key but Esc was silently discarded
+                                // here.
                                 match key.code {
                                     KeyCode::Esc => break TurnOutcome::Interrupted,
-                                    KeyCode::Up => {
+                                    KeyCode::PageUp => {
                                         scroll_offset = scroll_offset.saturating_add(1);
                                     }
-                                    KeyCode::Down => {
+                                    KeyCode::PageDown => {
                                         scroll_offset = scroll_offset.saturating_sub(1);
                                     }
                                     _ => {}
@@ -1162,6 +1172,12 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // (confirmed against ratatui 0.29.0's source) — no separate explicit
     // `LeaveAlternateScreen` call is needed here.
     ratatui::restore();
+    // Restore the terminal's own default cursor shape, undoing the
+    // BlinkingBar set at startup — best-effort, same as the set itself.
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::cursor::SetCursorStyle::DefaultUserShape
+    );
     if let Some(msg) = fatal_message {
         eprintln!("{msg}");
     }

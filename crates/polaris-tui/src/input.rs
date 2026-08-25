@@ -73,11 +73,11 @@ fn next_char_boundary(buffer: &str, cursor: usize) -> Option<usize> {
         .map(|c| cursor + c.len_utf8())
 }
 
-/// Session-local recall of previously submitted input, bound to
-/// Ctrl+P/Ctrl+N (the classic readline/Emacs previous-history/next-history
-/// keys) — not Up/Down, which the TUI's main loop uses for scrolling the
-/// conversation view instead. Not persisted to disk — a fresh `History`
-/// is created each time the TUI starts.
+/// Session-local recall of previously submitted input, bound to Up/Down —
+/// matching ordinary terminal/shell history recall. Conversation-view
+/// scrolling uses PageUp/PageDown instead (see the TUI's main loop). Not
+/// persisted to disk — a fresh `History` is created each time the TUI
+/// starts.
 pub struct History {
     entries: Vec<String>,
     /// Index into `entries` currently shown, or `None` when showing the

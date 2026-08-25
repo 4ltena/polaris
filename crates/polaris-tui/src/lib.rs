@@ -2,6 +2,7 @@
 //! is omitted.
 
 pub mod approver;
+mod clipboard;
 pub mod input;
 pub mod onboarding;
 pub mod persist;
@@ -105,11 +106,11 @@ fn abbreviate_home(path: &std::path::Path) -> String {
 // input pad-above(1) + input(1) + input pad-below(1) + footer(1).
 const FOOTER_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1 + 1;
 
-/// How many `scroll_offset` lines one mouse/trackpad wheel tick moves —
-/// a single line per tick feels sluggish for wheel input, unlike a key
-/// press (see `PageUp`/`PageDown`'s own `+1`, which is a deliberate,
-/// discrete step).
-const MOUSE_SCROLL_LINES: usize = 3;
+/// How long a `Ctrl+O` copy confirmation stays visible mid-turn before the
+/// `Thinking` animation resumes — see `mid_turn_notice_until` in `run()`.
+/// Long enough for a normal glance-at-the-screen reaction, short enough
+/// that it doesn't look stuck once the user has seen it.
+const MID_TURN_NOTICE_DURATION: Duration = Duration::from_millis(1500);
 
 /// Appends every `session.messages` entry and every `local_lines` entry
 /// added since the last call to `history`, once each — the in-memory
@@ -337,14 +338,17 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
         viewport: ratatui::Viewport::Fullscreen,
     }));
-    // Trackpad/mouse wheel scrolling of the conversation history — without
-    // this, crossterm never emits `Event::Mouse` at all, so wheel input
-    // silently did nothing. Best-effort: a terminal that doesn't support
-    // mouse reporting just keeps not sending mouse events, same as before.
-    let _ = ratatui::crossterm::execute!(
-        std::io::stdout(),
-        ratatui::crossterm::event::EnableMouseCapture
-    );
+    // Deliberately never enables mouse capture (`EnableMouseCapture`) — the
+    // terminal's own native mouse handling stays untouched, so drag-select
+    // and copy work exactly as they do in any ordinary terminal program.
+    // Enabling it would let a wheel-scroll feature work, but at the cost of
+    // the terminal routing every mouse event (including drag-select) to
+    // this process instead of handling it locally — the two can't coexist
+    // (codex's own TUI makes the same trade: see its `codex-rs` source,
+    // which has no mouse-handling code anywhere in the workspace). Scroll
+    // via PageUp/PageDown instead; copy the last reply via `Ctrl+O`/`/copy`
+    // (see `clipboard.rs`), which doesn't depend on terminal selection at
+    // all.
     // A thin bar cursor, not the terminal's default (usually a full
     // blinking block) — a block cursor fully inverts whatever glyph sits
     // in that cell, so parking it over the empty input box's placeholder
@@ -485,19 +489,6 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             Ok(e) => e,
             Err(_) => break ExitCode::FAILURE,
         };
-        if let ratatui::crossterm::event::Event::Mouse(mouse) = &event {
-            use ratatui::crossterm::event::MouseEventKind;
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    scroll_offset = scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
-                }
-                MouseEventKind::ScrollDown => {
-                    scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
-                }
-                _ => {}
-            }
-            continue;
-        }
         let ratatui::crossterm::event::Event::Key(key) = event else {
             continue;
         };
@@ -749,6 +740,21 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 }
                 _ => {}
             }
+        }
+
+        // Ctrl+O copies the last reply to the clipboard — same hotkey and
+        // behavior as codex's own `/copy`/`Ctrl+O` (see `slash::Action::Copy`).
+        if key.kind == ratatui::crossterm::event::KeyEventKind::Press
+            && key.code == ratatui::crossterm::event::KeyCode::Char('o')
+            && key
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
+        {
+            status = Status::Notice(clipboard::copy_last_reply_with(
+                &session,
+                clipboard::copy_to_clipboard,
+            ));
+            continue;
         }
 
         let text = if let Some(t) = review_text {
@@ -1048,6 +1054,15 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             // reaches the screen through `events_rx` instead, which
             // carries owned `AgentEvent`s and so borrows nothing.
             //
+            // `Ctrl+O` (copy) is the one mid-turn key handler that does
+            // need reply text, so it can't read `session` live once
+            // `agent_future` below borrows it mutably — captured here,
+            // before that borrow starts, as the reply from *before* this
+            // turn (there can't be a newer one yet; the turn hasn't
+            // produced a reply until it finishes).
+            let reply_before_this_turn =
+                clipboard::last_agent_message_text(&session).map(str::to_string);
+            //
             // Unbounded on purpose: a bounded sender would make
             // `agent::run` block on a full queue, i.e. let the display
             // throttle the actual turn. Events are small and a turn's
@@ -1074,6 +1089,12 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             // pre-draw above already painted the elapsed=0 frame.
             ticker.tick().await;
             let mut event_stream = ratatui::crossterm::event::EventStream::new();
+            // How long the `Ctrl+O` copy confirmation stays on screen
+            // before the ticker branch resumes overwriting `status` with
+            // the `Thinking` animation — without this, the confirmation
+            // would only ever survive until the very next tick (at most
+            // 100ms later), which reads as no feedback at all.
+            let mut mid_turn_notice_until: Option<Instant> = None;
 
             let turn_outcome = loop {
                 tokio::select! {
@@ -1099,7 +1120,15 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         }
                     }
                     _ = ticker.tick() => {
-                        status = Status::Thinking { elapsed: turn_started.elapsed() };
+                        if mid_turn_notice_until.is_some_and(|until| Instant::now() < until) {
+                            // Leave `status` as the Ctrl+O confirmation —
+                            // redrawing it unchanged below keeps it
+                            // visible instead of the `Thinking` animation
+                            // clobbering it on this tick.
+                        } else {
+                            mid_turn_notice_until = None;
+                            status = Status::Thinking { elapsed: turn_started.elapsed() };
+                        }
                         // History is never redrawn from here (see the
                         // comment above `agent_future`) — only the status
                         // row's shimmer/elapsed time animates, so this
@@ -1133,7 +1162,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         }
                     }
                     maybe_event = event_stream.next() => {
-                        use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
+                        use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
                         match maybe_event {
                             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                                 // Esc interrupts the in-flight turn;
@@ -1142,7 +1171,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 // running, the same saturating-add/sub as
                                 // the idle-loop handler above — previously
                                 // every key but Esc was silently discarded
-                                // here.
+                                // here. Ctrl+O copies the last reply, same
+                                // as the idle-loop handler.
                                 match key.code {
                                     KeyCode::Esc => break TurnOutcome::Interrupted,
                                     KeyCode::PageUp => {
@@ -1151,22 +1181,51 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                     KeyCode::PageDown => {
                                         scroll_offset = scroll_offset.saturating_sub(1);
                                     }
+                                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        status = Status::Notice(clipboard::copy_text_with(
+                                            reply_before_this_turn.as_deref(),
+                                            clipboard::copy_to_clipboard,
+                                        ));
+                                        // Draw immediately so the
+                                        // confirmation appears right away
+                                        // rather than up to 100ms late,
+                                        // and set the deadline the ticker
+                                        // branch checks so it keeps
+                                        // showing this instead of
+                                        // clobbering it with `Thinking` on
+                                        // its very next tick.
+                                        mid_turn_notice_until =
+                                            Some(Instant::now() + MID_TURN_NOTICE_DURATION);
+                                        if terminal
+                                            .borrow_mut()
+                                            .draw(|f| {
+                                                draw_frame(
+                                                    f,
+                                                    &history,
+                                                    scroll_offset,
+                                                    &input_buffer,
+                                                    input_cursor,
+                                                    &status,
+                                                    &render::HeaderInfo {
+                                                        provider_name: &args.provider_name,
+                                                        model_name: &model_name,
+                                                        usage: cumulative_usage,
+                                                        cwd: &cwd_display,
+                                                        cwd_short: &cwd_footer_display,
+                                                        effort_name: &effort_name,
+                                                    },
+                                                    &[],
+                                                    0,
+                                                )
+                                            })
+                                            .is_err()
+                                        {
+                                            break TurnOutcome::Fatal;
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
-                            // Mouse wheel scrolling also works while a turn
-                            // is running, same as PageUp/PageDown above.
-                            Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
-                                MouseEventKind::ScrollUp => {
-                                    scroll_offset =
-                                        scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
-                                }
-                                MouseEventKind::ScrollDown => {
-                                    scroll_offset =
-                                        scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
-                                }
-                                _ => {}
-                            },
                             Some(Ok(_)) => {}
                             Some(Err(_)) | None => break TurnOutcome::Fatal,
                         }
@@ -1233,15 +1292,6 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::cursor::SetCursorStyle::DefaultUserShape
-    );
-    // Undoes the EnableMouseCapture set at startup — best-effort, same as
-    // the enable itself. Otherwise mouse reporting mode would leak into
-    // whatever the user's shell does next (e.g. text selection with the
-    // mouse would stop working until they open and close another
-    // mouse-reporting program).
-    let _ = ratatui::crossterm::execute!(
-        std::io::stdout(),
-        ratatui::crossterm::event::DisableMouseCapture
     );
     if let Some(msg) = fatal_message {
         eprintln!("{msg}");
@@ -1667,6 +1717,21 @@ fn export_markdown(session: &polaris_core::session::Session) -> String {
     out
 }
 
+/// `Action::Copy`'s handler, pulled out of `apply_slash_action` so its
+/// success path — a session with a real reply, flowing through to
+/// `*status` — is unit-testable with a fake `copy_fn` instead of only
+/// ever being exercised through the real `clipboard::copy_to_clipboard`,
+/// which does actual OS-level I/O (unsafe to run unconditionally in
+/// automated tests — see `clipboard.rs`'s own tests for why that function
+/// is injectable in the first place).
+fn apply_copy_action(
+    session: &polaris_core::session::Session,
+    status: &mut Status,
+    copy_fn: impl FnOnce(&str) -> Result<(), String>,
+) {
+    *status = Status::Notice(clipboard::copy_last_reply_with(session, copy_fn));
+}
+
 /// Runs one resolved slash command. Never touches `session.messages` or
 /// the model — `Clear` is the only variant here that touches persisted
 /// state, and it does so by emptying the session file in place, not by
@@ -1736,6 +1801,10 @@ fn apply_slash_action(
         }
         slash::Action::Pwd => {
             *status = Status::Notice(cwd.display().to_string());
+            SlashOutcome::Continue
+        }
+        slash::Action::Copy => {
+            apply_copy_action(session, status, clipboard::copy_to_clipboard);
             SlashOutcome::Continue
         }
         slash::Action::Export(destination) => {
@@ -2745,6 +2814,70 @@ mod tests {
 
         match status {
             Status::Notice(n) => assert_eq!(n, dir.path().display().to_string()),
+            _ => panic!("expected a Notice"),
+        }
+    }
+
+    #[test]
+    fn copy_with_no_assistant_reply_yet_reports_nothing_to_copy() {
+        let mut session = Session::default();
+        session.push_user("hi");
+        let mut status = Status::Idle;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session_path = dir.path().join("session.jsonl");
+        let mut local_lines = Vec::new();
+
+        call(
+            slash::Action::Copy,
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+
+        match status {
+            Status::Notice(n) => assert!(n.contains("nothing to copy")),
+            _ => panic!("expected a Notice"),
+        }
+    }
+
+    #[test]
+    fn apply_copy_action_with_a_reply_wires_it_through_to_the_copy_fn_and_status() {
+        // Exercises the success path `apply_slash_action`'s `Action::Copy`
+        // arm delegates to, without performing real clipboard I/O — an
+        // accidental edit that drops the `*status = ...` assignment, or
+        // wires the wrong session into `copy_last_reply_with`, fails this.
+        let mut session = Session::default();
+        session.push_user("hi");
+        session.push_assistant("the answer is 4");
+        let mut status = Status::Idle;
+
+        apply_copy_action(&session, &mut status, |text| {
+            assert_eq!(text, "the answer is 4");
+            Ok(())
+        });
+
+        match status {
+            Status::Notice(n) => assert!(n.contains("copied")),
+            _ => panic!("expected a Notice"),
+        }
+    }
+
+    #[test]
+    fn apply_copy_action_reports_a_failing_copy() {
+        let mut session = Session::default();
+        session.push_assistant("reply");
+        let mut status = Status::Idle;
+
+        apply_copy_action(&session, &mut status, |_| Err("no tty".to_string()));
+
+        match status {
+            Status::Notice(n) => {
+                assert!(n.contains("can't copy"));
+                assert!(n.contains("no tty"));
+            }
             _ => panic!("expected a Notice"),
         }
     }

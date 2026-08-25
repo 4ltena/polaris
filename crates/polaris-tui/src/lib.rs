@@ -1739,6 +1739,24 @@ fn apply_copy_action(
     *status = Status::Notice(clipboard::copy_last_reply_with(session, copy_fn));
 }
 
+/// `Up`'s copy handler for mouse drag-selection, mirroring
+/// `apply_copy_action`'s injectable-`copy_fn` pattern (see its own doc
+/// comment for why: real clipboard I/O must never run unconditionally in
+/// the test suite). Unlike `apply_copy_action`, this takes the text
+/// directly rather than looking it up from a `Session` — the caller
+/// (Tasks 8/11) already has it from `selection::extract_text`, and is
+/// expected to only call this when `text` is non-empty (an empty/zero-
+/// width selection copies nothing and shows no notice at all).
+// Not yet called from production code — Tasks 8/11 wire it into the
+// idle/mid-turn loops on `Up`. Remove this allow once those callers land.
+#[allow(dead_code)]
+fn apply_selection_copy(text: &str, copy_fn: impl FnOnce(&str) -> Result<(), String>) -> String {
+    match copy_fn(text) {
+        Ok(()) => "copied selection to the clipboard".to_string(),
+        Err(e) => format!("can't copy: {e}"),
+    }
+}
+
 /// Runs one resolved slash command. Never touches `session.messages` or
 /// the model — `Clear` is the only variant here that touches persisted
 /// state, and it does so by emptying the session file in place, not by
@@ -2887,6 +2905,22 @@ mod tests {
             }
             _ => panic!("expected a Notice"),
         }
+    }
+
+    #[test]
+    fn apply_selection_copy_reports_success() {
+        let status = apply_selection_copy("hello world", |text| {
+            assert_eq!(text, "hello world");
+            Ok(())
+        });
+        assert!(status.contains("copied"));
+    }
+
+    #[test]
+    fn apply_selection_copy_reports_a_failing_copy() {
+        let status = apply_selection_copy("hello", |_| Err("no tty".to_string()));
+        assert!(status.contains("can't copy"));
+        assert!(status.contains("no tty"));
     }
 
     #[test]

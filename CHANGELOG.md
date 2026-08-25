@@ -17,6 +17,8 @@
 - 会話履歴の行が表示幅を超える場合、単語境界で複数行へ折り返すようにした(スタイル・網掛けを保ったまま)。従来は端末幅を超える行が右端で切り詰められていた
 - `/status`にキャッシュトークンの内訳を追加(`cache N`)。OpenAI Chat Completions APIの`usage.prompt_tokens_details.cached_tokens`、Responses API/Codexの`usage.input_tokens_details.cached_tokens`をそれぞれ読む
 - タッチパッド/マウスホイールで会話履歴をスクロールできるようにした(アイドル時・ターン実行中とも、1ティックあたり3行)
+- 入力欄の網掛けを、上下に網掛け済みの空行を1行ずつ追加して太くした
+- ChatGPT Plusサブスクリプションでは、既定のモデル/reasoning effortを`gpt-5.6-sol`/低(low)から`gpt-5.6-terra`/高(high)へ変更した(`--model`/`POLARIS_MODEL`を明示指定した場合はそちらが優先される)
 
 ### 変更
 

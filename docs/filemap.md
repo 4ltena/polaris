@@ -176,6 +176,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-21-polaris-tui.md` — polaris TUI Implementation Plan
 - `2026-08-24-polaris-files-md-autogen.md` — polaris ディレクトリ別 files.md 自動生成 Implementation Plan
 - `2026-08-24-polaris-tui-live-tool-progress.md` — polaris TUI ライブツール進捗・diff表示 Implementation Plan
+- `2026-08-25-polaris-tui-fullscreen-scroll.md` — polaris TUI 自前スクロール管理・フッター固定化 Implementation Plan
 
 ## `docs/superpowers/specs`
 

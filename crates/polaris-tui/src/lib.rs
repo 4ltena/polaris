@@ -285,20 +285,31 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // is synchronously inside an approval prompt that also draws to this
     // same terminal (see `approver::TuiApprover`'s docs).
     //
-    // An inline viewport, not the alternate screen `ratatui::init()` used
-    // to enter — matching codex's own terminal integration (verified by
-    // driving a real `codex` session in `tmux` and confirming its header
-    // and each conversation turn land in the terminal's *own* scrollback,
-    // recoverable by scrolling the terminal itself, while only a small
-    // fixed region at the bottom is ever repainted). The header and every
-    // conversation turn are appended once to the in-memory `history`
-    // buffer (see `append_new_history` below) and never touched again;
-    // only the small `INLINE_VIEWPORT_HEIGHT`-tall region (suggestions/
-    // status/input/footer, drawn by `render::render_footer`) is redrawn
-    // every frame. `history` isn't rendered yet — that's a later task.
-    // `ratatui::init_with_options` enables raw mode but — unlike `init()`
-    // — deliberately does not enter the alternate screen, which is what
-    // makes real scrollback possible.
+    // A self-managed `Viewport::Fullscreen`, not native terminal
+    // scrollback — every terminal except a rare few force-scrolls to the
+    // bottom on new output or a keystroke (verified against Terminal.app,
+    // which offers no way to disable it), which broke the earlier inline-
+    // viewport design's premise of a real, user-scrollable primary-buffer
+    // history. The header and every conversation turn are appended once to
+    // the in-memory `history` buffer (see `append_new_history` below); each
+    // frame, `draw_frame` renders `render::visible_history_window`'s slice
+    // of that buffer (governed by `scroll_offset` below) into the top
+    // region and `render::render_footer` (suggestions/status/input/footer)
+    // into the fixed `INLINE_VIEWPORT_HEIGHT`-tall bottom region — the one
+    // draw routine every redraw point in this loop shares.
+    // `ratatui::init_with_options` enables raw mode but — regardless of
+    // `Viewport` — does not itself enter the alternate screen, so that's
+    // done explicitly here (`EnterAlternateScreen`) with the matching
+    // `LeaveAlternateScreen` at this function's single `ratatui::restore()`
+    // cleanup point below, so a fullscreen redraw never overwrites the
+    // user's real shell scrollback and always hands it back on exit.
+    if let Err(e) = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::EnterAlternateScreen
+    ) {
+        eprintln!("Can't enter the alternate screen: {e}");
+        return ExitCode::FAILURE;
+    }
     let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
         viewport: ratatui::Viewport::Fullscreen,
     }));
@@ -312,8 +323,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let mut printed_local_lines = 0usize;
     // The in-memory scrollable history buffer — accumulates every line
     // that used to be printed one-shot to the terminal's native scrollback
-    // via `insert_before`. Not yet rendered (see `render::visible_history_window`
-    // and the fullscreen draw loop, wired up in a later task).
+    // via `insert_before`. Rendered every frame by `draw_frame`, which
+    // slices it down to `render::visible_history_window`'s current window.
     let mut history: Vec<render::HistoryLine> = Vec::new();
     // How far back the user has scrolled the history region — 0 always
     // means "following the tail" (see `render::visible_history_window`).
@@ -1018,6 +1029,13 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     };
 
     ratatui::restore();
+    // Best-effort — the process is already exiting, so there's nothing
+    // meaningful to fail out to; leaving the terminal in the alternate
+    // screen would be worse than a swallowed error here.
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::LeaveAlternateScreen
+    );
     if let Some(msg) = fatal_message {
         eprintln!("{msg}");
     }

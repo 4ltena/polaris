@@ -514,14 +514,14 @@ pub fn render_history_into(
             .render(row, buf);
         // Belt-and-braces: force the background on every cell of the row
         // directly, rather than relying solely on `Paragraph`'s own style
-        // fill (`buf.set_style` over the render area) to survive intact
-        // once this buffer is later flushed to a real terminal via
-        // `Terminal::insert_before` — a real-terminal check (not caught by
-        // any `TestBackend`-based test, since `TestBackend` records styled
-        // cells directly with no ANSI round-trip to lose) found the fill
-        // alone doesn't reliably reach the terminal for a shaded row once
-        // scrolled into real scrollback, while explicitly setting each
-        // cell's `bg` here does.
+        // fill (`buf.set_style` over the render area). There's no
+        // `Terminal::insert_before`/scrollback round-trip to lose the fill
+        // to anymore — this buffer is the self-managed `Viewport::Fullscreen`
+        // frame itself (see `lib.rs`), diffed and flushed to the real
+        // terminal fresh every frame — but the explicit per-cell `bg` set
+        // here is cheap and was kept as a guard against `Paragraph`'s own
+        // fill not covering the full row width in some terminal/backend
+        // combination.
         if hl.shaded {
             for x in row.x..row.x + row.width {
                 buf[(x, row.y)].set_bg(Color::DarkGray);
@@ -556,12 +556,11 @@ pub struct HeaderInfo<'a> {
     pub cwd_short: &'a str,
 }
 
-/// Builds the bordered header box's lines — a dim border, a bold title
-/// line, then dim-labeled `model:`/`directory:`/`tokens:` rows. Shared by
-/// the one-shot startup print (`insert_before`, see `lib.rs`) and by tests
-/// that want to check its content directly; there's exactly one caller
-/// site for the actual print, since — unlike the old full-redraw model —
-/// the header is now printed once and never redrawn.
+/// Builds the header box's unbordered content lines — a bold title line,
+/// then dim-labeled `model:`/`directory:`/`tokens:` rows (no border; see
+/// `header_history_lines` for the bordered version actually seeded into
+/// `history`). Shared by `header_history_lines` and by tests that want to
+/// check its content directly, without the border framing in the way.
 pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     vec![
@@ -609,9 +608,11 @@ pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
 
 /// `header_lines(header)`, framed with a hand-built box-drawing border, as
 /// plain `HistoryLine`s — the header's one-shot equivalent of
-/// `history_lines_for`. Used once at startup (see `lib.rs`'s `run()`) to
-/// seed `history`, replacing the old `insert_before(HEADER_HEIGHT,
-/// render_header_into)` call. Always returns exactly `HEADER_HEIGHT` rows.
+/// `history_lines_for`. Used at startup and by every conversation-view
+/// reset (see `lib.rs`'s `run()` and `reset_conversation_view`) to (re-)seed
+/// `history`; there is no separate `render_header_into`/`insert_before`
+/// print anymore — the header lives in `history` like everything else.
+/// Always returns exactly `HEADER_HEIGHT` rows.
 pub fn header_history_lines(header: &HeaderInfo, width: u16) -> Vec<HistoryLine> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let w = width as usize;
@@ -639,38 +640,24 @@ pub fn header_history_lines(header: &HeaderInfo, width: u16) -> Vec<HistoryLine>
 /// border rows (`Borders::ALL`).
 pub const HEADER_HEIGHT: u16 = 7;
 
-/// Renders `header_lines(header)` into `buf`, bordered — used for the
-/// one-shot startup print via `insert_before`. `area` must be
-/// `HEADER_HEIGHT` rows tall.
-pub fn render_header_into(
-    buf: &mut ratatui::buffer::Buffer,
-    area: ratatui::layout::Rect,
-    header: &HeaderInfo,
-) {
-    use ratatui::widgets::Widget;
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    Paragraph::new(header_lines(header))
-        .block(Block::default().borders(Borders::ALL).border_style(dim))
-        .render(area, buf);
-}
-
-/// The most suggestion rows shown at once — the popup can't grow the
-/// inline viewport's fixed height (ratatui's `Viewport::Inline` height is
-/// fixed at `Terminal` construction, see `lib.rs`'s `INLINE_VIEWPORT_HEIGHT`),
-/// so a query matching more than this many slash commands shows the first
-/// `MAX_DISPLAYED_SUGGESTIONS` plus a "+N more" row instead of growing
-/// without bound the way the old full-redraw layout allowed.
+/// The most suggestion rows shown at once — the footer region has a fixed
+/// `Constraint::Length` in `draw_frame`'s (`lib.rs`) vertical layout split
+/// and can't grow per-frame to fit content, so a query matching more than
+/// this many slash commands shows the first `MAX_DISPLAYED_SUGGESTIONS`
+/// plus a "+N more" row instead of growing without bound the way the
+/// scrollable history region above it can.
 pub const MAX_DISPLAYED_SUGGESTIONS: usize = 8;
 
 /// Everything redrawn every frame: the suggestions popup (while typing a
 /// `/command`), the status row (idle / thinking-with-shimmer / error /
 /// notice), the input line, and the footer (`model effort · cwd`). This is
-/// what lives inside the fixed-height inline viewport — the header and the
-/// conversation history are printed once, outside it, via `insert_before`
-/// (see `lib.rs`), never redrawn here. Replaces the old `render_chat`,
-/// which drew the header and full history inline with everything else on
-/// every frame; splitting it out is what makes the header/history land in
-/// the terminal's own real scrollback instead of being repainted away.
+/// the footer region of `draw_frame`'s (`lib.rs`) fullscreen layout split —
+/// the fixed-height bottom slice below the scrollable history region, which
+/// renders `history` separately via `render_history_into`. Replaces the old
+/// `render_chat`, which drew the header and full history inline with
+/// everything else on every frame; splitting it out is what makes the
+/// header/history scrollable as their own region instead of being
+/// repainted (and losing scroll position) with the footer every frame.
 #[allow(clippy::too_many_arguments)]
 pub fn render_footer(
     frame: &mut Frame,
@@ -2145,35 +2132,6 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("third paragraph")));
         // The label prefix should not repeat on continuation lines.
         assert!(!rows.iter().any(|r| r.contains("polaris: second paragraph")));
-    }
-
-    #[test]
-    fn the_header_shows_provider_model_and_usage() {
-        let header = HeaderInfo {
-            cwd: "/tmp/example",
-            cwd_short: "~/example",
-            effort_name: "low",
-            provider_name: "openai",
-            model_name: "gpt-5.4",
-            usage: polaris_provider::Usage {
-                input_tokens: 100,
-                output_tokens: 40,
-                total_tokens: 140,
-            },
-        };
-
-        // Wide enough that the header box's one content line ("model: ...
-        // tokens: in ... / out ... / total ...") isn't cut off before the
-        // usage numbers this test asserts on.
-        let mut buf =
-            ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, HEADER_HEIGHT));
-        let area = buf.area;
-        render_header_into(&mut buf, area, &header);
-
-        let content = buf.content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(content.contains("openai"));
-        assert!(content.contains("gpt-5.4"));
-        assert!(content.contains("140"));
     }
 
     #[test]

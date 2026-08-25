@@ -125,6 +125,29 @@ pub fn highlighted_columns(
     out
 }
 
+/// The full rendered text of one `HistoryLine` (all its spans
+/// concatenated) — `char_count`'s sibling, needed here (unlike in
+/// `highlighted_columns`) because this function returns text, not just
+/// counts.
+fn line_text(hl: &crate::render::HistoryLine) -> String {
+    hl.line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Extracts the selected text as a single `String`, joining lines with
+/// `"\n"`. Reuses `highlighted_columns` directly rather than re-deriving
+/// the same line/column ranges — `Selection` normalization and per-line
+/// clamping live in exactly one place.
+pub fn extract_text(wrapped: &[crate::render::HistoryLine], sel: &Selection) -> String {
+    highlighted_columns(wrapped, sel)
+        .into_iter()
+        .filter_map(|(line_idx, from, to)| {
+            let text = line_text(wrapped.get(line_idx)?);
+            Some(text.chars().skip(from).take(to - from).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +327,34 @@ mod tests {
     fn a_column_before_the_area_clamps_to_zero() {
         let pos = text_pos_from_screen(10, 0..10, area(5, 0, 40, 10), 0, 1);
         assert_eq!(pos.col, 0);
+    }
+
+    #[test]
+    fn extract_text_returns_a_single_lines_substring() {
+        let wrapped = vec![hl("hello world")];
+        let got = extract_text(&wrapped, &sel((0, 0), (0, 5)));
+        assert_eq!(got, "hello");
+    }
+
+    #[test]
+    fn extract_text_joins_multiple_lines_with_newlines() {
+        let wrapped = vec![hl("first line"), hl("second line"), hl("third")];
+        let got = extract_text(&wrapped, &sel((0, 6), (2, 3)));
+        assert_eq!(got, "line\nsecond line\nthi");
+    }
+
+    #[test]
+    fn extract_text_is_empty_for_a_zero_width_selection() {
+        let wrapped = vec![hl("hello")];
+        let got = extract_text(&wrapped, &sel((0, 2), (0, 2)));
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn extract_text_handles_full_width_characters_by_character_not_byte() {
+        let wrapped = vec![hl("aあいbうc")]; // full-width chars mixed with ASCII
+        // select "あい" — chars 1..3 (a=0, あ=1, い=2, b=3, ...)
+        let got = extract_text(&wrapped, &sel((0, 1), (0, 3)));
+        assert_eq!(got, "あい");
     }
 }

@@ -194,12 +194,14 @@ fn append_new_history(
 fn reset_conversation_view(
     history: &mut Vec<render::HistoryLine>,
     scroll_offset: &mut usize,
+    selection: &mut Option<selection::Selection>,
     header: &render::HeaderInfo,
     width: u16,
 ) {
     history.clear();
     history.extend(render::header_history_lines(header, width));
     *scroll_offset = 0;
+    *selection = None;
 }
 
 /// Appends one mid-turn `AgentEvent`'s formatted lines to `history` — the
@@ -641,6 +643,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             }
             continue;
         }
+        if let ratatui::crossterm::event::Event::Resize(_, _) = &event {
+            selection = None;
+        }
         let ratatui::crossterm::event::Event::Key(key) = event else {
             continue;
         };
@@ -700,6 +705,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             reset_conversation_view(
                                 &mut history,
                                 &mut scroll_offset,
+                                &mut selection,
                                 &render::HeaderInfo {
                                     provider_name: &args.provider_name,
                                     model_name: &model_name,
@@ -728,6 +734,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             reset_conversation_view(
                                 &mut history,
                                 &mut scroll_offset,
+                                &mut selection,
                                 &render::HeaderInfo {
                                     provider_name: &args.provider_name,
                                     model_name: &model_name,
@@ -756,6 +763,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             reset_conversation_view(
                                 &mut history,
                                 &mut scroll_offset,
+                                &mut selection,
                                 &render::HeaderInfo {
                                     provider_name: &args.provider_name,
                                     model_name: &model_name,
@@ -823,6 +831,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                         reset_conversation_view(
                                             &mut history,
                                             &mut scroll_offset,
+                                            &mut selection,
                                             &render::HeaderInfo {
                                                 provider_name: &args.provider_name,
                                                 model_name: &model_name,
@@ -909,6 +918,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             continue;
         }
 
+        selection = None;
+
         let text = if let Some(t) = review_text {
             t
         } else {
@@ -954,6 +965,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     reset_conversation_view(
                         &mut history,
                         &mut scroll_offset,
+                        &mut selection,
                         &render::HeaderInfo {
                             provider_name: &args.provider_name,
                             model_name: &model_name,
@@ -982,6 +994,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     reset_conversation_view(
                         &mut history,
                         &mut scroll_offset,
+                        &mut selection,
                         &render::HeaderInfo {
                             provider_name: &args.provider_name,
                             model_name: &model_name,
@@ -1010,6 +1023,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     reset_conversation_view(
                         &mut history,
                         &mut scroll_offset,
+                        &mut selection,
                         &render::HeaderInfo {
                             provider_name: &args.provider_name,
                             model_name: &model_name,
@@ -1072,6 +1086,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 reset_conversation_view(
                                     &mut history,
                                     &mut scroll_offset,
+                                    &mut selection,
                                     &render::HeaderInfo {
                                         provider_name: &args.provider_name,
                                         model_name: &model_name,

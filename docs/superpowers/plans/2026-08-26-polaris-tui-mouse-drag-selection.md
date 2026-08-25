@@ -1261,9 +1261,16 @@ Add near the two tests found in Step 3:
 fn draw_frame_highlights_an_active_selection() {
     let backend = ratatui::backend::TestBackend::new(40, 8);
     let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
-    let history = vec![render::HistoryLine::plain(ratatui::text::Line::from(
-        "select me",
-    ))];
+    // `HistoryLine::plain` is private to `render.rs` — this test lives in
+    // `lib.rs`'s own test module, a different module, so it must build
+    // `HistoryLine` via its public fields directly (both `line` and
+    // `shaded` are `pub`), matching how the two existing `draw_frame`
+    // tests in this same module already do it (grep `render::HistoryLine {`
+    // in `lib.rs`).
+    let history = vec![render::HistoryLine {
+        line: ratatui::text::Line::from("select me"),
+        shaded: false,
+    }];
     let sel = Some(selection::Selection {
         anchor: selection::TextPos { line: 0, col: 0 },
         cursor: selection::TextPos { line: 0, col: 6 },

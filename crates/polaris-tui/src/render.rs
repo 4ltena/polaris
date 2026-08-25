@@ -187,9 +187,7 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
             for row in format_tool_result_preview(result) {
                 lines.push(HistoryLine::plain(Line::from(Span::styled(
                     row,
-                    Style::default()
-                        .add_modifier(Modifier::DIM)
-                        .bg(Color::DarkGray),
+                    Style::default().add_modifier(Modifier::DIM),
                 ))));
             }
             if let Some(d) = diff {
@@ -2247,11 +2245,12 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_result_preview_row_is_shaded_like_code() {
-        // Distinguishes a code/output preview visually from ordinary dim
-        // log text — the same DarkGray background inline code and fenced
-        // code blocks already use, so a `read` preview reads as "this is
-        // code" rather than looking like a plain status line.
+    fn a_tool_result_preview_row_carries_no_background() {
+        // A tool result preview covers arbitrary command output (e.g. a
+        // `bash` "git commit"), not just source code read via `read` — a
+        // DarkGray background applied indiscriminately to every preview
+        // line looked like unwanted shading bleeding outside the input
+        // prompt. Plain dim text only, no background tint.
         let lines = format_event_for_live_print(&AgentEvent::ToolFinished {
             name: "read".to_string(),
             detail: "{}".to_string(),
@@ -2264,12 +2263,8 @@ mod tests {
             .find(|l| l.line.spans.iter().any(|s| s.content.contains("fn main")))
             .expect("the result preview row should be present");
         assert!(
-            preview_line
-                .line
-                .spans
-                .iter()
-                .any(|s| s.style.bg == Some(Color::DarkGray)),
-            "the preview row should carry a code-style background"
+            preview_line.line.spans.iter().all(|s| s.style.bg.is_none()),
+            "the preview row should carry no background tint"
         );
     }
 

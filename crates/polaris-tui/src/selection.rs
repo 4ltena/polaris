@@ -76,10 +76,127 @@ pub fn text_pos_from_screen(
     TextPos { line, col }
 }
 
+/// Character count of a `HistoryLine`'s full rendered text (all spans
+/// concatenated) — used to clamp/compute "to the end of this line"
+/// without needing to know display width here (`Modifier::REVERSED` is
+/// applied per-cell downstream in `apply_selection_highlight`, which is
+/// where width actually matters).
+fn char_count(hl: &crate::render::HistoryLine) -> usize {
+    hl.line
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum()
+}
+
+/// Turns a `Selection` into per-line `(line, start_col, end_col)` ranges
+/// (character indices, `end_col` exclusive) over `wrapped`. Pure logic —
+/// no rendering; Task 5's `apply_selection_highlight` walks each line's
+/// spans the same width-aware way `wrap_history_lines` already does to
+/// turn these character indices into screen columns.
+pub fn highlighted_columns(
+    wrapped: &[crate::render::HistoryLine],
+    sel: &Selection,
+) -> Vec<(usize, usize, usize)> {
+    let (start, end) = sel.ordered();
+    if start == end {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for line_idx in start.line..=end.line.min(wrapped.len().saturating_sub(1)) {
+        let Some(hl) = wrapped.get(line_idx) else {
+            break;
+        };
+        let len = char_count(hl);
+        let (from, to) = if start.line == end.line {
+            (start.col.min(len), end.col.min(len))
+        } else if line_idx == start.line {
+            (start.col.min(len), len)
+        } else if line_idx == end.line {
+            (0, end.col.min(len))
+        } else {
+            (0, len)
+        };
+        if from < to {
+            out.push((line_idx, from, to));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::HistoryLine;
     use ratatui::layout::Rect;
+    use ratatui::text::Line;
+
+    fn hl(text: &str) -> HistoryLine {
+        HistoryLine {
+            line: Line::from(text.to_string()),
+            shaded: false,
+        }
+    }
+
+    fn sel(anchor: (usize, usize), cursor: (usize, usize)) -> Selection {
+        Selection {
+            anchor: TextPos {
+                line: anchor.0,
+                col: anchor.1,
+            },
+            cursor: TextPos {
+                line: cursor.0,
+                col: cursor.1,
+            },
+            dragging: false,
+        }
+    }
+
+    #[test]
+    fn a_single_line_selection_highlights_only_its_own_column_range() {
+        let wrapped = vec![hl("hello world")];
+        let got = highlighted_columns(&wrapped, &sel((0, 2), (0, 7)));
+        assert_eq!(got, vec![(0, 2, 7)]);
+    }
+
+    #[test]
+    fn a_multi_line_selection_highlights_the_first_line_from_its_start_to_its_end() {
+        let wrapped = vec![hl("first line"), hl("second line"), hl("third")];
+        let got = highlighted_columns(&wrapped, &sel((0, 6), (2, 3)));
+        // first line (index 0): from col 6 to its own length (10)
+        assert_eq!(got[0], (0, 6, 10));
+    }
+
+    #[test]
+    fn a_multi_line_selection_highlights_middle_lines_fully_at_their_own_length() {
+        let wrapped = vec![hl("first line"), hl("second line"), hl("third")];
+        let got = highlighted_columns(&wrapped, &sel((0, 6), (2, 3)));
+        // second line (index 1) is fully included: 0..its own char count (11)
+        assert_eq!(got[1], (1, 0, 11));
+    }
+
+    #[test]
+    fn a_multi_line_selection_highlights_the_last_line_from_its_start_to_the_cursor() {
+        let wrapped = vec![hl("first line"), hl("second line"), hl("third")];
+        let got = highlighted_columns(&wrapped, &sel((0, 6), (2, 3)));
+        // third line (index 2): from 0 to col 3
+        assert_eq!(got[2], (2, 0, 3));
+    }
+
+    #[test]
+    fn a_zero_width_selection_highlights_nothing() {
+        let wrapped = vec![hl("hello")];
+        let got = highlighted_columns(&wrapped, &sel((0, 2), (0, 2)));
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn a_backward_drag_is_normalized_before_computing_columns() {
+        let wrapped = vec![hl("hello world")];
+        let got = highlighted_columns(&wrapped, &sel((0, 7), (0, 2)));
+        assert_eq!(got, vec![(0, 2, 7)]);
+    }
 
     fn pos(line: usize, col: usize) -> TextPos {
         TextPos { line, col }

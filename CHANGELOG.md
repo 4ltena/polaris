@@ -2,6 +2,25 @@
 
 [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) と [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
+## [0.5.0] — 2026-08-24 "Regulus"
+
+M4(subagent オーケストレーション基盤)を実装し、これを土台に2つの機能を追加した。会話コンテキストを一切消費せずディレクトリ構成の要約を保守する `files.md` 自動生成と、ツール呼び出し・subagent進捗をターン実行中に逐次表示するライブ表示改良。加えて、TUIの端末統合方式を `codex` の実挙動に合わせてインラインビューポートへ切り替えた。
+
+### 追加
+
+- `spawn` ツール: 1回の呼び出しで複数の subagent を同一波として並列実行する単一波オーケストレーション。書込先(`write_root`)が波内で重複する場合は1件も起動せず波全体を拒否
+- `agents/<type>/SKILL.md` による subagent 型定義の frontmatter 解析・discovery(`polaris-access`/`polaris-tier`/`polaris-wall-seconds`/`polaris-max-turns`/`polaris-continuation`/`polaris-output` の各メタデータ)。実例として `file-inspector`(読み取り専用)・`files-md-writer`(読み書き)の2型を同梱
+- subagent の結果は宣言済み JSON Schema で検証し、不一致時は検証エラーを添えて1回だけ再試行。壁時計超過・スキーマ不一致2回連続をそれぞれ専用の停止条件として追加
+- ディレクトリ別 `files.md` 自動生成: `write`/`edit`/`bash` 実行前後のファイルシステムスナップショット差分から新規ディレクトリ・新規ファイルを検出し、`files-md-writer` subagent を直接起動して該当ディレクトリの `files.md` を最新化する。モデルの判断・会話コンテキストを一切介さず、ハーネス側で決定的に実行
+- ツール呼び出し・spawn進捗のライブ表示: `polaris_core::agent::run`/`dispatch` から `AgentEvent`(`ToolStarted`/`ToolFinished`/`SpawnStarted`/`SpawnFinished`)を通知する経路を新設し、TUIがターン実行中にツール名・引数・結果プレビュー、write/editの実差分(40行で打ち切り)、spawnタスクごとの進捗を逐次表示する
+- 監査ログに `caller` フィールドを追加し、ルート("root")と各 subagent(型名)の呼び出しを区別して記録
+
+### 変更
+
+- TUIの端末統合方式を、独自のフルスクリーン管理から `ratatui::Viewport::Inline` へ変更し、会話履歴を端末自身のネイティブスクロールバックに一度きり印字する方式に変更(`codex` の実端末挙動を tmux で検証したうえで移植。この方式は v0.6.0 で自前スクロール管理の `Viewport::Fullscreen` へ再度置き換えられた)
+- `dispatch` を `async fn` 化(spawn の並列実行を await できるようにする土台)
+- `AuditLog`/`Provider` を `Arc` 化し、複数 subagent から共有できるようにした
+
 ## [0.4.0] — 2026-08-24 "Acubens"
 
 対話TUIを大幅に拡張した。TUI v2(ステータスバー・ツール呼び出しの可視化・Markdown整形)、初回起動時のオンボーディング画面、codex互換サブコマンド、対話中のスラッシュコマンド群、非同期イベントループ化によるライブなステータス表示を追加した。`codex`の実際のソースコード(GitHubから取得)とデスクトップのスクリーンショットを繰り返し参照し、対応する画面要素の見た目・操作感を検証したうえで移植した。

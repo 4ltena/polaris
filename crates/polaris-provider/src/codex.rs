@@ -43,13 +43,35 @@ pub fn input_items(messages: &[Message]) -> Vec<Value> {
                 "content": [{ "type": "input_text", "text": m.content }],
             })),
             Role::Assistant => {
-                for r in &m.reasoning {
-                    out.push(serde_json::json!({
-                        "type": "reasoning",
-                        "id": r.id,
-                        "summary": [],
-                        "encrypted_content": r.encrypted_content,
-                    }));
+                // Reasoning items are replayed before the message/
+                // function_call they informed, matching how the model
+                // originally emitted them. Note this only preserves
+                // turn-level ordering, not fine-grained interleaving:
+                // polaris collapses a turn's reasoning items and tool_calls
+                // into two separate flat Vecs, so a turn that actually
+                // produced reasoning -> call -> reasoning -> call emits all
+                // of its reasoning here first, followed by all of its
+                // tool_calls below, not interleaved to match the original
+                // emission. Deliberate simplification, not a bug.
+                //
+                // Only emitted when the turn goes on to produce a message
+                // or tool_calls: a reasoning item with nothing following it
+                // is a wire shape the Responses API rejects when
+                // `store: false` (see `build_body`, the only mode this
+                // provider ever uses).
+                if !m.content.is_empty() || !m.tool_calls.is_empty() {
+                    for r in &m.reasoning {
+                        out.push(serde_json::json!({
+                            "type": "reasoning",
+                            // Upstream's `prepare_response_items_for_request`
+                            // strips all item ids from every request when
+                            // `store: false` (polaris's only mode) - match
+                            // that instead of sending one, even though the
+                            // captured `ReasoningItem` still keeps its `id`.
+                            "summary": [],
+                            "encrypted_content": r.encrypted_content,
+                        }));
+                    }
                 }
                 // A turn with empty body text and only tool calls isn't
                 // unusual. Adding an empty message would just pile up
@@ -270,18 +292,23 @@ impl Folder {
             }
             "reasoning" => {
                 if let (Some(id), Some(encrypted_content)) = (
-                    item.get("id").and_then(|v| v.as_str()),
-                    item.get("encrypted_content").and_then(|v| v.as_str()),
+                    item.get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty()),
+                    item.get("encrypted_content")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty()),
                 ) {
                     self.reasoning.push(ReasoningItem {
                         id: id.to_string(),
                         encrypted_content: encrypted_content.to_string(),
                     });
                 }
-                // `id`/`encrypted_content` 欠如(`include` が効かなかった、
-                // reasoning非対応モデル等)は静かに読み飛ばす。継続性は
-                // ベストエフォートの最適化で、無ければ無いまま次のターン
-                // へ進んで構わない。
+                // A missing (or empty-string) `id`/`encrypted_content` -
+                // `include` wasn't honored, a non-reasoning model, etc. -
+                // is silently skipped. Continuity here is a best-effort
+                // optimization the turn doesn't depend on; it's fine to
+                // move on to the next turn without it.
             }
             _ => {}
         }
@@ -562,6 +589,28 @@ mod tests {
         );
     }
 
+    /// An empty string must be treated the same as absent, matching the
+    /// sibling `function_call` arm's `.filter(|s| !s.is_empty())` pattern.
+    /// Covers id-empty, encrypted_content-empty, and both-empty.
+    #[test]
+    fn a_reasoning_item_with_an_empty_id_or_encrypted_content_is_skipped() {
+        for (id, encrypted_content) in [("", "blob"), ("r1", ""), ("", "")] {
+            let mut f = Folder::new();
+            f.push(&frame(
+                "response.output_item.done",
+                reasoning_item(id, encrypted_content),
+            ))
+            .expect("push should succeed");
+            f.push(&frame("response.completed", serde_json::json!({})))
+                .expect("push should succeed");
+            let r = f.finish().expect("should be complete");
+            assert!(
+                r.reasoning.is_empty(),
+                "id={id:?} encrypted_content={encrypted_content:?} should have been skipped"
+            );
+        }
+    }
+
     /// The result doesn't change no matter where the frame gets split.
     /// Split tolerance is `sse.rs`'s responsibility, but whether this
     /// path actually goes through it is confirmed separately here. If it
@@ -837,8 +886,13 @@ mod tests {
         }])]);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0]["type"], "reasoning");
-        assert_eq!(items[0]["id"], "r1");
+        assert!(
+            items[0].get("id").is_none(),
+            "id must be stripped from the replayed reasoning item, matching upstream's \
+             behavior when store: false"
+        );
         assert_eq!(items[0]["encrypted_content"], "opaque");
+        assert_eq!(items[0]["summary"], serde_json::json!([]));
         assert_eq!(items[1]["type"], "message");
         assert_eq!(items[2]["type"], "function_call");
     }
@@ -848,6 +902,26 @@ mod tests {
         let items = input_items(&[Message::assistant("yes")]);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "message");
+    }
+
+    /// `agent::run_loop`'s no-tool-calls branch can push a `Message` with
+    /// non-empty `reasoning` but empty content and empty `tool_calls` (a
+    /// text-free final turn). Emitting the reasoning item alone would put
+    /// a reasoning item on the wire with nothing following it - a shape
+    /// the Responses API rejects when `store: false`. It must be dropped
+    /// entirely, not just left orphaned.
+    #[test]
+    fn a_turn_with_reasoning_but_no_content_or_tool_calls_emits_nothing() {
+        let items = input_items(&[Message::assistant("").with_reasoning(vec![
+            crate::ReasoningItem {
+                id: "r1".into(),
+                encrypted_content: "opaque".into(),
+            },
+        ])]);
+        assert!(
+            items.is_empty(),
+            "an orphaned reasoning item was emitted with nothing following it: {items:?}"
+        );
     }
 
     #[test]

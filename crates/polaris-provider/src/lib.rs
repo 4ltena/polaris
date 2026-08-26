@@ -31,7 +31,9 @@ pub struct ReasoningItem {
 /// A single message in the history. `tool_calls` is non-empty only when an
 /// assistant turn called a tool, and `tool_call_id` is carried only by a
 /// tool-result message. Both stay empty for an ordinary user/assistant
-/// utterance.
+/// utterance. `reasoning` is carried alongside an assistant turn for
+/// providers that have the concept (Codex); it stays empty everywhere
+/// else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -185,6 +187,10 @@ pub struct Usage {
     pub cached_tokens: u32,
 }
 
+/// One provider round trip. `reasoning` is populated only by providers
+/// that carry the concept (Codex); it's empty otherwise and meant to be
+/// attached to the resulting `Message` via `with_reasoning` so it can be
+/// replayed on the next turn.
 #[derive(Debug, Clone, Default)]
 pub struct CompletionResponse {
     pub text: String,

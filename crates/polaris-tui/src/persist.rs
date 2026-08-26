@@ -107,7 +107,7 @@ pub fn read_meta(meta_path: &Path) -> Option<SessionMeta> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn rewrite(path: &Path, messages: &[Message]) -> io::Result<()> {
+pub(crate) fn rewrite(path: &Path, messages: &[Message]) -> io::Result<()> {
     let mut file = File::create(path)?;
     for m in messages {
         let line = serde_json::to_string(m).expect("Message always serializes");

@@ -7,7 +7,7 @@ use std::time::Duration;
 use polaris_core::{AgentEvent, DiffLine};
 use polaris_provider::Role;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Constraint, Flex, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -955,6 +955,18 @@ pub fn render_footer(
     } else {
         shown as u16 + 1 + u16::from(truncated)
     };
+    // `area` is `draw_frame`'s fixed-height `FOOTER_HEIGHT` reservation
+    // (sized for the worst case — the suggestions popup at its max),
+    // which is almost always taller than this frame's actual content
+    // (`suggestions_height` is usually 0). Without `Flex::End`, the
+    // default `Flex::Start` stacks these six rows at `area`'s *top* and
+    // leaves the unused remainder as blank space below the input box —
+    // pushing it up away from the terminal's real bottom edge. Anchoring
+    // to the end instead keeps the footer flush against the bottom
+    // regardless of how much of `area` this frame's content actually
+    // needs; the leftover space lands above `status_area` instead, where
+    // it's invisible (it's still inside `footer_area`, never overlapping
+    // `history_area`).
     let [
         status_area,
         suggestions_area,
@@ -970,6 +982,7 @@ pub fn render_footer(
         Constraint::Length(1),
         Constraint::Length(1),
     ])
+    .flex(Flex::End)
     .areas(area);
 
     let status_line = match status {
@@ -1608,9 +1621,12 @@ mod tests {
                 );
             })
             .expect("draw");
-        // "› " (width 2) + "hello" (width 5) = column 7, on the input row
-        // (status(1) + suggestions(0) + pad-above(1) = row 2).
-        terminal.backend_mut().assert_cursor_position((7, 2));
+        // "› " (width 2) + "hello" (width 5) = column 7. The input row
+        // would be row 2 (status(1) + suggestions(0) + pad-above(1)) if
+        // this 10-row area exactly matched the 5 rows this frame's content
+        // needs — but it doesn't, so `Flex::End` shifts everything down by
+        // the 5-row leftover, landing the input row at row 7.
+        terminal.backend_mut().assert_cursor_position((7, 7));
     }
 
     /// Wide (CJK) characters must count as 2 columns each, or the cursor
@@ -1637,7 +1653,9 @@ mod tests {
             })
             .expect("draw");
         // "› "(2) + "hello"(5) + "こんにちは"(5 chars * width 2 = 10) = 17.
-        terminal.backend_mut().assert_cursor_position((17, 2));
+        // Row 7, not 2 — see `the_cursor_lands_right_after_the_typed_input_text`'s
+        // comment on this same 10-row-area/5-row-content leftover shift.
+        terminal.backend_mut().assert_cursor_position((17, 7));
     }
 
     fn test_header() -> HeaderInfo<'static> {
@@ -1730,22 +1748,25 @@ mod tests {
             .draw(|f| render_footer(f, f.area(), "hi", 2, &Status::Idle, &test_header(), &[], 0))
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        // Row 2 is the input row: status(1) + suggestions(0) + pad-above(1)
-        // = row 2.
+        // Row 2 would be the input row (status(1) + suggestions(0) +
+        // pad-above(1)) if this 7-row area matched the 5 rows this
+        // frame's content needs exactly — it doesn't (2 rows leftover),
+        // and `Flex::End` shifts everything down by that leftover, so the
+        // input row is actually row 4.
         // "› hi" ends well before column 50 on a 60-wide backend, but the
         // shading should still reach all the way to the row's right edge.
         assert_eq!(
-            buffer[(2, 2)].bg,
+            buffer[(2, 4)].bg,
             Color::DarkGray,
             "the prompt/typed-text cells should be shaded"
         );
         assert_eq!(
-            buffer[(50, 2)].bg,
+            buffer[(50, 4)].bg,
             Color::DarkGray,
             "empty space past the typed text should also be shaded, all the way to the row's edge"
         );
         assert_eq!(
-            buffer[(59, 2)].bg,
+            buffer[(59, 4)].bg,
             Color::DarkGray,
             "the row's last column should be shaded too"
         );
@@ -1762,16 +1783,18 @@ mod tests {
             .draw(|f| render_footer(f, f.area(), "hi", 2, &Status::Idle, &test_header(), &[], 0))
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        // status(1, row 0) + suggestions(0) + pad-above(row 1) + input(row 2)
-        // + pad-below(row 3) + footer(row 4).
+        // With this 7-row area 2 rows taller than the 5 rows this frame's
+        // content needs, `Flex::End` shifts the whole block down by that
+        // leftover: status(row 2) + suggestions(0) + pad-above(row 3) +
+        // input(row 4) + pad-below(row 5) + footer(row 6).
         for x in [0u16, 30, 59] {
             assert_eq!(
-                buffer[(x, 1)].bg,
+                buffer[(x, 3)].bg,
                 Color::DarkGray,
                 "the row above the input line should be shaded at column {x}"
             );
             assert_eq!(
-                buffer[(x, 3)].bg,
+                buffer[(x, 5)].bg,
                 Color::DarkGray,
                 "the row below the input line should be shaded at column {x}"
             );
@@ -1782,8 +1805,8 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect()
         };
-        assert_eq!(row_text(1).trim(), "");
         assert_eq!(row_text(3).trim(), "");
+        assert_eq!(row_text(5).trim(), "");
     }
 
     #[test]
@@ -1798,12 +1821,33 @@ mod tests {
         assert!(content.contains("esc to interrupt"));
     }
 
+    /// Regression test for the input box sitting well above the terminal's
+    /// real bottom edge whenever the suggestions popup isn't showing (the
+    /// common case): `draw_frame` always reserves `crate::FOOTER_HEIGHT`
+    /// rows for the footer — sized for the worst case, the popup at its
+    /// max — so this frame's actual content (5 rows, no suggestions) is
+    /// much shorter than the area it's given. Without `Flex::End`, that
+    /// leftover space landed *below* the input row instead of above it.
+    #[test]
+    fn the_input_row_reaches_the_true_bottom_of_the_footer_reservation() {
+        let pos = render_footer_cursor_position("", 0, 80, crate::FOOTER_HEIGHT);
+        // The five visible rows this content occupies — status,
+        // pad-above, input, pad-below, footer (suggestions is empty) —
+        // sit flush against the bottom of the reservation. Input is the
+        // third of those five, so two rows up from the very last one, not
+        // stranded near the top.
+        assert_eq!(pos.y, crate::FOOTER_HEIGHT - 3);
+    }
+
     #[test]
     fn the_cursor_lands_right_after_the_prompt_prefix_when_the_buffer_is_empty() {
         let pos = render_footer_cursor_position("", 0, 60, 6);
-        // status(1) + suggestions(0, empty when no popup) + pad-above(1)
-        // puts the input row at index 2.
-        assert_eq!(pos.y, 2);
+        // A 6-row area holds 1 more row than the 5 rows this frame's
+        // content actually needs (status+pad-above+input+pad-below+footer,
+        // suggestions being empty) — `Flex::End` anchors that content to
+        // the bottom of the area, so the leftover row lands above
+        // `status_area`, shifting the input row from index 2 to index 3.
+        assert_eq!(pos.y, 3);
         assert_eq!(pos.x, Line::from("\u{203a} ").width() as u16);
     }
 

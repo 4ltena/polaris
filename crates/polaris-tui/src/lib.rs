@@ -7,12 +7,6 @@ pub mod input;
 pub mod onboarding;
 pub mod persist;
 pub mod render;
-// Not yet constructed/read outside its own unit tests -- later tasks (2,
-// 3, 4, 5, 8, 11) wire mouse events into `Selection`/`TextPos`. `cargo
-// clippy --all-targets` still compiles the plain `lib` target (without
-// `cfg(test)`), where none of that applies, so without this the module
-// reads as entirely dead code until that wiring lands.
-#[allow(dead_code)]
 mod selection;
 pub mod sessions;
 pub mod slash;
@@ -183,14 +177,17 @@ fn append_new_history(
     }
 }
 
-/// Clears `history` and immediately re-seeds it with the header box, and
-/// resets `scroll_offset` back to 0 (following the tail) — the one place
-/// every conversation-view reset (`/resume`, `/new`, `/fork`, `/clear`)
-/// goes through, so the header can't be dropped by a bare `history.clear()`
-/// and a stale scroll position can't survive into a different, possibly
-/// much shorter, conversation. Callers still separately reset
-/// `printed_messages`/`printed_local_lines` to 0 — this only owns
-/// `history`/`scroll_offset`, not the counters `append_new_history` reads.
+/// Clears `history` and immediately re-seeds it with the header box,
+/// resets `scroll_offset` back to 0 (following the tail), and drops any
+/// in-progress or finalized text `selection` — the one place every
+/// conversation-view reset (`/resume`, `/new`, `/fork`, `/clear`) goes
+/// through, so the header can't be dropped by a bare `history.clear()`, a
+/// stale scroll position can't survive into a different, possibly much
+/// shorter, conversation, and a selection can't keep pointing at
+/// `wrapped` coordinates from a history that no longer exists. Callers
+/// still separately reset `printed_messages`/`printed_local_lines` to 0 —
+/// this only owns `history`/`scroll_offset`/`selection`, not the counters
+/// `append_new_history` reads.
 fn reset_conversation_view(
     history: &mut Vec<render::HistoryLine>,
     scroll_offset: &mut usize,
@@ -318,26 +315,6 @@ fn terminal_height(terminal: &RefCell<ratatui::DefaultTerminal>) -> u16 {
 /// out of scope for this plan.
 fn area_height_for_history(footer_height: u16, terminal_height: u16) -> u16 {
     terminal_height.saturating_sub(footer_height)
-}
-
-/// `wrap_history_lines(history, width).len()` — a thin name so call sites
-/// above read as "the wrapped length for selection purposes" rather than
-/// repeating the full `wrap_history_lines(...).len()` expression three
-/// times.
-fn wrapped_len_for_selection(history: &[render::HistoryLine], width: u16) -> usize {
-    render::wrap_history_lines(history, width).len()
-}
-
-/// `visible_history_window`, given everything needed to reproduce exactly
-/// what `draw_frame` used for the current frame.
-fn current_window(
-    history: &[render::HistoryLine],
-    scroll_offset: usize,
-    width: u16,
-    history_area_height: u16,
-) -> std::ops::Range<usize> {
-    let wrapped_len = wrapped_len_for_selection(history, width);
-    render::visible_history_window(wrapped_len, scroll_offset, history_area_height as usize)
 }
 
 pub async fn run(args: RunArgs<'_>) -> ExitCode {
@@ -560,89 +537,103 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
             break ExitCode::FAILURE;
         }
 
-        let event = match ratatui::crossterm::event::read() {
-            Ok(e) => e,
-            Err(_) => break ExitCode::FAILURE,
-        };
-        if let ratatui::crossterm::event::Event::Mouse(mouse) = &event {
-            use ratatui::crossterm::event::MouseEventKind;
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    scroll_offset = scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
-                }
-                MouseEventKind::ScrollDown => {
-                    scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
-                }
-                MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
-                    let history_area_height =
-                        area_height_for_history(FOOTER_HEIGHT, terminal_height(&terminal));
-                    if mouse.row < history_area_height {
-                        let pos = selection::text_pos_from_screen(
-                            wrapped_len_for_selection(&history, terminal_width(&terminal)),
-                            current_window(
-                                &history,
-                                scroll_offset,
-                                terminal_width(&terminal),
-                                history_area_height,
-                            ),
-                            ratatui::layout::Rect::new(
-                                0,
-                                0,
-                                terminal_width(&terminal),
-                                history_area_height,
-                            ),
-                            mouse.row,
-                            mouse.column,
-                        );
-                        selection = Some(selection::Selection {
-                            anchor: pos,
-                            cursor: pos,
-                            dragging: true,
-                        });
+        // Reads raw terminal events until one actually needs a redraw or
+        // key handling — a bare mouse-move (`MouseEventKind::Moved`, which
+        // `EnableMouseCapture`'s all-motion reporting fires on *any*
+        // mouse movement over the terminal, not just a drag) is consumed
+        // right here without ever reaching the outer loop's top-of-frame
+        // redraw. Every other mouse kind still falls through to `continue
+        // 'outer` exactly as before, so the redraw timing for
+        // scroll/select/copy is unchanged.
+        let event = loop {
+            let candidate = match ratatui::crossterm::event::read() {
+                Ok(e) => e,
+                Err(_) => break 'outer ExitCode::FAILURE,
+            };
+            if let ratatui::crossterm::event::Event::Mouse(mouse) = &candidate {
+                use ratatui::crossterm::event::MouseEventKind;
+                match mouse.kind {
+                    MouseEventKind::Moved => continue,
+                    MouseEventKind::ScrollUp => {
+                        scroll_offset = scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
                     }
-                }
-                MouseEventKind::Drag(ratatui::crossterm::event::MouseButton::Left) => {
-                    if let Some(sel) = selection.as_mut()
-                        && sel.dragging
-                    {
+                    MouseEventKind::ScrollDown => {
+                        scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                    }
+                    MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
                         let history_area_height =
                             area_height_for_history(FOOTER_HEIGHT, terminal_height(&terminal));
-                        let width = terminal_width(&terminal);
-                        let wrapped_len = wrapped_len_for_selection(&history, width);
-                        let window =
-                            current_window(&history, scroll_offset, width, history_area_height);
-                        sel.cursor = selection::text_pos_from_screen(
-                            wrapped_len,
-                            window,
-                            ratatui::layout::Rect::new(0, 0, width, history_area_height),
-                            mouse.row,
-                            mouse.column,
-                        );
-                        if mouse.row == 0 {
-                            scroll_offset = scroll_offset.saturating_add(1);
-                        } else if mouse.row + 1 >= history_area_height {
-                            scroll_offset = scroll_offset.saturating_sub(1);
+                        if mouse.row < history_area_height {
+                            let width = terminal_width(&terminal);
+                            let wrapped = render::wrap_history_lines(&history, width);
+                            let window = render::visible_history_window(
+                                wrapped.len(),
+                                scroll_offset,
+                                history_area_height as usize,
+                            );
+                            let pos = selection::text_pos_from_screen(
+                                &wrapped,
+                                window,
+                                ratatui::layout::Rect::new(0, 0, width, history_area_height),
+                                mouse.row,
+                                mouse.column,
+                            );
+                            selection = Some(selection::Selection {
+                                anchor: pos,
+                                cursor: pos,
+                                dragging: true,
+                            });
                         }
                     }
-                }
-                MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left) => {
-                    if let Some(sel) = selection.as_mut() {
-                        sel.dragging = false;
-                        let width = terminal_width(&terminal);
-                        let wrapped = render::wrap_history_lines(&history, width);
-                        let text = selection::extract_text(&wrapped, sel);
-                        if !text.is_empty() {
-                            status = Status::Notice(apply_selection_copy(
-                                &text,
-                                clipboard::copy_to_clipboard,
-                            ));
+                    MouseEventKind::Drag(ratatui::crossterm::event::MouseButton::Left) => {
+                        if let Some(sel) = selection.as_mut()
+                            && sel.dragging
+                        {
+                            let history_area_height =
+                                area_height_for_history(FOOTER_HEIGHT, terminal_height(&terminal));
+                            let width = terminal_width(&terminal);
+                            let wrapped = render::wrap_history_lines(&history, width);
+                            let window = render::visible_history_window(
+                                wrapped.len(),
+                                scroll_offset,
+                                history_area_height as usize,
+                            );
+                            sel.cursor = selection::text_pos_from_screen(
+                                &wrapped,
+                                window,
+                                ratatui::layout::Rect::new(0, 0, width, history_area_height),
+                                mouse.row,
+                                mouse.column,
+                            );
+                            if mouse.row == 0 {
+                                scroll_offset = scroll_offset.saturating_add(1);
+                            } else if mouse.row.saturating_add(1) >= history_area_height {
+                                scroll_offset = scroll_offset.saturating_sub(1);
+                            }
                         }
                     }
+                    MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left) => {
+                        if let Some(sel) = selection.as_mut()
+                            && sel.dragging
+                        {
+                            sel.dragging = false;
+                            let width = terminal_width(&terminal);
+                            let wrapped = render::wrap_history_lines(&history, width);
+                            let text = selection::extract_text(&wrapped, sel);
+                            if !text.is_empty() {
+                                status = Status::Notice(apply_selection_copy(
+                                    &text,
+                                    clipboard::copy_to_clipboard,
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+                continue 'outer;
             }
-            continue;
-        }
+            break candidate;
+        };
         if let ratatui::crossterm::event::Event::Resize(_, _) = &event {
             selection = None;
         }
@@ -1415,15 +1406,14 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                     );
                                     if mouse.row < history_area_height {
                                         let width = terminal_width(&terminal);
-                                        let wrapped_len = wrapped_len_for_selection(&history, width);
-                                        let window = current_window(
-                                            &history,
+                                        let wrapped = render::wrap_history_lines(&history, width);
+                                        let window = render::visible_history_window(
+                                            wrapped.len(),
                                             scroll_offset,
-                                            width,
-                                            history_area_height,
+                                            history_area_height as usize,
                                         );
                                         let pos = selection::text_pos_from_screen(
-                                            wrapped_len,
+                                            &wrapped,
                                             window,
                                             ratatui::layout::Rect::new(
                                                 0,
@@ -1450,15 +1440,14 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                             terminal_height(&terminal),
                                         );
                                         let width = terminal_width(&terminal);
-                                        let wrapped_len = wrapped_len_for_selection(&history, width);
-                                        let window = current_window(
-                                            &history,
+                                        let wrapped = render::wrap_history_lines(&history, width);
+                                        let window = render::visible_history_window(
+                                            wrapped.len(),
                                             scroll_offset,
-                                            width,
-                                            history_area_height,
+                                            history_area_height as usize,
                                         );
                                         sel.cursor = selection::text_pos_from_screen(
-                                            wrapped_len,
+                                            &wrapped,
                                             window,
                                             ratatui::layout::Rect::new(
                                                 0,
@@ -1471,13 +1460,16 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                         );
                                         if mouse.row == 0 {
                                             scroll_offset = scroll_offset.saturating_add(1);
-                                        } else if mouse.row + 1 >= history_area_height {
+                                        } else if mouse.row.saturating_add(1) >= history_area_height
+                                        {
                                             scroll_offset = scroll_offset.saturating_sub(1);
                                         }
                                     }
                                 }
                                 MouseEventKind::Up(MouseButton::Left) => {
-                                    if let Some(sel) = selection.as_mut() {
+                                    if let Some(sel) = selection.as_mut()
+                                        && sel.dragging
+                                    {
                                         sel.dragging = false;
                                         let width = terminal_width(&terminal);
                                         let wrapped = render::wrap_history_lines(&history, width);

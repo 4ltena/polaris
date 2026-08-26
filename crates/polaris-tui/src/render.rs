@@ -312,6 +312,19 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
                 Style::default().add_modifier(Modifier::DIM),
             )))]
         }
+        AgentEvent::HistoryCompacted {
+            messages_before,
+            messages_after,
+            tokens_before,
+            tokens_after,
+        } => {
+            vec![HistoryLine::plain(Line::from(Span::styled(
+                sanitize(&format!(
+                    "⏺ 会話履歴を要約しました ({messages_before}件→{messages_after}件、{tokens_before}tok→{tokens_after}tok)"
+                )),
+                Style::default().add_modifier(Modifier::DIM),
+            )))]
+        }
     }
 }
 
@@ -2732,6 +2745,20 @@ mod tests {
         });
         assert!(joined.contains("file-inspector"));
         assert!(joined.contains("done"));
+    }
+
+    #[test]
+    fn a_history_compacted_event_reports_before_and_after_counts() {
+        let joined = live_print_text(&AgentEvent::HistoryCompacted {
+            messages_before: 12,
+            messages_after: 3,
+            tokens_before: 48_201,
+            tokens_after: 2_103,
+        });
+        assert!(joined.contains("12"));
+        assert!(joined.contains('3'));
+        assert!(joined.contains("48"));
+        assert!(joined.contains("2,103") || joined.contains("2103"));
     }
 
     #[test]

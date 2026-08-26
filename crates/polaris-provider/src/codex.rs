@@ -103,15 +103,14 @@ pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) ->
         // and the prefix never shifts under us.
         "store": false,
         "stream": true,
-        // Without this the backend writes nothing to its prompt cache for
-        // a reasoning model: measured on 2026-08-25, the same two-turn
-        // run reported `cache_write_tokens: 0` and `cached_tokens: 0` on
-        // every request without it, and 7,680 of 8,014 input tokens
-        // served from cache on the second request with it. It is not
-        // merely a request to be shown the reasoning — it is what makes
-        // the turn cacheable at all, which is why it isn't something to
-        // opt into. Behind a flag that defaults to off, the default run
-        // is the one that pays full price for a prefix it already sent.
+        // Added 2026-08-25 on the strength of a two-turn run that showed
+        // `cache_write_tokens`/`cached_tokens` at 0 without this and 7,680
+        // of 8,014 cached with it. A direct A/B on 2026-08-26 (build with
+        // this change vs. without, same task, multiple turns) couldn't
+        // reproduce that gap — both builds reached 93-97% cached_tokens by
+        // the third turn regardless. Left on: it costs only a slightly
+        // larger response payload, but its necessity for caching is no
+        // longer something this code can claim as measured.
         "include": ["reasoning.encrypted_content"],
         // Points the backend at the shard already holding this prefix.
         // `store: false` keeps the prefix stable, but stability alone

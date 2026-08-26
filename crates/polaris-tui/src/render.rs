@@ -132,12 +132,14 @@ fn format_tool_call_args(detail: &str) -> String {
 /// to a whole fenced block in a reply.
 const CODE_TEXT_COLOR: Color = Color::Rgb(0x98, 0x9d, 0xcc);
 
-/// Background color for an active/finalized mouse selection — brighter and
-/// more saturated than `CODE_TEXT_COLOR`, but restrained rather than
-/// blinding (Tailwind's `blue-400`). Applied as a real background color
-/// rather than `Modifier::REVERSED`, so the highlight always reads the
-/// same regardless of the terminal's own color scheme.
-pub(crate) const SELECTION_HIGHLIGHT_COLOR: Color = Color::Rgb(0x60, 0xa5, 0xfa);
+/// Background color for an active/finalized mouse selection. Terminal
+/// cells have no real alpha channel, so "more transparent" is simulated by
+/// blending Tailwind's `blue-400` (`#60A5FA`) ~65% toward black — a darker,
+/// more muted blue that reads as a tint over the content rather than a
+/// solid opaque highlight. Applied as a real background color rather than
+/// `Modifier::REVERSED`, so it reads the same regardless of the terminal's
+/// own color scheme.
+pub(crate) const SELECTION_HIGHLIGHT_COLOR: Color = Color::Rgb(0x3e, 0x6b, 0xa3);
 
 /// The most diff lines (context/added/removed, combined across all hunks)
 /// shown live for one `ToolFinished { diff: Some(_), .. }` event, before the

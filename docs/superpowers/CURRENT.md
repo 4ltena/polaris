@@ -1,6 +1,6 @@
 # polaris 現況
 
-最終更新 2026-08-25
+最終更新 2026-08-26
 
 ## この文書の役割
 
@@ -12,12 +12,53 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `21b89cf`）。`origin/main`は`a094280`(v0.5.0 CHANGELOG)まで同期・push済み。それ以降のローカル3コミット(`3dcb979` CURRENT.md更新、`21b89cf` v0.6.0 CHANGELOG追加)は**利用者の指示で意図的に未push**。`v0.1.0`〜`v0.6.0`まですべてタグ付け済み(ローカル)だが、pushはv0.5.0までで止めている——`v0.6.0`のコード自体は(v0.5.0 push時に)main経由で既にリモートへ乗っているが、タグ・CHANGELOGはリモート未反映 |
-| 進行中の計画 | なし。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktree自体は別の生きたClaude Codeセッション(pid確認済み)がロックしているため未削除のまま残っている——次回セッションで pid が生きていなければ `git worktree remove` で片付けてよい |
+| ブランチ | `main`（HEAD `4a43c48`）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル2コミット(`235ec5d` プロンプトキャッシュ改善、`4a43c48` v0.7.0 CHANGELOG追加)と`v0.7.0`タグ(ローカルのみ)は**利用者の指示で意図的に未push** |
+| 進行中の計画 | プロンプトキャッシュ利用率の改善。コード・CHANGELOG・`v0.7.0`タグまで完了（詳細は専用節）。A/B実測と、`Folder::take_item`が`reasoning` itemを捨てている件の扱いが未了。計画書は起こしていない。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
 | 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
 | 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md`、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress-design.md`、`docs/superpowers/specs/2026-08-25-polaris-tui-fullscreen-scroll-design.md` |
-| 版の方針 | 単一の `vX.Y.Z` を単調に進める方式。2026-08-25、コードネームを「黄道十二星座を明るさ順ではなく神話的な繋がり(各星座の伝統的な星名)で単調に辿る」方式へ確定。確定した対応表: `v0.1.0`=`hamal`(おひつじ座、tag・push済み)、`v0.2.0`=`Aldebaran`(おうし座、tag・push済み)、`v0.3.0`=`Castor`(ふたご座、tag・push済み)、`v0.4.0`=`Acubens`(かに座、tag・push済み)、`v0.5.0`=`Regulus`(しし座、tag・push済み——M4 core・files.md自動生成・ライブ表示改良・Viewport::Inline化)、`v0.6.0`=`Spica`(おとめ座、tag済み・**push未実施**——TUIフルスクリーン化・入力欄編集機能拡張)、`v0.7.0`=`Zubenelgenubi`(てんびん座)、`v0.8.0`=`Antares`(さそり座)、`v0.9.0`=`Rukbat`(いて座)、`v0.10.0`=`Algedi`(やぎ座)、`v0.11.0`=`Sadalmelik`(みずがめ座)、`v0.12.0`=`Alrescha`(うお座)。**`v0.6.0`分の push(main分・タグ分とも)は利用者の明示的な承認が要る、標準ルール通り** |
+| 版の方針 | 単一の `vX.Y.Z` を単調に進める方式。2026-08-25、コードネームを「黄道十二星座を明るさ順ではなく神話的な繋がり(各星座の伝統的な星名)で単調に辿る」方式へ確定。確定した対応表: `v0.1.0`=`hamal`(おひつじ座、tag・push済み)、`v0.2.0`=`Aldebaran`(おうし座、tag・push済み)、`v0.3.0`=`Castor`(ふたご座、tag・push済み)、`v0.4.0`=`Acubens`(かに座、tag・push済み)、`v0.5.0`=`Regulus`(しし座、tag・push済み——M4 core・files.md自動生成・ライブ表示改良・Viewport::Inline化)、`v0.6.0`=`Spica`(おとめ座、tag・push済み——TUIフルスクリーン化・入力欄編集機能拡張・マウスドラッグ選択)、`v0.7.0`=`Zubenelgenubi`(てんびん座、tag済み・**push未実施**——プロンプトキャッシュ利用率改善)、`v0.8.0`=`Antares`(さそり座)、`v0.9.0`=`Rukbat`(いて座)、`v0.10.0`=`Algedi`(やぎ座)、`v0.11.0`=`Sadalmelik`(みずがめ座)、`v0.12.0`=`Alrescha`(うお座)。**`v0.7.0`分の push(main分・タグ分とも)は利用者の明示的な承認が要る、標準ルール通り** |
+
+## プロンプトキャッシュの利用率
+
+`235ec5d`でコミット済み(`v0.7.0`「`Zubenelgenubi`」、CHANGELOGは`4a43c48`)。`prompt_cache_key` の生成（`crates/polaris-provider/src/lib.rs`）、codex・openai 両プロバイダからの送信、`run_loop` が `cached_tokens` を合算していなかった欠落の修正（`crates/polaris-core/src/agent.rs`）、一発実行での usage 表示（`crates/polaris-cli/src/main.rs`）、および対応するテストである。
+
+2026-08-26、この差分へ2点を加えた。
+
+第一に、`crates/polaris-provider/src/codex.rs` の `include` を、`POLARIS_INCLUDE_REASONING` による opt-in から常時送信へ変更した。同じ差分が持ち込んだテスト `the_body_asks_for_encrypted_reasoning_so_the_turn_is_cacheable` は、環境変数を設定しない素の環境で `left: Array []` として落ちていた。コード自身のコメントが「これが無いとバックエンドは推論モデルのプロンプトキャッシュに何も書かない」と実測付きで述べている以上、既定を off に倒すと変更の目的そのものが既定経路で効かない。テストを実装に合わせるのではなく、実装をテストに合わせた。
+
+第二に、同ファイルのテスト内にあった `needless_borrows_for_generic_args`（`Message::user(&format!(...))`）を解消し、rustfmt を通した。`cargo clippy --workspace --all-targets -- -D warnings` がこの1件で落ちていたためである。
+
+### 判断の根拠にした実測（2026-08-26）
+
+同一の指示「複数コードの変更をした。現状の変更点をまとめる」を polaris と codex にそれぞれ与え、消費量を突き合わせた。codex 側の数値は `~/.codex/sessions/2026/08/26/rollout-2026-08-26T12-20-44-01a03c15-9aea-7700-abcd-2c094f98e8a7.jsonl` の `total_token_usage` から取っている。
+
+| | polaris | codex |
+| --- | --- | --- |
+| input（累計） | 49,446 | 274,800 |
+| うち cached | 15,360（31.1%） | 214,784（78.2%） |
+| output | 1,705 | 2,210 |
+| プロバイダ往復 | 9回以上 | 5回 |
+
+polaris 側は TUI の累積カウンタで、同一セッションの前ターンを含む2ターン分である。codex 側は実ユーザー発話1件のセッション全量にあたる。尺が揃っていない分は polaris に不利な方向へ効いている。
+
+codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割台で安定する形になっていた。1回目 12.6%、2回目 97.6%、3回目 77.9%、4回目 98.0%、5回目 93.6% である。polaris の 31.1% はこの形になっていない。なお codex は初回リクエストだけで input 46,566 トークンを送っており、これがツールを1つも呼ぶ前の常時コンテキストの床にあたる。polaris の同じ床は547である。
+
+### 併せて判明したこと
+
+`Folder::take_item` は `reasoning` item を `_ => {}` で捨てており、`Message` 型にも保持する場所が無い。一方 codex は rollout に `reasoning` item を `encrypted_content` ごと5件残していた。polaris は `include` で要求しながら受け取ったものを回収していない。
+
+ただしキャッシュ率の主因ではない。`include` を on にするだけで2リクエスト目に 8,014 中 7,680 という実測がコード内コメントに残っている。ツール呼び出しを跨いだ推論の連続性の問題として、別に扱う。
+
+### 検証
+
+`cargo test --workspace` は全緑、`cargo clippy --workspace --all-targets -- -D warnings` は clean、`cargo fmt --all -- --check` も clean。いずれも 2026-08-26 に実測した。
+
+### 未実施
+
+修正前後の A/B 実測は行っていない。2026-08-26、コミット自体は利用者の指示(このコミットを`v0.7.0`とする)で先に進めたが、A/B実測は別枠として残っている。手順は決めてある。`235ec5d`の前(`fca96c4`)と後(`235ec5d`以降)それぞれで`POLARIS_DUMP_USAGE=1`を与えた一発実行を1回ずつ流し、リクエスト単位の `cached_tokens` と `input_tokens` を上の codex の表と同じ形に並べる。作業ツリーがコミット済みになったため、`git worktree add`等で2つのビルドを共存させるか、`git stash`せず`git checkout fca96c4 -- <該当crate>`で一時的に戻して測る必要がある。累計値だけでは応答の非決定性で揺れるため、初回が冷えて2回目以降が9割台に乗る形になるかどうかで判定する。
+
+`Folder::take_item`が`reasoning` itemを`_ => {}`で捨てている件（下の「併せて判明したこと」）は、A/B実測とは別に、設計判断を要する変更として扱う。`Message`型に保持場所が無いため、型を広げるかどうかから決める必要があり、`spec-first-development`の対象になりうる規模。
 
 ## マイルストーン
 
@@ -417,16 +458,18 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-25、`v0.6.0`「`Spica`」のCHANGELOG追記・git tagが完了した直後に書き直した(push は利用者の指示で意図的に保留)。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
+本節は2026-08-26、プロンプトキャッシュ改善(`235ec5d`)を`v0.7.0`「`Zubenelgenubi`」としてコミット・タグ付けした直後に書き直した。`v0.6.0`はorigin push済み。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
 
 優先度順:
 
-1. **`v0.6.0`分の`git push`(main分3コミット・`v0.6.0`タグ分)の実施を利用者に確認する。** タグ・CHANGELOGは確定済みだが、push自体はまだ明示的な承認を得ていない
-2. **`worktree-feat-tui-live-progress`の後始末。** 別の生きたセッションのロックで`git worktree remove`が拒否された。そのセッションが終了していれば片付ける
+1. **プロンプトキャッシュ修正の A/B 実測。** 手順は「プロンプトキャッシュの利用率」節の「未実施」に書いた。`235ec5d`前後のビルドを両方用意して比較する。ここで9割台に乗らなければ、`reasoning` item を回収していない件が効いている疑いが立つ
+2. **`Folder::take_item`の`reasoning` item欠落への対応方針を決める。** A/B実測が9割台に乗らなかった場合、あるいはツール呼び出しを跨いだ推論連続性を狙う場合に着手する。`Message`型の拡張を伴うため設計判断が要る
+3. **`v0.7.0`分の`git push`(main分2コミット・`v0.7.0`タグ分)の実施を利用者に確認する。** タグ・CHANGELOGは確定済みだが、push自体はまだ明示的な承認を得ていない
+4. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
 
 そのうえで v1.0.0 のタグ付けの判断へ進む。
 
-キャッシュヒット率の記録は、タグ準備の前に入れる。設計が主張する「接頭辞を動かさないからキャッシュが効く」という性質を観測に変える作業であり、遅れても失われない。
+キャッシュヒット率の記録は、上の A/B 実測がその作業にあたる。設計が主張する「接頭辞を動かさないからキャッシュが効く」という性質を観測に変える。
 
 M4 の仕様は、6 本目のツールと 990 トークン上限の衝突（上の「M4 へ」参照）と、M3b が新たに繰り越した項目（並び順のテスト不在、部分文字列フォールバックの打ち切り通知）を先に見ておく。
 

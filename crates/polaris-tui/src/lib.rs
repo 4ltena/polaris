@@ -1073,6 +1073,16 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     status = Status::Idle;
                     continue;
                 }
+                Some(slash::Action::Compact) => {
+                    handle_compact(
+                        args.provider.as_ref(),
+                        &mut session,
+                        &session_path,
+                        &mut status,
+                    )
+                    .await;
+                    continue;
+                }
                 Some(action) => {
                     // Same reasoning as the popup-selection path above:
                     // `apply_slash_action` can't re-seed `history`'s header
@@ -1124,7 +1134,14 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         };
 
         session.push_user(&text);
-        let checkpoint = session.messages.len();
+        // `mut`: mid-turn compaction (see `history_compacted_this_turn`
+        // below) can shrink `session.messages` after this point but within
+        // the same turn, which would otherwise leave `checkpoint` pointing
+        // past the unbalanced tool-call tail `TurnOutcome::Done(Err(_))`/
+        // `Interrupted` roll back to — `Vec::truncate` silently no-ops
+        // when given a length >= the vec's current length, so a stale
+        // `checkpoint` would make that rollback quietly do nothing.
+        let mut checkpoint = session.messages.len();
         // A no-op after the first call for this session (see
         // `write_meta_if_absent`'s docs) — this is the lazy point where an
         // until-now-empty session actually starts existing on disk.
@@ -1296,8 +1313,21 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         if scroll_offset > 0 {
                             scroll_offset += appended;
                         }
-                        if matches!(event, polaris_core::AgentEvent::HistoryCompacted { .. }) {
+                        if let polaris_core::AgentEvent::HistoryCompacted {
+                            messages_before,
+                            messages_after,
+                            ..
+                        } = event
+                        {
                             history_compacted_this_turn = true;
+                            // `checkpoint` was captured before this turn's
+                            // compaction could have run — shift it back by
+                            // however many messages compaction just
+                            // removed so it still points at the same
+                            // logical position (see the comment on
+                            // `checkpoint`'s declaration above).
+                            checkpoint = checkpoint
+                                .saturating_sub(messages_before.saturating_sub(messages_after));
                         }
                     }
                     _ = ticker.tick() => {
@@ -1567,8 +1597,15 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 if scroll_offset > 0 {
                     scroll_offset += appended;
                 }
-                if matches!(event, polaris_core::AgentEvent::HistoryCompacted { .. }) {
+                if let polaris_core::AgentEvent::HistoryCompacted {
+                    messages_before,
+                    messages_after,
+                    ..
+                } = event
+                {
                     history_compacted_this_turn = true;
+                    checkpoint =
+                        checkpoint.saturating_sub(messages_before.saturating_sub(messages_after));
                 }
             }
             turn_outcome

@@ -14,7 +14,8 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::{
-    CompletionRequest, CompletionResponse, Message, Provider, ProviderError, Role, ToolCall, sse,
+    CompletionRequest, CompletionResponse, Message, Provider, ProviderError, ReasoningItem, Role,
+    ToolCall, sse,
 };
 
 /// The endpoint to send requests to. `store` is never used, so this is the
@@ -137,6 +138,7 @@ pub struct Folder {
     tool_calls: Vec<ToolCall>,
     completed: bool,
     usage: Option<crate::Usage>,
+    reasoning: Vec<ReasoningItem>,
 }
 
 impl Default for Folder {
@@ -153,6 +155,7 @@ impl Folder {
             tool_calls: Vec::new(),
             completed: false,
             usage: None,
+            reasoning: Vec::new(),
         }
     }
 
@@ -257,6 +260,21 @@ impl Folder {
                     arguments,
                 });
             }
+            "reasoning" => {
+                if let (Some(id), Some(encrypted_content)) = (
+                    item.get("id").and_then(|v| v.as_str()),
+                    item.get("encrypted_content").and_then(|v| v.as_str()),
+                ) {
+                    self.reasoning.push(ReasoningItem {
+                        id: id.to_string(),
+                        encrypted_content: encrypted_content.to_string(),
+                    });
+                }
+                // `id`/`encrypted_content` 欠如(`include` が効かなかった、
+                // reasoning非対応モデル等)は静かに読み飛ばす。継続性は
+                // ベストエフォートの最適化で、無ければ無いまま次のターン
+                // へ進んで構わない。
+            }
             _ => {}
         }
         Ok(())
@@ -273,7 +291,7 @@ impl Folder {
         Ok(CompletionResponse {
             text: self.text,
             tool_calls: self.tool_calls,
-            reasoning: Vec::new(),
+            reasoning: self.reasoning,
             usage: self.usage,
         })
     }
@@ -460,6 +478,17 @@ mod tests {
         })
     }
 
+    fn reasoning_item(id: &str, encrypted_content: &str) -> Value {
+        serde_json::json!({
+            "item": {
+                "type": "reasoning",
+                "id": id,
+                "summary": [],
+                "encrypted_content": encrypted_content,
+            }
+        })
+    }
+
     #[test]
     fn a_text_only_stream_folds_into_text() {
         let mut f = Folder::new();
@@ -490,6 +519,39 @@ mod tests {
         assert_eq!(r.tool_calls[0].id, "call_9");
         assert_eq!(r.tool_calls[0].name, "read");
         assert_eq!(r.tool_calls[0].arguments["path"], "a.txt");
+    }
+
+    #[test]
+    fn a_reasoning_item_is_captured_with_its_encrypted_content() {
+        let mut f = Folder::new();
+        f.push(&frame(
+            "response.output_item.done",
+            reasoning_item("r1", "opaque-blob"),
+        ))
+        .expect("push should succeed");
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("push should succeed");
+        let r = f.finish().expect("should be complete");
+        assert_eq!(r.reasoning.len(), 1);
+        assert_eq!(r.reasoning[0].id, "r1");
+        assert_eq!(r.reasoning[0].encrypted_content, "opaque-blob");
+    }
+
+    #[test]
+    fn a_reasoning_item_without_encrypted_content_is_skipped() {
+        let mut f = Folder::new();
+        f.push(&frame(
+            "response.output_item.done",
+            serde_json::json!({ "item": { "type": "reasoning", "id": "r1", "summary": [] } }),
+        ))
+        .expect("push should succeed");
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("push should succeed");
+        let r = f.finish().expect("should be complete");
+        assert!(
+            r.reasoning.is_empty(),
+            "a reasoning item with no encrypted_content must not be kept"
+        );
     }
 
     /// The result doesn't change no matter where the frame gets split.

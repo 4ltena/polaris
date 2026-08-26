@@ -335,7 +335,7 @@ pub(crate) async fn run_loop(
         }
 
         if res.tool_calls.is_empty() {
-            session.push_assistant(&res.text);
+            session.push_assistant(&res.text, res.reasoning);
             return Ok(AgentOutcome {
                 text: res.text,
                 usage,
@@ -348,7 +348,7 @@ pub(crate) async fn run_loop(
         // nothing to match "which call this result answers" against — a
         // real OpenAI endpoint rejects it (tests against a mock never
         // inspect the wire format, so they cannot detect this omission).
-        session.push_assistant_tool_calls(&res.text, res.tool_calls.clone());
+        session.push_assistant_tool_calls(&res.text, res.tool_calls.clone(), res.reasoning);
 
         for call in &res.tool_calls {
             // The `files.md` regeneration hook. It fires *only* for the
@@ -2118,6 +2118,7 @@ print("wrote")
                         total_tokens: 15,
                         cached_tokens: 4,
                     }),
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "it was 1 line".into(),
@@ -2128,6 +2129,7 @@ print("wrote")
                         total_tokens: 23,
                         cached_tokens: 16,
                     }),
+                    ..Default::default()
                 },
             ]),
         };
@@ -2174,6 +2176,73 @@ print("wrote")
             outcome.usage.cached_tokens, 20,
             "cached tokens are not being carried out of the turn"
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_from_a_tool_calling_turn_is_carried_into_the_session() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, "hello\n").expect("cannot write");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({ "path": target.to_str().unwrap() }),
+                    }],
+                    reasoning: vec![polaris_provider::ReasoningItem {
+                        id: "r1".into(),
+                        encrypted_content: "opaque".into(),
+                    }],
+                    usage: None,
+                },
+                CompletionResponse {
+                    text: "it was 1 line".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("how many lines is a.txt");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        // messages[0] is the user turn, messages[1] is the assistant turn that
+        // called the tool - that's the one that must carry the reasoning item
+        // captured alongside it.
+        let tool_calling_turn = &session.messages[1];
+        assert_eq!(tool_calling_turn.reasoning.len(), 1);
+        assert_eq!(tool_calling_turn.reasoning[0].id, "r1");
+        assert_eq!(tool_calling_turn.reasoning[0].encrypted_content, "opaque");
     }
 
     #[tokio::test]
@@ -2924,6 +2993,7 @@ print("wrote")
                 text: "done".into(),
                 tool_calls: vec![],
                 usage: None,
+                ..Default::default()
             }]),
         };
 

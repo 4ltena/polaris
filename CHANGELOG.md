@@ -2,6 +2,20 @@
 
 [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) と [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
+## [0.7.0] — 2026-08-26 "Zubenelgenubi"
+
+サーバー側のプロンプトキャッシュ利用率を改善した。ロードバランスされたバックエンドでは、ルーティング鍵を送らない限り同一プレフィックスのリクエストが同じシャードへ届く保証がなく、実測では同一タスクに対してpolarisが8リクエスト中キャッシュ0件だったのに対し、鍵を送る純正codexクライアントは63.4%がキャッシュヒットしていた。
+
+### 追加
+
+- `prompt_cache_key`の送信。モデル・reasoning effort・システムプロンプト・ツール定義のFNV-1aハッシュを鍵とする`cache_key`関数を追加し、Codex・OpenAI両プロバイダのリクエストに含めるようにした。会話内容そのものは鍵から除外しているため、ターンが進んでも鍵が変わらずキャッシュヒットを継続できる
+- one-shot実行(TUIを使わない`exec`系サブコマンド)でも、TUIの`/status`と同じ`tokens: in N / out N / cache N / total N — Mメッセージ`の内訳をstderrへ出力するようにした
+
+### 修正
+
+- Codexプロバイダが送る`include: ["reasoning.encrypted_content"]`を、環境変数によるオプトインから常時送信へ変更した。reasoning対応モデルにこれを送らないとサーバー側のプロンプトキャッシュへの書き込み自体が発生せず、実測では送らない場合は全リクエストで`cache_write_tokens`・`cached_tokens`が0、送った場合は2回目のリクエストで入力8,014トークン中7,680トークンがキャッシュから供給された
+- `agent::run_loop`がターン内の応答を積算する際、`cached_tokens`だけ加算し忘れていた不具合。`/status`のキャッシュ内訳表示が、実際のキャッシュ利用状況によらず常に`cache 0`のままになっていた
+
 ## [0.6.0] — 2026-08-25 "Spica"
 
 対話TUIの描画方式を、`ratatui::Viewport::Inline`(端末のネイティブスクロールバックへの一度きり印字)から、`Viewport::Fullscreen`による自前のスクロール管理へ移行した。Terminal.app を含む主要ターミナルが「新規出力・キー入力で強制的に最下部へスクロールする」挙動を無効化できないことを tmux での実地検証で確認したため。加えて、入力欄の編集機能を拡張した。

@@ -177,14 +177,19 @@ impl Provider for OpenAiProvider {
         let tools = tool_wire_shape(&req.tools);
 
         let model = self.model.read().expect("model lock poisoned").clone();
+        let effort = self.effort.read().expect("effort lock poisoned").clone();
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
+            // See `crate::cache_key`. Sent here for the same reason as
+            // in `codex::build_body`: a stable prefix is only reused if
+            // the backend is pointed at the shard holding it.
+            "prompt_cache_key": crate::cache_key(&model, effort.as_deref(), &req),
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
-        if let Some(effort) = self.effort.read().expect("effort lock poisoned").as_deref() {
+        if let Some(effort) = effort.as_deref() {
             body["reasoning_effort"] = Value::String(effort.to_string());
         }
 

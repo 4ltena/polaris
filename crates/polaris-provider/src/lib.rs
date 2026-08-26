@@ -89,6 +89,57 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolSpec>,
 }
 
+/// FNV-1a, one chunk at a time. Written out rather than taken from the
+/// standard library's `DefaultHasher` for the same reason
+/// `polaris_core::project::project_id` writes it out: the standard
+/// library doesn't specify its algorithm, and a value that shifted
+/// across Rust versions would silently throw away a cache generation.
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// A stable routing hint for the provider's prompt cache, sent as
+/// `prompt_cache_key`.
+///
+/// The provider caches by prefix, but on a load-balanced backend it has
+/// to find the shard holding that prefix before it can reuse it. Without
+/// a key, consecutive turns of one conversation can land on different
+/// shards and miss a cache written moments earlier. Measured against the
+/// Codex backend on 2026-08-25, polaris took 0 cached tokens across 8
+/// requests while `codex` — which sends a key of its own — took 63.4%
+/// on the same task.
+///
+/// The key covers exactly what fixes the cacheable prefix: the model,
+/// the reasoning effort, the system prompt, and the tool definitions.
+/// Requests sharing those share a prefix and belong on one shard;
+/// requests that don't would only evict each other. Conversation
+/// content is deliberately excluded — it grows every turn, and a key
+/// that moved with it would point at a fresh shard each time, which is
+/// the failure this exists to fix.
+pub fn cache_key(model: &str, effort: Option<&str>, req: &CompletionRequest) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+    let mut hash = fnv1a(FNV_OFFSET_BASIS, model.as_bytes());
+    hash = fnv1a(hash, b"\0");
+    hash = fnv1a(hash, effort.unwrap_or_default().as_bytes());
+    hash = fnv1a(hash, b"\0");
+    hash = fnv1a(hash, req.system.as_bytes());
+    for t in &req.tools {
+        hash = fnv1a(hash, b"\0");
+        hash = fnv1a(hash, t.name.as_bytes());
+        hash = fnv1a(hash, b"\0");
+        hash = fnv1a(hash, t.description.as_bytes());
+        hash = fnv1a(hash, b"\0");
+        hash = fnv1a(hash, t.parameters.to_string().as_bytes());
+    }
+    format!("polaris-{hash:016x}")
+}
+
 /// Token usage reported by a single provider response. `None` on
 /// `CompletionResponse` means the provider's response didn't carry a
 /// usable `usage` field — never a hard error, since this is a

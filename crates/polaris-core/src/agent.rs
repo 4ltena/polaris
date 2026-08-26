@@ -328,6 +328,10 @@ pub(crate) async fn run_loop(
             usage.input_tokens += u.input_tokens;
             usage.output_tokens += u.output_tokens;
             usage.total_tokens += u.total_tokens;
+            // Dropping this reported `cache 0` for every run regardless of
+            // what the provider actually served from cache, since the
+            // TUI's own accumulator only ever sees this total.
+            usage.cached_tokens += u.cached_tokens;
         }
 
         if res.tool_calls.is_empty() {
@@ -2112,7 +2116,7 @@ print("wrote")
                         input_tokens: 10,
                         output_tokens: 5,
                         total_tokens: 15,
-                        cached_tokens: 0,
+                        cached_tokens: 4,
                     }),
                 },
                 CompletionResponse {
@@ -2122,7 +2126,7 @@ print("wrote")
                         input_tokens: 20,
                         output_tokens: 3,
                         total_tokens: 23,
-                        cached_tokens: 0,
+                        cached_tokens: 16,
                     }),
                 },
             ]),
@@ -2162,6 +2166,14 @@ print("wrote")
         assert_eq!(outcome.usage.input_tokens, 30);
         assert_eq!(outcome.usage.output_tokens, 8);
         assert_eq!(outcome.usage.total_tokens, 38);
+        // Distinct per-response values, so a total of 20 can only come
+        // from summing both. Left at 0/0, this test passed while the
+        // field was being dropped outright, and every `/status` reported
+        // `cache 0` no matter what the provider served.
+        assert_eq!(
+            outcome.usage.cached_tokens, 20,
+            "cached tokens are not being carried out of the turn"
+        );
     }
 
     #[tokio::test]

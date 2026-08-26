@@ -93,8 +93,10 @@ pub struct CompactionReport {
     pub tokens_after: usize,
 }
 
-/// Returns `Ok(None)` when there's nothing old enough to compact away
-/// (`cut_index` returned 0) — not an error, just a no-op.
+/// Returns `Ok(None)` — not an error, just a no-op — when there's nothing
+/// worth compacting: `cut_index` returned 0 (not enough history yet), the
+/// prefix it found is below `MIN_TOKENS_TO_SUMMARIZE`, or the provider's
+/// summary came back empty.
 pub async fn compact(
     provider: &dyn Provider,
     messages: &mut Vec<Message>,

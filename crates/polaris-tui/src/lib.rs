@@ -1332,7 +1332,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     }
                     maybe_event = event_stream.next() => {
                         use ratatui::crossterm::event::{
-                            Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+                            Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+                            MouseEventKind,
                         };
                         match maybe_event {
                             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -1407,8 +1408,123 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                     scroll_offset =
                                         scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
                                 }
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    let history_area_height = area_height_for_history(
+                                        FOOTER_HEIGHT,
+                                        terminal_height(&terminal),
+                                    );
+                                    if mouse.row < history_area_height {
+                                        let width = terminal_width(&terminal);
+                                        let wrapped_len = wrapped_len_for_selection(&history, width);
+                                        let window = current_window(
+                                            &history,
+                                            scroll_offset,
+                                            width,
+                                            history_area_height,
+                                        );
+                                        let pos = selection::text_pos_from_screen(
+                                            wrapped_len,
+                                            window,
+                                            ratatui::layout::Rect::new(
+                                                0,
+                                                0,
+                                                width,
+                                                history_area_height,
+                                            ),
+                                            mouse.row,
+                                            mouse.column,
+                                        );
+                                        selection = Some(selection::Selection {
+                                            anchor: pos,
+                                            cursor: pos,
+                                            dragging: true,
+                                        });
+                                    }
+                                }
+                                MouseEventKind::Drag(MouseButton::Left) => {
+                                    if let Some(sel) = selection.as_mut()
+                                        && sel.dragging
+                                    {
+                                        let history_area_height = area_height_for_history(
+                                            FOOTER_HEIGHT,
+                                            terminal_height(&terminal),
+                                        );
+                                        let width = terminal_width(&terminal);
+                                        let wrapped_len = wrapped_len_for_selection(&history, width);
+                                        let window = current_window(
+                                            &history,
+                                            scroll_offset,
+                                            width,
+                                            history_area_height,
+                                        );
+                                        sel.cursor = selection::text_pos_from_screen(
+                                            wrapped_len,
+                                            window,
+                                            ratatui::layout::Rect::new(
+                                                0,
+                                                0,
+                                                width,
+                                                history_area_height,
+                                            ),
+                                            mouse.row,
+                                            mouse.column,
+                                        );
+                                        if mouse.row == 0 {
+                                            scroll_offset = scroll_offset.saturating_add(1);
+                                        } else if mouse.row + 1 >= history_area_height {
+                                            scroll_offset = scroll_offset.saturating_sub(1);
+                                        }
+                                    }
+                                }
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    if let Some(sel) = selection.as_mut() {
+                                        sel.dragging = false;
+                                        let width = terminal_width(&terminal);
+                                        let wrapped = render::wrap_history_lines(&history, width);
+                                        let text = selection::extract_text(&wrapped, sel);
+                                        if !text.is_empty() {
+                                            status = Status::Notice(apply_selection_copy(
+                                                &text,
+                                                clipboard::copy_to_clipboard,
+                                            ));
+                                            mid_turn_notice_until = Some(
+                                                Instant::now() + MID_TURN_NOTICE_DURATION,
+                                            );
+                                            if terminal
+                                                .borrow_mut()
+                                                .draw(|f| {
+                                                    draw_frame(
+                                                        f,
+                                                        &history,
+                                                        scroll_offset,
+                                                        &input_buffer,
+                                                        input_cursor,
+                                                        &status,
+                                                        &render::HeaderInfo {
+                                                            provider_name: &args.provider_name,
+                                                            model_name: &model_name,
+                                                            usage: cumulative_usage,
+                                                            cwd: &cwd_display,
+                                                            cwd_short: &cwd_footer_display,
+                                                            effort_name: &effort_name,
+                                                        },
+                                                        &[],
+                                                        0,
+                                                        &selection,
+                                                    )
+                                                })
+                                                .is_err()
+                                            {
+                                                break TurnOutcome::Fatal;
+                                            }
+                                        }
+                                    }
+                                }
                                 _ => {}
                             },
+                            Some(Ok(Event::Resize(_, _))) => {
+                                selection = None;
+                            }
                             Some(Ok(_)) => {}
                             Some(Err(_)) | None => break TurnOutcome::Fatal,
                         }

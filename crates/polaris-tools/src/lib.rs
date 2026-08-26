@@ -77,7 +77,7 @@ pub fn all_specs() -> Vec<ToolSpec> {
 fn read_spec() -> ToolSpec {
     ToolSpec {
         name: "read",
-        description: "Read a file. Returns it with line numbers. Use offset and limit to specify a range.",
+        description: "Read a file. Returns it with line numbers. Omit limit for up to 2000 lines from offset; don't guess a small limit, it just forces a second read.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -202,6 +202,30 @@ mod tests {
         assert_eq!(json["name"], "read");
         assert_eq!(json["parameters"]["required"][0], "path");
         assert_eq!(json["parameters"]["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn read_spec_tells_the_model_the_default_limit_instead_of_leaving_it_to_guess() {
+        // A live polaris-vs-codex comparison run showed the model choosing
+        // small limits (120-300 lines) with the old wording ("Use offset
+        // and limit to specify a range"), which said nothing about what
+        // happens when limit is omitted. Large files then needed a second
+        // read call for the remainder, and every extra round trip resends
+        // the whole growing history under this provider's store: false
+        // design (see codex.rs:132), so avoidable extra calls are not free
+        // the way they'd be under a stateful API. Naming the actual
+        // default here gives the model a reason to omit limit instead of
+        // guessing.
+        let read = all_specs()
+            .into_iter()
+            .find(|s| s.name == "read")
+            .expect("no read");
+        assert!(
+            read.description.contains("2000"),
+            "description should name the actual default so the model omits limit \
+             instead of guessing a small one: {:?}",
+            read.description
+        );
     }
 
     #[test]

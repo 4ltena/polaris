@@ -12,7 +12,7 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `657700c`）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル17コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`(プロンプトキャッシュ改善+CHANGELOG修正)を指しており、それより後のreasoning item保持一式(`dcfe7b9`〜`657700c`、spec・plan・6タスク+最終レビューのfix wave)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
+| ブランチ | `main`（HEAD `9f2eef9`）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル18コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`(プロンプトキャッシュ改善+CHANGELOG修正)を指しており、それより後のreasoning item保持一式(`dcfe7b9`〜`9f2eef9`、spec・plan・6タスク+最終レビューのfix waveと記録更新)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
 | 進行中の計画 | なし。プロンプトキャッシュ利用率の改善(`v0.7.0`)、reasoning item保持(spec・plan・SDD実行6タスク、詳細は専用節)ともに完了・ワークスペース全体で検証済み。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
 | 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
 | 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
@@ -489,7 +489,7 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 優先度順:
 
-1. **reasoning item保持を含む17件のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`657700c`(spec・plan・6タスク+修正2件)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
+1. **reasoning item保持を含む18件のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`9f2eef9`(spec・plan・6タスク+修正2件と記録更新)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
 2. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/`(台帳・brief・reportなど)は削除済み(finishing-a-development-branch完了に伴う)
 3. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
 4. **reasoning item保持の最終レビューで未対応のまま残した2件**(上の「reasoning item保持」節末尾)。コンパクション無しでの1ターンあたりの実際のトークン増分の実測、`/model`切り替え後にreasoning replayが失敗しないかの実地確認。どちらも壊れている証拠は無い、優先度は低い

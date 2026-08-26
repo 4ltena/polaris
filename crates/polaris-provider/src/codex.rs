@@ -103,6 +103,21 @@ pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) ->
         // and the prefix never shifts under us.
         "store": false,
         "stream": true,
+        // Without this the backend writes nothing to its prompt cache for
+        // a reasoning model: measured on 2026-08-25, the same two-turn
+        // run reported `cache_write_tokens: 0` and `cached_tokens: 0` on
+        // every request without it, and 7,680 of 8,014 input tokens
+        // served from cache on the second request with it. It is not
+        // merely a request to be shown the reasoning — it is what makes
+        // the turn cacheable at all, which is why it isn't something to
+        // opt into. Behind a flag that defaults to off, the default run
+        // is the one that pays full price for a prefix it already sent.
+        "include": ["reasoning.encrypted_content"],
+        // Points the backend at the shard already holding this prefix.
+        // `store: false` keeps the prefix stable, but stability alone
+        // doesn't help if each turn is routed somewhere else — see
+        // `crate::cache_key`.
+        "prompt_cache_key": crate::cache_key(model, effort, req),
     });
     let tools = tool_wire_shape(&req.tools);
     if !tools.is_empty() {
@@ -158,6 +173,14 @@ impl Folder {
                 "response.output_item.done" => self.take_item(&v)?,
                 "response.completed" => {
                     self.completed = true;
+                    if std::env::var_os("POLARIS_DUMP_USAGE").is_some() {
+                        eprintln!(
+                            "[usage] {}",
+                            v.pointer("/response/usage")
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|| "<absent>".into())
+                        );
+                    }
                     self.usage = v.pointer("/response/usage").and_then(|u| {
                         let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
                         let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
@@ -793,6 +816,92 @@ mod tests {
         assert!(
             body.get("reasoning").is_none(),
             "reasoning is being sent even though effort wasn't passed"
+        );
+    }
+
+    /// The point of the key: it must not move as the conversation grows.
+    /// A key derived from the messages would change every turn and route
+    /// each request to a fresh shard, which is exactly the 0% hit rate
+    /// this was added to fix. Pinning turn 1 against turn 5 is what
+    /// catches that regression; asserting the key merely exists would
+    /// not.
+    #[test]
+    fn the_cache_key_holds_still_while_the_conversation_grows() {
+        let turn = |n: usize| CompletionRequest {
+            system: "system".into(),
+            messages: (0..n).map(|i| Message::user(format!("turn {i}"))).collect(),
+            tools: polaris_tools::all_specs(),
+        };
+        let first = build_body("m", &turn(1), Some("high"));
+        let fifth = build_body("m", &turn(5), Some("high"));
+
+        assert!(
+            first["prompt_cache_key"].is_string(),
+            "no prompt_cache_key is being sent"
+        );
+        assert_eq!(
+            first["prompt_cache_key"], fifth["prompt_cache_key"],
+            "the key moved as the conversation grew, so every turn routes elsewhere"
+        );
+    }
+
+    /// The other half of the pair. Everything the key covers is something
+    /// that breaks prefix reuse, so a request that changes one of them
+    /// must not be pointed at the shard holding the old prefix — it would
+    /// only evict it. Without this, a constant key would pass the test
+    /// above.
+    #[test]
+    fn anything_that_breaks_the_prefix_changes_the_cache_key() {
+        let req = |system: &str, tools: Vec<polaris_tools::ToolSpec>| CompletionRequest {
+            system: system.into(),
+            messages: vec![Message::user("go")],
+            tools,
+        };
+        let all = polaris_tools::all_specs();
+        let base =
+            build_body("m", &req("system", all.clone()), Some("high"))["prompt_cache_key"].clone();
+
+        for (what, other) in [
+            (
+                "the model",
+                build_body("other", &req("system", all.clone()), Some("high")),
+            ),
+            (
+                "the effort",
+                build_body("m", &req("system", all.clone()), Some("low")),
+            ),
+            (
+                "the system prompt",
+                build_body("m", &req("other", all.clone()), Some("high")),
+            ),
+            (
+                "the tool list",
+                build_body("m", &req("system", all[1..].to_vec()), Some("high")),
+            ),
+        ] {
+            assert_ne!(
+                base, other["prompt_cache_key"],
+                "changing {what} left the cache key alone"
+            );
+        }
+    }
+
+    /// Not a cosmetic request to be shown the model's reasoning. Without
+    /// it the backend writes nothing to its prompt cache for a reasoning
+    /// model, and every turn pays full price for a prefix it already
+    /// sent — which is what polaris did until it was measured.
+    #[test]
+    fn the_body_asks_for_encrypted_reasoning_so_the_turn_is_cacheable() {
+        let req = CompletionRequest {
+            system: "s".into(),
+            messages: vec![Message::user("x")],
+            tools: vec![],
+        };
+        let body = build_body("m", &req, None);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"]),
+            "the prompt cache is being left switched off"
         );
     }
 

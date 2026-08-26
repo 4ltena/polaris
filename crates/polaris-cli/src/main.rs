@@ -597,6 +597,18 @@ async fn main() -> ExitCode {
             {
                 Ok(outcome) => {
                     println!("{}", outcome.text);
+                    // Same fields, same order as the TUI's `/status`, so a
+                    // one-shot run and an interactive one can be compared
+                    // without translating between two formats. On stderr,
+                    // since stdout is the answer and gets piped.
+                    eprintln!(
+                        "tokens: in {} / out {} / cache {} / total {} — {} messages",
+                        outcome.usage.input_tokens,
+                        outcome.usage.output_tokens,
+                        outcome.usage.cached_tokens,
+                        outcome.usage.total_tokens,
+                        session.messages.len(),
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

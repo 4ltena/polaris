@@ -12,7 +12,7 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `652708f`、その後`docs/filemap.md`の再生成のみ未コミットで残っている）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル29コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`を指しており、それより後のreasoning item保持一式・会話履歴の自動圧縮一式(`dcfe7b9`〜`652708f`)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
+| ブランチ | `main`（HEAD `bd1d8d8`、作業ツリーはクリーン）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル32コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`を指しており、それより後のreasoning item保持一式・会話履歴の自動圧縮一式(`dcfe7b9`〜`bd1d8d8`)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
 | 進行中の計画 | なし。プロンプトキャッシュ利用率の改善(`v0.7.0`)、reasoning item保持、会話履歴の自動圧縮(compaction、詳細は専用節)いずれも完了・ワークスペース全体で検証済み。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
 | 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
 | 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
@@ -93,17 +93,19 @@ codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割�
 
 **設計**: `COMPACTION_THRESHOLD = 100_000`トークン(モデルごとのコンテキストウィンドウをpolarisはどのプロバイダからも取得できないため、固定の保守的な値)を`session.messages`の実測トークン数が超えたら、直近`KEEP_RECENT_USER_TURNS = 2`件のユーザーターンを残し、それより前を1回のLLM要約呼び出しで1件の要約Messageへ置き換える。必ず`Role::User`の位置でのみ切る(ツール呼び出し/結果の対を割らない)。
 
-**実装内容**(コミット`dcfe7b9`〜`652708f`、6タスク+最終レビューのfix wave1回、全てレビュークリア):
+**実装内容**(コミット`dcfe7b9`〜`bd1d8d8`、6タスク+Task 5内のfix round1回+plan全体の最終レビューのfix wave1回、全てレビュークリア):
 - `crates/polaris-core/src/compaction.rs`(新規): `session_tokens`・`should_compact`・`cut_index`・`compact`
 - `agent::run_loop`への組み込み(閾値チェック→圧縮→`AgentEvent::HistoryCompacted`送出)、`run_loop`のシグネチャは無変更
 - `polaris-tui`: 通知行の表示(`render.rs`)、`/compact`手動コマンド(`slash.rs`+`lib.rs`の2箇所のディスパッチ地点)、ターン完了後の`persist::rewrite`による`/resume`との整合
 
-**タスク実行中に見つかった計画の穴・最終レビューでの指摘、いずれも同一SDD実行内で解消**:
+**タスク実行中に見つかった計画の穴、同一SDD実行内で解消**:
 - Task 1: ブリーフのimport文がテスト専用の`ToolCall`を無条件importにしていて非テストビルドでunused importになる件 → `#[cfg(test)]`で解決
 - Task 2: ブリーフのテスト文中の自己参照パス(`polaris_core::`→`crate::`)、および`"x".repeat(N)`が単純文字の繰り返しでトークナイザに強く圧縮される(`*5`では閾値を超えなかった)件 → `*10`に修正、実測で裏付け
-- 最終レビュー(fix round 1、コミット`2c9f9c9`→`652708f`): (a) `/compact`が末尾に空白等が付いた入力で無反応になる(ディスパッチ地点が2箇所あるうち1箇所しか埋めていなかった)→ 2箇所目にもハンドラを追加。(b) 既存のロールバック機構(`checkpoint`)が、ターン中盤でのcompaction発火によって古くなり、ロールバックがサイレントに無効化されうる潜在バグ(compaction機能が新たに到達可能にした)→ `checkpoint`をcompactionの前後件数差分だけ調整する形で解消、再レビューで算術を独立に再導出し正しさを確認済み
+- Task 5内のfix round(コミット`2c9f9c9`→`652708f`): (a) `/compact`が末尾に空白等が付いた入力で無反応になる(ディスパッチ地点が2箇所あるうち1箇所しか埋めていなかった)→ 2箇所目にもハンドラを追加。(b) 既存のロールバック機構(`checkpoint`)が、ターン中盤でのcompaction発火によって古くなり、ロールバックがサイレントに無効化されうる潜在バグ(compaction機能が新たに到達可能にした)→ `checkpoint`をcompactionの前後件数差分だけ調整する形で解消、再レビューで算術を独立に再導出し正しさを確認済み
 
-**検証**: `cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。`docs/filemap.md`もこのspec・plan追加に伴い再生成した。閾値を一時的に500へ下げた実地確認(tmux)は、このセッションの実行環境でtmuxペインへのキー入力が実際には処理されない不具合(polaris自体の問題ではなく環境側の制約)に阻まれ完了できなかった——自動テスト(`agent.rs`の`run_loop`統合テストが実プロバイダを模したモックで圧縮の発火・履歴の置き換えを検証済み、`lib.rs`の`handle_compact`テストが永続化の往復を実際のファイルI/Oで検証済み)による確証にとどまる。実際のCodexバックエンドに対する自動発火の実地確認は未実施のまま残っている。
+**plan全体の最終レビュー(Opus、範囲`dc92cfd..f8ad13b`)** で1件のCriticalと5件のImportantが見つかった。Criticalは、`checkpoint`と全く同じ形でもう1つ存在した`session.messages`へのローカルなインデックス`printed_messages`(画面へ描画済みの範囲を追う)がcompaction発火後に調整されておらず、compactionが起きるたびに画面の巻き戻し表示(履歴・ヘッダーごと消える、応答が表示されない、表示がずれる、のいずれか)が発生する不具合——Task 5のfix roundが`checkpoint`だけを直して`printed_messages`を見落としていた。Important 5件は: 要約呼び出し自体が失敗するとセッションが`/clear`するまで恒久的に壊れる(`?`で伝播していた)、要約が空文字列で返ると履歴が消える、`/compact`実行中に画面が固まって見える(進捗表示が無い)、圧縮後の直近ターンだけで再び閾値を超える病的ケースでspecの「無限ループしない」という説明自体が誤り(実際は要約の要約を毎ターン繰り返す)、README の`/compact`関連記述が実装と食い違ったまま。1回のfix wave(コミット`80e29c5`)で全て解消、スコープ付き再レビューでADDRESSED確認済み(Criticalの修正は再レビュアーが独自に新規テスト3種を「調整を外したら本当に落ちるか」まで追跡)。残った1件のMinor(doc comment未更新)はコントローラーが直接修正(`bd1d8d8`)。`/resume`ピッカーのプレビューが圧縮後は毎回同じ文言になる件(Important、コード修正だが規模が中程度)は今回のfix waveでは対応せず先送り、下記「次の一手」参照。台帳は`.superpowers/sdd/2026-08-26-polaris-history-compaction/progress.md`に残っている(未削除、finishing-a-development-branch完了後に削除予定)。
+
+**検証**: `cargo test --workspace`(全緑、最終レビューのfix wave後の新規テスト込み)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。`docs/filemap.md`もこのspec・plan追加に伴い再生成した。閾値を一時的に500へ下げた実地確認(tmux)は、このセッションの実行環境でtmuxペインへのキー入力が実際には処理されない不具合(polaris自体の問題ではなく環境側の制約)に阻まれ完了できなかった——自動テスト(`agent.rs`の`run_loop`統合テストが実プロバイダを模したモックで圧縮の発火・履歴の置き換えを検証済み、`lib.rs`の`handle_compact`テストが永続化の往復を実際のファイルI/Oで検証済み、最終レビューのfix waveで追加した`printed_messages`調整の回帰テスト3種が調整を外すと実際に落ちることまで再レビューで追跡済み)による確証にとどまる。実際のCodexバックエンドに対する自動発火の実地確認は未実施のまま残っている。
 
 ## マイルストーン
 
@@ -503,15 +505,16 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-26、会話履歴の自動圧縮(compaction)のSDD実行(全6タスク+最終レビューのfix wave1回)が完了し、ワークスペース全体の検証まで済んだ直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
+本節は2026-08-26、会話履歴の自動圧縮(compaction)のSDD実行(全6タスク+Task 5内fix round+plan全体の最終レビューのfix wave)が完了し、ワークスペース全体の検証まで済んだ直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
 
 優先度順:
 
-1. **reasoning item保持・compactionを含む29件のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`652708f`(reasoning item保持一式+compaction一式)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
+1. **reasoning item保持・compactionを含む30件超のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`bd1d8d8`(reasoning item保持一式+compaction一式)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
 2. **compactionの実機での自動発火を実地確認する。** 今回のセッションではtmux操作が環境側の制約で機能せず未実施。自動テストでの検証にとどまっている(上の「会話履歴の自動圧縮」節参照)
-3. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-history-compaction/`(台帳・brief・reportなど)は削除済み(finishing-a-development-branch完了に伴う)
-4. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
-5. **`/model`切り替え後にreasoning replayが失敗しないかの実地確認**(上の「reasoning item保持」節末尾)。壊れている証拠は無い、優先度は低い
+3. **`/resume`ピッカーのプレビューが圧縮後は毎回同じ文言になる件。** 最終レビューのImportant指摘だが、`sessions.rs`という今回のplanが触れていないファイルに及ぶため今回のfix waveでは対応せず先送りした(上の「会話履歴の自動圧縮」節参照)。データを壊すものではない
+4. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-history-compaction/`(台帳・brief・reportなど)は削除済み(finishing-a-development-branch完了に伴う)
+5. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
+6. **`/model`切り替え後にreasoning replayが失敗しないかの実地確認**(上の「reasoning item保持」節末尾)。壊れている証拠は無い、優先度は低い
 
 そのうえで v1.0.0 のタグ付けの判断へ進む。
 

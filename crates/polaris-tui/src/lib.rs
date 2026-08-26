@@ -2598,7 +2598,7 @@ mod tests {
         let after_first = history.len();
         assert!(after_first > 0);
 
-        session.push_assistant("reply");
+        session.push_assistant("reply", Vec::new());
         append_new_history(
             &session,
             &[],
@@ -2627,7 +2627,7 @@ mod tests {
     fn append_new_history_self_corrects_when_the_session_shrinks() {
         let mut session = polaris_core::session::Session::default();
         session.push_user("first");
-        session.push_assistant("reply");
+        session.push_assistant("reply", Vec::new());
         let mut printed_messages = 0;
         let mut printed_local_lines = 0;
         let mut history = Vec::new();
@@ -3384,7 +3384,7 @@ mod tests {
         // wires the wrong session into `copy_last_reply_with`, fails this.
         let mut session = Session::default();
         session.push_user("hi");
-        session.push_assistant("the answer is 4");
+        session.push_assistant("the answer is 4", Vec::new());
         let mut status = Status::Idle;
 
         apply_copy_action(&session, &mut status, |text| {
@@ -3401,7 +3401,7 @@ mod tests {
     #[test]
     fn apply_copy_action_reports_a_failing_copy() {
         let mut session = Session::default();
-        session.push_assistant("reply");
+        session.push_assistant("reply", Vec::new());
         let mut status = Status::Idle;
 
         apply_copy_action(&session, &mut status, |_| Err("no tty".to_string()));
@@ -3435,7 +3435,7 @@ mod tests {
     fn export_writes_the_conversation_as_markdown() {
         let mut session = Session::default();
         session.push_user("what does this repo do?");
-        session.push_assistant("it's a coding agent");
+        session.push_assistant("it's a coding agent", Vec::new());
         let mut status = Status::Idle;
         let dir = tempfile::tempdir().expect("temp dir");
         let session_path = dir.path().join("session.jsonl");
@@ -3492,7 +3492,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut session = Session::default();
         session.push_user("hello");
-        session.push_assistant("hi there");
+        session.push_assistant("hi there", Vec::new());
         let old_path = dir.path().join("old.jsonl");
         persist::append_message(&old_path, &session.messages[0]).expect("seed old file");
         let mut session_path = old_path.clone();

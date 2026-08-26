@@ -2388,7 +2388,7 @@ mod tests {
     #[test]
     fn a_message_with_a_raw_escape_byte_does_not_reach_the_terminal_buffer() {
         let mut session = Session::default();
-        session.push_assistant("\x1b[31mfake red\x1b[0m");
+        session.push_assistant("\x1b[31mfake red\x1b[0m", Vec::new());
 
         let content = render_history_to_string(&session.messages, 60);
         assert!(!content.chars().any(|c| c == '\u{1b}'));
@@ -2777,7 +2777,10 @@ mod tests {
     #[test]
     fn a_multi_line_reply_renders_as_multiple_lines_not_one_clipped_line() {
         let mut session = Session::default();
-        session.push_assistant("first paragraph\nsecond paragraph\nthird paragraph");
+        session.push_assistant(
+            "first paragraph\nsecond paragraph\nthird paragraph",
+            Vec::new(),
+        );
 
         let lines = history_lines_for(&session.messages);
         let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
@@ -2837,9 +2840,10 @@ mod tests {
                 name: "read".into(),
                 arguments: serde_json::json!({"path": "a.txt"}),
             }],
+            Vec::new(),
         );
         session.push_tool_result("c1", "hello from the tool");
-        session.push_assistant("a.txt contains a greeting");
+        session.push_assistant("a.txt contains a greeting", Vec::new());
 
         let content = render_history_to_string(&session.messages, 60);
         assert!(
@@ -2864,6 +2868,7 @@ mod tests {
                 name: "read".into(),
                 arguments: serde_json::json!({"path": "a.txt"}),
             }],
+            Vec::new(),
         );
         session.push_tool_result("c1", "1\tfirst line\n2\tsecond line\n");
 
@@ -2886,7 +2891,7 @@ mod tests {
     #[test]
     fn bold_text_is_rendered_with_the_bold_modifier() {
         let mut session = Session::default();
-        session.push_assistant("this is **bold** text");
+        session.push_assistant("this is **bold** text", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
@@ -2917,7 +2922,7 @@ mod tests {
     #[test]
     fn a_fenced_code_block_uses_the_code_text_color_not_a_background() {
         let mut session = Session::default();
-        session.push_assistant("```\nfn main() {}\n```");
+        session.push_assistant("```\nfn main() {}\n```", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let code_line = lines
@@ -2941,7 +2946,7 @@ mod tests {
     #[test]
     fn inline_code_and_surrounding_text_both_render_without_the_backticks() {
         let mut session = Session::default();
-        session.push_assistant("run `cargo test` now");
+        session.push_assistant("run `cargo test` now", Vec::new());
 
         let content = render_history_to_string(&session.messages, 60);
         assert!(content.contains("cargo test"));
@@ -2965,7 +2970,7 @@ mod tests {
     #[test]
     fn a_level_1_heading_strips_the_hash_and_renders_bold() {
         let mut session = Session::default();
-        session.push_assistant("# Title");
+        session.push_assistant("# Title", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         assert_eq!(lines.len(), 1);
@@ -2990,7 +2995,7 @@ mod tests {
     fn heading_levels_2_through_6_all_strip_their_hashes() {
         let mut session = Session::default();
         for level in 2..=6 {
-            session.push_assistant(&format!("{} h{level}", "#".repeat(level)));
+            session.push_assistant(&format!("{} h{level}", "#".repeat(level)), Vec::new());
         }
 
         let lines = history_lines_for(&session.messages);
@@ -3003,7 +3008,7 @@ mod tests {
     #[test]
     fn a_bold_span_inside_a_heading_is_still_bold_and_the_markers_are_gone() {
         let mut session = Session::default();
-        session.push_assistant("## has **emphasis** inside");
+        session.push_assistant("## has **emphasis** inside", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let text: String = lines[0]
@@ -3026,7 +3031,7 @@ mod tests {
     #[test]
     fn a_hash_without_a_following_space_is_not_a_heading() {
         let mut session = Session::default();
-        session.push_assistant("#nothashheading");
+        session.push_assistant("#nothashheading", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let text: String = lines[0]
@@ -3048,7 +3053,7 @@ mod tests {
     #[test]
     fn a_hash_inside_a_code_block_is_not_treated_as_a_heading() {
         let mut session = Session::default();
-        session.push_assistant("```\n# not a heading\n```");
+        session.push_assistant("```\n# not a heading\n```", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let inside = lines
@@ -3072,7 +3077,7 @@ mod tests {
     #[test]
     fn a_top_level_bullet_renders_with_a_bullet_marker_and_no_dash() {
         let mut session = Session::default();
-        session.push_assistant("- first item");
+        session.push_assistant("- first item", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let text: String = lines[0]
@@ -3087,7 +3092,7 @@ mod tests {
     #[test]
     fn a_star_bullet_also_renders_with_a_bullet_marker() {
         let mut session = Session::default();
-        session.push_assistant("* first item");
+        session.push_assistant("* first item", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let text: String = lines[0]
@@ -3102,7 +3107,7 @@ mod tests {
     #[test]
     fn a_nested_bullet_keeps_its_leading_indentation() {
         let mut session = Session::default();
-        session.push_assistant("top\n  - nested item");
+        session.push_assistant("top\n  - nested item", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         assert_eq!(lines.len(), 2);
@@ -3118,7 +3123,7 @@ mod tests {
     #[test]
     fn a_dash_inside_a_code_block_is_not_treated_as_a_bullet() {
         let mut session = Session::default();
-        session.push_assistant("```\n- not a bullet\n```");
+        session.push_assistant("```\n- not a bullet\n```", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let inside = lines
@@ -3144,7 +3149,7 @@ mod tests {
         // them.
         let mut session = Session::default();
         session.push_user("hello");
-        session.push_assistant("hi there");
+        session.push_assistant("hi there", Vec::new());
 
         let lines = history_lines_for(&session.messages);
         let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(

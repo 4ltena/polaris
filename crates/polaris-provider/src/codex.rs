@@ -43,6 +43,14 @@ pub fn input_items(messages: &[Message]) -> Vec<Value> {
                 "content": [{ "type": "input_text", "text": m.content }],
             })),
             Role::Assistant => {
+                for r in &m.reasoning {
+                    out.push(serde_json::json!({
+                        "type": "reasoning",
+                        "id": r.id,
+                        "summary": [],
+                        "encrypted_content": r.encrypted_content,
+                    }));
+                }
                 // A turn with empty body text and only tool calls isn't
                 // unusual. Adding an empty message would just pile up
                 // content-free utterances in the history.
@@ -811,6 +819,35 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[1]["type"], "function_call");
+    }
+
+    #[test]
+    fn a_turn_with_reasoning_emits_it_before_the_message_and_calls() {
+        let items = input_items(&[Message::assistant_with_tool_calls(
+            "I'll read it",
+            vec![ToolCall {
+                id: "c".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }],
+        )
+        .with_reasoning(vec![crate::ReasoningItem {
+            id: "r1".into(),
+            encrypted_content: "opaque".into(),
+        }])]);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["type"], "reasoning");
+        assert_eq!(items[0]["id"], "r1");
+        assert_eq!(items[0]["encrypted_content"], "opaque");
+        assert_eq!(items[1]["type"], "message");
+        assert_eq!(items[2]["type"], "function_call");
+    }
+
+    #[test]
+    fn a_turn_without_reasoning_emits_no_reasoning_item() {
+        let items = input_items(&[Message::assistant("yes")]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
     }
 
     #[test]

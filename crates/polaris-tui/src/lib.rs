@@ -2189,7 +2189,8 @@ fn apply_slash_action(
         | slash::Action::Permissions
         | slash::Action::Fork
         | slash::Action::Model
-        | slash::Action::Skills => {
+        | slash::Action::Skills
+        | slash::Action::Compact => {
             // Never reached: `run()` recognizes all of these before
             // dispatch — `Review` expands into a normal model turn;
             // `New`/`Resume`/`Fork` are handled by

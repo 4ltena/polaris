@@ -12,8 +12,8 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `4a43c48`）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル2コミット(`235ec5d` プロンプトキャッシュ改善、`4a43c48` v0.7.0 CHANGELOG追加)と`v0.7.0`タグ(ローカルのみ)は**利用者の指示で意図的に未push** |
-| 進行中の計画 | プロンプトキャッシュ利用率の改善。コード・CHANGELOG・`v0.7.0`タグまで完了（詳細は専用節）。A/B実測と、`Folder::take_item`が`reasoning` itemを捨てている件の扱いが未了。計画書は起こしていない。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
+| ブランチ | `main`（HEAD `6601f02`）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル15コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`(プロンプトキャッシュ改善+CHANGELOG修正)を指しており、それより後のreasoning item保持の6コミット(`dcfe7b9`〜`6601f02`)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
+| 進行中の計画 | なし。プロンプトキャッシュ利用率の改善(`v0.7.0`)、reasoning item保持(spec・plan・SDD実行6タスク、詳細は専用節)ともに完了・ワークスペース全体で検証済み。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
 | 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
 | 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md`、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress-design.md`、`docs/superpowers/specs/2026-08-25-polaris-tui-fullscreen-scroll-design.md` |
@@ -44,11 +44,9 @@ polaris 側は TUI の累積カウンタで、同一セッションの前ター�
 
 codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割台で安定する形になっていた。1回目 12.6%、2回目 97.6%、3回目 77.9%、4回目 98.0%、5回目 93.6% である。polaris の 31.1% はこの形になっていない。なお codex は初回リクエストだけで input 46,566 トークンを送っており、これがツールを1つも呼ぶ前の常時コンテキストの床にあたる。polaris の同じ床は547である。
 
-### 併せて判明したこと
+### 併せて判明したこと(実装済み)
 
-`Folder::take_item` は `reasoning` item を `_ => {}` で捨てており、`Message` 型にも保持する場所が無い。一方 codex は rollout に `reasoning` item を `encrypted_content` ごと5件残していた。polaris は `include` で要求しながら受け取ったものを回収していない。
-
-ただしキャッシュ率の主因ではない。`include` を on にするだけで2リクエスト目に 8,014 中 7,680 という実測がコード内コメントに残っている。ツール呼び出しを跨いだ推論の連続性の問題として、別に扱う。
+`Folder::take_item` が `reasoning` item を `_ => {}` で捨て、`Message` 型にも保持する場所が無かった件は、2026-08-26中に別のspec・plan・SDD実行(下記「reasoning item保持」節)で解消済み。この節はその発見の経緯として残す。
 
 ### 検証
 
@@ -64,7 +62,24 @@ codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割�
 
 `run_loop`の合算バグ修正自体は、キャッシュ実測の結果に関わらず独立して正しい修正であり、そのまま維持する。`prompt_cache_key`送信と`include`常時化は害があるわけではない(前者はOpenAIの標準的なルーティング用ヒントで無視されても無害、後者はレスポンスサイズがわずかに増えるだけ)が、CHANGELOGにある「送らないと0%」という因果の強さは、今回の直接検証では裏付けが取れなかった。
 
-`Folder::take_item`が`reasoning` itemを`_ => {}`で捨てている件（下の「併せて判明したこと」）を設計変更として進める根拠も、この結果を受けて再検討が要る——キャッシュがそもそも`include`無しでも9割台に達するなら、`reasoning` item保持によって埋めようとしていた「ツール呼び出しを跨いだ連続性」の欠落が、優先して手を付けるべき問題かどうかが不確かになった。
+`Folder::take_item`が`reasoning` itemを`_ => {}`で捨てている件（上の「併せて判明したこと」）を設計変更として進める根拠は、この結果を受けて一度弱まった——キャッシュがそもそも`include`無しでも9割台に達するなら、`reasoning` item保持によって埋めようとしていた「ツール呼び出しを跨いだ連続性」の欠落が、優先して手を付けるべき問題かどうかが不確かになった。それでも利用者の判断で、動機を「キャッシュ効率」から「upstream `codex-rs`との一致度」へ切り替えたうえで、下記の通り実装まで進めた。
+
+## reasoning item保持(2026-08-26、実装完了)
+
+`docs/superpowers/specs/2026-08-26-polaris-codex-reasoning-continuity-design.md`(spec)・`docs/superpowers/plans/2026-08-26-polaris-codex-reasoning-continuity.md`(6タスクplan)をbrainstorming→writing-plansスキルで作成し、subagent-driven-developmentで実行した。
+
+**設計の根拠**: upstream `codex-rs`の`core/src/client.rs`を読み、非Azure(polarisと同じChatGPTサブスク経路)では`store`が常に`false`で、`reasoning` itemも他の履歴itemと同様セッション全体を通じて保持・再送される(特別な有効期限は無い)ことを確認した上で設計した。動機はキャッシュ効率ではなく、upstreamとの一致度。
+
+**実装内容**(コミット`dcfe7b9`〜`6601f02`、6タスク全て個別レビュークリア):
+- `ReasoningItem { id, encrypted_content }`型と`Message.reasoning`/`CompletionResponse.reasoning`フィールド(`crates/polaris-provider/src/lib.rs`)
+- `Folder::take_item`が`"reasoning"` typeのSSE itemを捕捉(`crates/polaris-provider/src/codex.rs`)
+- `input_items`が次のターンでreasoning itemをワイヤへ再送(同ファイル)
+- `Session::push_assistant`/`push_assistant_tool_calls`のシグネチャ変更・`agent::run_loop`の配線(`crates/polaris-core/src/session.rs`/`agent.rs`)
+- `openai.rs`側は無視することを確認する回帰テストのみ(実装変更なし)
+
+**タスク実行中に見つかった計画の穴**: plan策定時の事前呼び出し元調査が`crates/polaris-core/src`のみに絞られており、`crates/polaris-tui`のテストコード内に同じ2関数を呼ぶ箇所が30件(すべて`#[cfg(test)]`内)あることを見落としていた。Task 4完了直後に`cargo check --workspace --all-targets`で30件のE0061としてmainが一時的にビルド不能になったが、未計画の修正タスク(空の`Vec::new()`引数を機械的に追加、コミット`ec1ccea`)で即座に復旧し、スコープ付きレビューで確認済み。台帳は`.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/progress.md`に残っている(未削除、下記「次の一手」参照)。
+
+**検証**: `cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。加えて実際のCodexバックエンドに対しrelease buildで4往復の`exec`を実行し、エラー無く完走することを確認した(2026-08-26)。`docs/filemap.md`もこのspec・plan追加に伴い再生成済み(`UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap`、コミット`5100c08`)。
 
 ## マイルストーン
 
@@ -464,14 +479,13 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-26、プロンプトキャッシュ修正のA/B実測を終えた直後に書き直した。実測結果は「プロンプトキャッシュの利用率」節を見よ——`fca96c4`(修正前)でも3ターン目以降93〜97%命中しており、当初の「送らないと0%」という前提は今回の検証では再現できなかった。`v0.6.0`はorigin push済み。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
+本節は2026-08-26、reasoning item保持のSDD実行(全6タスク+未計画の修正1件)が完了し、ワークスペース全体の検証・実地確認まで済んだ直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。CHANGELOGの`v0.7.0`エントリにあった因果の強さの見直しは`60bdebe`で完了済み(前回のこの節にあった項目)。
 
 優先度順:
 
-1. **`reasoning` item保持(`Folder::take_item`の欠落)に着手するかどうかを利用者と決める。** A/B実測がキャッシュ不全を裏付けなかったため、この設計変更の動機が当初より弱まっている。着手前に、そもそもの問題(ツール呼び出しを跨いだ推論連続性)が実害として観測されているかを別途確認すべき
-2. **CHANGELOGの`v0.7.0`エントリにある因果の強さの見直しを検討する。** 「includeを送らないとキャッシュに一切書き込まれない」という記述は今回の直接検証と食い違う。実測値そのものは書き換えず、現状の再現不能を別途記録するか、書きぶりを弱めるかを利用者に確認する
-3. **`v0.7.0`分の`git push`(main分2コミット・`v0.7.0`タグ分)の実施を利用者に確認する。** タグ・CHANGELOGは確定済みだが、push自体はまだ明示的な承認を得ていない
-4. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
+1. **reasoning item保持を含む15件のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`6601f02`(spec・plan・6タスク+修正1件)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
+2. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/`(台帳・brief・reportなど)は、finishing-a-development-branchスキルまで完了した時点で削除してよい(git管理外)
+3. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
 
 そのうえで v1.0.0 のタグ付けの判断へ進む。
 

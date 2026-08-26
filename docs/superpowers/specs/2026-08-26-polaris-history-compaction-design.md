@@ -185,7 +185,33 @@ pub enum AgentEvent {
 
 ### 5. TUI側の永続化再同期・`/compact`コマンド(`crates/polaris-tui/src/lib.rs`)
 
-`events_rx`受信ループ(lib.rs:1267)と、ターン終了直前のtry_recvドレイン(lib.rs:1541)の両方——`append_live_event`を呼んでいる箇所——で、受け取ったイベントが`AgentEvent::HistoryCompacted`のときだけ追加で`persist::rewrite(&session_path, &session.messages)`を呼ぶ。既存の`/clear`が`persist::clear_session`を呼ぶのと同じ扱い。`polaris-cli`(exec)はそもそも永続化しないため、この呼び出しはTUI側だけに置く。
+`events_rx`受信ループ(lib.rs:1267)の時点では`agent_future`が`session`を可変借用中のため、その場で`session.messages`へは触れられない(借用チェッカーに落ちる)。そこで直接`persist::rewrite`は呼ばず、ターンの外側スコープに`let mut history_compacted_this_turn = false;`を用意し、`events_rx`受信ループ・ターン終了直前のtry_recvドレイン(lib.rs:1541)の両方で、受け取ったイベントが`AgentEvent::HistoryCompacted`のときだけこのフラグを立てる(`append_live_event`自体は変更しない——既存通りイベント種別を問わず呼ぶ):
+
+```rust
+if matches!(event, polaris_core::AgentEvent::HistoryCompacted { .. }) {
+    history_compacted_this_turn = true;
+}
+```
+
+ターンが完了し`session`へ安全に触れられる`TurnOutcome::Done(Ok(result))`の分岐(lib.rs:1551、既存の`persist::append_message`呼び出しのすぐ隣)で、このフラグを見て分岐する:
+
+```rust
+if history_compacted_this_turn {
+    if let Err(e) = persist::rewrite(&session_path, &session.messages) {
+        fatal_message = Some(format!("Can't persist the compacted session: {e}"));
+        break 'outer ExitCode::FAILURE;
+    }
+} else if let Some(reply) = session.messages.last()
+    && let Err(e) = persist::append_message(&session_path, reply)
+{
+    fatal_message = Some(format!("Can't persist the reply: {e}"));
+    break 'outer ExitCode::FAILURE;
+}
+```
+
+`rewrite`は`session.messages`全体(圧縮後の要約+直近ターン+今回の応答)を書き込むため、通常の`append_message`と同時には呼ばない。既存の`/clear`が`persist::clear_session`を呼ぶのと同じ「全体書き換え」の扱い。`polaris-cli`(exec)はそもそも永続化しないため、この呼び出しはTUI側だけに置く。
+
+既知の限界: `TurnOutcome::Done(Err(e))`等、圧縮の直後にターン自体が失敗した経路では`history_compacted_this_turn`を見ていない——ディスク上のログは次に成功するターンか、明示的な`/compact`・`/clear`まで圧縮前の内容のまま残る。メモリ上の`session`自体は正しく圧縮済みのため実害は無いが、その間に`/resume`すると圧縮前の状態が読み込まれる。今回のscopeでは許容する。
 
 新規スラッシュコマンド`/compact`: 既存のコマンド分岐に追加し、上限に関係なく`compaction::compact(...)`を直接呼ぶ。閾値未満で呼んだ場合(`cut_index`が0を返す=直近ターンしかない)は「圧縮するものがありません」のような案内を出す。
 

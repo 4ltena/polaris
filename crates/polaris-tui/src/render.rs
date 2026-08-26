@@ -922,6 +922,43 @@ pub const HEADER_HEIGHT: u16 = 7;
 /// scrollable history region above it can.
 pub const MAX_DISPLAYED_SUGGESTIONS: usize = 8;
 
+/// How many rows the suggestions popup alone needs for `suggestion_count`
+/// live matches — `0` when there are none (the popup collapses away
+/// entirely), otherwise the shown rows (capped at
+/// `MAX_DISPLAYED_SUGGESTIONS`) plus one row for the popup's own top
+/// border, plus one more when the match count is truncated (the "+N more,
+/// keep typing" row). Factored out of `render_footer` so `footer_height`
+/// (below) can share the exact same computation instead of an
+/// independently maintained copy that could silently drift from what
+/// `render_footer` actually lays out.
+fn suggestions_popup_height(suggestion_count: usize) -> u16 {
+    if suggestion_count == 0 {
+        return 0;
+    }
+    let shown = suggestion_count.min(MAX_DISPLAYED_SUGGESTIONS);
+    let truncated = suggestion_count > MAX_DISPLAYED_SUGGESTIONS;
+    shown as u16 + 1 + u16::from(truncated)
+}
+
+/// The footer region's total height for `suggestion_count` live
+/// suggestions — the dynamic replacement for the old fixed `FOOTER_HEIGHT`
+/// constant. `draw_frame` (`lib.rs`) calls this every frame to size its
+/// `Constraint::Length` split, so the footer only ever claims as many rows
+/// as it actually needs this frame (5, the common case with no popup
+/// showing) rather than a worst-case reservation that left a permanent
+/// blank gap above it whenever the popup wasn't at its maximum. The same
+/// four mouse-event handler sites that independently recompute
+/// `history_area`'s height outside the `draw()` closure (see
+/// `area_height_for_history` in `lib.rs`) call this too, so both stay in
+/// sync with what this frame's `render_footer` call actually renders.
+///
+/// Always `5 + suggestions_popup_height(suggestion_count)`: status(1) +
+/// suggestions popup + input pad-above(1) + input(1) + input
+/// pad-below(1) + footer/model-line(1).
+pub fn footer_height(suggestion_count: usize) -> u16 {
+    5 + suggestions_popup_height(suggestion_count)
+}
+
 /// Everything redrawn every frame: the suggestions popup (while typing a
 /// `/command`), the status row (idle / thinking-with-shimmer / error /
 /// notice), the input line, and the footer (`model effort · cwd`). This is
@@ -946,27 +983,22 @@ pub fn render_footer(
     let dim = Style::default().add_modifier(Modifier::DIM);
     // Zero height when there's nothing to show, so the layout collapses
     // back to the plain split the moment the input stops starting with
-    // `/` — this row only exists while it has content. `+1` for the extra
-    // "+N more" row once truncated.
+    // `/` — this row only exists while it has content. Shared with
+    // `footer_height` (see its doc) so the two can never disagree about
+    // how tall the popup is this frame.
     let shown = suggestions.len().min(MAX_DISPLAYED_SUGGESTIONS);
-    let truncated = suggestions.len() > MAX_DISPLAYED_SUGGESTIONS;
-    let suggestions_height = if suggestions.is_empty() {
-        0
-    } else {
-        shown as u16 + 1 + u16::from(truncated)
-    };
-    // `area` is `draw_frame`'s fixed-height `FOOTER_HEIGHT` reservation
-    // (sized for the worst case — the suggestions popup at its max),
-    // which is almost always taller than this frame's actual content
-    // (`suggestions_height` is usually 0). Without `Flex::End`, the
-    // default `Flex::Start` stacks these six rows at `area`'s *top* and
-    // leaves the unused remainder as blank space below the input box —
-    // pushing it up away from the terminal's real bottom edge. Anchoring
-    // to the end instead keeps the footer flush against the bottom
-    // regardless of how much of `area` this frame's content actually
-    // needs; the leftover space lands above `status_area` instead, where
-    // it's invisible (it's still inside `footer_area`, never overlapping
-    // `history_area`).
+    let suggestions_height = suggestions_popup_height(suggestions.len());
+    // `area` is `draw_frame`'s `footer_height(suggestions.len())`
+    // reservation — normally an exact fit for what this frame actually
+    // needs, but `Flex::End` is kept regardless: it costs nothing when
+    // `area` is already an exact fit, and it's what makes the standalone
+    // `the_input_row_reaches_the_true_bottom_of_the_footer_reservation`
+    // regression test meaningful (an artificially oversized `area`, to
+    // pin down this bottom-anchoring behavior independent of how
+    // `draw_frame` sizes the area it passes in). Without it, the default
+    // `Flex::Start` would stack these six rows at `area`'s *top* and leave
+    // any leftover as blank space below the input box instead of above
+    // `status_area`.
     let [
         status_area,
         suggestions_area,
@@ -1823,20 +1855,55 @@ mod tests {
 
     /// Regression test for the input box sitting well above the terminal's
     /// real bottom edge whenever the suggestions popup isn't showing (the
-    /// common case): `draw_frame` always reserves `crate::FOOTER_HEIGHT`
-    /// rows for the footer — sized for the worst case, the popup at its
-    /// max — so this frame's actual content (5 rows, no suggestions) is
-    /// much shorter than the area it's given. Without `Flex::End`, that
-    /// leftover space landed *below* the input row instead of above it.
+    /// common case): given an area taller than what this frame's content
+    /// actually needs (5 rows, no suggestions — an artificially oversized
+    /// area, standing in for whatever `draw_frame` might hand it), the
+    /// content must still anchor to the bottom rather than the top. This
+    /// tests `render_footer`'s own `Flex::End` behavior in isolation —
+    /// unrelated to how `draw_frame` sizes the area it passes in, which is
+    /// `footer_height`'s job (see the tests below).
     #[test]
     fn the_input_row_reaches_the_true_bottom_of_the_footer_reservation() {
-        let pos = render_footer_cursor_position("", 0, 80, crate::FOOTER_HEIGHT);
+        let oversized_area_height = 20;
+        let pos = render_footer_cursor_position("", 0, 80, oversized_area_height);
         // The five visible rows this content occupies — status,
         // pad-above, input, pad-below, footer (suggestions is empty) —
         // sit flush against the bottom of the reservation. Input is the
         // third of those five, so two rows up from the very last one, not
         // stranded near the top.
-        assert_eq!(pos.y, crate::FOOTER_HEIGHT - 3);
+        assert_eq!(pos.y, oversized_area_height - 3);
+    }
+
+    // `footer_height` must mirror `render_footer`'s own internal
+    // `suggestions_height` computation exactly (see its doc comment) —
+    // these pin down the exact expected totals for four representative
+    // suggestion counts, derived from `render_footer`'s actual formula
+    // (`shown + 1 + u16::from(truncated)`), not hand-guessed:
+    //   n=0:  suggestions_height=0                         -> 5 + 0  = 5
+    //   n=1:  shown=1, truncated=false -> 1+1+0=2           -> 5 + 2  = 7
+    //   n=8:  shown=8, truncated=false -> 8+1+0=9           -> 5 + 9  = 14
+    //   n=11: shown=8, truncated=true  -> 8+1+1=10          -> 5 + 10 = 15
+    // The `n=8` case landing on exactly 14 confirms this matches the old
+    // fixed `FOOTER_HEIGHT` constant's own worst-case sizing at exactly
+    // `MAX_DISPLAYED_SUGGESTIONS` suggestions.
+    #[test]
+    fn footer_height_with_no_suggestions_is_just_the_five_fixed_rows() {
+        assert_eq!(footer_height(0), 5);
+    }
+
+    #[test]
+    fn footer_height_with_one_suggestion_adds_the_row_plus_its_border() {
+        assert_eq!(footer_height(1), 7);
+    }
+
+    #[test]
+    fn footer_height_at_the_display_cap_reserves_every_row_with_no_more_row() {
+        assert_eq!(footer_height(MAX_DISPLAYED_SUGGESTIONS), 14);
+    }
+
+    #[test]
+    fn footer_height_past_the_cap_adds_one_more_row_for_the_truncation_notice() {
+        assert_eq!(footer_height(MAX_DISPLAYED_SUGGESTIONS + 3), 15);
     }
 
     #[test]

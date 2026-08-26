@@ -341,6 +341,7 @@ impl Provider for OpenAiProvider {
         Ok(CompletionResponse {
             text,
             tool_calls,
+            reasoning: Vec::new(),
             usage,
         })
     }

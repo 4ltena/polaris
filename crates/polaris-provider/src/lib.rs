@@ -16,6 +16,18 @@ pub enum Role {
     Tool,
 }
 
+/// A `reasoning` item as returned by the Responses API. `encrypted_content`
+/// is opaque server-encrypted state — polaris never reads it, only replays
+/// it verbatim on the next turn so the backend can resume the same chain
+/// of thought across tool calls. Codex-provider-specific; `openai.rs`
+/// (Chat Completions) has no equivalent concept and simply never populates
+/// this.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReasoningItem {
+    pub id: String,
+    pub encrypted_content: String,
+}
+
 /// A single message in the history. `tool_calls` is non-empty only when an
 /// assistant turn called a tool, and `tool_call_id` is carried only by a
 /// tool-result message. Both stay empty for an ordinary user/assistant
@@ -28,6 +40,8 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning: Vec<ReasoningItem>,
 }
 
 impl Message {
@@ -37,6 +51,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning: Vec::new(),
         }
     }
 
@@ -46,6 +61,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning: Vec::new(),
         }
     }
 
@@ -62,6 +78,7 @@ impl Message {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            reasoning: Vec::new(),
         }
     }
 
@@ -72,7 +89,16 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            reasoning: Vec::new(),
         }
+    }
+
+    /// Attaches the reasoning items produced alongside this turn, so the
+    /// Codex provider can replay them on the next request. A no-op for
+    /// providers that don't carry the concept.
+    pub fn with_reasoning(mut self, reasoning: Vec<ReasoningItem>) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 }
 
@@ -163,6 +189,7 @@ pub struct Usage {
 pub struct CompletionResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    pub reasoning: Vec<ReasoningItem>,
     pub usage: Option<Usage>,
 }
 
@@ -254,6 +281,7 @@ mod tests {
                     name: "read".into(),
                     arguments: serde_json::json!({ "path": "src/main.rs" }),
                 }],
+                reasoning: Vec::new(),
                 usage: None,
             },
         });
@@ -328,6 +356,40 @@ mod tests {
         assert!(
             !matches!(ProviderError::Http("x".into()), ProviderError::Auth(_)),
             "Http matched Auth"
+        );
+    }
+
+    #[test]
+    fn a_message_with_reasoning_round_trips_through_json() {
+        let m = Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }],
+        )
+        .with_reasoning(vec![ReasoningItem {
+            id: "r1".into(),
+            encrypted_content: "opaque".into(),
+        }]);
+
+        let json = serde_json::to_value(&m).expect("should serialize");
+        assert_eq!(json["reasoning"][0]["id"], "r1");
+        assert_eq!(json["reasoning"][0]["encrypted_content"], "opaque");
+
+        let back: Message = serde_json::from_value(json).expect("should deserialize");
+        assert_eq!(back.reasoning.len(), 1);
+        assert_eq!(back.reasoning[0], m.reasoning[0]);
+    }
+
+    #[test]
+    fn a_message_without_reasoning_omits_the_field_from_json() {
+        let m = Message::user("hello");
+        let json = serde_json::to_value(&m).expect("should serialize");
+        assert!(
+            json.get("reasoning").is_none(),
+            "empty reasoning should be omitted, not serialized as []"
         );
     }
 }

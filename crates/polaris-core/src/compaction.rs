@@ -16,6 +16,18 @@ pub const COMPACTION_THRESHOLD: usize = 100_000;
 /// How many of the most recent user turns survive compaction verbatim.
 pub const KEEP_RECENT_USER_TURNS: usize = 2;
 
+/// The floor below which a prefix isn't worth summarizing. Without this,
+/// a pathologically large recent turn (see `compact`'s doc) leaves
+/// `cut_index` returning a small nonzero cut every subsequent call — after
+/// the first compaction, the summary message it inserts is itself
+/// `Role::User`, so the next cut lands right after it and `compact` would
+/// otherwise re-summarize just that previous summary by itself, every
+/// turn: a wasted provider round-trip, a bogus
+/// `messages_before == messages_after` notice, and an unnecessary
+/// prompt-cache invalidation, repeating until the real oversized tail
+/// shrinks below threshold some other way.
+pub const MIN_TOKENS_TO_SUMMARIZE: usize = 1_000;
+
 const SUMMARIZE_INSTRUCTION: &str = "Summarize everything above as a \
     handoff for continuing this conversation. Cover: what the user \
     originally asked for, what has been done so far, decisions made and \
@@ -88,7 +100,7 @@ pub async fn compact(
     messages: &mut Vec<Message>,
 ) -> Result<Option<CompactionReport>, ProviderError> {
     let cut = cut_index(messages);
-    if cut == 0 {
+    if cut == 0 || session_tokens(&messages[..cut]) < MIN_TOKENS_TO_SUMMARIZE {
         return Ok(None);
     }
 
@@ -104,6 +116,15 @@ pub async fn compact(
             tools: vec![],
         })
         .await?;
+
+    // A provider response with empty (or whitespace-only) text would
+    // otherwise still overwrite the entire prefix with a near-empty
+    // summary, destroying that history irrecoverably — and the caller
+    // (`persist::rewrite`) would then write that loss to disk. Treat it
+    // like "nothing to compact this turn" instead.
+    if res.text.trim().is_empty() {
+        return Ok(None);
+    }
 
     let mut new_messages = vec![Message::user(format!("{SUMMARY_PREFIX}{}", res.text))];
     new_messages.extend_from_slice(&messages[cut..]);
@@ -244,9 +265,17 @@ mod tests {
 
     #[tokio::test]
     async fn compact_replaces_old_turns_with_one_summary_and_keeps_the_recent_tail() {
+        // "reply 1" alone is well under `MIN_TOKENS_TO_SUMMARIZE` (Fix
+        // 5a's floor guard) — inflated here so the summarized prefix
+        // actually clears the floor and this test still exercises a real
+        // compaction rather than tripping the new "not worth it" no-op.
+        // Single-char repeats compress ~8:1 under o200k_base (see
+        // `polaris-core::agent`'s own compaction test for the same note),
+        // so 10x the floor in characters comfortably clears it in tokens.
+        let big_reply = "x".repeat(MIN_TOKENS_TO_SUMMARIZE * 10);
         let mut messages = vec![
             user("turn 1"),
-            Message::assistant("reply 1"),
+            Message::assistant(big_reply),
             user("turn 2"),
             Message::assistant("reply 2"),
             user("turn 3"),
@@ -282,5 +311,89 @@ mod tests {
         assert!(report.is_none());
         assert_eq!(messages.len(), original.len());
         assert_eq!(messages[0].content, original[0].content);
+    }
+
+    /// Fix 5a's floor guard: `cut_index` alone can return a nonzero cut
+    /// for a prefix that's too small to be worth a whole provider
+    /// round-trip to summarize — the pathological case being the summary
+    /// message compaction itself inserts (`Role::User`), which after a
+    /// first compaction can make the *next* cut land right after it,
+    /// re-summarizing just that one small message every turn. `compact`
+    /// must skip a prefix under `MIN_TOKENS_TO_SUMMARIZE`, exactly like
+    /// the `cut == 0` no-op.
+    #[tokio::test]
+    async fn compact_is_a_no_op_when_the_prefix_to_summarize_is_below_the_floor() {
+        let mut messages = vec![
+            user("tiny turn 1"),
+            Message::assistant("tiny reply 1"),
+            user("turn 2"),
+            Message::assistant("reply 2"),
+            user("turn 3"),
+            Message::assistant("reply 3"),
+        ];
+        let original = messages.clone();
+        // `cut_index` alone returns a nonzero cut here (same shape as
+        // `cut_index_keeps_exactly_the_recent_user_turns`) — the floor
+        // guard is what must turn it into a no-op, not the cut itself.
+        assert_ne!(cut_index(&messages), 0);
+
+        let report = compact(&Summarizer, &mut messages)
+            .await
+            .expect("should succeed");
+
+        assert!(
+            report.is_none(),
+            "a prefix this small should be skipped as not worth summarizing"
+        );
+        assert_eq!(messages.len(), original.len());
+        for (m, o) in messages.iter().zip(original.iter()) {
+            assert_eq!(m.content, o.content);
+        }
+    }
+
+    /// Fix 3: an empty (or whitespace-only) summary response must not
+    /// overwrite the prefix it was meant to summarize — that would
+    /// destroy that history irrecoverably (and `persist::rewrite` would
+    /// then write the loss to disk).
+    struct EmptySummarizer;
+
+    #[async_trait::async_trait]
+    impl Provider for EmptySummarizer {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<polaris_provider::CompletionResponse, ProviderError> {
+            Ok(polaris_provider::CompletionResponse {
+                text: "   \n  ".to_string(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_leaves_messages_unchanged_when_the_summary_response_is_empty() {
+        let big_reply = "x".repeat(MIN_TOKENS_TO_SUMMARIZE * 10);
+        let mut messages = vec![
+            user("turn 1"),
+            Message::assistant(big_reply),
+            user("turn 2"),
+            Message::assistant("reply 2"),
+            user("turn 3"),
+            Message::assistant("reply 3"),
+        ];
+        let original = messages.clone();
+
+        let report = compact(&EmptySummarizer, &mut messages)
+            .await
+            .expect("should succeed");
+
+        assert!(
+            report.is_none(),
+            "a whitespace-only summary must not be treated as a real compaction"
+        );
+        assert_eq!(messages.len(), original.len());
+        for (m, o) in messages.iter().zip(original.iter()) {
+            assert_eq!(m.content, o.content);
+        }
     }
 }

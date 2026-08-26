@@ -318,17 +318,31 @@ pub(crate) async fn run_loop(
 
         let total_tokens = crate::budget::always_on_tokens(system, tools)
             + crate::compaction::session_tokens(&session.messages);
-        if crate::compaction::should_compact(total_tokens)
-            && let Some(report) =
-                crate::compaction::compact(provider, &mut session.messages).await?
-            && let Some(tx) = &events
-        {
-            let _ = tx.send(crate::events::AgentEvent::HistoryCompacted {
-                messages_before: report.messages_before,
-                messages_after: report.messages_after,
-                tokens_before: report.tokens_before as u32,
-                tokens_after: report.tokens_after as u32,
-            });
+        if crate::compaction::should_compact(total_tokens) {
+            match crate::compaction::compact(provider, &mut session.messages).await {
+                Ok(Some(report)) => {
+                    if let Some(tx) = &events {
+                        let _ = tx.send(crate::events::AgentEvent::HistoryCompacted {
+                            messages_before: report.messages_before,
+                            messages_after: report.messages_after,
+                            tokens_before: report.tokens_before as u32,
+                            tokens_after: report.tokens_after as u32,
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    // Compaction is a best-effort optimization the turn
+                    // doesn't depend on. A failure here (rate limit,
+                    // transient error) must not block the turn itself —
+                    // send this turn's full history rather than
+                    // permanently bricking every subsequent turn on the
+                    // same failure (session.messages stays over
+                    // COMPACTION_THRESHOLD, so without this every future
+                    // turn — including `/compact` itself — would retry
+                    // and fail the same way until `/clear`/`/new`).
+                }
+            }
         }
 
         let res = provider
@@ -794,6 +808,34 @@ mod tests {
             } else {
                 r.remove(0)
             })
+        }
+    }
+
+    /// A provider whose first `complete` call — the summarization call
+    /// `compaction::compact` makes internally — fails, and every call
+    /// after that succeeds with a scripted reply. Used to prove a
+    /// compaction failure doesn't propagate via `?` and block the turn
+    /// (see `a_failed_compaction_call_does_not_block_the_turn`).
+    struct FailsOnFirstCallThenSucceeds {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FailsOnFirstCallThenSucceeds {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            let mut calls = self.calls.lock().expect("lock");
+            *calls += 1;
+            if *calls == 1 {
+                Err(polaris_provider::ProviderError::Http("boom".into()))
+            } else {
+                Ok(CompletionResponse {
+                    text: "final reply".into(),
+                    ..Default::default()
+                })
+            }
         }
     }
 
@@ -2366,6 +2408,74 @@ print("wrote")
             session.messages[0]
                 .content
                 .contains("summary of turns before the kept tail")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_compaction_call_does_not_block_the_turn() {
+        // Same over-threshold setup as the test above, except the
+        // provider's summarization call itself fails. Before this fix, `?`
+        // propagated that `ProviderError` straight out of `run_loop`,
+        // failing the whole turn — and since `session.messages` is still
+        // over `COMPACTION_THRESHOLD` afterward, every subsequent turn
+        // (including `/compact` itself) would retry compaction and fail
+        // the same way, permanently bricking the conversation until
+        // `/clear`/`/new`. The turn must instead proceed with its
+        // still-oversized history rather than fail.
+        let dir = tempfile::tempdir().expect("temp directory");
+
+        let big = "x".repeat(crate::compaction::COMPACTION_THRESHOLD * 10);
+        let mut session = Session::new();
+        session.push_user("turn 1");
+        session.push_assistant(&big, vec![]);
+        session.push_user("turn 2");
+        session.push_assistant("reply 2", vec![]);
+        session.push_user("turn 3 — the new message that pushes it over");
+
+        let p = FailsOnFirstCallThenSucceeds {
+            calls: Mutex::new(0),
+        };
+
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let outcome = run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(events_tx),
+            &mut ctx,
+        )
+        .await
+        .expect("a failed compaction call must not fail the turn itself");
+
+        assert_eq!(outcome.text, "final reply");
+
+        // No compaction actually happened — session.messages keeps its
+        // original 5 entries plus the turn's own new reply, and the first
+        // message is still the original "turn 1", not a summary.
+        assert_eq!(session.messages.len(), 6);
+        assert_eq!(session.messages[0].content, "turn 1");
+
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no HistoryCompacted event should have been sent for a failed compaction"
         );
     }
 

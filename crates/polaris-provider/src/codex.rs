@@ -273,6 +273,7 @@ impl Folder {
         Ok(CompletionResponse {
             text: self.text,
             tool_calls: self.tool_calls,
+            reasoning: Vec::new(),
             usage: self.usage,
         })
     }

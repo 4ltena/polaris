@@ -219,7 +219,7 @@ if history_compacted_this_turn {
 
 - 要約リクエスト自体の失敗は`run_loop`の通常のターン失敗として伝播する(上記)。
 - `cut_index`が0(直近`KEEP_RECENT_USER_TURNS`件のユーザーターンしか無い、またはユーザーターンが1件も無い)ときは`compact`は何もせず`Ok(None)`を返す——エラーではない。
-- 圧縮後、直近ターンだけで再び`COMPACTION_THRESHOLD`を超えている病的なケース(1件のツール結果が極端に大きい等)は、次のターンでも`should_compact`が真になり続けるが、`cut_index`が0を返すため無限ループはしない(圧縮対象が無ければ`compact`は無条件で`Ok(None)`)——ただしこの場合、肥大化した履歴のままプロバイダへ送り続けることになる。個々の巨大メッセージを縮める機構(upstreamの`trim_function_call_history_to_fit_context_window`相当)は今回のscope外(上記「非対象」参照)。
+- 圧縮後、直近ターンだけで再び`COMPACTION_THRESHOLD`を超えている病的なケース(1件のツール結果が極端に大きい等)は無限ループにはならない。ただし`cut_index`が0を返すからではない——圧縮が挿入する要約Message自体が`Role::User`のため、1回目の圧縮後は`cut_index`が1(要約の直後)を返すようになり、`compact`は毎ターン直前の要約1件だけを再要約する羽目になる。無駄なプロバイダ往復、`messages_before`と`messages_after`が一致するだけの実質無意味な通知、不要なプロンプトキャッシュの無効化が、肥大化した本当のテールが別の経路で縮むまで毎ターン繰り返される。この無駄を止めるため、`compact`は要約対象プレフィックスのトークン数が`MIN_TOKENS_TO_SUMMARIZE`未満なら`cut_index`の値に関わらず`Ok(None)`で打ち切る。個々の巨大メッセージを縮める機構(upstreamの`trim_function_call_history_to_fit_context_window`相当)は今回のscope外のままで、肥大化したテール自体は残り続ける。
 
 ## テスト方針
 

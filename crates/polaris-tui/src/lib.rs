@@ -804,6 +804,41 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         slash::Action::Compact => {
+                            // A real summarization call can take tens of
+                            // seconds — show something before awaiting it
+                            // rather than leaving the last drawn frame on
+                            // screen, which reads as a hang (same
+                            // "set status, force one immediate draw, then
+                            // do the slow thing" shape as the Ctrl+O
+                            // mid-turn confirmation above).
+                            status = Status::Notice("compacting...".to_string());
+                            if terminal
+                                .borrow_mut()
+                                .draw(|f| {
+                                    draw_frame(
+                                        f,
+                                        &history,
+                                        scroll_offset,
+                                        &input_buffer,
+                                        input_cursor,
+                                        &status,
+                                        &render::HeaderInfo {
+                                            provider_name: &args.provider_name,
+                                            model_name: &model_name,
+                                            usage: cumulative_usage,
+                                            cwd: &cwd_display,
+                                            cwd_short: &cwd_footer_display,
+                                            effort_name: &effort_name,
+                                        },
+                                        &[],
+                                        0,
+                                        &selection,
+                                    )
+                                })
+                                .is_err()
+                            {
+                                break ExitCode::FAILURE;
+                            }
                             handle_compact(
                                 args.provider.as_ref(),
                                 &mut session,
@@ -811,6 +846,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &mut status,
                             )
                             .await;
+                            printed_messages = session.messages.len();
                             continue;
                         }
                         action => {
@@ -1074,6 +1110,38 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     continue;
                 }
                 Some(slash::Action::Compact) => {
+                    // Same reasoning as the popup-selection path above:
+                    // show feedback before the (potentially tens-of-
+                    // seconds-long) summarization call rather than
+                    // leaving the last drawn frame on screen.
+                    status = Status::Notice("compacting...".to_string());
+                    if terminal
+                        .borrow_mut()
+                        .draw(|f| {
+                            draw_frame(
+                                f,
+                                &history,
+                                scroll_offset,
+                                &input_buffer,
+                                input_cursor,
+                                &status,
+                                &render::HeaderInfo {
+                                    provider_name: &args.provider_name,
+                                    model_name: &model_name,
+                                    usage: cumulative_usage,
+                                    cwd: &cwd_display,
+                                    cwd_short: &cwd_footer_display,
+                                    effort_name: &effort_name,
+                                },
+                                &[],
+                                0,
+                                &selection,
+                            )
+                        })
+                        .is_err()
+                    {
+                        break ExitCode::FAILURE;
+                    }
                     handle_compact(
                         args.provider.as_ref(),
                         &mut session,
@@ -1081,6 +1149,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &mut status,
                     )
                     .await;
+                    printed_messages = session.messages.len();
                     continue;
                 }
                 Some(action) => {
@@ -1327,6 +1396,18 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             // logical position (see the comment on
                             // `checkpoint`'s declaration above).
                             checkpoint = checkpoint
+                                .saturating_sub(messages_before.saturating_sub(messages_after));
+                            // Same staleness problem as `checkpoint`:
+                            // `printed_messages` was also captured before
+                            // this turn's compaction could have run. Left
+                            // unadjusted, `append_new_history`'s
+                            // shrink-guard (see its own doc) would fire the
+                            // next time it's called whenever this turn
+                            // removes more messages than it goes on to add,
+                            // wiping the entire `history` buffer — header
+                            // box included — instead of just rendering the
+                            // turn's new messages.
+                            printed_messages = printed_messages
                                 .saturating_sub(messages_before.saturating_sub(messages_after));
                         }
                     }
@@ -1606,6 +1687,8 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     history_compacted_this_turn = true;
                     checkpoint =
                         checkpoint.saturating_sub(messages_before.saturating_sub(messages_after));
+                    printed_messages = printed_messages
+                        .saturating_sub(messages_before.saturating_sub(messages_after));
                 }
             }
             turn_outcome
@@ -2378,9 +2461,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let session_path = dir.path().join("s.jsonl");
 
+        // "reply 1" alone is well under `MIN_TOKENS_TO_SUMMARIZE`
+        // (`compaction::compact`'s floor guard) — inflated here so the
+        // summarized prefix actually clears the floor and this test still
+        // exercises a real compaction rather than tripping the "not worth
+        // it" no-op. Single-char repeats compress ~8:1 under o200k_base
+        // (see `polaris-core::compaction`'s own test for the same note).
+        let big_reply = "x".repeat(polaris_core::compaction::MIN_TOKENS_TO_SUMMARIZE * 10);
         let mut session = Session::default();
         session.push_user("turn 1");
-        session.push_assistant("reply 1", vec![]);
+        session.push_assistant(&big_reply, vec![]);
         session.push_user("turn 2");
         session.push_assistant("reply 2", vec![]);
         session.push_user("turn 3");
@@ -2820,6 +2910,222 @@ mod tests {
             &mut history,
         );
         assert_eq!(printed_messages, 0);
+    }
+
+    /// Regression coverage for the final-whole-branch-review Critical
+    /// finding: `printed_messages` is a second local index into
+    /// `session.messages`, alongside `checkpoint`, and it goes stale in
+    /// exactly the same way when compaction shrinks `session.messages`
+    /// mid-turn. Left unadjusted, the next `append_new_history` call sees
+    /// a `session.messages.len()` that no longer lines up with
+    /// `printed_messages`, and depending on how the shrink compares to
+    /// what the turn then appends, either the shrink-guard fires and wipes
+    /// the entire `history` buffer (header included), nothing new renders
+    /// at all, or the wrong slice of new messages renders. These three
+    /// tests simulate what `run()`'s two `AgentEvent::HistoryCompacted`
+    /// drain sites do — shrink `session.messages` the way `compact` does,
+    /// then apply the exact same `saturating_sub` adjustment to
+    /// `printed_messages` that the fix makes — across all three
+    /// before/after-vs-turn-growth orderings, and confirm
+    /// `append_new_history` renders correctly in each.
+    #[test]
+    fn append_new_history_renders_correctly_after_compaction_shrinks_more_than_the_turn_grows() {
+        // D (messages compaction removes) > A (messages the turn then
+        // adds) — the normal case: several old turns fold into one
+        // summary, and the current turn only adds its own reply.
+        let mut session = Session::default();
+        for i in 0..6 {
+            session.push_user(&format!("turn {i}"));
+        }
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut history = vec![render::HistoryLine {
+            line: Line::from("HEADER"),
+            shaded: false,
+        }];
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(printed_messages, 6);
+        let after_initial_render = history.len();
+
+        // Compaction folds all 6 messages into 2 (a summary plus one kept
+        // turn) — D = 4 — mirroring the adjustment made at both
+        // `AgentEvent::HistoryCompacted` drain sites in `run()`.
+        let messages_before = session.messages.len();
+        session.messages = vec![
+            Message::user("summary of turns 0-4"),
+            Message::user("turn 5"),
+        ];
+        let messages_after = session.messages.len();
+        printed_messages =
+            printed_messages.saturating_sub(messages_before.saturating_sub(messages_after));
+        assert_eq!(printed_messages, 2);
+
+        // The turn itself then appends its own reply (A = 1 < D = 4).
+        session.push_assistant("the turn's reply", Vec::new());
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+
+        assert_eq!(
+            history[0].line,
+            Line::from("HEADER"),
+            "the shrink-guard must not have fired and wiped the header"
+        );
+        assert_eq!(
+            history.len(),
+            after_initial_render + 1,
+            "exactly the turn's one new reply should have been appended — \
+             not zero (guard silently no-op'ing) and not a full reprint"
+        );
+        assert_eq!(printed_messages, 3);
+    }
+
+    #[test]
+    fn append_new_history_renders_correctly_after_compaction_shrinks_exactly_as_much_as_the_turn_grows()
+     {
+        // D == A: without the `printed_messages` adjustment,
+        // `session.messages.len()` ends up back at its pre-compaction
+        // value, so the shrink-guard never fires but the "anything new to
+        // render?" check also sees no growth — the turn's reply silently
+        // never appears.
+        let mut session = Session::default();
+        for i in 0..6 {
+            session.push_user(&format!("turn {i}"));
+        }
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut history = vec![render::HistoryLine {
+            line: Line::from("HEADER"),
+            shaded: false,
+        }];
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(printed_messages, 6);
+        let after_initial_render = history.len();
+
+        // Compaction removes 2 messages (D = 2).
+        let messages_before = session.messages.len();
+        session.messages = vec![
+            Message::user("summary of turns 0-2"),
+            Message::user("turn 3"),
+            Message::user("turn 4"),
+            Message::user("turn 5"),
+        ];
+        let messages_after = session.messages.len();
+        printed_messages =
+            printed_messages.saturating_sub(messages_before.saturating_sub(messages_after));
+        assert_eq!(printed_messages, 4);
+
+        // The turn adds exactly 2 new messages (A = D = 2): its own user
+        // follow-up plus the assistant's reply.
+        session.push_user("follow-up");
+        session.push_assistant("the turn's reply", Vec::new());
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+
+        assert_eq!(
+            history[0].line,
+            Line::from("HEADER"),
+            "the shrink-guard must not have fired and wiped the header"
+        );
+        assert_eq!(
+            history.len(),
+            after_initial_render + 2,
+            "both of the turn's new messages should have been appended, \
+             not silently dropped"
+        );
+        assert_eq!(printed_messages, 6);
+    }
+
+    #[test]
+    fn append_new_history_renders_correctly_after_compaction_shrinks_less_than_the_turn_grows() {
+        // D < A: without the `printed_messages` adjustment, some of the
+        // turn's own new messages get skipped from the render — the slice
+        // starts too far into `session.messages`.
+        let mut session = Session::default();
+        for i in 0..6 {
+            session.push_user(&format!("turn {i}"));
+        }
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut history = vec![render::HistoryLine {
+            line: Line::from("HEADER"),
+            shaded: false,
+        }];
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(printed_messages, 6);
+        let after_initial_render = history.len();
+
+        // Compaction removes just 1 message (D = 1).
+        let messages_before = session.messages.len();
+        session.messages = vec![
+            Message::user("summary of turn 0"),
+            Message::user("turn 1"),
+            Message::user("turn 2"),
+            Message::user("turn 3"),
+            Message::user("turn 4"),
+        ];
+        let messages_after = session.messages.len();
+        printed_messages =
+            printed_messages.saturating_sub(messages_before.saturating_sub(messages_after));
+        assert_eq!(printed_messages, 5);
+
+        // The turn adds 3 new messages (A = 3 > D = 1).
+        session.push_user("follow-up");
+        session.push_assistant("intermediate reply", Vec::new());
+        session.push_assistant("final reply", Vec::new());
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+
+        assert_eq!(
+            history[0].line,
+            Line::from("HEADER"),
+            "the shrink-guard must not have fired and wiped the header"
+        );
+        assert_eq!(
+            history.len(),
+            after_initial_render + 3,
+            "all three of the turn's new messages should have been \
+             appended, not just the tail of them"
+        );
+        assert_eq!(printed_messages, 8);
     }
 
     #[test]

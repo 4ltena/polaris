@@ -12,7 +12,7 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `6601f02`）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル15コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`(プロンプトキャッシュ改善+CHANGELOG修正)を指しており、それより後のreasoning item保持の6コミット(`dcfe7b9`〜`6601f02`)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
+| ブランチ | `main`（HEAD `657700c`）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル17コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`(プロンプトキャッシュ改善+CHANGELOG修正)を指しており、それより後のreasoning item保持一式(`dcfe7b9`〜`657700c`、spec・plan・6タスク+最終レビューのfix wave)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
 | 進行中の計画 | なし。プロンプトキャッシュ利用率の改善(`v0.7.0`)、reasoning item保持(spec・plan・SDD実行6タスク、詳細は専用節)ともに完了・ワークスペース全体で検証済み。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
 | 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
 | 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
@@ -77,9 +77,15 @@ codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割�
 - `Session::push_assistant`/`push_assistant_tool_calls`のシグネチャ変更・`agent::run_loop`の配線(`crates/polaris-core/src/session.rs`/`agent.rs`)
 - `openai.rs`側は無視することを確認する回帰テストのみ(実装変更なし)
 
-**タスク実行中に見つかった計画の穴**: plan策定時の事前呼び出し元調査が`crates/polaris-core/src`のみに絞られており、`crates/polaris-tui`のテストコード内に同じ2関数を呼ぶ箇所が30件(すべて`#[cfg(test)]`内)あることを見落としていた。Task 4完了直後に`cargo check --workspace --all-targets`で30件のE0061としてmainが一時的にビルド不能になったが、未計画の修正タスク(空の`Vec::new()`引数を機械的に追加、コミット`ec1ccea`)で即座に復旧し、スコープ付きレビューで確認済み。台帳は`.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/progress.md`に残っている(未削除、下記「次の一手」参照)。
+**タスク実行中に見つかった計画の穴**: plan策定時の事前呼び出し元調査が`crates/polaris-core/src`のみに絞られており、`crates/polaris-tui`のテストコード内に同じ2関数を呼ぶ箇所が30件(すべて`#[cfg(test)]`内)あることを見落としていた。Task 4完了直後に`cargo check --workspace --all-targets`で30件のE0061としてmainが一時的にビルド不能になったが、未計画の修正タスク(空の`Vec::new()`引数を機械的に追加、コミット`ec1ccea`)で即座に復旧し、スコープ付きレビューで確認済み。
 
-**検証**: `cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。加えて実際のCodexバックエンドに対しrelease buildで4往復の`exec`を実行し、エラー無く完走することを確認した(2026-08-26)。`docs/filemap.md`もこのspec・plan追加に伴い再生成済み(`UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap`、コミット`5100c08`)。
+**最終の全体レビュー(Opus、範囲`8ce4cd9..d57aaec`)** で1件のImportant指摘が見つかった: `input_items`が再送するreasoning itemに`id`を付けていたが、upstream `codex-rs`の`prepare_response_items_for_request`は`store: false`(polarisが常用する唯一のモード)では全itemの`id`を落として送る。この機能の唯一の動機がupstream一致度である以上、実質的な不整合だった。もう1件のImportant指摘(`Session.messages`→`input_items`を通しで検証するテストが無い)と、Minor 5件(空文字列id/encrypted_contentの未フィルタ、日本語コメントの混入、再送順序の説明不足、doc comment未更新、content・tool_calls双方が空のターンでreasoning単独itemが孤立して送られる不具合)とあわせて、1回のfix wave(コミット`657700c`)で全て解消・スコープ付き再レビューでADDRESSED確認済み。台帳は`.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/progress.md`に残っている(未削除、下記「次の一手」参照)。
+
+**検証**: `cargo test --workspace`(787件全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。加えて実際のCodexバックエンドに対しrelease buildで4往復の`exec`を実行し、エラー無く完走することを確認した(2026-08-26、`id`削除前のfix wave前のビルドでの確認であり、reasoning itemの再送自体を観測したものではない点に注意)。`docs/filemap.md`もこのspec・plan追加に伴い再生成済み(`UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap`、コミット`5100c08`)。
+
+**未対応のまま残した最終レビュー指摘(コード変更を伴わないため、fix waveの対象外とした)**:
+- コンパクション(履歴圧縮)が無い件について、spec本文は「既存の制約であり新たに悪化するわけではない」と書いたが、実際には毎ターン数KBの`encrypted_content` blobが1件ずつ積み増され、`session.messages.clone()`で毎回リクエストに乗る。upstreamが`get_non_last_reasoning_items_tokens`という専用の勘定を持つ理由でもある。実害が出る前に、`POLARIS_DUMP_USAGE`のinput_tokens推移で1ターンあたりの増分を一度実測する価値がある
+- `/model`でセッション途中にモデルを切り替えると、前のモデルが生成した`encrypted_content`を別モデルへ再送する形になる。upstreamも同じ挙動だが、polarisはコンパクションも履歴整形も持たないため、実際に400が返るかどうかは未確認(`/model`切り替え後に1ターン回すだけの簡単な実地確認で足りる)
 
 ## マイルストーン
 
@@ -479,13 +485,14 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-26、reasoning item保持のSDD実行(全6タスク+未計画の修正1件)が完了し、ワークスペース全体の検証・実地確認まで済んだ直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。CHANGELOGの`v0.7.0`エントリにあった因果の強さの見直しは`60bdebe`で完了済み(前回のこの節にあった項目)。
+本節は2026-08-26、reasoning item保持のSDD実行(全6タスク+未計画の修正1件+最終レビューのfix wave)が完了し、ワークスペース全体の検証まで済んだ直後に書き直した。`cargo test --workspace`(787件全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。CHANGELOGの`v0.7.0`エントリにあった因果の強さの見直しは`60bdebe`で完了済み(前回のこの節にあった項目)。
 
 優先度順:
 
-1. **reasoning item保持を含む15件のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`6601f02`(spec・plan・6タスク+修正1件)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
-2. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/`(台帳・brief・reportなど)は、finishing-a-development-branchスキルまで完了した時点で削除してよい(git管理外)
+1. **reasoning item保持を含む17件のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`657700c`(spec・plan・6タスク+修正2件)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
+2. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/`(台帳・brief・reportなど)は削除済み(finishing-a-development-branch完了に伴う)
 3. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
+4. **reasoning item保持の最終レビューで未対応のまま残した2件**(上の「reasoning item保持」節末尾)。コンパクション無しでの1ターンあたりの実際のトークン増分の実測、`/model`切り替え後にreasoning replayが失敗しないかの実地確認。どちらも壊れている証拠は無い、優先度は低い
 
 そのうえで v1.0.0 のタグ付けの判断へ進む。
 

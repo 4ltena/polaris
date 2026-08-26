@@ -663,6 +663,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_message_with_reasoning_is_sent_unchanged_since_chat_completions_has_no_such_concept()
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
+            .expect("client should be constructible");
+        let with_reasoning = Message::assistant("yes").with_reasoning(vec![crate::ReasoningItem {
+            id: "r1".into(),
+            encrypted_content: "opaque".into(),
+        }]);
+        let without_reasoning = Message::assistant("yes");
+
+        p.complete(CompletionRequest {
+            system: "s".into(),
+            messages: vec![with_reasoning],
+            tools: vec![],
+        })
+        .await
+        .expect("should succeed");
+        p.complete(CompletionRequest {
+            system: "s".into(),
+            messages: vec![without_reasoning],
+            tools: vec![],
+        })
+        .await
+        .expect("should succeed");
+
+        let received = server.received_requests().await.expect("recorded");
+        let with_body: Value = received[0].body_json().expect("json");
+        let without_body: Value = received[1].body_json().expect("json");
+        assert_eq!(
+            with_body["messages"], without_body["messages"],
+            "a Message's reasoning field must not change the Chat Completions request body"
+        );
+    }
+
+    #[tokio::test]
     async fn set_model_changes_the_model_sent_on_the_next_request() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

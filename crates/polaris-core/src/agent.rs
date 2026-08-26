@@ -316,6 +316,21 @@ pub(crate) async fn run_loop(
             return Err(AgentError::Stopped(r));
         }
 
+        let total_tokens = crate::budget::always_on_tokens(system, tools)
+            + crate::compaction::session_tokens(&session.messages);
+        if crate::compaction::should_compact(total_tokens)
+            && let Some(report) =
+                crate::compaction::compact(provider, &mut session.messages).await?
+            && let Some(tx) = &events
+        {
+            let _ = tx.send(crate::events::AgentEvent::HistoryCompacted {
+                messages_before: report.messages_before,
+                messages_after: report.messages_after,
+                tokens_before: report.tokens_before as u32,
+                tokens_after: report.tokens_after as u32,
+            });
+        }
+
         let res = provider
             .complete(CompletionRequest {
                 system: system.to_string(),
@@ -2268,6 +2283,90 @@ print("wrote")
         assert_eq!(items[3]["type"], "function_call_output");
         assert_eq!(items[4]["type"], "message");
         assert_eq!(items[4]["role"], "assistant");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_crosses_the_compaction_threshold_compacts_before_sending() {
+        let dir = tempfile::tempdir().expect("temp directory");
+
+        // Two big prior turns (well past COMPACTION_THRESHOLD once summed),
+        // then a small final turn that triggers compaction before it sends.
+        // `x` repeats compress heavily under BPE (o200k_base measures ~8
+        // chars/token for a run of identical characters), so a `* 5`
+        // multiplier here would only reach ~63k measured tokens — short of
+        // COMPACTION_THRESHOLD once `always_on_tokens` and the other turns
+        // are added in. `* 10` clears the threshold from this message
+        // alone, confirmed against `crate::compaction::session_tokens`.
+        let big = "x".repeat(crate::compaction::COMPACTION_THRESHOLD * 10);
+        let mut session = Session::new();
+        session.push_user("turn 1");
+        session.push_assistant(&big, vec![]);
+        session.push_user("turn 2");
+        session.push_assistant("reply 2", vec![]);
+        session.push_user("turn 3 — the new message that pushes it over");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                // The summarization call compact() makes internally.
+                CompletionResponse {
+                    text: "summary of turns before the kept tail".into(),
+                    ..Default::default()
+                },
+                // The real turn's own response, sent after compaction.
+                CompletionResponse {
+                    text: "final reply".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let outcome = run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(events_tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(outcome.text, "final reply");
+
+        let event = events_rx
+            .try_recv()
+            .expect("a HistoryCompacted event should have been sent");
+        assert!(
+            matches!(event, crate::events::AgentEvent::HistoryCompacted { .. }),
+            "expected HistoryCompacted, got {event:?}"
+        );
+
+        // session.messages was replaced: 1 summary + the kept tail (turn 2,
+        // reply 2, turn 3) + the final assistant reply = 5.
+        assert_eq!(session.messages.len(), 5);
+        assert!(
+            session.messages[0]
+                .content
+                .contains("summary of turns before the kept tail")
+        );
     }
 
     #[tokio::test]

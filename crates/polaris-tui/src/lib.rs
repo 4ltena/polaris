@@ -470,6 +470,17 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let mut status = Status::Idle;
     let mut key_reader = CrosstermKeyReader;
     let mut fatal_message: Option<String> = None;
+    // Set when a `HistoryCompacted` event is drained mid-turn (see the
+    // `events_rx.recv()`/`try_recv` sites below) — `session.messages`
+    // can't be touched at that point (`agent_future` still holds it
+    // mutably borrowed), so this just remembers that a resync is owed.
+    // Declared here, outside `'outer`, rather than freshly per turn:
+    // `TurnOutcome::Done(Ok(_))` is the only place that clears it back to
+    // `false` (after actually persisting), so if compaction fires during
+    // a turn that then errors or is interrupted, the flag stays `true`
+    // and the *next* successful turn still catches the resync up in one
+    // `persist::rewrite` — see that match arm below.
+    let mut history_compacted_this_turn = false;
     // Which row the `/`-popup highlights. Persists across loop iterations
     // (arrow keys move it) and is clamped below whenever the candidate
     // list itself changes, so it's always a valid index or the list is
@@ -790,6 +801,16 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         slash::Action::Skills => {
                             run_skills_picker(&terminal, &mut key_reader, args.skills);
                             status = Status::Idle;
+                            continue;
+                        }
+                        slash::Action::Compact => {
+                            handle_compact(
+                                args.provider.as_ref(),
+                                &mut session,
+                                &session_path,
+                                &mut status,
+                            )
+                            .await;
                             continue;
                         }
                         action => {
@@ -1275,6 +1296,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         if scroll_offset > 0 {
                             scroll_offset += appended;
                         }
+                        if matches!(event, polaris_core::AgentEvent::HistoryCompacted { .. }) {
+                            history_compacted_this_turn = true;
+                        }
                     }
                     _ = ticker.tick() => {
                         if mid_turn_notice_until.is_some_and(|until| Instant::now() < until) {
@@ -1543,6 +1567,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 if scroll_offset > 0 {
                     scroll_offset += appended;
                 }
+                if matches!(event, polaris_core::AgentEvent::HistoryCompacted { .. }) {
+                    history_compacted_this_turn = true;
+                }
             }
             turn_outcome
         };
@@ -1554,12 +1581,18 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 cumulative_usage.total_tokens += result.usage.total_tokens;
                 cumulative_usage.cached_tokens += result.usage.cached_tokens;
                 status = Status::Idle;
-                if let Some(reply) = session.messages.last()
+                if history_compacted_this_turn {
+                    if let Err(e) = persist::rewrite(&session_path, &session.messages) {
+                        fatal_message = Some(format!("Can't persist the compacted session: {e}"));
+                        break 'outer ExitCode::FAILURE;
+                    }
+                } else if let Some(reply) = session.messages.last()
                     && let Err(e) = persist::append_message(&session_path, reply)
                 {
                     fatal_message = Some(format!("Can't persist the reply: {e}"));
                     break 'outer ExitCode::FAILURE;
                 }
+                history_compacted_this_turn = false;
             }
             TurnOutcome::Done(Err(e)) => {
                 // The agent loop can return after recording an assistant
@@ -1931,6 +1964,42 @@ fn handle_model<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
+/// Runs compaction unconditionally (ignores the threshold — that's the
+/// point of a manual command) and reports the result via `status`. On
+/// success, also resyncs the persisted session log so `/resume` reflects
+/// the compacted state, matching how `TurnOutcome::Done(Ok(_))` does the
+/// same thing after an automatic compaction (see the call site in `run`).
+async fn handle_compact(
+    provider: &dyn Provider,
+    session: &mut polaris_core::session::Session,
+    session_path: &std::path::Path,
+    status: &mut Status,
+) {
+    match polaris_core::compaction::compact(provider, &mut session.messages).await {
+        Ok(None) => {
+            *status = Status::Notice("nothing old enough to compact yet".to_string());
+        }
+        Ok(Some(report)) => match persist::rewrite(session_path, &session.messages) {
+            Ok(()) => {
+                *status = Status::Notice(format!(
+                    "compacted {} messages → {} ({} tok → {} tok)",
+                    report.messages_before,
+                    report.messages_after,
+                    report.tokens_before,
+                    report.tokens_after
+                ));
+            }
+            Err(e) => {
+                *status =
+                    Status::Notice(format!("compacted in memory, but couldn't persist it: {e}"));
+            }
+        },
+        Err(e) => {
+            *status = Status::Notice(format!("compaction failed: {e}"));
+        }
+    }
+}
+
 /// Runs the `/skills` picker: a blocking loop like the others, but with
 /// no selection outcome — Enter and Esc both just close it (see
 /// `render::render_skills_picker`'s docs on why: polaris has nothing
@@ -2251,6 +2320,69 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
     use ratatui::text::Line;
     use std::collections::VecDeque;
+
+    struct Summarizer;
+
+    #[async_trait::async_trait]
+    impl polaris_provider::Provider for Summarizer {
+        async fn complete(
+            &self,
+            _req: polaris_provider::CompletionRequest,
+        ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError> {
+            Ok(polaris_provider::CompletionResponse {
+                text: "summary text".to_string(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_compact_compacts_and_persists_when_there_is_something_to_compact() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session_path = dir.path().join("s.jsonl");
+
+        let mut session = Session::default();
+        session.push_user("turn 1");
+        session.push_assistant("reply 1", vec![]);
+        session.push_user("turn 2");
+        session.push_assistant("reply 2", vec![]);
+        session.push_user("turn 3");
+        session.push_assistant("reply 3", vec![]);
+
+        let mut status = Status::Idle;
+        handle_compact(&Summarizer, &mut session, &session_path, &mut status).await;
+
+        assert!(
+            matches!(&status, Status::Notice(s) if s.contains("compacted")),
+            "expected a 'compacted' notice, got a different status"
+        );
+        assert_eq!(session.messages.len(), 5, "1 summary + kept tail of 4");
+
+        let (loaded, _truncated) = persist::load_session(&session_path).expect("load");
+        assert_eq!(
+            loaded.messages.len(),
+            session.messages.len(),
+            "the persisted file must reflect the compacted session, not the pre-compaction one"
+        );
+        assert_eq!(loaded.messages[0].content, session.messages[0].content);
+    }
+
+    #[tokio::test]
+    async fn handle_compact_reports_when_there_is_nothing_to_compact() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session_path = dir.path().join("s.jsonl");
+        let mut session = Session::default();
+        session.push_user("only turn");
+        let mut status = Status::Idle;
+
+        handle_compact(&Summarizer, &mut session, &session_path, &mut status).await;
+
+        assert!(
+            matches!(&status, Status::Notice(s) if s.contains("nothing")),
+            "expected a 'nothing to compact' notice"
+        );
+        assert_eq!(session.messages.len(), 1, "must not have been touched");
+    }
 
     /// Feeds a fixed, pre-scripted sequence of key codes — the same
     /// approach `approver`'s own tests use, so a picker-driving test

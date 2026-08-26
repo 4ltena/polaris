@@ -134,12 +134,12 @@ const CODE_TEXT_COLOR: Color = Color::Rgb(0x98, 0x9d, 0xcc);
 
 /// Background color for an active/finalized mouse selection. Terminal
 /// cells have no real alpha channel, so "more transparent" is simulated by
-/// blending Tailwind's `blue-400` (`#60A5FA`) ~65% toward black — a darker,
-/// more muted blue that reads as a tint over the content rather than a
-/// solid opaque highlight. Applied as a real background color rather than
-/// `Modifier::REVERSED`, so it reads the same regardless of the terminal's
-/// own color scheme.
-pub(crate) const SELECTION_HIGHLIGHT_COLOR: Color = Color::Rgb(0x3e, 0x6b, 0xa3);
+/// blending Tailwind's `blue-400` (`#60A5FA`) toward black — currently at
+/// ~45% of its original brightness, a muted blue that reads as a tint over
+/// the content rather than a solid opaque highlight. Applied as a real
+/// background color rather than `Modifier::REVERSED`, so it reads the same
+/// regardless of the terminal's own color scheme.
+pub(crate) const SELECTION_HIGHLIGHT_COLOR: Color = Color::Rgb(0x2b, 0x4a, 0x71);
 
 /// The most diff lines (context/added/removed, combined across all hunks)
 /// shown live for one `ToolFinished { diff: Some(_), .. }` event, before the

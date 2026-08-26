@@ -91,7 +91,7 @@ codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割�
 
 `docs/superpowers/specs/2026-08-26-polaris-history-compaction-design.md`(spec)・`docs/superpowers/plans/2026-08-26-polaris-history-compaction.md`(6タスクplan)をbrainstorming→writing-plansスキルで作成し、subagent-driven-developmentで実行した。動機は、利用者が実施したpolaris対codexの比較レポートで「codexが最大の技術リスクとして名指しした」項目(履歴圧縮の欠如)を埋めること——「polarisがcodexに対して明確に優位でなければ普及しない」という利用者の方針による。
 
-**設計**: `COMPACTION_THRESHOLD = 100_000`トークン(モデルごとのコンテキストウィンドウをpolarisはどのプロバイダからも取得できないため、固定の保守的な値)を`session.messages`の実測トークン数が超えたら、直近`KEEP_RECENT_USER_TURNS = 2`件のユーザーターンを残し、それより前を1回のLLM要約呼び出しで1件の要約Messageへ置き換える。必ず`Role::User`の位置でのみ切る(ツール呼び出し/結果の対を割らない)。
+**設計**: `COMPACTION_THRESHOLD = 200_000`トークン(モデルごとのコンテキストウィンドウをpolarisはどのプロバイダからも取得できないため、固定値。当初100_000だったものを、圧縮のたびに要約が変わりプロンプトキャッシュの接頭辞を捨てることになるという理由で引き上げた。ただしこの効果は未実測であり、閾値を下回るウィンドウのモデルでは圧縮が発火する前に上限へ達するため機能しない)を`session.messages`の実測トークン数が超えたら、直近`KEEP_RECENT_USER_TURNS = 2`件のユーザーターンを残し、それより前を1回のLLM要約呼び出しで1件の要約Messageへ置き換える。必ず`Role::User`の位置でのみ切る(ツール呼び出し/結果の対を割らない)。
 
 **実装内容**(コミット`dcfe7b9`〜`bd1d8d8`、6タスク+Task 5内のfix round1回+plan全体の最終レビューのfix wave1回、全てレビュークリア):
 - `crates/polaris-core/src/compaction.rs`(新規): `session_tokens`・`should_compact`・`cut_index`・`compact`

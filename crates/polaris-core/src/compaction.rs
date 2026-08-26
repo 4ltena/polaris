@@ -7,11 +7,29 @@ use crate::budget::count_tokens;
 use polaris_provider::ToolCall;
 use polaris_provider::{CompletionRequest, Message, Provider, ProviderError, Role};
 
-/// Conservative and model-agnostic — polaris has no per-model context
-/// window table (no provider exposes one), so this is picked well below
-/// the smallest context window in common use (128k+) rather than tuned to
-/// any specific model.
-pub const COMPACTION_THRESHOLD: usize = 100_000;
+/// Model-agnostic — polaris has no per-model context window table (no
+/// provider exposes one). Originally 100k, picked well below the smallest
+/// context window in common use (128k+) purely to bound growth. Raised to
+/// 200k on the reasoning that compacting often is self-defeating: each
+/// compaction replaces old turns with a freshly generated
+/// (non-deterministic) summary, which discards the stable prefix the
+/// prompt cache had been reusing.
+///
+/// Two things about that reasoning are worth stating outright rather than
+/// leaving implied.
+///
+/// It is not a measured result. The comparable cache-efficiency claim made
+/// for `prompt_cache_key` and `include` in v0.7.0 did not survive a direct
+/// before/after build comparison — see that CHANGELOG entry — and this one
+/// has not been put through the same test.
+///
+/// Past the smallest common window, this constant stops protecting
+/// anything. A model whose window is under the threshold reaches its own
+/// limit before compaction can fire, so for those models the feature is
+/// inert rather than merely late. That is acceptable while polaris targets
+/// gpt-5.x windows, and it is the first thing to revisit if a provider
+/// with a smaller window is added.
+pub const COMPACTION_THRESHOLD: usize = 200_000;
 
 /// How many of the most recent user turns survive compaction verbatim.
 pub const KEEP_RECENT_USER_TURNS: usize = 2;

@@ -93,20 +93,6 @@ fn abbreviate_home(path: &std::path::Path) -> String {
     }
 }
 
-/// The footer region's fixed height within `draw_frame`'s fullscreen
-/// layout: a border row, up to `render::MAX_DISPLAYED_SUGGESTIONS`
-/// suggestion rows, one "N more" row, the status row, the input row, and
-/// the footer row, all summed. This is a `Constraint::Length` given to
-/// the vertical split in `draw_frame`, not a `Terminal`-level viewport
-/// setting (there's no separate inline viewport anymore — see `run()`'s
-/// `Viewport::Fullscreen` comment) — it's still fixed rather than
-/// growing to fit content, which is why the suggestions popup is capped
-/// (see `render::MAX_DISPLAYED_SUGGESTIONS`'s doc) instead of sizing to
-/// fit an unbounded match list.
-// status(1) + suggestions(MAX_DISPLAYED_SUGGESTIONS + "+N more" row, 1) +
-// input pad-above(1) + input(1) + input pad-below(1) + footer(1).
-const FOOTER_HEIGHT: u16 = 1 + render::MAX_DISPLAYED_SUGGESTIONS as u16 + 1 + 1 + 1 + 1 + 1;
-
 /// How many `scroll_offset` lines one mouse/trackpad wheel tick moves —
 /// a single line per tick feels sluggish for wheel input, unlike a key
 /// press (see `PageUp`/`PageDown`'s own `+1`, which is a deliberate,
@@ -237,11 +223,14 @@ fn new_session_id() -> String {
 }
 
 /// Splits `frame.area()` into the scrollable history region (top) and the
-/// fixed-height footer region (bottom, `FOOTER_HEIGHT` rows),
-/// renders the current `visible_history_window` slice of `history` into
-/// the first, and calls `render_footer` with the second. This is the one
-/// draw routine every redraw point in `run()` shares — see this plan's
-/// Task 6.
+/// footer region (bottom, `render::footer_height(suggestions.len())` rows —
+/// sized fresh each frame for exactly what this frame's footer content
+/// needs, not a fixed worst-case reservation, so `history_area` naturally
+/// grows to fill whatever the footer isn't using and the footer sits flush
+/// against the bottom with no leftover gap above it), renders the current
+/// `visible_history_window` slice of `history` into the first, and calls
+/// `render_footer` with the second. This is the one draw routine every
+/// redraw point in `run()` shares — see this plan's Task 6.
 #[allow(clippy::too_many_arguments)]
 fn draw_frame(
     frame: &mut ratatui::Frame,
@@ -256,9 +245,10 @@ fn draw_frame(
     selection: &Option<selection::Selection>,
 ) {
     let area = frame.area();
+    let footer_height = render::footer_height(suggestions.len());
     let [history_area, footer_area] = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Min(0),
-        ratatui::layout::Constraint::Length(FOOTER_HEIGHT),
+        ratatui::layout::Constraint::Length(footer_height),
     ])
     .areas(area);
 
@@ -307,8 +297,11 @@ fn terminal_height(terminal: &RefCell<ratatui::DefaultTerminal>) -> u16 {
 
 /// The history area's height, given the terminal's total height — mirrors
 /// `draw_frame`'s own `Layout::vertical([Constraint::Min(0),
-/// Constraint::Length(FOOTER_HEIGHT)])` split without needing a `Frame`
-/// to do it (mouse-event handling runs outside the `draw` closure).
+/// Constraint::Length(footer_height)])` split without needing a `Frame`
+/// to do it (mouse-event handling runs outside the `draw` closure). Callers
+/// pass `render::footer_height(...)` for `footer_height`, computed from
+/// whatever suggestion count this call site's `draw_frame` calls actually
+/// use — see the four call sites below.
 ///
 /// Duplicates a layout `draw_frame` already computes inline — a future
 /// refactor could have `draw_frame` itself call these helpers, but that's
@@ -365,8 +358,9 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // frame, `draw_frame` renders `render::visible_history_window`'s slice
     // of that buffer (governed by `scroll_offset` below) into the top
     // region and `render::render_footer` (suggestions/status/input/footer)
-    // into the fixed `FOOTER_HEIGHT`-tall bottom region — the one
-    // draw routine every redraw point in this loop shares.
+    // into the bottom region, sized fresh each frame by
+    // `render::footer_height` — the one draw routine every redraw point in
+    // this loop shares.
     // `ratatui::init_with_options` enables raw mode but — regardless of
     // `Viewport` — does not itself enter the alternate screen, so that's
     // done explicitly here (`EnterAlternateScreen`). `ratatui::restore()`
@@ -561,8 +555,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
                     }
                     MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
-                        let history_area_height =
-                            area_height_for_history(FOOTER_HEIGHT, terminal_height(&terminal));
+                        let history_area_height = area_height_for_history(
+                            render::footer_height(suggestions.len()),
+                            terminal_height(&terminal),
+                        );
                         if mouse.row < history_area_height {
                             let width = terminal_width(&terminal);
                             let wrapped = render::wrap_history_lines(&history, width);
@@ -589,8 +585,10 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         if let Some(sel) = selection.as_mut()
                             && sel.dragging
                         {
-                            let history_area_height =
-                                area_height_for_history(FOOTER_HEIGHT, terminal_height(&terminal));
+                            let history_area_height = area_height_for_history(
+                                render::footer_height(suggestions.len()),
+                                terminal_height(&terminal),
+                            );
                             let width = terminal_width(&terminal);
                             let wrapped = render::wrap_history_lines(&history, width);
                             let window = render::visible_history_window(
@@ -1400,8 +1398,16 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                         scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
                                 }
                                 MouseEventKind::Down(MouseButton::Left) => {
+                                    // Mid-turn `draw_frame` calls always pass
+                                    // a literal `&[]` for suggestions (the
+                                    // popup never shows once a turn is in
+                                    // flight — the input buffer that would
+                                    // drive it was already cleared on
+                                    // submit), so `footer_height(0)` always
+                                    // matches what this frame actually
+                                    // rendered.
                                     let history_area_height = area_height_for_history(
-                                        FOOTER_HEIGHT,
+                                        render::footer_height(0),
                                         terminal_height(&terminal),
                                     );
                                     if mouse.row < history_area_height {
@@ -1435,8 +1441,11 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                     if let Some(sel) = selection.as_mut()
                                         && sel.dragging
                                     {
+                                        // See the `Down` arm above: mid-turn
+                                        // `draw_frame` calls always pass `&[]`
+                                        // for suggestions.
                                         let history_area_height = area_height_for_history(
-                                            FOOTER_HEIGHT,
+                                            render::footer_height(0),
                                             terminal_height(&terminal),
                                         );
                                         let width = terminal_width(&terminal);
@@ -2293,9 +2302,10 @@ mod tests {
             })
             .collect();
         assert!(rows[0].contains("line from history"));
-        // The footer's placeholder text lands in the bottom FOOTER_HEIGHT
-        // rows, not the top history region.
-        let footer_start = 30 - FOOTER_HEIGHT as usize;
+        // The footer's placeholder text lands in the bottom
+        // `render::footer_height(0)` rows (no suggestions here), not the
+        // top history region.
+        let footer_start = 30 - render::footer_height(0) as usize;
         assert!(
             rows[footer_start..]
                 .iter()
@@ -2366,9 +2376,9 @@ mod tests {
 
     #[test]
     fn draw_frame_highlights_an_active_selection() {
-        // Tall enough that `FOOTER_HEIGHT` doesn't eat the whole viewport
-        // and leave zero rows for the history area (matches the height the
-        // other `draw_frame` tests in this module use).
+        // Tall enough that `render::footer_height(0)` doesn't eat the whole
+        // viewport and leave zero rows for the history area (matches the
+        // height the other `draw_frame` tests in this module use).
         let backend = ratatui::backend::TestBackend::new(40, 20);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         // `HistoryLine::plain` is private to `render.rs` — this test lives in
@@ -2420,6 +2430,154 @@ mod tests {
             render::SELECTION_HIGHLIGHT_COLOR,
             "a column past the selection should not be highlighted"
         );
+    }
+
+    /// Regression test for the *elimination*, not just relocation, of the
+    /// blank gap between the last conversation-history row and the footer
+    /// block — proves `history_area` actually grows to use every row
+    /// `footer_height(0)` doesn't need, rather than always leaving the
+    /// difference between a fixed worst-case reservation and the popup's
+    /// actual height (9 rows, `14 - 5`) as unused blank space whenever the
+    /// suggestions popup isn't showing (the common case).
+    ///
+    /// Fills history with more lines than any plausible `history_area`
+    /// height on this 20-row backend, so every row of the *actual* history
+    /// area — whatever height it turns out to be — has real "history line
+    /// N" text in it, right up to and including its very last row. Under
+    /// the old fixed `FOOTER_HEIGHT` (14) sizing this backend's history
+    /// area would only have gotten `20 - 14 = 6` rows (rows 0..6), leaving
+    /// rows 6..15 as pure unused blank space above the footer's status row
+    /// at row 15 — this test's row-14 assertion below would have failed
+    /// there, since row 14 sat well inside that unused gap, not inside
+    /// `history_area` at all.
+    #[test]
+    fn draw_frame_leaves_no_blank_gap_between_history_and_the_footer() {
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let history: Vec<render::HistoryLine> = (0..20)
+            .map(|i| render::HistoryLine {
+                line: ratatui::text::Line::from(format!("history line {i}")),
+                shaded: false,
+            })
+            .collect();
+        terminal
+            .draw(|f| {
+                draw_frame(
+                    f,
+                    &history,
+                    0,
+                    "",
+                    0,
+                    &Status::Idle,
+                    &render::HeaderInfo {
+                        provider_name: "openai",
+                        model_name: "gpt-5.4",
+                        usage: polaris_provider::Usage::default(),
+                        cwd: "/tmp",
+                        cwd_short: "~",
+                        effort_name: "low",
+                    },
+                    &[],
+                    0,
+                    &None,
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        // 0 suggestions here, so this must match what `draw_frame` itself
+        // just used to size `footer_area`.
+        let expected_history_height = 20 - render::footer_height(0) as usize;
+        assert!(
+            rows[expected_history_height - 1].contains("history line"),
+            "the row immediately above the footer must still be real \
+             history content, not blank leftover space: {:?}",
+            rows[expected_history_height - 1]
+        );
+        assert!(
+            !rows[expected_history_height].contains("history line"),
+            "the footer's own first row (status_area) must start \
+             immediately below history, with nothing blank in between: {:?}",
+            rows[expected_history_height]
+        );
+    }
+
+    /// Closes the duplication-drift risk between `area_height_for_history`
+    /// (used by the four mouse-event handlers, which run outside the
+    /// `draw()` closure and so can't ask ratatui's own `Layout` what
+    /// `history_area.height` is this frame) and what `draw_frame` actually
+    /// renders. Rather than duplicating `draw_frame`'s own
+    /// `Layout::vertical` call a second time (which would only prove the
+    /// test's copy agrees with itself), this renders a real `draw_frame`
+    /// call with more history lines than any plausible `history_area`
+    /// height, all carrying the same marker (`"H"`), then counts how many
+    /// contiguous rows from the top actually got that marker drawn into
+    /// them — the true observable size of `history_area`, straight from
+    /// the rendered buffer. That count must equal
+    /// `area_height_for_history(render::footer_height(n), terminal_height)`
+    /// for both a representative suggestion count with no popup (`0`) and
+    /// one at the popup's display cap (`MAX_DISPLAYED_SUGGESTIONS`).
+    #[test]
+    fn area_height_for_history_matches_draw_frames_actual_history_area_height() {
+        for &suggestion_count in &[0usize, render::MAX_DISPLAYED_SUGGESTIONS] {
+            let terminal_height: u16 = 20;
+            let suggestions: Vec<&slash::SlashCommand> =
+                slash::COMMANDS.iter().take(suggestion_count).collect();
+            assert_eq!(
+                suggestions.len(),
+                suggestion_count,
+                "slash::COMMANDS must have at least MAX_DISPLAYED_SUGGESTIONS entries \
+                 for this test to actually exercise the requested suggestion count"
+            );
+            let backend = ratatui::backend::TestBackend::new(60, terminal_height);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            let history: Vec<render::HistoryLine> = (0..terminal_height)
+                .map(|_| render::HistoryLine {
+                    line: ratatui::text::Line::from("H"),
+                    shaded: false,
+                })
+                .collect();
+            terminal
+                .draw(|f| {
+                    draw_frame(
+                        f,
+                        &history,
+                        0,
+                        "",
+                        0,
+                        &Status::Idle,
+                        &render::HeaderInfo {
+                            provider_name: "openai",
+                            model_name: "gpt-5.4",
+                            usage: polaris_provider::Usage::default(),
+                            cwd: "/tmp",
+                            cwd_short: "~",
+                            effort_name: "low",
+                        },
+                        &suggestions,
+                        0,
+                        &None,
+                    )
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let actual_history_rows = (0..buffer.area.height)
+                .take_while(|&y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "H"))
+                .count() as u16;
+            let via_helper =
+                area_height_for_history(render::footer_height(suggestion_count), terminal_height);
+            assert_eq!(
+                actual_history_rows, via_helper,
+                "suggestion_count={suggestion_count}: area_height_for_history \
+                 must stay in sync with what draw_frame actually renders"
+            );
+        }
     }
 
     #[test]

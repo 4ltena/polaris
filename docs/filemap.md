@@ -61,6 +61,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `approval.rs` — Approval boundary. `sandbox_mode` sets the technical boundary;
 - `audit.rs` — Append-only audit log. Not signed: in-process, the entity signing and the
 - `budget.rs` — Measurement of the always-on context. Numbers are backed by measurement,
+- `compaction.rs` — Automatic history summarization. Fires when the conversation's measured
 - `config.rs` — Loads config files. Not existing is normal; being malformed is not.
 - `constitution.rs` — The part of the always-on context that the harness does not own. The
 - `dir_watch.rs` — `bash`/`write`/`edit` 呼び出しの前後でファイルシステムを比較し、新規
@@ -180,6 +181,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-24-polaris-tui-live-tool-progress.md` — polaris TUI ライブツール進捗・diff表示 Implementation Plan
 - `2026-08-25-polaris-tui-fullscreen-scroll.md` — polaris TUI 自前スクロール管理・フッター固定化 Implementation Plan
 - `2026-08-26-polaris-codex-reasoning-continuity.md` — polaris Codexプロバイダ reasoning item保持 Implementation Plan
+- `2026-08-26-polaris-history-compaction.md` — polaris 会話履歴の自動圧縮(compaction) Implementation Plan
 - `2026-08-26-polaris-tui-mouse-drag-selection.md` — polaris TUI マウスドラッグ選択・自前クリップボードコピー Implementation Plan
 
 ## `docs/superpowers/specs`
@@ -194,4 +196,5 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-24-polaris-tui-live-tool-progress-design.md` — polaris TUI ライブツール進捗・diff表示 設計書
 - `2026-08-25-polaris-tui-fullscreen-scroll-design.md` — polaris TUI 自前スクロール管理・フッター固定化 設計書
 - `2026-08-26-polaris-codex-reasoning-continuity-design.md` — polaris Codexプロバイダ reasoning item保持 設計書
+- `2026-08-26-polaris-history-compaction-design.md` — polaris 会話履歴の自動圧縮(compaction) 設計書
 - `2026-08-26-polaris-tui-mouse-drag-selection-design.md` — polaris TUI マウスドラッグ選択・自前クリップボードコピー 設計書

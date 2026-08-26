@@ -12,8 +12,8 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `9f2eef9`）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル18コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`(プロンプトキャッシュ改善+CHANGELOG修正)を指しており、それより後のreasoning item保持一式(`dcfe7b9`〜`9f2eef9`、spec・plan・6タスク+最終レビューのfix waveと記録更新)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
-| 進行中の計画 | なし。プロンプトキャッシュ利用率の改善(`v0.7.0`)、reasoning item保持(spec・plan・SDD実行6タスク、詳細は専用節)ともに完了・ワークスペース全体で検証済み。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
+| ブランチ | `main`（HEAD `652708f`、その後`docs/filemap.md`の再生成のみ未コミットで残っている）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル29コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`を指しており、それより後のreasoning item保持一式・会話履歴の自動圧縮一式(`dcfe7b9`〜`652708f`)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
+| 進行中の計画 | なし。プロンプトキャッシュ利用率の改善(`v0.7.0`)、reasoning item保持、会話履歴の自動圧縮(compaction、詳細は専用節)いずれも完了・ワークスペース全体で検証済み。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
 | 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
 | 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md`、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress-design.md`、`docs/superpowers/specs/2026-08-25-polaris-tui-fullscreen-scroll-design.md` |
@@ -84,8 +84,26 @@ codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割�
 **検証**: `cargo test --workspace`(787件全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。加えて実際のCodexバックエンドに対しrelease buildで4往復の`exec`を実行し、エラー無く完走することを確認した(2026-08-26、`id`削除前のfix wave前のビルドでの確認であり、reasoning itemの再送自体を観測したものではない点に注意)。`docs/filemap.md`もこのspec・plan追加に伴い再生成済み(`UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap`、コミット`5100c08`)。
 
 **未対応のまま残した最終レビュー指摘(コード変更を伴わないため、fix waveの対象外とした)**:
-- コンパクション(履歴圧縮)が無い件について、spec本文は「既存の制約であり新たに悪化するわけではない」と書いたが、実際には毎ターン数KBの`encrypted_content` blobが1件ずつ積み増され、`session.messages.clone()`で毎回リクエストに乗る。upstreamが`get_non_last_reasoning_items_tokens`という専用の勘定を持つ理由でもある。実害が出る前に、`POLARIS_DUMP_USAGE`のinput_tokens推移で1ターンあたりの増分を一度実測する価値がある
-- `/model`でセッション途中にモデルを切り替えると、前のモデルが生成した`encrypted_content`を別モデルへ再送する形になる。upstreamも同じ挙動だが、polarisはコンパクションも履歴整形も持たないため、実際に400が返るかどうかは未確認(`/model`切り替え後に1ターン回すだけの簡単な実地確認で足りる)
+- ~~コンパクション(履歴圧縮)が無い件~~ → 2026-08-26中に別のspec・plan・SDD実行で解消済み。下記「会話履歴の自動圧縮」節を見よ
+- `/model`でセッション途中にモデルを切り替えると、前のモデルが生成した`encrypted_content`を別モデルへ再送する形になる。upstreamも同じ挙動だが、compactionが圧縮しなかった直近ターンにこの前提モデルのreasoning itemが残っていた場合、実際に400が返るかどうかは未確認(`/model`切り替え後に1ターン回すだけの簡単な実地確認で足りる)。compaction自体はこの問題を直接は解決しない——要約テキストはモデル非依存の平文になるが、`KEEP_RECENT_USER_TURNS`分の直近ターンはencrypted_contentごと残る
+
+## 会話履歴の自動圧縮(compaction、2026-08-26、実装完了)
+
+`docs/superpowers/specs/2026-08-26-polaris-history-compaction-design.md`(spec)・`docs/superpowers/plans/2026-08-26-polaris-history-compaction.md`(6タスクplan)をbrainstorming→writing-plansスキルで作成し、subagent-driven-developmentで実行した。動機は、利用者が実施したpolaris対codexの比較レポートで「codexが最大の技術リスクとして名指しした」項目(履歴圧縮の欠如)を埋めること——「polarisがcodexに対して明確に優位でなければ普及しない」という利用者の方針による。
+
+**設計**: `COMPACTION_THRESHOLD = 100_000`トークン(モデルごとのコンテキストウィンドウをpolarisはどのプロバイダからも取得できないため、固定の保守的な値)を`session.messages`の実測トークン数が超えたら、直近`KEEP_RECENT_USER_TURNS = 2`件のユーザーターンを残し、それより前を1回のLLM要約呼び出しで1件の要約Messageへ置き換える。必ず`Role::User`の位置でのみ切る(ツール呼び出し/結果の対を割らない)。
+
+**実装内容**(コミット`dcfe7b9`〜`652708f`、6タスク+最終レビューのfix wave1回、全てレビュークリア):
+- `crates/polaris-core/src/compaction.rs`(新規): `session_tokens`・`should_compact`・`cut_index`・`compact`
+- `agent::run_loop`への組み込み(閾値チェック→圧縮→`AgentEvent::HistoryCompacted`送出)、`run_loop`のシグネチャは無変更
+- `polaris-tui`: 通知行の表示(`render.rs`)、`/compact`手動コマンド(`slash.rs`+`lib.rs`の2箇所のディスパッチ地点)、ターン完了後の`persist::rewrite`による`/resume`との整合
+
+**タスク実行中に見つかった計画の穴・最終レビューでの指摘、いずれも同一SDD実行内で解消**:
+- Task 1: ブリーフのimport文がテスト専用の`ToolCall`を無条件importにしていて非テストビルドでunused importになる件 → `#[cfg(test)]`で解決
+- Task 2: ブリーフのテスト文中の自己参照パス(`polaris_core::`→`crate::`)、および`"x".repeat(N)`が単純文字の繰り返しでトークナイザに強く圧縮される(`*5`では閾値を超えなかった)件 → `*10`に修正、実測で裏付け
+- 最終レビュー(fix round 1、コミット`2c9f9c9`→`652708f`): (a) `/compact`が末尾に空白等が付いた入力で無反応になる(ディスパッチ地点が2箇所あるうち1箇所しか埋めていなかった)→ 2箇所目にもハンドラを追加。(b) 既存のロールバック機構(`checkpoint`)が、ターン中盤でのcompaction発火によって古くなり、ロールバックがサイレントに無効化されうる潜在バグ(compaction機能が新たに到達可能にした)→ `checkpoint`をcompactionの前後件数差分だけ調整する形で解消、再レビューで算術を独立に再導出し正しさを確認済み
+
+**検証**: `cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。`docs/filemap.md`もこのspec・plan追加に伴い再生成した。閾値を一時的に500へ下げた実地確認(tmux)は、このセッションの実行環境でtmuxペインへのキー入力が実際には処理されない不具合(polaris自体の問題ではなく環境側の制約)に阻まれ完了できなかった——自動テスト(`agent.rs`の`run_loop`統合テストが実プロバイダを模したモックで圧縮の発火・履歴の置き換えを検証済み、`lib.rs`の`handle_compact`テストが永続化の往復を実際のファイルI/Oで検証済み)による確証にとどまる。実際のCodexバックエンドに対する自動発火の実地確認は未実施のまま残っている。
 
 ## マイルストーン
 
@@ -485,14 +503,15 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-26、reasoning item保持のSDD実行(全6タスク+未計画の修正1件+最終レビューのfix wave)が完了し、ワークスペース全体の検証まで済んだ直後に書き直した。`cargo test --workspace`(787件全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。CHANGELOGの`v0.7.0`エントリにあった因果の強さの見直しは`60bdebe`で完了済み(前回のこの節にあった項目)。
+本節は2026-08-26、会話履歴の自動圧縮(compaction)のSDD実行(全6タスク+最終レビューのfix wave1回)が完了し、ワークスペース全体の検証まで済んだ直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
 
 優先度順:
 
-1. **reasoning item保持を含む18件のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`9f2eef9`(spec・plan・6タスク+修正2件と記録更新)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
-2. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/`(台帳・brief・reportなど)は削除済み(finishing-a-development-branch完了に伴う)
-3. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
-4. **reasoning item保持の最終レビューで未対応のまま残した2件**(上の「reasoning item保持」節末尾)。コンパクション無しでの1ターンあたりの実際のトークン増分の実測、`/model`切り替え後にreasoning replayが失敗しないかの実地確認。どちらも壊れている証拠は無い、優先度は低い
+1. **reasoning item保持・compactionを含む29件のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`652708f`(reasoning item保持一式+compaction一式)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
+2. **compactionの実機での自動発火を実地確認する。** 今回のセッションではtmux操作が環境側の制約で機能せず未実施。自動テストでの検証にとどまっている(上の「会話履歴の自動圧縮」節参照)
+3. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-history-compaction/`(台帳・brief・reportなど)は削除済み(finishing-a-development-branch完了に伴う)
+4. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
+5. **`/model`切り替え後にreasoning replayが失敗しないかの実地確認**(上の「reasoning item保持」節末尾)。壊れている証拠は無い、優先度は低い
 
 そのうえで v1.0.0 のタグ付けの判断へ進む。
 

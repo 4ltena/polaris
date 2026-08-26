@@ -2243,6 +2243,31 @@ print("wrote")
         assert_eq!(tool_calling_turn.reasoning.len(), 1);
         assert_eq!(tool_calling_turn.reasoning[0].id, "r1");
         assert_eq!(tool_calling_turn.reasoning[0].encrypted_content, "opaque");
+
+        // End to end: confirm the reasoning captured on session.messages[1]
+        // actually replays on the wire, and lands before the function_call
+        // it informed. session.messages is [user, assistant_tool_calling_turn,
+        // tool_result, assistant_final], so input_items on the full history
+        // must produce: user message, reasoning (from [1]), function_call
+        // (from [1]), function_call_output (from [2]), final message (from
+        // [3]).
+        let items = polaris_provider::codex::input_items(&session.messages);
+        assert_eq!(items.len(), 5, "unexpected item count: {items:?}");
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(
+            items[1]["type"], "reasoning",
+            "the reasoning item must appear before the function_call it informed"
+        );
+        assert!(
+            items[1].get("id").is_none(),
+            "id must be stripped from the replayed reasoning item"
+        );
+        assert_eq!(items[1]["encrypted_content"], "opaque");
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items[4]["type"], "message");
+        assert_eq!(items[4]["role"], "assistant");
     }
 
     #[tokio::test]

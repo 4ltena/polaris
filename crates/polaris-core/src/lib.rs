@@ -4,6 +4,7 @@ pub mod agent;
 pub mod approval;
 pub mod audit;
 pub mod budget;
+pub mod compaction;
 pub mod config;
 pub mod constitution;
 mod dir_watch;

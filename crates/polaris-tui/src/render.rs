@@ -132,6 +132,13 @@ fn format_tool_call_args(detail: &str) -> String {
 /// to a whole fenced block in a reply.
 const CODE_TEXT_COLOR: Color = Color::Rgb(0x98, 0x9d, 0xcc);
 
+/// Background color for an active/finalized mouse selection — brighter and
+/// more saturated than `CODE_TEXT_COLOR`, but restrained rather than
+/// blinding (Tailwind's `blue-400`). Applied as a real background color
+/// rather than `Modifier::REVERSED`, so the highlight always reads the
+/// same regardless of the terminal's own color scheme.
+pub(crate) const SELECTION_HIGHLIGHT_COLOR: Color = Color::Rgb(0x60, 0xa5, 0xfa);
+
 /// The most diff lines (context/added/removed, combined across all hunks)
 /// shown live for one `ToolFinished { diff: Some(_), .. }` event, before the
 /// rest is elided with a notice row — the live-print analog of
@@ -739,11 +746,11 @@ pub fn render_history_into(
 
 /// Overlays a selection's highlight onto an already-rendered `Buffer` —
 /// call this immediately after `render_history_into` has drawn `lines`
-/// into `area`. Only reverses video (`Modifier::REVERSED`); never touches
-/// `fg`/`bg`, so existing colors (role color, `CODE_TEXT_COLOR`, shaded
-/// rows) show through unchanged, just inverted — matching how ordinary
-/// terminal selection highlighting looks. `wrapped`/`window` are the same
-/// values `draw_frame` already computed for `render_history_into` itself.
+/// into `area`. Sets `SELECTION_HIGHLIGHT_COLOR` as the background; never
+/// touches `fg`, so existing foreground colors (role color,
+/// `CODE_TEXT_COLOR`) show through unchanged on top of the highlight.
+/// `wrapped`/`window` are the same values `draw_frame` already computed
+/// for `render_history_into` itself.
 pub fn apply_selection_highlight(
     buf: &mut ratatui::buffer::Buffer,
     area: ratatui::layout::Rect,
@@ -782,8 +789,7 @@ pub fn apply_selection_highlight(
                         if x >= area.x + area.width {
                             break 'spans;
                         }
-                        buf[(x, row_y)]
-                            .set_style(Style::default().add_modifier(Modifier::REVERSED));
+                        buf[(x, row_y)].set_style(Style::default().bg(SELECTION_HIGHLIGHT_COLOR));
                     }
                 }
                 display_col += w;
@@ -3051,7 +3057,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_selection_highlight_reverses_only_the_selected_cells() {
+    fn apply_selection_highlight_colors_only_the_selected_cells() {
         use crate::selection::{Selection, TextPos};
         let wrapped = vec![HistoryLine::plain(Line::from("hello world"))];
         let area = ratatui::layout::Rect::new(0, 0, 20, 5);
@@ -3066,20 +3072,23 @@ mod tests {
         apply_selection_highlight(&mut buf, area, 0..1, &wrapped, &sel);
 
         for x in 0..2 {
-            assert!(
-                !buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+            assert_ne!(
+                buf[(x, 0)].bg,
+                SELECTION_HIGHLIGHT_COLOR,
                 "column {x} should not be highlighted"
             );
         }
         for x in 2..7 {
-            assert!(
-                buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+            assert_eq!(
+                buf[(x, 0)].bg,
+                SELECTION_HIGHLIGHT_COLOR,
                 "column {x} should be highlighted"
             );
         }
         for x in 7..20 {
-            assert!(
-                !buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+            assert_ne!(
+                buf[(x, 0)].bg,
+                SELECTION_HIGHLIGHT_COLOR,
                 "column {x} should not be highlighted"
             );
         }
@@ -3105,8 +3114,9 @@ mod tests {
         apply_selection_highlight(&mut buf, area, 1..2, &wrapped, &sel);
 
         for x in 0..30 {
-            assert!(
-                !buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+            assert_ne!(
+                buf[(x, 0)].bg,
+                SELECTION_HIGHLIGHT_COLOR,
                 "column {x} should not be highlighted — line 0 is scrolled off"
             );
         }
@@ -3135,7 +3145,7 @@ mod tests {
             Color::Red,
             "the red fg color must survive the highlight"
         );
-        assert!(buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(0, 0)].bg, SELECTION_HIGHLIGHT_COLOR);
     }
 
     #[test]

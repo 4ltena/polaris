@@ -2410,16 +2410,14 @@ mod tests {
             })
             .expect("draw");
         let buf = terminal.backend().buffer();
-        assert!(
-            buf[(0, 0)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED),
+        assert_eq!(
+            buf[(0, 0)].bg,
+            render::SELECTION_HIGHLIGHT_COLOR,
             "the first selected column should be highlighted"
         );
-        assert!(
-            !buf[(7, 0)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED),
+        assert_ne!(
+            buf[(7, 0)].bg,
+            render::SELECTION_HIGHLIGHT_COLOR,
             "a column past the selection should not be highlighted"
         );
     }

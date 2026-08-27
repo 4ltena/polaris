@@ -183,6 +183,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-26-polaris-codex-reasoning-continuity.md` — polaris Codexプロバイダ reasoning item保持 Implementation Plan
 - `2026-08-26-polaris-history-compaction.md` — polaris 会話履歴の自動圧縮(compaction) Implementation Plan
 - `2026-08-26-polaris-tui-mouse-drag-selection.md` — polaris TUI マウスドラッグ選択・自前クリップボードコピー Implementation Plan
+- `2026-08-27-polaris-codex-ws-transport.md` — polaris Codex WebSocket トランスポート(フェーズ1) Implementation Plan
 
 ## `docs/superpowers/specs`
 

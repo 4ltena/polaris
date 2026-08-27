@@ -22,7 +22,7 @@ upstream `codex-rs`のコード(`core/src/client.rs:899`の`store: provider.is_a
 - 差分送信・`previous_response_id`継続(フェーズ2)
 - `openai.rs`(Chat Completions APIには対応する概念が無い。トレイト追加メソッドの自明な実装のみ持つ)
 - `session.rs`・`compaction.rs`への変更(フェーズ1では不要)
-- WSの正確なワイヤ形式(接続URL・アップグレードヘッダ・メッセージ封筒のJSON形状・ping/keepalive)を本設計書で確定させること。upstream(`ApiWebSocketConnection`・`stream_request`・関連ファイル)を読み解いて確定させること自体を、フェーズ1実装計画の最初のタスクとする
+- WSの正確なワイヤ形式(接続URL・アップグレードヘッダ・メッセージ封筒のJSON形状・ping/keepalive)を本設計書で確定させること——ただし、計画書作成の過程で実際にupstream(`codex-api/src/endpoint/responses_websocket.rs`・`codex-api/src/common.rs`・`codex-api/src/sse/responses.rs`)を読み解いてワイヤ形式を確定させた。その結果は実装計画書(`docs/superpowers/plans/2026-08-27-polaris-codex-ws-transport.md`)側に具体的なコードとして記載する。本設計書はアーキテクチャ判断(接続の生存期間・並行subagentとの整合・フォールバック方針)の記録に留める
 
 ## アーキテクチャ
 
@@ -32,25 +32,29 @@ upstream `codex-rs`のコード(`core/src/client.rs:899`の`store: provider.is_a
 
 upstreamのturn-stateは「同一ターン内の複数リクエストでは使い回すが、別ターンをまたいで使い回すとルーティング事故になる」という制約を持つ。1個の永続WS接続+1個のturn-stateを`CodexProvider`インスタンス単位で持たせると、親の`run_loop`と並行実行される各subagentの`run_loop`が同じ接続・turn-stateを奪い合い、この制約に抵触する。
 
-**対処**: `Provider`トレイトへ、object-safeな新規メソッドを1本追加する。
+**対処**: `Provider`トレイトへ、object-safeな新規メソッドを1本、**デフォルト実装付きで**追加する。
 
 ```rust
 pub trait Provider: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
 
-    /// Returns a fresh, independently-scoped handle for a new logical
-    /// turn (a subagent's own `run_loop`). A provider holding per-turn
-    /// connection state (WS connection + turn-state) must return a new
-    /// instance with its own connection, never sharing a connection or
-    /// turn-state across concurrently-running turns. A stateless provider
-    /// may return a value that behaves identically to `self`.
-    fn for_new_turn(&self) -> Arc<dyn Provider>;
+    /// Returns a fresh, independently-scoped provider handle for a new
+    /// logical turn (a subagent's own `run_loop`), when this provider
+    /// holds per-turn connection state that must not be shared across
+    /// concurrently-running turns (see `CodexProvider`'s WS transport).
+    /// Returns `None` when there's no such state to isolate — the
+    /// default, safe for every provider without per-turn connection
+    /// state, real or test double alike.
+    fn for_new_turn(&self) -> Option<Arc<dyn Provider>> {
+        None
+    }
 }
 ```
 
-- `CodexProvider::for_new_turn`は、同じ`base`/`model`/`effort_override`(現在値のスナップショット)/`tokens`(`Arc<dyn TokenSource>`、共有して問題ない不変ハンドル)/`idle`(タイムアウト設定)を使って新しい`CodexProvider`インスタンスを構築する。`client: reqwest::Client`は内部で新規に作る(接続プールを共有する積極的な理由が無く、WS接続自体が独立している以上、道連れで共有する理由も無い)。新インスタンスは自分専用の(まだ確立していない)WS接続状態を持つ。
-- `OpenAiProvider`はWS的な接続状態を持たない(`base_url`/`api_key`/`model`/`effort`の4フィールドのみ、`model`/`effort`は`RwLock`越しに読む必要があるため`Clone`は導出できない)。`for_new_turn`は現在の4フィールドの値をそれぞれ読み出し、同じ設定値で新しい`OpenAiProvider`インスタンスを構築して返す——独立した接続状態を持つ必要が無いため、これは単なる値渡しの再構築であり、subagent側もこれまで通り動作する。
-- `spawn.rs`の`run_wave`は、各subagentタスクを起動する直前に`provider_pool.for_new_turn()`を呼び、そのタスク専用のプロバイダハンドルを渡す(`provider_pool`自体をそのまま共有しない)。親の`run_loop`自身は、起動時に受け取った`provider`をそのまま使い続ける(こちらは変更不要)。
+このトレイトの実装はワークスペース全体で14箇所ある(本物2つ`CodexProvider`・`OpenAiProvider`、テスト用モック12個)。デフォルト実装を`None`にすることで、実際に接続状態を分離する必要がある`CodexProvider`だけが上書きすればよく、残り13箇所(`OpenAiProvider`含む)は一切変更不要になる。
+
+- `CodexProvider::for_new_turn`は、同じ`base`/`model`/`effort_override`(現在値のスナップショット)/`tokens`(`Arc<dyn TokenSource>`、共有して問題ない不変ハンドル)/`idle`(タイムアウト設定)を使って新しい`CodexProvider`インスタンスを構築し、`Some(Arc::new(...))`を返す。`client: reqwest::Client`は内部で新規に作る(接続プールを共有する積極的な理由が無く、WS接続自体が独立している以上、道連れで共有する理由も無い)。新インスタンスは自分専用の(まだ確立していない)WS接続状態を持つ。
+- `spawn.rs`の`run_wave`は、各subagentタスクを起動する直前に`provider_pool.for_new_turn().unwrap_or_else(|| provider_pool.clone())`を呼び、そのタスク専用のプロバイダハンドルを渡す(`provider_pool`自体をそのまま共有しない)。親の`run_loop`自身は、起動時に受け取った`provider`をそのまま使い続ける(こちらは変更不要)。
 - 既存のテスト用`Scripted`等のモックプロバイダにも、この新規メソッドの単純な実装(`Arc::new(self.clone())`相当)を追加する。挙動は変わらないため、既存テストへの影響は無い想定。
 
 ### 2. WS接続の生存期間
@@ -80,14 +84,14 @@ WSアップグレードに失敗した場合(接続拒否、プロキシ等に�
 
 ## テスト方針
 
-1. `for_new_turn`: `CodexProvider`・`OpenAiProvider`双方で、返されたインスタンスが独立した状態(接続・turn-stateを共有しない)を持つこと。
-2. `spawn.rs`の`run_wave`: 各subagentタスクが`for_new_turn()`経由で得たプロバイダハンドルを使うこと(モックプロバイダで`for_new_turn`の呼び出し回数・独立性を検証)。
+1. `for_new_turn`: `CodexProvider`は`Some`を返し、返されたインスタンスが独立した状態(接続・turn-stateを共有しない)を持つこと。デフォルト実装(`OpenAiProvider`・テスト用モック)は`None`を返すこと。
+2. `spawn.rs`の`run_wave`: 各subagentタスクが`for_new_turn().unwrap_or_else(|| provider_pool.clone())`経由で得たプロバイダハンドルを使うこと(モックプロバイダで呼び出し回数・独立性を検証)。
 3. WS接続確立・再利用・フォールバックのテストは、正確なワイヤ形式が判明してから設計する(実装計画側のタスクとして先送り)。ローカルWSテストサーバ(crateの選定含む)を使うか、upstream同様に接続層を抽象化してモック可能にするかは実装時に判断する。
 4. 既存の`attempt`(HTTP/SSE)経路の全テストは無変更のまま通ること(フォールバック経路として存置されるため)。
 
 ## 受け入れ基準
 
-1. `Provider`トレイトに`for_new_turn`が追加され、`CodexProvider`・`OpenAiProvider`双方に実装がある。
+1. `Provider`トレイトに、`None`を返すデフォルト実装付きの`for_new_turn`が追加され、`CodexProvider`がこれを`Some`を返す形で上書きしている。
 2. `spawn::run_wave`が各subagentタスクへ`for_new_turn()`由来の独立したプロバイダハンドルを渡し、親の`run_loop`とWS接続・turn-stateを共有しない。
 3. `CodexProvider`がWS接続を確立できる環境では、複数ターンにわたって同一接続を再利用する。
 4. WS接続を確立できない環境では、現行のHTTP/SSE経路(`attempt`)へ自動的にフォールバックし、フェーズ1以前と同じ挙動になる。

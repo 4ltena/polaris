@@ -77,7 +77,7 @@ pub fn all_specs() -> Vec<ToolSpec> {
 fn read_spec() -> ToolSpec {
     ToolSpec {
         name: "read",
-        description: "Read a file. Returns it with line numbers. Omit limit for up to 2000 lines from offset; don't guess a small limit, it just forces a second read.",
+        description: "Read a file. Returns it with line numbers. Omit limit unless you truly want less than 2000 lines - a guessed smaller value just forces a second read.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

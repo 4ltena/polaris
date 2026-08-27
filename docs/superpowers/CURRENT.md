@@ -1,6 +1,6 @@
 # polaris 現況
 
-最終更新 2026-08-26
+最終更新 2026-08-27
 
 ## この文書の役割
 
@@ -12,8 +12,8 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `bd1d8d8`、作業ツリーはクリーン）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカル32コミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`を指しており、それより後のreasoning item保持一式・会話履歴の自動圧縮一式(`dcfe7b9`〜`bd1d8d8`)はまだどの版にも含まれていない——バージョン付けは利用者の判断待ち |
-| 進行中の計画 | なし。プロンプトキャッシュ利用率の改善(`v0.7.0`)、reasoning item保持、会話履歴の自動圧縮(compaction、詳細は専用節)いずれも完了・ワークスペース全体で検証済み。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
+| ブランチ | `main`（HEAD `533b0a1`、作業ツリーはクリーン）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカルコミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`を指したまま——それより後のreasoning item保持一式・自動履歴圧縮一式・system prompt検証ルール追加・read往復数削減2件(`dcfe7b9`〜`533b0a1`)は`v0.7.0`へ統合する方針が確定済み（下記「版の方針」参照）だが再タグ付けはまだ |
+| 進行中の計画 | なし（SDD計画としては）。ただし brainstorming による `store: true` + `previous_response_id` 化の検討が次に着手予定（下記「polaris vs codex 生トークン量の差」節）。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
 | 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
 | 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md`、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress-design.md`、`docs/superpowers/specs/2026-08-25-polaris-tui-fullscreen-scroll-design.md` |
@@ -86,6 +86,26 @@ codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割�
 **未対応のまま残した最終レビュー指摘(コード変更を伴わないため、fix waveの対象外とした)**:
 - ~~コンパクション(履歴圧縮)が無い件~~ → 2026-08-26中に別のspec・plan・SDD実行で解消済み。下記「会話履歴の自動圧縮」節を見よ
 - `/model`でセッション途中にモデルを切り替えると、前のモデルが生成した`encrypted_content`を別モデルへ再送する形になる。upstreamも同じ挙動だが、compactionが圧縮しなかった直近ターンにこの前提モデルのreasoning itemが残っていた場合、実際に400が返るかどうかは未確認(`/model`切り替え後に1ターン回すだけの簡単な実地確認で足りる)。compaction自体はこの問題を直接は解決しない——要約テキストはモデル非依存の平文になるが、`KEEP_RECENT_USER_TURNS`分の直近ターンはencrypted_contentごと残る
+
+## polaris vs codex の生トークン量の差(2026-08-27、調査完了・read側の対処は実装済み)
+
+利用者から「精度向上作業の一環として`polaris`/`codex`両方に『このプロジェクトを分析する』を与えて比較したところ、polarisのraw total(698,358)がcodexのtotal(86,878)を大幅に上回っており、固定コンテキストの床を減らすという当初目標に反して問題」との指摘を受けて開始した調査。
+
+**根本原因(両実装のコードで確認済み)**: `crates/polaris-provider/src/codex.rs:132-135`は`store: false`を明示し、毎ターン履歴全体を再送する設計(「サーバーに状態を持たせない、送信内容と計測内容を一致させる」という設計原則による意図的な選択)。一方、upstream `codex-rs`(`core/src/client.rs:1165-1252`、`:265-266`)はWebSocketセッション+`previous_response_id`で**前回レスポンスからの差分アイテムのみ**を送る。つまり2つの「total tokens」はそもそも同じものを計測していない。polarisのraw totalは往復ごとに履歴全体を数え直すため往復数にほぼ比例して伸びる(実測: 変更前は最終内容量71,037と3実行中最小にもかかわらずraw totalは699,872と3実行中最大——内容量ではなく往復数が支配的要因)。
+
+**副産物として判明したデバッグ上の罠**: `/Users/kn/.polaris/state/<project-id>/audit.jsonl`の`result`/`detail`はログ保存用に4 KiBへ切り詰められる(`crates/polaris-core/src/audit.rs:88`の`MAX_RESULT_BYTES`)。多くの`read`呼び出しの`result_len`が`limit`の値によらず~4200バイトに集中して見えたのはこの切り詰めであり、モデルに実際に送られた内容量の指標ではない。audit logの`result`長を会話コスト測定の代理指標に使わないこと。
+
+**read往復数削減(commit `8666bdc`・`533b0a1`、実装・計測済み)**: `read`ツールの説明文が「`limit`省略時どうなるか」を一切述べておらず、モデルは常に小さめの`limit`(120〜300行)を指定して大きいファイルで2回目の読み込みを要していた。説明文へ既定値(2,000行)を明示し、さらに「省略が既定選択」と明言する形へ2段階で強めた。同一プロンプトでのA/B実測:
+
+| | 往復数 | raw total | キャッシュヒット率 |
+| --- | --- | --- | --- |
+| 変更前 | 16 | 699,872 | 88.1% |
+| 修正1後 | 8 | 521,304 | 78.5% |
+| 修正2後 | 7 | 461,611 | 73.5% |
+
+raw totalは34%減ったが、キャッシュヒット率も88.1%→73.5%まで下がった。往復を減らせばキャッシュ再利用の機会も減るという表裏の関係で、これは`store: false`のままでは避けられない(下記の構造的理由による)。利用者の判断で、この2件はキャッシュ比率低下込みで確定・維持することにした。
+
+**「キャッシュ比率を90%前後に保ったままraw totalを減らす」ための追加調査**: `store: false`では`raw total ≈ 往復数 × 平均コンテキストサイズ ÷ 2`という関係になり、キャッシュヒット率も往復の細かさ(小さい増分を何度も送るほど高い)に依存する。両者は同じ「往復粒度」という1つのダイヤルの表裏であり、このダイヤルを動かす限りどちらかを犠牲にせざるを得ない。`read.rs:128-133`は部分読み込み時点で既にファイルの総行数を返しており、モデルが2回目の読み込みを要するかどうかは情報不足ではなく都度の判断によるものと確認した。往復粒度を保ったまま読む総量そのものを削る(重複読み込みの排除など)手段は、変更前の内容量(71,037)が既にかなり切り詰められているため上限が小さい(体感10〜15%程度)。**両立を構造的に実現できる手段は`store: true` + `previous_response_id`化のみ**というのがこの調査の結論。利用者の判断で、read側の2件は確定させたうえで、`store: true`化の設計をbrainstormingスキルで別途進める方針となった(まだ着手前)。
 
 ## 会話履歴の自動圧縮(compaction、2026-08-26、実装完了)
 
@@ -389,7 +409,7 @@ M2.5 完了後、初めて実際の ChatGPT サブスクリプションで一気
 | 真の同時最大（憲法と環境を同時に飽和させ skill 100 件） | 855 トークン | `constitution.rs` の `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget` |
 | codex 側ツールワイヤ形式での下限（openai と並行して独立に固定） | 486 トークン | `budget.rs` の `always_on_tokens_counts_the_wire_shape_not_the_bare_tool_spec` |
 | 上限 | 990 トークン | |
-| ツール本数 | 5 / 上限 6 | |
+| ツール本数 | 6 / 上限 6（`read`/`write`/`edit`/`bash`/`skill`/`spawn`） | |
 | テスト | 350 件（ホスト。Linux コンテナは M2 完了時点で 260 件を確認、M2.5 以降は polaris-auth/provider のみで Linux 固有のサンドボックス経路には触れていない） | |
 
 常時コンテキストは、実際に送信されるシステムプロンプトとツールスキーマを `tiktoken_rs::o200k_base()` で数えた実測値である。見積ではない。
@@ -505,14 +525,14 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-26、会話履歴の自動圧縮(compaction)のSDD実行(全6タスク+Task 5内fix round+plan全体の最終レビューのfix wave)が完了し、ワークスペース全体の検証まで済んだ直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
+本節は2026-08-27、read往復数削減2件(commit `8666bdc`・`533b0a1`)とCURRENT.mdのHEAD/ツール数の記載修正が完了した直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
 
 優先度順:
 
-1. **reasoning item保持・compactionを含む30件超のローカル未pushコミットの扱いを利用者と決める。** `v0.7.0`タグ(`60bdebe`)より後に積んだ`dcfe7b9`〜`bd1d8d8`(reasoning item保持一式+compaction一式)がまだどの版にも属していない。`v0.7.0`へ含めるか、新しく`v0.8.0`「`Antares`」として切るかを確認し、CHANGELOG追記・タグ付けへ進む(標準ルール通りタグ・CHANGELOG・push は別々の明示的承認が要る)
-2. **compactionの実機での自動発火を実地確認する。** 今回のセッションではtmux操作が環境側の制約で機能せず未実施。自動テストでの検証にとどまっている(上の「会話履歴の自動圧縮」節参照)
-3. **`/resume`ピッカーのプレビューが圧縮後は毎回同じ文言になる件。** 最終レビューのImportant指摘だが、`sessions.rs`という今回のplanが触れていないファイルに及ぶため今回のfix waveでは対応せず先送りした(上の「会話履歴の自動圧縮」節参照)。データを壊すものではない
-4. **SDDワークスペースの後始末。** `.superpowers/sdd/2026-08-26-polaris-history-compaction/`(台帳・brief・reportなど)は削除済み(finishing-a-development-branch完了に伴う)
+1. **`store: true` + `previous_response_id`化の設計をbrainstormingスキルで進める。** 「polaris vs codexの生トークン量の差」節の調査結論を受けて利用者が明示的に指示した次の一手。会話をOpenAI側サーバーに保持することになる点(現行の「サーバーに状態を持たせない」設計原則からの転換)、`polaris-provider`のトランスポート変更(WS化の要否)、`compaction.rs`との整合(圧縮後の要約とサーバー側保持状態の食い違い)が主な論点。着手前
+2. **v0.7.0の版付けを確定させる。** reasoning item保持・compaction・system prompt検証ルール・read往復数削減2件は全て`v0.7.0`「`Zubenelgenubi`」へ含める方針が確定済み(2026-08-27)。`store:true`化を含めるかは設計・実装が終わってから判断。CHANGELOG追記・再タグ付け・pushは標準ルール通りそれぞれ別の明示的承認が要る
+3. **compactionの実機での自動発火を実地確認する。** tmux操作が環境側の制約で機能せず未実施のまま(上の「会話履歴の自動圧縮」節参照)。自動テストでの検証にとどまっている
+4. **`/resume`ピッカーのプレビューが圧縮後は毎回同じ文言になる件。** 最終レビューのImportant指摘だが、`sessions.rs`という当時のplanが触れていないファイルに及ぶため先送りした(上の「会話履歴の自動圧縮」節参照)。データを壊すものではない
 5. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
 6. **`/model`切り替え後にreasoning replayが失敗しないかの実地確認**(上の「reasoning item保持」節末尾)。壊れている証拠は無い、優先度は低い
 

@@ -6,6 +6,10 @@ use polaris_provider::{Message, ReasoningItem, ToolCall};
 #[derive(Default, Clone)]
 pub struct Session {
     pub messages: Vec<Message>,
+    /// Saves the full original history before a valid summary replaces it.
+    pub before_compact: Option<std::sync::Arc<crate::compaction::ArchiveHook>>,
+    /// Optional local override; no model window is inferred.
+    pub compaction_threshold: Option<usize>,
 }
 
 impl Session {

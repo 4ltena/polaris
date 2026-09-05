@@ -66,13 +66,14 @@ impl crate::approval::Approver for AutoApprove {
 /// What a successful turn produced: the final text, and the token usage
 /// accumulated across every `provider.complete()` call the turn made
 /// (a turn that used a tool calls the provider more than once). A
-/// response whose `usage` came back `None` contributes nothing to this
-/// total rather than failing the turn — usage is a best-effort report,
-/// never something the loop depends on to function.
+/// response whose `usage` came back `None` is recorded as missing in
+/// `usage_report`. Known totals include summaries and children; missing
+/// usage is never evidence of zero consumption.
 #[derive(Debug)]
 pub struct AgentOutcome {
     pub text: String,
     pub usage: polaris_provider::Usage,
+    pub usage_report: polaris_provider::UsageReport,
 }
 
 /// Pass in `always_on` as something [`crate::prompt::assemble_always_on`]
@@ -301,7 +302,13 @@ pub(crate) async fn run_loop(
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
-    let mut usage = polaris_provider::Usage::default();
+    // Both paths share one meter: direct calls (including summaries), and
+    // the pool used by spawn/files.md children. Never add child totals to
+    // this snapshot; their actual calls have already been observed here.
+    let meter = polaris_provider::UsageMeter::default();
+    let metered_provider = meter.wrap(provider);
+    let provider: &dyn Provider = &metered_provider;
+    let provider_pool: Arc<dyn Provider> = Arc::new(meter.wrap(provider_pool));
     loop {
         // Call unconditionally every turn. If this were only called on
         // error, a call pattern that never triggers an error would never
@@ -318,8 +325,18 @@ pub(crate) async fn run_loop(
 
         let total_tokens = crate::budget::always_on_tokens(system, tools)
             + crate::compaction::session_tokens(&session.messages);
-        if crate::compaction::should_compact(total_tokens) {
-            match crate::compaction::compact(provider, &mut session.messages).await {
+        if total_tokens
+            >= session
+                .compaction_threshold
+                .unwrap_or(crate::compaction::COMPACTION_THRESHOLD)
+        {
+            match crate::compaction::compact_with_archive(
+                provider,
+                &mut session.messages,
+                session.before_compact.as_deref(),
+            )
+            .await
+            {
                 Ok(Some(report)) => {
                     if let Some(tx) = &events {
                         let _ = tx.send(crate::events::AgentEvent::HistoryCompacted {
@@ -353,21 +370,12 @@ pub(crate) async fn run_loop(
             })
             .await?;
 
-        if let Some(u) = res.usage {
-            usage.input_tokens += u.input_tokens;
-            usage.output_tokens += u.output_tokens;
-            usage.total_tokens += u.total_tokens;
-            // Dropping this reported `cache 0` for every run regardless of
-            // what the provider actually served from cache, since the
-            // TUI's own accumulator only ever sees this total.
-            usage.cached_tokens += u.cached_tokens;
-        }
-
         if res.tool_calls.is_empty() {
             session.push_assistant(&res.text, res.reasoning);
             return Ok(AgentOutcome {
                 text: res.text,
-                usage,
+                usage: meter.snapshot().usage,
+                usage_report: meter.snapshot(),
             });
         }
 
@@ -2328,6 +2336,103 @@ print("wrote")
     }
 
     #[tokio::test]
+    async fn custom_threshold_meters_summaries_even_when_empty_or_archive_fails() {
+        for (summary, archive_fails) in [("summary", false), (" \n", false), ("summary", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = Session::new();
+            session.compaction_threshold = Some(1_000);
+            session.push_user("old");
+            session.push_assistant(&"x".repeat(10_000), vec![]);
+            session.push_user("recent");
+            session.push_user("latest");
+            let original = serde_json::to_value(&session.messages).unwrap();
+            let archived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = archived.clone();
+            session.before_compact = Some(Arc::new(move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if archive_fails {
+                    Err(std::io::Error::other("archive failed"))
+                } else {
+                    Ok(())
+                }
+            }));
+            let p = Scripted {
+                replies: Mutex::new(vec![
+                    CompletionResponse {
+                        text: summary.into(),
+                        usage: Some(polaris_provider::Usage {
+                            input_tokens: 100,
+                            output_tokens: 10,
+                            total_tokens: 110,
+                            cached_tokens: 50,
+                        }),
+                        ..Default::default()
+                    },
+                    CompletionResponse {
+                        text: "done".into(),
+                        usage: Some(polaris_provider::Usage {
+                            input_tokens: 20,
+                            output_tokens: 5,
+                            total_tokens: 25,
+                            cached_tokens: 10,
+                        }),
+                        ..Default::default()
+                    },
+                ]),
+            };
+            let always_on = crate::prompt::assemble_always_on("", "", &[]);
+            let mut stop = StopTracker::new(10);
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let outcome = run(
+                &p,
+                &mut session,
+                shared_audit(&dir.path().join("audit.jsonl")),
+                &mut stop,
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                Some(tx),
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.text, "done");
+            assert_eq!(outcome.usage.total_tokens, 135);
+            assert_eq!(outcome.usage.input_tokens, 120);
+            assert_eq!(outcome.usage.output_tokens, 15);
+            assert_eq!(outcome.usage.cached_tokens, 60);
+            assert_eq!(outcome.usage_report.reported_responses, 2);
+            assert_eq!(
+                archived.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(!summary.trim().is_empty())
+            );
+            if summary.trim().is_empty() || archive_fails {
+                assert_eq!(
+                    serde_json::to_value(&session.messages[..4]).unwrap(),
+                    original
+                );
+                assert!(rx.try_recv().is_err());
+            } else {
+                assert_eq!(session.messages.len(), 4);
+                assert!(matches!(
+                    rx.try_recv().unwrap(),
+                    crate::events::AgentEvent::HistoryCompacted { .. }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_turn_that_crosses_the_compaction_threshold_compacts_before_sending() {
         let dir = tempfile::tempdir().expect("temp directory");
 
@@ -2574,16 +2679,34 @@ print("wrote")
                             }]
                         }),
                     }],
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                        total_tokens: 13,
+                        cached_tokens: 5,
+                    }),
                     ..Default::default()
                 },
                 CompletionResponse {
                     text: subagent_result.clone(),
                     tool_calls: vec![],
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                        total_tokens: 13,
+                        cached_tokens: 5,
+                    }),
                     ..Default::default()
                 },
                 CompletionResponse {
                     text: "the subagent reported back".into(),
                     tool_calls: vec![],
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                        total_tokens: 13,
+                        cached_tokens: 5,
+                    }),
                     ..Default::default()
                 },
             ]),
@@ -2618,8 +2741,14 @@ print("wrote")
             &mut ctx,
         )
         .await
-        .expect("the root loop failed")
-        .text;
+        .expect("the root loop failed");
+        assert_eq!(out.usage.total_tokens, 39);
+        assert_eq!(out.usage.input_tokens, 30);
+        assert_eq!(out.usage.output_tokens, 9);
+        assert_eq!(out.usage.cached_tokens, 15);
+        assert_eq!(out.usage_report.reported_responses, 3);
+        assert_eq!(out.usage_report.missing_responses, 0);
+        let out = out.text;
         assert_eq!(out, "the subagent reported back");
 
         let tool_msg = session
@@ -3220,7 +3349,7 @@ print("wrote")
     }
 
     #[tokio::test]
-    async fn a_response_with_no_usage_contributes_zero_not_a_failure() {
+    async fn a_response_with_no_usage_is_reported_as_missing() {
         let dir = tempfile::tempdir().expect("temp directory");
         let p = Scripted {
             replies: Mutex::new(vec![CompletionResponse {
@@ -3261,6 +3390,8 @@ print("wrote")
         .expect("should succeed");
 
         assert_eq!(outcome.usage.total_tokens, 0);
+        assert_eq!(outcome.usage_report.missing_responses, 1);
+        assert_eq!(outcome.usage_report.reported_responses, 0);
     }
 
     #[tokio::test]

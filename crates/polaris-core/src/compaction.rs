@@ -104,11 +104,42 @@ fn cut_index(messages: &[Message]) -> usize {
     user_positions[user_positions.len() - KEEP_RECENT_USER_TURNS]
 }
 
+#[derive(Debug)]
 pub struct CompactionReport {
     pub messages_before: usize,
     pub messages_after: usize,
     pub tokens_before: usize,
     pub tokens_after: usize,
+}
+
+pub type ArchiveHook = dyn Fn(&[Message]) -> std::io::Result<()> + Send + Sync;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CompactionError {
+    #[error("provider: {0}")]
+    Provider(#[from] ProviderError),
+    #[error("could not archive history: {0}")]
+    Archive(#[from] std::io::Error),
+}
+
+/// Usage survives an empty summary or a failure to archive the original.
+#[derive(Debug)]
+pub struct CompactionOutcome {
+    pub result: Result<Option<CompactionReport>, CompactionError>,
+    pub usage_report: polaris_provider::UsageReport,
+}
+
+pub async fn compact_with_usage(
+    provider: &dyn Provider,
+    messages: &mut Vec<Message>,
+    before_compact: Option<&ArchiveHook>,
+) -> CompactionOutcome {
+    let meter = polaris_provider::UsageMeter::default();
+    let result = compact_with_archive(&meter.wrap(provider), messages, before_compact).await;
+    CompactionOutcome {
+        result,
+        usage_report: meter.snapshot(),
+    }
 }
 
 /// Returns `Ok(None)` — not an error, just a no-op — when there's nothing
@@ -119,6 +150,18 @@ pub async fn compact(
     provider: &dyn Provider,
     messages: &mut Vec<Message>,
 ) -> Result<Option<CompactionReport>, ProviderError> {
+    match compact_with_archive(provider, messages, None).await {
+        Ok(report) => Ok(report),
+        Err(CompactionError::Provider(error)) => Err(error),
+        Err(CompactionError::Archive(_)) => unreachable!("no archive hook supplied"),
+    }
+}
+
+pub async fn compact_with_archive(
+    provider: &dyn Provider,
+    messages: &mut Vec<Message>,
+    before_compact: Option<&ArchiveHook>,
+) -> Result<Option<CompactionReport>, CompactionError> {
     let cut = cut_index(messages);
     if cut == 0 || session_tokens(&messages[..cut]) < MIN_TOKENS_TO_SUMMARIZE {
         return Ok(None);
@@ -146,6 +189,10 @@ pub async fn compact(
         return Ok(None);
     }
 
+    if let Some(archive) = before_compact {
+        archive(messages)?;
+    }
+
     let mut new_messages = vec![Message::user(format!("{SUMMARY_PREFIX}{}", res.text))];
     new_messages.extend_from_slice(&messages[cut..]);
     *messages = new_messages;
@@ -161,6 +208,97 @@ pub async fn compact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MeasuredSummary(&'static str);
+
+    #[async_trait::async_trait]
+    impl Provider for MeasuredSummary {
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<polaris_provider::CompletionResponse, ProviderError> {
+            Ok(polaris_provider::CompletionResponse {
+                text: self.0.into(),
+                usage: Some(polaris_provider::Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    total_tokens: 110,
+                    cached_tokens: 50,
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn compactable_history() -> Vec<Message> {
+        vec![
+            Message::user("old"),
+            Message::assistant("x".repeat(MIN_TOKENS_TO_SUMMARIZE * 10)),
+            Message::user("recent"),
+            Message::user("latest"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn measured_empty_summary_keeps_usage_without_archiving_or_replacing() {
+        let mut messages = compactable_history();
+        let original = serde_json::to_value(&messages).unwrap();
+        let archive =
+            |_: &[Message]| -> std::io::Result<()> { panic!("empty summary must not archive") };
+        let outcome =
+            compact_with_usage(&MeasuredSummary(" \n"), &mut messages, Some(&archive)).await;
+        assert!(outcome.result.unwrap().is_none());
+        assert_eq!(outcome.usage_report.usage.total_tokens, 110);
+        assert_eq!(outcome.usage_report.reported_responses, 1);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn measured_archive_failure_preserves_full_history_and_usage() {
+        let mut messages = compactable_history();
+        let original = serde_json::to_value(&messages).unwrap();
+        let expected = original.clone();
+        let archive = move |history: &[Message]| -> std::io::Result<()> {
+            assert_eq!(serde_json::to_value(history).unwrap(), expected);
+            Err(std::io::Error::other("archive unavailable"))
+        };
+        let outcome =
+            compact_with_usage(&MeasuredSummary("summary"), &mut messages, Some(&archive)).await;
+        assert!(matches!(outcome.result, Err(CompactionError::Archive(_))));
+        assert_eq!(outcome.usage_report.usage.total_tokens, 110);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn archive_receives_original_history_before_successful_replacement() {
+        let mut messages = compactable_history();
+        let original = serde_json::to_value(&messages).unwrap();
+        let archived = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let saved = archived.clone();
+        let archive = move |history: &[Message]| -> std::io::Result<()> {
+            *saved.lock().unwrap() = Some(serde_json::to_value(history).unwrap());
+            Ok(())
+        };
+        let outcome =
+            compact_with_usage(&MeasuredSummary("summary"), &mut messages, Some(&archive)).await;
+        assert!(outcome.result.unwrap().is_some());
+        assert_eq!(archived.lock().unwrap().as_ref(), Some(&original));
+        assert_eq!(messages.len(), 3);
+        assert_eq!(outcome.usage_report.usage.cached_tokens, 50);
+    }
+
+    #[tokio::test]
+    async fn measured_no_op_is_not_a_missing_response() {
+        let outcome = compact_with_usage(
+            &MeasuredSummary("summary"),
+            &mut vec![Message::user("new")],
+            None,
+        )
+        .await;
+        assert!(outcome.result.unwrap().is_none());
+        assert_eq!(outcome.usage_report.reported_responses, 0);
+        assert_eq!(outcome.usage_report.missing_responses, 0);
+    }
 
     fn user(content: &str) -> Message {
         Message::user(content)

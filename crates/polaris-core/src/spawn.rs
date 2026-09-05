@@ -514,6 +514,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_meter_keeps_schema_retry_costs_on_success_and_failure() {
+        for succeeds in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let valid =
+                serde_json::json!({"path": "a.rs", "responsibility": "entry", "test_file": null})
+                    .to_string();
+            let mut first = text("invalid JSON");
+            first.usage = Some(polaris_provider::Usage {
+                input_tokens: 10,
+                output_tokens: 3,
+                total_tokens: 13,
+                cached_tokens: 5,
+            });
+            let mut retry = text(if succeeds { &valid } else { "still invalid" });
+            retry.usage = Some(polaris_provider::Usage {
+                input_tokens: 20,
+                output_tokens: 4,
+                total_tokens: 24,
+                cached_tokens: 8,
+            });
+            let meter = polaris_provider::UsageMeter::default();
+            let provider: Arc<dyn Provider> = Arc::new(meter.wrap(scripted(vec![first, retry])));
+            let outcome = run_one(
+                &SpawnTask {
+                    agent_type: "file-inspector".into(),
+                    task: "inspect".into(),
+                    write_root: None,
+                },
+                &[file_inspector()],
+                provider,
+                audit_in(dir.path()),
+                &full_access(),
+                Path::new("/bin/true"),
+                None,
+            )
+            .await;
+            assert_eq!(matches!(outcome, TaskOutcome::Ok(_)), succeeds);
+            let report = meter.snapshot();
+            assert_eq!(report.usage.total_tokens, 37);
+            assert_eq!(report.usage.input_tokens, 30);
+            assert_eq!(report.usage.output_tokens, 7);
+            assert_eq!(report.usage.cached_tokens, 13);
+            assert_eq!(report.reported_responses, 2);
+            assert_eq!(report.missing_responses, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn a_subagent_that_uses_a_tool_and_returns_matching_json_succeeds() {
         let dir = tempfile::tempdir().expect("temp directory");
         let target = dir.path().join("a.rs");

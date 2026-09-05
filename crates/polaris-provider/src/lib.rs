@@ -187,6 +187,105 @@ pub struct Usage {
     pub cached_tokens: u32,
 }
 
+/// Known consumption and coverage of a group of requests. Missing usage
+/// and failed requests are not evidence of zero consumption.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UsageReport {
+    pub usage: Usage,
+    pub reported_responses: u64,
+    pub missing_responses: u64,
+    /// Provider errors and requests dropped after polling began but before
+    /// a response arrived. Consumption is unknown, not necessarily zero;
+    /// an unpolled future never starts a request and is not counted.
+    pub failed_requests: u64,
+}
+
+/// Shared observation of actual provider calls, including calls whose
+/// results are discarded (empty summaries, schema retries, failed children).
+#[derive(Clone, Default)]
+pub struct UsageMeter(std::sync::Arc<std::sync::Mutex<UsageReport>>);
+
+impl UsageMeter {
+    pub fn snapshot(&self) -> UsageReport {
+        *self.0.lock().expect("usage meter poisoned")
+    }
+
+    pub fn wrap<P>(&self, provider: P) -> MeteredProvider<P> {
+        MeteredProvider {
+            provider,
+            meter: self.clone(),
+        }
+    }
+
+    fn record(&self, result: &Result<CompletionResponse, ProviderError>) {
+        let mut report = self.0.lock().expect("usage meter poisoned");
+        match result {
+            Ok(response) => match response.usage {
+                Some(usage) => {
+                    report.reported_responses = report.reported_responses.saturating_add(1);
+                    let total = &mut report.usage;
+                    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+                    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+                    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+                    total.cached_tokens = total.cached_tokens.saturating_add(usage.cached_tokens);
+                }
+                None => report.missing_responses = report.missing_responses.saturating_add(1),
+            },
+            Err(_) => report.failed_requests = report.failed_requests.saturating_add(1),
+        }
+    }
+}
+
+/// Accounts for cancellation when the async call is dropped at its await.
+/// Normal completion disarms the guard after recording the response once.
+struct RequestGuard<'a> {
+    meter: &'a UsageMeter,
+    completed: bool,
+}
+
+impl Drop for RequestGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Drop may run during unwinding; do not panic again on poison.
+            let mut report = self.meter.0.lock().unwrap_or_else(|e| e.into_inner());
+            report.failed_requests = report.failed_requests.saturating_add(1);
+        }
+    }
+}
+
+/// Wrap each execution path once per meter; child totals must not then be
+/// added again. A separate meter may observe a subset through this wrapper.
+pub struct MeteredProvider<P> {
+    provider: P,
+    meter: UsageMeter,
+}
+
+#[async_trait::async_trait]
+impl<P> Provider for MeteredProvider<P>
+where
+    P: std::ops::Deref + Send + Sync,
+    P::Target: Provider,
+{
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
+        let mut guard = RequestGuard {
+            meter: &self.meter,
+            completed: false,
+        };
+        let result = self.provider.complete(req).await;
+        self.meter.record(&result);
+        guard.completed = true;
+        result
+    }
+
+    fn set_model(&self, model: &str) {
+        self.provider.set_model(model);
+    }
+
+    fn set_effort(&self, effort: Option<&str>) {
+        self.provider.set_effort(effort);
+    }
+}
+
 /// One provider round trip. `reasoning` is populated only by providers
 /// that carry the concept (Codex); it's empty otherwise and meant to be
 /// attached to the resulting `Message` via `with_reasoning` so it can be
@@ -262,6 +361,164 @@ pub trait TokenSource: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PendingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for PendingProvider {
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            std::future::pending().await
+        }
+    }
+
+    struct ErrorProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ErrorProvider {
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Err(ProviderError::Http("failed".into()))
+        }
+    }
+
+    fn empty_request() -> CompletionRequest {
+        CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+        }
+    }
+
+    #[test]
+    fn meter_records_dropped_polled_requests_as_unknown_once_per_scope() {
+        let outer = UsageMeter::default();
+        let inner = UsageMeter::default();
+        let provider = outer.wrap(&PendingProvider);
+        let wrapped = inner.wrap(&provider);
+
+        drop(wrapped.complete(empty_request()));
+        assert_eq!(outer.snapshot().failed_requests, 0);
+        assert_eq!(inner.snapshot().failed_requests, 0);
+
+        let mut request = wrapped.complete(empty_request());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(request.as_mut().poll(&mut context).is_pending());
+        assert!(request.as_mut().poll(&mut context).is_pending());
+        drop(request);
+
+        for meter in [outer, inner] {
+            let report = meter.snapshot();
+            assert_eq!(report.failed_requests, 1);
+            assert_eq!(report.reported_responses, 0);
+            assert_eq!(report.missing_responses, 0);
+            assert_eq!(report.usage.total_tokens, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn meter_disarms_drop_guard_for_success_missing_usage_and_error() {
+        let meter = UsageMeter::default();
+        let known = Canned {
+            reply: CompletionResponse {
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    total_tokens: 13,
+                    cached_tokens: 5,
+                }),
+                ..Default::default()
+            },
+        };
+        meter.wrap(&known).complete(empty_request()).await.unwrap();
+        let report = meter.snapshot();
+        assert_eq!(report.reported_responses, 1);
+        assert_eq!(report.failed_requests, 0);
+        assert_eq!(report.usage.total_tokens, 13);
+        assert_eq!(report.usage.input_tokens, 10);
+        assert_eq!(report.usage.output_tokens, 3);
+        assert_eq!(report.usage.cached_tokens, 5);
+
+        let missing = Canned {
+            reply: CompletionResponse::default(),
+        };
+        meter
+            .wrap(&missing)
+            .complete(empty_request())
+            .await
+            .unwrap();
+        assert_eq!(meter.snapshot().missing_responses, 1);
+        assert_eq!(meter.snapshot().failed_requests, 0);
+
+        assert!(
+            meter
+                .wrap(&ErrorProvider)
+                .complete(empty_request())
+                .await
+                .is_err()
+        );
+        let report = meter.snapshot();
+        assert_eq!(report.failed_requests, 1);
+        assert_eq!(report.reported_responses, 1);
+        assert_eq!(report.missing_responses, 1);
+        assert_eq!(report.usage.total_tokens, 13);
+    }
+
+    #[tokio::test]
+    async fn meter_distinguishes_zero_missing_failure_and_nested_scopes() {
+        let outer = UsageMeter::default();
+        let inner = UsageMeter::default();
+        let provider = Canned {
+            reply: CompletionResponse {
+                usage: Some(Usage::default()),
+                ..Default::default()
+            },
+        };
+        let wrapped = outer.wrap(&provider);
+        inner
+            .wrap(&wrapped)
+            .complete(CompletionRequest {
+                system: String::new(),
+                messages: vec![],
+                tools: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(outer.snapshot().reported_responses, 1);
+        assert_eq!(inner.snapshot().reported_responses, 1);
+        outer.record(&Ok(CompletionResponse::default()));
+        outer.record(&Err(ProviderError::Http("failed".into())));
+        let report = outer.snapshot();
+        assert_eq!(report.usage.total_tokens, 0);
+        assert_eq!(report.reported_responses, 1);
+        assert_eq!(report.missing_responses, 1);
+        assert_eq!(report.failed_requests, 1);
+    }
+
+    #[test]
+    fn meter_saturates_legacy_counters_instead_of_wrapping() {
+        let meter = UsageMeter::default();
+        let response = CompletionResponse {
+            usage: Some(Usage {
+                input_tokens: u32::MAX,
+                output_tokens: 1,
+                total_tokens: u32::MAX,
+                cached_tokens: u32::MAX,
+            }),
+            ..Default::default()
+        };
+        meter.record(&Ok(response.clone()));
+        meter.record(&Ok(response));
+        let report = meter.snapshot();
+        assert_eq!(report.usage.input_tokens, u32::MAX);
+        assert_eq!(report.usage.output_tokens, 2);
+        assert_eq!(report.usage.total_tokens, u32::MAX);
+        assert_eq!(report.usage.cached_tokens, u32::MAX);
+    }
 
     struct Canned {
         reply: CompletionResponse,

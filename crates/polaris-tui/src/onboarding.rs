@@ -493,9 +493,32 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_interactive_terminal_is_refused_immediately() {
-        // This test process's own stdin/stdout are not a real TTY under
-        // `cargo test`, so `run()` must hit its own guard and return
-        // NonInteractive rather than trying to draw anything or hang.
+        // Cargo may inherit a real terminal. Run this test in a child with
+        // explicit non-terminal streams, never against the user's TTY.
+        const CHILD: &str = "POLARIS_TEST_NON_INTERACTIVE_ONBOARDING";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "onboarding::tests::a_non_interactive_terminal_is_refused_immediately",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .expect("run non-interactive child");
+            assert!(
+                output.status.success(),
+                "child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(!std::io::stdin().is_terminal());
+        assert!(!std::io::stdout().is_terminal());
         let dir = tempfile::tempdir().expect("temp dir");
         let auth_path = dir.path().join("auth.json");
         let key_path = dir.path().join("api_key.json");
@@ -504,5 +527,7 @@ mod tests {
             .await
             .expect_err("a non-interactive terminal must be refused");
         assert!(matches!(err, OnboardingError::NonInteractive));
+        assert!(!auth_path.exists());
+        assert!(!key_path.exists());
     }
 }

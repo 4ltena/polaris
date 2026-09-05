@@ -4,8 +4,10 @@
 pub mod approver;
 mod clipboard;
 pub mod input;
+mod memory;
 pub mod onboarding;
 pub mod persist;
+pub use memory::{configure_memory, lock_memory};
 pub mod render;
 mod selection;
 pub mod sessions;
@@ -57,6 +59,8 @@ pub struct RunArgs<'a> {
     pub sessions_dir: PathBuf,
     pub audit_path: PathBuf,
     pub max_turns: u32,
+    pub remember: bool,
+    pub compact_at: Option<usize>,
     pub sandbox: SandboxPolicy,
     pub helper: PathBuf,
     pub approval_policy: ApprovalPolicy,
@@ -310,7 +314,9 @@ fn area_height_for_history(footer_height: u16, terminal_height: u16) -> u16 {
     terminal_height.saturating_sub(footer_height)
 }
 
-pub async fn run(args: RunArgs<'_>) -> ExitCode {
+pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
+    let usage_meter = polaris_provider::UsageMeter::default();
+    args.provider = Arc::new(usage_meter.wrap(args.provider.clone()));
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         eprintln!("polaris: refusing to start the TUI on a non-interactive terminal");
         return ExitCode::FAILURE;
@@ -466,7 +472,6 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         .initial_effort_name
         .clone()
         .unwrap_or_else(|| render::DEFAULT_EFFORT.to_string());
-    let mut cumulative_usage = polaris_provider::Usage::default();
     let mut status = Status::Idle;
     let mut key_reader = CrosstermKeyReader;
     let mut fatal_message: Option<String> = None;
@@ -493,6 +498,19 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     let mut local_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
 
     let exit_code = 'outer: loop {
+        let mut cumulative_usage = usage_meter.snapshot().usage;
+        session.compaction_threshold = args.compact_at;
+        if args.remember
+            && let Err(error) = memory::configure_saved_memory(
+                &mut session,
+                &args.cwd,
+                &args.state_dir,
+                &session_path,
+            )
+        {
+            fatal_message = Some(format!("履歴保存を準備できません: {error}"));
+            break 'outer ExitCode::FAILURE;
+        }
         // Recomputed every draw from the live buffer, so the popup tracks
         // each keystroke — not just the moment `/` was first typed.
         let suggestions = match input_buffer.strip_prefix('/') {
@@ -844,6 +862,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &mut session,
                                 &session_path,
                                 &mut status,
+                                &mut cumulative_usage,
                             )
                             .await;
                             printed_messages = session.messages.len();
@@ -865,7 +884,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &mut status,
                                 &args.provider_name,
                                 &model_name,
-                                cumulative_usage,
+                                usage_meter.snapshot(),
                                 args.skills,
                                 &args.cwd,
                                 &mut local_lines,
@@ -1147,6 +1166,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &mut session,
                         &session_path,
                         &mut status,
+                        &mut cumulative_usage,
                     )
                     .await;
                     printed_messages = session.messages.len();
@@ -1164,7 +1184,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &mut status,
                         &args.provider_name,
                         &model_name,
-                        cumulative_usage,
+                        usage_meter.snapshot(),
                         args.skills,
                         &args.cwd,
                         &mut local_lines,
@@ -1696,10 +1716,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
 
         match outcome {
             TurnOutcome::Done(Ok(result)) => {
-                cumulative_usage.input_tokens += result.usage.input_tokens;
-                cumulative_usage.output_tokens += result.usage.output_tokens;
-                cumulative_usage.total_tokens += result.usage.total_tokens;
-                cumulative_usage.cached_tokens += result.usage.cached_tokens;
+                let _ = result;
                 status = Status::Idle;
                 if history_compacted_this_turn {
                     if let Err(e) = persist::rewrite(&session_path, &session.messages) {
@@ -1898,11 +1915,20 @@ fn handle_fork(
     let new_session_path = sessions_dir.join(format!("{}.jsonl", new_session_id()));
     let new_meta_path = new_session_path.with_extension("meta.json");
     let started = now_millis();
+    let origin_cwd = persist::read_meta(meta_path)
+        .map(|meta| meta.cwd)
+        .unwrap_or_else(|| {
+            if session.messages.is_empty() {
+                cwd_display.to_owned()
+            } else {
+                String::new()
+            }
+        });
 
     if let Err(e) = persist::write_meta_if_absent(
         &new_meta_path,
         &persist::SessionMeta {
-            cwd: cwd_display.to_string(),
+            cwd: origin_cwd,
             started_at_millis: started,
         },
     ) {
@@ -2094,8 +2120,27 @@ async fn handle_compact(
     session: &mut polaris_core::session::Session,
     session_path: &std::path::Path,
     status: &mut Status,
+    usage: &mut polaris_provider::Usage,
 ) {
-    match polaris_core::compaction::compact(provider, &mut session.messages).await {
+    let outcome = polaris_core::compaction::compact_with_usage(
+        provider,
+        &mut session.messages,
+        session.before_compact.as_deref(),
+    )
+    .await;
+    usage.input_tokens = usage
+        .input_tokens
+        .saturating_add(outcome.usage_report.usage.input_tokens);
+    usage.output_tokens = usage
+        .output_tokens
+        .saturating_add(outcome.usage_report.usage.output_tokens);
+    usage.total_tokens = usage
+        .total_tokens
+        .saturating_add(outcome.usage_report.usage.total_tokens);
+    usage.cached_tokens = usage
+        .cached_tokens
+        .saturating_add(outcome.usage_report.usage.cached_tokens);
+    match outcome.result {
         Ok(None) => {
             *status = Status::Notice("nothing old enough to compact yet".to_string());
         }
@@ -2260,7 +2305,7 @@ fn apply_slash_action(
     status: &mut Status,
     provider_name: &str,
     model_name: &str,
-    cumulative_usage: polaris_provider::Usage,
+    usage_report: polaris_provider::UsageReport,
     // No longer read here — `/skills` is intercepted in `run()` before
     // dispatch (see `run_skills_picker`) now that it's a full-screen
     // picker instead of a one-line `Status::Notice`. Kept as a parameter
@@ -2285,13 +2330,16 @@ fn apply_slash_action(
             }
         }
         slash::Action::Status => {
+            let cumulative_usage = usage_report.usage;
             *status = Status::Notice(format!(
-                "{provider_name} / {model_name} — tokens: in {} / out {} / cache {} / total {} — {} messages",
+                "{provider_name} / {model_name} — tokens: in {} / out {} / cache {} / total {} — {} messages; 確認済み使用量、欠測 {} / 失敗 {}",
                 cumulative_usage.input_tokens,
                 cumulative_usage.output_tokens,
                 cumulative_usage.cached_tokens,
                 cumulative_usage.total_tokens,
                 session.messages.len(),
+                usage_report.missing_responses,
+                usage_report.failed_requests,
             ));
             SlashOutcome::Continue
         }
@@ -2477,7 +2525,14 @@ mod tests {
         session.push_assistant("reply 3", vec![]);
 
         let mut status = Status::Idle;
-        handle_compact(&Summarizer, &mut session, &session_path, &mut status).await;
+        handle_compact(
+            &Summarizer,
+            &mut session,
+            &session_path,
+            &mut status,
+            &mut polaris_provider::Usage::default(),
+        )
+        .await;
 
         assert!(
             matches!(&status, Status::Notice(s) if s.contains("compacted")),
@@ -2502,7 +2557,14 @@ mod tests {
         session.push_user("only turn");
         let mut status = Status::Idle;
 
-        handle_compact(&Summarizer, &mut session, &session_path, &mut status).await;
+        handle_compact(
+            &Summarizer,
+            &mut session,
+            &session_path,
+            &mut status,
+            &mut polaris_provider::Usage::default(),
+        )
+        .await;
 
         assert!(
             matches!(&status, Status::Notice(s) if s.contains("nothing")),
@@ -3156,7 +3218,7 @@ mod tests {
             status,
             "openai",
             "gpt-5.4",
-            polaris_provider::Usage::default(),
+            polaris_provider::UsageReport::default(),
             skills,
             cwd,
             local_lines,
@@ -3786,7 +3848,10 @@ mod tests {
             &mut status,
             "openai",
             "gpt-5.4",
-            usage,
+            polaris_provider::UsageReport {
+                usage,
+                ..Default::default()
+            },
             &[],
             dir.path(),
             &mut local_lines,
@@ -4001,6 +4066,48 @@ mod tests {
             Status::Notice(n) => assert!(n.contains("forked to")),
             _ => panic!("expected a Notice"),
         }
+    }
+
+    #[test]
+    fn fork_preserves_foreign_project_provenance_for_memory() {
+        let logs = tempfile::tempdir().unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        let current = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.push_user("original project decision");
+        let mut session_path = logs.path().join("original.jsonl");
+        let mut meta_path = session_path.with_extension("meta.json");
+        let origin_cwd = origin
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        persist::write_meta_if_absent(
+            &meta_path,
+            &persist::SessionMeta {
+                cwd: origin_cwd.clone(),
+                started_at_millis: 1,
+            },
+        )
+        .unwrap();
+        let mut started = 1;
+        let mut status = Status::Idle;
+        handle_fork(
+            logs.path(),
+            current.path().to_str().unwrap(),
+            &session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+        );
+        assert_eq!(persist::read_meta(&meta_path).unwrap().cwd, origin_cwd);
+        memory::configure_saved_memory(&mut session, current.path(), logs.path(), &session_path)
+            .unwrap();
+        assert!(session.before_compact.as_ref().unwrap()(&session.messages).is_err());
+        assert!(!logs.path().join("memory.sqlite3").exists());
     }
 
     #[test]

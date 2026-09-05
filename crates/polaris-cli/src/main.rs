@@ -18,9 +18,12 @@ use polaris_core::{
 use polaris_provider::openai::OpenAiProvider;
 use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
+mod memory;
+
 #[derive(Parser)]
 #[command(
     name = "polaris",
+    version,
     about = "A minimal-context coding agent",
     after_help = "\
 Environment variables:
@@ -49,6 +52,14 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     max_turns: u32,
 
+    /// 圧縮前の履歴をローカル保存し、プロジェクト別の検索索引を作る。
+    #[arg(long)]
+    remember: bool,
+
+    /// 自動圧縮を開始する推定トークン数。省略時は既存の200,000。
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1000..))]
+    compact_at: Option<u32>,
+
     /// Run as a confined child that reads one mutation operation from stdin
     /// and executes it. Internal use only; not meant to be invoked directly
     /// by users.
@@ -69,6 +80,8 @@ struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// ローカルに保存した会話の検索・取得・削除。
+    Memory(memory::Args),
     /// Authenticate with a ChatGPT subscription. Opens a browser.
     Login,
     /// Delete the stored credentials. Does not touch `~/.codex/`.
@@ -251,6 +264,7 @@ async fn main() -> ExitCode {
     let mut args = Args::parse();
 
     match args.command.take() {
+        Some(Command::Memory(options)) => return memory::run(options).await,
         Some(Command::Login) => {
             let store = match polaris_auth::store::default_path() {
                 Ok(p) => p,
@@ -556,7 +570,28 @@ async fn main() -> ExitCode {
 
     match args.prompt.clone() {
         Some(prompt) => {
+            let usage_meter = polaris_provider::UsageMeter::default();
+            let provider: std::sync::Arc<dyn polaris_provider::Provider> =
+                std::sync::Arc::new(usage_meter.wrap(provider.clone()));
             let mut session = Session::new();
+            session.compaction_threshold = args.compact_at.map(|n| n as usize);
+            if args.remember {
+                let session_id = format!(
+                    "exec-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                );
+                match polaris_tui::configure_memory(&mut session, &cwd, &state_dir, &session_id) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        eprintln!("履歴保存を準備できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             session.push_user(&prompt);
 
             // Exactly one handle, shared with whatever subagents `spawn`
@@ -609,10 +644,26 @@ async fn main() -> ExitCode {
                         outcome.usage.total_tokens,
                         session.messages.len(),
                     );
+                    let coverage = usage_meter.snapshot();
+                    eprintln!(
+                        "使用量の計測: 応答あり {} / 欠測 {} / 失敗 {}。欠測・失敗分の消費は不明です。",
+                        coverage.reported_responses,
+                        coverage.missing_responses,
+                        coverage.failed_requests
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
                     eprintln!("{e}");
+                    let coverage = usage_meter.snapshot();
+                    eprintln!(
+                        "終了までの確認済み消費: 入力 {} / 出力 {} / 合計 {}。欠測 {} / 失敗 {}。",
+                        coverage.usage.input_tokens,
+                        coverage.usage.output_tokens,
+                        coverage.usage.total_tokens,
+                        coverage.missing_responses,
+                        coverage.failed_requests
+                    );
                     ExitCode::FAILURE
                 }
             }
@@ -628,6 +679,8 @@ async fn main() -> ExitCode {
                 sessions_dir,
                 audit_path,
                 max_turns: args.max_turns,
+                remember: args.remember,
+                compact_at: args.compact_at.map(|n| n as usize),
                 sandbox,
                 helper,
                 approval_policy,

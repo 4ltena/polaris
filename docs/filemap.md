@@ -44,11 +44,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-cli/src`
 
 - `main.rs` — Entry point for the `polaris` binary. Decides the endpoint from environment
+- `memory.rs` — Local project memory commands; embedding requests require explicit configuration.
 
 ## `crates/polaris-cli/tests`
 
 - `cli.rs` — Integration tests for the CLI binary. Launches the real process to verify behavior.
 - `confined_helper.rs` — Integration test that launches the real `polaris` binary as a helper
+- `memory.rs` — Exercises project memory through the real CLI without model calls.
 - `subcommands.rs` — Pins down that subcommands are actually reachable.
 
 ## `crates/polaris-core`
@@ -82,6 +84,18 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/tests`
 
 - `filemap.rs` — A snapshot test that confirms `docs/filemap.md` matches the actual state of the repository.
+
+## `crates/polaris-memory`
+
+- `Cargo.toml` — manifest for the polaris-memory crate
+
+## `crates/polaris-memory/src`
+
+- `lib.rs` — Local, explicitly populated memory. Retrieved text is quoted historical evidence,
+
+## `crates/polaris-memory/tests`
+
+- `memory.rs` — Persistence, isolation, retrieval budgets and explicit embedding behavior.
 
 ## `crates/polaris-provider`
 
@@ -150,6 +164,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `clipboard.rs` — Copies text to the system clipboard via the OSC 52 terminal escape
 - `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from
 - `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
+- `memory.rs` — Explicitly enabled project memory and pre-compaction archival.
 - `onboarding.rs` — The onboarding screen: shown by `polaris-cli` when the interactive TUI
 - `persist.rs` — Session persistence: one JSON `Message` per line.
 - `render.rs` — Pure rendering: turns a `Session` + input state into terminal cells.
@@ -160,11 +175,12 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `docs`
 
+- `context-efficiency.md` — コンテキストの効率化とローカル記憶
 - `filemap.md` — File map
 
 ## `docs/superpowers`
 
-- `CURRENT.md` — polaris 現況
+- `CURRENT.md` — Polaris 現況
 
 ## `docs/superpowers/plans`
 

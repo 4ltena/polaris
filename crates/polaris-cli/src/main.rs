@@ -52,9 +52,29 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     max_turns: u32,
 
+    /// 実行モデル。省略時はPOLARIS_MODELまたは従来の既定値。
+    #[arg(long)]
+    model: Option<String>,
+
+    /// 推論強度を明示する。省略時は従来のアカウント設定。
+    #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
+    effort: Option<String>,
+
     /// 圧縮前の履歴をローカル保存し、プロジェクト別の検索索引を作る。
     #[arg(long)]
     remember: bool,
+
+    /// ツール結果の退避。既定はoff。履歴保存の--rememberとは独立。
+    #[arg(long, value_enum, default_value_t = ToolMemoryArg::Off)]
+    tool_memory: ToolMemoryArg,
+
+    /// ツール記憶用の埋め込みURL。モデルとの同時指定と記憶の有効化が必要。
+    #[arg(long, requires = "tool_memory_embedding_model")]
+    tool_memory_embedding_url: Option<String>,
+
+    /// ツール記憶用の埋め込みモデル。URLとの同時指定が必要。
+    #[arg(long, requires = "tool_memory_embedding_url")]
+    tool_memory_embedding_model: Option<String>,
 
     /// 自動圧縮を開始する推定トークン数。省略時は既存の200,000。
     #[arg(long, value_parser = clap::value_parser!(u32).range(1000..))]
@@ -76,6 +96,45 @@ struct Args {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ToolMemoryArg {
+    Off,
+    History,
+    Retrieval,
+}
+
+impl ToolMemoryArg {
+    fn retention(self) -> Option<polaris_core::tool_memory::RetentionMode> {
+        use polaris_core::tool_memory::RetentionMode;
+        match self {
+            Self::Off => None,
+            Self::History => Some(RetentionMode::History),
+            Self::Retrieval => Some(RetentionMode::Retrieval),
+        }
+    }
+}
+
+impl Args {
+    fn validate_tool_memory(&self) -> Result<(), &'static str> {
+        match (
+            &self.tool_memory_embedding_url,
+            &self.tool_memory_embedding_model,
+        ) {
+            (None, None) => Ok(()),
+            (Some(url), Some(model))
+                if self.tool_memory != ToolMemoryArg::Off
+                    && !url.trim().is_empty()
+                    && !model.trim().is_empty() =>
+            {
+                Ok(())
+            }
+            _ => Err(
+                "埋め込みURLとモデルは空でない値を両方指定し、--tool-memory historyまたはretrievalを有効にしてください",
+            ),
+        }
+    }
 }
 
 #[derive(clap::Subcommand)]
@@ -262,6 +321,14 @@ impl polaris_provider::TokenSource for AuthTokens {
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args = Args::parse();
+    if let Err(error) = args.validate_tool_memory() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+    let tool_memory_embedding = args
+        .tool_memory_embedding_url
+        .clone()
+        .zip(args.tool_memory_embedding_model.clone());
 
     match args.command.take() {
         Some(Command::Memory(options)) => return memory::run(options).await,
@@ -370,7 +437,10 @@ async fn main() -> ExitCode {
         return run_confined_apply();
     }
 
-    let model = std::env::var("POLARIS_MODEL").ok();
+    let model = args
+        .model
+        .clone()
+        .or_else(|| std::env::var("POLARIS_MODEL").ok());
     let mut provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| {
         let has_openai_key = std::env::var("POLARIS_API_KEY").is_ok()
             || polaris_auth::api_key::default_path()
@@ -488,6 +558,11 @@ async fn main() -> ExitCode {
         }
     };
 
+    if let Some(effort) = args.effort.as_deref() {
+        provider.set_effort(Some(effort));
+        initial_effort_name = Some(effort.to_string());
+    }
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // The audit log and the confined helper's staging location share the
@@ -575,15 +650,15 @@ async fn main() -> ExitCode {
                 std::sync::Arc::new(usage_meter.wrap(provider.clone()));
             let mut session = Session::new();
             session.compaction_threshold = args.compact_at.map(|n| n as usize);
+            let session_id = format!(
+                "exec-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
             if args.remember {
-                let session_id = format!(
-                    "exec-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                );
                 match polaris_tui::configure_memory(&mut session, &cwd, &state_dir, &session_id) {
                     Ok(()) => {}
                     Err(error) => {
@@ -591,6 +666,22 @@ async fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 }
+            }
+            if let Some(mode) = args.tool_memory.retention()
+                && let Err(error) = polaris_tui::tool_memory::configure_tool_memory(
+                    &mut session,
+                    &cwd,
+                    &state_dir,
+                    &session_id,
+                    mode,
+                    tool_memory_embedding.clone(),
+                )
+            {
+                eprintln!("ツール記憶を準備できません: {error}");
+                return ExitCode::FAILURE;
+            }
+            if args.tool_memory.retention().is_some() {
+                eprintln!("ツール記憶セッション: {session_id}");
             }
             session.push_user(&prompt);
 
@@ -680,6 +771,8 @@ async fn main() -> ExitCode {
                 audit_path,
                 max_turns: args.max_turns,
                 remember: args.remember,
+                tool_memory: args.tool_memory.retention(),
+                tool_memory_embedding,
                 compact_at: args.compact_at.map(|n| n as usize),
                 sandbox,
                 helper,
@@ -1114,5 +1207,75 @@ mod tests {
         );
         assert_eq!(got.file_name().unwrap(), "audit.jsonl");
         assert!(got.parent().unwrap().is_dir(), "directory was not created");
+    }
+}
+
+#[cfg(test)]
+mod tool_memory_settings_tests {
+    use super::*;
+
+    #[test]
+    fn tool_memory_defaults_off_and_is_independent_of_remember() {
+        let args = Args::try_parse_from(["polaris"]).unwrap();
+        assert_eq!(args.tool_memory.retention(), None);
+        assert!(args.validate_tool_memory().is_ok());
+        for mode in ["history", "retrieval"] {
+            let args = Args::try_parse_from(["polaris", "--tool-memory", mode]).unwrap();
+            assert!(args.tool_memory.retention().is_some());
+            assert!(!args.remember);
+            assert!(args.validate_tool_memory().is_ok());
+        }
+        let args = Args::try_parse_from(["polaris", "--remember"]).unwrap();
+        assert_eq!(args.tool_memory.retention(), None);
+        assert!(Args::try_parse_from(["polaris", "--tool-memory", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn tool_memory_embedding_requires_pair_and_enabled_mode() {
+        for flag in [
+            "--tool-memory-embedding-url",
+            "--tool-memory-embedding-model",
+        ] {
+            assert!(Args::try_parse_from(["polaris", flag, "value"]).is_err());
+        }
+        for mode in ["off", "history", "retrieval"] {
+            let args = Args::try_parse_from([
+                "polaris",
+                "--tool-memory",
+                mode,
+                "--tool-memory-embedding-url",
+                "http://localhost:8080/v1",
+                "--tool-memory-embedding-model",
+                "local-model",
+            ])
+            .unwrap();
+            assert_eq!(args.validate_tool_memory().is_ok(), mode != "off");
+        }
+        let args = Args::try_parse_from([
+            "polaris",
+            "--tool-memory",
+            "retrieval",
+            "--tool-memory-embedding-url",
+            " ",
+            "--tool-memory-embedding-model",
+            "model",
+        ])
+        .unwrap();
+        assert!(args.validate_tool_memory().is_err());
+    }
+
+    #[test]
+    fn tool_memory_help_lists_settings() {
+        let help = <Args as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        for flag in [
+            "--tool-memory",
+            "--tool-memory-embedding-url",
+            "--tool-memory-embedding-model",
+        ] {
+            assert!(help.contains(flag));
+        }
+        assert!(help.contains("off, history, retrieval"));
     }
 }

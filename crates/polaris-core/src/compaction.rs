@@ -1,6 +1,6 @@
 //! Automatic history summarization. Fires when the conversation's measured
-//! token count crosses a fixed ceiling, replacing everything before the
-//! most recent few user turns with one LLM-generated summary message.
+//! token count crosses a fixed ceiling. Keeps recent user turns, or the
+//! original instruction and recent complete tool groups in a single turn.
 
 use crate::budget::count_tokens;
 #[cfg(test)]
@@ -88,20 +88,83 @@ pub fn should_compact(total_tokens: usize) -> bool {
 }
 
 /// Returns the index to cut at: the index of the `KEEP_RECENT_USER_TURNS`
-/// most recent `Role::User` messages' *earliest* one — i.e. where the kept
+/// most recent real user messages' *earliest* one — i.e. where the kept
 /// tail begins. Returns 0 (nothing to compact) when there are
 /// `KEEP_RECENT_USER_TURNS` or fewer user turns total.
 fn cut_index(messages: &[Message]) -> usize {
     let user_positions: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m.role, Role::User))
+        .filter(|(_, m)| is_user_instruction(m))
         .map(|(i, _)| i)
         .collect();
     if user_positions.len() <= KEEP_RECENT_USER_TURNS {
         return 0;
     }
     user_positions[user_positions.len() - KEEP_RECENT_USER_TURNS]
+}
+
+fn is_user_instruction(message: &Message) -> bool {
+    matches!(message.role, Role::User) && !message.content.starts_with(SUMMARY_PREFIX)
+}
+
+/// Only cut at boundaries with no outstanding calls. Invalid or ambiguous
+/// pairing disables compaction rather than risking an orphaned result.
+fn compaction_range(messages: &[Message]) -> Option<std::ops::Range<usize>> {
+    let mut pending = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut boundaries = vec![0];
+    let mut groups = Vec::new();
+    let mut group_start = None;
+    for (index, message) in messages.iter().enumerate() {
+        if !message.tool_calls.is_empty() {
+            if !matches!(message.role, Role::Assistant) {
+                return None;
+            }
+            group_start.get_or_insert(index);
+            for call in &message.tool_calls {
+                if !seen.insert(call.id.as_str()) {
+                    return None;
+                }
+                pending.insert(call.id.as_str());
+            }
+        }
+        if matches!(message.role, Role::Tool) {
+            if !pending.remove(message.tool_call_id.as_deref()?) {
+                return None;
+            }
+        } else if message.tool_call_id.is_some() {
+            return None;
+        }
+        if pending.is_empty() {
+            boundaries.push(index + 1);
+            if let Some(start) = group_start.take() {
+                groups.push(start);
+            }
+        }
+    }
+    let cut = cut_index(messages);
+    if cut > 0 && boundaries.contains(&cut) {
+        return Some(0..cut);
+    }
+    // Keep recent multi-turn exchanges verbatim. The fallback is strictly
+    // for one real user turn, retaining its instruction and two full groups.
+    let users: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| is_user_instruction(message))
+        .map(|(index, _)| index)
+        .collect();
+    if users.len() != 1 {
+        return None;
+    }
+    let start = users[0] + 1;
+    let groups: Vec<_> = groups.into_iter().filter(|index| *index >= start).collect();
+    if groups.len() <= 2 {
+        return None;
+    }
+    let end = groups[groups.len() - 2];
+    (boundaries.contains(&start) && boundaries.contains(&end)).then_some(start..end)
 }
 
 #[derive(Debug)]
@@ -143,9 +206,9 @@ pub async fn compact_with_usage(
 }
 
 /// Returns `Ok(None)` — not an error, just a no-op — when there's nothing
-/// worth compacting: `cut_index` returned 0 (not enough history yet), the
-/// prefix it found is below `MIN_TOKENS_TO_SUMMARIZE`, or the provider's
-/// summary came back empty.
+/// worth compacting: no safe range exists, the range is below
+/// `MIN_TOKENS_TO_SUMMARIZE`, or the summary is empty or does not shrink
+/// the measured history.
 pub async fn compact(
     provider: &dyn Provider,
     messages: &mut Vec<Message>,
@@ -162,15 +225,17 @@ pub async fn compact_with_archive(
     messages: &mut Vec<Message>,
     before_compact: Option<&ArchiveHook>,
 ) -> Result<Option<CompactionReport>, CompactionError> {
-    let cut = cut_index(messages);
-    if cut == 0 || session_tokens(&messages[..cut]) < MIN_TOKENS_TO_SUMMARIZE {
+    let Some(range) = compaction_range(messages) else {
+        return Ok(None);
+    };
+    if session_tokens(&messages[range.clone()]) < MIN_TOKENS_TO_SUMMARIZE {
         return Ok(None);
     }
 
     let messages_before = messages.len();
     let tokens_before = session_tokens(messages);
 
-    let mut to_summarize = messages[..cut].to_vec();
+    let mut to_summarize = messages[..range.end].to_vec();
     to_summarize.push(Message::user(SUMMARIZE_INSTRUCTION));
     let res = provider
         .complete(CompletionRequest {
@@ -189,12 +254,16 @@ pub async fn compact_with_archive(
         return Ok(None);
     }
 
+    let mut new_messages = messages[..range.start].to_vec();
+    new_messages.push(Message::user(format!("{SUMMARY_PREFIX}{}", res.text)));
+    new_messages.extend_from_slice(&messages[range.end..]);
+    if session_tokens(&new_messages) >= tokens_before {
+        return Ok(None);
+    }
     if let Some(archive) = before_compact {
         archive(messages)?;
     }
 
-    let mut new_messages = vec![Message::user(format!("{SUMMARY_PREFIX}{}", res.text))];
-    new_messages.extend_from_slice(&messages[cut..]);
     *messages = new_messages;
 
     Ok(Some(CompactionReport {
@@ -209,10 +278,10 @@ pub async fn compact_with_archive(
 mod tests {
     use super::*;
 
-    struct MeasuredSummary(&'static str);
+    struct MeasuredSummary<'a>(&'a str);
 
     #[async_trait::async_trait]
-    impl Provider for MeasuredSummary {
+    impl Provider for MeasuredSummary<'_> {
         async fn complete(
             &self,
             _: CompletionRequest,
@@ -298,6 +367,172 @@ mod tests {
         assert!(outcome.result.unwrap().is_none());
         assert_eq!(outcome.usage_report.reported_responses, 0);
         assert_eq!(outcome.usage_report.missing_responses, 0);
+    }
+
+    #[tokio::test]
+    async fn nonshrinking_summary_preserves_history_and_usage() {
+        let mut messages = compactable_history();
+        let original = serde_json::to_value(&messages).unwrap();
+        struct Echo;
+        #[async_trait::async_trait]
+        impl Provider for Echo {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<polaris_provider::CompletionResponse, ProviderError> {
+                Ok(polaris_provider::CompletionResponse {
+                    text: req
+                        .messages
+                        .iter()
+                        .map(|m| m.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    ..Default::default()
+                })
+            }
+        }
+        let archive = |_: &[Message]| -> std::io::Result<()> { panic!("must shrink first") };
+        let outcome = compact_with_usage(&Echo, &mut messages, Some(&archive)).await;
+        assert!(outcome.result.unwrap().is_none());
+        assert_eq!(outcome.usage_report.missing_responses, 1);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn single_turn_retains_instruction_recent_groups_and_pending_call() {
+        let mut messages = vec![user("Original instruction: keep all constraints")];
+        for id in ["a", "b", "c", "d"] {
+            messages.push(assistant_with_call("", id));
+            messages.push(tool_result(id, &"x".repeat(MIN_TOKENS_TO_SUMMARIZE * 10)));
+        }
+        messages.push(assistant_with_call("still pending", "pending"));
+        let original_user = serde_json::to_value(&messages[0]).unwrap();
+        let tail = serde_json::to_value(&messages[5..]).unwrap();
+        let report = compact(&Summarizer, &mut messages).await.unwrap().unwrap();
+        assert!(report.tokens_after < report.tokens_before);
+        assert_eq!(serde_json::to_value(&messages[0]).unwrap(), original_user);
+        assert!(messages[1].content.starts_with(SUMMARY_PREFIX));
+        assert_eq!(serde_json::to_value(&messages[2..]).unwrap(), tail);
+        // A pending call prevents later groups from supplying a safe boundary.
+        messages.push(assistant_with_call("", "later"));
+        messages.push(tool_result("later", "done"));
+        assert!(compaction_range(&messages).is_none());
+    }
+
+    #[test]
+    fn cross_turn_pending_and_partially_completed_batches_are_not_cut() {
+        let mut messages = compactable_history();
+        messages.insert(1, assistant_with_call("", "pending"));
+        assert!(compaction_range(&messages).is_none());
+        let mut messages = vec![user("instruction")];
+        let mut batch = assistant_with_call("", "a");
+        batch
+            .tool_calls
+            .extend(assistant_with_call("", "b").tool_calls);
+        messages.push(batch);
+        messages.push(tool_result("a", "partial"));
+        for id in ["c", "d", "e"] {
+            messages.push(assistant_with_call("", id));
+            messages.push(tool_result(id, "done"));
+        }
+        assert!(compaction_range(&messages).is_none());
+        messages.push(tool_result("b", "done"));
+        // All overlapping calls form one indivisible completed group.
+        assert!(compaction_range(&messages).is_none());
+    }
+
+    #[tokio::test]
+    async fn automatic_no_op_does_not_throttle_newly_eligible_history() {
+        let meter = polaris_provider::UsageMeter::default();
+        let measured = meter.wrap(&MeasuredSummary("summary"));
+        let mut session = crate::session::Session::new();
+        session.messages = compactable_history();
+        session.messages.pop();
+        let original = serde_json::to_value(&session.messages).unwrap();
+        let tokens_before = session_tokens(&session.messages);
+        assert!(
+            session
+                .compact_automatically(&measured)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(meter.snapshot().reported_responses, 0);
+        assert_eq!(serde_json::to_value(&session.messages).unwrap(), original);
+        assert!(session.compaction_retry_tokens.is_none());
+
+        session.push_user("continue");
+        assert!(
+            session_tokens(&session.messages) - tokens_before
+                < MIN_TOKENS_TO_SUMMARIZE.max(tokens_before / 10)
+        );
+        let report = session
+            .compact_automatically(&measured)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.tokens_after < report.tokens_before);
+        assert_eq!(meter.snapshot().reported_responses, 1);
+        assert_eq!(session.messages.last().unwrap().content, "continue");
+        assert!(session.compaction_retry_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_waits_for_growth_and_meters_only_actual_attempts() {
+        struct Failing;
+        #[async_trait::async_trait]
+        impl Provider for Failing {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<polaris_provider::CompletionResponse, ProviderError> {
+                Err(ProviderError::Http("failed".into()))
+            }
+        }
+        let nonshrinking = "summary ".repeat(MIN_TOKENS_TO_SUMMARIZE * 100);
+        let nonshrinking_provider = MeasuredSummary(&nonshrinking);
+        for provider in [
+            &MeasuredSummary(" ") as &dyn Provider,
+            &Failing,
+            &nonshrinking_provider,
+        ] {
+            let meter = polaris_provider::UsageMeter::default();
+            let measured = meter.wrap(provider);
+            let mut session = crate::session::Session::new();
+            session.messages = compactable_history();
+            let _ = session.compact_automatically(&measured).await;
+            let first = meter.snapshot();
+            for _ in 0..5 {
+                session.push_assistant("small", vec![]);
+                assert!(
+                    session
+                        .compact_automatically(&measured)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let unchanged = meter.snapshot();
+            assert_eq!(unchanged.reported_responses, first.reported_responses);
+            assert_eq!(unchanged.failed_requests, first.failed_requests);
+            assert_eq!(unchanged.usage.total_tokens, first.usage.total_tokens);
+            session.push_assistant(&"x".repeat(MIN_TOKENS_TO_SUMMARIZE * 20), vec![]);
+            let _ = session.compact_automatically(&measured).await;
+            let second = meter.snapshot();
+            assert_eq!(second.reported_responses, first.reported_responses * 2);
+            assert_eq!(second.failed_requests, first.failed_requests * 2);
+            assert_eq!(second.usage.total_tokens, first.usage.total_tokens * 2);
+        }
+        let mut session = crate::session::Session::new();
+        session.messages = compactable_history();
+        assert!(
+            session
+                .compact_automatically(&Summarizer)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(session.compaction_retry_tokens.is_none());
     }
 
     fn user(content: &str) -> Message {

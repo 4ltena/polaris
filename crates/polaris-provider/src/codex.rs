@@ -13,6 +13,9 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde_json::Value;
 
+#[path = "codex_metrics.rs"]
+mod metrics;
+
 use crate::{
     CompletionRequest, CompletionResponse, Message, Provider, ProviderError, ReasoningItem, Role,
     ToolCall, sse,
@@ -169,6 +172,8 @@ pub struct Folder {
     completed: bool,
     usage: Option<crate::Usage>,
     reasoning: Vec<ReasoningItem>,
+    metrics_usage: metrics::TokenUsage,
+    cancelled: bool,
 }
 
 impl Default for Folder {
@@ -186,6 +191,8 @@ impl Folder {
             completed: false,
             usage: None,
             reasoning: Vec::new(),
+            metrics_usage: metrics::TokenUsage::default(),
+            cancelled: false,
         }
     }
 
@@ -201,6 +208,9 @@ impl Folder {
             let v: Value = serde_json::from_str(data)
                 .map_err(|e| ProviderError::Decode(format!("SSE data is not JSON: {e}")))?;
 
+            if let Some(usage) = v.pointer("/response/usage") {
+                self.metrics_usage = metrics::TokenUsage::parse(usage);
+            }
             match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
                 "response.output_item.done" => self.take_item(&v)?,
                 "response.completed" => {
@@ -237,6 +247,7 @@ impl Folder {
                     return Err(ProviderError::Http(format!("the response failed: {msg}")));
                 }
                 "response.cancelled" => {
+                    self.cancelled = true;
                     return Err(ProviderError::Http("the response was cancelled".into()));
                 }
                 // Deltas and everything else are skipped. Looking only at
@@ -350,6 +361,8 @@ pub struct CodexProvider {
     tokens: Arc<dyn crate::TokenSource>,
     client: reqwest::Client,
     idle: Duration,
+    cache_namespace: Option<std::ffi::OsString>,
+    cache_mode: Option<std::ffi::OsString>,
 }
 
 impl CodexProvider {
@@ -370,6 +383,8 @@ impl CodexProvider {
             tokens,
             client: reqwest::Client::new(),
             idle,
+            cache_namespace: std::env::var_os("POLARIS_CACHE_NAMESPACE"),
+            cache_mode: std::env::var_os("POLARIS_CACHE_MODE"),
         }
     }
 
@@ -396,61 +411,92 @@ impl CodexProvider {
             .expect("effort lock poisoned")
             .clone();
         let effort = override_effort.as_deref().or(token.effort.as_deref());
-        let body = build_body(&model, req, effort);
-        let resp = self
-            .client
-            .post(format!("{}/responses", self.base))
-            .bearer_auth(&token.access_token)
-            .header("chatgpt-account-id", &token.account_id)
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let mut body = build_body(&model, req, effort);
+        metrics::apply_namespace(&mut body, self.cache_namespace.as_deref())?;
+        metrics::apply_cache_mode(&mut body, self.cache_mode.as_deref())?;
+        let mut metric = metrics::RequestMetric::from_env(&body)?;
+        let result = async {
+            let resp = self
+                .client
+                .post(format!("{}/responses", self.base))
+                .bearer_auth(&token.access_token)
+                .header("chatgpt-account-id", &token.account_id)
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    if let Some(metric) = metric.as_mut() {
+                        metric.transport_cause = Some(metrics::transport_cause(&e));
+                    }
+                    ProviderError::Http(e.to_string())
+                })?;
 
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            // Let the caller decide whether to refresh and retry.
-            return Err(ProviderError::Auth(format!("status {status}")));
-        }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let hint = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http(format!(
-                "rate limited. retry-after: {hint} seconds. {body}"
-            )));
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http(format!("status {status}: {body}")));
-        }
+            let status = resp.status();
+            if let Some(metric) = metric.as_mut() {
+                metric.http_status = Some(status.as_u16());
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                // Let the caller decide whether to refresh and retry.
+                return Err(ProviderError::Auth(format!("status {status}")));
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let hint = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ProviderError::Http(format!(
+                    "rate limited. retry-after: {hint} seconds. {body}"
+                )));
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ProviderError::Http(format!("status {status}: {body}")));
+            }
 
-        let mut folder = Folder::new();
-        let mut stream = resp.bytes_stream();
-        loop {
-            // Measured against idle time. The response's overall length
-            // grows normally.
-            let next = tokio::time::timeout(self.idle, stream.next()).await;
-            match next {
-                Err(_) => {
-                    return Err(ProviderError::Http(format!(
-                        "no response arrived for {} seconds",
-                        self.idle.as_secs()
-                    )));
-                }
-                Ok(None) => break,
-                Ok(Some(chunk)) => {
-                    let bytes = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
-                    folder.push(&bytes)?;
+            let mut folder = Folder::new();
+            let mut stream = resp.bytes_stream();
+            loop {
+                // Measured against idle time. The response's overall length
+                // grows normally.
+                let next = tokio::time::timeout(self.idle, stream.next()).await;
+                match next {
+                    Err(_) => {
+                        if let Some(metric) = metric.as_mut() {
+                            metric.transport_cause = Some("idle_timeout");
+                        }
+                        return Err(ProviderError::Http(format!(
+                            "no response arrived for {} seconds",
+                            self.idle.as_secs()
+                        )));
+                    }
+                    Ok(None) => break,
+                    Ok(Some(chunk)) => {
+                        let bytes = chunk.map_err(|e| {
+                            if let Some(metric) = metric.as_mut() {
+                                metric.transport_cause = Some(metrics::transport_cause(&e));
+                            }
+                            ProviderError::Http(e.to_string())
+                        })?;
+                        let pushed = folder.push(&bytes);
+                        if let Some(metric) = metric.as_mut() {
+                            metric.usage = folder.metrics_usage;
+                            metric.server_cancelled = folder.cancelled;
+                        }
+                        pushed?;
+                    }
                 }
             }
+            folder.finish()
         }
-        folder.finish()
+        .await;
+        if let Some(metric) = metric.as_mut() {
+            metric.finish(&result);
+        }
+        result
     }
 }
 

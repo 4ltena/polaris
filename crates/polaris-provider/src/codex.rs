@@ -13,8 +13,12 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde_json::Value;
 
+#[path = "codex_metrics.rs"]
+mod metrics;
+
 use crate::{
-    CompletionRequest, CompletionResponse, Message, Provider, ProviderError, Role, ToolCall, sse,
+    CompletionRequest, CompletionResponse, Message, Provider, ProviderError, ReasoningItem, Role,
+    ToolCall, sse,
 };
 
 /// The endpoint to send requests to. `store` is never used, so this is the
@@ -42,6 +46,36 @@ pub fn input_items(messages: &[Message]) -> Vec<Value> {
                 "content": [{ "type": "input_text", "text": m.content }],
             })),
             Role::Assistant => {
+                // Reasoning items are replayed before the message/
+                // function_call they informed, matching how the model
+                // originally emitted them. Note this only preserves
+                // turn-level ordering, not fine-grained interleaving:
+                // polaris collapses a turn's reasoning items and tool_calls
+                // into two separate flat Vecs, so a turn that actually
+                // produced reasoning -> call -> reasoning -> call emits all
+                // of its reasoning here first, followed by all of its
+                // tool_calls below, not interleaved to match the original
+                // emission. Deliberate simplification, not a bug.
+                //
+                // Only emitted when the turn goes on to produce a message
+                // or tool_calls: a reasoning item with nothing following it
+                // is a wire shape the Responses API rejects when
+                // `store: false` (see `build_body`, the only mode this
+                // provider ever uses).
+                if !m.content.is_empty() || !m.tool_calls.is_empty() {
+                    for r in &m.reasoning {
+                        out.push(serde_json::json!({
+                            "type": "reasoning",
+                            // Upstream's `prepare_response_items_for_request`
+                            // strips all item ids from every request when
+                            // `store: false` (polaris's only mode) - match
+                            // that instead of sending one, even though the
+                            // captured `ReasoningItem` still keeps its `id`.
+                            "summary": [],
+                            "encrypted_content": r.encrypted_content,
+                        }));
+                    }
+                }
                 // A turn with empty body text and only tool calls isn't
                 // unusual. Adding an empty message would just pile up
                 // content-free utterances in the history.
@@ -103,6 +137,20 @@ pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) ->
         // and the prefix never shifts under us.
         "store": false,
         "stream": true,
+        // Added 2026-08-25 on the strength of a two-turn run that showed
+        // `cache_write_tokens`/`cached_tokens` at 0 without this and 7,680
+        // of 8,014 cached with it. A direct A/B on 2026-08-26 (build with
+        // this change vs. without, same task, multiple turns) couldn't
+        // reproduce that gap — both builds reached 93-97% cached_tokens by
+        // the third turn regardless. Left on: it costs only a slightly
+        // larger response payload, but its necessity for caching is no
+        // longer something this code can claim as measured.
+        "include": ["reasoning.encrypted_content"],
+        // Points the backend at the shard already holding this prefix.
+        // `store: false` keeps the prefix stable, but stability alone
+        // doesn't help if each turn is routed somewhere else — see
+        // `crate::cache_key`.
+        "prompt_cache_key": crate::cache_key(model, effort, req),
     });
     let tools = tool_wire_shape(&req.tools);
     if !tools.is_empty() {
@@ -123,6 +171,9 @@ pub struct Folder {
     tool_calls: Vec<ToolCall>,
     completed: bool,
     usage: Option<crate::Usage>,
+    reasoning: Vec<ReasoningItem>,
+    metrics_usage: metrics::TokenUsage,
+    cancelled: bool,
 }
 
 impl Default for Folder {
@@ -139,6 +190,9 @@ impl Folder {
             tool_calls: Vec::new(),
             completed: false,
             usage: None,
+            reasoning: Vec::new(),
+            metrics_usage: metrics::TokenUsage::default(),
+            cancelled: false,
         }
     }
 
@@ -154,10 +208,21 @@ impl Folder {
             let v: Value = serde_json::from_str(data)
                 .map_err(|e| ProviderError::Decode(format!("SSE data is not JSON: {e}")))?;
 
+            if let Some(usage) = v.pointer("/response/usage") {
+                self.metrics_usage = metrics::TokenUsage::parse(usage);
+            }
             match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
                 "response.output_item.done" => self.take_item(&v)?,
                 "response.completed" => {
                     self.completed = true;
+                    if std::env::var_os("POLARIS_DUMP_USAGE").is_some() {
+                        eprintln!(
+                            "[usage] {}",
+                            v.pointer("/response/usage")
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|| "<absent>".into())
+                        );
+                    }
                     self.usage = v.pointer("/response/usage").and_then(|u| {
                         let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
                         let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
@@ -182,6 +247,7 @@ impl Folder {
                     return Err(ProviderError::Http(format!("the response failed: {msg}")));
                 }
                 "response.cancelled" => {
+                    self.cancelled = true;
                     return Err(ProviderError::Http("the response was cancelled".into()));
                 }
                 // Deltas and everything else are skipped. Looking only at
@@ -235,6 +301,26 @@ impl Folder {
                     arguments,
                 });
             }
+            "reasoning" => {
+                if let (Some(id), Some(encrypted_content)) = (
+                    item.get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty()),
+                    item.get("encrypted_content")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty()),
+                ) {
+                    self.reasoning.push(ReasoningItem {
+                        id: id.to_string(),
+                        encrypted_content: encrypted_content.to_string(),
+                    });
+                }
+                // A missing (or empty-string) `id`/`encrypted_content` -
+                // `include` wasn't honored, a non-reasoning model, etc. -
+                // is silently skipped. Continuity here is a best-effort
+                // optimization the turn doesn't depend on; it's fine to
+                // move on to the next turn without it.
+            }
             _ => {}
         }
         Ok(())
@@ -251,6 +337,7 @@ impl Folder {
         Ok(CompletionResponse {
             text: self.text,
             tool_calls: self.tool_calls,
+            reasoning: self.reasoning,
             usage: self.usage,
         })
     }
@@ -274,6 +361,8 @@ pub struct CodexProvider {
     tokens: Arc<dyn crate::TokenSource>,
     client: reqwest::Client,
     idle: Duration,
+    cache_namespace: Option<std::ffi::OsString>,
+    cache_mode: Option<std::ffi::OsString>,
 }
 
 impl CodexProvider {
@@ -294,6 +383,8 @@ impl CodexProvider {
             tokens,
             client: reqwest::Client::new(),
             idle,
+            cache_namespace: std::env::var_os("POLARIS_CACHE_NAMESPACE"),
+            cache_mode: std::env::var_os("POLARIS_CACHE_MODE"),
         }
     }
 
@@ -320,61 +411,92 @@ impl CodexProvider {
             .expect("effort lock poisoned")
             .clone();
         let effort = override_effort.as_deref().or(token.effort.as_deref());
-        let body = build_body(&model, req, effort);
-        let resp = self
-            .client
-            .post(format!("{}/responses", self.base))
-            .bearer_auth(&token.access_token)
-            .header("chatgpt-account-id", &token.account_id)
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let mut body = build_body(&model, req, effort);
+        metrics::apply_namespace(&mut body, self.cache_namespace.as_deref())?;
+        metrics::apply_cache_mode(&mut body, self.cache_mode.as_deref())?;
+        let mut metric = metrics::RequestMetric::from_env(&body)?;
+        let result = async {
+            let resp = self
+                .client
+                .post(format!("{}/responses", self.base))
+                .bearer_auth(&token.access_token)
+                .header("chatgpt-account-id", &token.account_id)
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    if let Some(metric) = metric.as_mut() {
+                        metric.transport_cause = Some(metrics::transport_cause(&e));
+                    }
+                    ProviderError::Http(e.to_string())
+                })?;
 
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            // Let the caller decide whether to refresh and retry.
-            return Err(ProviderError::Auth(format!("status {status}")));
-        }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let hint = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http(format!(
-                "rate limited. retry-after: {hint} seconds. {body}"
-            )));
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http(format!("status {status}: {body}")));
-        }
+            let status = resp.status();
+            if let Some(metric) = metric.as_mut() {
+                metric.http_status = Some(status.as_u16());
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                // Let the caller decide whether to refresh and retry.
+                return Err(ProviderError::Auth(format!("status {status}")));
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let hint = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ProviderError::Http(format!(
+                    "rate limited. retry-after: {hint} seconds. {body}"
+                )));
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ProviderError::Http(format!("status {status}: {body}")));
+            }
 
-        let mut folder = Folder::new();
-        let mut stream = resp.bytes_stream();
-        loop {
-            // Measured against idle time. The response's overall length
-            // grows normally.
-            let next = tokio::time::timeout(self.idle, stream.next()).await;
-            match next {
-                Err(_) => {
-                    return Err(ProviderError::Http(format!(
-                        "no response arrived for {} seconds",
-                        self.idle.as_secs()
-                    )));
-                }
-                Ok(None) => break,
-                Ok(Some(chunk)) => {
-                    let bytes = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
-                    folder.push(&bytes)?;
+            let mut folder = Folder::new();
+            let mut stream = resp.bytes_stream();
+            loop {
+                // Measured against idle time. The response's overall length
+                // grows normally.
+                let next = tokio::time::timeout(self.idle, stream.next()).await;
+                match next {
+                    Err(_) => {
+                        if let Some(metric) = metric.as_mut() {
+                            metric.transport_cause = Some("idle_timeout");
+                        }
+                        return Err(ProviderError::Http(format!(
+                            "no response arrived for {} seconds",
+                            self.idle.as_secs()
+                        )));
+                    }
+                    Ok(None) => break,
+                    Ok(Some(chunk)) => {
+                        let bytes = chunk.map_err(|e| {
+                            if let Some(metric) = metric.as_mut() {
+                                metric.transport_cause = Some(metrics::transport_cause(&e));
+                            }
+                            ProviderError::Http(e.to_string())
+                        })?;
+                        let pushed = folder.push(&bytes);
+                        if let Some(metric) = metric.as_mut() {
+                            metric.usage = folder.metrics_usage;
+                            metric.server_cancelled = folder.cancelled;
+                        }
+                        pushed?;
+                    }
                 }
             }
+            folder.finish()
         }
-        folder.finish()
+        .await;
+        if let Some(metric) = metric.as_mut() {
+            metric.finish(&result);
+        }
+        result
     }
 }
 
@@ -437,6 +559,17 @@ mod tests {
         })
     }
 
+    fn reasoning_item(id: &str, encrypted_content: &str) -> Value {
+        serde_json::json!({
+            "item": {
+                "type": "reasoning",
+                "id": id,
+                "summary": [],
+                "encrypted_content": encrypted_content,
+            }
+        })
+    }
+
     #[test]
     fn a_text_only_stream_folds_into_text() {
         let mut f = Folder::new();
@@ -467,6 +600,61 @@ mod tests {
         assert_eq!(r.tool_calls[0].id, "call_9");
         assert_eq!(r.tool_calls[0].name, "read");
         assert_eq!(r.tool_calls[0].arguments["path"], "a.txt");
+    }
+
+    #[test]
+    fn a_reasoning_item_is_captured_with_its_encrypted_content() {
+        let mut f = Folder::new();
+        f.push(&frame(
+            "response.output_item.done",
+            reasoning_item("r1", "opaque-blob"),
+        ))
+        .expect("push should succeed");
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("push should succeed");
+        let r = f.finish().expect("should be complete");
+        assert_eq!(r.reasoning.len(), 1);
+        assert_eq!(r.reasoning[0].id, "r1");
+        assert_eq!(r.reasoning[0].encrypted_content, "opaque-blob");
+    }
+
+    #[test]
+    fn a_reasoning_item_without_encrypted_content_is_skipped() {
+        let mut f = Folder::new();
+        f.push(&frame(
+            "response.output_item.done",
+            serde_json::json!({ "item": { "type": "reasoning", "id": "r1", "summary": [] } }),
+        ))
+        .expect("push should succeed");
+        f.push(&frame("response.completed", serde_json::json!({})))
+            .expect("push should succeed");
+        let r = f.finish().expect("should be complete");
+        assert!(
+            r.reasoning.is_empty(),
+            "a reasoning item with no encrypted_content must not be kept"
+        );
+    }
+
+    /// An empty string must be treated the same as absent, matching the
+    /// sibling `function_call` arm's `.filter(|s| !s.is_empty())` pattern.
+    /// Covers id-empty, encrypted_content-empty, and both-empty.
+    #[test]
+    fn a_reasoning_item_with_an_empty_id_or_encrypted_content_is_skipped() {
+        for (id, encrypted_content) in [("", "blob"), ("r1", ""), ("", "")] {
+            let mut f = Folder::new();
+            f.push(&frame(
+                "response.output_item.done",
+                reasoning_item(id, encrypted_content),
+            ))
+            .expect("push should succeed");
+            f.push(&frame("response.completed", serde_json::json!({})))
+                .expect("push should succeed");
+            let r = f.finish().expect("should be complete");
+            assert!(
+                r.reasoning.is_empty(),
+                "id={id:?} encrypted_content={encrypted_content:?} should have been skipped"
+            );
+        }
     }
 
     /// The result doesn't change no matter where the frame gets split.
@@ -729,6 +917,60 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_with_reasoning_emits_it_before_the_message_and_calls() {
+        let items = input_items(&[Message::assistant_with_tool_calls(
+            "I'll read it",
+            vec![ToolCall {
+                id: "c".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }],
+        )
+        .with_reasoning(vec![crate::ReasoningItem {
+            id: "r1".into(),
+            encrypted_content: "opaque".into(),
+        }])]);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["type"], "reasoning");
+        assert!(
+            items[0].get("id").is_none(),
+            "id must be stripped from the replayed reasoning item, matching upstream's \
+             behavior when store: false"
+        );
+        assert_eq!(items[0]["encrypted_content"], "opaque");
+        assert_eq!(items[0]["summary"], serde_json::json!([]));
+        assert_eq!(items[1]["type"], "message");
+        assert_eq!(items[2]["type"], "function_call");
+    }
+
+    #[test]
+    fn a_turn_without_reasoning_emits_no_reasoning_item() {
+        let items = input_items(&[Message::assistant("yes")]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+    }
+
+    /// `agent::run_loop`'s no-tool-calls branch can push a `Message` with
+    /// non-empty `reasoning` but empty content and empty `tool_calls` (a
+    /// text-free final turn). Emitting the reasoning item alone would put
+    /// a reasoning item on the wire with nothing following it - a shape
+    /// the Responses API rejects when `store: false`. It must be dropped
+    /// entirely, not just left orphaned.
+    #[test]
+    fn a_turn_with_reasoning_but_no_content_or_tool_calls_emits_nothing() {
+        let items = input_items(&[Message::assistant("").with_reasoning(vec![
+            crate::ReasoningItem {
+                id: "r1".into(),
+                encrypted_content: "opaque".into(),
+            },
+        ])]);
+        assert!(
+            items.is_empty(),
+            "an orphaned reasoning item was emitted with nothing following it: {items:?}"
+        );
+    }
+
+    #[test]
     fn a_tool_result_becomes_a_function_call_output() {
         let items = input_items(&[Message::tool_result("call_1", "42 lines")]);
         assert_eq!(items[0]["type"], "function_call_output");
@@ -793,6 +1035,92 @@ mod tests {
         assert!(
             body.get("reasoning").is_none(),
             "reasoning is being sent even though effort wasn't passed"
+        );
+    }
+
+    /// The point of the key: it must not move as the conversation grows.
+    /// A key derived from the messages would change every turn and route
+    /// each request to a fresh shard, which is exactly the 0% hit rate
+    /// this was added to fix. Pinning turn 1 against turn 5 is what
+    /// catches that regression; asserting the key merely exists would
+    /// not.
+    #[test]
+    fn the_cache_key_holds_still_while_the_conversation_grows() {
+        let turn = |n: usize| CompletionRequest {
+            system: "system".into(),
+            messages: (0..n).map(|i| Message::user(format!("turn {i}"))).collect(),
+            tools: polaris_tools::all_specs(),
+        };
+        let first = build_body("m", &turn(1), Some("high"));
+        let fifth = build_body("m", &turn(5), Some("high"));
+
+        assert!(
+            first["prompt_cache_key"].is_string(),
+            "no prompt_cache_key is being sent"
+        );
+        assert_eq!(
+            first["prompt_cache_key"], fifth["prompt_cache_key"],
+            "the key moved as the conversation grew, so every turn routes elsewhere"
+        );
+    }
+
+    /// The other half of the pair. Everything the key covers is something
+    /// that breaks prefix reuse, so a request that changes one of them
+    /// must not be pointed at the shard holding the old prefix — it would
+    /// only evict it. Without this, a constant key would pass the test
+    /// above.
+    #[test]
+    fn anything_that_breaks_the_prefix_changes_the_cache_key() {
+        let req = |system: &str, tools: Vec<polaris_tools::ToolSpec>| CompletionRequest {
+            system: system.into(),
+            messages: vec![Message::user("go")],
+            tools,
+        };
+        let all = polaris_tools::all_specs();
+        let base =
+            build_body("m", &req("system", all.clone()), Some("high"))["prompt_cache_key"].clone();
+
+        for (what, other) in [
+            (
+                "the model",
+                build_body("other", &req("system", all.clone()), Some("high")),
+            ),
+            (
+                "the effort",
+                build_body("m", &req("system", all.clone()), Some("low")),
+            ),
+            (
+                "the system prompt",
+                build_body("m", &req("other", all.clone()), Some("high")),
+            ),
+            (
+                "the tool list",
+                build_body("m", &req("system", all[1..].to_vec()), Some("high")),
+            ),
+        ] {
+            assert_ne!(
+                base, other["prompt_cache_key"],
+                "changing {what} left the cache key alone"
+            );
+        }
+    }
+
+    /// Not a cosmetic request to be shown the model's reasoning. Without
+    /// it the backend writes nothing to its prompt cache for a reasoning
+    /// model, and every turn pays full price for a prefix it already
+    /// sent — which is what polaris did until it was measured.
+    #[test]
+    fn the_body_asks_for_encrypted_reasoning_so_the_turn_is_cacheable() {
+        let req = CompletionRequest {
+            system: "s".into(),
+            messages: vec![Message::user("x")],
+            tools: vec![],
+        };
+        let body = build_body("m", &req, None);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"]),
+            "the prompt cache is being left switched off"
         );
     }
 

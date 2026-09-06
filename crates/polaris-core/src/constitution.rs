@@ -7,7 +7,29 @@ use std::path::Path;
 use crate::budget::count_tokens;
 
 /// The ceiling on the number of tokens allowed for the constitution block.
-pub const CONSTITUTION_LIMIT: usize = 150;
+///
+/// Was 150, cut to 100 to make room in `budget::BUDGET_LIMIT` (990) for two
+/// verification rules added to `prompt::SYSTEM_PROMPT` (see that constant's
+/// own history) — the fixed system prompt takes priority over the
+/// user-configurable constitution budget when the two compete for the same
+/// ceiling.
+///
+/// While making that change, the worst-case total measured 990 with
+/// `CONSTITUTION_LIMIT` still at 150 — i.e. before this cut, before the new
+/// rules, the documented margin below had *already* silently gone to zero.
+/// The "626 tokens" this comment used to cite (see git history) was stale;
+/// something grew `budget::always_on_tokens`'s tool-definition component
+/// since it was written, and nothing caught it because, as the next
+/// paragraph already warned, a margin with no living test asserting its
+/// *size* — only that it stays under the ceiling — can shrink to nothing
+/// without any test failing. Restoring the original ~360-token margin isn't
+/// this change's job; it would mean cutting the user-configurable budget
+/// far enough to make `CONSTITUTION_LIMIT` nearly useless. This cut only
+/// restores a modest ~20-token margin (measured 968 with both ceilings
+/// saturated) — enough that a one-line rule addition doesn't immediately
+/// retrip this test, not a claim that the underlying growth is understood
+/// or bounded.
+pub const CONSTITUTION_LIMIT: usize = 100;
 
 /// The ceiling on the number of tokens allowed for the environment block.
 ///
@@ -18,22 +40,15 @@ pub const CONSTITUTION_LIMIT: usize = 150;
 /// the promise that "there is no path to exceeding the budget no matter how
 /// far the skill count, the size of AGENTS.md, or the length of environment
 /// info grows" would break against an abnormally long cwd or a huge branch
-/// name. We chose 200 as a value that keeps more than 8x headroom over the
-/// measured real-world cwd + branch value (24 tokens) while landing in
-/// roughly the same order of magnitude as the constitution ceiling
-/// (`CONSTITUTION_LIMIT` = 150), and that leaves the always-on total enough
-/// headroom against 990 even when both are simultaneously packed to their
-/// ceiling. Saturating both at once, and also passing 100 skills, measures
-/// 626 tokens (skills add not a single token) — this is exactly the input
-/// `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget` builds
-/// (it is the only test that packs all 3 inputs named by acceptance
-/// criterion 1 to their maximum simultaneously;
-/// `full_always_on_context_stays_within_budget` measures the case where the
-/// environment block is at its real-world length). This number moves if the
-/// tool count or schema changes — the 525 once written here had gone stale,
-/// left over from before the skill tool existed, unrefreshed: exactly what
-/// this file's own thesis warns about — a number with no living test behind
-/// it rots.
+/// name. 200 keeps more than 8x headroom over the measured real-world cwd +
+/// branch value (24 tokens). See `CONSTITUTION_LIMIT`'s own doc for why the
+/// combined worst-case margin against `budget::BUDGET_LIMIT` is much
+/// smaller than either ceiling alone would suggest, and for what "measures
+/// N tokens" actually means here: `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget`
+/// is the test that packs all 3 inputs named by acceptance criterion 1
+/// (skill count, AGENTS.md size, environment info length) to their maximum
+/// simultaneously; `full_always_on_context_stays_within_budget` measures the
+/// case where the environment block is at its real-world length instead.
 pub const ENVIRONMENT_LIMIT: usize = 200;
 
 const BEGIN: &str = "<!-- polaris:always-on -->";

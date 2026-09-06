@@ -44,11 +44,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-cli/src`
 
 - `main.rs` — Entry point for the `polaris` binary. Decides the endpoint from environment
+- `memory.rs` — Local project memory commands; embedding requests require explicit configuration.
 
 ## `crates/polaris-cli/tests`
 
 - `cli.rs` — Integration tests for the CLI binary. Launches the real process to verify behavior.
 - `confined_helper.rs` — Integration test that launches the real `polaris` binary as a helper
+- `memory.rs` — Exercises project memory through the real CLI without model calls.
 - `subcommands.rs` — Pins down that subcommands are actually reachable.
 
 ## `crates/polaris-core`
@@ -61,6 +63,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `approval.rs` — Approval boundary. `sandbox_mode` sets the technical boundary;
 - `audit.rs` — Append-only audit log. Not signed: in-process, the entity signing and the
 - `budget.rs` — Measurement of the always-on context. Numbers are backed by measurement,
+- `compaction.rs` — Automatic history summarization. Fires when the conversation's measured
 - `config.rs` — Loads config files. Not existing is normal; being malformed is not.
 - `constitution.rs` — The part of the always-on context that the harness does not own. The
 - `dir_watch.rs` — `bash`/`write`/`edit` 呼び出しの前後でファイルシステムを比較し、新規
@@ -73,6 +76,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `session.rs` — Message history. In M1, this is append-only — no compaction, no
 - `spawn.rs` — The `spawn` tool's implementation. Type discovery reuses
 - `stop.rs` — Stop conditions. No automatic recovery is attempted. Continuing to spin
+- `tool_memory.rs` — Opt-in recoverable tool-result retention; original output lives outside history.
 
 ## `crates/polaris-core/src/secret_screen`
 
@@ -82,6 +86,18 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `filemap.rs` — A snapshot test that confirms `docs/filemap.md` matches the actual state of the repository.
 
+## `crates/polaris-memory`
+
+- `Cargo.toml` — manifest for the polaris-memory crate
+
+## `crates/polaris-memory/src`
+
+- `lib.rs` — Local, explicitly populated memory. Retrieved text is quoted historical evidence,
+
+## `crates/polaris-memory/tests`
+
+- `memory.rs` — Persistence, isolation, retrieval budgets and explicit embedding behavior.
+
 ## `crates/polaris-provider`
 
 - `Cargo.toml` — manifest for the polaris-provider crate
@@ -89,6 +105,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-provider/src`
 
 - `codex.rs` — A provider that speaks the Responses API using ChatGPT subscription
+- `codex_metrics.rs` — Opt-in, content-free diagnostics for each actual Codex HTTP attempt.
 - `lib.rs` — Provider abstraction. Transport-dependent parts live in each
 - `openai.rs` — OpenAI-compatible chat completions. Swap out `base_url` and you can hit
 - `sse.rs` — Incrementally decodes SSE (text/event-stream). Pushing a byte chunk
@@ -149,6 +166,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `clipboard.rs` — Copies text to the system clipboard via the OSC 52 terminal escape
 - `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from
 - `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
+- `memory.rs` — Explicitly enabled project memory and pre-compaction archival.
 - `onboarding.rs` — The onboarding screen: shown by `polaris-cli` when the interactive TUI
 - `persist.rs` — Session persistence: one JSON `Message` per line.
 - `render.rs` — Pure rendering: turns a `Session` + input state into terminal cells.
@@ -156,14 +174,17 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `sessions.rs` — Enumerates saved conversations under `~/.polaris/sessions/` for the
 - `slash.rs` — Slash commands: local, client-side commands recognized when the input
 - `time.rs` — A tiny, dependency-free UTC timestamp formatter — just enough to
+- `tool_memory.rs` — Immutable, scoped tool output storage behind the reserved memory read path.
 
 ## `docs`
 
+- `context-efficiency.md` — コンテキストの効率化とローカル記憶
 - `filemap.md` — File map
+- `gpt6-efficiency-results.md` — GPT-6 medium 効率化の初回実測
 
 ## `docs/superpowers`
 
-- `CURRENT.md` — polaris 現況
+- `CURRENT.md` — Polaris 現在の状態
 
 ## `docs/superpowers/plans`
 
@@ -179,7 +200,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-24-polaris-files-md-autogen.md` — polaris ディレクトリ別 files.md 自動生成 Implementation Plan
 - `2026-08-24-polaris-tui-live-tool-progress.md` — polaris TUI ライブツール進捗・diff表示 Implementation Plan
 - `2026-08-25-polaris-tui-fullscreen-scroll.md` — polaris TUI 自前スクロール管理・フッター固定化 Implementation Plan
+- `2026-08-26-polaris-codex-reasoning-continuity.md` — polaris Codexプロバイダ reasoning item保持 Implementation Plan
+- `2026-08-26-polaris-history-compaction.md` — polaris 会話履歴の自動圧縮(compaction) Implementation Plan
 - `2026-08-26-polaris-tui-mouse-drag-selection.md` — polaris TUI マウスドラッグ選択・自前クリップボードコピー Implementation Plan
+- `2026-08-27-polaris-codex-ws-transport.md` — polaris Codex WebSocket トランスポート(フェーズ1) Implementation Plan
 
 ## `docs/superpowers/specs`
 
@@ -192,4 +216,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `2026-08-24-polaris-files-md-autogen-design.md` — polaris ディレクトリ別 `files.md` 自動生成 設計書
 - `2026-08-24-polaris-tui-live-tool-progress-design.md` — polaris TUI ライブツール進捗・diff表示 設計書
 - `2026-08-25-polaris-tui-fullscreen-scroll-design.md` — polaris TUI 自前スクロール管理・フッター固定化 設計書
+- `2026-08-26-polaris-codex-reasoning-continuity-design.md` — polaris Codexプロバイダ reasoning item保持 設計書
+- `2026-08-26-polaris-history-compaction-design.md` — polaris 会話履歴の自動圧縮(compaction) 設計書
 - `2026-08-26-polaris-tui-mouse-drag-selection-design.md` — polaris TUI マウスドラッグ選択・自前クリップボードコピー 設計書
+- `2026-08-27-polaris-codex-ws-transport-design.md` — polaris Codex WebSocket トランスポート(フェーズ1)設計書

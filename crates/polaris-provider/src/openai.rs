@@ -177,14 +177,19 @@ impl Provider for OpenAiProvider {
         let tools = tool_wire_shape(&req.tools);
 
         let model = self.model.read().expect("model lock poisoned").clone();
+        let effort = self.effort.read().expect("effort lock poisoned").clone();
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
+            // See `crate::cache_key`. Sent here for the same reason as
+            // in `codex::build_body`: a stable prefix is only reused if
+            // the backend is pointed at the shard holding it.
+            "prompt_cache_key": crate::cache_key(&model, effort.as_deref(), &req),
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
-        if let Some(effort) = self.effort.read().expect("effort lock poisoned").as_deref() {
+        if let Some(effort) = effort.as_deref() {
             body["reasoning_effort"] = Value::String(effort.to_string());
         }
 
@@ -336,6 +341,7 @@ impl Provider for OpenAiProvider {
         Ok(CompletionResponse {
             text,
             tool_calls,
+            reasoning: Vec::new(),
             usage,
         })
     }
@@ -653,6 +659,50 @@ mod tests {
         assert_eq!(
             body["tools"], expected,
             "the tool definitions sent don't match tool_wire_shape's output"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_with_reasoning_is_sent_unchanged_since_chat_completions_has_no_such_concept()
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let p = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
+            .expect("client should be constructible");
+        let with_reasoning = Message::assistant("yes").with_reasoning(vec![crate::ReasoningItem {
+            id: "r1".into(),
+            encrypted_content: "opaque".into(),
+        }]);
+        let without_reasoning = Message::assistant("yes");
+
+        p.complete(CompletionRequest {
+            system: "s".into(),
+            messages: vec![with_reasoning],
+            tools: vec![],
+        })
+        .await
+        .expect("should succeed");
+        p.complete(CompletionRequest {
+            system: "s".into(),
+            messages: vec![without_reasoning],
+            tools: vec![],
+        })
+        .await
+        .expect("should succeed");
+
+        let received = server.received_requests().await.expect("recorded");
+        let with_body: Value = received[0].body_json().expect("json");
+        let without_body: Value = received[1].body_json().expect("json");
+        assert_eq!(
+            with_body["messages"], without_body["messages"],
+            "a Message's reasoning field must not change the Chat Completions request body"
         );
     }
 

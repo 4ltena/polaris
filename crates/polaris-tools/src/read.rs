@@ -41,6 +41,31 @@ pub const MAX_READ_OUTPUT_BYTES: usize = 1024 * 1024;
 /// `offset` is a 0-based line number; `limit` is the number of lines to
 /// return. The line numbers in the output are 1-based.
 pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolError> {
+    let budget = std::env::var("POLARIS_READ_OUTPUT_BYTES")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|n| (1024..=MAX_READ_OUTPUT_BYTES).contains(n))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "POLARIS_READ_OUTPUT_BYTES must be between 1024 and 1048576",
+                    )
+                })
+        })
+        .transpose()?;
+    read_with_budget(path, offset, limit, budget)
+}
+
+fn read_with_budget(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    budget: Option<usize>,
+) -> Result<String, ToolError> {
+    let output_cap = budget.unwrap_or(MAX_READ_OUTPUT_BYTES);
     if path_policy::is_denied(path) {
         return Err(ToolError::PathDenied(path.display().to_string()));
     }
@@ -110,7 +135,19 @@ pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolErro
         // Returning "truncated" without showing any content leaves the
         // model with no next move at all — the same principle `bash` and
         // the skill tool's candidate list already apply to their own caps.
-        if last_included > offset && out.len() + rendered.len() > MAX_READ_OUTPUT_BYTES {
+        if last_included > offset && out.len() + rendered.len() > output_cap {
+            break;
+        }
+        if budget.is_some() && last_included == offset && rendered.len() > output_cap {
+            let mut end = output_cap;
+            while !rendered.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&rendered[..end]);
+            out.push_str(&format!(
+                "\n(line {} was truncated within the line by the experimental byte budget. Use bash with a bounded extraction for the remainder; read offset only advances whole lines.)\n", i + 1
+            ));
+            last_included = i + 1;
             break;
         }
         out.push_str(&rendered);
@@ -318,6 +355,29 @@ mod tests {
         assert!(
             !out.contains("continue with offset="),
             "says it was truncated even though the only line was shown"
+        );
+    }
+
+    #[test]
+    fn experimental_budget_preserves_line_continuation_and_unicode() {
+        let f = fixture(&[&"日本語".repeat(300), "last"]);
+        let out = read_with_budget(f.path(), 0, 100, Some(1024)).unwrap();
+        assert!(out.starts_with("1\t日本語"));
+        assert!(out.contains("truncated within the line"));
+        assert!(out.contains("continue with offset=1"));
+        assert!(out.len() < 1400);
+        assert_eq!(
+            read_with_budget(f.path(), 1, 100, Some(1024)).unwrap(),
+            "2\tlast\n"
+        );
+    }
+
+    #[test]
+    fn experimental_budget_leaves_small_reads_unchanged() {
+        let f = fixture(&["alpha", "beta"]);
+        assert_eq!(
+            read_with_budget(f.path(), 0, 100, Some(1024)).unwrap(),
+            read_with_budget(f.path(), 0, 100, None).unwrap()
         );
     }
 

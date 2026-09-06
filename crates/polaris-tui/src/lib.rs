@@ -4,13 +4,16 @@
 pub mod approver;
 mod clipboard;
 pub mod input;
+mod memory;
 pub mod onboarding;
 pub mod persist;
+pub use memory::{configure_memory, lock_memory};
 pub mod render;
 mod selection;
 pub mod sessions;
 pub mod slash;
 mod time;
+pub mod tool_memory;
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -57,6 +60,10 @@ pub struct RunArgs<'a> {
     pub sessions_dir: PathBuf,
     pub audit_path: PathBuf,
     pub max_turns: u32,
+    pub remember: bool,
+    pub tool_memory: Option<polaris_core::tool_memory::RetentionMode>,
+    pub tool_memory_embedding: Option<(String, String)>,
+    pub compact_at: Option<usize>,
     pub sandbox: SandboxPolicy,
     pub helper: PathBuf,
     pub approval_policy: ApprovalPolicy,
@@ -70,6 +77,72 @@ pub struct RunArgs<'a> {
     /// (see `polaris_core::config`).
     pub spawn_concurrency: usize,
     pub spawn_write_concurrency: usize,
+}
+
+// Ancestors are read-only and must form an explicit, bounded same-project chain.
+const MAX_TOOL_MEMORY_ORIGINS: usize = 64;
+
+fn saved_tool_memory_namespace(
+    project: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<(String, Vec<String>)> {
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .ok_or_else(|| std::io::Error::other("invalid session id"))?
+        .to_owned();
+    let project = polaris_core::project::resolve_root(project);
+    let mut seen = std::collections::HashSet::from([id.clone()]);
+    let mut origins = Vec::new();
+    let mut cursor = path.to_path_buf();
+    while let Some(origin) = persist::read_tool_memory_origin(&cursor.with_extension("meta.json"))?
+    {
+        if origins.len() >= MAX_TOOL_MEMORY_ORIGINS || !seen.insert(origin.clone()) {
+            return Err(std::io::Error::other(
+                "記憶の系譜が循環しているか上限を超えています",
+            ));
+        }
+        let source = path.with_file_name(format!("{origin}.jsonl"));
+        let source_meta = persist::read_meta(&source.with_extension("meta.json"))
+            .ok_or_else(|| std::io::Error::other("記憶の元セッションの出自を確認できません"))?;
+        if !source.is_file()
+            || !std::path::Path::new(&source_meta.cwd).is_absolute()
+            || polaris_core::project::resolve_root(std::path::Path::new(&source_meta.cwd))
+                != project
+        {
+            return Err(std::io::Error::other(
+                "記憶の元セッションが存在しないか同一プロジェクトではありません",
+            ));
+        }
+        origins.push(origin);
+        cursor = source;
+    }
+    Ok((id, origins))
+}
+
+fn configure_saved_tool_memory(
+    session: &mut polaris_core::session::Session,
+    project: &std::path::Path,
+    state_dir: &std::path::Path,
+    session_path: &std::path::Path,
+    mode: Option<polaris_core::tool_memory::RetentionMode>,
+    embedding: Option<(String, String)>,
+) -> std::io::Result<()> {
+    session.tool_memory = None;
+    if let Some(mode) = mode
+        && memory::saved_project_matches(session, project, session_path)
+    {
+        let (id, origins) = saved_tool_memory_namespace(project, session_path)?;
+        tool_memory::configure_tool_memory_with_origins(
+            session, project, state_dir, &id, &origins, mode, embedding,
+        )?;
+    }
+    Ok(())
 }
 
 /// Collapses a leading `$HOME` to `~`, for the footer only (see
@@ -310,7 +383,9 @@ fn area_height_for_history(footer_height: u16, terminal_height: u16) -> u16 {
     terminal_height.saturating_sub(footer_height)
 }
 
-pub async fn run(args: RunArgs<'_>) -> ExitCode {
+pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
+    let usage_meter = polaris_provider::UsageMeter::default();
+    args.provider = Arc::new(usage_meter.wrap(args.provider.clone()));
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         eprintln!("polaris: refusing to start the TUI on a non-interactive terminal");
         return ExitCode::FAILURE;
@@ -466,10 +541,20 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         .initial_effort_name
         .clone()
         .unwrap_or_else(|| render::DEFAULT_EFFORT.to_string());
-    let mut cumulative_usage = polaris_provider::Usage::default();
     let mut status = Status::Idle;
     let mut key_reader = CrosstermKeyReader;
     let mut fatal_message: Option<String> = None;
+    // Set when a `HistoryCompacted` event is drained mid-turn (see the
+    // `events_rx.recv()`/`try_recv` sites below) — `session.messages`
+    // can't be touched at that point (`agent_future` still holds it
+    // mutably borrowed), so this just remembers that a resync is owed.
+    // Declared here, outside `'outer`, rather than freshly per turn:
+    // `TurnOutcome::Done(Ok(_))` is the only place that clears it back to
+    // `false` (after actually persisting), so if compaction fires during
+    // a turn that then errors or is interrupted, the flag stays `true`
+    // and the *next* successful turn still catches the resync up in one
+    // `persist::rewrite` — see that match arm below.
+    let mut history_compacted_this_turn = false;
     // Which row the `/`-popup highlights. Persists across loop iterations
     // (arrow keys move it) and is clamped below whenever the candidate
     // list itself changes, so it's always a valid index or the list is
@@ -481,7 +566,39 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
     // the real history.
     let mut local_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
 
+    let mut tool_memory_path: Option<PathBuf> = None;
     let exit_code = 'outer: loop {
+        if tool_memory_path.as_ref() != Some(&session_path)
+            || (args.tool_memory.is_some()
+                && session.tool_memory.is_none()
+                && memory::saved_project_matches(&session, &args.cwd, &session_path))
+        {
+            if let Err(error) = configure_saved_tool_memory(
+                &mut session,
+                &args.cwd,
+                &args.state_dir,
+                &session_path,
+                args.tool_memory,
+                args.tool_memory_embedding.clone(),
+            ) {
+                fatal_message = Some(format!("ツール記憶を準備できません: {error}"));
+                break 'outer ExitCode::FAILURE;
+            }
+            tool_memory_path = Some(session_path.clone());
+        }
+        let mut cumulative_usage = usage_meter.snapshot().usage;
+        session.compaction_threshold = args.compact_at;
+        if args.remember
+            && let Err(error) = memory::configure_saved_memory(
+                &mut session,
+                &args.cwd,
+                &args.state_dir,
+                &session_path,
+            )
+        {
+            fatal_message = Some(format!("履歴保存を準備できません: {error}"));
+            break 'outer ExitCode::FAILURE;
+        }
         // Recomputed every draw from the live buffer, so the popup tracks
         // each keystroke — not just the moment `/` was first typed.
         let suggestions = match input_buffer.strip_prefix('/') {
@@ -792,6 +909,53 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                             status = Status::Idle;
                             continue;
                         }
+                        slash::Action::Compact => {
+                            // A real summarization call can take tens of
+                            // seconds — show something before awaiting it
+                            // rather than leaving the last drawn frame on
+                            // screen, which reads as a hang (same
+                            // "set status, force one immediate draw, then
+                            // do the slow thing" shape as the Ctrl+O
+                            // mid-turn confirmation above).
+                            status = Status::Notice("compacting...".to_string());
+                            if terminal
+                                .borrow_mut()
+                                .draw(|f| {
+                                    draw_frame(
+                                        f,
+                                        &history,
+                                        scroll_offset,
+                                        &input_buffer,
+                                        input_cursor,
+                                        &status,
+                                        &render::HeaderInfo {
+                                            provider_name: &args.provider_name,
+                                            model_name: &model_name,
+                                            usage: cumulative_usage,
+                                            cwd: &cwd_display,
+                                            cwd_short: &cwd_footer_display,
+                                            effort_name: &effort_name,
+                                        },
+                                        &[],
+                                        0,
+                                        &selection,
+                                    )
+                                })
+                                .is_err()
+                            {
+                                break ExitCode::FAILURE;
+                            }
+                            handle_compact(
+                                args.provider.as_ref(),
+                                &mut session,
+                                &session_path,
+                                &mut status,
+                                &mut cumulative_usage,
+                            )
+                            .await;
+                            printed_messages = session.messages.len();
+                            continue;
+                        }
                         action => {
                             // `apply_slash_action` clears `session.messages`/
                             // `local_lines` for `Clear` but has no access to
@@ -808,7 +972,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                                 &mut status,
                                 &args.provider_name,
                                 &model_name,
-                                cumulative_usage,
+                                usage_meter.snapshot(),
                                 args.skills,
                                 &args.cwd,
                                 &mut local_lines,
@@ -1052,6 +1216,50 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                     status = Status::Idle;
                     continue;
                 }
+                Some(slash::Action::Compact) => {
+                    // Same reasoning as the popup-selection path above:
+                    // show feedback before the (potentially tens-of-
+                    // seconds-long) summarization call rather than
+                    // leaving the last drawn frame on screen.
+                    status = Status::Notice("compacting...".to_string());
+                    if terminal
+                        .borrow_mut()
+                        .draw(|f| {
+                            draw_frame(
+                                f,
+                                &history,
+                                scroll_offset,
+                                &input_buffer,
+                                input_cursor,
+                                &status,
+                                &render::HeaderInfo {
+                                    provider_name: &args.provider_name,
+                                    model_name: &model_name,
+                                    usage: cumulative_usage,
+                                    cwd: &cwd_display,
+                                    cwd_short: &cwd_footer_display,
+                                    effort_name: &effort_name,
+                                },
+                                &[],
+                                0,
+                                &selection,
+                            )
+                        })
+                        .is_err()
+                    {
+                        break ExitCode::FAILURE;
+                    }
+                    handle_compact(
+                        args.provider.as_ref(),
+                        &mut session,
+                        &session_path,
+                        &mut status,
+                        &mut cumulative_usage,
+                    )
+                    .await;
+                    printed_messages = session.messages.len();
+                    continue;
+                }
                 Some(action) => {
                     // Same reasoning as the popup-selection path above:
                     // `apply_slash_action` can't re-seed `history`'s header
@@ -1064,7 +1272,7 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         &mut status,
                         &args.provider_name,
                         &model_name,
-                        cumulative_usage,
+                        usage_meter.snapshot(),
                         args.skills,
                         &args.cwd,
                         &mut local_lines,
@@ -1103,7 +1311,14 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
         };
 
         session.push_user(&text);
-        let checkpoint = session.messages.len();
+        // `mut`: mid-turn compaction (see `history_compacted_this_turn`
+        // below) can shrink `session.messages` after this point but within
+        // the same turn, which would otherwise leave `checkpoint` pointing
+        // past the unbalanced tool-call tail `TurnOutcome::Done(Err(_))`/
+        // `Interrupted` roll back to — `Vec::truncate` silently no-ops
+        // when given a length >= the vec's current length, so a stale
+        // `checkpoint` would make that rollback quietly do nothing.
+        let mut checkpoint = session.messages.len();
         // A no-op after the first call for this session (see
         // `write_meta_if_absent`'s docs) — this is the lazy point where an
         // until-now-empty session actually starts existing on disk.
@@ -1274,6 +1489,34 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                         // `append_live_event`'s doc).
                         if scroll_offset > 0 {
                             scroll_offset += appended;
+                        }
+                        if let polaris_core::AgentEvent::HistoryCompacted {
+                            messages_before,
+                            messages_after,
+                            ..
+                        } = event
+                        {
+                            history_compacted_this_turn = true;
+                            // `checkpoint` was captured before this turn's
+                            // compaction could have run — shift it back by
+                            // however many messages compaction just
+                            // removed so it still points at the same
+                            // logical position (see the comment on
+                            // `checkpoint`'s declaration above).
+                            checkpoint = checkpoint
+                                .saturating_sub(messages_before.saturating_sub(messages_after));
+                            // Same staleness problem as `checkpoint`:
+                            // `printed_messages` was also captured before
+                            // this turn's compaction could have run. Left
+                            // unadjusted, `append_new_history`'s
+                            // shrink-guard (see its own doc) would fire the
+                            // next time it's called whenever this turn
+                            // removes more messages than it goes on to add,
+                            // wiping the entire `history` buffer — header
+                            // box included — instead of just rendering the
+                            // turn's new messages.
+                            printed_messages = printed_messages
+                                .saturating_sub(messages_before.saturating_sub(messages_after));
                         }
                     }
                     _ = ticker.tick() => {
@@ -1543,23 +1786,38 @@ pub async fn run(args: RunArgs<'_>) -> ExitCode {
                 if scroll_offset > 0 {
                     scroll_offset += appended;
                 }
+                if let polaris_core::AgentEvent::HistoryCompacted {
+                    messages_before,
+                    messages_after,
+                    ..
+                } = event
+                {
+                    history_compacted_this_turn = true;
+                    checkpoint =
+                        checkpoint.saturating_sub(messages_before.saturating_sub(messages_after));
+                    printed_messages = printed_messages
+                        .saturating_sub(messages_before.saturating_sub(messages_after));
+                }
             }
             turn_outcome
         };
 
         match outcome {
             TurnOutcome::Done(Ok(result)) => {
-                cumulative_usage.input_tokens += result.usage.input_tokens;
-                cumulative_usage.output_tokens += result.usage.output_tokens;
-                cumulative_usage.total_tokens += result.usage.total_tokens;
-                cumulative_usage.cached_tokens += result.usage.cached_tokens;
+                let _ = result;
                 status = Status::Idle;
-                if let Some(reply) = session.messages.last()
+                if history_compacted_this_turn {
+                    if let Err(e) = persist::rewrite(&session_path, &session.messages) {
+                        fatal_message = Some(format!("Can't persist the compacted session: {e}"));
+                        break 'outer ExitCode::FAILURE;
+                    }
+                } else if let Some(reply) = session.messages.last()
                     && let Err(e) = persist::append_message(&session_path, reply)
                 {
                     fatal_message = Some(format!("Can't persist the reply: {e}"));
                     break 'outer ExitCode::FAILURE;
                 }
+                history_compacted_this_turn = false;
             }
             TurnOutcome::Done(Err(e)) => {
                 // The agent loop can return after recording an assistant
@@ -1742,16 +2000,72 @@ fn handle_fork(
     session_started_at_millis: &mut u128,
     status: &mut Status,
 ) {
+    let has_references = session.messages.iter().any(|message| {
+        message.content.contains("memory://")
+            || message.content.starts_with("[Stored tool result ")
+            || message
+                .tool_calls
+                .iter()
+                .any(|call| call.arguments.to_string().contains("memory://"))
+    });
+    let saved_origin = match persist::read_tool_memory_origin(meta_path) {
+        Ok(origin) => origin,
+        Err(error) => {
+            *status = Status::Notice(format!(
+                "記憶の出自を確認できないため分岐できません: {error}"
+            ));
+            return;
+        }
+    };
+    let needs_memory_origin =
+        has_references || session.tool_memory.is_some() || saved_origin.is_some();
+    let memory_origin =
+        if memory::saved_project_matches(session, std::path::Path::new(cwd_display), session_path)
+            && persist::read_meta(meta_path).is_some()
+            && session_path.is_file()
+        {
+            match saved_tool_memory_namespace(std::path::Path::new(cwd_display), session_path) {
+                Ok((id, origins)) if origins.len() < MAX_TOOL_MEMORY_ORIGINS => Some(id),
+                Ok(_) => {
+                    *status = Status::Notice("記憶の系譜が上限に達したため分岐できません".into());
+                    return;
+                }
+                Err(error) => {
+                    *status = Status::Notice(format!(
+                        "記憶の出自を確認できないため分岐できません: {error}"
+                    ));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+    if needs_memory_origin && memory_origin.is_none() {
+        *status = Status::Notice(
+            "記憶の出自を確認できないため分岐できません。元の会話はそのまま継続できます。".into(),
+        );
+        return;
+    }
     let new_session_path = sessions_dir.join(format!("{}.jsonl", new_session_id()));
     let new_meta_path = new_session_path.with_extension("meta.json");
     let started = now_millis();
+    let origin_cwd = persist::read_meta(meta_path)
+        .map(|meta| meta.cwd)
+        .unwrap_or_else(|| {
+            if session.messages.is_empty() {
+                cwd_display.to_owned()
+            } else {
+                String::new()
+            }
+        });
 
-    if let Err(e) = persist::write_meta_if_absent(
+    if let Err(e) = persist::write_fork_meta(
         &new_meta_path,
         &persist::SessionMeta {
-            cwd: cwd_display.to_string(),
+            cwd: origin_cwd,
             started_at_millis: started,
         },
+        memory_origin.as_deref(),
     ) {
         *status = Status::Notice(format!("can't fork: {e}"));
         return;
@@ -1763,7 +2077,14 @@ fn handle_fork(
         }
     }
 
-    *status = Status::Notice(format!("forked to {}", new_session_path.display()));
+    *status = Status::Notice(if memory_origin.is_some() {
+        format!(
+            "分岐先: {}。祖先の記憶は参照専用で、新しい記憶はこの分岐に保存します。祖先の記憶を削除すると、この分岐の記憶利用も無効になります。",
+            new_session_path.display()
+        )
+    } else {
+        format!("forked to {}", new_session_path.display())
+    });
     *session_path = new_session_path;
     *meta_path = new_meta_path;
     *session_started_at_millis = started;
@@ -1931,6 +2252,61 @@ fn handle_model<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
+/// Runs compaction unconditionally (ignores the threshold — that's the
+/// point of a manual command) and reports the result via `status`. On
+/// success, also resyncs the persisted session log so `/resume` reflects
+/// the compacted state, matching how `TurnOutcome::Done(Ok(_))` does the
+/// same thing after an automatic compaction (see the call site in `run`).
+async fn handle_compact(
+    provider: &dyn Provider,
+    session: &mut polaris_core::session::Session,
+    session_path: &std::path::Path,
+    status: &mut Status,
+    usage: &mut polaris_provider::Usage,
+) {
+    let outcome = polaris_core::compaction::compact_with_usage(
+        provider,
+        &mut session.messages,
+        session.before_compact.as_deref(),
+    )
+    .await;
+    usage.input_tokens = usage
+        .input_tokens
+        .saturating_add(outcome.usage_report.usage.input_tokens);
+    usage.output_tokens = usage
+        .output_tokens
+        .saturating_add(outcome.usage_report.usage.output_tokens);
+    usage.total_tokens = usage
+        .total_tokens
+        .saturating_add(outcome.usage_report.usage.total_tokens);
+    usage.cached_tokens = usage
+        .cached_tokens
+        .saturating_add(outcome.usage_report.usage.cached_tokens);
+    match outcome.result {
+        Ok(None) => {
+            *status = Status::Notice("nothing old enough to compact yet".to_string());
+        }
+        Ok(Some(report)) => match persist::rewrite(session_path, &session.messages) {
+            Ok(()) => {
+                *status = Status::Notice(format!(
+                    "compacted {} messages → {} ({} tok → {} tok)",
+                    report.messages_before,
+                    report.messages_after,
+                    report.tokens_before,
+                    report.tokens_after
+                ));
+            }
+            Err(e) => {
+                *status =
+                    Status::Notice(format!("compacted in memory, but couldn't persist it: {e}"));
+            }
+        },
+        Err(e) => {
+            *status = Status::Notice(format!("compaction failed: {e}"));
+        }
+    }
+}
+
 /// Runs the `/skills` picker: a blocking loop like the others, but with
 /// no selection outcome — Enter and Esc both just close it (see
 /// `render::render_skills_picker`'s docs on why: polaris has nothing
@@ -2071,7 +2447,7 @@ fn apply_slash_action(
     status: &mut Status,
     provider_name: &str,
     model_name: &str,
-    cumulative_usage: polaris_provider::Usage,
+    usage_report: polaris_provider::UsageReport,
     // No longer read here — `/skills` is intercepted in `run()` before
     // dispatch (see `run_skills_picker`) now that it's a full-screen
     // picker instead of a one-line `Status::Notice`. Kept as a parameter
@@ -2096,13 +2472,16 @@ fn apply_slash_action(
             }
         }
         slash::Action::Status => {
+            let cumulative_usage = usage_report.usage;
             *status = Status::Notice(format!(
-                "{provider_name} / {model_name} — tokens: in {} / out {} / cache {} / total {} — {} messages",
+                "{provider_name} / {model_name} — tokens: in {} / out {} / cache {} / total {} — {} messages; 確認済み使用量、欠測 {} / 失敗 {}",
                 cumulative_usage.input_tokens,
                 cumulative_usage.output_tokens,
                 cumulative_usage.cached_tokens,
                 cumulative_usage.total_tokens,
                 session.messages.len(),
+                usage_report.missing_responses,
+                usage_report.failed_requests,
             ));
             SlashOutcome::Continue
         }
@@ -2189,7 +2568,8 @@ fn apply_slash_action(
         | slash::Action::Permissions
         | slash::Action::Fork
         | slash::Action::Model
-        | slash::Action::Skills => {
+        | slash::Action::Skills
+        | slash::Action::Compact => {
             // Never reached: `run()` recognizes all of these before
             // dispatch — `Review` expands into a normal model turn;
             // `New`/`Resume`/`Fork` are handled by
@@ -2250,6 +2630,90 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
     use ratatui::text::Line;
     use std::collections::VecDeque;
+
+    struct Summarizer;
+
+    #[async_trait::async_trait]
+    impl polaris_provider::Provider for Summarizer {
+        async fn complete(
+            &self,
+            _req: polaris_provider::CompletionRequest,
+        ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError> {
+            Ok(polaris_provider::CompletionResponse {
+                text: "summary text".to_string(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_compact_compacts_and_persists_when_there_is_something_to_compact() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session_path = dir.path().join("s.jsonl");
+
+        // "reply 1" alone is well under `MIN_TOKENS_TO_SUMMARIZE`
+        // (`compaction::compact`'s floor guard) — inflated here so the
+        // summarized prefix actually clears the floor and this test still
+        // exercises a real compaction rather than tripping the "not worth
+        // it" no-op. Single-char repeats compress ~8:1 under o200k_base
+        // (see `polaris-core::compaction`'s own test for the same note).
+        let big_reply = "x".repeat(polaris_core::compaction::MIN_TOKENS_TO_SUMMARIZE * 10);
+        let mut session = Session::default();
+        session.push_user("turn 1");
+        session.push_assistant(&big_reply, vec![]);
+        session.push_user("turn 2");
+        session.push_assistant("reply 2", vec![]);
+        session.push_user("turn 3");
+        session.push_assistant("reply 3", vec![]);
+
+        let mut status = Status::Idle;
+        handle_compact(
+            &Summarizer,
+            &mut session,
+            &session_path,
+            &mut status,
+            &mut polaris_provider::Usage::default(),
+        )
+        .await;
+
+        assert!(
+            matches!(&status, Status::Notice(s) if s.contains("compacted")),
+            "expected a 'compacted' notice, got a different status"
+        );
+        assert_eq!(session.messages.len(), 5, "1 summary + kept tail of 4");
+
+        let (loaded, _truncated) = persist::load_session(&session_path).expect("load");
+        assert_eq!(
+            loaded.messages.len(),
+            session.messages.len(),
+            "the persisted file must reflect the compacted session, not the pre-compaction one"
+        );
+        assert_eq!(loaded.messages[0].content, session.messages[0].content);
+    }
+
+    #[tokio::test]
+    async fn handle_compact_reports_when_there_is_nothing_to_compact() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let session_path = dir.path().join("s.jsonl");
+        let mut session = Session::default();
+        session.push_user("only turn");
+        let mut status = Status::Idle;
+
+        handle_compact(
+            &Summarizer,
+            &mut session,
+            &session_path,
+            &mut status,
+            &mut polaris_provider::Usage::default(),
+        )
+        .await;
+
+        assert!(
+            matches!(&status, Status::Notice(s) if s.contains("nothing")),
+            "expected a 'nothing to compact' notice"
+        );
+        assert_eq!(session.messages.len(), 1, "must not have been touched");
+    }
 
     /// Feeds a fixed, pre-scripted sequence of key codes — the same
     /// approach `approver`'s own tests use, so a picker-driving test
@@ -2598,7 +3062,7 @@ mod tests {
         let after_first = history.len();
         assert!(after_first > 0);
 
-        session.push_assistant("reply");
+        session.push_assistant("reply", Vec::new());
         append_new_history(
             &session,
             &[],
@@ -2627,7 +3091,7 @@ mod tests {
     fn append_new_history_self_corrects_when_the_session_shrinks() {
         let mut session = polaris_core::session::Session::default();
         session.push_user("first");
-        session.push_assistant("reply");
+        session.push_assistant("reply", Vec::new());
         let mut printed_messages = 0;
         let mut printed_local_lines = 0;
         let mut history = Vec::new();
@@ -2650,6 +3114,222 @@ mod tests {
             &mut history,
         );
         assert_eq!(printed_messages, 0);
+    }
+
+    /// Regression coverage for the final-whole-branch-review Critical
+    /// finding: `printed_messages` is a second local index into
+    /// `session.messages`, alongside `checkpoint`, and it goes stale in
+    /// exactly the same way when compaction shrinks `session.messages`
+    /// mid-turn. Left unadjusted, the next `append_new_history` call sees
+    /// a `session.messages.len()` that no longer lines up with
+    /// `printed_messages`, and depending on how the shrink compares to
+    /// what the turn then appends, either the shrink-guard fires and wipes
+    /// the entire `history` buffer (header included), nothing new renders
+    /// at all, or the wrong slice of new messages renders. These three
+    /// tests simulate what `run()`'s two `AgentEvent::HistoryCompacted`
+    /// drain sites do — shrink `session.messages` the way `compact` does,
+    /// then apply the exact same `saturating_sub` adjustment to
+    /// `printed_messages` that the fix makes — across all three
+    /// before/after-vs-turn-growth orderings, and confirm
+    /// `append_new_history` renders correctly in each.
+    #[test]
+    fn append_new_history_renders_correctly_after_compaction_shrinks_more_than_the_turn_grows() {
+        // D (messages compaction removes) > A (messages the turn then
+        // adds) — the normal case: several old turns fold into one
+        // summary, and the current turn only adds its own reply.
+        let mut session = Session::default();
+        for i in 0..6 {
+            session.push_user(&format!("turn {i}"));
+        }
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut history = vec![render::HistoryLine {
+            line: Line::from("HEADER"),
+            shaded: false,
+        }];
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(printed_messages, 6);
+        let after_initial_render = history.len();
+
+        // Compaction folds all 6 messages into 2 (a summary plus one kept
+        // turn) — D = 4 — mirroring the adjustment made at both
+        // `AgentEvent::HistoryCompacted` drain sites in `run()`.
+        let messages_before = session.messages.len();
+        session.messages = vec![
+            Message::user("summary of turns 0-4"),
+            Message::user("turn 5"),
+        ];
+        let messages_after = session.messages.len();
+        printed_messages =
+            printed_messages.saturating_sub(messages_before.saturating_sub(messages_after));
+        assert_eq!(printed_messages, 2);
+
+        // The turn itself then appends its own reply (A = 1 < D = 4).
+        session.push_assistant("the turn's reply", Vec::new());
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+
+        assert_eq!(
+            history[0].line,
+            Line::from("HEADER"),
+            "the shrink-guard must not have fired and wiped the header"
+        );
+        assert_eq!(
+            history.len(),
+            after_initial_render + 1,
+            "exactly the turn's one new reply should have been appended — \
+             not zero (guard silently no-op'ing) and not a full reprint"
+        );
+        assert_eq!(printed_messages, 3);
+    }
+
+    #[test]
+    fn append_new_history_renders_correctly_after_compaction_shrinks_exactly_as_much_as_the_turn_grows()
+     {
+        // D == A: without the `printed_messages` adjustment,
+        // `session.messages.len()` ends up back at its pre-compaction
+        // value, so the shrink-guard never fires but the "anything new to
+        // render?" check also sees no growth — the turn's reply silently
+        // never appears.
+        let mut session = Session::default();
+        for i in 0..6 {
+            session.push_user(&format!("turn {i}"));
+        }
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut history = vec![render::HistoryLine {
+            line: Line::from("HEADER"),
+            shaded: false,
+        }];
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(printed_messages, 6);
+        let after_initial_render = history.len();
+
+        // Compaction removes 2 messages (D = 2).
+        let messages_before = session.messages.len();
+        session.messages = vec![
+            Message::user("summary of turns 0-2"),
+            Message::user("turn 3"),
+            Message::user("turn 4"),
+            Message::user("turn 5"),
+        ];
+        let messages_after = session.messages.len();
+        printed_messages =
+            printed_messages.saturating_sub(messages_before.saturating_sub(messages_after));
+        assert_eq!(printed_messages, 4);
+
+        // The turn adds exactly 2 new messages (A = D = 2): its own user
+        // follow-up plus the assistant's reply.
+        session.push_user("follow-up");
+        session.push_assistant("the turn's reply", Vec::new());
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+
+        assert_eq!(
+            history[0].line,
+            Line::from("HEADER"),
+            "the shrink-guard must not have fired and wiped the header"
+        );
+        assert_eq!(
+            history.len(),
+            after_initial_render + 2,
+            "both of the turn's new messages should have been appended, \
+             not silently dropped"
+        );
+        assert_eq!(printed_messages, 6);
+    }
+
+    #[test]
+    fn append_new_history_renders_correctly_after_compaction_shrinks_less_than_the_turn_grows() {
+        // D < A: without the `printed_messages` adjustment, some of the
+        // turn's own new messages get skipped from the render — the slice
+        // starts too far into `session.messages`.
+        let mut session = Session::default();
+        for i in 0..6 {
+            session.push_user(&format!("turn {i}"));
+        }
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut history = vec![render::HistoryLine {
+            line: Line::from("HEADER"),
+            shaded: false,
+        }];
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+        assert_eq!(printed_messages, 6);
+        let after_initial_render = history.len();
+
+        // Compaction removes just 1 message (D = 1).
+        let messages_before = session.messages.len();
+        session.messages = vec![
+            Message::user("summary of turn 0"),
+            Message::user("turn 1"),
+            Message::user("turn 2"),
+            Message::user("turn 3"),
+            Message::user("turn 4"),
+        ];
+        let messages_after = session.messages.len();
+        printed_messages =
+            printed_messages.saturating_sub(messages_before.saturating_sub(messages_after));
+        assert_eq!(printed_messages, 5);
+
+        // The turn adds 3 new messages (A = 3 > D = 1).
+        session.push_user("follow-up");
+        session.push_assistant("intermediate reply", Vec::new());
+        session.push_assistant("final reply", Vec::new());
+
+        append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        );
+
+        assert_eq!(
+            history[0].line,
+            Line::from("HEADER"),
+            "the shrink-guard must not have fired and wiped the header"
+        );
+        assert_eq!(
+            history.len(),
+            after_initial_render + 3,
+            "all three of the turn's new messages should have been \
+             appended, not just the tail of them"
+        );
+        assert_eq!(printed_messages, 8);
     }
 
     #[test]
@@ -2680,7 +3360,7 @@ mod tests {
             status,
             "openai",
             "gpt-5.4",
-            polaris_provider::Usage::default(),
+            polaris_provider::UsageReport::default(),
             skills,
             cwd,
             local_lines,
@@ -3310,7 +3990,10 @@ mod tests {
             &mut status,
             "openai",
             "gpt-5.4",
-            usage,
+            polaris_provider::UsageReport {
+                usage,
+                ..Default::default()
+            },
             &[],
             dir.path(),
             &mut local_lines,
@@ -3384,7 +4067,7 @@ mod tests {
         // wires the wrong session into `copy_last_reply_with`, fails this.
         let mut session = Session::default();
         session.push_user("hi");
-        session.push_assistant("the answer is 4");
+        session.push_assistant("the answer is 4", Vec::new());
         let mut status = Status::Idle;
 
         apply_copy_action(&session, &mut status, |text| {
@@ -3401,7 +4084,7 @@ mod tests {
     #[test]
     fn apply_copy_action_reports_a_failing_copy() {
         let mut session = Session::default();
-        session.push_assistant("reply");
+        session.push_assistant("reply", Vec::new());
         let mut status = Status::Idle;
 
         apply_copy_action(&session, &mut status, |_| Err("no tty".to_string()));
@@ -3435,7 +4118,7 @@ mod tests {
     fn export_writes_the_conversation_as_markdown() {
         let mut session = Session::default();
         session.push_user("what does this repo do?");
-        session.push_assistant("it's a coding agent");
+        session.push_assistant("it's a coding agent", Vec::new());
         let mut status = Status::Idle;
         let dir = tempfile::tempdir().expect("temp dir");
         let session_path = dir.path().join("session.jsonl");
@@ -3492,7 +4175,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut session = Session::default();
         session.push_user("hello");
-        session.push_assistant("hi there");
+        session.push_assistant("hi there", Vec::new());
         let old_path = dir.path().join("old.jsonl");
         persist::append_message(&old_path, &session.messages[0]).expect("seed old file");
         let mut session_path = old_path.clone();
@@ -3525,6 +4208,58 @@ mod tests {
             Status::Notice(n) => assert!(n.contains("forked to")),
             _ => panic!("expected a Notice"),
         }
+    }
+
+    #[test]
+    fn fork_preserves_foreign_project_provenance_for_memory() {
+        let logs = tempfile::tempdir().unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        let current = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.push_user("original project decision");
+        let mut session_path = logs.path().join("original.jsonl");
+        let mut meta_path = session_path.with_extension("meta.json");
+        let origin_cwd = origin
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        persist::write_meta_if_absent(
+            &meta_path,
+            &persist::SessionMeta {
+                cwd: origin_cwd.clone(),
+                started_at_millis: 1,
+            },
+        )
+        .unwrap();
+        let mut started = 1;
+        let mut status = Status::Idle;
+        handle_fork(
+            logs.path(),
+            current.path().to_str().unwrap(),
+            &session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+        );
+        assert_eq!(persist::read_meta(&meta_path).unwrap().cwd, origin_cwd);
+        memory::configure_saved_memory(&mut session, current.path(), logs.path(), &session_path)
+            .unwrap();
+        assert!(session.before_compact.as_ref().unwrap()(&session.messages).is_err());
+        configure_saved_tool_memory(
+            &mut session,
+            current.path(),
+            logs.path(),
+            &session_path,
+            Some(polaris_core::tool_memory::RetentionMode::History),
+            None,
+        )
+        .unwrap();
+        assert!(session.tool_memory.is_none());
+        assert!(!logs.path().join("memory.sqlite3").exists());
     }
 
     #[test]
@@ -3739,5 +4474,493 @@ mod tests {
             render::visible_history_window(history_len, scroll_offset, 10),
             190..200
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_memory_settings_tests {
+    use super::*;
+    use polaris_core::{session::Session, tool_memory::RetentionMode};
+
+    #[test]
+    fn fork_with_unknown_memory_origin_is_rejected_without_changing_source_or_writing_files() {
+        for tool_argument in [false, true] {
+            let logs = tempfile::tempdir().unwrap();
+            let mut session = Session::new();
+            session.push_user("keep instructions");
+            if tool_argument {
+                session.push_assistant_tool_calls(
+                    "",
+                    vec![polaris_provider::ToolCall {
+                        id: "pending".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "memory://original"}),
+                    }],
+                    Vec::new(),
+                );
+            } else {
+                session.push_tool_result(
+                    "completed",
+                    "[Stored tool result original] memory://original",
+                );
+            }
+            let before = serde_json::to_string(&session.messages).unwrap();
+            let mut path = logs.path().join("original.jsonl");
+            let mut meta = path.with_extension("meta.json");
+            let old_path = path.clone();
+            let old_meta = meta.clone();
+            let mut started = 42;
+            let mut status = Status::Idle;
+            handle_fork(
+                logs.path(),
+                "/project",
+                &session,
+                &mut path,
+                &mut meta,
+                &mut started,
+                &mut status,
+            );
+            assert_eq!(path, old_path);
+            assert_eq!(meta, old_meta);
+            assert_eq!(started, 42);
+            assert_eq!(serde_json::to_string(&session.messages).unwrap(), before);
+            assert_eq!(std::fs::read_dir(logs.path()).unwrap().count(), 0);
+            assert!(
+                matches!(status, Status::Notice(message) if message.contains("分岐できません"))
+            );
+        }
+    }
+
+    #[test]
+    fn tool_memory_lineage_rejects_unverified_ancestors_and_excessive_depth() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let cwd = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let write = |id: &str, origin: Option<&str>| {
+            let path = logs.path().join(format!("{id}.jsonl"));
+            persist::clear_session(&path).unwrap();
+            if path.with_extension("meta.json").exists() {
+                std::fs::remove_file(path.with_extension("meta.json")).unwrap();
+            }
+            persist::write_fork_meta(
+                &path.with_extension("meta.json"),
+                &persist::SessionMeta {
+                    cwd: cwd.clone(),
+                    started_at_millis: 1,
+                },
+                origin,
+            )
+            .unwrap();
+            path
+        };
+        let a = write("A", None);
+        let b = write("B", Some("A"));
+        let c = write("C", Some("B"));
+        assert_eq!(
+            saved_tool_memory_namespace(root.path(), &c).unwrap(),
+            ("C".into(), vec!["B".into(), "A".into()])
+        );
+        for bad in [
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":"missing"}),
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":"C"}),
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":"B"}),
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":"../A"}),
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":null}),
+            serde_json::json!({"cwd":foreign.path(),"started_at_millis":1}),
+            serde_json::json!({"cwd":"relative","started_at_millis":1}),
+            serde_json::json!({"tool_memory_origin":"A"}),
+            serde_json::json!([]),
+        ] {
+            std::fs::write(b.with_extension("meta.json"), bad.to_string()).unwrap();
+            assert!(
+                saved_tool_memory_namespace(root.path(), &c).is_err(),
+                "{bad}"
+            );
+        }
+        std::fs::write(b.with_extension("meta.json"), b"{broken").unwrap();
+        assert!(saved_tool_memory_namespace(root.path(), &c).is_err());
+        std::fs::remove_file(b.with_extension("meta.json")).unwrap();
+        assert!(saved_tool_memory_namespace(root.path(), &c).is_err());
+        write("B", Some("A"));
+        std::fs::remove_file(&a).unwrap();
+        assert!(saved_tool_memory_namespace(root.path(), &c).is_err());
+        write("A", None);
+        std::fs::remove_file(&b).unwrap();
+        assert!(saved_tool_memory_namespace(root.path(), &c).is_err());
+
+        let mut previous = "A".to_owned();
+        for depth in 1..=MAX_TOOL_MEMORY_ORIGINS + 1 {
+            let id = format!("depth-{depth}");
+            let path = write(&id, Some(&previous));
+            assert_eq!(
+                saved_tool_memory_namespace(root.path(), &path).is_ok(),
+                depth <= MAX_TOOL_MEMORY_ORIGINS
+            );
+            previous = id;
+        }
+    }
+
+    #[tokio::test]
+    async fn two_generation_fork_resume_writes_own_session_and_origin_forget_invalidates() {
+        for forget_child in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let logs = tempfile::tempdir().unwrap();
+            let state = logs.path().canonicalize().unwrap().join("state");
+            let path = logs.path().join("original.jsonl");
+            let mut session = Session::new();
+            configure_saved_tool_memory(
+                &mut session,
+                root.path(),
+                &state,
+                &path,
+                Some(RetentionMode::History),
+                None,
+            )
+            .unwrap();
+            let saved = session
+                .tool_memory
+                .as_ref()
+                .unwrap()
+                .backend
+                .save(
+                    &polaris_provider::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path":"source.txt"}),
+                    },
+                    "original evidence before file changes",
+                )
+                .await
+                .unwrap();
+            session.push_tool_result("call", &format!("memory://{}", saved.id));
+            persist::write_meta_if_absent(
+                &path.with_extension("meta.json"),
+                &persist::SessionMeta {
+                    cwd: root.path().canonicalize().unwrap().to_str().unwrap().into(),
+                    started_at_millis: 1,
+                },
+            )
+            .unwrap();
+            persist::append_message(&path, &session.messages[0]).unwrap();
+            let (mut loaded, _) = persist::load_session(&path).unwrap();
+            configure_saved_tool_memory(
+                &mut loaded,
+                root.path(),
+                &state,
+                &path,
+                Some(RetentionMode::History),
+                None,
+            )
+            .unwrap();
+            let original = loaded
+                .tool_memory
+                .as_ref()
+                .unwrap()
+                .backend
+                .read(&format!("memory://{}", saved.id), 0, 100)
+                .await
+                .unwrap();
+            assert!(original.contains("original evidence before file changes"));
+            let mut fork_path = path.clone();
+            let mut meta_path = path.with_extension("meta.json");
+            let mut started = 1;
+            let mut status = Status::Idle;
+            let mut descendants = Vec::new();
+            let mut ancestor_ids = vec!["original".to_owned()];
+            for generation in 0..2 {
+                let previous = fork_path.clone();
+                handle_fork(
+                    logs.path(),
+                    root.path().to_str().unwrap(),
+                    &loaded,
+                    &mut fork_path,
+                    &mut meta_path,
+                    &mut started,
+                    &mut status,
+                );
+                assert_ne!(fork_path, previous);
+                assert_eq!(
+                    persist::read_tool_memory_origin(&meta_path)
+                        .unwrap()
+                        .as_deref(),
+                    previous.file_stem().and_then(|id| id.to_str())
+                );
+                assert!(matches!(&status, Status::Notice(message) if message.contains("削除")));
+                loaded = persist::load_session(&fork_path).unwrap().0;
+                configure_saved_tool_memory(
+                    &mut loaded,
+                    root.path(),
+                    &state,
+                    &fork_path,
+                    Some(RetentionMode::History),
+                    None,
+                )
+                .unwrap();
+                let (current, origins) =
+                    saved_tool_memory_namespace(root.path(), &fork_path).unwrap();
+                assert_eq!(origins, ancestor_ids);
+                ancestor_ids.insert(0, current.clone());
+                let backend = loaded.tool_memory.as_ref().unwrap().backend.clone();
+                if let Some((_, parent_record, _)) = descendants.last() {
+                    assert!(
+                        backend
+                            .read(&format!("memory://{parent_record}"), 0, 100)
+                            .await
+                            .unwrap()
+                            .contains("fork evidence")
+                    );
+                }
+                let record = backend
+                    .save(
+                        &polaris_provider::ToolCall {
+                            id: format!("fork-{generation}"),
+                            name: "read".into(),
+                            arguments: serde_json::json!({"path":"fork.txt"}),
+                        },
+                        "fork evidence",
+                    )
+                    .await
+                    .unwrap();
+                let store =
+                    polaris_memory::MemoryStore::open(state.join("memory.sqlite3")).unwrap();
+                let project = persist::project_identity(root.path()).unwrap();
+                assert!(store.get(&project, &current, &record.id).unwrap().is_some());
+                for ancestor in &origins {
+                    assert!(store.get(&project, ancestor, &record.id).unwrap().is_none());
+                }
+                assert!(
+                    session
+                        .tool_memory
+                        .as_ref()
+                        .unwrap()
+                        .backend
+                        .read(&format!("memory://{}", record.id), 0, 100)
+                        .await
+                        .is_err()
+                );
+                descendants.push((current, record.id, backend));
+                assert!(
+                    loaded
+                        .tool_memory
+                        .as_ref()
+                        .unwrap()
+                        .backend
+                        .read(&format!("memory://{}", saved.id), 0, 100)
+                        .await
+                        .unwrap()
+                        .contains("original evidence before file changes")
+                );
+            }
+            let foreign = tempfile::tempdir().unwrap();
+            configure_saved_tool_memory(
+                &mut loaded,
+                foreign.path(),
+                &state,
+                &fork_path,
+                Some(RetentionMode::History),
+                None,
+            )
+            .unwrap();
+            assert!(loaded.tool_memory.is_none());
+            configure_saved_tool_memory(
+                &mut loaded,
+                root.path(),
+                &state,
+                &fork_path,
+                Some(RetentionMode::History),
+                None,
+            )
+            .unwrap();
+            {
+                let _lock = memory::lock_memory(&state).unwrap();
+                let mut store =
+                    polaris_memory::MemoryStore::open(state.join("memory.sqlite3")).unwrap();
+                store
+                    .delete_session(
+                        &persist::project_identity(root.path()).unwrap(),
+                        if forget_child {
+                            &descendants[0].0
+                        } else {
+                            "original"
+                        },
+                    )
+                    .unwrap();
+            }
+            let store = polaris_memory::MemoryStore::open(state.join("memory.sqlite3")).unwrap();
+            let project = persist::project_identity(root.path()).unwrap();
+            assert_eq!(
+                store
+                    .get(&project, "original", &saved.id)
+                    .unwrap()
+                    .is_some(),
+                forget_child
+            );
+            if forget_child {
+                assert!(
+                    store
+                        .get(&project, &descendants[0].0, &descendants[0].1)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    session
+                        .tool_memory
+                        .as_ref()
+                        .unwrap()
+                        .backend
+                        .read(&format!("memory://{}", saved.id), 0, 100)
+                        .await
+                        .unwrap()
+                        .contains("original evidence")
+                );
+                assert!(
+                    session
+                        .tool_memory
+                        .as_ref()
+                        .unwrap()
+                        .backend
+                        .save(
+                            &polaris_provider::ToolCall {
+                                id: "parent-later".into(),
+                                name: "read".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                            "parent remains writable"
+                        )
+                        .await
+                        .is_ok()
+                );
+            }
+            for (_, record, backend) in &descendants {
+                assert!(
+                    backend
+                        .read(&format!("memory://{record}"), 0, 100)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    backend
+                        .save(
+                            &polaris_provider::ToolCall {
+                                id: "blocked".into(),
+                                name: "read".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                            "cannot resurrect"
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+            let backend = &loaded.tool_memory.as_ref().unwrap().backend;
+            assert!(
+                backend
+                    .read(&format!("memory://{}", saved.id), 0, 100)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                backend
+                    .save(
+                        &polaris_provider::ToolCall {
+                            id: "later".into(),
+                            name: "read".into(),
+                            arguments: serde_json::json!({"path":"source.txt"})
+                        },
+                        "cannot resurrect"
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_memory_settings_preserve_messages_and_reject_foreign_or_unknown_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let state = logs.path().canonicalize().unwrap().join("state");
+        let path = logs.path().join("saved.jsonl");
+        let mut session = Session::new();
+        configure_saved_tool_memory(
+            &mut session,
+            root.path(),
+            &state,
+            &path,
+            Some(RetentionMode::History),
+            None,
+        )
+        .unwrap();
+        assert!(session.tool_memory.is_some());
+        assert!(session.before_compact.is_none());
+        session.push_user("keep user instructions");
+        session.push_assistant_tool_calls(
+            "pending",
+            vec![polaris_provider::ToolCall {
+                id: "pending-call".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"file"}"#.into(),
+            }],
+            Vec::new(),
+        );
+        let before = serde_json::to_string(&session.messages).unwrap();
+        configure_saved_tool_memory(
+            &mut session,
+            root.path(),
+            &state,
+            &path,
+            Some(RetentionMode::History),
+            None,
+        )
+        .unwrap();
+        assert!(
+            session.tool_memory.is_none(),
+            "unknown nonempty origin is rejected"
+        );
+        persist::write_meta_if_absent(
+            &path.with_extension("meta.json"),
+            &persist::SessionMeta {
+                cwd: root.path().canonicalize().unwrap().to_str().unwrap().into(),
+                started_at_millis: 1,
+            },
+        )
+        .unwrap();
+        configure_saved_tool_memory(
+            &mut session,
+            root.path(),
+            &state,
+            &path,
+            Some(RetentionMode::Retrieval),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            session.tool_memory.as_ref().unwrap().mode,
+            RetentionMode::Retrieval
+        );
+        configure_saved_tool_memory(
+            &mut session,
+            foreign.path(),
+            &state,
+            &path,
+            Some(RetentionMode::History),
+            None,
+        )
+        .unwrap();
+        assert!(
+            session.tool_memory.is_none(),
+            "foreign origin clears an existing backend"
+        );
+        assert_eq!(serde_json::to_string(&session.messages).unwrap(), before);
+        configure_saved_tool_memory(&mut session, root.path(), &state, &path, None, None).unwrap();
+        assert!(session.tool_memory.is_none());
     }
 }

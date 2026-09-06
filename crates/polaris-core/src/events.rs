@@ -27,6 +27,12 @@ pub enum AgentEvent {
         agent_type: String,
         ok: bool,
     },
+    HistoryCompacted {
+        messages_before: usize,
+        messages_after: usize,
+        tokens_before: u32,
+        tokens_after: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

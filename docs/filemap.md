@@ -76,6 +76,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `session.rs` — Message history. In M1, this is append-only — no compaction, no
 - `spawn.rs` — The `spawn` tool's implementation. Type discovery reuses
 - `stop.rs` — Stop conditions. No automatic recovery is attempted. Continuing to spin
+- `tool_memory.rs` — Opt-in recoverable tool-result retention; original output lives outside history.
 
 ## `crates/polaris-core/src/secret_screen`
 
@@ -104,6 +105,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-provider/src`
 
 - `codex.rs` — A provider that speaks the Responses API using ChatGPT subscription
+- `codex_metrics.rs` — Opt-in, content-free diagnostics for each actual Codex HTTP attempt.
 - `lib.rs` — Provider abstraction. Transport-dependent parts live in each
 - `openai.rs` — OpenAI-compatible chat completions. Swap out `base_url` and you can hit
 - `sse.rs` — Incrementally decodes SSE (text/event-stream). Pushing a byte chunk
@@ -172,15 +174,17 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `sessions.rs` — Enumerates saved conversations under `~/.polaris/sessions/` for the
 - `slash.rs` — Slash commands: local, client-side commands recognized when the input
 - `time.rs` — A tiny, dependency-free UTC timestamp formatter — just enough to
+- `tool_memory.rs` — Immutable, scoped tool output storage behind the reserved memory read path.
 
 ## `docs`
 
 - `context-efficiency.md` — コンテキストの効率化とローカル記憶
 - `filemap.md` — File map
+- `gpt6-efficiency-results.md` — GPT-6 medium 効率化の初回実測
 
 ## `docs/superpowers`
 
-- `CURRENT.md` — Polaris 現況
+- `CURRENT.md` — Polaris 現在の状態
 
 ## `docs/superpowers/plans`
 

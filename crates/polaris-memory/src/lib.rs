@@ -108,6 +108,16 @@ pub struct SearchHit {
     pub score: f64,
 }
 
+/// A bounded UTF-8 byte range. Offsets refer to the original record, and `end`
+/// is exclusive. The record retains provenance but contains only the selected text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordRange {
+    pub record: Record,
+    pub start: usize,
+    pub end: usize,
+    pub total_bytes: usize,
+}
+
 pub struct MemoryStore {
     connection: Connection,
 }
@@ -257,6 +267,41 @@ impl MemoryStore {
             .optional()?)
     }
 
+    /// Fetches at most MAX_EXCERPT_BYTES bytes starting at an exact UTF-8
+    /// boundary. Out-of-bounds/interior-byte starts are errors; EOF is valid.
+    /// The end rounds down to a character boundary. Zero budgets are valid.
+    pub fn get_range(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        id: &str,
+        start: usize,
+        max_bytes: usize,
+    ) -> Result<Option<RecordRange>> {
+        let Some(mut record) = self.get(project_id, session_id, id)? else {
+            return Ok(None);
+        };
+        let total_bytes = record.text.len();
+        if !record.text.is_char_boundary(start) {
+            return Err(Error::InvalidInput(
+                "start must be a UTF-8 boundary within the record",
+            ));
+        }
+        let end = floor_boundary(
+            &record.text,
+            start
+                .saturating_add(max_bytes.min(MAX_EXCERPT_BYTES))
+                .min(total_bytes),
+        );
+        record.text = record.text[start..end].to_owned();
+        Ok(Some(RecordRange {
+            record,
+            start,
+            end,
+            total_bytes,
+        }))
+    }
+
     /// Fetches a project-scoped ID, rejecting ambiguous IDs across sessions.
     pub fn get_by_id(&self, project_id: &str, id: &str) -> Result<Option<Record>> {
         let mut statement = self.connection.prepare(
@@ -299,6 +344,20 @@ impl MemoryStore {
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    /// Whether this scoped record already has an embedding for the requested model.
+    pub fn has_embedding(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        id: &str,
+        model: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_vectors WHERE project_id=?1 AND session_id=?2 AND id=?3 AND model=?4)",
+            params![project_id, session_id, id, model], |row| row.get(0),
+        )?)
     }
 
     /// Attaches/replaces a supplied embedding without modifying text or metadata.
@@ -381,11 +440,22 @@ impl MemoryStore {
     }
 
     /// Ranks inside the requested scope and keeps only a bounded set of excerpts.
+    /// Exact score ties prefer newer timestamps: numeric Unix milliseconds for
+    /// native records, lexical order for consistently formatted imported dates.
+    /// Mixed timestamp formats are deterministic, not chronologically normalized.
     /// Lexical terms are literal: SQL/FTS syntax, `%`, `_`, etc. have no special role.
     pub fn search(&self, request: &SearchRequest<'_>) -> Result<Vec<SearchHit>> {
         if let SearchMode::Hybrid { query, embedding } = request.mode {
             return self.search_hybrid(request, query, embedding);
         }
+        self.search_candidates(request, None)
+    }
+
+    fn search_candidates(
+        &self,
+        request: &SearchRequest<'_>,
+        excerpt_query: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
         validate_metadata(request.project_id)?;
         if let Some(session) = request.session_id {
             validate_metadata(session)?;
@@ -397,15 +467,11 @@ impl MemoryStore {
                         "query must be nonempty and at most 4096 bytes",
                     ));
                 }
-                let mut terms: Vec<String> =
-                    query.split_whitespace().map(str::to_lowercase).collect();
-                terms.sort();
-                terms.dedup();
-                terms
+                query_terms(query)
             }
             SearchMode::Semantic(embedding) => {
                 validate_embedding(embedding)?;
-                Vec::new()
+                excerpt_query.map(query_terms).unwrap_or_default()
             }
             SearchMode::Hybrid { .. } => unreachable!("hybrid handled above"),
         };
@@ -438,32 +504,29 @@ impl MemoryStore {
         let mut hits = Vec::new();
         while let Some(row) = rows.next()? {
             let record = read_record(row)?;
-            let (score, offset) = match request.mode {
+            let folded = if terms.is_empty() {
+                String::new()
+            } else {
+                record.text.to_lowercase()
+            };
+            let score = match request.mode {
                 SearchMode::Lexical(_) => {
-                    let folded = record.text.to_lowercase();
                     if !terms.iter().all(|term| folded.contains(term)) {
                         continue;
                     }
-                    let score = terms
+                    terms
                         .iter()
                         .map(|term| folded.matches(term.as_str()).count())
-                        .sum::<usize>() as f64;
-                    // Map lowercased byte offsets back to original UTF-8 boundaries.
-                    let folded_offset = terms
-                        .iter()
-                        .filter_map(|term| folded.find(term))
-                        .min()
-                        .unwrap_or(0);
-                    (score, original_offset(&record.text, folded_offset))
+                        .sum::<usize>() as f64
                 }
                 SearchMode::Semantic(query) => {
                     let bytes: Vec<u8> = row.get(7)?;
-                    (cosine(&query.values, &bytes)?, 0)
+                    cosine(&query.values, &bytes)?
                 }
                 SearchMode::Hybrid { .. } => unreachable!("hybrid handled above"),
             };
             let hit = SearchHit {
-                excerpt: excerpt(&record.text, offset, excerpt_bytes),
+                excerpt: relevant_excerpt(&record.text, &folded, &terms, excerpt_bytes),
                 project_id: record.project_id,
                 session_id: record.session_id,
                 id: record.id,
@@ -473,12 +536,7 @@ impl MemoryStore {
                 score,
             };
             hits.push(hit);
-            hits.sort_by(|a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| a.session_id.cmp(&b.session_id))
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            hits.sort_by(compare_hits);
             hits.truncate(limit);
         }
         Ok(hits)
@@ -501,7 +559,11 @@ impl MemoryStore {
                 limit: if request.limit == 0 { 0 } else { MAX_RESULTS },
                 excerpt_bytes: request.excerpt_bytes,
             };
-            for (rank, mut hit) in self.search(&candidate_request)?.into_iter().enumerate() {
+            for (rank, mut hit) in self
+                .search_candidates(&candidate_request, Some(query))?
+                .into_iter()
+                .enumerate()
+            {
                 hit.score = 1.0 / (60.0 + rank as f64 + 1.0);
                 let key = (hit.session_id.clone(), hit.id.clone());
                 if let Some(existing) = candidates.get_mut(&key) {
@@ -512,12 +574,7 @@ impl MemoryStore {
             }
         }
         let mut hits: Vec<_> = candidates.into_values().collect();
-        hits.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.session_id.cmp(&b.session_id))
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        hits.sort_by(compare_hits);
         hits.truncate(request.limit.min(MAX_RESULTS));
         Ok(hits)
     }
@@ -579,25 +636,94 @@ fn cosine(query: &[f32], bytes: &[u8]) -> Result<f64> {
     Ok((dot / (query_norm.sqrt() * stored_norm.sqrt())).clamp(-1.0, 1.0))
 }
 
-fn original_offset(text: &str, folded_offset: usize) -> usize {
-    let mut folded_bytes = 0;
-    for (offset, character) in text.char_indices() {
-        folded_bytes += character.to_lowercase().map(char::len_utf8).sum::<usize>();
-        if folded_bytes > folded_offset {
-            return offset;
-        }
-    }
-    0
+// Native archives use integer Unix milliseconds. Imported nonnumeric timestamps
+// sort lexicographically and must use one consistent format/timezone for freshness.
+// Mixed formats have deterministic ordering, not inferred chronological meaning.
+// Only exact relevance ties reach this comparison.
+fn compare_hits(a: &SearchHit, b: &SearchHit) -> std::cmp::Ordering {
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| freshness_key(&b.timestamp).cmp(&freshness_key(&a.timestamp)))
+        .then_with(|| a.session_id.cmp(&b.session_id))
+        .then_with(|| a.id.cmp(&b.id))
 }
 
-fn excerpt(text: &str, offset: usize, budget: usize) -> String {
-    let mut start = offset.saturating_sub(budget / 4);
-    while !text.is_char_boundary(start) {
-        start += 1;
+fn freshness_key(timestamp: &str) -> (u8, u128, &str) {
+    if timestamp.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(millis) = timestamp.parse::<u128>()
+    {
+        (1, millis, "")
+    } else {
+        (0, 0, timestamp)
     }
-    let mut end = start.saturating_add(budget).min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn floor_boundary(text: &str, mut offset: usize) -> usize {
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
     }
-    text[start..end].to_owned()
+    offset
+}
+
+fn relevant_excerpt(text: &str, folded: &str, terms: &[String], budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    // Whole-record embeddings cannot locate a relevant passage on their own.
+    if terms.is_empty() || text.len() <= budget {
+        return text[..floor_boundary(text, text.len().min(budget))].to_owned();
+    }
+    // Map case-folded matches once, including expanding lowercase characters.
+    let mut folded_bytes = 0;
+    let mut boundaries = Vec::new();
+    for (offset, character) in text.char_indices() {
+        boundaries.push((folded_bytes, offset));
+        folded_bytes += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+    boundaries.push((folded_bytes, text.len()));
+    let mut matches = Vec::new();
+    for term in terms {
+        for (offset, _) in folded.match_indices(term.as_str()) {
+            let start = boundaries[boundaries.partition_point(|&(f, _)| f <= offset) - 1].1;
+            let end = boundaries[boundaries.partition_point(|&(f, _)| f < offset + term.len())].1;
+            matches.push((start, end));
+        }
+    }
+    matches.sort_unstable();
+    let mut best_start = 0;
+    let mut best_coverage = 0;
+    // Prefer a window containing more distinct query terms, not repetition of
+    // one term. Equal coverage keeps the earliest passage, deterministically.
+    'windows: for &(offset, match_end) in &matches {
+        let context = (budget / 4).min(budget.saturating_sub(match_end - offset));
+        // Also try without leading context so it cannot crowd out another term.
+        for padding in [context, 0] {
+            let mut start = offset.saturating_sub(padding);
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            let end = floor_boundary(text, start.saturating_add(budget).min(text.len()));
+            let window = text[start..end].to_lowercase();
+            let coverage = terms
+                .iter()
+                .filter(|term| window.contains(term.as_str()))
+                .count();
+            if coverage > best_coverage {
+                best_start = start;
+                best_coverage = coverage;
+                if coverage == terms.len() {
+                    break 'windows;
+                }
+            }
+        }
+    }
+    let end = floor_boundary(text, best_start.saturating_add(budget).min(text.len()));
+    text[best_start..end].to_owned()
 }

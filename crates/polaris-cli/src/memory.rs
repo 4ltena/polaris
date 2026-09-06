@@ -28,7 +28,16 @@ enum Command {
         embedding: EmbeddingArgs,
     },
     /// 出典を確認して記録本文を取得する。
-    Get { session: String, id: String },
+    Get {
+        session: String,
+        id: String,
+        /// UTF-8バイト単位の開始位置。文字の途中は指定できません。
+        #[arg(long)]
+        start: Option<usize>,
+        /// 取得する最大バイト数。範囲取得時の既定512、上限4096。
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
     /// 指定記録に埋め込みを付ける。本文を設定したローカルサーバーへ送信する。
     Embed {
         session: String,
@@ -187,7 +196,31 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 )?
             );
         }
-        Command::Get { session, id } => {
+        Command::Get {
+            session,
+            id,
+            start,
+            max_bytes,
+        } => {
+            if start.is_some() || max_bytes.is_some() {
+                let range = store
+                    .get_range(
+                        &project_id,
+                        &session,
+                        &id,
+                        start.unwrap_or(0),
+                        max_bytes.unwrap_or(512),
+                    )?
+                    .ok_or("記録がありません")?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "historical_evidence", "record": range.record,
+                        "range": {"start": range.start, "end": range.end, "total_bytes": range.total_bytes}
+                    }))?
+                );
+                return Ok(());
+            }
             let record = store
                 .get(&project_id, &session, &id)?
                 .ok_or("記録がありません")?;

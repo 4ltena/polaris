@@ -123,6 +123,21 @@ pub fn configure_memory(
     Ok(())
 }
 
+pub(crate) fn saved_project_matches(
+    session: &Session,
+    project: &Path,
+    session_path: &Path,
+) -> bool {
+    let root = polaris_core::project::resolve_root(project);
+    match super::persist::read_meta(&session_path.with_extension("meta.json")) {
+        Some(meta) => {
+            Path::new(&meta.cwd).is_absolute()
+                && polaris_core::project::resolve_root(Path::new(&meta.cwd)) == root
+        }
+        None => session.messages.is_empty(),
+    }
+}
+
 /// A resumed conversation keeps its original project provenance.
 pub fn configure_saved_memory(
     session: &mut Session,
@@ -130,15 +145,8 @@ pub fn configure_saved_memory(
     state_dir: &Path,
     session_path: &Path,
 ) -> io::Result<()> {
-    let origin = super::persist::read_meta(&session_path.with_extension("meta.json"));
     let root = polaris_core::project::resolve_root(project);
-    let compatible = match origin {
-        Some(meta) => {
-            Path::new(&meta.cwd).is_absolute()
-                && polaris_core::project::resolve_root(Path::new(&meta.cwd)) == root
-        }
-        None => session.messages.is_empty(),
-    };
+    let compatible = saved_project_matches(session, project, session_path);
     if !compatible {
         session.before_compact = Some(Arc::new(|_| {
             Err(io::Error::other(

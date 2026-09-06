@@ -108,6 +108,47 @@ pub fn write_meta_if_absent(meta_path: &Path, meta: &SessionMeta) -> io::Result<
     std::fs::write(meta_path, json)
 }
 
+/// Forks retain their own write namespace and record the immediate source.
+/// Its verified lineage grants read-only access to ancestor tool memory.
+pub(crate) fn write_fork_meta(
+    path: &Path,
+    meta: &SessionMeta,
+    memory_origin: Option<&str>,
+) -> io::Result<()> {
+    let mut value = serde_json::to_value(meta)?;
+    if let Some(origin) = memory_origin {
+        value["tool_memory_origin"] = serde_json::Value::String(origin.into());
+    }
+    atomic_write(path, false, |file| {
+        serde_json::to_writer(file, &value).map_err(io::Error::other)
+    })
+}
+
+/// Missing fields are legacy sessions; malformed origin fields fail closed.
+pub(crate) fn read_tool_memory_origin(path: &Path) -> io::Result<Option<String>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if !value.is_object() {
+        return Err(io::Error::other("記憶のセッションメタデータが不正です"));
+    }
+    match value.get("tool_memory_origin") {
+        None => Ok(None),
+        Some(serde_json::Value::String(origin))
+            if !origin.is_empty()
+                && origin
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
+            Ok(Some(origin.clone()))
+        }
+        _ => Err(io::Error::other("記憶の元セッションIDが不正です")),
+    }
+}
+
 /// Reads back a session's metadata. `None` (not an error) when the file
 /// is missing or unparseable — a `/resume` listing skips a corrupt or
 /// incomplete entry rather than failing the whole list.

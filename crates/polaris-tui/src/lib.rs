@@ -13,6 +13,7 @@ mod selection;
 pub mod sessions;
 pub mod slash;
 mod time;
+pub mod tool_memory;
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -60,6 +61,8 @@ pub struct RunArgs<'a> {
     pub audit_path: PathBuf,
     pub max_turns: u32,
     pub remember: bool,
+    pub tool_memory: Option<polaris_core::tool_memory::RetentionMode>,
+    pub tool_memory_embedding: Option<(String, String)>,
     pub compact_at: Option<usize>,
     pub sandbox: SandboxPolicy,
     pub helper: PathBuf,
@@ -74,6 +77,72 @@ pub struct RunArgs<'a> {
     /// (see `polaris_core::config`).
     pub spawn_concurrency: usize,
     pub spawn_write_concurrency: usize,
+}
+
+// Ancestors are read-only and must form an explicit, bounded same-project chain.
+const MAX_TOOL_MEMORY_ORIGINS: usize = 64;
+
+fn saved_tool_memory_namespace(
+    project: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<(String, Vec<String>)> {
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .ok_or_else(|| std::io::Error::other("invalid session id"))?
+        .to_owned();
+    let project = polaris_core::project::resolve_root(project);
+    let mut seen = std::collections::HashSet::from([id.clone()]);
+    let mut origins = Vec::new();
+    let mut cursor = path.to_path_buf();
+    while let Some(origin) = persist::read_tool_memory_origin(&cursor.with_extension("meta.json"))?
+    {
+        if origins.len() >= MAX_TOOL_MEMORY_ORIGINS || !seen.insert(origin.clone()) {
+            return Err(std::io::Error::other(
+                "記憶の系譜が循環しているか上限を超えています",
+            ));
+        }
+        let source = path.with_file_name(format!("{origin}.jsonl"));
+        let source_meta = persist::read_meta(&source.with_extension("meta.json"))
+            .ok_or_else(|| std::io::Error::other("記憶の元セッションの出自を確認できません"))?;
+        if !source.is_file()
+            || !std::path::Path::new(&source_meta.cwd).is_absolute()
+            || polaris_core::project::resolve_root(std::path::Path::new(&source_meta.cwd))
+                != project
+        {
+            return Err(std::io::Error::other(
+                "記憶の元セッションが存在しないか同一プロジェクトではありません",
+            ));
+        }
+        origins.push(origin);
+        cursor = source;
+    }
+    Ok((id, origins))
+}
+
+fn configure_saved_tool_memory(
+    session: &mut polaris_core::session::Session,
+    project: &std::path::Path,
+    state_dir: &std::path::Path,
+    session_path: &std::path::Path,
+    mode: Option<polaris_core::tool_memory::RetentionMode>,
+    embedding: Option<(String, String)>,
+) -> std::io::Result<()> {
+    session.tool_memory = None;
+    if let Some(mode) = mode
+        && memory::saved_project_matches(session, project, session_path)
+    {
+        let (id, origins) = saved_tool_memory_namespace(project, session_path)?;
+        tool_memory::configure_tool_memory_with_origins(
+            session, project, state_dir, &id, &origins, mode, embedding,
+        )?;
+    }
+    Ok(())
 }
 
 /// Collapses a leading `$HOME` to `~`, for the footer only (see
@@ -497,7 +566,26 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // the real history.
     let mut local_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
 
+    let mut tool_memory_path: Option<PathBuf> = None;
     let exit_code = 'outer: loop {
+        if tool_memory_path.as_ref() != Some(&session_path)
+            || (args.tool_memory.is_some()
+                && session.tool_memory.is_none()
+                && memory::saved_project_matches(&session, &args.cwd, &session_path))
+        {
+            if let Err(error) = configure_saved_tool_memory(
+                &mut session,
+                &args.cwd,
+                &args.state_dir,
+                &session_path,
+                args.tool_memory,
+                args.tool_memory_embedding.clone(),
+            ) {
+                fatal_message = Some(format!("ツール記憶を準備できません: {error}"));
+                break 'outer ExitCode::FAILURE;
+            }
+            tool_memory_path = Some(session_path.clone());
+        }
         let mut cumulative_usage = usage_meter.snapshot().usage;
         session.compaction_threshold = args.compact_at;
         if args.remember
@@ -1912,6 +2000,52 @@ fn handle_fork(
     session_started_at_millis: &mut u128,
     status: &mut Status,
 ) {
+    let has_references = session.messages.iter().any(|message| {
+        message.content.contains("memory://")
+            || message.content.starts_with("[Stored tool result ")
+            || message
+                .tool_calls
+                .iter()
+                .any(|call| call.arguments.to_string().contains("memory://"))
+    });
+    let saved_origin = match persist::read_tool_memory_origin(meta_path) {
+        Ok(origin) => origin,
+        Err(error) => {
+            *status = Status::Notice(format!(
+                "記憶の出自を確認できないため分岐できません: {error}"
+            ));
+            return;
+        }
+    };
+    let needs_memory_origin =
+        has_references || session.tool_memory.is_some() || saved_origin.is_some();
+    let memory_origin =
+        if memory::saved_project_matches(session, std::path::Path::new(cwd_display), session_path)
+            && persist::read_meta(meta_path).is_some()
+            && session_path.is_file()
+        {
+            match saved_tool_memory_namespace(std::path::Path::new(cwd_display), session_path) {
+                Ok((id, origins)) if origins.len() < MAX_TOOL_MEMORY_ORIGINS => Some(id),
+                Ok(_) => {
+                    *status = Status::Notice("記憶の系譜が上限に達したため分岐できません".into());
+                    return;
+                }
+                Err(error) => {
+                    *status = Status::Notice(format!(
+                        "記憶の出自を確認できないため分岐できません: {error}"
+                    ));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+    if needs_memory_origin && memory_origin.is_none() {
+        *status = Status::Notice(
+            "記憶の出自を確認できないため分岐できません。元の会話はそのまま継続できます。".into(),
+        );
+        return;
+    }
     let new_session_path = sessions_dir.join(format!("{}.jsonl", new_session_id()));
     let new_meta_path = new_session_path.with_extension("meta.json");
     let started = now_millis();
@@ -1925,12 +2059,13 @@ fn handle_fork(
             }
         });
 
-    if let Err(e) = persist::write_meta_if_absent(
+    if let Err(e) = persist::write_fork_meta(
         &new_meta_path,
         &persist::SessionMeta {
             cwd: origin_cwd,
             started_at_millis: started,
         },
+        memory_origin.as_deref(),
     ) {
         *status = Status::Notice(format!("can't fork: {e}"));
         return;
@@ -1942,7 +2077,14 @@ fn handle_fork(
         }
     }
 
-    *status = Status::Notice(format!("forked to {}", new_session_path.display()));
+    *status = Status::Notice(if memory_origin.is_some() {
+        format!(
+            "分岐先: {}。祖先の記憶は参照専用で、新しい記憶はこの分岐に保存します。祖先の記憶を削除すると、この分岐の記憶利用も無効になります。",
+            new_session_path.display()
+        )
+    } else {
+        format!("forked to {}", new_session_path.display())
+    });
     *session_path = new_session_path;
     *meta_path = new_meta_path;
     *session_started_at_millis = started;
@@ -4107,6 +4249,16 @@ mod tests {
         memory::configure_saved_memory(&mut session, current.path(), logs.path(), &session_path)
             .unwrap();
         assert!(session.before_compact.as_ref().unwrap()(&session.messages).is_err());
+        configure_saved_tool_memory(
+            &mut session,
+            current.path(),
+            logs.path(),
+            &session_path,
+            Some(polaris_core::tool_memory::RetentionMode::History),
+            None,
+        )
+        .unwrap();
+        assert!(session.tool_memory.is_none());
         assert!(!logs.path().join("memory.sqlite3").exists());
     }
 
@@ -4322,5 +4474,493 @@ mod tests {
             render::visible_history_window(history_len, scroll_offset, 10),
             190..200
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_memory_settings_tests {
+    use super::*;
+    use polaris_core::{session::Session, tool_memory::RetentionMode};
+
+    #[test]
+    fn fork_with_unknown_memory_origin_is_rejected_without_changing_source_or_writing_files() {
+        for tool_argument in [false, true] {
+            let logs = tempfile::tempdir().unwrap();
+            let mut session = Session::new();
+            session.push_user("keep instructions");
+            if tool_argument {
+                session.push_assistant_tool_calls(
+                    "",
+                    vec![polaris_provider::ToolCall {
+                        id: "pending".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "memory://original"}),
+                    }],
+                    Vec::new(),
+                );
+            } else {
+                session.push_tool_result(
+                    "completed",
+                    "[Stored tool result original] memory://original",
+                );
+            }
+            let before = serde_json::to_string(&session.messages).unwrap();
+            let mut path = logs.path().join("original.jsonl");
+            let mut meta = path.with_extension("meta.json");
+            let old_path = path.clone();
+            let old_meta = meta.clone();
+            let mut started = 42;
+            let mut status = Status::Idle;
+            handle_fork(
+                logs.path(),
+                "/project",
+                &session,
+                &mut path,
+                &mut meta,
+                &mut started,
+                &mut status,
+            );
+            assert_eq!(path, old_path);
+            assert_eq!(meta, old_meta);
+            assert_eq!(started, 42);
+            assert_eq!(serde_json::to_string(&session.messages).unwrap(), before);
+            assert_eq!(std::fs::read_dir(logs.path()).unwrap().count(), 0);
+            assert!(
+                matches!(status, Status::Notice(message) if message.contains("分岐できません"))
+            );
+        }
+    }
+
+    #[test]
+    fn tool_memory_lineage_rejects_unverified_ancestors_and_excessive_depth() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let cwd = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let write = |id: &str, origin: Option<&str>| {
+            let path = logs.path().join(format!("{id}.jsonl"));
+            persist::clear_session(&path).unwrap();
+            if path.with_extension("meta.json").exists() {
+                std::fs::remove_file(path.with_extension("meta.json")).unwrap();
+            }
+            persist::write_fork_meta(
+                &path.with_extension("meta.json"),
+                &persist::SessionMeta {
+                    cwd: cwd.clone(),
+                    started_at_millis: 1,
+                },
+                origin,
+            )
+            .unwrap();
+            path
+        };
+        let a = write("A", None);
+        let b = write("B", Some("A"));
+        let c = write("C", Some("B"));
+        assert_eq!(
+            saved_tool_memory_namespace(root.path(), &c).unwrap(),
+            ("C".into(), vec!["B".into(), "A".into()])
+        );
+        for bad in [
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":"missing"}),
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":"C"}),
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":"B"}),
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":"../A"}),
+            serde_json::json!({"cwd":cwd,"started_at_millis":1,"tool_memory_origin":null}),
+            serde_json::json!({"cwd":foreign.path(),"started_at_millis":1}),
+            serde_json::json!({"cwd":"relative","started_at_millis":1}),
+            serde_json::json!({"tool_memory_origin":"A"}),
+            serde_json::json!([]),
+        ] {
+            std::fs::write(b.with_extension("meta.json"), bad.to_string()).unwrap();
+            assert!(
+                saved_tool_memory_namespace(root.path(), &c).is_err(),
+                "{bad}"
+            );
+        }
+        std::fs::write(b.with_extension("meta.json"), b"{broken").unwrap();
+        assert!(saved_tool_memory_namespace(root.path(), &c).is_err());
+        std::fs::remove_file(b.with_extension("meta.json")).unwrap();
+        assert!(saved_tool_memory_namespace(root.path(), &c).is_err());
+        write("B", Some("A"));
+        std::fs::remove_file(&a).unwrap();
+        assert!(saved_tool_memory_namespace(root.path(), &c).is_err());
+        write("A", None);
+        std::fs::remove_file(&b).unwrap();
+        assert!(saved_tool_memory_namespace(root.path(), &c).is_err());
+
+        let mut previous = "A".to_owned();
+        for depth in 1..=MAX_TOOL_MEMORY_ORIGINS + 1 {
+            let id = format!("depth-{depth}");
+            let path = write(&id, Some(&previous));
+            assert_eq!(
+                saved_tool_memory_namespace(root.path(), &path).is_ok(),
+                depth <= MAX_TOOL_MEMORY_ORIGINS
+            );
+            previous = id;
+        }
+    }
+
+    #[tokio::test]
+    async fn two_generation_fork_resume_writes_own_session_and_origin_forget_invalidates() {
+        for forget_child in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let logs = tempfile::tempdir().unwrap();
+            let state = logs.path().canonicalize().unwrap().join("state");
+            let path = logs.path().join("original.jsonl");
+            let mut session = Session::new();
+            configure_saved_tool_memory(
+                &mut session,
+                root.path(),
+                &state,
+                &path,
+                Some(RetentionMode::History),
+                None,
+            )
+            .unwrap();
+            let saved = session
+                .tool_memory
+                .as_ref()
+                .unwrap()
+                .backend
+                .save(
+                    &polaris_provider::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path":"source.txt"}),
+                    },
+                    "original evidence before file changes",
+                )
+                .await
+                .unwrap();
+            session.push_tool_result("call", &format!("memory://{}", saved.id));
+            persist::write_meta_if_absent(
+                &path.with_extension("meta.json"),
+                &persist::SessionMeta {
+                    cwd: root.path().canonicalize().unwrap().to_str().unwrap().into(),
+                    started_at_millis: 1,
+                },
+            )
+            .unwrap();
+            persist::append_message(&path, &session.messages[0]).unwrap();
+            let (mut loaded, _) = persist::load_session(&path).unwrap();
+            configure_saved_tool_memory(
+                &mut loaded,
+                root.path(),
+                &state,
+                &path,
+                Some(RetentionMode::History),
+                None,
+            )
+            .unwrap();
+            let original = loaded
+                .tool_memory
+                .as_ref()
+                .unwrap()
+                .backend
+                .read(&format!("memory://{}", saved.id), 0, 100)
+                .await
+                .unwrap();
+            assert!(original.contains("original evidence before file changes"));
+            let mut fork_path = path.clone();
+            let mut meta_path = path.with_extension("meta.json");
+            let mut started = 1;
+            let mut status = Status::Idle;
+            let mut descendants = Vec::new();
+            let mut ancestor_ids = vec!["original".to_owned()];
+            for generation in 0..2 {
+                let previous = fork_path.clone();
+                handle_fork(
+                    logs.path(),
+                    root.path().to_str().unwrap(),
+                    &loaded,
+                    &mut fork_path,
+                    &mut meta_path,
+                    &mut started,
+                    &mut status,
+                );
+                assert_ne!(fork_path, previous);
+                assert_eq!(
+                    persist::read_tool_memory_origin(&meta_path)
+                        .unwrap()
+                        .as_deref(),
+                    previous.file_stem().and_then(|id| id.to_str())
+                );
+                assert!(matches!(&status, Status::Notice(message) if message.contains("削除")));
+                loaded = persist::load_session(&fork_path).unwrap().0;
+                configure_saved_tool_memory(
+                    &mut loaded,
+                    root.path(),
+                    &state,
+                    &fork_path,
+                    Some(RetentionMode::History),
+                    None,
+                )
+                .unwrap();
+                let (current, origins) =
+                    saved_tool_memory_namespace(root.path(), &fork_path).unwrap();
+                assert_eq!(origins, ancestor_ids);
+                ancestor_ids.insert(0, current.clone());
+                let backend = loaded.tool_memory.as_ref().unwrap().backend.clone();
+                if let Some((_, parent_record, _)) = descendants.last() {
+                    assert!(
+                        backend
+                            .read(&format!("memory://{parent_record}"), 0, 100)
+                            .await
+                            .unwrap()
+                            .contains("fork evidence")
+                    );
+                }
+                let record = backend
+                    .save(
+                        &polaris_provider::ToolCall {
+                            id: format!("fork-{generation}"),
+                            name: "read".into(),
+                            arguments: serde_json::json!({"path":"fork.txt"}),
+                        },
+                        "fork evidence",
+                    )
+                    .await
+                    .unwrap();
+                let store =
+                    polaris_memory::MemoryStore::open(state.join("memory.sqlite3")).unwrap();
+                let project = persist::project_identity(root.path()).unwrap();
+                assert!(store.get(&project, &current, &record.id).unwrap().is_some());
+                for ancestor in &origins {
+                    assert!(store.get(&project, ancestor, &record.id).unwrap().is_none());
+                }
+                assert!(
+                    session
+                        .tool_memory
+                        .as_ref()
+                        .unwrap()
+                        .backend
+                        .read(&format!("memory://{}", record.id), 0, 100)
+                        .await
+                        .is_err()
+                );
+                descendants.push((current, record.id, backend));
+                assert!(
+                    loaded
+                        .tool_memory
+                        .as_ref()
+                        .unwrap()
+                        .backend
+                        .read(&format!("memory://{}", saved.id), 0, 100)
+                        .await
+                        .unwrap()
+                        .contains("original evidence before file changes")
+                );
+            }
+            let foreign = tempfile::tempdir().unwrap();
+            configure_saved_tool_memory(
+                &mut loaded,
+                foreign.path(),
+                &state,
+                &fork_path,
+                Some(RetentionMode::History),
+                None,
+            )
+            .unwrap();
+            assert!(loaded.tool_memory.is_none());
+            configure_saved_tool_memory(
+                &mut loaded,
+                root.path(),
+                &state,
+                &fork_path,
+                Some(RetentionMode::History),
+                None,
+            )
+            .unwrap();
+            {
+                let _lock = memory::lock_memory(&state).unwrap();
+                let mut store =
+                    polaris_memory::MemoryStore::open(state.join("memory.sqlite3")).unwrap();
+                store
+                    .delete_session(
+                        &persist::project_identity(root.path()).unwrap(),
+                        if forget_child {
+                            &descendants[0].0
+                        } else {
+                            "original"
+                        },
+                    )
+                    .unwrap();
+            }
+            let store = polaris_memory::MemoryStore::open(state.join("memory.sqlite3")).unwrap();
+            let project = persist::project_identity(root.path()).unwrap();
+            assert_eq!(
+                store
+                    .get(&project, "original", &saved.id)
+                    .unwrap()
+                    .is_some(),
+                forget_child
+            );
+            if forget_child {
+                assert!(
+                    store
+                        .get(&project, &descendants[0].0, &descendants[0].1)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    session
+                        .tool_memory
+                        .as_ref()
+                        .unwrap()
+                        .backend
+                        .read(&format!("memory://{}", saved.id), 0, 100)
+                        .await
+                        .unwrap()
+                        .contains("original evidence")
+                );
+                assert!(
+                    session
+                        .tool_memory
+                        .as_ref()
+                        .unwrap()
+                        .backend
+                        .save(
+                            &polaris_provider::ToolCall {
+                                id: "parent-later".into(),
+                                name: "read".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                            "parent remains writable"
+                        )
+                        .await
+                        .is_ok()
+                );
+            }
+            for (_, record, backend) in &descendants {
+                assert!(
+                    backend
+                        .read(&format!("memory://{record}"), 0, 100)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    backend
+                        .save(
+                            &polaris_provider::ToolCall {
+                                id: "blocked".into(),
+                                name: "read".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                            "cannot resurrect"
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+            let backend = &loaded.tool_memory.as_ref().unwrap().backend;
+            assert!(
+                backend
+                    .read(&format!("memory://{}", saved.id), 0, 100)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                backend
+                    .save(
+                        &polaris_provider::ToolCall {
+                            id: "later".into(),
+                            name: "read".into(),
+                            arguments: serde_json::json!({"path":"source.txt"})
+                        },
+                        "cannot resurrect"
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_memory_settings_preserve_messages_and_reject_foreign_or_unknown_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let state = logs.path().canonicalize().unwrap().join("state");
+        let path = logs.path().join("saved.jsonl");
+        let mut session = Session::new();
+        configure_saved_tool_memory(
+            &mut session,
+            root.path(),
+            &state,
+            &path,
+            Some(RetentionMode::History),
+            None,
+        )
+        .unwrap();
+        assert!(session.tool_memory.is_some());
+        assert!(session.before_compact.is_none());
+        session.push_user("keep user instructions");
+        session.push_assistant_tool_calls(
+            "pending",
+            vec![polaris_provider::ToolCall {
+                id: "pending-call".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"file"}"#.into(),
+            }],
+            Vec::new(),
+        );
+        let before = serde_json::to_string(&session.messages).unwrap();
+        configure_saved_tool_memory(
+            &mut session,
+            root.path(),
+            &state,
+            &path,
+            Some(RetentionMode::History),
+            None,
+        )
+        .unwrap();
+        assert!(
+            session.tool_memory.is_none(),
+            "unknown nonempty origin is rejected"
+        );
+        persist::write_meta_if_absent(
+            &path.with_extension("meta.json"),
+            &persist::SessionMeta {
+                cwd: root.path().canonicalize().unwrap().to_str().unwrap().into(),
+                started_at_millis: 1,
+            },
+        )
+        .unwrap();
+        configure_saved_tool_memory(
+            &mut session,
+            root.path(),
+            &state,
+            &path,
+            Some(RetentionMode::Retrieval),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            session.tool_memory.as_ref().unwrap().mode,
+            RetentionMode::Retrieval
+        );
+        configure_saved_tool_memory(
+            &mut session,
+            foreign.path(),
+            &state,
+            &path,
+            Some(RetentionMode::History),
+            None,
+        )
+        .unwrap();
+        assert!(
+            session.tool_memory.is_none(),
+            "foreign origin clears an existing backend"
+        );
+        assert_eq!(serde_json::to_string(&session.messages).unwrap(), before);
+        configure_saved_tool_memory(&mut session, root.path(), &state, &path, None, None).unwrap();
+        assert!(session.tool_memory.is_none());
     }
 }

@@ -17,5 +17,6 @@ pub mod secret_screen;
 pub mod session;
 pub mod spawn;
 pub mod stop;
+pub mod tool_memory;
 
 pub use events::{AgentEvent, Diff, DiffHunk, DiffLine, compute_diff};

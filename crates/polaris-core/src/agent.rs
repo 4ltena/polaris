@@ -174,6 +174,35 @@ fn cap_changes(
     (changes, total - cap)
 }
 
+/// Flush before a consumer can observe files.md, and before the next model
+/// request. The provider pool already carries the root's usage meter.
+async fn flush_directory_changes(
+    pending: &mut crate::dir_watch::DirChanges,
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    ctx: &mut ToolContext<'_>,
+) {
+    if pending.new_dirs.is_empty() && pending.new_files_in_existing_dirs.is_empty() {
+        return;
+    }
+    let mut changes = std::mem::take(pending);
+    changes.new_dirs.sort();
+    changes.new_dirs.dedup();
+    changes.new_files_in_existing_dirs.sort();
+    changes.new_files_in_existing_dirs.dedup();
+    // Break the async type cycle through the files-md-writer's run_loop.
+    Box::pin(crate::files_md::regenerate_for_changes(
+        &changes,
+        agent_types,
+        provider_pool,
+        audit,
+        ctx.sandbox,
+        ctx.helper,
+    ))
+    .await;
+}
+
 /// Called immediately before a `bash` / `write` / `edit` call. Decides
 /// what range of the filesystem to watch, takes the "before" snapshot on
 /// the spot, and returns the pair — the range and the snapshot have to be
@@ -323,6 +352,23 @@ pub(crate) async fn run_loop(
             return Err(AgentError::Stopped(r));
         }
 
+        if let Some(memory) = session.tool_memory.clone() {
+            let report = memory.retain(&mut session.messages).await;
+            if report.stored > 0 || report.failed > 0 {
+                audit.lock().await.record(&Record {
+                    tool: "tool-memory",
+                    detail: "retain",
+                    sandbox: None,
+                    target: None,
+                    result: &format!(
+                        "stored={} failed={} history_bytes_removed={}",
+                        report.stored, report.failed, report.bytes_removed
+                    ),
+                    caller,
+                })?;
+            }
+        }
+
         let total_tokens = crate::budget::always_on_tokens(system, tools)
             + crate::compaction::session_tokens(&session.messages);
         if total_tokens
@@ -330,13 +376,7 @@ pub(crate) async fn run_loop(
                 .compaction_threshold
                 .unwrap_or(crate::compaction::COMPACTION_THRESHOLD)
         {
-            match crate::compaction::compact_with_archive(
-                provider,
-                &mut session.messages,
-                session.before_compact.as_deref(),
-            )
-            .await
-            {
+            match session.compact_automatically(provider).await {
                 Ok(Some(report)) => {
                     if let Some(tx) = &events {
                         let _ = tx.send(crate::events::AgentEvent::HistoryCompacted {
@@ -387,7 +427,26 @@ pub(crate) async fn run_loop(
         // inspect the wire format, so they cannot detect this omission).
         session.push_assistant_tool_calls(&res.text, res.tool_calls.clone(), res.reasoning);
 
+        let mut pending_changes = crate::dir_watch::DirChanges::default();
         for call in &res.tool_calls {
+            // Read/bash (and spawn/skill) may consume the generated map.
+            // Explicit map edits must also see the preceding regeneration.
+            if !matches!(call.name.as_str(), "write" | "edit")
+                || call.arguments["path"].as_str().is_some_and(|path| {
+                    std::path::Path::new(path)
+                        .file_name()
+                        .is_some_and(|name| name == "files.md")
+                })
+            {
+                flush_directory_changes(
+                    &mut pending_changes,
+                    agent_types,
+                    provider_pool.clone(),
+                    audit.clone(),
+                    ctx,
+                )
+                .await;
+            }
             // The `files.md` regeneration hook. It fires *only* for the
             // root's own tool calls — see `pre_call_snapshot`'s docs for
             // why `caller == "root"` is a correctness condition and not a
@@ -396,18 +455,27 @@ pub(crate) async fn run_loop(
                 caller == "root" && matches!(call.name.as_str(), "bash" | "write" | "edit");
             let pre_snapshot = watched.then(|| pre_call_snapshot(&call.name, call, ctx));
 
-            let outcome = dispatch(
-                call,
-                skills,
-                agent_types,
-                provider_pool.clone(),
-                audit.clone(),
-                spawn_concurrency,
-                spawn_write_concurrency,
-                events.clone(),
-                ctx,
-            )
-            .await;
+            let memory_path = (call.name == "read")
+                .then(|| call.arguments["path"].as_str())
+                .flatten()
+                .filter(|path| path.starts_with("memory://"));
+            let outcome = if let Some(path) = memory_path {
+                dispatch_memory_read(session.tool_memory.as_ref(), call, path, events.as_ref())
+                    .await
+            } else {
+                dispatch(
+                    call,
+                    skills,
+                    agent_types,
+                    provider_pool.clone(),
+                    audit.clone(),
+                    spawn_concurrency,
+                    spawn_write_concurrency,
+                    events.clone(),
+                    ctx,
+                )
+                .await
+            };
 
             // `result` is exactly the body actually returned to the model
             // (on success) or the error text (on failure).
@@ -477,24 +545,10 @@ pub(crate) async fn run_loop(
                         caller: "harness",
                     });
                 }
-                if !changes.new_dirs.is_empty() || !changes.new_files_in_existing_dirs.is_empty() {
-                    // Boxed for the same reason the `spawn` arm is: this
-                    // closes the type-level cycle
-                    // `run_loop -> files_md::regenerate_for_changes ->
-                    // spawn::run_one -> run_loop`. It never recurses at
-                    // runtime — the subagent's own calls are guarded out by
-                    // `caller == "root"` above — but the compiler still has
-                    // to give the future a finite size.
-                    Box::pin(crate::files_md::regenerate_for_changes(
-                        &changes,
-                        agent_types,
-                        provider_pool.clone(),
-                        audit.clone(),
-                        ctx.sandbox,
-                        ctx.helper,
-                    ))
-                    .await;
-                }
+                pending_changes.new_dirs.extend(changes.new_dirs);
+                pending_changes
+                    .new_files_in_existing_dirs
+                    .extend(changes.new_files_in_existing_dirs);
             }
 
             match outcome {
@@ -508,13 +562,76 @@ pub(crate) async fn run_loop(
                 }
                 Err(msg) => {
                     if let Some(r) = stop.observe_error(&msg) {
+                        flush_directory_changes(
+                            &mut pending_changes,
+                            agent_types,
+                            provider_pool.clone(),
+                            audit.clone(),
+                            ctx,
+                        )
+                        .await;
                         return Err(AgentError::Stopped(r));
                     }
                     session.push_tool_result(&call.id, &msg);
                 }
             }
         }
+        flush_directory_changes(
+            &mut pending_changes,
+            agent_types,
+            provider_pool.clone(),
+            audit.clone(),
+            ctx,
+        )
+        .await;
     }
+}
+
+async fn dispatch_memory_read(
+    memory: Option<&crate::tool_memory::ToolMemory>,
+    call: &polaris_provider::ToolCall,
+    path: &str,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+) -> Result<String, String> {
+    if let Some(tx) = events {
+        let _ = tx.send(crate::events::AgentEvent::ToolStarted {
+            name: "read".into(),
+            detail: call.arguments.to_string(),
+        });
+    }
+    let result = async {
+        let memory = memory
+            .ok_or("tool memory is disabled; enable --tool-memory to retrieve saved results")?;
+        let parse = |key: &str, default: usize| -> Result<usize, String> {
+            match call.arguments.get(key) {
+                None => Ok(default),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| format!("{key} must be a nonnegative integer")),
+            }
+        };
+        memory
+            .backend
+            .read(
+                path,
+                parse("offset", 0)?,
+                parse("limit", polaris_tools::read::DEFAULT_LIMIT)?,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    if let Some(tx) = events {
+        let _ = tx.send(crate::events::AgentEvent::ToolFinished {
+            name: "read".into(),
+            detail: call.arguments.to_string(),
+            ok: result.is_ok(),
+            result: result.as_ref().map_or_else(Clone::clone, Clone::clone),
+            diff: None,
+        });
+    }
+    result
 }
 
 /// Routes a tool call to its actual implementation. A failure becomes a
@@ -3030,6 +3147,189 @@ print("wrote")
             log.contains("\"caller\":\"files-md-writer\""),
             "no regeneration ran for the directory the write created: {log}"
         );
+    }
+
+    #[tokio::test]
+    async fn directory_flush_deduplicates_and_keeps_child_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().canonicalize().unwrap();
+        std::fs::write(dir.join("files.md"), "map").unwrap();
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            std::slice::from_ref(&dir),
+        )
+        .unwrap();
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(vec![CompletionResponse {
+                text: serde_json::json!({"path": dir.join("files.md"), "status": "ok"}).to_string(),
+                usage: Some(polaris_provider::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                    cached_tokens: 0,
+                }),
+                ..Default::default()
+            }]),
+        });
+        let meter = polaris_provider::UsageMeter::default();
+        let measured: Arc<dyn Provider> = Arc::new(meter.wrap(p));
+        let mut changes = crate::dir_watch::DirChanges {
+            new_dirs: vec![dir.clone(), dir.clone()],
+            new_files_in_existing_dirs: vec![dir.join("a"), dir.join("b")],
+        };
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: Path::new("/bin/true"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let logs = tempfile::tempdir().unwrap();
+        let audit = shared_audit(&logs.path().join("audit.jsonl"));
+        flush_directory_changes(
+            &mut changes,
+            &[files_md_writer_agent_type()],
+            measured.clone(),
+            audit.clone(),
+            &mut ctx,
+        )
+        .await;
+        assert_eq!(changes, crate::dir_watch::DirChanges::default());
+        assert_eq!(meter.snapshot().reported_responses, 1);
+        assert_eq!(meter.snapshot().usage.total_tokens, 15);
+        flush_directory_changes(
+            &mut changes,
+            &[files_md_writer_agent_type()],
+            measured,
+            audit,
+            &mut ctx,
+        )
+        .await;
+        assert_eq!(meter.snapshot().reported_responses, 1);
+    }
+
+    #[tokio::test]
+    async fn batched_writes_regenerate_once_before_read() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = write_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        // The grandparent needs existing content for its diff to mean
+        // anything, and it doubles as something the subagent can read.
+        let seed = sandbox.writable_roots()[0].join("seed.txt");
+        std::fs::write(&seed, "seed\n").expect("cannot write");
+        let sub = sandbox.writable_roots()[0].join("sub");
+        let target = sub.join("new.txt");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("files.md"), "existing map").unwrap();
+
+        let mut replies = vec![CompletionResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": target.display().to_string(),
+                    "content": "body"
+                }),
+            }],
+            ..Default::default()
+        }];
+        replies[0].tool_calls.push(ToolCall {
+            id: "c2".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path": sub.join("other.txt"), "content": "other"}),
+        });
+        replies[0].tool_calls.push(ToolCall {
+            id: "c3".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": sub.join("files.md")}),
+        });
+        replies.extend(files_md_writer_turns(&seed, &sub));
+        replies.push(final_text("done"));
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(replies),
+        });
+
+        let logs = tempfile::tempdir().expect("temp directory");
+        let audit_path = logs.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut session = Session::new();
+        session.push_user("create sub/new.txt");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let out = run(
+            p.as_ref(),
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[files_md_writer_agent_type()],
+            p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
+            &mut ctx,
+        )
+        .await
+        .expect("the root loop failed")
+        .text;
+        assert_eq!(out, "done", "tool history: {:?}", session.messages);
+
+        assert!(
+            target.is_file(),
+            "the write did not actually create the file"
+        );
+        assert!(sub.is_dir(), "the write did not actually create sub/");
+
+        let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        assert!(
+            log.contains("\"caller\":\"files-md-writer\""),
+            "no regeneration ran for the directory the write created: {log}"
+        );
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let regenerations: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry["caller"] == "files-md-writer")
+            .collect();
+        assert_eq!(
+            regenerations.len(),
+            1,
+            "duplicate directory must regenerate once"
+        );
+        let regeneration = regenerations[0].0;
+        let writes: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry["caller"] == "root" && entry["tool"] == "write")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(writes.len(), 2);
+        assert!(writes.into_iter().all(|index| index < regeneration));
+        let read = entries
+            .iter()
+            .position(|entry| entry["caller"] == "root" && entry["tool"] == "read")
+            .unwrap();
+        assert!(regeneration < read, "flush before the root reads its map");
     }
 
     #[tokio::test]

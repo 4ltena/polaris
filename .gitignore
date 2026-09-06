@@ -1,6 +1,8 @@
 /target
+.DS_Store
 CLAUDE.md
 AGENTS.md
 .claude/
 .codex/
 /.polaris/
+/scripts/__pycache__/

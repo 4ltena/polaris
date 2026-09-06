@@ -160,9 +160,9 @@ mod tests {
     fn last_agent_message_text_returns_the_most_recent_assistant_reply() {
         let mut session = Session::new();
         session.push_user("hi");
-        session.push_assistant("first reply");
+        session.push_assistant("first reply", Vec::new());
         session.push_user("again");
-        session.push_assistant("second reply");
+        session.push_assistant("second reply", Vec::new());
         assert_eq!(last_agent_message_text(&session), Some("second reply"));
     }
 
@@ -170,8 +170,8 @@ mod tests {
     fn last_agent_message_text_skips_a_trailing_tool_only_assistant_turn() {
         let mut session = Session::new();
         session.push_user("hi");
-        session.push_assistant("real reply");
-        session.push_assistant_tool_calls("", Vec::new());
+        session.push_assistant("real reply", Vec::new());
+        session.push_assistant_tool_calls("", Vec::new(), Vec::new());
         assert_eq!(last_agent_message_text(&session), Some("real reply"));
     }
 
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn copy_last_reply_with_a_reply_reports_success() {
         let mut session = Session::new();
-        session.push_assistant("the answer is 4");
+        session.push_assistant("the answer is 4", Vec::new());
         let status = copy_last_reply_with(&session, |text| {
             assert_eq!(text, "the answer is 4");
             Ok(())
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn copy_last_reply_with_a_failing_copy_reports_the_error() {
         let mut session = Session::new();
-        session.push_assistant("reply");
+        session.push_assistant("reply", Vec::new());
         let status = copy_last_reply_with(&session, |_| Err("no tty".to_string()));
         assert!(status.contains("can't copy"));
         assert!(status.contains("no tty"));

@@ -66,13 +66,14 @@ impl crate::approval::Approver for AutoApprove {
 /// What a successful turn produced: the final text, and the token usage
 /// accumulated across every `provider.complete()` call the turn made
 /// (a turn that used a tool calls the provider more than once). A
-/// response whose `usage` came back `None` contributes nothing to this
-/// total rather than failing the turn — usage is a best-effort report,
-/// never something the loop depends on to function.
+/// response whose `usage` came back `None` is recorded as missing in
+/// `usage_report`. Known totals include summaries and children; missing
+/// usage is never evidence of zero consumption.
 #[derive(Debug)]
 pub struct AgentOutcome {
     pub text: String,
     pub usage: polaris_provider::Usage,
+    pub usage_report: polaris_provider::UsageReport,
 }
 
 /// Pass in `always_on` as something [`crate::prompt::assemble_always_on`]
@@ -171,6 +172,35 @@ fn cap_changes(
     let remaining = cap - changes.new_dirs.len();
     changes.new_files_in_existing_dirs.truncate(remaining);
     (changes, total - cap)
+}
+
+/// Flush before a consumer can observe files.md, and before the next model
+/// request. The provider pool already carries the root's usage meter.
+async fn flush_directory_changes(
+    pending: &mut crate::dir_watch::DirChanges,
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    ctx: &mut ToolContext<'_>,
+) {
+    if pending.new_dirs.is_empty() && pending.new_files_in_existing_dirs.is_empty() {
+        return;
+    }
+    let mut changes = std::mem::take(pending);
+    changes.new_dirs.sort();
+    changes.new_dirs.dedup();
+    changes.new_files_in_existing_dirs.sort();
+    changes.new_files_in_existing_dirs.dedup();
+    // Break the async type cycle through the files-md-writer's run_loop.
+    Box::pin(crate::files_md::regenerate_for_changes(
+        &changes,
+        agent_types,
+        provider_pool,
+        audit,
+        ctx.sandbox,
+        ctx.helper,
+    ))
+    .await;
 }
 
 /// Called immediately before a `bash` / `write` / `edit` call. Decides
@@ -301,7 +331,13 @@ pub(crate) async fn run_loop(
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
-    let mut usage = polaris_provider::Usage::default();
+    // Both paths share one meter: direct calls (including summaries), and
+    // the pool used by spawn/files.md children. Never add child totals to
+    // this snapshot; their actual calls have already been observed here.
+    let meter = polaris_provider::UsageMeter::default();
+    let metered_provider = meter.wrap(provider);
+    let provider: &dyn Provider = &metered_provider;
+    let provider_pool: Arc<dyn Provider> = Arc::new(meter.wrap(provider_pool));
     loop {
         // Call unconditionally every turn. If this were only called on
         // error, a call pattern that never triggers an error would never
@@ -316,6 +352,56 @@ pub(crate) async fn run_loop(
             return Err(AgentError::Stopped(r));
         }
 
+        if let Some(memory) = session.tool_memory.clone() {
+            let report = memory.retain(&mut session.messages).await;
+            if report.stored > 0 || report.failed > 0 {
+                audit.lock().await.record(&Record {
+                    tool: "tool-memory",
+                    detail: "retain",
+                    sandbox: None,
+                    target: None,
+                    result: &format!(
+                        "stored={} failed={} history_bytes_removed={}",
+                        report.stored, report.failed, report.bytes_removed
+                    ),
+                    caller,
+                })?;
+            }
+        }
+
+        let total_tokens = crate::budget::always_on_tokens(system, tools)
+            + crate::compaction::session_tokens(&session.messages);
+        if total_tokens
+            >= session
+                .compaction_threshold
+                .unwrap_or(crate::compaction::COMPACTION_THRESHOLD)
+        {
+            match session.compact_automatically(provider).await {
+                Ok(Some(report)) => {
+                    if let Some(tx) = &events {
+                        let _ = tx.send(crate::events::AgentEvent::HistoryCompacted {
+                            messages_before: report.messages_before,
+                            messages_after: report.messages_after,
+                            tokens_before: report.tokens_before as u32,
+                            tokens_after: report.tokens_after as u32,
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    // Compaction is a best-effort optimization the turn
+                    // doesn't depend on. A failure here (rate limit,
+                    // transient error) must not block the turn itself —
+                    // send this turn's full history rather than
+                    // permanently bricking every subsequent turn on the
+                    // same failure (session.messages stays over
+                    // COMPACTION_THRESHOLD, so without this every future
+                    // turn — including `/compact` itself — would retry
+                    // and fail the same way until `/clear`/`/new`).
+                }
+            }
+        }
+
         let res = provider
             .complete(CompletionRequest {
                 system: system.to_string(),
@@ -324,17 +410,12 @@ pub(crate) async fn run_loop(
             })
             .await?;
 
-        if let Some(u) = res.usage {
-            usage.input_tokens += u.input_tokens;
-            usage.output_tokens += u.output_tokens;
-            usage.total_tokens += u.total_tokens;
-        }
-
         if res.tool_calls.is_empty() {
-            session.push_assistant(&res.text);
+            session.push_assistant(&res.text, res.reasoning);
             return Ok(AgentOutcome {
                 text: res.text,
-                usage,
+                usage: meter.snapshot().usage,
+                usage_report: meter.snapshot(),
             });
         }
 
@@ -344,9 +425,28 @@ pub(crate) async fn run_loop(
         // nothing to match "which call this result answers" against — a
         // real OpenAI endpoint rejects it (tests against a mock never
         // inspect the wire format, so they cannot detect this omission).
-        session.push_assistant_tool_calls(&res.text, res.tool_calls.clone());
+        session.push_assistant_tool_calls(&res.text, res.tool_calls.clone(), res.reasoning);
 
+        let mut pending_changes = crate::dir_watch::DirChanges::default();
         for call in &res.tool_calls {
+            // Read/bash (and spawn/skill) may consume the generated map.
+            // Explicit map edits must also see the preceding regeneration.
+            if !matches!(call.name.as_str(), "write" | "edit")
+                || call.arguments["path"].as_str().is_some_and(|path| {
+                    std::path::Path::new(path)
+                        .file_name()
+                        .is_some_and(|name| name == "files.md")
+                })
+            {
+                flush_directory_changes(
+                    &mut pending_changes,
+                    agent_types,
+                    provider_pool.clone(),
+                    audit.clone(),
+                    ctx,
+                )
+                .await;
+            }
             // The `files.md` regeneration hook. It fires *only* for the
             // root's own tool calls — see `pre_call_snapshot`'s docs for
             // why `caller == "root"` is a correctness condition and not a
@@ -355,18 +455,27 @@ pub(crate) async fn run_loop(
                 caller == "root" && matches!(call.name.as_str(), "bash" | "write" | "edit");
             let pre_snapshot = watched.then(|| pre_call_snapshot(&call.name, call, ctx));
 
-            let outcome = dispatch(
-                call,
-                skills,
-                agent_types,
-                provider_pool.clone(),
-                audit.clone(),
-                spawn_concurrency,
-                spawn_write_concurrency,
-                events.clone(),
-                ctx,
-            )
-            .await;
+            let memory_path = (call.name == "read")
+                .then(|| call.arguments["path"].as_str())
+                .flatten()
+                .filter(|path| path.starts_with("memory://"));
+            let outcome = if let Some(path) = memory_path {
+                dispatch_memory_read(session.tool_memory.as_ref(), call, path, events.as_ref())
+                    .await
+            } else {
+                dispatch(
+                    call,
+                    skills,
+                    agent_types,
+                    provider_pool.clone(),
+                    audit.clone(),
+                    spawn_concurrency,
+                    spawn_write_concurrency,
+                    events.clone(),
+                    ctx,
+                )
+                .await
+            };
 
             // `result` is exactly the body actually returned to the model
             // (on success) or the error text (on failure).
@@ -436,24 +545,10 @@ pub(crate) async fn run_loop(
                         caller: "harness",
                     });
                 }
-                if !changes.new_dirs.is_empty() || !changes.new_files_in_existing_dirs.is_empty() {
-                    // Boxed for the same reason the `spawn` arm is: this
-                    // closes the type-level cycle
-                    // `run_loop -> files_md::regenerate_for_changes ->
-                    // spawn::run_one -> run_loop`. It never recurses at
-                    // runtime — the subagent's own calls are guarded out by
-                    // `caller == "root"` above — but the compiler still has
-                    // to give the future a finite size.
-                    Box::pin(crate::files_md::regenerate_for_changes(
-                        &changes,
-                        agent_types,
-                        provider_pool.clone(),
-                        audit.clone(),
-                        ctx.sandbox,
-                        ctx.helper,
-                    ))
-                    .await;
-                }
+                pending_changes.new_dirs.extend(changes.new_dirs);
+                pending_changes
+                    .new_files_in_existing_dirs
+                    .extend(changes.new_files_in_existing_dirs);
             }
 
             match outcome {
@@ -467,13 +562,76 @@ pub(crate) async fn run_loop(
                 }
                 Err(msg) => {
                     if let Some(r) = stop.observe_error(&msg) {
+                        flush_directory_changes(
+                            &mut pending_changes,
+                            agent_types,
+                            provider_pool.clone(),
+                            audit.clone(),
+                            ctx,
+                        )
+                        .await;
                         return Err(AgentError::Stopped(r));
                     }
                     session.push_tool_result(&call.id, &msg);
                 }
             }
         }
+        flush_directory_changes(
+            &mut pending_changes,
+            agent_types,
+            provider_pool.clone(),
+            audit.clone(),
+            ctx,
+        )
+        .await;
     }
+}
+
+async fn dispatch_memory_read(
+    memory: Option<&crate::tool_memory::ToolMemory>,
+    call: &polaris_provider::ToolCall,
+    path: &str,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+) -> Result<String, String> {
+    if let Some(tx) = events {
+        let _ = tx.send(crate::events::AgentEvent::ToolStarted {
+            name: "read".into(),
+            detail: call.arguments.to_string(),
+        });
+    }
+    let result = async {
+        let memory = memory
+            .ok_or("tool memory is disabled; enable --tool-memory to retrieve saved results")?;
+        let parse = |key: &str, default: usize| -> Result<usize, String> {
+            match call.arguments.get(key) {
+                None => Ok(default),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| format!("{key} must be a nonnegative integer")),
+            }
+        };
+        memory
+            .backend
+            .read(
+                path,
+                parse("offset", 0)?,
+                parse("limit", polaris_tools::read::DEFAULT_LIMIT)?,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    if let Some(tx) = events {
+        let _ = tx.send(crate::events::AgentEvent::ToolFinished {
+            name: "read".into(),
+            detail: call.arguments.to_string(),
+            ok: result.is_ok(),
+            result: result.as_ref().map_or_else(Clone::clone, Clone::clone),
+            diff: None,
+        });
+    }
+    result
 }
 
 /// Routes a tool call to its actual implementation. A failure becomes a
@@ -775,6 +933,34 @@ mod tests {
             } else {
                 r.remove(0)
             })
+        }
+    }
+
+    /// A provider whose first `complete` call — the summarization call
+    /// `compaction::compact` makes internally — fails, and every call
+    /// after that succeeds with a scripted reply. Used to prove a
+    /// compaction failure doesn't propagate via `?` and block the turn
+    /// (see `a_failed_compaction_call_does_not_block_the_turn`).
+    struct FailsOnFirstCallThenSucceeds {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FailsOnFirstCallThenSucceeds {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            let mut calls = self.calls.lock().expect("lock");
+            *calls += 1;
+            if *calls == 1 {
+                Err(polaris_provider::ProviderError::Http("boom".into()))
+            } else {
+                Ok(CompletionResponse {
+                    text: "final reply".into(),
+                    ..Default::default()
+                })
+            }
         }
     }
 
@@ -2112,8 +2298,9 @@ print("wrote")
                         input_tokens: 10,
                         output_tokens: 5,
                         total_tokens: 15,
-                        cached_tokens: 0,
+                        cached_tokens: 4,
                     }),
+                    ..Default::default()
                 },
                 CompletionResponse {
                     text: "it was 1 line".into(),
@@ -2122,8 +2309,9 @@ print("wrote")
                         input_tokens: 20,
                         output_tokens: 3,
                         total_tokens: 23,
-                        cached_tokens: 0,
+                        cached_tokens: 16,
                     }),
+                    ..Default::default()
                 },
             ]),
         };
@@ -2162,6 +2350,355 @@ print("wrote")
         assert_eq!(outcome.usage.input_tokens, 30);
         assert_eq!(outcome.usage.output_tokens, 8);
         assert_eq!(outcome.usage.total_tokens, 38);
+        // Distinct per-response values, so a total of 20 can only come
+        // from summing both. Left at 0/0, this test passed while the
+        // field was being dropped outright, and every `/status` reported
+        // `cache 0` no matter what the provider served.
+        assert_eq!(
+            outcome.usage.cached_tokens, 20,
+            "cached tokens are not being carried out of the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_from_a_tool_calling_turn_is_carried_into_the_session() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, "hello\n").expect("cannot write");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({ "path": target.to_str().unwrap() }),
+                    }],
+                    reasoning: vec![polaris_provider::ReasoningItem {
+                        id: "r1".into(),
+                        encrypted_content: "opaque".into(),
+                    }],
+                    usage: None,
+                },
+                CompletionResponse {
+                    text: "it was 1 line".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let mut session = Session::new();
+        session.push_user("how many lines is a.txt");
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        // messages[0] is the user turn, messages[1] is the assistant turn that
+        // called the tool - that's the one that must carry the reasoning item
+        // captured alongside it.
+        let tool_calling_turn = &session.messages[1];
+        assert_eq!(tool_calling_turn.reasoning.len(), 1);
+        assert_eq!(tool_calling_turn.reasoning[0].id, "r1");
+        assert_eq!(tool_calling_turn.reasoning[0].encrypted_content, "opaque");
+
+        // End to end: confirm the reasoning captured on session.messages[1]
+        // actually replays on the wire, and lands before the function_call
+        // it informed. session.messages is [user, assistant_tool_calling_turn,
+        // tool_result, assistant_final], so input_items on the full history
+        // must produce: user message, reasoning (from [1]), function_call
+        // (from [1]), function_call_output (from [2]), final message (from
+        // [3]).
+        let items = polaris_provider::codex::input_items(&session.messages);
+        assert_eq!(items.len(), 5, "unexpected item count: {items:?}");
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(
+            items[1]["type"], "reasoning",
+            "the reasoning item must appear before the function_call it informed"
+        );
+        assert!(
+            items[1].get("id").is_none(),
+            "id must be stripped from the replayed reasoning item"
+        );
+        assert_eq!(items[1]["encrypted_content"], "opaque");
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items[4]["type"], "message");
+        assert_eq!(items[4]["role"], "assistant");
+    }
+
+    #[tokio::test]
+    async fn custom_threshold_meters_summaries_even_when_empty_or_archive_fails() {
+        for (summary, archive_fails) in [("summary", false), (" \n", false), ("summary", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = Session::new();
+            session.compaction_threshold = Some(1_000);
+            session.push_user("old");
+            session.push_assistant(&"x".repeat(10_000), vec![]);
+            session.push_user("recent");
+            session.push_user("latest");
+            let original = serde_json::to_value(&session.messages).unwrap();
+            let archived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = archived.clone();
+            session.before_compact = Some(Arc::new(move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if archive_fails {
+                    Err(std::io::Error::other("archive failed"))
+                } else {
+                    Ok(())
+                }
+            }));
+            let p = Scripted {
+                replies: Mutex::new(vec![
+                    CompletionResponse {
+                        text: summary.into(),
+                        usage: Some(polaris_provider::Usage {
+                            input_tokens: 100,
+                            output_tokens: 10,
+                            total_tokens: 110,
+                            cached_tokens: 50,
+                        }),
+                        ..Default::default()
+                    },
+                    CompletionResponse {
+                        text: "done".into(),
+                        usage: Some(polaris_provider::Usage {
+                            input_tokens: 20,
+                            output_tokens: 5,
+                            total_tokens: 25,
+                            cached_tokens: 10,
+                        }),
+                        ..Default::default()
+                    },
+                ]),
+            };
+            let always_on = crate::prompt::assemble_always_on("", "", &[]);
+            let mut stop = StopTracker::new(10);
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let outcome = run(
+                &p,
+                &mut session,
+                shared_audit(&dir.path().join("audit.jsonl")),
+                &mut stop,
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                Some(tx),
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.text, "done");
+            assert_eq!(outcome.usage.total_tokens, 135);
+            assert_eq!(outcome.usage.input_tokens, 120);
+            assert_eq!(outcome.usage.output_tokens, 15);
+            assert_eq!(outcome.usage.cached_tokens, 60);
+            assert_eq!(outcome.usage_report.reported_responses, 2);
+            assert_eq!(
+                archived.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(!summary.trim().is_empty())
+            );
+            if summary.trim().is_empty() || archive_fails {
+                assert_eq!(
+                    serde_json::to_value(&session.messages[..4]).unwrap(),
+                    original
+                );
+                assert!(rx.try_recv().is_err());
+            } else {
+                assert_eq!(session.messages.len(), 4);
+                assert!(matches!(
+                    rx.try_recv().unwrap(),
+                    crate::events::AgentEvent::HistoryCompacted { .. }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_crosses_the_compaction_threshold_compacts_before_sending() {
+        let dir = tempfile::tempdir().expect("temp directory");
+
+        // Two big prior turns (well past COMPACTION_THRESHOLD once summed),
+        // then a small final turn that triggers compaction before it sends.
+        // `x` repeats compress heavily under BPE (o200k_base measures ~8
+        // chars/token for a run of identical characters), so a `* 5`
+        // multiplier here would only reach ~63k measured tokens — short of
+        // COMPACTION_THRESHOLD once `always_on_tokens` and the other turns
+        // are added in. `* 10` clears the threshold from this message
+        // alone, confirmed against `crate::compaction::session_tokens`.
+        let big = "x".repeat(crate::compaction::COMPACTION_THRESHOLD * 10);
+        let mut session = Session::new();
+        session.push_user("turn 1");
+        session.push_assistant(&big, vec![]);
+        session.push_user("turn 2");
+        session.push_assistant("reply 2", vec![]);
+        session.push_user("turn 3 — the new message that pushes it over");
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                // The summarization call compact() makes internally.
+                CompletionResponse {
+                    text: "summary of turns before the kept tail".into(),
+                    ..Default::default()
+                },
+                // The real turn's own response, sent after compaction.
+                CompletionResponse {
+                    text: "final reply".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let outcome = run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(events_tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(outcome.text, "final reply");
+
+        let event = events_rx
+            .try_recv()
+            .expect("a HistoryCompacted event should have been sent");
+        assert!(
+            matches!(event, crate::events::AgentEvent::HistoryCompacted { .. }),
+            "expected HistoryCompacted, got {event:?}"
+        );
+
+        // session.messages was replaced: 1 summary + the kept tail (turn 2,
+        // reply 2, turn 3) + the final assistant reply = 5.
+        assert_eq!(session.messages.len(), 5);
+        assert!(
+            session.messages[0]
+                .content
+                .contains("summary of turns before the kept tail")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_compaction_call_does_not_block_the_turn() {
+        // Same over-threshold setup as the test above, except the
+        // provider's summarization call itself fails. Before this fix, `?`
+        // propagated that `ProviderError` straight out of `run_loop`,
+        // failing the whole turn — and since `session.messages` is still
+        // over `COMPACTION_THRESHOLD` afterward, every subsequent turn
+        // (including `/compact` itself) would retry compaction and fail
+        // the same way, permanently bricking the conversation until
+        // `/clear`/`/new`. The turn must instead proceed with its
+        // still-oversized history rather than fail.
+        let dir = tempfile::tempdir().expect("temp directory");
+
+        let big = "x".repeat(crate::compaction::COMPACTION_THRESHOLD * 10);
+        let mut session = Session::new();
+        session.push_user("turn 1");
+        session.push_assistant(&big, vec![]);
+        session.push_user("turn 2");
+        session.push_assistant("reply 2", vec![]);
+        session.push_user("turn 3 — the new message that pushes it over");
+
+        let p = FailsOnFirstCallThenSucceeds {
+            calls: Mutex::new(0),
+        };
+
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let outcome = run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(events_tx),
+            &mut ctx,
+        )
+        .await
+        .expect("a failed compaction call must not fail the turn itself");
+
+        assert_eq!(outcome.text, "final reply");
+
+        // No compaction actually happened — session.messages keeps its
+        // original 5 entries plus the turn's own new reply, and the first
+        // message is still the original "turn 1", not a summary.
+        assert_eq!(session.messages.len(), 6);
+        assert_eq!(session.messages[0].content, "turn 1");
+
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no HistoryCompacted event should have been sent for a failed compaction"
+        );
     }
 
     #[tokio::test]
@@ -2259,16 +2796,34 @@ print("wrote")
                             }]
                         }),
                     }],
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                        total_tokens: 13,
+                        cached_tokens: 5,
+                    }),
                     ..Default::default()
                 },
                 CompletionResponse {
                     text: subagent_result.clone(),
                     tool_calls: vec![],
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                        total_tokens: 13,
+                        cached_tokens: 5,
+                    }),
                     ..Default::default()
                 },
                 CompletionResponse {
                     text: "the subagent reported back".into(),
                     tool_calls: vec![],
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                        total_tokens: 13,
+                        cached_tokens: 5,
+                    }),
                     ..Default::default()
                 },
             ]),
@@ -2303,8 +2858,14 @@ print("wrote")
             &mut ctx,
         )
         .await
-        .expect("the root loop failed")
-        .text;
+        .expect("the root loop failed");
+        assert_eq!(out.usage.total_tokens, 39);
+        assert_eq!(out.usage.input_tokens, 30);
+        assert_eq!(out.usage.output_tokens, 9);
+        assert_eq!(out.usage.cached_tokens, 15);
+        assert_eq!(out.usage_report.reported_responses, 3);
+        assert_eq!(out.usage_report.missing_responses, 0);
+        let out = out.text;
         assert_eq!(out, "the subagent reported back");
 
         let tool_msg = session
@@ -2586,6 +3147,189 @@ print("wrote")
             log.contains("\"caller\":\"files-md-writer\""),
             "no regeneration ran for the directory the write created: {log}"
         );
+    }
+
+    #[tokio::test]
+    async fn directory_flush_deduplicates_and_keeps_child_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().canonicalize().unwrap();
+        std::fs::write(dir.join("files.md"), "map").unwrap();
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            std::slice::from_ref(&dir),
+        )
+        .unwrap();
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(vec![CompletionResponse {
+                text: serde_json::json!({"path": dir.join("files.md"), "status": "ok"}).to_string(),
+                usage: Some(polaris_provider::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                    cached_tokens: 0,
+                }),
+                ..Default::default()
+            }]),
+        });
+        let meter = polaris_provider::UsageMeter::default();
+        let measured: Arc<dyn Provider> = Arc::new(meter.wrap(p));
+        let mut changes = crate::dir_watch::DirChanges {
+            new_dirs: vec![dir.clone(), dir.clone()],
+            new_files_in_existing_dirs: vec![dir.join("a"), dir.join("b")],
+        };
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: Path::new("/bin/true"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let logs = tempfile::tempdir().unwrap();
+        let audit = shared_audit(&logs.path().join("audit.jsonl"));
+        flush_directory_changes(
+            &mut changes,
+            &[files_md_writer_agent_type()],
+            measured.clone(),
+            audit.clone(),
+            &mut ctx,
+        )
+        .await;
+        assert_eq!(changes, crate::dir_watch::DirChanges::default());
+        assert_eq!(meter.snapshot().reported_responses, 1);
+        assert_eq!(meter.snapshot().usage.total_tokens, 15);
+        flush_directory_changes(
+            &mut changes,
+            &[files_md_writer_agent_type()],
+            measured,
+            audit,
+            &mut ctx,
+        )
+        .await;
+        assert_eq!(meter.snapshot().reported_responses, 1);
+    }
+
+    #[tokio::test]
+    async fn batched_writes_regenerate_once_before_read() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let helper_dir = tempfile::tempdir().expect("temp directory");
+        let helper = write_helper(helper_dir.path());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        // The grandparent needs existing content for its diff to mean
+        // anything, and it doubles as something the subagent can read.
+        let seed = sandbox.writable_roots()[0].join("seed.txt");
+        std::fs::write(&seed, "seed\n").expect("cannot write");
+        let sub = sandbox.writable_roots()[0].join("sub");
+        let target = sub.join("new.txt");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("files.md"), "existing map").unwrap();
+
+        let mut replies = vec![CompletionResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": target.display().to_string(),
+                    "content": "body"
+                }),
+            }],
+            ..Default::default()
+        }];
+        replies[0].tool_calls.push(ToolCall {
+            id: "c2".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path": sub.join("other.txt"), "content": "other"}),
+        });
+        replies[0].tool_calls.push(ToolCall {
+            id: "c3".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": sub.join("files.md")}),
+        });
+        replies.extend(files_md_writer_turns(&seed, &sub));
+        replies.push(final_text("done"));
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(replies),
+        });
+
+        let logs = tempfile::tempdir().expect("temp directory");
+        let audit_path = logs.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut session = Session::new();
+        session.push_user("create sub/new.txt");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let out = run(
+            p.as_ref(),
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[files_md_writer_agent_type()],
+            p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
+            &mut ctx,
+        )
+        .await
+        .expect("the root loop failed")
+        .text;
+        assert_eq!(out, "done", "tool history: {:?}", session.messages);
+
+        assert!(
+            target.is_file(),
+            "the write did not actually create the file"
+        );
+        assert!(sub.is_dir(), "the write did not actually create sub/");
+
+        let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        assert!(
+            log.contains("\"caller\":\"files-md-writer\""),
+            "no regeneration ran for the directory the write created: {log}"
+        );
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let regenerations: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry["caller"] == "files-md-writer")
+            .collect();
+        assert_eq!(
+            regenerations.len(),
+            1,
+            "duplicate directory must regenerate once"
+        );
+        let regeneration = regenerations[0].0;
+        let writes: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry["caller"] == "root" && entry["tool"] == "write")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(writes.len(), 2);
+        assert!(writes.into_iter().all(|index| index < regeneration));
+        let read = entries
+            .iter()
+            .position(|entry| entry["caller"] == "root" && entry["tool"] == "read")
+            .unwrap();
+        assert!(regeneration < read, "flush before the root reads its map");
     }
 
     #[tokio::test]
@@ -2905,13 +3649,14 @@ print("wrote")
     }
 
     #[tokio::test]
-    async fn a_response_with_no_usage_contributes_zero_not_a_failure() {
+    async fn a_response_with_no_usage_is_reported_as_missing() {
         let dir = tempfile::tempdir().expect("temp directory");
         let p = Scripted {
             replies: Mutex::new(vec![CompletionResponse {
                 text: "done".into(),
                 tool_calls: vec![],
                 usage: None,
+                ..Default::default()
             }]),
         };
 
@@ -2945,6 +3690,8 @@ print("wrote")
         .expect("should succeed");
 
         assert_eq!(outcome.usage.total_tokens, 0);
+        assert_eq!(outcome.usage_report.missing_responses, 1);
+        assert_eq!(outcome.usage_report.reported_responses, 0);
     }
 
     #[tokio::test]

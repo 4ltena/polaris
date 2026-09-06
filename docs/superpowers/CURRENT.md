@@ -1,6 +1,6 @@
 # polaris 現況
 
-最終更新 2026-08-25
+最終更新 2026-08-27
 
 ## この文書の役割
 
@@ -12,12 +12,120 @@
 
 | | |
 | --- | --- |
-| ブランチ | `main`（HEAD `21b89cf`）。`origin/main`は`a094280`(v0.5.0 CHANGELOG)まで同期・push済み。それ以降のローカル3コミット(`3dcb979` CURRENT.md更新、`21b89cf` v0.6.0 CHANGELOG追加)は**利用者の指示で意図的に未push**。`v0.1.0`〜`v0.6.0`まですべてタグ付け済み(ローカル)だが、pushはv0.5.0までで止めている——`v0.6.0`のコード自体は(v0.5.0 push時に)main経由で既にリモートへ乗っているが、タグ・CHANGELOGはリモート未反映 |
-| 進行中の計画 | なし。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktree自体は別の生きたClaude Codeセッション(pid確認済み)がロックしているため未削除のまま残っている——次回セッションで pid が生きていなければ `git worktree remove` で片付けてよい |
+| ブランチ | `main`（HEAD `533b0a1`、作業ツリーはクリーン）。`origin/main`は`fca96c4`(v0.6.0 CHANGELOG、47コミット分)まで同期・push済み。`v0.1.0`〜`v0.6.0`タグもorigin反映済み。それ以降のローカルコミットは**利用者の指示で意図的に未push**。`v0.7.0`タグ(ローカルのみ)は`60bdebe`を指したまま——それより後のreasoning item保持一式・自動履歴圧縮一式・system prompt検証ルール追加・read往復数削減2件(`dcfe7b9`〜`533b0a1`)は`v0.7.0`へ統合する方針が確定済み（下記「版の方針」参照）だが再タグ付けはまだ |
+| 進行中の計画 | なし（SDD計画としては）。ただし brainstorming による `store: true` + `previous_response_id` 化の検討が次に着手予定（下記「polaris vs codex 生トークン量の差」節）。`worktree-feat-tui-live-progress`のTUIフルスクリーン化計画(9タスク)は完了・最終レビュークリア・main統合済み。worktreeをロックしていた別セッションのpidは確認できなくなった（`lsof`でcwd該当なし、2026-08-26時点）——次回`git worktree remove`を試して片付けてよい |
 | 直近で終えた計画（main に統合済み・タグ済み・push済み） | `docs/superpowers/plans/2026-08-20-polaris-m4-core.md`（M4 core、全12タスク）、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress.md`（ライブ表示改良）、per-directory `files.md` 自動生成計画、TUI `Viewport::Inline` 切替——以上すべて`v0.5.0`「`Regulus`」としてタグ・CHANGELOG・push済み。`docs/superpowers/plans/2026-08-21-polaris-tui.md`（v0.3.0「`Castor`」）、TUI v2・オンボーディング・codex互換サブコマンド等（v0.4.0「`Acubens`」）も同様にタグ・push済み |
 | 直近で終えた計画（main に統合済み・タグ済み・push未実施） | `docs/superpowers/plans/2026-08-25-polaris-tui-fullscreen-scroll.md`（全9タスク、`v0.6.0`「`Spica`」。`Viewport::Fullscreen`への移行、履歴の自前スクロール管理、フッター固定、`with_fullscreen_picker`廃止、最終レビューで見つかった4件のImportant指摘も1回の修正waveで解消・再レビュー済み。左右カーソル移動・Ctrl+P/N入力履歴・IME preedit位置修正も同梱）。SDD台帳は完了に伴い削除済み。CHANGELOG追記・タグ付けは完了、pushのみ利用者の指示待ち |
 | 仕様 | `docs/superpowers/specs/2026-08-16-polaris-harness-design.md`、`docs/superpowers/specs/2026-08-18-polaris-codex-provider-design.md`、`docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-v2-design.md`、`docs/superpowers/specs/2026-08-21-polaris-tui-onboarding-design.md`、`docs/superpowers/plans/2026-08-24-polaris-tui-live-tool-progress-design.md`、`docs/superpowers/specs/2026-08-25-polaris-tui-fullscreen-scroll-design.md` |
-| 版の方針 | 単一の `vX.Y.Z` を単調に進める方式。2026-08-25、コードネームを「黄道十二星座を明るさ順ではなく神話的な繋がり(各星座の伝統的な星名)で単調に辿る」方式へ確定。確定した対応表: `v0.1.0`=`hamal`(おひつじ座、tag・push済み)、`v0.2.0`=`Aldebaran`(おうし座、tag・push済み)、`v0.3.0`=`Castor`(ふたご座、tag・push済み)、`v0.4.0`=`Acubens`(かに座、tag・push済み)、`v0.5.0`=`Regulus`(しし座、tag・push済み——M4 core・files.md自動生成・ライブ表示改良・Viewport::Inline化)、`v0.6.0`=`Spica`(おとめ座、tag済み・**push未実施**——TUIフルスクリーン化・入力欄編集機能拡張)、`v0.7.0`=`Zubenelgenubi`(てんびん座)、`v0.8.0`=`Antares`(さそり座)、`v0.9.0`=`Rukbat`(いて座)、`v0.10.0`=`Algedi`(やぎ座)、`v0.11.0`=`Sadalmelik`(みずがめ座)、`v0.12.0`=`Alrescha`(うお座)。**`v0.6.0`分の push(main分・タグ分とも)は利用者の明示的な承認が要る、標準ルール通り** |
+| 版の方針 | 単一の `vX.Y.Z` を単調に進める方式。2026-08-25、コードネームを「黄道十二星座を明るさ順ではなく神話的な繋がり(各星座の伝統的な星名)で単調に辿る」方式へ確定。確定した対応表: `v0.1.0`=`hamal`(おひつじ座、tag・push済み)、`v0.2.0`=`Aldebaran`(おうし座、tag・push済み)、`v0.3.0`=`Castor`(ふたご座、tag・push済み)、`v0.4.0`=`Acubens`(かに座、tag・push済み)、`v0.5.0`=`Regulus`(しし座、tag・push済み——M4 core・files.md自動生成・ライブ表示改良・Viewport::Inline化)、`v0.6.0`=`Spica`(おとめ座、tag・push済み——TUIフルスクリーン化・入力欄編集機能拡張・マウスドラッグ選択)、`v0.7.0`=`Zubenelgenubi`(てんびん座、旧タグは`60bdebe`を指したまま・**再タグ付け待ち・push未実施**——プロンプトキャッシュ利用率改善+reasoning item保持+自動履歴圧縮+精度向上作業を1本にまとめる方針へ2026-08-27に変更、詳細はCHANGELOG参照。当初`v0.8.0`「Antares」として分けていたが利用者の指示で`v0.7.0`へ統合、`Antares`はv0.8.0の名前として再び空いている)、`v0.8.0`=`Antares`(さそり座、未使用)、`v0.9.0`=`Rukbat`(いて座)、`v0.10.0`=`Algedi`(やぎ座)、`v0.11.0`=`Sadalmelik`(みずがめ座)、`v0.12.0`=`Alrescha`(うお座)。**`v0.7.0`分の再タグ付け・push は利用者の明示的な承認が要る、標準ルール通り** |
+
+## プロンプトキャッシュの利用率
+
+`235ec5d`でコミット済み(`v0.7.0`「`Zubenelgenubi`」、CHANGELOGは`4a43c48`)。`prompt_cache_key` の生成（`crates/polaris-provider/src/lib.rs`）、codex・openai 両プロバイダからの送信、`run_loop` が `cached_tokens` を合算していなかった欠落の修正（`crates/polaris-core/src/agent.rs`）、一発実行での usage 表示（`crates/polaris-cli/src/main.rs`）、および対応するテストである。
+
+2026-08-26、この差分へ2点を加えた。
+
+第一に、`crates/polaris-provider/src/codex.rs` の `include` を、`POLARIS_INCLUDE_REASONING` による opt-in から常時送信へ変更した。同じ差分が持ち込んだテスト `the_body_asks_for_encrypted_reasoning_so_the_turn_is_cacheable` は、環境変数を設定しない素の環境で `left: Array []` として落ちていた。コード自身のコメントが「これが無いとバックエンドは推論モデルのプロンプトキャッシュに何も書かない」と実測付きで述べている以上、既定を off に倒すと変更の目的そのものが既定経路で効かない。テストを実装に合わせるのではなく、実装をテストに合わせた。
+
+第二に、同ファイルのテスト内にあった `needless_borrows_for_generic_args`（`Message::user(&format!(...))`）を解消し、rustfmt を通した。`cargo clippy --workspace --all-targets -- -D warnings` がこの1件で落ちていたためである。
+
+### 判断の根拠にした実測（2026-08-26）
+
+同一の指示「複数コードの変更をした。現状の変更点をまとめる」を polaris と codex にそれぞれ与え、消費量を突き合わせた。codex 側の数値は `~/.codex/sessions/2026/08/26/rollout-2026-08-26T12-20-44-01a03c15-9aea-7700-abcd-2c094f98e8a7.jsonl` の `total_token_usage` から取っている。
+
+| | polaris | codex |
+| --- | --- | --- |
+| input（累計） | 49,446 | 274,800 |
+| うち cached | 15,360（31.1%） | 214,784（78.2%） |
+| output | 1,705 | 2,210 |
+| プロバイダ往復 | 9回以上 | 5回 |
+
+polaris 側は TUI の累積カウンタで、同一セッションの前ターンを含む2ターン分である。codex 側は実ユーザー発話1件のセッション全量にあたる。尺が揃っていない分は polaris に不利な方向へ効いている。
+
+codex のリクエスト単位の内訳は、初回だけ冷えて以降が9割台で安定する形になっていた。1回目 12.6%、2回目 97.6%、3回目 77.9%、4回目 98.0%、5回目 93.6% である。polaris の 31.1% はこの形になっていない。なお codex は初回リクエストだけで input 46,566 トークンを送っており、これがツールを1つも呼ぶ前の常時コンテキストの床にあたる。polaris の同じ床は547である。
+
+### 併せて判明したこと(実装済み)
+
+`Folder::take_item` が `reasoning` item を `_ => {}` で捨て、`Message` 型にも保持する場所が無かった件は、2026-08-26中に別のspec・plan・SDD実行(下記「reasoning item保持」節)で解消済み。この節はその発見の経緯として残す。
+
+### 検証
+
+`cargo test --workspace` は全緑、`cargo clippy --workspace --all-targets -- -D warnings` は clean、`cargo fmt --all -- --check` も clean。いずれも 2026-08-26 に実測した。
+
+### A/B実測の結果(2026-08-26)
+
+`235ec5d`の前(`fca96c4`、`git worktree add`で分離)と後(現行HEAD)、それぞれで release ビルドを作り、同一プロンプトを`POLARIS_DUMP_USAGE=1`付きで1回ずつ流した。`fca96c4`には`POLARIS_DUMP_USAGE`のデバッグ出力自体が無いため、この計測のためだけに同じeprintln1個を一時的に追加した(cache_key・includeなど挙動には一切触れていない、使い捨てworktreeのみの変更で計測後に破棄)。
+
+結果は当初の想定と違った。**`prompt_cache_key`も`include`も無い`fca96c4`の時点で、同一プレフィックスが繰り返される3ターン目以降、キャッシュ命中率は93〜97%に達していた**(タスクA: 2ターンのみで判定不能、タスクB: 4ターン中3・4ターン目がbefore側で96.8%・93.3%)。`after`側もほぼ同じ形(3ターン目95.3%)だったが、4ターン目は0%に落ちた回があり、beforeより悪化する場合すら観測された。`cache_write_tokens`は前後どちらのビルドでもどのリクエストでも常に0で、この値自体はキャッシュ動作の指標として機能していないらしい。
+
+つまり、この日直接測った範囲では「`prompt_cache_key`/`include`を送らないとキャッシュが一切効かない」という前提は再現できなかった。以前記録した「polarisが8リクエスト中キャッシュ0件」という観測(上の実測表)は、`run_loop`が`cached_tokens`を合算し忘れていた欠落(TUIの`/status`表示バグ)を見ていた可能性が高い——サーバー側は実際にはキャッシュを使えていたが、表示側が常に0を返していたために「効いていない」と誤認した疑いがある。この解釈は当時のセッションのrolloutログまでは遡って確認していない、あくまで今回の再現不能から導いた推測にとどまる。
+
+`run_loop`の合算バグ修正自体は、キャッシュ実測の結果に関わらず独立して正しい修正であり、そのまま維持する。`prompt_cache_key`送信と`include`常時化は害があるわけではない(前者はOpenAIの標準的なルーティング用ヒントで無視されても無害、後者はレスポンスサイズがわずかに増えるだけ)が、CHANGELOGにある「送らないと0%」という因果の強さは、今回の直接検証では裏付けが取れなかった。
+
+`Folder::take_item`が`reasoning` itemを`_ => {}`で捨てている件（上の「併せて判明したこと」）を設計変更として進める根拠は、この結果を受けて一度弱まった——キャッシュがそもそも`include`無しでも9割台に達するなら、`reasoning` item保持によって埋めようとしていた「ツール呼び出しを跨いだ連続性」の欠落が、優先して手を付けるべき問題かどうかが不確かになった。それでも利用者の判断で、動機を「キャッシュ効率」から「upstream `codex-rs`との一致度」へ切り替えたうえで、下記の通り実装まで進めた。
+
+## reasoning item保持(2026-08-26、実装完了)
+
+`docs/superpowers/specs/2026-08-26-polaris-codex-reasoning-continuity-design.md`(spec)・`docs/superpowers/plans/2026-08-26-polaris-codex-reasoning-continuity.md`(6タスクplan)をbrainstorming→writing-plansスキルで作成し、subagent-driven-developmentで実行した。
+
+**設計の根拠**: upstream `codex-rs`の`core/src/client.rs`を読み、非Azure(polarisと同じChatGPTサブスク経路)では`store`が常に`false`で、`reasoning` itemも他の履歴itemと同様セッション全体を通じて保持・再送される(特別な有効期限は無い)ことを確認した上で設計した。動機はキャッシュ効率ではなく、upstreamとの一致度。
+
+**実装内容**(コミット`dcfe7b9`〜`6601f02`、6タスク全て個別レビュークリア):
+- `ReasoningItem { id, encrypted_content }`型と`Message.reasoning`/`CompletionResponse.reasoning`フィールド(`crates/polaris-provider/src/lib.rs`)
+- `Folder::take_item`が`"reasoning"` typeのSSE itemを捕捉(`crates/polaris-provider/src/codex.rs`)
+- `input_items`が次のターンでreasoning itemをワイヤへ再送(同ファイル)
+- `Session::push_assistant`/`push_assistant_tool_calls`のシグネチャ変更・`agent::run_loop`の配線(`crates/polaris-core/src/session.rs`/`agent.rs`)
+- `openai.rs`側は無視することを確認する回帰テストのみ(実装変更なし)
+
+**タスク実行中に見つかった計画の穴**: plan策定時の事前呼び出し元調査が`crates/polaris-core/src`のみに絞られており、`crates/polaris-tui`のテストコード内に同じ2関数を呼ぶ箇所が30件(すべて`#[cfg(test)]`内)あることを見落としていた。Task 4完了直後に`cargo check --workspace --all-targets`で30件のE0061としてmainが一時的にビルド不能になったが、未計画の修正タスク(空の`Vec::new()`引数を機械的に追加、コミット`ec1ccea`)で即座に復旧し、スコープ付きレビューで確認済み。
+
+**最終の全体レビュー(Opus、範囲`8ce4cd9..d57aaec`)** で1件のImportant指摘が見つかった: `input_items`が再送するreasoning itemに`id`を付けていたが、upstream `codex-rs`の`prepare_response_items_for_request`は`store: false`(polarisが常用する唯一のモード)では全itemの`id`を落として送る。この機能の唯一の動機がupstream一致度である以上、実質的な不整合だった。もう1件のImportant指摘(`Session.messages`→`input_items`を通しで検証するテストが無い)と、Minor 5件(空文字列id/encrypted_contentの未フィルタ、日本語コメントの混入、再送順序の説明不足、doc comment未更新、content・tool_calls双方が空のターンでreasoning単独itemが孤立して送られる不具合)とあわせて、1回のfix wave(コミット`657700c`)で全て解消・スコープ付き再レビューでADDRESSED確認済み。台帳は`.superpowers/sdd/2026-08-26-polaris-codex-reasoning-continuity/progress.md`に残っている(未削除、下記「次の一手」参照)。
+
+**検証**: `cargo test --workspace`(787件全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。加えて実際のCodexバックエンドに対しrelease buildで4往復の`exec`を実行し、エラー無く完走することを確認した(2026-08-26、`id`削除前のfix wave前のビルドでの確認であり、reasoning itemの再送自体を観測したものではない点に注意)。`docs/filemap.md`もこのspec・plan追加に伴い再生成済み(`UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap`、コミット`5100c08`)。
+
+**未対応のまま残した最終レビュー指摘(コード変更を伴わないため、fix waveの対象外とした)**:
+- ~~コンパクション(履歴圧縮)が無い件~~ → 2026-08-26中に別のspec・plan・SDD実行で解消済み。下記「会話履歴の自動圧縮」節を見よ
+- `/model`でセッション途中にモデルを切り替えると、前のモデルが生成した`encrypted_content`を別モデルへ再送する形になる。upstreamも同じ挙動だが、compactionが圧縮しなかった直近ターンにこの前提モデルのreasoning itemが残っていた場合、実際に400が返るかどうかは未確認(`/model`切り替え後に1ターン回すだけの簡単な実地確認で足りる)。compaction自体はこの問題を直接は解決しない——要約テキストはモデル非依存の平文になるが、`KEEP_RECENT_USER_TURNS`分の直近ターンはencrypted_contentごと残る
+
+## polaris vs codex の生トークン量の差(2026-08-27、調査完了・read側の対処は実装済み)
+
+利用者から「精度向上作業の一環として`polaris`/`codex`両方に『このプロジェクトを分析する』を与えて比較したところ、polarisのraw total(698,358)がcodexのtotal(86,878)を大幅に上回っており、固定コンテキストの床を減らすという当初目標に反して問題」との指摘を受けて開始した調査。
+
+**根本原因(両実装のコードで確認済み)**: `crates/polaris-provider/src/codex.rs:132-135`は`store: false`を明示し、毎ターン履歴全体を再送する設計(「サーバーに状態を持たせない、送信内容と計測内容を一致させる」という設計原則による意図的な選択)。一方、upstream `codex-rs`(`core/src/client.rs:1165-1252`、`:265-266`)はWebSocketセッション+`previous_response_id`で**前回レスポンスからの差分アイテムのみ**を送る。つまり2つの「total tokens」はそもそも同じものを計測していない。polarisのraw totalは往復ごとに履歴全体を数え直すため往復数にほぼ比例して伸びる(実測: 変更前は最終内容量71,037と3実行中最小にもかかわらずraw totalは699,872と3実行中最大——内容量ではなく往復数が支配的要因)。
+
+**副産物として判明したデバッグ上の罠**: `/Users/kn/.polaris/state/<project-id>/audit.jsonl`の`result`/`detail`はログ保存用に4 KiBへ切り詰められる(`crates/polaris-core/src/audit.rs:88`の`MAX_RESULT_BYTES`)。多くの`read`呼び出しの`result_len`が`limit`の値によらず~4200バイトに集中して見えたのはこの切り詰めであり、モデルに実際に送られた内容量の指標ではない。audit logの`result`長を会話コスト測定の代理指標に使わないこと。
+
+**read往復数削減(commit `8666bdc`・`533b0a1`、実装・計測済み)**: `read`ツールの説明文が「`limit`省略時どうなるか」を一切述べておらず、モデルは常に小さめの`limit`(120〜300行)を指定して大きいファイルで2回目の読み込みを要していた。説明文へ既定値(2,000行)を明示し、さらに「省略が既定選択」と明言する形へ2段階で強めた。同一プロンプトでのA/B実測:
+
+| | 往復数 | raw total | キャッシュヒット率 |
+| --- | --- | --- | --- |
+| 変更前 | 16 | 699,872 | 88.1% |
+| 修正1後 | 8 | 521,304 | 78.5% |
+| 修正2後 | 7 | 461,611 | 73.5% |
+
+raw totalは34%減ったが、キャッシュヒット率も88.1%→73.5%まで下がった。往復を減らせばキャッシュ再利用の機会も減るという表裏の関係で、これは`store: false`のままでは避けられない(下記の構造的理由による)。利用者の判断で、この2件はキャッシュ比率低下込みで確定・維持することにした。
+
+**「キャッシュ比率を90%前後に保ったままraw totalを減らす」ための追加調査**: `store: false`では`raw total ≈ 往復数 × 平均コンテキストサイズ ÷ 2`という関係になり、キャッシュヒット率も往復の細かさ(小さい増分を何度も送るほど高い)に依存する。両者は同じ「往復粒度」という1つのダイヤルの表裏であり、このダイヤルを動かす限りどちらかを犠牲にせざるを得ない。`read.rs:128-133`は部分読み込み時点で既にファイルの総行数を返しており、モデルが2回目の読み込みを要するかどうかは情報不足ではなく都度の判断によるものと確認した。往復粒度を保ったまま読む総量そのものを削る(重複読み込みの排除など)手段は、変更前の内容量(71,037)が既にかなり切り詰められているため上限が小さい(体感10〜15%程度)。**両立を構造的に実現できる手段は`store: true` + `previous_response_id`化のみ**というのがこの調査の結論。利用者の判断で、read側の2件は確定させたうえで、`store: true`化の設計をbrainstormingスキルで別途進める方針となった(まだ着手前)。
+
+## 会話履歴の自動圧縮(compaction、2026-08-26、実装完了)
+
+`docs/superpowers/specs/2026-08-26-polaris-history-compaction-design.md`(spec)・`docs/superpowers/plans/2026-08-26-polaris-history-compaction.md`(6タスクplan)をbrainstorming→writing-plansスキルで作成し、subagent-driven-developmentで実行した。動機は、利用者が実施したpolaris対codexの比較レポートで「codexが最大の技術リスクとして名指しした」項目(履歴圧縮の欠如)を埋めること——「polarisがcodexに対して明確に優位でなければ普及しない」という利用者の方針による。
+
+**設計**: `COMPACTION_THRESHOLD = 200_000`トークン(モデルごとのコンテキストウィンドウをpolarisはどのプロバイダからも取得できないため、固定値。当初100_000だったものを、圧縮のたびに要約が変わりプロンプトキャッシュの接頭辞を捨てることになるという理由で引き上げた。ただしこの効果は未実測であり、閾値を下回るウィンドウのモデルでは圧縮が発火する前に上限へ達するため機能しない)を`session.messages`の実測トークン数が超えたら、直近`KEEP_RECENT_USER_TURNS = 2`件のユーザーターンを残し、それより前を1回のLLM要約呼び出しで1件の要約Messageへ置き換える。必ず`Role::User`の位置でのみ切る(ツール呼び出し/結果の対を割らない)。
+
+**実装内容**(コミット`dcfe7b9`〜`bd1d8d8`、6タスク+Task 5内のfix round1回+plan全体の最終レビューのfix wave1回、全てレビュークリア):
+- `crates/polaris-core/src/compaction.rs`(新規): `session_tokens`・`should_compact`・`cut_index`・`compact`
+- `agent::run_loop`への組み込み(閾値チェック→圧縮→`AgentEvent::HistoryCompacted`送出)、`run_loop`のシグネチャは無変更
+- `polaris-tui`: 通知行の表示(`render.rs`)、`/compact`手動コマンド(`slash.rs`+`lib.rs`の2箇所のディスパッチ地点)、ターン完了後の`persist::rewrite`による`/resume`との整合
+
+**タスク実行中に見つかった計画の穴、同一SDD実行内で解消**:
+- Task 1: ブリーフのimport文がテスト専用の`ToolCall`を無条件importにしていて非テストビルドでunused importになる件 → `#[cfg(test)]`で解決
+- Task 2: ブリーフのテスト文中の自己参照パス(`polaris_core::`→`crate::`)、および`"x".repeat(N)`が単純文字の繰り返しでトークナイザに強く圧縮される(`*5`では閾値を超えなかった)件 → `*10`に修正、実測で裏付け
+- Task 5内のfix round(コミット`2c9f9c9`→`652708f`): (a) `/compact`が末尾に空白等が付いた入力で無反応になる(ディスパッチ地点が2箇所あるうち1箇所しか埋めていなかった)→ 2箇所目にもハンドラを追加。(b) 既存のロールバック機構(`checkpoint`)が、ターン中盤でのcompaction発火によって古くなり、ロールバックがサイレントに無効化されうる潜在バグ(compaction機能が新たに到達可能にした)→ `checkpoint`をcompactionの前後件数差分だけ調整する形で解消、再レビューで算術を独立に再導出し正しさを確認済み
+
+**plan全体の最終レビュー(Opus、範囲`dc92cfd..f8ad13b`)** で1件のCriticalと5件のImportantが見つかった。Criticalは、`checkpoint`と全く同じ形でもう1つ存在した`session.messages`へのローカルなインデックス`printed_messages`(画面へ描画済みの範囲を追う)がcompaction発火後に調整されておらず、compactionが起きるたびに画面の巻き戻し表示(履歴・ヘッダーごと消える、応答が表示されない、表示がずれる、のいずれか)が発生する不具合——Task 5のfix roundが`checkpoint`だけを直して`printed_messages`を見落としていた。Important 5件は: 要約呼び出し自体が失敗するとセッションが`/clear`するまで恒久的に壊れる(`?`で伝播していた)、要約が空文字列で返ると履歴が消える、`/compact`実行中に画面が固まって見える(進捗表示が無い)、圧縮後の直近ターンだけで再び閾値を超える病的ケースでspecの「無限ループしない」という説明自体が誤り(実際は要約の要約を毎ターン繰り返す)、README の`/compact`関連記述が実装と食い違ったまま。1回のfix wave(コミット`80e29c5`)で全て解消、スコープ付き再レビューでADDRESSED確認済み(Criticalの修正は再レビュアーが独自に新規テスト3種を「調整を外したら本当に落ちるか」まで追跡)。残った1件のMinor(doc comment未更新)はコントローラーが直接修正(`bd1d8d8`)。`/resume`ピッカーのプレビューが圧縮後は毎回同じ文言になる件(Important、コード修正だが規模が中程度)は今回のfix waveでは対応せず先送り、下記「次の一手」参照。台帳は`.superpowers/sdd/2026-08-26-polaris-history-compaction/progress.md`に残っている(未削除、finishing-a-development-branch完了後に削除予定)。
+
+**検証**: `cargo test --workspace`(全緑、最終レビューのfix wave後の新規テスト込み)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)。`docs/filemap.md`もこのspec・plan追加に伴い再生成した。閾値を一時的に500へ下げた実地確認(tmux)は、このセッションの実行環境でtmuxペインへのキー入力が実際には処理されない不具合(polaris自体の問題ではなく環境側の制約)に阻まれ完了できなかった——自動テスト(`agent.rs`の`run_loop`統合テストが実プロバイダを模したモックで圧縮の発火・履歴の置き換えを検証済み、`lib.rs`の`handle_compact`テストが永続化の往復を実際のファイルI/Oで検証済み、最終レビューのfix waveで追加した`printed_messages`調整の回帰テスト3種が調整を外すと実際に落ちることまで再レビューで追跡済み)による確証にとどまる。実際のCodexバックエンドに対する自動発火の実地確認は未実施のまま残っている。
 
 ## マイルストーン
 
@@ -301,7 +409,7 @@ M2.5 完了後、初めて実際の ChatGPT サブスクリプションで一気
 | 真の同時最大（憲法と環境を同時に飽和させ skill 100 件） | 855 トークン | `constitution.rs` の `absurdly_long_cwd_cannot_push_the_assembled_system_over_budget` |
 | codex 側ツールワイヤ形式での下限（openai と並行して独立に固定） | 486 トークン | `budget.rs` の `always_on_tokens_counts_the_wire_shape_not_the_bare_tool_spec` |
 | 上限 | 990 トークン | |
-| ツール本数 | 5 / 上限 6 | |
+| ツール本数 | 6 / 上限 6（`read`/`write`/`edit`/`bash`/`skill`/`spawn`） | |
 | テスト | 350 件（ホスト。Linux コンテナは M2 完了時点で 260 件を確認、M2.5 以降は polaris-auth/provider のみで Linux 固有のサンドボックス経路には触れていない） | |
 
 常時コンテキストは、実際に送信されるシステムプロンプトとツールスキーマを `tiktoken_rs::o200k_base()` で数えた実測値である。見積ではない。
@@ -417,16 +525,20 @@ Task 5 が繰り越していた「`ensure_fresh`/`force_refresh` の成功時の
 
 ## 次の一手
 
-本節は2026-08-25、`v0.6.0`「`Spica`」のCHANGELOG追記・git tagが完了した直後に書き直した(push は利用者の指示で意図的に保留)。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
+本節は2026-08-27、read往復数削減2件(commit `8666bdc`・`533b0a1`)とCURRENT.mdのHEAD/ツール数の記載修正が完了した直後に書き直した。`cargo test --workspace`(全緑)・`cargo clippy --workspace --all-targets -- -D warnings`(clean)・`cargo fmt --all -- --check`(clean)を実測で確認済み。
 
 優先度順:
 
-1. **`v0.6.0`分の`git push`(main分3コミット・`v0.6.0`タグ分)の実施を利用者に確認する。** タグ・CHANGELOGは確定済みだが、push自体はまだ明示的な承認を得ていない
-2. **`worktree-feat-tui-live-progress`の後始末。** 別の生きたセッションのロックで`git worktree remove`が拒否された。そのセッションが終了していれば片付ける
+1. **`store: true` + `previous_response_id`化の設計をbrainstormingスキルで進める。** 「polaris vs codexの生トークン量の差」節の調査結論を受けて利用者が明示的に指示した次の一手。会話をOpenAI側サーバーに保持することになる点(現行の「サーバーに状態を持たせない」設計原則からの転換)、`polaris-provider`のトランスポート変更(WS化の要否)、`compaction.rs`との整合(圧縮後の要約とサーバー側保持状態の食い違い)が主な論点。着手前
+2. **v0.7.0の版付けを確定させる。** reasoning item保持・compaction・system prompt検証ルール・read往復数削減2件は全て`v0.7.0`「`Zubenelgenubi`」へ含める方針が確定済み(2026-08-27)。`store:true`化を含めるかは設計・実装が終わってから判断。CHANGELOG追記・再タグ付け・pushは標準ルール通りそれぞれ別の明示的承認が要る
+3. **compactionの実機での自動発火を実地確認する。** tmux操作が環境側の制約で機能せず未実施のまま(上の「会話履歴の自動圧縮」節参照)。自動テストでの検証にとどまっている
+4. **`/resume`ピッカーのプレビューが圧縮後は毎回同じ文言になる件。** 最終レビューのImportant指摘だが、`sessions.rs`という当時のplanが触れていないファイルに及ぶため先送りした(上の「会話履歴の自動圧縮」節参照)。データを壊すものではない
+5. **`worktree-feat-tui-live-progress`の後始末。** ロックしていたセッションのpidは確認できなくなった。`git worktree remove`を試し、拒否されれば中身を見て利用者に確認する
+6. **`/model`切り替え後にreasoning replayが失敗しないかの実地確認**(上の「reasoning item保持」節末尾)。壊れている証拠は無い、優先度は低い
 
 そのうえで v1.0.0 のタグ付けの判断へ進む。
 
-キャッシュヒット率の記録は、タグ準備の前に入れる。設計が主張する「接頭辞を動かさないからキャッシュが効く」という性質を観測に変える作業であり、遅れても失われない。
+キャッシュヒット率の記録は、上の A/B 実測がその作業にあたる。設計が主張する「接頭辞を動かさないからキャッシュが効く」という性質を観測に変える。
 
 M4 の仕様は、6 本目のツールと 990 トークン上限の衝突（上の「M4 へ」参照）と、M3b が新たに繰り越した項目（並び順のテスト不在、部分文字列フォールバックの打ち切り通知）を先に見ておく。
 

@@ -19,6 +19,7 @@ use crate::spawn::{SpawnTask, TaskOutcome, run_one};
 
 const FILES_MD_AGENT_TYPE: &str = "files-md-writer";
 const FILES_MD_FILENAME: &str = "files.md";
+const MAX_REGENERATION_TARGETS: usize = 32;
 
 pub(crate) async fn regenerate_for_changes(
     changes: &DirChanges,
@@ -32,7 +33,17 @@ pub(crate) async fn regenerate_for_changes(
         return;
     }
 
-    let targets = targets_to_regenerate(changes);
+    let (targets, skipped) = bounded_targets(changes);
+    if skipped > 0 {
+        let _ = audit.lock().await.record(&Record {
+            tool: "files-md-writer",
+            detail: "regeneration target limit",
+            sandbox: None,
+            target: None,
+            result: &format!("skipped {skipped} directories after deduplication"),
+            caller: "harness",
+        });
+    }
 
     for dir in targets {
         regenerate_one(
@@ -45,6 +56,13 @@ pub(crate) async fn regenerate_for_changes(
         )
         .await;
     }
+}
+
+fn bounded_targets(changes: &DirChanges) -> (Vec<PathBuf>, usize) {
+    let mut targets = targets_to_regenerate(changes);
+    let skipped = targets.len().saturating_sub(MAX_REGENERATION_TARGETS);
+    targets.truncate(MAX_REGENERATION_TARGETS);
+    (targets, skipped)
 }
 
 /// 純粋関数として切り出す——subagent 実行なしにロジックを単体テストする
@@ -133,6 +151,24 @@ async fn regenerate_one(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn actual_target_limit_applies_after_parent_expansion_and_deduplication() {
+        let root = tempfile::tempdir().unwrap();
+        let mut dirs = Vec::new();
+        for i in 0..32 {
+            let parent = root.path().join(format!("p{i:02}"));
+            std::fs::create_dir_all(parent.join("child")).unwrap();
+            std::fs::write(parent.join("files.md"), "index").unwrap();
+            dirs.push(parent.join("child"));
+        }
+        dirs.extend(dirs.clone());
+        let changes = changes_with(dirs, vec![]);
+        assert_eq!(targets_to_regenerate(&changes).len(), 64);
+        let (targets, skipped) = bounded_targets(&changes);
+        assert_eq!(targets.len(), 32);
+        assert_eq!(skipped, 32);
+    }
 
     fn changes_with(new_dirs: Vec<PathBuf>, new_files: Vec<PathBuf>) -> DirChanges {
         DirChanges {

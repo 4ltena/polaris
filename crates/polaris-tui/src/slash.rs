@@ -12,7 +12,7 @@
 //! most depend on a subsystem polaris doesn't have (MCP client, IDE
 //! integration, multi-agent orchestration, background terminals,
 //! terminal pets, ...) and stay out for that reason: `/mcp`, `/apps`,
-//! `/plugins`, `/compact`, `/vim`, `/keymap`, `/hooks`, `/import`,
+//! `/plugins`, `/vim`, `/keymap`, `/hooks`, `/import`,
 //! `/memories`, `/theme`, `/pets`, `/ide`, `/plan`, `/goal`, `/agents`,
 //! `/subagents`, `/side`, `/btw`, `/ps`, `/stop`, `/title`,
 //! `/statusline`, `/feedback`, `/personality`, `/experimental`,
@@ -55,6 +55,10 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "clear",
         description: "erase this conversation's saved history",
+    },
+    SlashCommand {
+        name: "compact",
+        description: "summarize older history now to free up context",
     },
     SlashCommand {
         name: "init",
@@ -133,6 +137,11 @@ pub enum Action {
     /// have) and swaps the active session in place on selection.
     Resume,
     Clear,
+    /// Not handled by `apply_slash_action` — needs a real `&dyn Provider`
+    /// reference and an async LLM call, which `apply_slash_action` (sync,
+    /// display-strings-only) doesn't have. The caller in `lib.rs`
+    /// intercepts this the same way it does `Model`.
+    Compact,
     Init,
     /// Same interception story as `Permissions` — the caller shows a
     /// picker over the fixed model catalog and, on selection, both calls
@@ -199,6 +208,7 @@ pub fn parse(line: &str) -> Option<Action> {
         "new" => Action::New,
         "resume" => Action::Resume,
         "clear" => Action::Clear,
+        "compact" => Action::Compact,
         "init" => Action::Init,
         "model" => Action::Model,
         "diff" => Action::Diff,
@@ -332,6 +342,13 @@ mod tests {
     #[test]
     fn surrounding_whitespace_after_the_slash_is_trimmed() {
         assert!(matches!(parse("/ clear "), Some(Action::Clear)));
+    }
+
+    #[test]
+    fn compact_is_a_known_command() {
+        assert!(matches!(parse("/compact"), Some(Action::Compact)));
+        assert!(matches!(action_for("compact"), Action::Compact));
+        assert!(COMMANDS.iter().any(|c| c.name == "compact"));
     }
 
     #[test]

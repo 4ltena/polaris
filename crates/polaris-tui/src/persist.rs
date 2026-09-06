@@ -2,7 +2,9 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Splits raw file bytes into lines, keeping the newline convention of
 /// `BufRead::lines()` (split on `\n`, trailing `\r` trimmed) but without
@@ -58,13 +60,20 @@ pub fn load_session(path: &Path) -> io::Result<(Session, bool)> {
         rewrite(path, &messages)?;
     }
 
-    Ok((Session { messages }, truncated))
+    Ok((
+        Session {
+            messages,
+            ..Session::default()
+        },
+        truncated,
+    ))
 }
 
 /// Appends one message as a single JSON line. Creates the file if it
 /// doesn't exist yet.
 pub fn append_message(path: &Path, message: &Message) -> io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut options = private_options();
+    let mut file = options.create(true).append(true).open(path)?;
     let line = serde_json::to_string(message).expect("Message always serializes");
     writeln!(file, "{line}")
 }
@@ -99,6 +108,47 @@ pub fn write_meta_if_absent(meta_path: &Path, meta: &SessionMeta) -> io::Result<
     std::fs::write(meta_path, json)
 }
 
+/// Forks retain their own write namespace and record the immediate source.
+/// Its verified lineage grants read-only access to ancestor tool memory.
+pub(crate) fn write_fork_meta(
+    path: &Path,
+    meta: &SessionMeta,
+    memory_origin: Option<&str>,
+) -> io::Result<()> {
+    let mut value = serde_json::to_value(meta)?;
+    if let Some(origin) = memory_origin {
+        value["tool_memory_origin"] = serde_json::Value::String(origin.into());
+    }
+    atomic_write(path, false, |file| {
+        serde_json::to_writer(file, &value).map_err(io::Error::other)
+    })
+}
+
+/// Missing fields are legacy sessions; malformed origin fields fail closed.
+pub(crate) fn read_tool_memory_origin(path: &Path) -> io::Result<Option<String>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if !value.is_object() {
+        return Err(io::Error::other("記憶のセッションメタデータが不正です"));
+    }
+    match value.get("tool_memory_origin") {
+        None => Ok(None),
+        Some(serde_json::Value::String(origin))
+            if !origin.is_empty()
+                && origin
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
+            Ok(Some(origin.clone()))
+        }
+        _ => Err(io::Error::other("記憶の元セッションIDが不正です")),
+    }
+}
+
 /// Reads back a session's metadata. `None` (not an error) when the file
 /// is missing or unparseable — a `/resume` listing skips a corrupt or
 /// incomplete entry rather than failing the whole list.
@@ -107,18 +157,449 @@ pub fn read_meta(meta_path: &Path) -> Option<SessionMeta> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn rewrite(path: &Path, messages: &[Message]) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    for m in messages {
-        let line = serde_json::to_string(m).expect("Message always serializes");
-        writeln!(file, "{line}")?;
+pub(crate) fn rewrite(path: &Path, messages: &[Message]) -> io::Result<()> {
+    atomic_write(path, true, |file| {
+        for m in messages {
+            serde_json::to_writer(&mut *file, m)?;
+            file.write_all(b"\n")?;
+        }
+        Ok(())
+    })
+}
+
+/// A complete pre-compaction snapshot. This is historical data, never
+/// instructions or approval to execute actions. `project_id` is the canonical
+/// project directory, and `session_id` is the resumable log's file stem.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArchiveSnapshot {
+    pub version: u32,
+    pub project_id: String,
+    pub session_id: String,
+    pub archived_at_millis: u128,
+    pub messages: Vec<Message>,
+}
+
+/// Resolves aliases (including symlinks) without conflating directories that
+/// happen to have the same basename. Missing projects return an error rather
+/// than silently acquiring a different identity. Performs no writes.
+pub fn project_identity(project: &Path) -> io::Result<String> {
+    let canonical = project.canonicalize()?;
+    if !canonical.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project is not a directory",
+        ));
     }
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "project path is not UTF-8"))
+}
+
+/// Archive snapshots live outside the resumable JSONL namespace.
+pub fn archive_dir(session_path: &Path) -> PathBuf {
+    session_path.with_extension("archive")
+}
+
+/// Saves all original Message fields before a caller compacts or replaces
+/// history. An error must abort that destructive operation. Never changes the
+/// resumable log, and never overwrites a previous snapshot. No automatic import
+/// of existing session logs is performed. On Unix directories are 0700 and
+/// files 0600; on other platforms access follows the user's directory ACLs.
+pub fn archive_snapshot(
+    session_path: &Path,
+    project: &Path,
+    messages: &[Message],
+) -> io::Result<PathBuf> {
+    let project_id = project_identity(project)?;
+    let session_id = session_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid session path"))?;
+    let archived_at_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_millis();
+    let snapshot = ArchiveSnapshot {
+        version: 1,
+        project_id,
+        session_id: session_id.to_owned(),
+        archived_at_millis,
+        messages: messages.to_vec(),
+    };
+    let dir = archive_dir(session_path);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(&dir) {
+        Ok(()) => sync_parent(&dir)?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    // Do not follow an archive-directory symlink into another project's data.
+    if !std::fs::symlink_metadata(&dir)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    loop {
+        let path = dir.join(format!(
+            "{archived_at_millis}-{}-{}.json",
+            std::process::id(),
+            next_id()
+        ));
+        match atomic_write(&path, false, |file| {
+            serde_json::to_writer(file, &snapshot).map_err(io::Error::from)
+        }) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Strict, read-only access for retrieval. Unlike `load_session`, malformed or
+/// truncated data returns an error and is never repaired, shortened or created.
+pub fn read_archive(path: &Path) -> io::Result<ArchiveSnapshot> {
+    let snapshot: ArchiveSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
+    if snapshot.version != 1
+        || snapshot.session_id.is_empty()
+        || !Path::new(&snapshot.project_id).is_absolute()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid archive provenance or version",
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+struct PendingFile {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        // Close first so cleanup also works on Windows.
+        self.file.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(parent_dir(path))?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Writes and syncs a private sibling before publication. Every failure before
+/// publication leaves the old file intact. A directory-sync error after
+/// publication can report an error with the complete new file already visible.
+fn atomic_write(
+    path: &Path,
+    replace: bool,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut pending = loop {
+        let candidate =
+            parent_dir(path).join(format!(".polaris-{}-{}.tmp", std::process::id(), next_id()));
+        match private_options().create_new(true).open(&candidate) {
+            Ok(file) => {
+                break PendingFile {
+                    path: candidate,
+                    file: Some(file),
+                };
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let file = pending.file.as_mut().expect("pending file is open");
+    write(file)?;
+    file.sync_all()?;
+    pending.file.take();
+    if replace {
+        std::fs::rename(&pending.path, path)?;
+    } else {
+        // Atomic create-if-absent: never clobber an earlier archive, even if
+        // separate processes happen to choose the same snapshot name.
+        std::fs::hard_link(&pending.path, path)?;
+    }
+    drop(pending);
+    sync_parent(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrite_replaces_a_long_log_and_clear_leaves_no_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        append_message(&path, &Message::user("old".repeat(1024))).unwrap();
+        rewrite(&path, &[Message::assistant("short")]).unwrap();
+        let (session, truncated) = load_session(&path).unwrap();
+        assert!(!truncated);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "short");
+        clear_session(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn partial_write_failure_preserves_original_bytes_and_removes_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        // Include a damaged tail: even recovery must not destroy it until the
+        // replacement has been completely written and synced.
+        let original = b"{\"role\":\"user\",\"content\":\"keep\"}\n{broken";
+        std::fs::write(&path, original).unwrap();
+        let result = atomic_write(&path, true, |file| {
+            file.write_all(b"partial replacement")?;
+            assert_eq!(std::fs::read(&path)?, original);
+            Err(io::Error::other("injected write failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn publication_failure_cleans_up_and_preserves_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"keep").unwrap();
+        assert!(rewrite(&path, &[Message::user("new")]).is_err());
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_and_recovery_publish_new_inodes_without_truncating_open_readers() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let original = b"{\"role\":\"user\",\"content\":\"keep\"}\n{broken";
+        std::fs::write(&path, original).unwrap();
+        let mut old_reader = File::open(&path).unwrap();
+        let (session, truncated) = load_session(&path).unwrap();
+        assert!(truncated);
+        assert_eq!(session.messages[0].content, "keep");
+        let mut old_bytes = Vec::new();
+        old_reader.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, original);
+        assert!(!load_session(&path).unwrap().1);
+    }
+
+    #[test]
+    fn archive_preserves_full_messages_and_provenance_separately_from_resume() {
+        use polaris_provider::{ReasoningItem, ToolCall};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-42.jsonl");
+        let messages = vec![
+            Message::user("元の記録"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}),
+                }],
+            )
+            .with_reasoning(vec![ReasoningItem {
+                id: "reasoning-1".into(),
+                encrypted_content: "opaque-original".into(),
+            }]),
+            Message::tool_result("call-1", "full result"),
+        ];
+        rewrite(&path, &messages).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let archived_path = archive_snapshot(&path, dir.path(), &messages).unwrap();
+        assert_eq!(archived_path.parent().unwrap(), archive_dir(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let archive = read_archive(&archived_path).unwrap();
+        assert_eq!(archive.version, 1);
+        assert_eq!(archive.session_id, "session-42");
+        assert_eq!(archive.project_id, project_identity(dir.path()).unwrap());
+        assert!(archive.archived_at_millis > 0);
+        assert_eq!(
+            serde_json::to_value(&archive.messages).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        rewrite(&path, &[Message::user("summary")]).unwrap();
+        assert_eq!(read_archive(&archived_path).unwrap().messages.len(), 3);
+        assert_eq!(
+            load_session(&path).unwrap().0.messages[0].content,
+            "summary"
+        );
+    }
+
+    #[test]
+    fn subsequent_snapshots_never_overwrite_earlier_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let first = archive_snapshot(&path, dir.path(), &[Message::user("first")]).unwrap();
+        let second = archive_snapshot(&path, dir.path(), &[Message::user("second")]).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(read_archive(&first).unwrap().messages[0].content, "first");
+        assert_eq!(read_archive(&second).unwrap().messages[0].content, "second");
+        assert_eq!(std::fs::read_dir(archive_dir(&path)).unwrap().count(), 2);
+        assert!(!path.exists());
+        // Even an explicitly colliding destination is create-only.
+        let bytes = std::fs::read(&first).unwrap();
+        assert_eq!(
+            atomic_write(&first, false, |f| f.write_all(b"replacement"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), bytes);
+    }
+
+    #[test]
+    fn archive_errors_leave_resume_and_existing_archives_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        append_message(&path, &Message::user("keep")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(archive_dir(&path), b"not a directory").unwrap();
+        assert!(archive_snapshot(&path, dir.path(), &[Message::user("new")]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(archive_dir(&path)).unwrap(),
+            b"not a directory"
+        );
+    }
+
+    #[test]
+    fn archive_read_is_strict_and_never_repairs_or_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.json");
+        assert_eq!(
+            read_archive(&path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!path.exists());
+        let bytes = b"{\"version\":1,\"messages\":[";
+        std::fs::write(&path, bytes).unwrap();
+        assert!(read_archive(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let valid = archive_snapshot(&dir.path().join("s.jsonl"), dir.path(), &[]).unwrap();
+        let before = std::fs::read(&valid).unwrap();
+        assert!(read_archive(&valid).unwrap().messages.is_empty());
+        assert_eq!(std::fs::read(&valid).unwrap(), before);
+        let mut unsupported: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        unsupported["version"] = serde_json::json!(99);
+        std::fs::write(&valid, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+        assert_eq!(
+            read_archive(&valid).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn project_identity_separates_same_named_projects_and_rejects_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a/project");
+        let second = dir.path().join("b/project");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        assert_ne!(
+            project_identity(&first).unwrap(),
+            project_identity(&second).unwrap()
+        );
+        assert_eq!(
+            project_identity(&first).unwrap(),
+            project_identity(&first.join(".")).unwrap()
+        );
+        assert!(project_identity(&dir.path().join("missing")).is_err());
+        let session = dir.path().join("s.jsonl");
+        for project in [&first, &second] {
+            let snapshot = archive_snapshot(&session, project, &[]).unwrap();
+            assert_eq!(
+                read_archive(&snapshot).unwrap().project_id,
+                project_identity(project).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_permissions_are_private_and_symlink_aliases_preserve_project_identity() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&project, &alias).unwrap();
+        assert_eq!(
+            project_identity(&project).unwrap(),
+            project_identity(&alias).unwrap()
+        );
+        let session = dir.path().join("s.jsonl");
+        let path = archive_snapshot(&session, &alias, &[Message::user("private")]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(archive_dir(&session))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        rewrite(&session, &[Message::user("private")]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&session).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let linked_session = dir.path().join("linked.jsonl");
+        symlink(archive_dir(&session), archive_dir(&linked_session)).unwrap();
+        assert!(archive_snapshot(&linked_session, &project, &[]).is_err());
+        assert_eq!(std::fs::read_dir(archive_dir(&session)).unwrap().count(), 1);
+    }
 
     #[test]
     fn a_missing_file_loads_as_an_empty_session() {

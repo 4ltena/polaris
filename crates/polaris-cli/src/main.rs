@@ -30,7 +30,7 @@ Environment variables:
   POLARIS_PROVIDER  openai (default) or codex. codex uses the credentials from `polaris login`.
   POLARIS_API_KEY   Required when provider=openai. API key for an OpenAI-compatible endpoint.
   POLARIS_BASE_URL  Used when provider=openai; defaults to https://api.openai.com/v1
-  POLARIS_MODEL     Defaults to gpt-5.4 (openai) / gpt-5.6-sol (codex)
+  POLARIS_MODEL     Defaults to gpt-6-astra; reasoning effort defaults to medium (--effort)
 "
 )]
 struct Args {
@@ -52,12 +52,12 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     max_turns: u32,
 
-    /// 実行モデル。省略時はPOLARIS_MODELまたは従来の既定値。
+    /// 実行モデル。省略時はPOLARIS_MODEL、未設定ならgpt-6-astra。
     #[arg(long)]
     model: Option<String>,
 
-    /// 推論強度を明示する。省略時は従来のアカウント設定。
-    #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
+    /// 推論強度。既定はmedium。明示した値が優先する。
+    #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
     effort: Option<String>,
 
     /// 圧縮前の履歴をローカル保存し、プロジェクト別の検索索引を作る。
@@ -261,34 +261,12 @@ fn effort_for(access_token: &str) -> Option<String> {
     polaris_auth::effort_for_plan_type(plan.as_deref()).map(|s| s.to_string())
 }
 
-/// Determines the default model from the stored credentials' `chatgpt_plan_type`
-/// claim, the same way `effort_for` determines the default effort — but
-/// unlike `effort_for` (called per-request, inside `TokenSource::token`,
-/// where a fresh access token is already guaranteed), this runs once at
-/// startup before any model string is picked, so it reads the store
-/// directly rather than through the async refresh path. A stale-but-still
-/// generally-valid stored token is fine here: `chatgpt_plan_type` doesn't
-/// change from one refresh to the next, and this is only ever choosing a
-/// *default* — an explicit `--model`/`POLARIS_MODEL` always wins over it
-/// (see the caller). Returns `None` (defer to `DEFAULT_MODEL`) whenever
-/// there's no stored login, the store can't be read, or the plan doesn't
-/// map to an override.
-fn model_for_stored_plan(store_path: &Path) -> Option<String> {
-    let creds = polaris_auth::store::load_from(store_path).ok().flatten()?;
-    let plan = polaris_auth::token::plan_type_from_access_token(&creds.access_token);
-    polaris_auth::model_for_plan_type(plan.as_deref()).map(|s| s.to_string())
-}
-
-/// Same stored-credentials read as `model_for_stored_plan`, but for the
-/// TUI footer's displayed effort: seeds `RunArgs::initial_effort_name` so
-/// the footer shows the actual plan-derived effort (e.g. "high" for Plus)
-/// from the first frame, instead of always starting at
-/// `render::DEFAULT_EFFORT` regardless of what's really sent to the API.
-/// Returns `None` (defer to `render::DEFAULT_EFFORT`) under the same
-/// conditions as `model_for_stored_plan`.
-fn effort_for_stored_plan(store_path: &Path) -> Option<String> {
-    let creds = polaris_auth::store::load_from(store_path).ok().flatten()?;
-    effort_for(&creds.access_token)
+/// Resolve both providers identically; an account plan cannot replace an
+/// explicit or default model.
+fn selected_model(explicit: Option<String>, environment: Option<String>) -> String {
+    explicit
+        .or(environment)
+        .unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string())
 }
 
 #[async_trait::async_trait]
@@ -437,10 +415,7 @@ async fn main() -> ExitCode {
         return run_confined_apply();
     }
 
-    let model = args
-        .model
-        .clone()
-        .or_else(|| std::env::var("POLARIS_MODEL").ok());
+    let model = selected_model(args.model.clone(), std::env::var("POLARIS_MODEL").ok());
     let mut provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| {
         let has_openai_key = std::env::var("POLARIS_API_KEY").is_ok()
             || polaris_auth::api_key::default_path()
@@ -455,11 +430,7 @@ async fn main() -> ExitCode {
     });
 
     let model_name: String;
-    // Seeds the TUI footer's displayed effort — `None` means "let it show
-    // render::DEFAULT_EFFORT", same as before this existed. Only the codex
-    // branch sets this (to the same chatgpt_plan_type-derived value
-    // effort_for_stored_plan/effort_for send to the API); the openai
-    // branch has no such server-side plan-based effort to reflect.
+    // Mirror the CLI effort in the TUI footer.
     let mut initial_effort_name: Option<String> = None;
 
     let provider: std::sync::Arc<dyn polaris_provider::Provider> = loop {
@@ -516,7 +487,7 @@ async fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                let model = model.clone().unwrap_or_else(|| "gpt-5.4".to_string());
+                let model = model.clone();
                 model_name = model.clone();
                 match OpenAiProvider::new(base, key, model) {
                     Ok(p) => break std::sync::Arc::new(p),
@@ -534,22 +505,22 @@ async fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                // Precedence: an explicit --model/POLARIS_MODEL always
-                // wins; otherwise the stored account's plan may override
-                // the default (see model_for_stored_plan's doc comment).
-                let model = model
-                    .or_else(|| model_for_stored_plan(&store))
-                    .unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string());
+                let model = model.clone();
                 model_name = model.clone();
-                initial_effort_name = effort_for_stored_plan(&store);
-                break std::sync::Arc::new(polaris_provider::codex::CodexProvider::new(
+                match polaris_provider::codex::CodexProvider::new(
                     polaris_provider::codex::ENDPOINT_BASE.to_string(),
                     model,
                     std::sync::Arc::new(AuthTokens {
                         issuer: polaris_auth::ISSUER.to_string(),
                         store,
                     }),
-                ));
+                ) {
+                    Ok(provider) => break std::sync::Arc::new(provider),
+                    Err(error) => {
+                        eprintln!("Can't build the client: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
             }
             other => {
                 eprintln!("POLARIS_PROVIDER is an unknown value {other}. Specify openai or codex");
@@ -996,17 +967,17 @@ mod tests {
     }
 
     #[test]
-    fn model_for_stored_plan_defers_when_nothing_is_stored() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = dir.path().join("auth.json");
-        assert_eq!(model_for_stored_plan(&store), None);
-    }
-
-    #[test]
-    fn effort_for_stored_plan_defers_when_nothing_is_stored() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = dir.path().join("auth.json");
-        assert_eq!(effort_for_stored_plan(&store), None);
+    fn defaults_and_explicit_model_effort_have_the_documented_precedence() {
+        let args = Args::try_parse_from(["polaris", "-p", "hello"]).expect("args");
+        assert_eq!(selected_model(args.model, None), "gpt-6-astra");
+        assert_eq!(args.effort.as_deref(), Some("medium"));
+        assert_eq!(selected_model(None, Some("env-model".into())), "env-model");
+        assert_eq!(
+            selected_model(Some("flag-model".into()), Some("env-model".into())),
+            "flag-model"
+        );
+        let args = Args::try_parse_from(["polaris", "--effort", "high"]).expect("args");
+        assert_eq!(args.effort.as_deref(), Some("high"));
     }
 
     #[test]

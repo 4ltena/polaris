@@ -8,11 +8,13 @@ cargo test --locked --offline -p polaris-core budget
 cargo test --locked --offline -p polaris-cli tool_memory_defaults_off_and_is_independent_of_remember
 ```
 
-常時コンテキストの検査は、実際のOpenAI・Codexワイヤ形式のトークン数が990以下であること、ツール数が6以下であること、skill数の増加で固定部分が増えないことを確認する。CLIの設定テストは`--tool-memory`が既定offで、`--remember`から独立していることを確認する。
+基底コンテキストの検査は、workflow本文を除くOpenAI・Codexワイヤ形式のトークン数が990以下であること、ツール数が6以下であること、skill数の増加で固定部分が増えないことを確認する。workflow本文と識別情報は別途384トークン以下を確認する。CLIの設定テストは`--tool-memory`が既定offで、`--remember`から独立していることを確認する。
 
 変更範囲に応じて、対象crateのテスト、`cargo clippy --locked --offline --all-targets -- -D warnings`、Python測定スクリプトのテストを追加する。ネットワーク認証、実端末の描画、実モデル推論は自動テストだけで確認できない。
 
 ## TUIの手動確認
+
+v0.11.0のworkflow、strict10、再開・分岐、モデル要求の上限制御は[v0.11.0の検証状況](sadalmelik-validation.md)にまとめる。疑似応答の制御試験は実モデルの品質やトークン削減を証明しない。
 
 資格情報のない検証用環境で`polaris`を起動し、次を確認する。
 
@@ -22,7 +24,7 @@ cargo test --locked --offline -p polaris-cli tool_memory_defaults_off_and_is_ind
 - ChatGPTサインインはブラウザを開き、認可後に対話を開始する。
 - 文字入力、Backspace、Enterで送信でき、応答が履歴に追加される。
 - 書き込み要求で承認モーダルが出て、`y`と`n`で応答できる。
-- `Ctrl-C`で終了できる。送信済み会話は`~/.polaris/sessions/`に保存され、`/resume`で選んで再開できる。
+- `Ctrl-C`で終了できる。workflowを使う送信済み会話は保存領域の`sessions-v2/`に保存され、`/resume`で選んで再開できる。
 - ヘッダーとステータスにプロバイダ、モデル、累積トークンが表示される。
 - ツール呼び出しでは`⚙ read(...)`と`→ ...`が表示される。
 - 太字、インラインコード、コードブロックが整形表示される。

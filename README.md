@@ -8,97 +8,78 @@
 </p>
 
 <p align="center">
-  <strong>v0.10.0 “Algedi”</strong> · <a href="CHANGELOG.md">変更履歴</a>
+  <strong>v0.11.0 “Sadalmelik”</strong> · <a href="CHANGELOG.md">変更履歴</a>
 </p>
 
 <p align="center">
   <strong>日本語</strong> · <a href="README.en.md" lang="en">English</a>
 </p>
 
-Polarisは、常時送信する指示とツール定義を小さく保ち、必要な資料だけを検索・再取得するRust製のCLI/TUIエージェントである。会話の圧縮、圧縮前履歴のローカル保存、大きなツール結果の退避と再取得に対応する。
+Polarisは、必要な指示と資料だけをモデルへ渡すRust製のCLI/TUIエージェントである。作業段階を記録するworkflowを標準で備え、共通ルールと企画・仕様策定・実装・レビューなどの段階に必要なskillを、通常のskill検索とは別に読み込む。
+
+## 純正Codexとの比較
+
+企画・要件定義・データ設計・実装計画など8種類の課題を、同じ`gpt-6-astra`／`medium`で比較した。下表は同じ課題・反復がそろった16試行、各2ターンの合計である。Polarisはworkflowを有効にした構成を使った。
+
+| 指標 | Polaris | 純正Codex CLI 0.153.4 | Polarisの削減率 |
+| --- | ---: | ---: | ---: |
+| 総トークン | **99,530** | 493,518 | **79.8%** |
+| API換算費用 | **$2.46658** | $4.16582 | **40.8%** |
+| 品質検査 | 16/16合格 | 16/16合格 | — |
+
+総トークンはキャッシュ済み入力を含む入力と出力の合計。費用は測定仕様で固定したAPI単価による参考額で、Codexの実請求額ではない。短い合成課題による別時刻の測定であり、一般の実装作業や長期対話の削減率を保証しない。[測定条件・品質評価・時間・制約](docs/preimplementation-evaluation.md)を参照。
 
 ## はじめに
 
-Rust 1.96.0（`rust-toolchain.toml`で固定）を用意してビルドする。
+Rust 1.96.0を用意し、ChatGPTサブスクリプションで認証する。
 
 ```sh
 cargo build --release
-POLARIS_API_KEY=sk-... target/release/polaris -p "Cargo.toml は何行か"
-```
-
-開発中は `cargo run -p polaris-cli -- -p "..."` でも実行できる。`--prompt`を省略すると対話TUIを起動する。
-
-ChatGPTサブスクリプションで使う場合は、先に認証する。
-
-```sh
 target/release/polaris login
 POLARIS_PROVIDER=codex target/release/polaris -p "Cargo.toml は何行か"
 ```
 
-既定モデルは`gpt-6-astra`、推論強度は`medium`。明示する場合は`POLARIS_MODEL=gpt-6-astra`と`--effort medium`を別々に指定する。
+`-p`を省略すると対話TUIを起動する。開発中は`cargo run -p polaris-cli -- -p "..."`でも実行できる。既定モデルは`gpt-6-astra`、推論強度は`medium`である。
+
+段階を指定して始める場合は、`--phase`を使う。
 
 ```sh
-POLARIS_PROVIDER=codex POLARIS_MODEL=gpt-6-astra target/release/polaris --effort medium -p "Cargo.toml は何行か"
+POLARIS_PROVIDER=codex target/release/polaris --phase specify -p "機材貸出サービスの受入条件を整理する"
 ```
 
-プロバイダ、監査ログ、サンドボックス、TUI、保存済み会話、全サブコマンドは[利用ガイド](docs/usage.md)を参照。
+APIキー用の`openai`プロバイダはChat Completions形式のため、Responses APIが必要なAstraのtool callingには未対応である。認証・設定・保存済み会話の再開方法は[利用ガイド](docs/usage.md)にまとめる。
 
-## 主な性質
+## 主な機能
 
-- 常時コンテキストは基準トークナイザー`o200k_base`で990トークン以下、ツールは6個以下に制限し、実際に送るワイヤ形式をテストする。
-- skill一覧は常時展開せず、必要なときだけ`skill`で検索する。会話履歴、取得資料、ツール結果、取得したskill本文は固定部分に含めない。
-- 大きなツール結果の退避は`--tool-memory off|history|retrieval`で選ぶ。既定は`off`であり、圧縮前履歴を保存する`--remember`とは独立している。
-- `retrieval`は保存時点の原文をキーワード検索し、必要な行・段落だけを再取得する。意味検索はローカル埋め込みURLとモデルを明示した場合だけ有効になる。
-- `spawn`は独立したsubagentを1波で実行し、型ごとのJSON Schemaで結果を検証する。深さは1に固定する。
+- **段階別workflow**：共通skillと現在の段階の必須skillを各ターンで固定する。通常のskill検索は必要なときに使い、カタログ全体を常時展開しない。
+- **小さな基底コンテキスト**：基底の指示と最大6個のツール定義は`o200k_base`で990トークン以下。workflowのskillと識別情報には別枠で最大384トークンを設ける。履歴・取得資料・ツール結果はこの固定部分に含めない。
+- **保存と再取得**：大きなツール結果を原文とともに保存し、必要な行や段落だけを取り出せる。ツール記憶は`--tool-memory history|retrieval`で有効化する。
+- **会話の継続**：workflowの段階と会話を保存し、再開・分岐で引き継ぐ。子エージェントは1波で並列実行し、型ごとの出力Schemaで検証する。
 
-固定コンテキストは総入力の上限ではなく、履歴・取得資料・ツール結果は別に加算される。保存結果は取得時点の原文であり、現在のファイル内容が必要な場合は通常のパスを読む。
-
-ツール結果の保存、検索URI、圧縮、測定用の実行方法は[コンテキスト効率化](docs/context-efficiency.md)、subagentの設定と制約は[subagent](docs/subagents.md)にある。
-
-## v0.10.0の変更
-
-- 保存済みツール結果の記録内検索、filemapの案内、隔離環境での通信と認証に対応した。
-- 既定モデルを`gpt-6-astra`、推論強度を`medium`に統一した。
-- 本文量を変えずにキャッシュを改善する任意設定と、長期対話・skill数・tool数・例示数を含む品質検証を追加した。`POLARIS_CACHE_PACING=on`は要求開始を最低5秒間隔にする。既定は`off`。
-
-36ターンの完了した1組では、同じ総トークン数でキャッシュ率が54.11%から63.83%へ上がり、API換算費用が15.38%下がった。ただし別課題の対照側が品質不合格で停止したため、全体の改善や再現性は未確認である。[条件・結果・制約](docs/gpt6-cache-pacing-results.md)を参照。
+v0.11.0 “Sadalmelik”ではworkflowを標準採用し、会話保存・再開・分岐を整えた。直近10ターンと要約検索を使う`strict10`と、キャッシュ用の要求間隔制御は任意設定である。strict10の実モデル評価は未完了で、Web検索は現行CLIでは有効化できない。利用条件と制限は[検証状況](docs/sadalmelik-validation.md)に記載する。各版の変更は[変更履歴](CHANGELOG.md)を参照。
 
 ## 文書
 
 | 文書 | 内容 |
 | --- | --- |
-| [利用ガイド](docs/usage.md) | ビルド、認証、監査ログ、TUI、会話、スラッシュコマンド。 |
-| [コンテキスト効率化](docs/context-efficiency.md) | 圧縮、原文保存、検索、埋め込み、測定手順。 |
-| [subagent](docs/subagents.md) | `spawn`の設定、型、出力Schema、実行制限。 |
-| [テスト](docs/testing.md) | 固定コンテキストの検査とTUIの手動確認。 |
-| [skill/plugin大量時の比較](docs/skill-scaling-benchmark.md) | 旧来の初回入力と時間の測定条件・結果。 |
-| [GPT-6 medium実測結果](docs/gpt6-efficiency-results.md) | 段階別の合成課題、通常Codex比較、測定上の制約。 |
-| [キャッシュと品質検証](docs/gpt6-cache-affinity-results.md) | 本文量を維持する通信変更、長期対話、skill・tool数と例示数の検証。 |
-| [要求間隔とキャッシュ](docs/gpt6-cache-pacing-results.md) | 本文量を変えずに送信間隔だけを変える実験。 |
-
-## 通常Codexとの比較
-
-v0.9.0時点で、通常Codex CLIとPolaris候補版を、同じ合成資料・依頼文、GPT-6 medium、各3回で比較した。通常Codex側は測定時のユーザー設定・スキルを維持している。
-
-| 指標（各3回合計） | 通常Codex | Polaris | Polarisの削減率 |
-| --- | ---: | ---: | ---: |
-| 総トークン | 612,027 | 38,620 | 93.7% |
-| 処理時間 | 93.678秒 | 72.096秒 | 23.0% |
-| 正答・変更範囲 | 3/3合格 | 3/3合格 | — |
-
-総トークンはキャッシュ済み入力を含む入力と出力の合計で、料金比較ではない。単一の合成課題・別時刻の測定であり、v0.10.0全体や一般の実装作業での削減率を示さない。[詳細と制約](docs/gpt6-efficiency-results.md)を参照。
-
-以前の大量skill/plugin比較では、Polarisの初回入力は547トークンだった。この値は当時のAPI使用量であり、現在の固定コンテキストの測定値ではない。測定条件と全表は[skill/plugin大量時の比較](docs/skill-scaling-benchmark.md)にある。
+| [利用ガイド](docs/usage.md) | 認証、設定、workflow、TUI、会話の再開・分岐。 |
+| [コンテキスト効率化](docs/context-efficiency.md) | 圧縮、原文保存、検索、埋め込み、strict10。 |
+| [subagent](docs/subagents.md) | 並列実行、出力Schema、実行制限。 |
+| [実装前段階の実測](docs/preimplementation-evaluation.md) | 企画から計画レビューまでの品質と純正Codex比較。 |
+| [v0.11.0の検証](docs/sadalmelik-validation.md) | 制御試験、実モデル試験、未検証の範囲。 |
+| [テスト](docs/testing.md) | 自動検査とTUIの手動確認。 |
+| [過去のGPT-6実測](docs/gpt6-efficiency-results.md) | v0.9.0時点の合成課題と測定条件。 |
+| [skill/plugin大量時の比較](docs/skill-scaling-benchmark.md) | 以前の初回入力547トークンの測定条件。 |
+| [要求間隔とキャッシュ](docs/gpt6-cache-pacing-results.md) | v0.10.0の長期対話によるキャッシュ実験。 |
+| [Codex更新調査](docs/codex-update-efficiency.md) | 公開変更の確認と自動モデル要求の制御。 |
 
 ## 開発と検証
 
 ```sh
+cargo test --locked --offline --workspace
+cargo clippy --locked --offline --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-cargo test --locked --offline -p polaris-core budget
-cargo test --locked --offline -p polaris-cli tool_memory_defaults_off_and_is_independent_of_remember
 ```
-
-検査の対象、TUIの手動確認、環境依存の制限は[テスト](docs/testing.md)を参照。
 
 ## ライセンス
 

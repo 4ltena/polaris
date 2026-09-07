@@ -13,9 +13,13 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde_json::Value;
 
+#[path = "cache_prefix.rs"]
+mod cache_prefix;
 #[path = "codex_metrics.rs"]
 mod metrics;
 
+use crate::cache_pacing::{Gate as PacingGate, Mode as PacingMode};
+use crate::turn_affinity::{TurnAffinityMode, TurnContext, TurnIdentity};
 use crate::{
     CompletionRequest, CompletionResponse, Message, Provider, ProviderError, ReasoningItem, Role,
     ToolCall, sse,
@@ -26,14 +30,9 @@ use crate::{
 pub const ENDPOINT_BASE: &str = "https://chatgpt.com/backend-api/codex";
 /// The default used when `POLARIS_MODEL` is omitted.
 ///
-/// `gpt-5.1-codex-max` / `gpt-5.2-codex` / `gpt-5.3-codex`, picked up from
-/// strings in the binary at design time, existed in none of the real
-/// catalog (`codex debug models`). The real backend clearly returned a 400
-/// saying "Codex usage on a ChatGPT account is not supported" for these,
-/// with auth itself going through fine (not a 401). Swapped in for the
-/// real catalog's top-priority model instead. As the spec states plainly,
-/// there's no guarantee this name will keep working going forward either.
-pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+/// The product default. CLI configuration supplies the explicit medium
+/// reasoning effort; this constant intentionally selects only the model.
+pub const DEFAULT_MODEL: &str = "gpt-6-astra";
 
 /// Converts history into a sequence of Responses `input` elements.
 pub fn input_items(messages: &[Message]) -> Vec<Value> {
@@ -128,9 +127,26 @@ pub fn tool_wire_shape(tools: &[polaris_tools::ToolSpec]) -> Vec<Value> {
 /// server's default — the same shape as the existing decision to omit the
 /// `tools` key entirely rather than send an empty array.
 pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) -> Value {
+    build_body_with_instructions(model, req, &req.system, effort)
+}
+
+fn build_body_with_instructions(
+    model: &str,
+    req: &CompletionRequest,
+    instructions: &str,
+    effort: Option<&str>,
+) -> Value {
+    // Use the same effective instructions for the wire body and the existing
+    // cache-key function. A stable guide must therefore be reflected before
+    // cache-key construction, while compact retains the old values exactly.
+    let effective_req = CompletionRequest {
+        system: instructions.to_string(),
+        messages: Vec::new(),
+        tools: req.tools.clone(),
+    };
     let mut body = serde_json::json!({
         "model": model,
-        "instructions": req.system,
+        "instructions": instructions,
         "input": input_items(&req.messages),
         // Never let the server hold conversation state. Send the full
         // text every turn. What's sent and what's measured then match,
@@ -150,7 +166,7 @@ pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) ->
         // `store: false` keeps the prefix stable, but stability alone
         // doesn't help if each turn is routed somewhere else — see
         // `crate::cache_key`.
-        "prompt_cache_key": crate::cache_key(model, effort, req),
+        "prompt_cache_key": crate::cache_key(model, effort, &effective_req),
     });
     let tools = tool_wire_shape(&req.tools);
     if !tools.is_empty() {
@@ -363,10 +379,17 @@ pub struct CodexProvider {
     idle: Duration,
     cache_namespace: Option<std::ffi::OsString>,
     cache_mode: Option<std::ffi::OsString>,
+    cache_prefix: cache_prefix::CachePrefixProfile,
+    turn_affinity: TurnAffinityMode,
+    pacing: PacingGate,
 }
 
 impl CodexProvider {
-    pub fn new(base: String, model: String, tokens: Arc<dyn crate::TokenSource>) -> Self {
+    pub fn new(
+        base: String,
+        model: String,
+        tokens: Arc<dyn crate::TokenSource>,
+    ) -> Result<Self, ProviderError> {
         Self::with_idle_timeout(base, model, tokens, DEFAULT_IDLE_TIMEOUT)
     }
 
@@ -375,17 +398,40 @@ impl CodexProvider {
         model: String,
         tokens: Arc<dyn crate::TokenSource>,
         idle: Duration,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProviderError> {
+        Self::with_idle_timeout_and_affinity(
+            base,
+            model,
+            tokens,
+            idle,
+            TurnAffinityMode::from_env()?,
+        )
+    }
+
+    fn with_idle_timeout_and_affinity(
+        base: String,
+        model: String,
+        tokens: Arc<dyn crate::TokenSource>,
+        idle: Duration,
+        turn_affinity: TurnAffinityMode,
+    ) -> Result<Self, ProviderError> {
+        let client = polaris_http::client_builder()
+            .map_err(|e| ProviderError::Http(format!("could not configure HTTP client: {e}")))?
+            .build()
+            .map_err(|e| ProviderError::Http(format!("could not build HTTP client: {e}")))?;
+        Ok(Self {
             base,
             model: std::sync::RwLock::new(model),
             effort_override: std::sync::RwLock::new(None),
             tokens,
-            client: reqwest::Client::new(),
+            client,
             idle,
             cache_namespace: std::env::var_os("POLARIS_CACHE_NAMESPACE"),
             cache_mode: std::env::var_os("POLARIS_CACHE_MODE"),
-        }
+            cache_prefix: cache_prefix::CachePrefixProfile::from_env()?,
+            turn_affinity,
+            pacing: PacingGate::new(PacingMode::from_env()?),
+        })
     }
 
     /// Sends a single request and folds the SSE. A 401 is not folded
@@ -403,6 +449,7 @@ impl CodexProvider {
         &self,
         token: &crate::Token,
         req: &CompletionRequest,
+        turn: Option<&TurnContext>,
     ) -> Result<CompletionResponse, ProviderError> {
         let model = self.model.read().expect("model lock poisoned").clone();
         let override_effort = self
@@ -411,30 +458,76 @@ impl CodexProvider {
             .expect("effort lock poisoned")
             .clone();
         let effort = override_effort.as_deref().or(token.effort.as_deref());
-        let mut body = build_body(&model, req, effort);
+        let instructions = self.cache_prefix.instructions(&model, req);
+        let mut body = build_body_with_instructions(&model, req, &instructions, effort);
         metrics::apply_namespace(&mut body, self.cache_namespace.as_deref())?;
         metrics::apply_cache_mode(&mut body, self.cache_mode.as_deref())?;
-        let mut metric = metrics::RequestMetric::from_env(&body)?;
+        let prefix_diagnostics = self.cache_prefix.diagnostics(&model, req);
+        let mut metric = metrics::RequestMetric::from_env(&body, prefix_diagnostics)?;
+        let identity = TurnIdentity {
+            origin: self.base.clone(),
+            account_id: token.account_id.clone(),
+            model,
+            effort: effort.map(str::to_string),
+            cache_key: body["prompt_cache_key"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let sent = match (self.turn_affinity, turn) {
+            (TurnAffinityMode::On, Some(turn)) => turn.take_matching(&identity),
+            _ => None,
+        };
+        if let Some(metric) = metric.as_mut() {
+            metric.defer_dispatch();
+            metric.turn_affinity(self.turn_affinity, turn.is_some(), sent.is_some(), false);
+        }
         let result = async {
-            let resp = self
+            let mut request = self
                 .client
                 .post(format!("{}/responses", self.base))
                 .bearer_auth(&token.access_token)
                 .header("chatgpt-account-id", &token.account_id)
                 .header("accept", "text/event-stream")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    if let Some(metric) = metric.as_mut() {
-                        metric.transport_cause = Some(metrics::transport_cause(&e));
-                    }
-                    ProviderError::Http(e.to_string())
-                })?;
+                .json(&body);
+            if let Some(state) = sent.as_ref() {
+                request = request.header("x-codex-turn-state", state.clone());
+            }
+            // Prepare the body, request and diagnostic file before waiting.
+            // The gate captures one dispatch instant for both pacing and metrics.
+            let dispatch = self.pacing.dispatch().await;
+            if let Some(metric) = metric.as_mut() {
+                metric.start_dispatch(&dispatch);
+                metric.cache_pacing(
+                    self.pacing.mode(),
+                    self.pacing.interval(),
+                    dispatch.wait,
+                    dispatch.offset,
+                );
+            }
+            let resp = request.send().await.map_err(|e| {
+                if let Some(metric) = metric.as_mut() {
+                    metric.transport_cause = Some(metrics::transport_cause(&e));
+                }
+                ProviderError::Http(e.to_string())
+            })?;
 
             let status = resp.status();
             if let Some(metric) = metric.as_mut() {
                 metric.http_status = Some(status.as_u16());
+            }
+            let received = resp
+                .headers()
+                .get("x-codex-turn-state")
+                .filter(|value| !value.as_bytes().is_empty())
+                .cloned();
+            if let Some(metric) = metric.as_mut() {
+                metric.turn_affinity(
+                    self.turn_affinity,
+                    turn.is_some(),
+                    sent.is_some(),
+                    received.is_some(),
+                );
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 // Let the caller decide whether to refresh and retry.
@@ -490,7 +583,15 @@ impl CodexProvider {
                     }
                 }
             }
-            folder.finish()
+            let completed = folder.finish()?;
+            // A header only becomes reusable after the SSE itself confirms a
+            // successful response. It remains opaque and is never logged.
+            if self.turn_affinity == TurnAffinityMode::On
+                && let (Some(turn), Some(state)) = (turn, received)
+            {
+                turn.store_first(identity, state);
+            }
+            Ok(completed)
         }
         .await;
         if let Some(metric) = metric.as_mut() {
@@ -504,16 +605,38 @@ impl CodexProvider {
 impl Provider for CodexProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let token = self.tokens.token().await?;
-        match self.attempt(&token, &req).await {
+        match self.attempt(&token, &req, None).await {
             Err(ProviderError::Auth(_)) => {
                 // Exactly once. Never retry indefinitely.
                 let token = self.tokens.refreshed().await?;
-                self.attempt(&token, &req).await.map_err(|e| match e {
+                self.attempt(&token, &req, None).await.map_err(|e| match e {
                     ProviderError::Auth(_) => ProviderError::Auth(
                         "auth was still refused after refreshing. redo `polaris login`".into(),
                     ),
                     other => other,
                 })
+            }
+            other => other,
+        }
+    }
+
+    async fn complete_in_turn(
+        &self,
+        req: CompletionRequest,
+        turn: &TurnContext,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let token = self.tokens.token().await?;
+        match self.attempt(&token, &req, Some(turn)).await {
+            Err(ProviderError::Auth(_)) => {
+                let token = self.tokens.refreshed().await?;
+                self.attempt(&token, &req, Some(turn))
+                    .await
+                    .map_err(|e| match e {
+                        ProviderError::Auth(_) => ProviderError::Auth(
+                            "auth was still refused after refreshing. redo `polaris login`".into(),
+                        ),
+                        other => other,
+                    })
             }
             other => other,
         }
@@ -541,6 +664,11 @@ mod tests {
             }
         }
         format!("data: {v}\n\n").into_bytes()
+    }
+
+    #[test]
+    fn default_model_is_gpt_6_astra() {
+        assert_eq!(DEFAULT_MODEL, "gpt-6-astra");
     }
 
     fn message_item(text: &str) -> Value {
@@ -1038,6 +1166,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_profile_is_wire_identical_to_the_existing_body() {
+        let req = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message::user("go")],
+            tools: polaris_tools::all_specs(),
+        };
+        let existing = build_body("gpt-6-astra", &req, Some("medium"));
+        let instructions =
+            cache_prefix::CachePrefixProfile::Compact.instructions("gpt-6-astra", &req);
+        let profiled =
+            build_body_with_instructions("gpt-6-astra", &req, &instructions, Some("medium"));
+        assert_eq!(profiled, existing, "compact changed the existing wire body");
+        assert!(profiled.get("cache_prefix").is_none());
+        assert!(profiled.get("cache_prefix_version").is_none());
+    }
+
+    #[test]
+    fn stable_uses_a_distinct_key_that_holds_while_history_grows() {
+        let turn = |n| CompletionRequest {
+            system: "system".into(),
+            messages: std::iter::once(Message::assistant_with_tool_calls(
+                "read first",
+                vec![ToolCall {
+                    id: "call_preserved".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "Cargo.toml"}),
+                }],
+            ))
+            .chain(std::iter::once(Message::tool_result(
+                "call_preserved",
+                "contents",
+            )))
+            .chain((0..n).map(|i| Message::user(format!("turn {i}"))))
+            .collect(),
+            tools: polaris_tools::all_specs(),
+        };
+        let first = turn(1);
+        let appended = turn(2);
+        let compact = build_body("gpt-6-astra", &first, Some("medium"));
+        let stable_first_instructions =
+            cache_prefix::CachePrefixProfile::Stable.instructions("gpt-6-astra", &first);
+        let stable_appended_instructions =
+            cache_prefix::CachePrefixProfile::Stable.instructions("gpt-6-astra", &appended);
+        let stable_first = build_body_with_instructions(
+            "gpt-6-astra",
+            &first,
+            &stable_first_instructions,
+            Some("medium"),
+        );
+        let stable_appended = build_body_with_instructions(
+            "gpt-6-astra",
+            &appended,
+            &stable_appended_instructions,
+            Some("medium"),
+        );
+        assert_ne!(
+            stable_first["prompt_cache_key"],
+            compact["prompt_cache_key"]
+        );
+        assert_eq!(
+            stable_first["prompt_cache_key"], stable_appended["prompt_cache_key"],
+            "appending history moved the stable cache key"
+        );
+        assert_eq!(stable_first["input"], first_body_input(&first));
+        assert_eq!(stable_appended["input"], first_body_input(&appended));
+        assert_eq!(stable_first["input"][1]["call_id"], "call_preserved");
+        assert_eq!(stable_first["tools"], compact["tools"]);
+        for body in [&stable_first, &stable_appended] {
+            assert!(body.get("cache_prefix").is_none());
+            assert!(body.get("cache_prefix_version").is_none());
+            assert!(body.get("cache_prefix_hash").is_none());
+            assert!(body.get("target_applied").is_none());
+        }
+    }
+
+    #[test]
+    fn stable_skips_non_target_models_and_tool_less_requests() {
+        let tools = polaris_tools::all_specs();
+        let target = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message::user("go")],
+            tools: tools.clone(),
+        };
+        let tool_less = CompletionRequest {
+            system: "system".into(),
+            messages: vec![Message::user("go")],
+            tools: vec![],
+        };
+        for (model, req) in [
+            ("gpt-6-astra-preview", &target),
+            ("gpt-6-astra", &tool_less),
+        ] {
+            let instructions = cache_prefix::CachePrefixProfile::Stable.instructions(model, req);
+            let profiled = build_body_with_instructions(model, req, &instructions, Some("medium"));
+            assert_eq!(profiled, build_body(model, req, Some("medium")));
+            assert!(
+                !cache_prefix::CachePrefixProfile::Stable
+                    .diagnostics(model, req)
+                    .target_applied
+            );
+        }
+    }
+
+    fn first_body_input(req: &CompletionRequest) -> Value {
+        Value::Array(input_items(&req.messages))
+    }
+
     /// The point of the key: it must not move as the conversation grows.
     /// A key derived from the messages would change every turn and route
     /// each request to a fresh shard, which is exactly the 0% hit rate
@@ -1224,7 +1460,7 @@ mod tests {
             .mount(&s)
             .await;
 
-        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
+        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new()).expect("client");
         let r = p.complete(req()).await.expect("should succeed");
         assert_eq!(r.text, "ok");
     }
@@ -1244,7 +1480,7 @@ mod tests {
             .mount(&s)
             .await;
 
-        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
+        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new()).expect("client");
         p.set_effort(Some("xhigh"));
         p.complete(req()).await.expect("should succeed");
 
@@ -1277,13 +1513,153 @@ mod tests {
             .await;
 
         let t = Tokens::new();
-        let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone()).expect("client");
         let r = p.complete(req()).await.expect("should succeed on retry");
         assert_eq!(r.text, "succeeded on retry");
         assert_eq!(
             t.refreshes.load(Ordering::SeqCst),
             1,
             "the number of refreshes isn't 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_pacing_preserves_wire_body_and_cancelled_wait_sends_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+                frame("response.output_item.done", message_item("ok")),
+                frame("response.completed", serde_json::json!({})),
+            ])))
+            .mount(&server)
+            .await;
+        let mut off =
+            CodexProvider::new(server.uri(), "gpt-6-astra".into(), Tokens::new()).unwrap();
+        off.pacing = PacingGate::new(PacingMode::Off);
+        off.set_effort(Some("medium"));
+        let mut on = CodexProvider::new(server.uri(), "gpt-6-astra".into(), Tokens::new()).unwrap();
+        on.pacing =
+            PacingGate::with_interval(PacingMode::On, std::time::Duration::from_millis(100));
+        on.set_effort(Some("medium"));
+        off.complete(req()).await.unwrap();
+        on.complete(req()).await.unwrap();
+        // Timeout owns and drops the actual request future, releasing its gate guard.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), on.complete(req()))
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), on.complete(req()))
+            .await
+            .unwrap()
+            .unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 3);
+        assert!(received.windows(2).all(|pair| pair[0].body == pair[1].body));
+        assert!(
+            received
+                .iter()
+                .all(|r| !r.headers.contains_key("x-codex-turn-state"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_pacing_applies_again_to_the_single_auth_retry() {
+        let server = MockServer::start().await;
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = starts.clone();
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(move |request: &wiremock::Request| {
+                observed.lock().unwrap().push(std::time::Instant::now());
+                if request.headers.get("authorization").unwrap() == "Bearer first" {
+                    ResponseTemplate::new(401)
+                } else {
+                    ResponseTemplate::new(200).set_body_string(sse_body(&[
+                        frame("response.output_item.done", message_item("ok")),
+                        frame("response.completed", serde_json::json!({})),
+                    ]))
+                }
+            })
+            .mount(&server)
+            .await;
+        let tokens = Tokens::new();
+        let mut provider = CodexProvider::new(server.uri(), "m".into(), tokens.clone()).unwrap();
+        provider.pacing =
+            PacingGate::with_interval(PacingMode::On, std::time::Duration::from_millis(100));
+        provider.complete(req()).await.unwrap();
+        assert_eq!(tokens.refreshes.load(Ordering::SeqCst), 1);
+        let starts = starts.lock().unwrap();
+        assert_eq!(starts.len(), 2);
+        // Allow local transport scheduling jitter; gate unit tests check the exact boundary.
+        assert!(starts[1].duration_since(starts[0]) >= std::time::Duration::from_millis(80));
+    }
+
+    /// A readonly auth source rejects the refresh step after a 401. The
+    /// provider must return that error directly: a second Responses request
+    /// would reuse credentials that were already refused. The auth crate
+    /// separately verifies that its readonly source makes no token POST or
+    /// credential-store write before returning this error.
+    #[tokio::test]
+    async fn a_401_with_a_rejected_refresh_does_not_repeat_the_model_request() {
+        struct ReadOnlyTokens {
+            refreshes: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::TokenSource for ReadOnlyTokens {
+            async fn token(&self) -> Result<crate::Token, ProviderError> {
+                Ok(crate::Token {
+                    access_token: "first".into(),
+                    account_id: "acct-1".into(),
+                    effort: None,
+                })
+            }
+
+            async fn refreshed(&self) -> Result<crate::Token, ProviderError> {
+                self.refreshes.fetch_add(1, Ordering::SeqCst);
+                Err(ProviderError::Auth(
+                    "authentication refresh is disabled".into(),
+                ))
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .mount(&server)
+            .await;
+
+        let tokens = Arc::new(ReadOnlyTokens {
+            refreshes: AtomicUsize::new(0),
+        });
+        let provider =
+            CodexProvider::new(server.uri(), "m".into(), tokens.clone()).expect("client");
+        let error = provider
+            .complete(req())
+            .await
+            .expect_err("readonly refresh rejection must stop the request");
+
+        assert!(
+            matches!(error, ProviderError::Auth(_)),
+            "not Auth: {error:?}"
+        );
+        assert_eq!(
+            tokens.refreshes.load(Ordering::SeqCst),
+            1,
+            "the provider must ask the auth source exactly once"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("request recording")
+                .len(),
+            1,
+            "a rejected refresh must not repeat the model request"
         );
     }
 
@@ -1299,7 +1675,7 @@ mod tests {
             .await;
 
         let t = Tokens::new();
-        let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone()).expect("client");
         let err = p.complete(req()).await.expect_err("should fail");
         assert!(matches!(err, ProviderError::Auth(_)), "not Auth: {err:?}");
         assert_eq!(
@@ -1327,7 +1703,7 @@ mod tests {
             .await;
 
         let t = Tokens::new();
-        let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone()).expect("client");
 
         let bound = Duration::from_millis(500);
         let outcome = tokio::time::timeout(bound, p.complete(req())).await;
@@ -1368,7 +1744,7 @@ mod tests {
             .await;
 
         let t = Tokens::new();
-        let p = CodexProvider::new(s.uri(), "m".into(), t.clone());
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone()).expect("client");
         let err = p.complete(req()).await.expect_err("should fail");
         assert!(matches!(err, ProviderError::Http(_)), "not Http: {err:?}");
         assert_eq!(
@@ -1393,7 +1769,7 @@ mod tests {
             .mount(&s)
             .await;
 
-        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
+        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new()).expect("client");
         let err = p.complete(req()).await.expect_err("should fail");
         let ProviderError::Http(msg) = err else {
             panic!("not Http: {err:?}");
@@ -1419,7 +1795,7 @@ mod tests {
             .mount(&s)
             .await;
 
-        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new());
+        let p = CodexProvider::new(s.uri(), "m".into(), Tokens::new()).expect("client");
         let err = p.complete(req()).await.expect_err("should fail");
         assert!(
             matches!(err, ProviderError::Decode(_)),
@@ -1446,8 +1822,377 @@ mod tests {
             "http://127.0.0.1:1/unreachable".into(),
             "m".into(),
             Arc::new(NoTokens),
-        );
+        )
+        .expect("client");
         let err = p.complete(req()).await.expect_err("should fail");
         assert!(matches!(err, ProviderError::Auth(_)), "not Auth: {err:?}");
+    }
+
+    fn affinity_provider(base: String, mode: TurnAffinityMode) -> CodexProvider {
+        CodexProvider::with_idle_timeout_and_affinity(
+            base,
+            "m".into(),
+            Tokens::new(),
+            Duration::from_secs(1),
+            mode,
+        )
+        .expect("client")
+    }
+
+    /// A state first observed after `response.completed` stays within its
+    /// context. A fresh context, even on the same shared provider, has none.
+    #[tokio::test]
+    async fn turn_affinity_is_shared_only_within_one_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-codex-turn-state", "opaque-state")
+                    .set_body_string(sse_body(&[frame(
+                        "response.completed",
+                        serde_json::json!({}),
+                    )])),
+            )
+            .mount(&server)
+            .await;
+        let provider = affinity_provider(server.uri(), TurnAffinityMode::On);
+        let turn = TurnContext::new();
+        provider
+            .complete_in_turn(req(), &turn)
+            .await
+            .expect("first response");
+        provider
+            .complete_in_turn(req(), &turn)
+            .await
+            .expect("continuation");
+        provider
+            .complete_in_turn(req(), &TurnContext::new())
+            .await
+            .expect("new turn");
+
+        let requests = server.received_requests().await.expect("recorded");
+        assert!(requests[0].headers.get("x-codex-turn-state").is_none());
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok()),
+            Some("opaque-state")
+        );
+        assert!(requests[2].headers.get("x-codex-turn-state").is_none());
+    }
+
+    /// Absence is ordinary success, but must never manufacture a value for a
+    /// later tool continuation.
+    #[tokio::test]
+    async fn missing_turn_state_is_never_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[frame(
+                "response.completed",
+                serde_json::json!({}),
+            )])))
+            .mount(&server)
+            .await;
+        let provider = affinity_provider(server.uri(), TurnAffinityMode::On);
+        let turn = TurnContext::new();
+        provider
+            .complete_in_turn(req(), &turn)
+            .await
+            .expect("first response");
+        provider
+            .complete_in_turn(req(), &turn)
+            .await
+            .expect("continuation");
+        for request in server.received_requests().await.expect("recorded") {
+            assert!(request.headers.get("x-codex-turn-state").is_none());
+        }
+    }
+
+    /// Header transport is the only on/off difference. The JSON body still
+    /// contains the real six-tool catalog, encrypted reasoning and a tool
+    /// output byte-for-byte unchanged.
+    #[tokio::test]
+    async fn turn_affinity_does_not_change_outbound_body_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-codex-turn-state", "opaque-state")
+                    .set_body_string(sse_body(&[frame(
+                        "response.completed",
+                        serde_json::json!({}),
+                    )])),
+            )
+            .mount(&server)
+            .await;
+        let request = || CompletionRequest {
+            system: "s".into(),
+            messages: vec![
+                Message::assistant("thinking").with_reasoning(vec![ReasoningItem {
+                    id: "reasoning-id".into(),
+                    encrypted_content: "encrypted-reasoning".into(),
+                }]),
+                Message::tool_result("call-1", "tool-output"),
+            ],
+            tools: polaris_tools::all_specs(),
+        };
+        assert_eq!(
+            request().tools.len(),
+            6,
+            "the actual always-on catalog has six tools"
+        );
+        let off_turn = TurnContext::new();
+        let off = affinity_provider(server.uri(), TurnAffinityMode::Off);
+        off.complete_in_turn(request(), &off_turn)
+            .await
+            .expect("off initial response");
+        off.complete_in_turn(request(), &off_turn)
+            .await
+            .expect("off continuation");
+        let on_turn = TurnContext::new();
+        let on = affinity_provider(server.uri(), TurnAffinityMode::On);
+        on.complete_in_turn(request(), &on_turn)
+            .await
+            .expect("on initial response");
+        on.complete_in_turn(request(), &on_turn)
+            .await
+            .expect("on continuation");
+        let requests = server.received_requests().await.expect("recorded");
+        assert!(requests[1].headers.get("x-codex-turn-state").is_none());
+        assert!(requests[3].headers.get("x-codex-turn-state").is_some());
+        assert_eq!(requests[1].body, requests[3].body);
+    }
+
+    fn sequence_responder(
+        responses: Vec<ResponseTemplate>,
+    ) -> impl Fn(&wiremock::Request) -> ResponseTemplate + Send + Sync {
+        let responses = Arc::new(std::sync::Mutex::new(responses));
+        move |_| responses.lock().expect("responses").remove(0)
+    }
+
+    #[tokio::test]
+    async fn concurrent_contexts_keep_distinct_server_states_on_one_provider() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(sequence_responder(vec![
+                ResponseTemplate::new(200)
+                    .insert_header("x-codex-turn-state", "state-a")
+                    .set_body_string(sse_body(&[frame(
+                        "response.completed",
+                        serde_json::json!({}),
+                    )])),
+                ResponseTemplate::new(200)
+                    .insert_header("x-codex-turn-state", "state-b")
+                    .set_body_string(sse_body(&[frame(
+                        "response.completed",
+                        serde_json::json!({}),
+                    )])),
+                ResponseTemplate::new(200).set_body_string(sse_body(&[frame(
+                    "response.completed",
+                    serde_json::json!({}),
+                )])),
+                ResponseTemplate::new(200).set_body_string(sse_body(&[frame(
+                    "response.completed",
+                    serde_json::json!({}),
+                )])),
+            ]))
+            .mount(&server)
+            .await;
+        let provider = Arc::new(affinity_provider(server.uri(), TurnAffinityMode::On));
+        let a = Arc::new(TurnContext::new());
+        let b = Arc::new(TurnContext::new());
+        let (ra, rb) = tokio::join!(
+            provider.complete_in_turn(req(), &a),
+            provider.complete_in_turn(req(), &b)
+        );
+        ra.expect("a initial");
+        rb.expect("b initial");
+        let (ra, rb) = tokio::join!(
+            provider.complete_in_turn(req(), &a),
+            provider.complete_in_turn(req(), &b)
+        );
+        ra.expect("a continuation");
+        rb.expect("b continuation");
+        let requests = server.received_requests().await.expect("recorded");
+        let sent: std::collections::BTreeSet<_> = requests[2..]
+            .iter()
+            .map(|r| {
+                r.headers
+                    .get("x-codex-turn-state")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            ["state-a".to_string(), "state-b".to_string()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cancelled_decode_and_empty_headers_never_replace_state() {
+        let cases = vec![
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", "new")
+                .set_body_string(sse_body(&[frame("response.failed", serde_json::json!({}))])),
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", "new")
+                .set_body_string(sse_body(&[frame(
+                    "response.cancelled",
+                    serde_json::json!({}),
+                )])),
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", "new")
+                .set_body_string("data: not-json\n\n"),
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", "")
+                .set_body_string(sse_body(&[frame(
+                    "response.completed",
+                    serde_json::json!({}),
+                )])),
+        ];
+        for bad in cases {
+            // First-state-wins alone would mask a bug that saves a failed
+            // response's header. Exercise an initially empty context too.
+            let fresh_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(sequence_responder(vec![
+                    bad.clone(),
+                    ResponseTemplate::new(200).set_body_string(sse_body(&[frame(
+                        "response.completed",
+                        serde_json::json!({}),
+                    )])),
+                ]))
+                .mount(&fresh_server)
+                .await;
+            let fresh_provider = affinity_provider(fresh_server.uri(), TurnAffinityMode::On);
+            let fresh_turn = TurnContext::new();
+            let _ = fresh_provider.complete_in_turn(req(), &fresh_turn).await;
+            fresh_provider
+                .complete_in_turn(req(), &fresh_turn)
+                .await
+                .expect("after initial bad response");
+            let fresh_requests = fresh_server.received_requests().await.expect("recorded");
+            assert!(
+                fresh_requests[1]
+                    .headers
+                    .get("x-codex-turn-state")
+                    .is_none()
+            );
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(sequence_responder(vec![
+                    ResponseTemplate::new(200)
+                        .insert_header("x-codex-turn-state", "old")
+                        .set_body_string(sse_body(&[frame(
+                            "response.completed",
+                            serde_json::json!({}),
+                        )])),
+                    bad,
+                    ResponseTemplate::new(200).set_body_string(sse_body(&[frame(
+                        "response.completed",
+                        serde_json::json!({}),
+                    )])),
+                ]))
+                .mount(&server)
+                .await;
+            let provider = affinity_provider(server.uri(), TurnAffinityMode::On);
+            let turn = TurnContext::new();
+            provider
+                .complete_in_turn(req(), &turn)
+                .await
+                .expect("initial");
+            let _ = provider.complete_in_turn(req(), &turn).await;
+            provider
+                .complete_in_turn(req(), &turn)
+                .await
+                .expect("after bad response");
+            let requests = server.received_requests().await.expect("recorded");
+            assert_eq!(
+                requests[2]
+                    .headers
+                    .get("x-codex-turn-state")
+                    .and_then(|v| v.to_str().ok()),
+                Some("old")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_state_only_when_the_account_is_unchanged() {
+        struct RefreshTokens {
+            changed: bool,
+        }
+        #[async_trait::async_trait]
+        impl crate::TokenSource for RefreshTokens {
+            async fn token(&self) -> Result<crate::Token, ProviderError> {
+                Ok(crate::Token {
+                    access_token: "first".into(),
+                    account_id: "a".into(),
+                    effort: None,
+                })
+            }
+            async fn refreshed(&self) -> Result<crate::Token, ProviderError> {
+                Ok(crate::Token {
+                    access_token: "second".into(),
+                    account_id: if self.changed { "b" } else { "a" }.into(),
+                    effort: None,
+                })
+            }
+        }
+        for changed in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(sequence_responder(vec![
+                    ResponseTemplate::new(200)
+                        .insert_header("x-codex-turn-state", "old")
+                        .set_body_string(sse_body(&[frame(
+                            "response.completed",
+                            serde_json::json!({}),
+                        )])),
+                    ResponseTemplate::new(401),
+                    ResponseTemplate::new(200).set_body_string(sse_body(&[frame(
+                        "response.completed",
+                        serde_json::json!({}),
+                    )])),
+                ]))
+                .mount(&server)
+                .await;
+            let provider = CodexProvider::with_idle_timeout_and_affinity(
+                server.uri(),
+                "m".into(),
+                Arc::new(RefreshTokens { changed }),
+                Duration::from_secs(1),
+                TurnAffinityMode::On,
+            )
+            .expect("client");
+            let turn = TurnContext::new();
+            provider
+                .complete_in_turn(req(), &turn)
+                .await
+                .expect("initial");
+            provider
+                .complete_in_turn(req(), &turn)
+                .await
+                .expect("refresh retry");
+            let requests = server.received_requests().await.expect("recorded");
+            assert_eq!(
+                requests[1]
+                    .headers
+                    .get("x-codex-turn-state")
+                    .and_then(|v| v.to_str().ok()),
+                Some("old")
+            );
+            assert_eq!(
+                requests[2].headers.get("x-codex-turn-state").is_some(),
+                !changed
+            );
+        }
     }
 }

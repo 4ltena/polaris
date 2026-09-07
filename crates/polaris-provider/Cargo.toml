@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 polaris-tools = { path = "../polaris-tools" }
+polaris-http = { path = "../polaris-http" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

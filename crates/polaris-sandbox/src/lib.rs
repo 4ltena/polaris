@@ -4,6 +4,7 @@
 //! the policy and the normalized writable roots, and merely hands them off
 //! to platform-specific mechanisms.
 
+mod broker;
 pub mod confine;
 pub mod helper;
 pub mod policy;

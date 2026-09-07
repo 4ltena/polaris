@@ -200,6 +200,27 @@ fn format_tool_result_preview(result: &str) -> Vec<String> {
 /// subagents.
 pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
     match event {
+        AgentEvent::WorkflowResolved {
+            phase,
+            skill_ids,
+            changed_skill_ids,
+            manifest_hash,
+        } => {
+            let selected = if skill_ids.is_empty() {
+                "(none)".to_string()
+            } else {
+                skill_ids.join(", ")
+            };
+            let mut text =
+                format!("workflow phase={phase}; skills={selected}; manifest={manifest_hash}");
+            if !changed_skill_ids.is_empty() {
+                text.push_str(&format!("; changed={}", changed_skill_ids.join(", ")));
+            }
+            vec![HistoryLine::plain(Line::from(Span::styled(
+                sanitize(&text),
+                Style::default().add_modifier(Modifier::DIM),
+            )))]
+        }
         AgentEvent::ToolStarted { name, detail } => {
             let args = format_tool_call_args(detail);
             let preview: String = args.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
@@ -2131,6 +2152,7 @@ mod tests {
                 started_at_millis: now - 42_000,
                 message_count: 3,
                 preview: "what does this repo do?".to_string(),
+                kind: crate::sessions::SessionKind::Legacy,
             }],
         }];
 
@@ -2451,6 +2473,20 @@ mod tests {
         assert!(text.contains("⏺"));
         assert!(text.contains("bash"));
         assert!(text.contains("ls"));
+    }
+
+    #[test]
+    fn workflow_resolution_reports_phase_skills_manifest_and_changed_skills() {
+        let text = live_print_text(&AgentEvent::WorkflowResolved {
+            phase: "implement".into(),
+            skill_ids: vec!["build".into(), "test".into()],
+            changed_skill_ids: vec!["test".into()],
+            manifest_hash: "abc123".into(),
+        });
+        assert!(text.contains("phase=implement"));
+        assert!(text.contains("skills=build, test"));
+        assert!(text.contains("manifest=abc123"));
+        assert!(text.contains("changed=test"));
     }
 
     #[test]

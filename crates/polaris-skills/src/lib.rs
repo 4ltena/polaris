@@ -3,6 +3,7 @@
 pub mod agent_type;
 pub mod discovery;
 pub mod frontmatter;
+pub mod workflow_profile;
 
 use std::path::PathBuf;
 

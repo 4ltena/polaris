@@ -1,11 +1,13 @@
 //! Provider abstraction. Transport-dependent parts live in each
 //! implementation; only the shape of requests and responses lives here.
 
+pub mod attempts;
 pub mod cache_pacing;
 pub mod codex;
 pub mod openai;
 pub mod sse;
 pub mod turn_affinity;
+pub mod web_search;
 
 use polaris_tools::ToolSpec;
 use serde::{Deserialize, Serialize};
@@ -46,6 +48,14 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning: Vec<ReasoningItem>,
+    /// Hosted provider items are preserved for display and session storage;
+    /// they are never replayed as local function calls.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_web_search: Vec<web_search::HostedWebSearchItem>,
+    /// URL citations remain attached to their provider text parts. Consumers
+    /// must not reuse offsets after rewriting the text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_citations: Vec<web_search::UrlCitation>,
 }
 
 impl Message {
@@ -56,6 +66,8 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning: Vec::new(),
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
         }
     }
 
@@ -66,6 +78,8 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning: Vec::new(),
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
         }
     }
 
@@ -83,6 +97,8 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             reasoning: Vec::new(),
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
         }
     }
 
@@ -94,6 +110,8 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             reasoning: Vec::new(),
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
         }
     }
 
@@ -102,6 +120,18 @@ impl Message {
     /// providers that don't carry the concept.
     pub fn with_reasoning(mut self, reasoning: Vec<ReasoningItem>) -> Self {
         self.reasoning = reasoning;
+        self
+    }
+
+    /// Attaches hosted Web output without changing the function-tool history
+    /// or the disabled provider wire.
+    pub fn with_hosted_web_search(
+        mut self,
+        hosted_web_search: Vec<web_search::HostedWebSearchItem>,
+        url_citations: Vec<web_search::UrlCitation>,
+    ) -> Self {
+        self.hosted_web_search = hosted_web_search;
+        self.url_citations = url_citations;
         self
     }
 }
@@ -323,6 +353,66 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
     pub reasoning: Vec<ReasoningItem>,
     pub usage: Option<Usage>,
+    pub hosted_web_search: Vec<web_search::HostedWebSearchItem>,
+    pub url_citations: Vec<web_search::UrlCitation>,
+}
+
+impl CompletionResponse {
+    /// Returns the model text followed by a safe, end-of-message source list.
+    /// Citation offsets are deliberately ignored: the list remains valid even
+    /// after a caller changes the text, and only parsed HTTP(S) URLs appear.
+    pub fn display_text(&self) -> String {
+        let mut sources: Vec<(String, String)> = Vec::new();
+        for citation in &self.url_citations {
+            let label = citation.title.as_deref().unwrap_or(&citation.url);
+            push_display_source(&mut sources, label, &citation.url);
+        }
+        for item in &self.hosted_web_search {
+            for source in &item.sources {
+                push_display_source(&mut sources, &source.url, &source.url);
+            }
+        }
+        if sources.is_empty() {
+            return self.text.clone();
+        }
+
+        let mut display = self.text.clone();
+        if !display.is_empty() {
+            display.push_str("\n\n");
+        }
+        display.push_str("Sources:\n");
+        for (index, (label, url)) in sources.into_iter().enumerate() {
+            display.push_str(&format!(
+                "{}- [{}](<{}>)\n",
+                index + 1,
+                escape_markdown_label(&label),
+                url,
+            ));
+        }
+        display.pop();
+        display
+    }
+}
+
+fn push_display_source(sources: &mut Vec<(String, String)>, label: &str, raw_url: &str) {
+    let Ok(url) = reqwest::Url::parse(raw_url) else {
+        return;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
+    let url = url.to_string();
+    if !sources.iter().any(|(_, existing)| existing == &url) {
+        sources.push((label.to_string(), url));
+    }
+}
+
+fn escape_markdown_label(label: &str) -> String {
+    label
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace(['\r', '\n'], " ")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -333,6 +423,10 @@ pub enum ProviderError {
     Decode(String),
     #[error("auth: {0}")]
     Auth(String),
+    #[error("request budget: {0}")]
+    Budget(String),
+    #[error("unsupported provider capability: {0}")]
+    Unsupported(String),
 }
 
 #[async_trait::async_trait]
@@ -627,6 +721,7 @@ mod tests {
                 }],
                 reasoning: Vec::new(),
                 usage: None,
+                ..CompletionResponse::default()
             },
         });
         let res = p
@@ -734,6 +829,39 @@ mod tests {
         assert!(
             json.get("reasoning").is_none(),
             "empty reasoning should be omitted, not serialized as []"
+        );
+    }
+
+    #[test]
+    fn display_text_uses_only_safe_urls_and_never_uses_citation_offsets() {
+        let response = CompletionResponse {
+            text: "Answer".into(),
+            url_citations: vec![web_search::UrlCitation {
+                url: "https://example.test/a".into(),
+                title: Some("[A]\\label".into()),
+                start_index: Some(99),
+                end_index: Some(1),
+            }],
+            hosted_web_search: vec![web_search::HostedWebSearchItem {
+                output_index: 1,
+                id: "ws_1".into(),
+                status: web_search::HostedItemStatus::Completed,
+                action: web_search::WebSearchAction::Search { queries: vec![] },
+                sources: vec![
+                    web_search::WebSource {
+                        url: "https://example.test/a".into(),
+                    },
+                    web_search::WebSource {
+                        url: "javascript:alert(1)".into(),
+                    },
+                ],
+            }],
+            ..CompletionResponse::default()
+        };
+
+        assert_eq!(
+            response.display_text(),
+            "Answer\n\nSources:\n1- [\\[A\\]\\\\label](<https://example.test/a>)"
         );
     }
 }

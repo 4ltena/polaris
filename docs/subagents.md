@@ -21,6 +21,8 @@
 | `[spawn] concurrency` | `8` | 1波で同時に実行するタスク数の上限。 |
 | `[spawn] write_concurrency` | `4` | `write_root`を持つタスクの同時実行上限。 |
 
+workflowが有効な親は、必須skill設定と段階を子へ渡す。子の段階は型のmetadataに`polaris-phase: review`などの指定があればそれを使い、なければ親の現在段階を引き継ぐ。親の承認、完了、検証の証跡は引き継がず、子の新しい作業に対する許可や完了根拠にはならない。
+
 ```toml
 [agents]
 paths = ["/path/to/shared/agents"]

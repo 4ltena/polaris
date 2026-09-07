@@ -41,6 +41,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "show provider, model, and token usage",
     },
     SlashCommand {
+        name: "phase",
+        description: "show or set the explicit workflow phase",
+    },
+    SlashCommand {
         name: "skills",
         description: "browse the skills polaris discovered in this project",
     },
@@ -120,6 +124,9 @@ pub fn matching(prefix: &str) -> Vec<&'static SlashCommand> {
 pub enum Action {
     Help,
     Status,
+    /// Empty means display the current phase. A nonempty value is checked by
+    /// the session so unknown names are rejected rather than coerced.
+    Phase(String),
     /// Same interception story as `New`/`Resume` below — the caller
     /// shows a full-screen, browse-only picker over the discovered
     /// skills (needs the terminal, which `apply_slash_action` doesn't
@@ -204,6 +211,7 @@ pub fn parse(line: &str) -> Option<Action> {
     Some(match name.as_str() {
         "" | "help" => Action::Help,
         "status" => Action::Status,
+        "phase" => Action::Phase(extra),
         "skills" => Action::Skills,
         "new" => Action::New,
         "resume" => Action::Resume,
@@ -259,6 +267,7 @@ mod tests {
     fn known_commands_parse_to_their_action() {
         assert!(matches!(parse("/help"), Some(Action::Help)));
         assert!(matches!(parse("/status"), Some(Action::Status)));
+        assert!(matches!(parse("/phase"), Some(Action::Phase(value)) if value.is_empty()));
         assert!(matches!(parse("/skills"), Some(Action::Skills)));
         assert!(matches!(parse("/new"), Some(Action::New)));
         assert!(matches!(parse("/resume"), Some(Action::Resume)));
@@ -349,6 +358,18 @@ mod tests {
         assert!(matches!(parse("/compact"), Some(Action::Compact)));
         assert!(matches!(action_for("compact"), Action::Compact));
         assert!(COMMANDS.iter().any(|c| c.name == "compact"));
+    }
+
+    #[test]
+    fn phase_carries_the_requested_name_for_session_validation() {
+        assert!(matches!(
+            parse("/phase implement"),
+            Some(Action::Phase(value)) if value == "implement"
+        ));
+        assert!(matches!(
+            parse("/phase impossible"),
+            Some(Action::Phase(value)) if value == "impossible"
+        ));
     }
 
     #[test]

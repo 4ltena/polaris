@@ -45,6 +45,9 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-cli/examples`
 
 - `cache_quality.rs` — Offline-testable driver for the cache-affinity quality matrix.
+- `preimplementation_eval.rs` — One approved two-turn pre-implementation evaluation trial.
+- `sadalmelik_pilot.rs` — Two-send live canary using production Session, workflow and Codex transport.
+- `sadalmelik_quality.rs` — Offline run-loop fixture driver.  Live Codex is deliberately blocked.
 
 ## `crates/polaris-cli/src`
 
@@ -71,6 +74,8 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `compaction.rs` — Automatic history summarization. Fires when the conversation's measured
 - `config.rs` — Loads config files. Not existing is normal; being malformed is not.
 - `constitution.rs` — The part of the always-on context that the harness does not own. The
+- `conversation_memory.rs` — Publication boundary between the raw session marker and conversation indexes.
+- `conversation_state.rs` — Versioned session storage, separate from the legacy Message-only JSONL reader.
 - `dir_watch.rs` — `bash`/`write`/`edit` 呼び出しの前後でファイルシステムを比較し、新規
 - `events.rs` — ターン実行中にツール呼び出し・subagent活動をTUIへリアルタイム通知する
 - `files_md.rs` — `dir_watch` が検出した変更を、実際に `files.md` を書く subagent の
@@ -78,10 +83,17 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `lib.rs` — Entry point for polaris-core. Ties together the budget, constitution, and prompt modules.
 - `project.rs` — Resolves the project root.
 - `prompt.rs` — The single place that assembles the set of things loaded every turn.
-- `session.rs` — Message history. In M1, this is append-only — no compaction, no
+- `session.rs` — In-memory request history with optional durable v2 storage.
+- `session_store.rs` — Durable session attachment, generation checks, and tombstone-serialized writes.
 - `spawn.rs` — The `spawn` tool's implementation. Type discovery reuses
 - `stop.rs` — Stop conditions. No automatic recovery is attempted. Continuing to spin
+- `strict_provider.rs` — Dedicated summary-provider adapter and installation of the fixed local helper.
 - `tool_memory.rs` — Opt-in recoverable tool-result retention; original output lives outside history.
+- `workflow.rs` — Explicit workflow focus, independent of tool permissions and completion evidence.
+
+## `crates/polaris-core/src/conversation_memory`
+
+- `strict_history.rs` — Strict ten-turn preparation over the shared v2 session store.
 
 ## `crates/polaris-core/src/secret_screen`
 
@@ -109,10 +121,12 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-memory/src`
 
+- `conversation.rs` — Pending, scope-bound summaries for strict conversation history.
 - `lib.rs` — Local, explicitly populated memory. Retrieved text is quoted historical evidence,
 
 ## `crates/polaris-memory/tests`
 
+- `conversation.rs` — Conversation index scope, publication, provenance, and forgetting contracts.
 - `memory.rs` — Persistence, isolation, retrieval budgets and explicit embedding behavior.
 
 ## `crates/polaris-provider`
@@ -121,6 +135,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-provider/src`
 
+- `attempts.rs` — Physical provider attempts, durable reservations and conservative settlement.
 - `cache_pacing.rs` — Optional per-provider spacing of model request dispatches.
 - `cache_prefix.rs` — Fixed, opt-in instructions for the cache-prefix cost experiment.
 - `codex.rs` — A provider that speaks the Responses API using ChatGPT subscription
@@ -129,6 +144,11 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `openai.rs` — OpenAI-compatible chat completions. Swap out `base_url` and you can hit
 - `sse.rs` — Incrementally decodes SSE (text/event-stream). Pushing a byte chunk
 - `turn_affinity.rs` — Opaque transport continuity scoped to one logical user turn.
+- `web_search.rs` — Hosted web-search request policy and Responses-style output parsing.
+
+## `crates/polaris-provider/tests`
+
+- `web_search.rs` — Hosted Web request boundaries and anonymous response fixtures.
 
 ## `crates/polaris-sandbox`
 
@@ -149,12 +169,45 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `Cargo.toml` — manifest for the polaris-skills crate
 
+## `crates/polaris-skills/resources/workflow/brainstorm`
+
+- `SKILL.md` — SKILL.md
+
+## `crates/polaris-skills/resources/workflow/deliver`
+
+- `SKILL.md` — SKILL.md
+
+## `crates/polaris-skills/resources/workflow/implement`
+
+- `SKILL.md` — SKILL.md
+
+## `crates/polaris-skills/resources/workflow/review`
+
+- `SKILL.md` — SKILL.md
+
+## `crates/polaris-skills/resources/workflow/specify`
+
+- `SKILL.md` — SKILL.md
+
+## `crates/polaris-skills/resources/workflow/verify`
+
+- `SKILL.md` — SKILL.md
+
+## `crates/polaris-skills/resources/workflow/workflow-core`
+
+- `SKILL.md` — SKILL.md
+
 ## `crates/polaris-skills/src`
 
 - `agent_type.rs` — subagent 型の定義（`agents/<type>/SKILL.md`）の解析と discovery。
 - `discovery.rs` — Skill discovery. A single corrupt skill must not take down the whole
 - `frontmatter.rs` — SKILL.md frontmatter parsing. Validates only the constraints the specification lays down; adds no constraints of its own.
 - `lib.rs` — Loading of skills that conform to the Agent Skills specification. Adds no frontmatter fields of its own.
+- `workflow_profile.rs` — Deterministic resolution of the optional shipped workflow skill profile.
+
+## `crates/polaris-skills/tests`
+
+- `workflow_profile.rs` — Mandatory workflow skill resolution, source identity, and token budgets.
 
 ## `crates/polaris-tools`
 
@@ -199,12 +252,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `docs`
 
+- `codex-update-efficiency.md` — Codex更新と使用量削減策の適用
 - `context-efficiency.md` — コンテキストの効率化とローカル記憶
 - `filemap.md` — File map
 - `gpt6-cache-affinity-results.md` — 本文量を維持したキャッシュ再利用と品質検証
 - `gpt6-cache-cost-results.md` — GPT-6のキャッシュ率と費用の比較
 - `gpt6-cache-pacing-results.md` — 要求間隔とキャッシュ再利用の検証
 - `gpt6-efficiency-results.md` — GPT-6 medium 効率化の初回実測
+- `preimplementation-evaluation.md` — 実装前段階の評価計画
+- `sadalmelik-validation.md` — v0.11.0の検証状況
 - `skill-scaling-benchmark.md` — skill/pluginを大量に含めた比較
 - `subagents.md` — subagent
 - `testing.md` — テスト

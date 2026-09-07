@@ -287,6 +287,8 @@ mod tests {
             _: CompletionRequest,
         ) -> Result<polaris_provider::CompletionResponse, ProviderError> {
             Ok(polaris_provider::CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: self.0.into(),
                 usage: Some(polaris_provider::Usage {
                     input_tokens: 100,
@@ -381,6 +383,8 @@ mod tests {
                 req: CompletionRequest,
             ) -> Result<polaris_provider::CompletionResponse, ProviderError> {
                 Ok(polaris_provider::CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: req
                         .messages
                         .iter()
@@ -650,6 +654,8 @@ mod tests {
             assert_eq!(req.system, COMPACTION_SYSTEM_PROMPT);
             assert!(req.tools.is_empty(), "summarization must not offer tools");
             Ok(polaris_provider::CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: "the user asked X, we did Y".to_string(),
                 ..Default::default()
             })
@@ -757,6 +763,8 @@ mod tests {
             _req: CompletionRequest,
         ) -> Result<polaris_provider::CompletionResponse, ProviderError> {
             Ok(polaris_provider::CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: "   \n  ".to_string(),
                 ..Default::default()
             })

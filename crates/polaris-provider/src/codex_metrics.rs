@@ -370,6 +370,8 @@ impl RequestMetric {
             Err(ProviderError::Auth(_)) => "auth_error",
             Err(ProviderError::Http(_)) => "http_error",
             Err(ProviderError::Decode(_)) => "decode_error",
+            Err(ProviderError::Budget(_)) => "budget_error",
+            Err(ProviderError::Unsupported(_)) => "unsupported_error",
         };
     }
 
@@ -733,6 +735,7 @@ mod tests {
                     tool_calls: vec![],
                     reasoning: vec![],
                     usage: None,
+                    ..CompletionResponse::default()
                 }));
             }
         }

@@ -1,11 +1,19 @@
-# Polaris
+# polaris
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/polaris-banner-white.svg">
-  <img src="docs/assets/polaris-banner-ink.svg" alt="Polaris — アスタリスクとワードマーク" width="800" height="200">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/polaris-banner-white.svg">
+    <img src="docs/assets/polaris-banner-ink.svg" alt="Polaris — アスタリスクとワードマーク" width="800" height="200">
+  </picture>
+</p>
 
-**v0.10.0 “Algedi”** · [変更履歴](CHANGELOG.md)
+<p align="center">
+  <strong>v0.10.0 “Algedi”</strong> · <a href="CHANGELOG.md">変更履歴</a>
+</p>
+
+<p align="center">
+  <strong>日本語</strong> · <a href="README.en.md" lang="en">English</a>
+</p>
 
 Polarisは、常時送信する指示とツール定義を小さく保ち、必要な資料だけを検索・再取得するRust製のCLI/TUIエージェントである。会話の圧縮、圧縮前履歴のローカル保存、大きなツール結果の退避と再取得に対応する。
 

@@ -1267,6 +1267,7 @@ pub fn render_resume_picker(
 /// `CompletionRequest` doesn't carry at all). `pub` so `lib.rs`'s
 /// `run_model_picker` can navigate it without duplicating the list.
 pub const MODEL_CATALOG: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -1350,10 +1351,8 @@ pub const EFFORT_CATALOG: &[(&str, &str)] = &[
     ),
 ];
 
-/// `EFFORT_CATALOG`'s first entry is always the default, the same way
-/// codex marks `Low` `(default)` regardless of which row is currently
-/// active.
-pub const DEFAULT_EFFORT: &str = EFFORT_CATALOG[0].0;
+/// Match the CLI default; the current selection may override it.
+pub const DEFAULT_EFFORT: &str = "medium";
 
 /// Maps a picker-level effort name to the literal token actually sent
 /// over the wire. Real reasoning-effort APIs only accept a handful of
@@ -2219,7 +2218,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert!(rows.iter().any(|r| r.contains("low (default)")));
+        assert!(rows.iter().any(|r| r.contains("medium (default)")));
         assert!(rows.iter().any(|r| r.contains("high (current)")));
         // Neither row is both at once here, so the combined suffix must
         // not appear.
@@ -2231,7 +2230,7 @@ mod tests {
         let backend = TestBackend::new(100, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_effort_picker(f, "gpt-5.6-sol", "low", 0))
+            .draw(|f| render_effort_picker(f, "gpt-6-astra", "medium", 1))
             .expect("draw");
 
         let content = terminal
@@ -2241,7 +2240,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("low (default, current)"));
+        assert!(content.contains("medium (default, current)"));
     }
 
     #[test]

@@ -31,6 +31,12 @@ pub enum TaskOutcome {
     Failed(String),
 }
 
+#[derive(Clone)]
+pub struct ChildWorkflow {
+    pub workflow: crate::workflow::SessionWorkflow,
+    pub skills: Vec<polaris_skills::Skill>,
+}
+
 /// Runs one task against its resolved type definition. When the type
 /// cannot be found, the error carries the same candidate list
 /// `polaris_tools::skill::lookup` produces — the failure response follows
@@ -44,6 +50,30 @@ pub async fn run_one(
     helper: &Path,
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
 ) -> TaskOutcome {
+    run_one_scoped(
+        task,
+        agent_types,
+        provider,
+        audit,
+        base_sandbox,
+        helper,
+        events,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_one_scoped(
+    task: &SpawnTask,
+    agent_types: &[AgentType],
+    provider: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    base_sandbox: &SandboxPolicy,
+    helper: &Path,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    workflow: Option<&ChildWorkflow>,
+) -> TaskOutcome {
     if let Some(tx) = &events {
         let _ = tx.send(crate::events::AgentEvent::SpawnStarted {
             agent_type: task.agent_type.clone(),
@@ -51,7 +81,22 @@ pub async fn run_one(
         });
     }
 
-    let outcome = run_one_inner(task, agent_types, provider, audit, base_sandbox, helper).await;
+    let outcome = polaris_provider::attempts::in_scope(
+        polaris_provider::attempts::AttemptContext {
+            parent_id: Some(format!("spawn:{}", task.agent_type)),
+            kind: polaris_provider::attempts::AttemptKind::Child,
+        },
+        run_one_inner(
+            task,
+            agent_types,
+            provider,
+            audit,
+            base_sandbox,
+            helper,
+            workflow,
+        ),
+    )
+    .await;
 
     if let Some(tx) = &events {
         let _ = tx.send(crate::events::AgentEvent::SpawnFinished {
@@ -76,6 +121,7 @@ async fn run_one_inner(
     audit: Arc<Mutex<AuditLog>>,
     base_sandbox: &SandboxPolicy,
     helper: &Path,
+    workflow: Option<&ChildWorkflow>,
 ) -> TaskOutcome {
     let Some(agent) = agent_types.iter().find(|a| a.name == task.agent_type) else {
         let candidates = polaris_tools::skill::lookup(agent_types, &task.agent_type);
@@ -102,6 +148,20 @@ async fn run_one_inner(
     };
 
     let mut session = Session::new();
+    if let Some(inherited) = workflow {
+        // A child receives required skills and focus, but no parent grants or
+        // completed verification evidence for its new task.
+        let mut config = inherited.workflow.config.clone();
+        config.initial_phase = match agent.workflow_phase.as_deref() {
+            Some(phase) => match phase.parse() {
+                Ok(phase) => phase,
+                Err(error) => return TaskOutcome::Failed(error),
+            },
+            None => inherited.workflow.state().phase,
+        };
+        session.workflow = Some(crate::workflow::SessionWorkflow::new(config));
+    }
+    let skills = workflow.map_or(&[][..], |context| context.skills.as_slice());
     session.push_user(&task.task);
     let mut stop = StopTracker::with_wall_seconds(agent.max_turns, agent.wall_seconds);
     let mut gate = Gate::new(ApprovalPolicy::Never);
@@ -120,7 +180,7 @@ async fn run_one_inner(
         &mut stop,
         &agent.body,
         &tools,
-        &[],
+        skills,
         // A subagent can never spawn (depth is fixed at 1), so there is
         // no type catalog to resolve against, and its own provider /
         // audit handles are simply the ones it was given.
@@ -180,7 +240,7 @@ async fn run_one_inner(
                     &mut stop,
                     &agent.body,
                     &tools,
-                    &[],
+                    skills,
                     &[],
                     provider.clone(),
                     DEFAULT_CONCURRENCY,
@@ -334,6 +394,34 @@ pub async fn run_wave(
     write_concurrency: usize,
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
 ) -> String {
+    run_wave_scoped(
+        tasks,
+        agent_types,
+        provider,
+        audit,
+        base_sandbox,
+        helper,
+        concurrency,
+        write_concurrency,
+        events,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_wave_scoped(
+    tasks: Vec<SpawnTask>,
+    agent_types: &[AgentType],
+    provider: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    base_sandbox: &SandboxPolicy,
+    helper: &Path,
+    concurrency: usize,
+    write_concurrency: usize,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    workflow: Option<ChildWorkflow>,
+) -> String {
     if let Err(msg) = check_no_write_root_overlap(&tasks) {
         let entries: Vec<serde_json::Value> = tasks
             .iter()
@@ -358,6 +446,7 @@ pub async fn run_wave(
         let total_permits = &total_permits;
         let write_permits = &write_permits;
         let needs_write = task.write_root.is_some();
+        let workflow = workflow.as_ref();
         async move {
             // Held across `run_one`'s whole `.await` — that is the point:
             // the permit bounds how many tasks are *running* at once, not
@@ -368,7 +457,7 @@ pub async fn run_wave(
             } else {
                 None
             };
-            let outcome = run_one(
+            let outcome = run_one_scoped(
                 task,
                 agent_types,
                 provider,
@@ -376,6 +465,7 @@ pub async fn run_wave(
                 base_sandbox,
                 helper,
                 events,
+                workflow,
             )
             .await;
             // A successful result has already been parsed as JSON by
@@ -474,6 +564,8 @@ mod tests {
 
     fn text(s: &str) -> CompletionResponse {
         CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: s.to_string(),
             tool_calls: vec![],
             ..Default::default()
@@ -482,6 +574,8 @@ mod tests {
 
     fn read_call(path: &Path) -> CompletionResponse {
         CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
@@ -782,6 +876,8 @@ mod tests {
                     .expect("lock")
                     .push(req.tools.iter().map(|t| t.name.to_string()).collect());
                 Ok(CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: r#"{"path":"a.rs","responsibility":"x"}"#.into(),
                     tool_calls: vec![],
                     ..Default::default()

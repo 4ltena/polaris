@@ -15,12 +15,13 @@ use polaris_skills::AgentType;
 
 use crate::audit::{AuditLog, Record};
 use crate::dir_watch::DirChanges;
-use crate::spawn::{SpawnTask, TaskOutcome, run_one};
+use crate::spawn::{ChildWorkflow, SpawnTask, TaskOutcome, run_one_scoped};
 
 const FILES_MD_AGENT_TYPE: &str = "files-md-writer";
 const FILES_MD_FILENAME: &str = "files.md";
 const MAX_REGENERATION_TARGETS: usize = 32;
 
+#[cfg(test)]
 pub(crate) async fn regenerate_for_changes(
     changes: &DirChanges,
     agent_types: &[AgentType],
@@ -28,6 +29,27 @@ pub(crate) async fn regenerate_for_changes(
     audit: Arc<Mutex<AuditLog>>,
     base_sandbox: &SandboxPolicy,
     helper: &Path,
+) {
+    regenerate_for_changes_scoped(
+        changes,
+        agent_types,
+        provider,
+        audit,
+        base_sandbox,
+        helper,
+        None,
+    )
+    .await;
+}
+
+pub(crate) async fn regenerate_for_changes_scoped(
+    changes: &DirChanges,
+    agent_types: &[AgentType],
+    provider: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    base_sandbox: &SandboxPolicy,
+    helper: &Path,
+    workflow: Option<ChildWorkflow>,
 ) {
     if agent_types.iter().all(|a| a.name != FILES_MD_AGENT_TYPE) {
         return;
@@ -53,6 +75,7 @@ pub(crate) async fn regenerate_for_changes(
             audit.clone(),
             base_sandbox,
             helper,
+            workflow.as_ref(),
         )
         .await;
     }
@@ -110,13 +133,14 @@ async fn regenerate_one(
     audit: Arc<Mutex<AuditLog>>,
     base_sandbox: &SandboxPolicy,
     helper: &Path,
+    workflow: Option<&ChildWorkflow>,
 ) {
     let task = SpawnTask {
         agent_type: FILES_MD_AGENT_TYPE.to_string(),
         task: dir.display().to_string(),
         write_root: Some(dir.display().to_string()),
     };
-    let outcome = run_one(
+    let outcome = run_one_scoped(
         &task,
         agent_types,
         provider,
@@ -124,6 +148,7 @@ async fn regenerate_one(
         base_sandbox,
         helper,
         None,
+        workflow,
     )
     .await;
     if let TaskOutcome::Failed(msg) = outcome {

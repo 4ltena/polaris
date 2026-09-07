@@ -324,6 +324,8 @@ mod tests {
                             .contains("late evidence")
                     );
                     Ok(CompletionResponse {
+                        hosted_web_search: Vec::new(),
+                        url_citations: Vec::new(),
                         tool_calls: vec![ToolCall {
                             id: "restore".into(),
                             name: "read".into(),
@@ -335,6 +337,8 @@ mod tests {
                     assert_eq!(step, 1);
                     assert_eq!(request.messages.last().unwrap().content, "late evidence");
                     Ok(CompletionResponse {
+                        hosted_web_search: Vec::new(),
+                        url_citations: Vec::new(),
                         text: "verified".into(),
                         ..CompletionResponse::default()
                     })

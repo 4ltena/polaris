@@ -14,6 +14,7 @@ use polaris_core::{
     constitution, prompt,
     session::Session,
     stop::StopTracker,
+    workflow::Phase,
 };
 use polaris_provider::openai::OpenAiProvider;
 use polaris_sandbox::{SandboxMode, SandboxPolicy};
@@ -80,6 +81,26 @@ struct Args {
     #[arg(long, value_parser = clap::value_parser!(u32).range(1000..))]
     compact_at: Option<u32>,
 
+    /// Hosted Web検索。接続先の上限契約が確認できるまでcached/liveは拒否する。
+    #[arg(long, value_enum, default_value_t = WebSearchArg::Disabled)]
+    web_search: WebSearchArg,
+
+    /// workflowを有効にしたセッションの作業段階。
+    #[arg(long, value_enum)]
+    phase: Option<PhaseArg>,
+
+    /// 履歴の保存方式。strict10は固定したローカル埋め込み設定を必要とする。
+    #[arg(long, value_enum)]
+    history_mode: Option<HistoryModeArg>,
+
+    /// 保存済みv2セッションを再開する。旧JSONLは新しいv2 UUIDへ一度だけ取り込む。
+    #[arg(long, conflicts_with = "fork")]
+    resume: Option<String>,
+
+    /// 指定v2セッションを新しいUUIDへ分岐して実行する。
+    #[arg(long, conflicts_with = "resume")]
+    fork: Option<String>,
+
     /// Run as a confined child that reads one mutation operation from stdin
     /// and executes it. Internal use only; not meant to be invoked directly
     /// by users.
@@ -103,6 +124,53 @@ enum ToolMemoryArg {
     Off,
     History,
     Retrieval,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum WebSearchArg {
+    Disabled,
+    Cached,
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PhaseArg {
+    General,
+    Brainstorm,
+    Specify,
+    Implement,
+    Review,
+    Verify,
+    Deliver,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum HistoryModeArg {
+    Legacy,
+    Strict10,
+}
+
+impl From<HistoryModeArg> for polaris_core::conversation_state::HistoryMode {
+    fn from(value: HistoryModeArg) -> Self {
+        match value {
+            HistoryModeArg::Legacy => Self::Legacy,
+            HistoryModeArg::Strict10 => Self::Strict10,
+        }
+    }
+}
+
+impl From<PhaseArg> for Phase {
+    fn from(value: PhaseArg) -> Self {
+        match value {
+            PhaseArg::General => Self::General,
+            PhaseArg::Brainstorm => Self::Brainstorm,
+            PhaseArg::Specify => Self::Specify,
+            PhaseArg::Implement => Self::Implement,
+            PhaseArg::Review => Self::Review,
+            PhaseArg::Verify => Self::Verify,
+            PhaseArg::Deliver => Self::Deliver,
+        }
+    }
 }
 
 impl ToolMemoryArg {
@@ -269,6 +337,115 @@ fn selected_model(explicit: Option<String>, environment: Option<String>) -> Stri
         .unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string())
 }
 
+fn restore_continuation_workflow(
+    resume: Option<&str>,
+    fork: Option<&str>,
+    session: &mut Session,
+    saved: &polaris_core::session_store::PersistedSession,
+    config: &polaris_core::workflow::WorkflowConfig,
+) -> Result<(), String> {
+    if resume.is_none() && fork.is_none() {
+        return Ok(());
+    }
+    if config.enabled {
+        session.workflow = Some(
+            saved
+                .restore_workflow(config.clone())
+                .map_err(|error| format!("ワークフロー状態を復元できません: {error}"))?,
+        );
+    } else {
+        let state = saved
+            .snapshot()
+            .map_err(|error| format!("保存済みワークフローを確認できません: {error}"))?
+            .state;
+        if state.workflow.revision != 0
+            || state.workflow.phase != polaris_core::workflow::Phase::General
+            || !state.workflow.skills.is_empty()
+        {
+            return Err(
+                "保存済みワークフローを維持するには設定で [workflow].enabled = true が必要です"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn strict_history(
+    config: &polaris_core::config::EmbeddingConfig,
+    provider_name: &str,
+    private_root: &Path,
+    attempt_ledger: polaris_provider::attempts::AttemptLedger,
+    parent_id: &str,
+) -> Result<
+    (
+        std::sync::Arc<polaris_core::conversation_memory::StrictHistory>,
+        polaris_provider::UsageMeter,
+    ),
+    String,
+> {
+    let provider: std::sync::Arc<dyn polaris_provider::Provider> = match provider_name {
+        "openai" => {
+            let base = std::env::var("POLARIS_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+            let key = std::env::var("POLARIS_API_KEY")
+                .ok()
+                .or_else(|| {
+                    polaris_auth::api_key::default_path()
+                        .ok()
+                        .and_then(|path| polaris_auth::api_key::load_from(&path).ok().flatten())
+                })
+                .ok_or("POLARIS_API_KEY is not set")?;
+            std::sync::Arc::new(
+                OpenAiProvider::new(base, key, "gpt-6-astra".into())
+                    .map_err(|e| e.to_string())?
+                    .with_attempt_ledger(attempt_ledger.scoped(
+                        polaris_provider::attempts::AttemptContext {
+                            parent_id: Some(parent_id.to_string()),
+                            kind: polaris_provider::attempts::AttemptKind::Summary,
+                        },
+                    )),
+            )
+        }
+        "codex" => {
+            let store = polaris_auth::store::default_path().map_err(|e| e.to_string())?;
+            std::sync::Arc::new(
+                polaris_provider::codex::CodexProvider::new(
+                    polaris_provider::codex::ENDPOINT_BASE.into(),
+                    "gpt-6-astra".into(),
+                    std::sync::Arc::new(AuthTokens {
+                        issuer: polaris_auth::ISSUER.into(),
+                        store,
+                    }),
+                )
+                .map_err(|e| e.to_string())?
+                .with_attempt_ledger(attempt_ledger.scoped(
+                    polaris_provider::attempts::AttemptContext {
+                        parent_id: Some(parent_id.to_string()),
+                        kind: polaris_provider::attempts::AttemptKind::Summary,
+                    },
+                )),
+            )
+        }
+        other => return Err(format!("unknown provider {other}")),
+    };
+    provider.set_effort(Some("medium"));
+    let summary = std::sync::Arc::new(polaris_core::strict_provider::ProviderSummary::new(
+        provider,
+    ));
+    let usage = summary.usage.clone();
+    let mut embedder = polaris_core::strict_provider::local_embedder(config, private_root)
+        .map_err(|e| e.to_string())?;
+    embedder.attempt_ledger = Some(attempt_ledger);
+    Ok((
+        std::sync::Arc::new(polaris_core::conversation_memory::StrictHistory::new(
+            summary,
+            std::sync::Arc::new(embedder),
+        )),
+        usage,
+    ))
+}
+
 #[async_trait::async_trait]
 impl polaris_provider::TokenSource for AuthTokens {
     async fn token(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
@@ -299,6 +476,12 @@ impl polaris_provider::TokenSource for AuthTokens {
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args = Args::parse();
+    if args.web_search != WebSearchArg::Disabled {
+        eprintln!(
+            "Web検索は接続先の上限契約が未確認のため利用できません。disabledを使用してください。"
+        );
+        return ExitCode::FAILURE;
+    }
     if let Err(error) = args.validate_tool_memory() {
         eprintln!("{error}");
         return ExitCode::FAILURE;
@@ -432,6 +615,19 @@ async fn main() -> ExitCode {
     let model_name: String;
     // Mirror the CLI effort in the TUI footer.
     let mut initial_effort_name: Option<String> = None;
+    let attempt_parent_id = match polaris_core::session_store::new_session_id() {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("試行記録の親IDを作成できません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let attempt_ledger = polaris_provider::attempts::AttemptLedger::with_context(
+        polaris_provider::attempts::AttemptContext {
+            parent_id: Some(attempt_parent_id.clone()),
+            kind: polaris_provider::attempts::AttemptKind::Completion,
+        },
+    );
 
     let provider: std::sync::Arc<dyn polaris_provider::Provider> = loop {
         match provider_name.as_str() {
@@ -489,7 +685,9 @@ async fn main() -> ExitCode {
                 };
                 let model = model.clone();
                 model_name = model.clone();
-                match OpenAiProvider::new(base, key, model) {
+                match OpenAiProvider::new(base, key, model)
+                    .map(|provider| provider.with_attempt_ledger(attempt_ledger.clone()))
+                {
                     Ok(p) => break std::sync::Arc::new(p),
                     Err(e) => {
                         eprintln!("Can't build the client: {e}");
@@ -514,7 +712,9 @@ async fn main() -> ExitCode {
                         issuer: polaris_auth::ISSUER.to_string(),
                         store,
                     }),
-                ) {
+                )
+                .map(|provider| provider.with_attempt_ledger(attempt_ledger.clone()))
+                {
                     Ok(provider) => break std::sync::Arc::new(provider),
                     Err(error) => {
                         eprintln!("Can't build the client: {error}");
@@ -594,10 +794,47 @@ async fn main() -> ExitCode {
     let constitution = constitution::load(&cwd);
     let environment = constitution::environment_block(&cwd, None);
 
-    let config = polaris_core::config::load(&cwd).unwrap_or_else(|e| {
-        eprintln!("Can't read the config: {e}");
-        polaris_core::config::Config::default()
-    });
+    let config = match polaris_core::config::load(&cwd) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("設定を読み込めません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let history_mode = args
+        .history_mode
+        .map(polaris_core::conversation_state::HistoryMode::from)
+        .unwrap_or(config.history_mode);
+    if history_mode == polaris_core::conversation_state::HistoryMode::Strict10
+        && (config.embedding.runtime.is_none()
+            || config.embedding.model_path.is_none()
+            || config.embedding.revision.is_none())
+    {
+        eprintln!("strict10 には [embedding] の runtime、model_path、revision が必要です");
+        return ExitCode::FAILURE;
+    }
+    let configured_strict =
+        if history_mode == polaris_core::conversation_state::HistoryMode::Strict10 {
+            let Some(root) = sessions_dir.parent() else {
+                eprintln!("v2セッションの保存先を特定できません");
+                return ExitCode::FAILURE;
+            };
+            match strict_history(
+                &config.embedding,
+                &provider_name,
+                root,
+                attempt_ledger.clone(),
+                &attempt_parent_id,
+            ) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    eprintln!("strict10を準備できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            None
+        };
     let discovered = polaris_skills::discover(&cwd, &config.skills_paths);
     for line in format_skipped_skills(&discovered.skipped) {
         eprintln!("{line}");
@@ -620,6 +857,142 @@ async fn main() -> ExitCode {
             let provider: std::sync::Arc<dyn polaris_provider::Provider> =
                 std::sync::Arc::new(usage_meter.wrap(provider.clone()));
             let mut session = Session::new();
+            session.disable_files_md_auto_regenerate = !config.files_md_auto_regenerate;
+            if config.workflow.enabled {
+                session.workflow = Some(polaris_core::workflow::SessionWorkflow::new(
+                    config.workflow.clone(),
+                ));
+            }
+            if let Some(phase) = args.phase.map(Phase::from) {
+                let Some(workflow) = &session.workflow else {
+                    eprintln!("--phase には設定で [workflow].enabled = true が必要です");
+                    return ExitCode::FAILURE;
+                };
+                if let Err(error) = workflow.request_phase(phase) {
+                    eprintln!("ワークフロー段階を設定できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let project_id = match polaris_tui::persist::project_identity(
+                &polaris_core::project::resolve_root(&cwd),
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    eprintln!("プロジェクト識別子を取得できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let data_root = match sessions_dir.parent() {
+                Some(root) => root,
+                None => {
+                    eprintln!("v2セッションの保存先を特定できません");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let database = state_dir.join("memory.sqlite3");
+            let strict = configured_strict.clone();
+            let persistence = match (&args.resume, &args.fork) {
+                (Some(id), None) => Some(
+                    match polaris_core::session_store::PersistedSession::open(
+                        data_root,
+                        &database,
+                        &project_id,
+                        id,
+                    ) {
+                        Ok(session) => Ok(session),
+                        Err(open_error) => {
+                            let legacy = sessions_dir.join(format!("{id}.jsonl"));
+                            match legacy
+                                .is_file()
+                                .then(|| polaris_tui::persist::load_session(&legacy))
+                            {
+                                Some(Ok((legacy_session, _))) => {
+                                    polaris_core::session_store::PersistedSession::import(
+                                        data_root,
+                                        &database,
+                                        &project_id,
+                                        history_mode,
+                                        session.workflow.as_ref(),
+                                        &legacy_session.messages,
+                                    )
+                                }
+                                _ => Err(open_error),
+                            }
+                        }
+                    },
+                ),
+                (None, Some(id)) => Some(
+                    polaris_core::session_store::PersistedSession::open(
+                        data_root,
+                        &database,
+                        &project_id,
+                        id,
+                    )
+                    .and_then(|session| session.fork("")),
+                ),
+                (None, None)
+                    if config.workflow.enabled
+                        || history_mode
+                            != polaris_core::conversation_state::HistoryMode::Legacy =>
+                {
+                    Some(polaris_core::session_store::PersistedSession::create(
+                        data_root,
+                        &database,
+                        &project_id,
+                        history_mode,
+                        session.workflow.as_ref(),
+                    ))
+                }
+                (None, None) => None,
+                _ => unreachable!("clap rejects mutually exclusive session flags"),
+            };
+            let persistence = match persistence {
+                None => None,
+                Some(Ok(persistence)) => Some(persistence),
+                Some(Err(error)) => {
+                    eprintln!("v2セッションを開けません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Some(saved) = &persistence
+                && let Err(error) = restore_continuation_workflow(
+                    args.resume.as_deref(),
+                    args.fork.as_deref(),
+                    &mut session,
+                    saved,
+                    &config.workflow,
+                )
+            {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+            if let Some(persistence) = persistence
+                && let Err(error) = session.attach(persistence)
+            {
+                eprintln!("v2セッションを接続できません: {error}");
+                return ExitCode::FAILURE;
+            }
+            if let Some((history, usage)) = strict {
+                session.strict_history = Some(history);
+                session.summary_usage = Some(usage);
+                if args.resume.is_some()
+                    && let Err(error) = session.recover_history().await
+                {
+                    eprintln!("strict10履歴を復元できません: {error}");
+                    if let Some(usage) = &session.summary_usage {
+                        let usage = usage.snapshot();
+                        eprintln!(
+                            "要約の確認済み消費: 入力 {} / 出力 {} / 合計 {}。欠測 {} / 失敗 {}。",
+                            usage.usage.input_tokens,
+                            usage.usage.output_tokens,
+                            usage.usage.total_tokens,
+                            usage.missing_responses,
+                            usage.failed_requests
+                        );
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
             session.compaction_threshold = args.compact_at.map(|n| n as usize);
             let session_id = format!(
                 "exec-{}-{}",
@@ -713,6 +1086,17 @@ async fn main() -> ExitCode {
                         coverage.missing_responses,
                         coverage.failed_requests
                     );
+                    if let Some(usage) = &session.summary_usage {
+                        let usage = usage.snapshot();
+                        eprintln!(
+                            "要約の確認済み消費: 入力 {} / 出力 {} / 合計 {}。欠測 {} / 失敗 {}。",
+                            usage.usage.input_tokens,
+                            usage.usage.output_tokens,
+                            usage.usage.total_tokens,
+                            usage.missing_responses,
+                            usage.failed_requests
+                        );
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -726,6 +1110,17 @@ async fn main() -> ExitCode {
                         coverage.missing_responses,
                         coverage.failed_requests
                     );
+                    if let Some(usage) = &session.summary_usage {
+                        let usage = usage.snapshot();
+                        eprintln!(
+                            "要約の確認済み消費: 入力 {} / 出力 {} / 合計 {}。欠測 {} / 失敗 {}。",
+                            usage.usage.input_tokens,
+                            usage.usage.output_tokens,
+                            usage.usage.total_tokens,
+                            usage.missing_responses,
+                            usage.failed_requests
+                        );
+                    }
                     ExitCode::FAILURE
                 }
             }
@@ -753,6 +1148,14 @@ async fn main() -> ExitCode {
                 agent_types: &discovered_agents.agent_types,
                 spawn_concurrency: config.spawn_concurrency,
                 spawn_write_concurrency: config.spawn_write_concurrency,
+                files_md_auto_regenerate: config.files_md_auto_regenerate,
+                workflow_config: config.workflow,
+                initial_phase: args.phase.map(Phase::from),
+                history_mode,
+                strict_history: configured_strict
+                    .as_ref()
+                    .map(|(history, _)| history.clone()),
+                summary_usage: configured_strict.as_ref().map(|(_, usage)| usage.clone()),
             })
             .await
         }
@@ -948,6 +1351,71 @@ fn format_skipped_skills(skipped: &[polaris_skills::Skipped]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resume_and_fork_restore_saved_focus_without_resetting_runtime_settings() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            session_store::PersistedSession,
+            workflow::{Phase, SessionWorkflow, WorkflowConfig},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source_config = WorkflowConfig {
+            enabled: true,
+            initial_phase: Phase::Review,
+            ..WorkflowConfig::default()
+        };
+        let source_workflow = SessionWorkflow::new(source_config);
+        let source = PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "test-project",
+            HistoryMode::Legacy,
+            Some(&source_workflow),
+        )
+        .unwrap();
+        let child = source.fork(&"a".repeat(64)).unwrap();
+        let current_config = WorkflowConfig {
+            initial_phase: Phase::Implement,
+            ..polaris_core::config::Config::default().workflow
+        };
+        for (flag, saved) in [("--resume", &source), ("--fork", &child)] {
+            let id = saved.snapshot().unwrap().state.session_id;
+            let args = Args::try_parse_from(["polaris", flag, &id]).unwrap();
+            let mut session = Session {
+                workflow: Some(SessionWorkflow::new(current_config.clone())),
+                disable_files_md_auto_regenerate: true,
+                ..Session::default()
+            };
+            restore_continuation_workflow(
+                args.resume.as_deref(),
+                args.fork.as_deref(),
+                &mut session,
+                saved,
+                &current_config,
+            )
+            .unwrap();
+            assert_eq!(
+                session.workflow.as_ref().unwrap().state().phase,
+                Phase::Review,
+                "{flag}"
+            );
+            assert_eq!(session.workflow.as_ref().unwrap().config, current_config);
+            assert!(session.disable_files_md_auto_regenerate);
+            let disabled = WorkflowConfig::default();
+            assert!(
+                restore_continuation_workflow(
+                    args.resume.as_deref(),
+                    args.fork.as_deref(),
+                    &mut session,
+                    saved,
+                    &disabled
+                )
+                .is_err(),
+                "{flag}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -978,6 +1446,34 @@ mod tests {
         );
         let args = Args::try_parse_from(["polaris", "--effort", "high"]).expect("args");
         assert_eq!(args.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn workflow_history_and_durable_session_flags_parse_with_their_contract() {
+        let args = Args::try_parse_from([
+            "polaris",
+            "--phase",
+            "implement",
+            "--history-mode",
+            "strict10",
+            "--resume",
+            "00000000-0000-4000-8000-000000000001",
+            "-p",
+            "continue",
+        ])
+        .expect("v0.11 flags");
+        assert_eq!(args.phase, Some(PhaseArg::Implement));
+        assert_eq!(args.history_mode, Some(HistoryModeArg::Strict10));
+        assert_eq!(
+            args.resume.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert!(
+            Args::try_parse_from([
+                "polaris", "--resume", "one", "--fork", "two", "-p", "continue",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

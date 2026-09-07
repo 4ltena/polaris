@@ -6,7 +6,10 @@
 //! the repository. We don't walk up to `/` when no marker is found, because
 //! doing so would make the writable root the entire filesystem.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 /// Marker directories. The nearest one wins.
 const MARKERS: &[&str] = &[".git", ".polaris"];
@@ -44,34 +47,73 @@ pub fn project_id(canonical_path: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// The project's state directory: `~/.polaris/state/<project-id>/`, created
-/// if missing. `<project-id>` is derived from the resolved project root
+/// Resolves the root used only for state and session storage.
+///
+/// An explicit `POLARIS_DATA_DIR` must be an absolute, non-empty path. It is
+/// intentionally separate from `HOME`: authentication and credentials retain
+/// their existing location under `HOME`.
+fn storage_root(data_dir: Option<&OsStr>, home: Option<&OsStr>) -> std::io::Result<PathBuf> {
+    match data_dir {
+        Some(data_dir) if data_dir.is_empty() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POLARIS_DATA_DIR must not be empty",
+        )),
+        Some(data_dir) => {
+            let root = PathBuf::from(data_dir);
+            if !root.is_absolute() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "POLARIS_DATA_DIR must be an absolute path",
+                ));
+            }
+            Ok(root)
+        }
+        None => home
+            .map(|home| Path::new(home).join(".polaris"))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set")),
+    }
+}
+
+fn storage_root_from_env() -> std::io::Result<PathBuf> {
+    let data_dir = std::env::var_os("POLARIS_DATA_DIR");
+    let home = std::env::var_os("HOME");
+    storage_root(data_dir.as_deref(), home.as_deref())
+}
+
+fn state_dir_at(storage_root: &Path, cwd: &Path) -> std::io::Result<PathBuf> {
+    let root = resolve_root(cwd);
+    let id = project_id(&root);
+    let dir = storage_root.join("state").join(id);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The project's state directory. By default this is
+/// `~/.polaris/state/<project-id>/`; when `POLARIS_DATA_DIR` is set it is
+/// `<POLARIS_DATA_DIR>/state/<project-id>/`. The directory is created if
+/// missing. `<project-id>` is derived from the resolved project root
 /// (`resolve_root`), not the working directory — see `project_id`'s docs on
 /// why launch location must not split a project's state across directories.
 pub fn state_dir(cwd: &Path) -> std::io::Result<PathBuf> {
-    let root = resolve_root(cwd);
-    let id = project_id(&root);
+    state_dir_at(&storage_root_from_env()?, cwd)
+}
 
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
-    let dir = Path::new(&home).join(".polaris").join("state").join(id);
+fn sessions_dir_at(storage_root: &Path) -> std::io::Result<PathBuf> {
+    let dir = storage_root.join("sessions");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 /// The directory holding every saved TUI conversation, across every
-/// project: `~/.polaris/sessions/`, created if missing. Unlike
+/// project: `~/.polaris/sessions/` by default or
+/// `<POLARIS_DATA_DIR>/sessions/` when overridden, created if missing. Unlike
 /// `state_dir`, this is not scoped to one project's hashed id — `/resume`
 /// needs to list conversations from every directory polaris has ever run
 /// in, not just the current one, so conversations live in one shared
 /// pool and carry their originating directory as metadata instead (see
 /// `polaris-tui::persist::SessionMeta`).
 pub fn sessions_dir() -> std::io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
-    let dir = Path::new(&home).join(".polaris").join("sessions");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    sessions_dir_at(&storage_root_from_env()?)
 }
 
 #[cfg(test)]
@@ -150,28 +192,56 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    // `sessions_dir` reads `HOME`, which is process-global state — swapping
-    // it races with any other test doing the same unless serialized.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn default_storage_paths_remain_under_home() {
+        let home = tempfile::tempdir().expect("temp directory");
+        let project = tempfile::tempdir().expect("temp directory");
+        std::fs::create_dir(project.path().join(".git")).expect("mkdir");
+
+        let storage = storage_root(None, Some(home.path().as_os_str())).expect("storage root");
+        let state = state_dir_at(&storage, project.path()).expect("state dir");
+        let sessions = sessions_dir_at(&storage).expect("sessions dir");
+        let project_root = project.path().canonicalize().expect("canonicalize");
+
+        assert_eq!(storage, home.path().join(".polaris"));
+        assert_eq!(state, storage.join("state").join(project_id(&project_root)));
+        assert_eq!(sessions, storage.join("sessions"));
+        assert!(state.is_dir());
+        assert!(sessions.is_dir());
+    }
 
     #[test]
-    fn sessions_dir_is_shared_across_projects_not_hashed_per_project() {
+    fn explicit_data_dir_contains_state_and_sessions_without_changing_home() {
         let home = tempfile::tempdir().expect("temp directory");
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialized by `HOME_LOCK`; restored before the guard drops.
-        unsafe {
-            std::env::set_var("HOME", home.path());
+        let data = tempfile::tempdir().expect("temp directory");
+        let project = tempfile::tempdir().expect("temp directory");
+        std::fs::create_dir(project.path().join(".git")).expect("mkdir");
+        let home_before = std::env::var_os("HOME");
+
+        let storage = storage_root(Some(data.path().as_os_str()), Some(home.path().as_os_str()))
+            .expect("storage root");
+        let state = state_dir_at(&storage, project.path()).expect("state dir");
+        let sessions = sessions_dir_at(&storage).expect("sessions dir");
+        let project_root = project.path().canonicalize().expect("canonicalize");
+
+        assert_eq!(storage, data.path());
+        assert_eq!(
+            state,
+            data.path().join("state").join(project_id(&project_root))
+        );
+        assert_eq!(sessions, data.path().join("sessions"));
+        assert!(!home.path().join(".polaris").exists());
+        assert_eq!(std::env::var_os("HOME"), home_before);
+    }
+
+    #[test]
+    fn invalid_explicit_data_dir_is_rejected_without_home_fallback() {
+        let home = tempfile::tempdir().expect("temp directory");
+        for data_dir in [OsStr::new(""), OsStr::new("relative/data")] {
+            let error = storage_root(Some(data_dir), Some(home.path().as_os_str()))
+                .expect_err("invalid explicit data directory must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
-
-        let dir = sessions_dir().expect("sessions dir");
-
-        match prev {
-            Some(p) => unsafe { std::env::set_var("HOME", p) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        assert_eq!(dir, home.path().join(".polaris").join("sessions"));
-        assert!(dir.is_dir());
+        assert!(!home.path().join(".polaris").exists());
     }
 }

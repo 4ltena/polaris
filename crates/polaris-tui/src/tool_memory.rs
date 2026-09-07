@@ -454,6 +454,40 @@ impl Backend {
         }
         Ok(output)
     }
+    fn search_scoped(&self, id: &str, query: &str) -> io::Result<String> {
+        let _lock = self.lock()?;
+        let store = self.store()?;
+        // Resolve provenance before matching. A missing, foreign, or forgotten ID
+        // must never broaden into the global search path.
+        let raw = self.get(&store, id, RAW).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "指定した記憶IDは現プロジェクトまたは許可された祖先にありません",
+            )
+        })?;
+        let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+        let lower = raw.text.to_lowercase();
+        let mut output = format!(
+            "記録限定キーワード検索\nmemory://{id}\n一致箇所の抜粋（全件・全文ではありません）\n"
+        );
+        if terms.is_empty() || !terms.iter().all(|term| lower.contains(term)) {
+            return Ok(output);
+        }
+        for (start, end) in excerpt_ranges(&raw.text, &terms, 0) {
+            let first = raw.text[..start].bytes().filter(|&b| b == b'\n').count() + 1;
+            let last = first + raw.text[start..end].bytes().filter(|&b| b == b'\n').count();
+            let row = format!(
+                "memory://{id}/bytes/{start}\n保存本文の行{first}–{last}（抜粋）\n{}\n",
+                &raw.text[start..end]
+            );
+            if output.len() + row.len() > 4000 {
+                output.push_str("追加の候補を省略。必要なら原文を取得。\n");
+                break;
+            }
+            output.push_str(&row);
+        }
+        Ok(output)
+    }
 }
 impl ToolMemoryBackend for Backend {
     fn save<'a>(
@@ -524,6 +558,17 @@ impl ToolMemoryBackend for Backend {
                     "キーワード検索（埋め込み未設定）"
                 };
                 return self.search(query, vector.as_ref().ok(), label);
+            }
+            if let Some((id, query)) = target.split_once("/search/") {
+                if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(io::Error::other("原文IDが不正です"));
+                }
+                if query.trim().is_empty() || query.len() > 4096 {
+                    return Err(io::Error::other(
+                        "記録限定検索語は1〜4096バイトで指定してください",
+                    ));
+                }
+                return self.search_scoped(id, query);
             }
             let (id, byte) = match target.split_once("/bytes/") {
                 Some((id, byte)) => (id, byte.parse::<usize>().map_err(io::Error::other)?),
@@ -857,6 +902,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_search_reopens_the_saved_snapshot_after_source_changes() {
+        let dir = private_temp();
+        let source = dir.path().join("original");
+        std::fs::write(&source, "日本語 needle saved").unwrap();
+        let saved = backend(dir.path())
+            .save(&call(), &std::fs::read_to_string(&source).unwrap())
+            .await
+            .unwrap();
+        std::fs::write(&source, "needle changed on disk").unwrap();
+
+        let resumed = backend(dir.path());
+        let result = resumed
+            .read(&format!("memory://{}/search/needle", saved.id), 0, 10)
+            .await
+            .unwrap();
+        assert!(result.contains("日本語 needle saved"));
+        assert!(!result.contains("changed on disk"));
+        assert!(
+            result
+                .lines()
+                .any(|line| line == format!("memory://{}", saved.id))
+        );
+    }
+
+    #[tokio::test]
     async fn byte_uri_roundtrip_recovers_giant_line_through_public_backend() {
         let dir = private_temp();
         let backend = backend(dir.path());
@@ -965,6 +1035,75 @@ mod tests {
                 .is_err()
         );
         assert!(backend.read("memory://search/needle", 0, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn scoped_search_never_falls_back_outside_its_provenance() {
+        let dir = private_temp();
+        let backend = backend(dir.path());
+        let selected = backend
+            .save(
+                &call(),
+                &format!(
+                    "{}\n{} selected needle",
+                    "日本🦀".repeat(700),
+                    "日本🦀".repeat(30)
+                ),
+            )
+            .await
+            .unwrap();
+        let distractor = backend.save(&call(), "distractor needle").await.unwrap();
+        let uri = format!("memory://{}/search/needle", selected.id);
+        let result = backend.read(&uri, 0, 10).await.unwrap();
+        assert!(result.len() <= 4000);
+        assert!(result.contains("日本🦀") && result.contains("selected needle"));
+        assert!(!result.contains("distractor"));
+        assert!(
+            result
+                .lines()
+                .any(|line| line == format!("memory://{}", selected.id))
+        );
+        let byte_uri = result
+            .lines()
+            .find(|line| line.starts_with(&format!("memory://{}/bytes/", selected.id)))
+            .unwrap();
+        assert!(
+            backend
+                .read(byte_uri, 0, 1)
+                .await
+                .unwrap()
+                .contains("needle")
+        );
+
+        let no_hit = backend
+            .read(&format!("memory://{}/search/absent", selected.id), 0, 10)
+            .await
+            .unwrap();
+        assert!(!no_hit.contains("distractor") && !no_hit.contains("/bytes/"));
+        assert!(
+            backend
+                .read("memory://bad/search/needle", 0, 10)
+                .await
+                .is_err()
+        );
+
+        let foreign = Backend {
+            project: "foreign".into(),
+            session: "session".into(),
+            origins: Vec::new(),
+            state: dir.path().into(),
+            embedding: None,
+        };
+        assert!(foreign.read(&uri, 0, 10).await.is_err());
+        let mut store = backend.store().unwrap();
+        store.delete_session("project", "session").unwrap();
+        assert!(backend.read(&uri, 0, 10).await.is_err());
+        assert!(
+            backend
+                .read(&format!("memory://{}/search/needle", distractor.id), 0, 10)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1164,6 +1303,13 @@ mod tests {
                 .await
                 .unwrap()
                 .contains(&original.id)
+        );
+        assert!(
+            child
+                .read(&format!("memory://{}/search/needle", original.id), 0, 10)
+                .await
+                .unwrap()
+                .contains("ancestor needle")
         );
         let own = child.save(&call(), "child needle").await.unwrap();
         assert_ne!(

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::attempts::AttemptLedger;
 use crate::{CompletionRequest, CompletionResponse, Provider, ProviderError, Role, ToolCall};
 use polaris_tools::ToolSpec;
 
@@ -58,6 +59,7 @@ pub struct OpenAiProvider {
     model: std::sync::RwLock<String>,
     effort: std::sync::RwLock<Option<String>>,
     client: reqwest::Client,
+    attempt_ledger: Option<AttemptLedger>,
 }
 
 impl OpenAiProvider {
@@ -96,7 +98,15 @@ impl OpenAiProvider {
             model: std::sync::RwLock::new(model),
             effort: std::sync::RwLock::new(None),
             client,
+            attempt_ledger: None,
         })
+    }
+
+    /// Enables in-memory observation of physical HTTP attempts for this transport.
+    /// Without this hook, request bytes and behavior remain unchanged.
+    pub fn with_attempt_ledger(mut self, ledger: AttemptLedger) -> Self {
+        self.attempt_ledger = Some(ledger);
+        self
     }
 }
 
@@ -137,6 +147,10 @@ pub fn tool_wire_shape(tools: &[ToolSpec]) -> Vec<Value> {
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
+        let logical = self
+            .attempt_ledger
+            .as_ref()
+            .map(AttemptLedger::begin_logical);
         let mut messages = vec![serde_json::json!({
             "role": "system",
             "content": req.system,
@@ -194,157 +208,182 @@ impl Provider for OpenAiProvider {
             body["reasoning_effort"] = Value::String(effort.to_string());
         }
 
-        let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                // `reqwest::Error`'s `Display` doesn't say whether it was
-                // a timeout (it only prints something like `error sending
-                // request for url (...)`). Without checking `is_timeout()`
-                // and spelling out here that this failed because of the
-                // idle timeout, the user can't tell a dropped connection
-                // apart from a timeout.
-                if e.is_timeout() {
-                    ProviderError::Http(format!(
-                        "the request timed out (no response for a while): {e}"
-                    ))
-                } else {
-                    ProviderError::Http(e.to_string())
-                }
-            })?;
-
-        if !resp.status().is_success() {
-            return Err(ProviderError::Http(format!("status {}", resp.status())));
-        }
-
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Decode(e.to_string()))?;
-
-        // If `choices` is missing/empty, or choices[0].message is missing,
-        // the response couldn't be interpreted. Without turning this into
-        // Decode here, it becomes a "looks like a normal completion"
-        // empty response (text="" / tool_calls=[]), and the agent loop
-        // above misreads "no tool call" as "done" and silently breaks.
-        let msg = v
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|first| first.get("message"))
-            .ok_or_else(|| {
-                ProviderError::Decode("choices is empty, or message is missing".into())
-            })?;
-
-        // Only turn this into Decode when both content and tool_calls are
-        // "effectively absent." "Absent" has to be defined symmetrically
-        // for both sides — if only one side is lenient, the same silent
-        // empty success slips out through that lenient gate.
-        //
-        // content is "absent" when the field itself is missing, or it's
-        // JSON null. There's no meaningful distinction to draw here on
-        // the wire between missing and null. Meanwhile, when content is
-        // an empty string, it "is present" — that's treated as a normal
-        // response where the model simply said nothing (never treat empty
-        // as equivalent to absent).
-        //
-        // tool_calls is "absent" when the field itself is missing, or
-        // it's JSON null, or it's an empty array. `{"content": null,
-        // "tool_calls": null}` and `{"content": null, "tool_calls": []}`
-        // are semantically identical to the missing-key case (no call was
-        // ever requested), and without treating them the same, the
-        // "looks like a normal completion" empty response of text="" /
-        // tool_calls=[] slips past this guard (the loop misreads it as
-        // "no tool call = done" and returns an empty string as the final
-        // answer, silently breaking).
-        //
-        // The combination of `content: null` with a non-empty tool_calls
-        // (the normal shape of a tool-only turn) does not trip this guard.
-        let content_field = msg.get("content");
-        let tool_calls_field = msg.get("tool_calls");
-        let content_is_absent = content_field.is_none_or(|c| c.is_null());
-        let tool_calls_are_absent = tool_calls_field
-            .is_none_or(|c| c.is_null() || c.as_array().is_some_and(|a| a.is_empty()));
-        if content_is_absent && tool_calls_are_absent {
-            return Err(ProviderError::Decode(
-                "message has neither content nor tool_calls".into(),
-            ));
-        }
-        let text = content_field
-            .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let mut tool_calls = Vec::new();
-        if let Some(calls) = tool_calls_field.and_then(|tc| tc.as_array()) {
-            for c in calls {
-                // If function.name is missing/empty, it reaches the
-                // dispatcher looking like "an unknown tool with an empty
-                // name," and the decode failure ends up looking like a
-                // tool-selection problem. Stop it here and report it at
-                // the source instead.
-                let name = c
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        ProviderError::Decode(
-                            "tool_calls[].function.name is missing or empty".into(),
-                        )
-                    })?;
-
-                // id gets the same missing/empty treatment as Decode, for
-                // the same reason. It's a field with the same shape as
-                // name, at the same cost, so it's kept consistent.
-                // That said, exactly how an empty id would actually break
-                // things downstream (matching against tool results)
-                // hasn't been confirmed.
-                let id = c
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        ProviderError::Decode("tool_calls[].id is missing or empty".into())
-                    })?;
-
-                let raw = c["function"]["arguments"].as_str().unwrap_or("{}");
-                let arguments: Value =
-                    serde_json::from_str(raw).map_err(|e| ProviderError::Decode(e.to_string()))?;
-                tool_calls.push(ToolCall {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    arguments,
-                });
-            }
-        }
-
-        let usage = v.get("usage").and_then(|u| {
-            let input_tokens = u.get("prompt_tokens")?.as_u64()? as u32;
-            let output_tokens = u.get("completion_tokens")?.as_u64()? as u32;
-            let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
-            let cached_tokens = u
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32;
-            Some(crate::Usage {
-                input_tokens,
-                output_tokens,
-                total_tokens,
-                cached_tokens,
+        // This is immediately before reqwest starts the physical request. An
+        // unpolled completion never reaches this point; a dropped future is
+        // marked cancelled by the guard.
+        let mut attempt_guard = self
+            .attempt_ledger
+            .as_ref()
+            .zip(logical.as_ref())
+            .map(|(ledger, logical)| {
+                ledger.begin_attempt(
+                    logical,
+                    &model,
+                    None,
+                    crate::attempts::BudgetReservation::default(),
+                )
             })
-        });
+            .transpose()
+            .map_err(|error| ProviderError::Budget(error.to_string()))?;
+        let result = async {
+            let resp = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    // `reqwest::Error`'s `Display` doesn't say whether it was
+                    // a timeout (it only prints something like `error sending
+                    // request for url (...)`). Without checking `is_timeout()`
+                    // and spelling out here that this failed because of the
+                    // idle timeout, the user can't tell a dropped connection
+                    // apart from a timeout.
+                    if e.is_timeout() {
+                        ProviderError::Http(format!(
+                            "the request timed out (no response for a while): {e}"
+                        ))
+                    } else {
+                        ProviderError::Http(e.to_string())
+                    }
+                })?;
 
-        Ok(CompletionResponse {
-            text,
-            tool_calls,
-            reasoning: Vec::new(),
-            usage,
-        })
+            if !resp.status().is_success() {
+                return Err(ProviderError::Http(format!("status {}", resp.status())));
+            }
+
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+            // If `choices` is missing/empty, or choices[0].message is missing,
+            // the response couldn't be interpreted. Without turning this into
+            // Decode here, it becomes a "looks like a normal completion"
+            // empty response (text="" / tool_calls=[]), and the agent loop
+            // above misreads "no tool call" as "done" and silently breaks.
+            let msg = v
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|first| first.get("message"))
+                .ok_or_else(|| {
+                    ProviderError::Decode("choices is empty, or message is missing".into())
+                })?;
+
+            // Only turn this into Decode when both content and tool_calls are
+            // "effectively absent." "Absent" has to be defined symmetrically
+            // for both sides — if only one side is lenient, the same silent
+            // empty success slips out through that lenient gate.
+            //
+            // content is "absent" when the field itself is missing, or it's
+            // JSON null. There's no meaningful distinction to draw here on
+            // the wire between missing and null. Meanwhile, when content is
+            // an empty string, it "is present" — that's treated as a normal
+            // response where the model simply said nothing (never treat empty
+            // as equivalent to absent).
+            //
+            // tool_calls is "absent" when the field itself is missing, or
+            // it's JSON null, or it's an empty array. `{"content": null,
+            // "tool_calls": null}` and `{"content": null, "tool_calls": []}`
+            // are semantically identical to the missing-key case (no call was
+            // ever requested), and without treating them the same, the
+            // "looks like a normal completion" empty response of text="" /
+            // tool_calls=[] slips past this guard (the loop misreads it as
+            // "no tool call = done" and returns an empty string as the final
+            // answer, silently breaking).
+            //
+            // The combination of `content: null` with a non-empty tool_calls
+            // (the normal shape of a tool-only turn) does not trip this guard.
+            let content_field = msg.get("content");
+            let tool_calls_field = msg.get("tool_calls");
+            let content_is_absent = content_field.is_none_or(|c| c.is_null());
+            let tool_calls_are_absent = tool_calls_field
+                .is_none_or(|c| c.is_null() || c.as_array().is_some_and(|a| a.is_empty()));
+            if content_is_absent && tool_calls_are_absent {
+                return Err(ProviderError::Decode(
+                    "message has neither content nor tool_calls".into(),
+                ));
+            }
+            let text = content_field
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let mut tool_calls = Vec::new();
+            if let Some(calls) = tool_calls_field.and_then(|tc| tc.as_array()) {
+                for c in calls {
+                    // If function.name is missing/empty, it reaches the
+                    // dispatcher looking like "an unknown tool with an empty
+                    // name," and the decode failure ends up looking like a
+                    // tool-selection problem. Stop it here and report it at
+                    // the source instead.
+                    let name = c
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            ProviderError::Decode(
+                                "tool_calls[].function.name is missing or empty".into(),
+                            )
+                        })?;
+
+                    // id gets the same missing/empty treatment as Decode, for
+                    // the same reason. It's a field with the same shape as
+                    // name, at the same cost, so it's kept consistent.
+                    // That said, exactly how an empty id would actually break
+                    // things downstream (matching against tool results)
+                    // hasn't been confirmed.
+                    let id = c
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            ProviderError::Decode("tool_calls[].id is missing or empty".into())
+                        })?;
+
+                    let raw = c["function"]["arguments"].as_str().unwrap_or("{}");
+                    let arguments: Value = serde_json::from_str(raw)
+                        .map_err(|e| ProviderError::Decode(e.to_string()))?;
+                    tool_calls.push(ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments,
+                    });
+                }
+            }
+
+            let usage = v.get("usage").and_then(|u| {
+                let input_tokens = u.get("prompt_tokens")?.as_u64()? as u32;
+                let output_tokens = u.get("completion_tokens")?.as_u64()? as u32;
+                let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
+                let cached_tokens = u
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                Some(crate::Usage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cached_tokens,
+                })
+            });
+
+            Ok(CompletionResponse {
+                text,
+                tool_calls,
+                reasoning: Vec::new(),
+                usage,
+                ..CompletionResponse::default()
+            })
+        }
+        .await;
+        if let Some(guard) = attempt_guard.as_mut() {
+            guard.finish(&result);
+        }
+        result
     }
 
     fn set_model(&self, model: &str) {
@@ -396,6 +435,34 @@ mod tests {
         assert_eq!(res.tool_calls.len(), 1);
         assert_eq!(res.tool_calls[0].name, "read");
         assert_eq!(res.tool_calls[0].arguments["path"], "a.rs");
+    }
+
+    #[tokio::test]
+    async fn uninstrumented_transport_leaves_an_available_ledger_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let ledger = crate::attempts::AttemptLedger::default();
+        let provider = OpenAiProvider::new(server.uri(), "k".into(), "m".into())
+            .expect("client should be constructible");
+        provider
+            .complete(CompletionRequest {
+                system: "s".into(),
+                messages: vec![],
+                tools: vec![],
+            })
+            .await
+            .expect("uninstrumented request succeeds");
+        assert!(
+            ledger.snapshot().is_empty(),
+            "a detached ledger observes nothing"
+        );
     }
 
     #[tokio::test]

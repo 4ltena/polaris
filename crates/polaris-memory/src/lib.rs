@@ -7,6 +7,7 @@
 //! corpora, not an approximate nearest-neighbor service.
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
+pub mod conversation;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
@@ -173,6 +174,7 @@ impl MemoryStore {
             );",
         )?;
         transaction.commit()?;
+        conversation::initialize(&connection)?;
         Ok(Self { connection })
     }
 

@@ -74,7 +74,11 @@ async fn post_token(
     fallback_refresh: Option<&str>,
     fallback_account: Option<&str>,
 ) -> Result<Credentials, AuthError> {
-    let resp = reqwest::Client::new()
+    let client = polaris_http::client_builder()
+        .map_err(|e| AuthError::Http(format!("could not configure HTTP client: {e}")))?
+        .build()
+        .map_err(|e| AuthError::Http(format!("could not build HTTP client: {e}")))?;
+    let resp = client
         .post(format!("{issuer}/oauth/token"))
         .form(form)
         .send()

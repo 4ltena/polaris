@@ -33,7 +33,7 @@ pub const CONSTITUTION_LIMIT: usize = 100;
 
 /// The ceiling on the number of tokens allowed for the environment block.
 ///
-/// `environment_block` only carries the cwd and the branch name, but both
+/// `environment_block` carries filemap availability, cwd and branch; the latter two
 /// are strings dictated by the disk / Git — the harness does not control
 /// their length. The real-world value in this actual repository is around
 /// 24 tokens for cwd + branch combined, but without an explicit ceiling,
@@ -220,7 +220,20 @@ pub fn load(project_root: &Path) -> String {
 
 /// Environment info. Hands over up front the facts the model would otherwise spend a turn discovering.
 pub fn environment_block(cwd: &Path, branch: Option<&str>) -> String {
-    let mut s = format!("cwd: {}", cwd.display());
+    // Report the startup snapshot without reading contents or following a docs link.
+    let map_state = match std::fs::symlink_metadata(cwd.join("docs")) {
+        Ok(meta) if meta.is_dir() => match std::fs::symlink_metadata(cwd.join("docs/filemap.md")) {
+            Ok(meta) if meta.is_file() => "ready",
+            Ok(_) => "unavailable",
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent",
+            Err(_) => "unavailable",
+        },
+        Ok(_) => "unavailable",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent",
+        Err(_) => "unavailable",
+    };
+    // Put this bounded fact first so long paths cannot truncate it away.
+    let mut s = format!("filemap={map_state}\ncwd: {}", cwd.display());
     if let Some(b) = branch {
         s.push_str(&format!("\ngit branch: {b}"));
     }
@@ -485,6 +498,37 @@ Long procedure. Not loaded.
         let got = environment_block(Path::new("/w/polaris"), Some("feat/x"));
         assert!(got.contains("/w/polaris"));
         assert!(got.contains("feat/x"));
+    }
+
+    #[test]
+    fn environment_reports_filemap_without_reading_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(environment_block(dir.path(), None).starts_with("filemap=absent\n"));
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        assert!(environment_block(dir.path(), None).starts_with("filemap=absent\n"));
+        std::fs::write(dir.path().join("docs/filemap.md"), "private marker").unwrap();
+        let environment = environment_block(dir.path(), None);
+        assert!(environment.starts_with("filemap=ready\n"));
+        assert!(!environment.contains("private marker"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_does_not_follow_filemap_or_docs_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("filemap.md"), "outside").unwrap();
+        symlink(outside.path(), root.path().join("docs")).unwrap();
+        assert!(environment_block(root.path(), None).starts_with("filemap=unavailable\n"));
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        symlink(
+            outside.path().join("filemap.md"),
+            root.path().join("docs/filemap.md"),
+        )
+        .unwrap();
+        assert!(environment_block(root.path(), None).starts_with("filemap=unavailable\n"));
     }
 
     /// A set of skills fed to the budget tests. Their name, description, and

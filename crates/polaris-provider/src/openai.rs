@@ -84,7 +84,8 @@ impl OpenAiProvider {
         connect_timeout: Duration,
         read_timeout: Duration,
     ) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
+        let client = polaris_http::client_builder()
+            .map_err(|e| ProviderError::Http(format!("could not configure HTTP client: {e}")))?
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
             .build()

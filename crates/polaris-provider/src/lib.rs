@@ -1,9 +1,11 @@
 //! Provider abstraction. Transport-dependent parts live in each
 //! implementation; only the shape of requests and responses lives here.
 
+pub mod cache_pacing;
 pub mod codex;
 pub mod openai;
 pub mod sse;
+pub mod turn_affinity;
 
 use polaris_tools::ToolSpec;
 use serde::{Deserialize, Serialize};
@@ -267,14 +269,15 @@ where
     P::Target: Provider,
 {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
-        let mut guard = RequestGuard {
-            meter: &self.meter,
-            completed: false,
-        };
-        let result = self.provider.complete(req).await;
-        self.meter.record(&result);
-        guard.completed = true;
-        result
+        self.complete_metered(req, None).await
+    }
+
+    async fn complete_in_turn(
+        &self,
+        req: CompletionRequest,
+        turn: &turn_affinity::TurnContext,
+    ) -> Result<CompletionResponse, ProviderError> {
+        self.complete_metered(req, Some(turn)).await
     }
 
     fn set_model(&self, model: &str) {
@@ -283,6 +286,30 @@ where
 
     fn set_effort(&self, effort: Option<&str>) {
         self.provider.set_effort(effort);
+    }
+}
+
+impl<P> MeteredProvider<P>
+where
+    P: std::ops::Deref + Send + Sync,
+    P::Target: Provider,
+{
+    async fn complete_metered(
+        &self,
+        req: CompletionRequest,
+        turn: Option<&turn_affinity::TurnContext>,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let mut guard = RequestGuard {
+            meter: &self.meter,
+            completed: false,
+        };
+        let result = match turn {
+            Some(turn) => self.provider.complete_in_turn(req, turn).await,
+            None => self.provider.complete(req).await,
+        };
+        self.meter.record(&result);
+        guard.completed = true;
+        result
     }
 }
 
@@ -311,6 +338,16 @@ pub enum ProviderError {
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
+
+    /// Completes a request that belongs to one logical user turn. Providers
+    /// without turn-scoped transport state retain their existing behavior.
+    async fn complete_in_turn(
+        &self,
+        req: CompletionRequest,
+        _turn: &turn_affinity::TurnContext,
+    ) -> Result<CompletionResponse, ProviderError> {
+        self.complete(req).await
+    }
 
     /// Switches which model subsequent `complete` calls use. Takes `&self`
     /// (not `&mut self`) so it can be called through the same shared
@@ -532,6 +569,50 @@ mod tests {
         ) -> Result<CompletionResponse, ProviderError> {
             Ok(self.reply.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn metered_provider_forwards_turn_context_and_records_usage_once() {
+        struct TurnAware(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl Provider for TurnAware {
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                panic!("complete_in_turn was not forwarded")
+            }
+
+            async fn complete_in_turn(
+                &self,
+                _req: CompletionRequest,
+                _turn: &turn_affinity::TurnContext,
+            ) -> Result<CompletionResponse, ProviderError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(CompletionResponse {
+                    usage: Some(Usage {
+                        input_tokens: 7,
+                        output_tokens: 2,
+                        total_tokens: 9,
+                        cached_tokens: 3,
+                    }),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let provider = TurnAware(std::sync::atomic::AtomicUsize::new(0));
+        let meter = UsageMeter::default();
+        meter
+            .wrap(&provider)
+            .complete_in_turn(empty_request(), &turn_affinity::TurnContext::new())
+            .await
+            .expect("response");
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let report = meter.snapshot();
+        assert_eq!(report.reported_responses, 1);
+        assert_eq!(report.usage.total_tokens, 9);
+        assert_eq!(report.failed_requests, 0);
     }
 
     #[tokio::test]

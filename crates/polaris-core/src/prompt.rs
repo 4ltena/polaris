@@ -27,7 +27,7 @@ Rules:
 - Never guess file contents. Read them.
 - If the same error occurs three times in a row, stop and report it.
 - Do not claim work is done without showing the command output that proves it.
-- Read docs/filemap.md before searching the tree.
+- Read docs/filemap.md before tree searches only when filemap=ready.
 - Verify counts and causal claims against real output before stating them.
 - A cited path:line must actually support the claim it's attached to.
 ";

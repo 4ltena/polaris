@@ -338,6 +338,9 @@ pub(crate) async fn run_loop(
     let metered_provider = meter.wrap(provider);
     let provider: &dyn Provider = &metered_provider;
     let provider_pool: Arc<dyn Provider> = Arc::new(meter.wrap(provider_pool));
+    // Every invocation owns its context. Child agents invoke run_loop
+    // independently and cannot inherit transport state from their parent.
+    let turn_context = polaris_provider::turn_affinity::TurnContext::new();
     loop {
         // Call unconditionally every turn. If this were only called on
         // error, a call pattern that never triggers an error would never
@@ -378,6 +381,9 @@ pub(crate) async fn run_loop(
         {
             match session.compact_automatically(provider).await {
                 Ok(Some(report)) => {
+                    // Only a completed compaction starts a new transport
+                    // context; a no-op or failure retains this turn's state.
+                    turn_context.clear();
                     if let Some(tx) = &events {
                         let _ = tx.send(crate::events::AgentEvent::HistoryCompacted {
                             messages_before: report.messages_before,
@@ -403,11 +409,14 @@ pub(crate) async fn run_loop(
         }
 
         let res = provider
-            .complete(CompletionRequest {
-                system: system.to_string(),
-                messages: session.messages.clone(),
-                tools: tools.to_vec(),
-            })
+            .complete_in_turn(
+                CompletionRequest {
+                    system: system.to_string(),
+                    messages: session.messages.clone(),
+                    tools: tools.to_vec(),
+                },
+                &turn_context,
+            )
             .await?;
 
         if res.tool_calls.is_empty() {
@@ -936,6 +945,33 @@ mod tests {
         }
     }
 
+    struct TurnOnlyProvider {
+        turn_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for TurnOnlyProvider {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            panic!("run_loop must use complete_in_turn for model calls")
+        }
+
+        async fn complete_in_turn(
+            &self,
+            _req: CompletionRequest,
+            _turn: &polaris_provider::turn_affinity::TurnContext,
+        ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+            self.turn_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CompletionResponse {
+                text: "done".into(),
+                ..Default::default()
+            })
+        }
+    }
+
     /// A provider whose first `complete` call — the summarization call
     /// `compaction::compact` makes internally — fails, and every call
     /// after that succeeds with a scripted reply. Used to prove a
@@ -943,6 +979,50 @@ mod tests {
     /// (see `a_failed_compaction_call_does_not_block_the_turn`).
     struct FailsOnFirstCallThenSucceeds {
         calls: Mutex<usize>,
+    }
+
+    #[tokio::test]
+    async fn thirty_six_logical_turns_each_use_turn_aware_completion() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let provider = TurnOnlyProvider {
+            turn_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        for turn in 0..36 {
+            let mut session = Session::new();
+            session.push_user(&format!("turn {turn}"));
+            let mut stop = StopTracker::new(2);
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let outcome = run(
+                &provider,
+                &mut session,
+                dummy_audit(&dir),
+                &mut stop,
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                None,
+                &mut ctx,
+            )
+            .await
+            .expect("turn succeeds");
+            assert_eq!(outcome.text, "done");
+        }
+        assert_eq!(
+            provider
+                .turn_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            36
+        );
     }
 
     #[async_trait::async_trait]

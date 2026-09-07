@@ -67,6 +67,24 @@ pub fn run_confined(
     args: &[String],
     stdin: Option<&str>,
 ) -> Result<Outcome, SandboxError> {
+    let broker = crate::broker::from_environment()?;
+    run_confined_with_broker(policy, program, args, stdin, broker.as_ref())
+}
+
+/// Executes through an explicitly supplied broker configuration when present.
+/// Keeping this separate from `run_confined` makes the protocol testable
+/// without changing process-global environment variables.
+pub(crate) fn run_confined_with_broker(
+    policy: &SandboxPolicy,
+    program: &Path,
+    args: &[String],
+    stdin: Option<&str>,
+    broker: Option<&crate::broker::BrokerConfig>,
+) -> Result<Outcome, SandboxError> {
+    if let Some(broker) = broker {
+        return crate::broker::run(broker, policy, program, args, stdin);
+    }
+
     let mut cmd = build_command(policy, program, args)?;
 
     cmd.stdin(if stdin.is_some() {

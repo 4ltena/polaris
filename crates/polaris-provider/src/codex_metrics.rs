@@ -30,6 +30,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::cache_prefix::CachePrefixDiagnostics;
+use crate::cache_pacing::Mode as PacingMode;
+use crate::turn_affinity::TurnAffinityMode;
 use crate::{CompletionResponse, ProviderError};
 
 fn fingerprint(value: &Value) -> Value {
@@ -269,16 +272,41 @@ pub(super) struct RequestMetric {
     pub(super) server_cancelled: bool,
     pub(super) transport_cause: Option<&'static str>,
     outcome: &'static str,
+    dispatched: bool,
 }
 
 impl RequestMetric {
-    pub(super) fn from_env(body: &Value) -> Result<Option<Self>, ProviderError> {
+    pub(super) fn from_env(
+        body: &Value,
+        cache_prefix: CachePrefixDiagnostics,
+    ) -> Result<Option<Self>, ProviderError> {
         std::env::var_os("POLARIS_METRICS_PATH")
-            .map(|path| Self::new(Path::new(&path), body))
+            .map(|path| Self::new_with_cache_prefix(Path::new(&path), body, cache_prefix))
             .transpose()
     }
 
+    #[cfg(test)]
     fn new(path: &Path, body: &Value) -> Result<Self, ProviderError> {
+        // Existing metrics-only tests do not model a provider profile. Keep
+        // that local fixture path explicit; live attempts always use
+        // `new_with_cache_prefix` above.
+        Self::new_with_cache_prefix(
+            path,
+            body,
+            CachePrefixDiagnostics {
+                profile: "compact",
+                version: "compact-v1",
+                guide_hash: crate::fnv1a(0xcbf2_9ce4_8422_2325, b""),
+                target_applied: false,
+            },
+        )
+    }
+
+    fn new_with_cache_prefix(
+        path: &Path,
+        body: &Value,
+        cache_prefix: CachePrefixDiagnostics,
+    ) -> Result<Self, ProviderError> {
         let file = private_file(path).map_err(|_| metrics_error())?;
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let timestamp = SystemTime::now()
@@ -304,11 +332,18 @@ impl RequestMetric {
             server_cancelled: false,
             transport_cause: None,
             outcome: "cancelled",
+            dispatched: true,
             record: json!({
                 "schema_version": 1, "provider": "codex", "started_unix_ms": timestamp,
                 "attempt_id": format!("{}-{timestamp}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)),
                 "model": body["model"], "effort": body.pointer("/reasoning/effort"),
                 "cache_mode": body.pointer("/prompt_cache_options/mode"),
+                "cache_prefix": {
+                    "profile": cache_prefix.profile,
+                    "version": cache_prefix.version,
+                    "hash": format!("fnv1a64-{:016x}", cache_prefix.guide_hash),
+                    "target_applied": cache_prefix.target_applied,
+                },
                 "request_key": fingerprint(body)["hash"],
                 "prompt_cache_key": body["prompt_cache_key"],
                 "request": fingerprint(body), "visible_history": fingerprint(&visible),
@@ -316,6 +351,16 @@ impl RequestMetric {
                 "visible_history_items": visible_items,
             }),
         })
+    }
+
+    pub(super) fn defer_dispatch(&mut self) {
+        self.dispatched = false;
+    }
+
+    pub(super) fn start_dispatch(&mut self, dispatch: &crate::cache_pacing::Dispatch) {
+        self.start = dispatch.started;
+        self.record["started_unix_ms"] = json!(dispatch.unix_ms);
+        self.dispatched = true;
     }
 
     pub(super) fn finish(&mut self, result: &Result<CompletionResponse, ProviderError>) {
@@ -326,6 +371,31 @@ impl RequestMetric {
             Err(ProviderError::Http(_)) => "http_error",
             Err(ProviderError::Decode(_)) => "decode_error",
         };
+    }
+
+    pub(super) fn turn_affinity(
+        &mut self,
+        mode: TurnAffinityMode,
+        context_present: bool,
+        sent: bool,
+        received: bool,
+    ) {
+        self.record["turn_affinity"] = json!({
+            "mode": mode.as_str(),
+            "context_present": context_present,
+            "sent": sent,
+            "received": received,
+        });
+    }
+
+    pub(super) fn cache_pacing(
+        &mut self,
+        mode: PacingMode,
+        interval: std::time::Duration,
+        wait: std::time::Duration,
+        offset: std::time::Duration,
+    ) {
+        self.record["cache_pacing"] = json!({"mode": mode.as_str(), "interval_ms": interval.as_millis() as u64, "wait_ms": wait.as_millis() as u64, "dispatch_offset_ms": offset.as_millis() as u64});
     }
 
     fn write(&mut self) -> io::Result<()> {
@@ -349,7 +419,7 @@ impl RequestMetric {
 
 impl Drop for RequestMetric {
     fn drop(&mut self) {
-        if self.write().is_err() {
+        if self.dispatched && self.write().is_err() {
             eprintln!("Polaris: 診断ログの保存に失敗しました。今回の計測には欠測があります。");
         }
     }
@@ -402,6 +472,48 @@ mod tests {
             },
             Some("medium"),
         )
+    }
+
+    #[test]
+    fn cache_pacing_cancelled_before_dispatch_does_not_log_a_model_request() {
+        let path = LogPath::new();
+        let mut metric = RequestMetric::new(&path.0, &body()).unwrap();
+        metric.defer_dispatch();
+        drop(metric);
+        assert!(path.records().is_empty());
+    }
+
+    #[test]
+    fn cache_pacing_dispatch_resets_timing_and_preserves_error_outcome() {
+        let path = LogPath::new();
+        let mut metric = RequestMetric::new(&path.0, &body()).unwrap();
+        metric.defer_dispatch();
+        let dispatch = crate::cache_pacing::Dispatch {
+            wait: std::time::Duration::from_secs(5),
+            offset: std::time::Duration::from_secs(10),
+            started: Instant::now(),
+            unix_ms: 123456,
+        };
+        metric.start_dispatch(&dispatch);
+        assert_eq!(metric.start, dispatch.started);
+        metric.cache_pacing(
+            PacingMode::On,
+            crate::cache_pacing::INTERVAL,
+            dispatch.wait,
+            dispatch.offset,
+        );
+        metric.finish(&Err(ProviderError::Auth("expired".into())));
+        drop(metric);
+        let rows = path.records();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["started_unix_ms"], 123456);
+        assert_eq!(rows[0]["outcome"], "auth_error");
+        assert_eq!(
+            rows[0]["cache_pacing"],
+            json!({
+                "mode": "on", "interval_ms": 5000, "wait_ms": 5000, "dispatch_offset_ms": 10000,
+            })
+        );
     }
 
     #[test]
@@ -505,6 +617,36 @@ mod tests {
         assert_eq!(rows[0]["cache_mode"], Value::Null);
         assert_eq!(rows[1]["cache_mode"], "implicit");
         assert_eq!(rows[2]["cache_mode"], "explicit");
+    }
+
+    #[test]
+    fn cache_prefix_diagnostics_record_identifiers_not_the_guide() {
+        let path = LogPath::new();
+        let guide = super::super::cache_prefix::stable_guide();
+        drop(
+            RequestMetric::new_with_cache_prefix(
+                &path.0,
+                &body(),
+                CachePrefixDiagnostics {
+                    profile: "stable",
+                    version: "stable-v1",
+                    guide_hash: crate::fnv1a(0xcbf2_9ce4_8422_2325, guide.as_bytes()),
+                    target_applied: true,
+                },
+            )
+            .unwrap(),
+        );
+        let row = &path.records()[0];
+        assert_eq!(row["cache_prefix"]["profile"], "stable");
+        assert_eq!(row["cache_prefix"]["version"], "stable-v1");
+        assert!(
+            row["cache_prefix"]["hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("fnv1a64-")
+        );
+        assert_eq!(row["cache_prefix"]["target_applied"], true);
+        assert!(!std::fs::read_to_string(&path.0).unwrap().contains(guide));
     }
 
     #[test]

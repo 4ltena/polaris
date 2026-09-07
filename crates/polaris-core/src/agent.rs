@@ -116,6 +116,7 @@ pub async fn run(
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
+    session.check_persistence()?;
     run_loop(
         provider,
         session,
@@ -181,6 +182,7 @@ async fn flush_directory_changes(
     agent_types: &[polaris_skills::AgentType],
     provider_pool: Arc<dyn Provider>,
     audit: Arc<Mutex<AuditLog>>,
+    workflow: Option<crate::spawn::ChildWorkflow>,
     ctx: &mut ToolContext<'_>,
 ) {
     if pending.new_dirs.is_empty() && pending.new_files_in_existing_dirs.is_empty() {
@@ -192,13 +194,14 @@ async fn flush_directory_changes(
     changes.new_files_in_existing_dirs.sort();
     changes.new_files_in_existing_dirs.dedup();
     // Break the async type cycle through the files-md-writer's run_loop.
-    Box::pin(crate::files_md::regenerate_for_changes(
+    Box::pin(crate::files_md::regenerate_for_changes_scoped(
         &changes,
         agent_types,
         provider_pool,
         audit,
         ctx.sandbox,
         ctx.helper,
+        workflow,
     ))
     .await;
 }
@@ -331,6 +334,59 @@ pub(crate) async fn run_loop(
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
+    // Resolve once at the real user boundary; tool continuations retain this
+    // exact snapshot. The guard releases the turn on errors and cancellation.
+    session.check_persistence()?;
+    let workflow_turn = session
+        .workflow
+        .as_ref()
+        .filter(|workflow| workflow.config.enabled)
+        .map(|workflow| workflow.begin_turn_from_disk(skills))
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    let workflow_system = workflow_turn
+        .as_ref()
+        .map(|turn| format!("{system}\n{}", turn.body));
+    let system = workflow_system.as_deref().unwrap_or(system);
+    session.checkpoint()?;
+    if let Some(turn) = &workflow_turn {
+        audit.lock().await.record(&Record {
+            tool: "workflow",
+            detail: turn.state.phase.as_str(),
+            sandbox: None,
+            target: None,
+            result: &format!(
+                "manifest={} skills={} changed={}",
+                turn.state.skill_manifest_hash,
+                turn.ids.join(","),
+                turn.changed_skill_ids.join(",")
+            ),
+            caller,
+        })?;
+        if let Some(tx) = &events {
+            let _ = tx.send(crate::events::AgentEvent::WorkflowResolved {
+                phase: turn.state.phase.to_string(),
+                skill_ids: turn.ids.clone(),
+                changed_skill_ids: turn.changed_skill_ids.clone(),
+                manifest_hash: turn.state.skill_manifest_hash.clone(),
+            });
+        }
+    }
+    let summary_before = session
+        .summary_usage
+        .as_ref()
+        .map(|meter| meter.snapshot())
+        .unwrap_or_default();
+    let historical_evidence = session.prepare_history().await?;
+    let strict_history = session.uses_strict_history()?;
+    let child_workflow = session
+        .workflow
+        .as_ref()
+        .filter(|workflow| workflow.config.enabled)
+        .map(|workflow| crate::spawn::ChildWorkflow {
+            workflow: workflow.clone(),
+            skills: skills.to_vec(),
+        });
     // Both paths share one meter: direct calls (including summaries), and
     // the pool used by spawn/files.md children. Never add child totals to
     // this snapshot; their actual calls have already been observed here.
@@ -374,10 +430,11 @@ pub(crate) async fn run_loop(
 
         let total_tokens = crate::budget::always_on_tokens(system, tools)
             + crate::compaction::session_tokens(&session.messages);
-        if total_tokens
-            >= session
-                .compaction_threshold
-                .unwrap_or(crate::compaction::COMPACTION_THRESHOLD)
+        if !strict_history
+            && total_tokens
+                >= session
+                    .compaction_threshold
+                    .unwrap_or(crate::compaction::COMPACTION_THRESHOLD)
         {
             match session.compact_automatically(provider).await {
                 Ok(Some(report)) => {
@@ -408,11 +465,17 @@ pub(crate) async fn run_loop(
             }
         }
 
+        session.check_persistence()?;
+        let mut request_messages = session.examples.clone();
+        if let Some(evidence) = &historical_evidence {
+            request_messages.push(evidence.clone());
+        }
+        request_messages.extend_from_slice(&session.messages);
         let res = provider
             .complete_in_turn(
                 CompletionRequest {
                     system: system.to_string(),
-                    messages: session.messages.clone(),
+                    messages: request_messages,
                     tools: tools.to_vec(),
                 },
                 &turn_context,
@@ -420,11 +483,27 @@ pub(crate) async fn run_loop(
             .await?;
 
         if res.tool_calls.is_empty() {
-            session.push_assistant(&res.text, res.reasoning);
+            let display_text = res.display_text();
+            session.push_message(
+                polaris_provider::Message::assistant(&res.text)
+                    .with_reasoning(res.reasoning)
+                    .with_hosted_web_search(res.hosted_web_search, res.url_citations),
+                false,
+            );
+            session.check_persistence()?;
+            let usage_report = include_summary_usage(
+                meter.snapshot(),
+                summary_before,
+                session
+                    .summary_usage
+                    .as_ref()
+                    .map(|meter| meter.snapshot())
+                    .unwrap_or_default(),
+            );
             return Ok(AgentOutcome {
-                text: res.text,
-                usage: meter.snapshot().usage,
-                usage_report: meter.snapshot(),
+                text: display_text,
+                usage: usage_report.usage,
+                usage_report,
             });
         }
 
@@ -434,7 +513,13 @@ pub(crate) async fn run_loop(
         // nothing to match "which call this result answers" against — a
         // real OpenAI endpoint rejects it (tests against a mock never
         // inspect the wire format, so they cannot detect this omission).
-        session.push_assistant_tool_calls(&res.text, res.tool_calls.clone(), res.reasoning);
+        session.push_message(
+            polaris_provider::Message::assistant_with_tool_calls(&res.text, res.tool_calls.clone())
+                .with_reasoning(res.reasoning)
+                .with_hosted_web_search(res.hosted_web_search, res.url_citations),
+            false,
+        );
+        session.check_persistence()?;
 
         let mut pending_changes = crate::dir_watch::DirChanges::default();
         for call in &res.tool_calls {
@@ -452,6 +537,7 @@ pub(crate) async fn run_loop(
                     agent_types,
                     provider_pool.clone(),
                     audit.clone(),
+                    child_workflow.clone(),
                     ctx,
                 )
                 .await;
@@ -460,15 +546,27 @@ pub(crate) async fn run_loop(
             // root's own tool calls — see `pre_call_snapshot`'s docs for
             // why `caller == "root"` is a correctness condition and not a
             // mere optimization.
-            let watched =
-                caller == "root" && matches!(call.name.as_str(), "bash" | "write" | "edit");
+            let watched = caller == "root"
+                && !session.disable_files_md_auto_regenerate
+                && matches!(call.name.as_str(), "bash" | "write" | "edit");
             let pre_snapshot = watched.then(|| pre_call_snapshot(&call.name, call, ctx));
 
             let memory_path = (call.name == "read")
                 .then(|| call.arguments["path"].as_str())
                 .flatten()
                 .filter(|path| path.starts_with("memory://"));
-            let outcome = if let Some(path) = memory_path {
+            let conversation_path = (call.name == "read")
+                .then(|| call.arguments["path"].as_str())
+                .flatten()
+                .filter(|path| path.starts_with("conversation://"));
+            let outcome = if let Some(path) = conversation_path {
+                dispatch_conversation_read(
+                    session.persistence.as_ref(),
+                    call,
+                    path,
+                    events.as_ref(),
+                )
+            } else if let Some(path) = memory_path {
                 dispatch_memory_read(session.tool_memory.as_ref(), call, path, events.as_ref())
                     .await
             } else {
@@ -481,6 +579,7 @@ pub(crate) async fn run_loop(
                     spawn_concurrency,
                     spawn_write_concurrency,
                     events.clone(),
+                    child_workflow.clone(),
                     ctx,
                 )
                 .await
@@ -488,6 +587,19 @@ pub(crate) async fn run_loop(
 
             // `result` is exactly the body actually returned to the model
             // (on success) or the error text (on failure).
+            // A command can partially mutate files even if it returns an error.
+            // Existing verification cannot certify the resulting working tree.
+            let may_change_artifact = matches!(call.name.as_str(), "write" | "edit" | "bash")
+                || (call.name == "spawn"
+                    && call.arguments["tasks"].as_array().is_some_and(|tasks| {
+                        tasks.iter().any(|task| task["write_root"].is_string())
+                    }));
+            if may_change_artifact
+                && let Some(workflow) = &mut session.workflow
+                && let Some(verification) = &mut workflow.gates.verification
+            {
+                verification.stale = true;
+            }
             let result: &str = match &outcome {
                 Ok(body) => body.as_str(),
                 Err(msg) => msg.as_str(),
@@ -570,30 +682,104 @@ pub(crate) async fn run_loop(
                     session.push_tool_result(&call.id, &body);
                 }
                 Err(msg) => {
+                    session.push_tool_result(&call.id, &msg);
+                    session.check_persistence()?;
                     if let Some(r) = stop.observe_error(&msg) {
                         flush_directory_changes(
                             &mut pending_changes,
                             agent_types,
                             provider_pool.clone(),
                             audit.clone(),
+                            child_workflow.clone(),
                             ctx,
                         )
                         .await;
                         return Err(AgentError::Stopped(r));
                     }
-                    session.push_tool_result(&call.id, &msg);
                 }
             }
+            session.check_persistence()?;
         }
         flush_directory_changes(
             &mut pending_changes,
             agent_types,
             provider_pool.clone(),
             audit.clone(),
+            child_workflow.clone(),
             ctx,
         )
         .await;
     }
+}
+
+fn include_summary_usage(
+    mut main: polaris_provider::UsageReport,
+    before: polaris_provider::UsageReport,
+    after: polaris_provider::UsageReport,
+) -> polaris_provider::UsageReport {
+    main.usage.input_tokens = main.usage.input_tokens.saturating_add(
+        after
+            .usage
+            .input_tokens
+            .saturating_sub(before.usage.input_tokens),
+    );
+    main.usage.output_tokens = main.usage.output_tokens.saturating_add(
+        after
+            .usage
+            .output_tokens
+            .saturating_sub(before.usage.output_tokens),
+    );
+    main.usage.total_tokens = main.usage.total_tokens.saturating_add(
+        after
+            .usage
+            .total_tokens
+            .saturating_sub(before.usage.total_tokens),
+    );
+    main.usage.cached_tokens = main.usage.cached_tokens.saturating_add(
+        after
+            .usage
+            .cached_tokens
+            .saturating_sub(before.usage.cached_tokens),
+    );
+    main.reported_responses += after
+        .reported_responses
+        .saturating_sub(before.reported_responses);
+    main.missing_responses += after
+        .missing_responses
+        .saturating_sub(before.missing_responses);
+    main.failed_requests += after.failed_requests.saturating_sub(before.failed_requests);
+    main
+}
+
+fn dispatch_conversation_read(
+    saved: Option<&crate::session_store::PersistedSession>,
+    call: &polaris_provider::ToolCall,
+    path: &str,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+) -> Result<String, String> {
+    if let Some(tx) = events {
+        let _ = tx.send(crate::events::AgentEvent::ToolStarted {
+            name: "read".into(),
+            detail: call.arguments.to_string(),
+        });
+    }
+    let result = saved
+        .ok_or_else(|| "会話原文の永続保存が有効ではありません".to_string())
+        .and_then(|saved| {
+            saved.snapshot().map_err(|error| error.to_string())?;
+            crate::conversation_memory::read_source(&saved.store, &saved.database, path)
+                .map_err(|error| error.to_string())
+        });
+    if let Some(tx) = events {
+        let _ = tx.send(crate::events::AgentEvent::ToolFinished {
+            name: "read".into(),
+            detail: call.arguments.to_string(),
+            ok: result.is_ok(),
+            result: result.as_ref().map_or_else(Clone::clone, Clone::clone),
+            diff: None,
+        });
+    }
+    result
 }
 
 async fn dispatch_memory_read(
@@ -669,6 +855,7 @@ async fn dispatch(
     spawn_concurrency: usize,
     spawn_write_concurrency: usize,
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    workflow: Option<crate::spawn::ChildWorkflow>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<String, String> {
     if let Some(tx) = &events {
@@ -798,7 +985,7 @@ async fn dispatch(
             // Depth is fixed at 1 so this never recurses at runtime (a
             // subagent's tool list has no `spawn` in it), but the compiler
             // still has to give the future a finite size.
-            Ok(Box::pin(crate::spawn::run_wave(
+            Ok(Box::pin(crate::spawn::run_wave_scoped(
                 tasks,
                 agent_types,
                 provider_pool,
@@ -808,6 +995,7 @@ async fn dispatch(
                 spawn_concurrency,
                 spawn_write_concurrency,
                 events.clone(),
+                workflow,
             ))
             .await)
         }
@@ -949,6 +1137,139 @@ mod tests {
         turn_calls: std::sync::atomic::AtomicUsize,
     }
 
+    #[tokio::test]
+    async fn strict_history_keeps_ten_real_turns_and_never_archives_retrieval() {
+        use crate::conversation_memory::{
+            EmbeddingModel, StrictEmbedder, StrictHistory, StrictSummaryProvider, SummaryRequest,
+        };
+        use std::{future::Future, pin::Pin};
+        type Reply<'a, T> = Pin<Box<dyn Future<Output = std::io::Result<T>> + Send + 'a>>;
+        struct Summary;
+        impl StrictSummaryProvider for Summary {
+            fn summarize<'a>(&'a self, request: SummaryRequest) -> Reply<'a, String> {
+                Box::pin(async move {
+                    Ok(serde_json::json!({"facts":[format!("marker-{}", request.source_turn_id)],"decisions":[],"constraints":[],"corrections":[],"open_items":[],"source_turn_ids":[request.source_turn_id]}).to_string())
+                })
+            }
+        }
+        struct Embedding(EmbeddingModel);
+        impl StrictEmbedder for Embedding {
+            fn metadata(&self) -> &EmbeddingModel {
+                &self.0
+            }
+            fn embed_passage<'a>(&'a self, _: &'a str) -> Reply<'a, Vec<f32>> {
+                Box::pin(async { Ok(vec![1., 0., 0.]) })
+            }
+            fn embed_query<'a>(&'a self, _: &'a str) -> Reply<'a, Vec<Vec<f32>>> {
+                Box::pin(async { Ok(vec![vec![1., 0., 0.]]) })
+            }
+        }
+        struct Capture(Mutex<Vec<CompletionRequest>>);
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.0.lock().unwrap().push(request);
+                Ok(CompletionResponse {
+                    text: "recorded".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let saved = crate::session_store::PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "fixture",
+            crate::conversation_state::HistoryMode::Strict10,
+            None,
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.attach(saved.clone()).unwrap();
+        session.strict_history = Some(Arc::new(StrictHistory::new(
+            Arc::new(Summary),
+            Arc::new(Embedding(EmbeddingModel {
+                model: "fixture".into(),
+                revision: "1".into(),
+                dimension: 3,
+            })),
+        )));
+        // A low legacy threshold must not route strict10 through best-effort compaction.
+        session.compaction_threshold = Some(1);
+        let provider = Capture(Mutex::new(Vec::new()));
+        let always = crate::prompt::assemble_always_on("", "", &[]);
+        for turn in 1..=12 {
+            session.push_user(&format!("marker-{turn}"));
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            run(
+                &provider,
+                &mut session,
+                dummy_audit(&dir),
+                &mut StopTracker::new(2),
+                &always,
+                &[],
+                &[],
+                unused_provider_pool(),
+                1,
+                1,
+                None,
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+        }
+        let requests = provider.0.lock().unwrap();
+        assert_eq!(requests.len(), 12);
+        assert_eq!(
+            requests[9]
+                .messages
+                .iter()
+                .filter(|message| message.content.starts_with("marker-"))
+                .count(),
+            10
+        );
+        assert_eq!(
+            requests[11]
+                .messages
+                .iter()
+                .filter(|message| message.content.starts_with("marker-"))
+                .count(),
+            10
+        );
+        assert!(
+            requests[11]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("conversation://"))
+        );
+        let snapshot = saved.snapshot().unwrap();
+        assert_eq!(snapshot.events.len(), 24);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.starts_turn)
+                .count(),
+            12
+        );
+        assert_eq!(snapshot.state.visible_summary_ids.len(), 2);
+        assert!(
+            !snapshot
+                .events
+                .iter()
+                .any(|event| event.message.content.contains("conversation://"))
+        );
+    }
+
     #[async_trait::async_trait]
     impl Provider for TurnOnlyProvider {
         async fn complete(
@@ -966,9 +1287,94 @@ mod tests {
             self.turn_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: "done".into(),
                 ..Default::default()
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_is_injected_before_send_and_invalid_bindings_make_zero_calls() {
+        use crate::workflow::{SessionWorkflow, WorkflowConfig, WorkflowGatesV1, WorkflowStateV1};
+        struct Capture(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.0.lock().unwrap().push(request.system);
+                Ok(CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let provider = Capture(Mutex::new(Vec::new()));
+        for (enabled, reference, expected_ok) in [
+            (false, "user:missing", true),
+            (true, "builtin:workflow-core", true),
+            (true, "user:missing", false),
+        ] {
+            let mut session = Session::new();
+            session.workflow = Some(
+                SessionWorkflow::restore(
+                    WorkflowConfig {
+                        enabled,
+                        always: vec![reference.into()],
+                        ..Default::default()
+                    },
+                    WorkflowGatesV1::default(),
+                    WorkflowStateV1::default(),
+                )
+                .unwrap(),
+            );
+            session.push_user("question");
+            let mut stop = StopTracker::new(2);
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let before = provider.0.lock().unwrap().len();
+            let result = run(
+                &provider,
+                &mut session,
+                dummy_audit(&dir),
+                &mut stop,
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                None,
+                &mut ctx,
+            )
+            .await;
+            assert_eq!(result.is_ok(), expected_ok);
+            let captured = provider.0.lock().unwrap();
+            assert_eq!(captured.len() - before, usize::from(expected_ok));
+            if expected_ok {
+                if enabled {
+                    assert!(
+                        captured
+                            .last()
+                            .unwrap()
+                            .contains("Required workflow instructions")
+                    );
+                } else {
+                    assert_eq!(captured.last().unwrap(), always_on.system());
+                }
+            }
         }
     }
 
@@ -1037,6 +1443,8 @@ mod tests {
                 Err(polaris_provider::ProviderError::Http("boom".into()))
             } else {
                 Ok(CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "final reply".into(),
                     ..Default::default()
                 })
@@ -1105,6 +1513,7 @@ mod tests {
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             None,
+            None,
             &mut ctx,
         )
         .await
@@ -1145,6 +1554,7 @@ mod tests {
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             None,
+            None,
             &mut ctx,
         )
         .await
@@ -1184,6 +1594,7 @@ mod tests {
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             None,
+            None,
             &mut ctx,
         )
         .await
@@ -1208,6 +1619,8 @@ mod tests {
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -1217,6 +1630,8 @@ mod tests {
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "it was 1 line".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -1273,6 +1688,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp directory");
         let p = Scripted {
             replies: Mutex::new(vec![CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: "done".into(),
                 tool_calls: vec![],
                 ..Default::default()
@@ -1326,6 +1743,8 @@ mod tests {
         std::fs::write(&target, "hello\n").expect("cannot write");
 
         let fail_call = || CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c".into(),
@@ -1335,6 +1754,8 @@ mod tests {
             ..Default::default()
         };
         let ok_call = || CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c".into(),
@@ -1352,6 +1773,8 @@ mod tests {
                 ok_call(),
                 fail_call(),
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -1396,6 +1819,8 @@ mod tests {
     async fn stops_when_tool_fails_three_times() {
         let dir = tempfile::tempdir().expect("temp directory");
         let call = || CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c".into(),
@@ -1456,6 +1881,8 @@ mod tests {
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -1465,6 +1892,8 @@ mod tests {
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "read it".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -1528,6 +1957,8 @@ mod tests {
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -1537,6 +1968,8 @@ mod tests {
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "got it".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -1669,6 +2102,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -1678,6 +2113,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "wrote it".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -1752,6 +2189,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -1764,6 +2203,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "I'll write elsewhere instead".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -1868,6 +2309,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -1880,6 +2323,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "elsewhere".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -2025,6 +2470,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -2038,6 +2485,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "elsewhere".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -2158,6 +2607,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -2173,6 +2624,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -2186,7 +2639,7 @@ print("wrote")
         let audit = shared_audit(&dir.path().join("audit.jsonl"));
         let mut stop = StopTracker::new(10);
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
-        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
         let mut approver = RecordingApprover {
             decision: crate::approval::Decision::Allow,
             asked: 0,
@@ -2274,6 +2727,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -2286,6 +2741,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "wrote it".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -2368,6 +2825,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -2383,6 +2842,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "it was 1 line".into(),
                     tool_calls: vec![],
                     usage: Some(polaris_provider::Usage {
@@ -2449,6 +2910,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -2462,6 +2925,8 @@ print("wrote")
                     usage: None,
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "it was 1 line".into(),
                     ..Default::default()
                 },
@@ -2556,6 +3021,8 @@ print("wrote")
             let p = Scripted {
                 replies: Mutex::new(vec![
                     CompletionResponse {
+                        hosted_web_search: Vec::new(),
+                        url_citations: Vec::new(),
                         text: summary.into(),
                         usage: Some(polaris_provider::Usage {
                             input_tokens: 100,
@@ -2566,6 +3033,8 @@ print("wrote")
                         ..Default::default()
                     },
                     CompletionResponse {
+                        hosted_web_search: Vec::new(),
+                        url_citations: Vec::new(),
                         text: "done".into(),
                         usage: Some(polaris_provider::Usage {
                             input_tokens: 20,
@@ -2653,11 +3122,15 @@ print("wrote")
             replies: Mutex::new(vec![
                 // The summarization call compact() makes internally.
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "summary of turns before the kept tail".into(),
                     ..Default::default()
                 },
                 // The real turn's own response, sent after compaction.
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "final reply".into(),
                     ..Default::default()
                 },
@@ -2789,6 +3262,8 @@ print("wrote")
         // outcome as `run` itself.
         let p = Scripted {
             replies: Mutex::new(vec![CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: "hello from run_loop".into(),
                 tool_calls: vec![],
                 ..Default::default()
@@ -2865,6 +3340,8 @@ print("wrote")
         let p: Arc<dyn Provider> = Arc::new(Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -2885,6 +3362,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: subagent_result.clone(),
                     tool_calls: vec![],
                     usage: Some(polaris_provider::Usage {
@@ -2896,6 +3375,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "the subagent reported back".into(),
                     tool_calls: vec![],
                     usage: Some(polaris_provider::Usage {
@@ -3004,6 +3485,8 @@ print("wrote")
     ) -> Vec<CompletionResponse> {
         vec![
             CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: String::new(),
                 tool_calls: vec![ToolCall {
                     id: "sub-1".into(),
@@ -3013,6 +3496,8 @@ print("wrote")
                 ..Default::default()
             },
             CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: serde_json::json!({
                     "path": dir.join("files.md").display().to_string(),
                     "status": "ok"
@@ -3026,6 +3511,8 @@ print("wrote")
 
     fn bash_call(command: String) -> CompletionResponse {
         CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
@@ -3038,6 +3525,8 @@ print("wrote")
 
     fn final_text(s: &str) -> CompletionResponse {
         CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: s.into(),
             tool_calls: vec![],
             ..Default::default()
@@ -3137,6 +3626,99 @@ print("wrote")
     }
 
     #[tokio::test]
+    async fn disabled_root_regeneration_does_not_make_an_extra_files_md_request() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        let changed_file = sandbox.writable_roots()[0].join("changed.txt");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p: Arc<dyn Provider> = Arc::new(BashThenAlwaysOk {
+            command: format!("echo changed > {}", changed_file.display()),
+            calls: calls.clone(),
+        });
+        let logs = tempfile::tempdir().expect("temp directory");
+        let audit_path = logs.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut session = Session::new();
+        session.disable_files_md_auto_regenerate = true;
+        session.push_user("change a file");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: std::path::Path::new("/bin/true"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+
+        let out = run(
+            p.as_ref(),
+            &mut session,
+            audit,
+            &mut stop,
+            &always_on,
+            &[],
+            &[files_md_writer_agent_type()],
+            p.clone(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
+            &mut ctx,
+        )
+        .await
+        .expect("the root loop failed");
+
+        assert_eq!(out.text, r#"{"path":"files.md","status":"ok"}"#);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "only the root tool turn and its normal continuation may call the provider"
+        );
+        let log = std::fs::read_to_string(&audit_path).expect("cannot read the log");
+        assert!(
+            !log.contains("files-md-writer"),
+            "disabled automatic regeneration started a files-md-writer: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_files_md_writer_spawn_remains_eligible_when_auto_regeneration_is_disabled() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("policy");
+        let output_path = sandbox.writable_roots()[0].join("files.md");
+        let p: Arc<dyn Provider> = Arc::new(Scripted {
+            replies: Mutex::new(vec![final_text(
+                &serde_json::json!({ "path": output_path, "status": "ok" }).to_string(),
+            )]),
+        });
+        let logs = tempfile::tempdir().expect("temp directory");
+        let outcome = crate::spawn::run_one(
+            &crate::spawn::SpawnTask {
+                agent_type: "files-md-writer".into(),
+                task: "write the requested file map".into(),
+                write_root: Some(sandbox.writable_roots()[0].display().to_string()),
+            },
+            &[files_md_writer_agent_type()],
+            p,
+            shared_audit(&logs.path().join("audit.jsonl")),
+            &sandbox,
+            std::path::Path::new("/bin/true"),
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, crate::spawn::TaskOutcome::Ok(_)));
+    }
+
+    #[tokio::test]
     async fn a_root_write_into_a_not_yet_existing_directory_regenerates_for_that_new_directory() {
         // `polaris_sandbox`'s helper runs `create_dir_all` before writing,
         // so a `write` to `sub/new.txt` genuinely creates `sub`. Watching
@@ -3164,6 +3746,8 @@ print("wrote")
         assert!(!sub.exists(), "the directory must not exist beforehand");
 
         let mut replies = vec![CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
@@ -3241,6 +3825,8 @@ print("wrote")
         .unwrap();
         let p: Arc<dyn Provider> = Arc::new(Scripted {
             replies: Mutex::new(vec![CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: serde_json::json!({"path": dir.join("files.md"), "status": "ok"}).to_string(),
                 usage: Some(polaris_provider::Usage {
                     input_tokens: 10,
@@ -3272,6 +3858,7 @@ print("wrote")
             &[files_md_writer_agent_type()],
             measured.clone(),
             audit.clone(),
+            None,
             &mut ctx,
         )
         .await;
@@ -3283,6 +3870,7 @@ print("wrote")
             &[files_md_writer_agent_type()],
             measured,
             audit,
+            None,
             &mut ctx,
         )
         .await;
@@ -3309,6 +3897,8 @@ print("wrote")
         std::fs::write(sub.join("files.md"), "existing map").unwrap();
 
         let mut replies = vec![CompletionResponse {
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
@@ -3733,6 +4323,8 @@ print("wrote")
         let dir = tempfile::tempdir().expect("temp directory");
         let p = Scripted {
             replies: Mutex::new(vec![CompletionResponse {
+                hosted_web_search: Vec::new(),
+                url_citations: Vec::new(),
                 text: "done".into(),
                 tool_calls: vec![],
                 usage: None,
@@ -3782,6 +4374,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -3793,6 +4387,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -3854,6 +4450,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -3865,6 +4463,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -3921,6 +4521,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -3930,6 +4532,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -3992,6 +4596,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -4004,6 +4610,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -4107,6 +4715,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -4119,6 +4729,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -4186,6 +4798,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -4198,6 +4812,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -4265,6 +4881,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -4278,6 +4896,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -4363,6 +4983,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -4375,6 +4997,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "it failed".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -4451,6 +5075,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -4463,6 +5089,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "I'll write elsewhere instead".into(),
                     tool_calls: vec![],
                     ..Default::default()
@@ -4527,6 +5155,8 @@ print("wrote")
         let p = Scripted {
             replies: Mutex::new(vec![
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -4536,6 +5166,8 @@ print("wrote")
                     ..Default::default()
                 },
                 CompletionResponse {
+                    hosted_web_search: Vec::new(),
+                    url_citations: Vec::new(),
                     text: "done".into(),
                     tool_calls: vec![],
                     ..Default::default()

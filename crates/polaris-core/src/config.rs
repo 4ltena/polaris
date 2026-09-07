@@ -7,6 +7,13 @@ use serde::Deserialize;
 /// The merged configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Strict history is opt-in and requires a pinned local embedding backend.
+    pub history_mode: crate::conversation_state::HistoryMode,
+    pub embedding: EmbeddingConfig,
+    /// Built-in workflow skills are enabled unless configuration explicitly opts out.
+    pub workflow: crate::workflow::WorkflowConfig,
+    /// Whether root tool mutations automatically regenerate affected `files.md` maps.
+    pub files_md_auto_regenerate: bool,
     /// Additional places to look for skills. Not included in the 2 default locations.
     pub skills_paths: Vec<PathBuf>,
     /// Additional places to look for subagent types. Not included in the 2 default locations
@@ -27,6 +34,19 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            history_mode: crate::conversation_state::HistoryMode::Legacy,
+            embedding: EmbeddingConfig::default(),
+            workflow: crate::workflow::WorkflowConfig {
+                enabled: true,
+                always: vec!["builtin:workflow-core".into()],
+                phase_skills: crate::workflow::Phase::ALL
+                    .into_iter()
+                    .filter(|phase| *phase != crate::workflow::Phase::General)
+                    .map(|phase| (phase, vec![format!("builtin:{phase}")]))
+                    .collect(),
+                ..Default::default()
+            },
+            files_md_auto_regenerate: true,
             skills_paths: Vec::new(),
             agents_paths: Vec::new(),
             spawn_concurrency: crate::spawn::DEFAULT_CONCURRENCY,
@@ -37,12 +57,44 @@ impl Default for Config {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
+    history_mode: Option<crate::conversation_state::HistoryMode>,
+    #[serde(default)]
+    embedding: EmbeddingConfig,
+    #[serde(default)]
+    workflow: RawWorkflow,
+    #[serde(default)]
+    files_md: RawFilesMd,
     #[serde(default)]
     skills: RawSkills,
     #[serde(default)]
     agents: RawAgents,
     #[serde(default)]
     spawn: RawSpawn,
+}
+
+/// Explicit, local-only embedding runtime. No downloads occur during a turn.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    pub runtime: Option<PathBuf>,
+    pub model_path: Option<PathBuf>,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkflow {
+    enabled: Option<bool>,
+    initial_phase: Option<crate::workflow::Phase>,
+    always: Option<Vec<String>>,
+    phase_skills: Option<std::collections::BTreeMap<crate::workflow::Phase, Vec<String>>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFilesMd {
+    /// `None` inherits the prior stage; the default remains enabled.
+    auto_regenerate: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -119,6 +171,39 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
     let mut merged = Config::default();
     for path in [global, project].into_iter().flatten() {
         if let Some(raw) = read_one(path)? {
+            if let Some(mode) = raw.history_mode {
+                merged.history_mode = mode;
+            }
+            if raw.embedding.runtime.is_some() {
+                merged.embedding.runtime = raw.embedding.runtime;
+            }
+            if raw.embedding.model_path.is_some() {
+                merged.embedding.model_path = raw.embedding.model_path;
+            }
+            if raw.embedding.revision.is_some() {
+                merged.embedding.revision = raw.embedding.revision;
+            }
+            if let Some(enabled) = raw.workflow.enabled {
+                merged.workflow.enabled = enabled;
+            }
+            if let Some(phase) = raw.workflow.initial_phase {
+                merged.workflow.initial_phase = phase;
+            }
+            if let Some(always) = raw.workflow.always {
+                merged.workflow.always = always;
+            }
+            if let Some(phases) = raw.workflow.phase_skills {
+                // An explicit empty map clears all inherited stage bindings.
+                // Nonempty maps override their named phases only, including [].
+                if phases.is_empty() {
+                    merged.workflow.phase_skills.clear();
+                } else {
+                    merged.workflow.phase_skills.extend(phases);
+                }
+            }
+            if let Some(auto_regenerate) = raw.files_md.auto_regenerate {
+                merged.files_md_auto_regenerate = auto_regenerate;
+            }
             if let Some(paths) = raw.skills.paths {
                 merged.skills_paths = paths;
             }
@@ -155,6 +240,123 @@ pub fn load(project_root: &Path) -> Result<Config, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_defaults_resolve_builtin_skills_for_every_phase() {
+        use crate::workflow::{Phase, SessionWorkflow, WORKFLOW_TOKEN_LIMIT};
+        let config = try_load_from(None, None).unwrap();
+        assert!(config.workflow.enabled);
+        assert_eq!(
+            config.history_mode,
+            crate::conversation_state::HistoryMode::Legacy
+        );
+        assert_eq!(config.embedding, EmbeddingConfig::default());
+        assert_eq!(config.workflow.initial_phase, Phase::General);
+        let runtime = SessionWorkflow::new(config.workflow);
+        for phase in Phase::ALL {
+            runtime.request_phase(phase).unwrap();
+            let turn = runtime.begin_turn(&[]).unwrap();
+            let mut expected = vec!["builtin:workflow-core".to_string()];
+            if phase != Phase::General {
+                expected.push(format!("builtin:{phase}"));
+            }
+            assert_eq!(turn.ids, expected);
+            assert!(turn.tokens <= WORKFLOW_TOKEN_LIMIT);
+        }
+    }
+
+    #[test]
+    fn workflow_opt_out_is_inherited_and_can_be_overridden() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let gp = write(global.path(), "[workflow]\nenabled = false\n");
+        let pp = write(project.path(), "[workflow]\ninitial_phase = 'review'\n");
+        assert!(
+            !try_load_from(Some(&gp), Some(&pp))
+                .unwrap()
+                .workflow
+                .enabled
+        );
+        let pp = write(project.path(), "[workflow]\nenabled = true\n");
+        assert!(
+            try_load_from(Some(&gp), Some(&pp))
+                .unwrap()
+                .workflow
+                .enabled
+        );
+        let pp = write(project.path(), "[workflow]\nenabled = false\n");
+        assert!(!try_load_from(None, Some(&pp)).unwrap().workflow.enabled);
+        let pp = write(
+            project.path(),
+            "[workflow]\nalways = []\nphase_skills = {}\n",
+        );
+        let cleared = try_load_from(None, Some(&pp)).unwrap();
+        assert!(cleared.workflow.enabled);
+        assert!(cleared.workflow.always.is_empty());
+        assert!(cleared.workflow.phase_skills.is_empty());
+    }
+
+    #[test]
+    fn workflow_inherits_missing_keys_and_clears_explicit_empty_values() {
+        use crate::workflow::Phase;
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let gp = write(
+            global.path(),
+            "[workflow]\nenabled = true\ninitial_phase = 'implement'\nalways = ['core']\n[workflow.phase_skills]\nreview = ['reviewer']\nverify = ['tests']\n",
+        );
+        let pp = write(
+            project.path(),
+            "[workflow]\nalways = []\n[workflow.phase_skills]\nreview = []\n",
+        );
+        let config = try_load_from(Some(&gp), Some(&pp)).unwrap();
+        assert!(config.workflow.enabled);
+        assert_eq!(config.workflow.initial_phase, Phase::Implement);
+        assert!(config.workflow.always.is_empty());
+        assert!(config.workflow.phase_skills[&Phase::Review].is_empty());
+        assert_eq!(config.workflow.phase_skills[&Phase::Verify], vec!["tests"]);
+        let pp = write(
+            project.path(),
+            "[workflow]\nenabled = false\nphase_skills = {}\n",
+        );
+        let config = try_load_from(Some(&gp), Some(&pp)).unwrap();
+        assert!(!config.workflow.enabled);
+        assert!(config.workflow.phase_skills.is_empty());
+        assert_eq!(config.workflow.always, vec!["core"]);
+    }
+
+    #[test]
+    fn workflow_rejects_unknown_phase_or_misspelled_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        for body in [
+            "[workflow]\ninitial_phase = 'auto'",
+            "[workflow]\nenabeld = true",
+            "[workflow.phase_skills]\nauto = []",
+        ] {
+            let path = write(dir.path(), body);
+            assert!(try_load_from(None, Some(&path)).is_err());
+        }
+    }
+
+    #[test]
+    fn files_md_auto_regenerate_defaults_true_and_project_overrides_global() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let global_path = write(global.path(), "[files_md]\nauto_regenerate = false\n");
+        let project_path = write(project.path(), "# inherit files_md\n");
+        assert!(Config::default().files_md_auto_regenerate);
+        assert!(
+            !try_load_from(Some(&global_path), Some(&project_path))
+                .unwrap()
+                .files_md_auto_regenerate
+        );
+        let project_path = write(project.path(), "[files_md]\nauto_regenerate = true\n");
+        assert!(
+            try_load_from(Some(&global_path), Some(&project_path))
+                .unwrap()
+                .files_md_auto_regenerate
+        );
+    }
 
     fn write(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         let p = dir.join("config.toml");

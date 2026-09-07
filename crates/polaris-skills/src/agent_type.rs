@@ -24,6 +24,8 @@ pub struct AgentType {
     pub tier: String,
     pub wall_seconds: u32,
     pub max_turns: u32,
+    /// Explicit role focus from the local type definition, never task prose.
+    pub workflow_phase: Option<String>,
     pub continuation: bool,
     pub output_schema: PathBuf,
 }
@@ -191,6 +193,25 @@ pub fn parse(text: &str, dir_name: &str, dir_path: &Path) -> Result<AgentType, A
             });
         }
     };
+    let workflow_phase = metadata.get("polaris-phase").cloned();
+    if let Some(phase) = &workflow_phase
+        && ![
+            "general",
+            "brainstorm",
+            "specify",
+            "implement",
+            "review",
+            "verify",
+            "deliver",
+        ]
+        .contains(&phase.as_str())
+    {
+        return Err(AgentTypeError::InvalidMetadataValue {
+            agent: dir_name.into(),
+            key: "polaris-phase",
+            value: phase.clone(),
+        });
+    }
     // `polaris-output` names a file the *parent* process later reads and
     // feeds to a JSON Schema validator, so where it is allowed to point is
     // a trust boundary, not a convenience. `Path::join` replaces the whole
@@ -218,6 +239,7 @@ pub fn parse(text: &str, dir_name: &str, dir_path: &Path) -> Result<AgentType, A
         tier,
         wall_seconds,
         max_turns,
+        workflow_phase,
         continuation,
         output_schema,
     })

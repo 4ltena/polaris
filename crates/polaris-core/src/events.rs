@@ -5,6 +5,12 @@
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    WorkflowResolved {
+        phase: String,
+        skill_ids: Vec<String>,
+        changed_skill_ids: Vec<String>,
+        manifest_hash: String,
+    },
     ToolStarted {
         name: String,
         detail: String,

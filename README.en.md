@@ -8,99 +8,80 @@
 </p>
 
 <p align="center">
-  <strong>v0.10.0 “Algedi”</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
+  <strong>v0.11.0 “Sadalmelik”</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
 </p>
 
 <p align="center">
   <a href="README.md" lang="ja">日本語</a> · <strong>English</strong>
 </p>
 
-Polaris is a Rust CLI/TUI coding agent that keeps always-on instructions and tool definitions small, retrieving additional material when needed. It supports conversation compaction, local archival of pre-compaction history, and storage and retrieval of large tool results.
+Polaris is a Rust CLI/TUI agent that sends the model the instructions and material needed for the current task. Its built-in workflow records the working phase and loads shared rules and phase-required skills separately from ordinary skill search.
+
+## Comparison with stock Codex
+
+Eight synthetic task types cover planning, requirements, data design, implementation planning, and plan review. Both tools requested `gpt-6-astra` with `medium` effort. The table totals 16 matched trials with two turns each; Polaris had workflow enabled.
+
+| Metric | Polaris | Stock Codex CLI 0.153.4 | Reduction |
+| --- | ---: | ---: | ---: |
+| Total tokens | **99,530** | 493,518 | **79.8%** |
+| Hypothetical API cost | **$2.46658** | $4.16582 | **40.8%** |
+| Quality checks | 16/16 passed | 16/16 passed | — |
+
+Total tokens include input and output; cached input is already part of input. Cost uses API prices frozen in the measurement specification, not actual Codex billing. These short synthetic tasks were measured at different times and do not establish reductions for general coding work or long conversations. See the [method, quality checks, timing, and limitations](docs/preimplementation-evaluation.md).
 
 ## Getting started
 
-Install Rust 1.96.0, pinned in `rust-toolchain.toml`, and build:
+Install Rust 1.96.0, build, and authenticate with a ChatGPT subscription.
 
 ```sh
 cargo build --release
-POLARIS_API_KEY=sk-... target/release/polaris -p "How many lines are in Cargo.toml?"
-```
-
-During development, use `cargo run -p polaris-cli -- -p "..."`. Omit `--prompt` to start the interactive TUI.
-
-To use a ChatGPT subscription, sign in first:
-
-```sh
 target/release/polaris login
 POLARIS_PROVIDER=codex target/release/polaris -p "How many lines are in Cargo.toml?"
 ```
 
-The default model is `gpt-6-astra` with `medium` reasoning effort. To select them explicitly, pass the model and effort separately:
+Omit `-p` to start the interactive TUI. During development, use `cargo run -p polaris-cli -- -p "..."`. The default model is `gpt-6-astra`, with `medium` reasoning effort.
+
+Use `--phase` to choose the starting phase:
 
 ```sh
-POLARIS_PROVIDER=codex POLARIS_MODEL=gpt-6-astra target/release/polaris --effort medium -p "How many lines are in Cargo.toml?"
+POLARIS_PROVIDER=codex target/release/polaris --phase specify -p "Define acceptance criteria for an equipment lending service"
 ```
 
-See the [usage guide](docs/usage.md) for providers, audit logs, sandboxing, the TUI, saved conversations, and subcommands. The detailed documentation linked below is currently in Japanese.
+The API-key `openai` provider currently uses Chat Completions and does not support Astra tool calling, which requires the Responses API. See the [usage guide](docs/usage.md) for authentication, configuration, and resuming conversations.
 
-## Core behavior
+## Core features
 
-- Always-on context is limited to 990 tokens with the reference tokenizer `o200k_base`, with at most six tools. Tests measure the serialized wire format.
-- Skill catalogs are not expanded into every request. The `skill` tool searches them when needed. Conversation history, retrieved material, tool results, and loaded skill bodies are outside the fixed budget.
-- `--tool-memory off|history|retrieval` controls retention of large tool results. It defaults to `off` and is independent of `--remember`, which archives pre-compaction history.
-- `retrieval` searches the stored original by keyword and retrieves selected lines or paragraphs. Semantic search is enabled only when a local embedding URL and model are explicitly configured.
-- `spawn` runs independent subagents in one wave and validates their output against each agent type's JSON Schema. Delegation depth is limited to one.
+- **Phase-aware workflow:** Shared and phase-required skills are fixed for each turn. Ordinary skill search remains available on demand without expanding the entire catalog into every request.
+- **Small base context:** Base instructions and at most six tool definitions stay within 990 tokens under `o200k_base`. Workflow skills and identifying wrappers have a separate 384-token budget. History, retrieved material, and tool results are outside this fixed budget.
+- **Retention and retrieval:** Large tool results can be stored and retrieved by selected lines or paragraphs. Enable this with `--tool-memory history|retrieval`.
+- **Conversation continuity:** Saved conversations preserve workflow state across resume and fork. Subagents run in one parallel wave with output validated against per-type schemas.
 
-The fixed context budget is not a cap on total input: history, retrieved material, and tool results add to each request. Retained results are snapshots from the time they were obtained. Read the ordinary file path when current contents are needed.
-
-See [context efficiency](docs/context-efficiency.md) for storage, retrieval URIs, compaction, and measurement, and [subagents](docs/subagents.md) for configuration and constraints.
-
-## Changes in v0.10.0
-
-- Added searches within a retained tool-result record, filemap guidance, and support for communication and authentication in isolated environments.
-- Unified the default model and reasoning effort as `gpt-6-astra` and `medium`.
-- Added opt-in cache experiments that preserve request content, plus quality checks covering long conversations, skill and tool counts, and example counts. `POLARIS_CACHE_PACING=on` spaces model request starts at least five seconds apart. It defaults to `off`.
-
-In one completed 36-turn pair, total token usage was identical while the cache rate increased from 54.11% to 63.83% and hypothetical API cost fell by 15.38%. Another task's control run stopped on a quality failure, so the complete comparison and reproducibility remain unverified. See the [conditions, results, and limitations](docs/gpt6-cache-pacing-results.md).
+v0.11.0 “Sadalmelik” adopts workflow by default and adds durable conversation state, resume, and fork. The recent-ten-turn `strict10` mode with summary retrieval and cache request pacing remain opt-in. Real-model evaluation of strict10 is incomplete, and Web search cannot be enabled in the current CLI; see the [validation report](docs/sadalmelik-validation.md) for requirements and limits, and the [changelog](CHANGELOG.md) for release history.
 
 ## Documentation
 
-The following detailed documents are in Japanese.
+The detailed documents below are in Japanese.
 
 | Document | Contents |
 | --- | --- |
-| [Usage guide](docs/usage.md) | Building, authentication, audit logs, TUI, conversations, and slash commands. |
-| [Context efficiency](docs/context-efficiency.md) | Compaction, archival, retrieval, embeddings, and measurement. |
-| [Subagents](docs/subagents.md) | `spawn` configuration, agent types, output schemas, and execution limits. |
-| [Testing](docs/testing.md) | Fixed-context checks and manual TUI verification. |
-| [Large skill/plugin comparison](docs/skill-scaling-benchmark.md) | Earlier measurements of initial input and elapsed time. |
-| [GPT-6 medium measurements](docs/gpt6-efficiency-results.md) | Synthetic tasks, comparison with Codex CLI, and measurement limits. |
-| [Cache and quality checks](docs/gpt6-cache-affinity-results.md) | Transport changes preserving content, long conversations, and varying skill, tool, and example counts. |
-| [Request pacing and caching](docs/gpt6-cache-pacing-results.md) | An experiment changing request spacing without changing request content. |
-
-## Comparison with Codex CLI
-
-At v0.9.0, Codex CLI and a Polaris candidate were each run three times with the same synthetic material, prompt, and GPT-6 medium model. Codex retained the user's configuration and skills from the measurement environment.
-
-| Metric (three runs combined) | Codex CLI | Polaris | Reduction |
-| --- | ---: | ---: | ---: |
-| Total tokens | 612,027 | 38,620 | 93.7% |
-| Elapsed time | 93.678 s | 72.096 s | 23.0% |
-| Answer and scope checks | 3/3 passed | 3/3 passed | — |
-
-Total tokens are input plus output; cached tokens are already part of input. This is not a cost comparison. The runs used one synthetic task at different times; these reductions do not establish performance for v0.10.0 as a whole or for general coding work. See the [details and limitations](docs/gpt6-efficiency-results.md).
-
-In an earlier large skill/plugin comparison, Polaris used 547 input tokens on the first request. That figure was API-reported usage at the time, not a measurement of the current fixed context. See the [measurement conditions and tables](docs/skill-scaling-benchmark.md).
+| [Usage guide](docs/usage.md) | Authentication, configuration, workflow, TUI, resume, and fork. |
+| [Context efficiency](docs/context-efficiency.md) | Compaction, archival, retrieval, embeddings, and strict10. |
+| [Subagents](docs/subagents.md) | Parallel execution, schemas, and execution limits. |
+| [Preimplementation measurements](docs/preimplementation-evaluation.md) | Planning quality and the stock Codex comparison. |
+| [v0.11.0 validation](docs/sadalmelik-validation.md) | Control tests, real-model tests, and unverified behavior. |
+| [Testing](docs/testing.md) | Automated checks and manual TUI verification. |
+| [Earlier GPT-6 measurements](docs/gpt6-efficiency-results.md) | Synthetic tasks and measurement conditions at v0.9.0. |
+| [Large skill/plugin comparison](docs/skill-scaling-benchmark.md) | Conditions behind the earlier 547-token initial input. |
+| [Request pacing and caching](docs/gpt6-cache-pacing-results.md) | The v0.10.0 long-conversation cache experiment. |
+| [Codex update investigation](docs/codex-update-efficiency.md) | Public changes and control of automatic model requests. |
 
 ## Development and verification
 
 ```sh
+cargo test --locked --offline --workspace
+cargo clippy --locked --offline --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-cargo test --locked --offline -p polaris-core budget
-cargo test --locked --offline -p polaris-cli tool_memory_defaults_off_and_is_independent_of_remember
 ```
-
-See [testing](docs/testing.md) for coverage, manual TUI checks, and environment-dependent limitations.
 
 ## License
 

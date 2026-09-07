@@ -18,8 +18,10 @@ mod cache_prefix;
 #[path = "codex_metrics.rs"]
 mod metrics;
 
+use crate::attempts::{AttemptLedger, LogicalRequest};
 use crate::cache_pacing::{Gate as PacingGate, Mode as PacingMode};
 use crate::turn_affinity::{TurnAffinityMode, TurnContext, TurnIdentity};
+use crate::web_search::{WebSearchConfig, parse_hosted_web_search_item, parse_url_citations};
 use crate::{
     CompletionRequest, CompletionResponse, Message, Provider, ProviderError, ReasoningItem, Role,
     ToolCall, sse,
@@ -130,6 +132,22 @@ pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) ->
     build_body_with_instructions(model, req, &req.system, effort)
 }
 
+/// Adds hosted web search only after the selected endpoint has been verified
+/// against the complete bounded Responses contract. The disabled configuration
+/// returns the historical `build_body` result unchanged.
+pub fn build_body_with_web_search(
+    model: &str,
+    req: &CompletionRequest,
+    effort: Option<&str>,
+    config: WebSearchConfig,
+) -> Result<Value, ProviderError> {
+    let mut body = build_body(model, req, effort);
+    config
+        .apply_to_body(&mut body)
+        .map_err(|error| ProviderError::Unsupported(error.to_string()))?;
+    Ok(body)
+}
+
 fn build_body_with_instructions(
     model: &str,
     req: &CompletionRequest,
@@ -148,9 +166,9 @@ fn build_body_with_instructions(
         "model": model,
         "instructions": instructions,
         "input": input_items(&req.messages),
-        // Never let the server hold conversation state. Send the full
-        // text every turn. What's sent and what's measured then match,
-        // and the prefix never shifts under us.
+        // Do not request stored response state. Send the locally assembled
+        // history explicitly; store:false does not itself guarantee a stable
+        // prefix or reduce billed input tokens.
         "store": false,
         "stream": true,
         // Added 2026-08-25 on the strength of a two-turn run that showed
@@ -162,10 +180,8 @@ fn build_body_with_instructions(
         // larger response payload, but its necessity for caching is no
         // longer something this code can claim as measured.
         "include": ["reasoning.encrypted_content"],
-        // Points the backend at the shard already holding this prefix.
-        // `store: false` keeps the prefix stable, but stability alone
-        // doesn't help if each turn is routed somewhere else — see
-        // `crate::cache_key`.
+        // Routing hint combined with the backend's prefix hash. It neither
+        // pins a machine nor guarantees a cache hit; see `crate::cache_key`.
         "prompt_cache_key": crate::cache_key(model, effort, &effective_req),
     });
     let tools = tool_wire_shape(&req.tools);
@@ -188,6 +204,8 @@ pub struct Folder {
     completed: bool,
     usage: Option<crate::Usage>,
     reasoning: Vec<ReasoningItem>,
+    hosted_web_search: Vec<crate::web_search::HostedWebSearchItem>,
+    url_citations: Vec<crate::web_search::UrlCitation>,
     metrics_usage: metrics::TokenUsage,
     cancelled: bool,
 }
@@ -207,6 +225,8 @@ impl Folder {
             completed: false,
             usage: None,
             reasoning: Vec::new(),
+            hosted_web_search: Vec::new(),
+            url_citations: Vec::new(),
             metrics_usage: metrics::TokenUsage::default(),
             cancelled: false,
         }
@@ -276,6 +296,12 @@ impl Folder {
     }
 
     fn take_item(&mut self, v: &Value) -> Result<(), ProviderError> {
+        if let Some(item) = parse_hosted_web_search_item(v)
+            .map_err(|error| ProviderError::Decode(error.to_string()))?
+        {
+            self.hosted_web_search.push(item);
+            return Ok(());
+        }
         let Some(item) = v.get("item") else {
             return Ok(());
         };
@@ -287,6 +313,7 @@ impl Folder {
             "message" => {
                 if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
                     for p in parts {
+                        self.url_citations.extend(parse_url_citations(p));
                         if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
                             self.text.push_str(t);
                         }
@@ -355,6 +382,8 @@ impl Folder {
             tool_calls: self.tool_calls,
             reasoning: self.reasoning,
             usage: self.usage,
+            hosted_web_search: self.hosted_web_search,
+            url_citations: self.url_citations,
         })
     }
 }
@@ -382,6 +411,10 @@ pub struct CodexProvider {
     cache_prefix: cache_prefix::CachePrefixProfile,
     turn_affinity: TurnAffinityMode,
     pacing: PacingGate,
+    attempt_ledger: Option<AttemptLedger>,
+    web_search: WebSearchConfig,
+    request_caps: Option<crate::attempts::RequestCaps>,
+    visible_request_byte_limit: Option<usize>,
 }
 
 impl CodexProvider {
@@ -431,7 +464,57 @@ impl CodexProvider {
             cache_prefix: cache_prefix::CachePrefixProfile::from_env()?,
             turn_affinity,
             pacing: PacingGate::new(PacingMode::from_env()?),
+            attempt_ledger: None,
+            web_search: WebSearchConfig::default(),
+            request_caps: None,
+            visible_request_byte_limit: None,
         })
+    }
+
+    /// Attaches physical HTTP-attempt observation to this transport.
+    /// Without this hook, request bytes and behavior remain unchanged.
+    pub fn with_attempt_ledger(mut self, ledger: AttemptLedger) -> Self {
+        self.attempt_ledger = Some(ledger);
+        self
+    }
+
+    pub fn with_request_caps(mut self, caps: crate::attempts::RequestCaps) -> Self {
+        self.request_caps = Some(caps);
+        self
+    }
+
+    /// Rejects a final serialized request body above this UTF-8 byte limit.
+    /// This bounds visible request bytes only; it does not claim a token cap.
+    pub fn with_visible_request_byte_limit(mut self, limit: usize) -> Self {
+        self.visible_request_byte_limit = Some(limit);
+        self
+    }
+
+    fn validate_optional_contracts(&self) -> Result<(), ProviderError> {
+        if let Some(caps) = self.request_caps {
+            caps.validate()?;
+            if self.attempt_ledger.is_none() {
+                return Err(ProviderError::Budget(
+                    "bounded requests need an attempt ledger".into(),
+                ));
+            }
+            if self.web_search.policy != crate::web_search::WebSearchPolicy::Disabled
+                && caps.max_hosted_actions == 0
+            {
+                return Err(ProviderError::Budget(
+                    "hosted actions need a reservation".into(),
+                ));
+            }
+        }
+        self.web_search
+            .apply_to_body(&mut serde_json::json!({}))
+            .map_err(|e| ProviderError::Unsupported(e.to_string()))
+    }
+
+    /// Configures hosted web search without changing `CompletionRequest`.
+    pub fn with_web_search_config(mut self, config: WebSearchConfig) -> Self {
+        self.web_search = config;
+        self
     }
 
     /// Sends a single request and folds the SSE. A 401 is not folded
@@ -450,6 +533,8 @@ impl CodexProvider {
         token: &crate::Token,
         req: &CompletionRequest,
         turn: Option<&TurnContext>,
+        logical: Option<&LogicalRequest>,
+        retry_reason: Option<&str>,
     ) -> Result<CompletionResponse, ProviderError> {
         let model = self.model.read().expect("model lock poisoned").clone();
         let override_effort = self
@@ -460,8 +545,26 @@ impl CodexProvider {
         let effort = override_effort.as_deref().or(token.effort.as_deref());
         let instructions = self.cache_prefix.instructions(&model, req);
         let mut body = build_body_with_instructions(&model, req, &instructions, effort);
+        self.web_search
+            .apply_to_body(&mut body)
+            .map_err(|error| ProviderError::Unsupported(error.to_string()))?;
         metrics::apply_namespace(&mut body, self.cache_namespace.as_deref())?;
         metrics::apply_cache_mode(&mut body, self.cache_mode.as_deref())?;
+        let reservation = self
+            .request_caps
+            .map(|caps| caps.apply(&mut body))
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(limit) = self.visible_request_byte_limit {
+            let bytes = serde_json::to_vec(&body)
+                .map_err(|error| ProviderError::Budget(error.to_string()))?
+                .len();
+            if bytes > limit {
+                return Err(ProviderError::Budget(
+                    "visible request exceeds UTF-8 byte limit".into(),
+                ));
+            }
+        }
         let prefix_diagnostics = self.cache_prefix.diagnostics(&model, req);
         let mut metric = metrics::RequestMetric::from_env(&body, prefix_diagnostics)?;
         let identity = TurnIdentity {
@@ -482,6 +585,7 @@ impl CodexProvider {
             metric.defer_dispatch();
             metric.turn_affinity(self.turn_affinity, turn.is_some(), sent.is_some(), false);
         }
+        let mut attempt_guard = None;
         let result = async {
             let mut request = self
                 .client
@@ -505,6 +609,16 @@ impl CodexProvider {
                     dispatch.offset,
                 );
             }
+            // Start only after pacing grants this dispatch and immediately before
+            // reqwest polls the HTTP request. Drop records cancellation from here.
+            attempt_guard = match (&self.attempt_ledger, logical) {
+                (Some(ledger), Some(logical)) => Some(
+                    ledger
+                        .begin_attempt(logical, &identity.model, retry_reason, reservation)
+                        .map_err(|error| ProviderError::Budget(error.to_string()))?,
+                ),
+                _ => None,
+            };
             let resp = request.send().await.map_err(|e| {
                 if let Some(metric) = metric.as_mut() {
                     metric.transport_cause = Some(metrics::transport_cause(&e));
@@ -594,6 +708,9 @@ impl CodexProvider {
             Ok(completed)
         }
         .await;
+        if let Some(guard) = attempt_guard.as_mut() {
+            guard.finish(&result);
+        }
         if let Some(metric) = metric.as_mut() {
             metric.finish(&result);
         }
@@ -604,12 +721,28 @@ impl CodexProvider {
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
+        self.validate_optional_contracts()?;
+        let logical = self
+            .attempt_ledger
+            .as_ref()
+            .map(AttemptLedger::begin_logical);
         let token = self.tokens.token().await?;
-        match self.attempt(&token, &req, None).await {
+        match self
+            .attempt(&token, &req, None, logical.as_ref(), None)
+            .await
+        {
             Err(ProviderError::Auth(_)) => {
                 // Exactly once. Never retry indefinitely.
                 let token = self.tokens.refreshed().await?;
-                self.attempt(&token, &req, None).await.map_err(|e| match e {
+                self.attempt(
+                    &token,
+                    &req,
+                    None,
+                    logical.as_ref(),
+                    Some("401 unauthorized"),
+                )
+                .await
+                .map_err(|e| match e {
                     ProviderError::Auth(_) => ProviderError::Auth(
                         "auth was still refused after refreshing. redo `polaris login`".into(),
                     ),
@@ -625,18 +758,32 @@ impl Provider for CodexProvider {
         req: CompletionRequest,
         turn: &TurnContext,
     ) -> Result<CompletionResponse, ProviderError> {
+        self.validate_optional_contracts()?;
+        let logical = self
+            .attempt_ledger
+            .as_ref()
+            .map(AttemptLedger::begin_logical);
         let token = self.tokens.token().await?;
-        match self.attempt(&token, &req, Some(turn)).await {
+        match self
+            .attempt(&token, &req, Some(turn), logical.as_ref(), None)
+            .await
+        {
             Err(ProviderError::Auth(_)) => {
                 let token = self.tokens.refreshed().await?;
-                self.attempt(&token, &req, Some(turn))
-                    .await
-                    .map_err(|e| match e {
-                        ProviderError::Auth(_) => ProviderError::Auth(
-                            "auth was still refused after refreshing. redo `polaris login`".into(),
-                        ),
-                        other => other,
-                    })
+                self.attempt(
+                    &token,
+                    &req,
+                    Some(turn),
+                    logical.as_ref(),
+                    Some("401 unauthorized"),
+                )
+                .await
+                .map_err(|e| match e {
+                    ProviderError::Auth(_) => ProviderError::Auth(
+                        "auth was still refused after refreshing. redo `polaris login`".into(),
+                    ),
+                    other => other,
+                })
             }
             other => other,
         }
@@ -988,6 +1135,35 @@ mod tests {
         assert_eq!(items[0]["role"], "user");
         assert_eq!(items[0]["content"][0]["type"], "input_text");
         assert_eq!(items[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn disabled_web_search_keeps_the_existing_body_exact() {
+        let request = req();
+        assert_eq!(
+            build_body("gpt-6-astra", &request, Some("medium")),
+            build_body_with_web_search(
+                "gpt-6-astra",
+                &request,
+                Some("medium"),
+                WebSearchConfig::disabled(),
+            )
+            .expect("disabled is a no-op"),
+        );
+    }
+
+    #[test]
+    fn live_web_search_is_rejected_before_a_request_body_can_be_used() {
+        let error = build_body_with_web_search(
+            "gpt-6-astra",
+            &req(),
+            Some("medium"),
+            WebSearchConfig::live(
+                crate::web_search::WebSearchRequestCaps::new(2, 4096).expect("caps"),
+            ),
+        )
+        .expect_err("the Codex endpoint is unverified");
+        assert!(matches!(error, ProviderError::Unsupported(_)));
     }
 
     #[test]
@@ -1465,6 +1641,68 @@ mod tests {
         assert_eq!(r.text, "ok");
     }
 
+    #[tokio::test]
+    async fn visible_request_limit_rejects_oversize_before_attempt_or_send() {
+        let server = MockServer::start().await;
+        let ledger = crate::attempts::AttemptLedger::default();
+        let provider = CodexProvider::new(server.uri(), "m".into(), Tokens::new())
+            .expect("client")
+            .with_attempt_ledger(ledger.clone())
+            .with_visible_request_byte_limit(1);
+
+        let error = provider
+            .complete(req())
+            .await
+            .expect_err("body exceeds one byte");
+        assert!(matches!(error, ProviderError::Budget(_)));
+        assert!(
+            ledger.snapshot().is_empty(),
+            "oversize body creates no attempt"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
+            "oversize body sends nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_request_limit_leaves_a_tiny_valid_body_unchanged() {
+        let baseline_server = MockServer::start().await;
+        let limited_server = MockServer::start().await;
+        for server in [&baseline_server, &limited_server] {
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+                    frame("response.output_item.done", message_item("ok")),
+                    frame("response.completed", serde_json::json!({})),
+                ])))
+                .mount(server)
+                .await;
+        }
+
+        CodexProvider::new(baseline_server.uri(), "m".into(), Tokens::new())
+            .expect("client")
+            .complete(req())
+            .await
+            .expect("baseline request succeeds");
+        CodexProvider::new(limited_server.uri(), "m".into(), Tokens::new())
+            .expect("client")
+            .with_visible_request_byte_limit(32_000)
+            .complete(req())
+            .await
+            .expect("limited request succeeds");
+
+        let baseline = baseline_server.received_requests().await.expect("recorded");
+        let limited = limited_server.received_requests().await.expect("recorded");
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(baseline[0].body, limited[0].body);
+    }
+
     /// `set_effort` must override the account-plan-derived effort
     /// (`Tokens` here always returns `effort: None`, so any effort seen
     /// on the wire had to come from the override, not the token).
@@ -1513,13 +1751,76 @@ mod tests {
             .await;
 
         let t = Tokens::new();
-        let p = CodexProvider::new(s.uri(), "m".into(), t.clone()).expect("client");
+        let ledger = crate::attempts::AttemptLedger::default();
+        let p = CodexProvider::new(s.uri(), "m".into(), t.clone())
+            .expect("client")
+            .with_attempt_ledger(ledger.clone());
         let r = p.complete(req()).await.expect("should succeed on retry");
         assert_eq!(r.text, "succeeded on retry");
         assert_eq!(
             t.refreshes.load(Ordering::SeqCst),
             1,
             "the number of refreshes isn't 1"
+        );
+        let attempts = ledger.snapshot();
+        assert_eq!(attempts.len(), 2, "401 retry is two physical sends");
+        assert_eq!(attempts[0].logical_id, attempts[1].logical_id);
+        assert_eq!(attempts[0].status, crate::attempts::AttemptStatus::Failed);
+        assert_eq!(
+            attempts[1].status,
+            crate::attempts::AttemptStatus::Succeeded
+        );
+        assert_eq!(
+            attempts[1].retry_reason.as_deref(),
+            Some("401 unauthorized")
+        );
+        assert_eq!(
+            attempts[1].usage,
+            crate::attempts::UsageObservation::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_marks_a_sent_future_cancelled_and_ignores_an_unpolled_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(200))
+                    .set_body_string(sse_body(&[frame(
+                        "response.completed",
+                        serde_json::json!({}),
+                    )])),
+            )
+            .mount(&server)
+            .await;
+
+        let ledger = crate::attempts::AttemptLedger::default();
+        let provider = CodexProvider::new(server.uri(), "m".into(), Tokens::new())
+            .expect("client")
+            .with_attempt_ledger(ledger.clone());
+        let never_polled = provider.complete(req());
+        drop(never_polled);
+        assert!(ledger.snapshot().is_empty(), "unpolled futures do not send");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                provider.complete(req())
+            )
+            .await
+            .is_err()
+        );
+        let attempts = ledger.snapshot();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].status,
+            crate::attempts::AttemptStatus::Cancelled
+        );
+        assert_eq!(
+            attempts[0].usage,
+            crate::attempts::UsageObservation::Missing
         );
     }
 

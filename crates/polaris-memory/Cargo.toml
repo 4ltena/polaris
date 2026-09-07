@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+tiktoken-rs = { workspace = true }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 serde = { workspace = true }
 thiserror = { workspace = true }

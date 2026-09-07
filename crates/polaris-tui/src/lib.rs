@@ -46,10 +46,8 @@ pub struct RunArgs<'a> {
     pub provider: Arc<dyn Provider>,
     pub provider_name: String,
     pub model_name: String,
-    /// Seeds the footer's displayed effort when the caller already knows a
-    /// plan-derived override (see `polaris-cli`'s `effort_for_stored_plan`)
-    /// — otherwise `run()` falls back to `render::DEFAULT_EFFORT`, same as
-    /// before this field existed.
+    /// Seeds the footer with the caller's selected effort; otherwise use
+    /// `render::DEFAULT_EFFORT`.
     pub initial_effort_name: Option<String>,
     pub cwd: PathBuf,
     pub state_dir: PathBuf,
@@ -533,10 +531,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // that actually changes what gets sent; this is only the display copy
     // shown in the header/footer/notices.
     let mut model_name = args.model_name.clone();
-    // Seeded from `args.initial_effort_name` when the caller already knows
-    // a plan-derived override (e.g. Plus accounts default to "high" — see
-    // `polaris-cli`'s `effort_for_stored_plan`); otherwise the same default
-    // `render::render_effort_picker` itself marks `(default)`.
+    // Use the caller's selection or the same default marked in the picker.
     let mut effort_name = args
         .initial_effort_name
         .clone()
@@ -3815,14 +3810,13 @@ mod tests {
     fn handle_model_switches_the_provider_and_the_display_copies() {
         let backend = TestBackend::new(70, 14);
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
-        // gpt-5.4 is index 4 in MODEL_CATALOG; Down moves to gpt-5.4-mini,
+        // Down from gpt-5.4 moves to gpt-5.4-mini,
         // Enter advances to the effort step. "high" is index 2 in
-        // EFFORT_CATALOG; Down x2 from "low" (the starting `effort_name`)
+        // EFFORT_CATALOG; Down once from the default "medium"
         // reaches it, then Enter confirms the whole wizard.
         let mut reader = ScriptedReader(VecDeque::from([
             KeyCode::Down,
             KeyCode::Enter,
-            KeyCode::Down,
             KeyCode::Down,
             KeyCode::Enter,
         ]));
@@ -3871,10 +3865,9 @@ mod tests {
         // human-readable display name.
         let backend = TestBackend::new(70, 14);
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
-        // "extra high" is index 3 in EFFORT_CATALOG; Down x3 from "low".
+        // "extra high" is two rows after the default "medium".
         let mut reader = ScriptedReader(VecDeque::from([
             KeyCode::Enter,
-            KeyCode::Down,
             KeyCode::Down,
             KeyCode::Down,
             KeyCode::Enter,

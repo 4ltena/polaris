@@ -17,7 +17,7 @@ pub mod pkce;
 pub mod store;
 pub mod token;
 
-use std::path::Path;
+use std::{ffi::OsStr, path::Path};
 
 /// The authorization issuer.
 pub const ISSUER: &str = "https://auth.openai.com";
@@ -29,6 +29,10 @@ pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 pub const CALLBACK_PORT: u16 = 1455;
 /// The scope we request. Without `offline_access` no refresh token comes back.
 pub const SCOPE: &str = "openid profile email offline_access";
+/// When set to `1`, only credentials that can be used without refreshing are
+/// accepted. This is for isolated runs whose credential store is mounted
+/// read-only.
+pub const AUTH_READ_ONLY_ENV: &str = "POLARIS_AUTH_READ_ONLY";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -52,6 +56,10 @@ pub enum AuthError {
     PortInUse(String),
     #[error("not logged in")]
     NotLoggedIn,
+    #[error("authentication refresh is disabled by {AUTH_READ_ONLY_ENV}=1")]
+    ReadOnly,
+    #[error("{AUTH_READ_ONLY_ENV} must be unset, 0, or 1")]
+    InvalidReadOnlyMode,
 }
 
 /// The credentials we store. `expires_at` is Unix seconds. When the response
@@ -85,6 +93,25 @@ pub fn needs_refresh(c: &Credentials, now: u64) -> bool {
         None => true,
         Some(exp) => exp <= now.saturating_add(EXPIRY_MARGIN_SECS),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshPolicy {
+    Allow,
+    ReadOnly,
+}
+
+fn refresh_policy(value: Option<&OsStr>) -> Result<RefreshPolicy, AuthError> {
+    match value {
+        None => Ok(RefreshPolicy::Allow),
+        Some(value) if value == OsStr::new("0") => Ok(RefreshPolicy::Allow),
+        Some(value) if value == OsStr::new("1") => Ok(RefreshPolicy::ReadOnly),
+        Some(_) => Err(AuthError::InvalidReadOnlyMode),
+    }
+}
+
+fn current_refresh_policy() -> Result<RefreshPolicy, AuthError> {
+    refresh_policy(std::env::var_os(AUTH_READ_ONLY_ENV).as_deref())
 }
 
 /// Determines the `reasoning.effort` to send to the Responses API from
@@ -131,9 +158,20 @@ pub fn model_for_plan_type(plan_type: Option<&str>) -> Option<&'static str> {
 /// Reads the stored credentials and, if needed, refreshes them before
 /// returning.
 pub async fn ensure_fresh(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
+    ensure_fresh_with_policy(issuer, store_path, current_refresh_policy()?).await
+}
+
+async fn ensure_fresh_with_policy(
+    issuer: &str,
+    store_path: &Path,
+    policy: RefreshPolicy,
+) -> Result<Credentials, AuthError> {
     let c = store::load_from(store_path)?.ok_or(AuthError::NotLoggedIn)?;
     if !needs_refresh(&c, now_secs()) {
         return Ok(c);
+    }
+    if policy == RefreshPolicy::ReadOnly {
+        return Err(AuthError::ReadOnly);
     }
     let fresh = token::refresh(issuer, &c.refresh_token, Some(&c.account_id)).await?;
     store::save_to(store_path, &fresh)?;
@@ -142,7 +180,18 @@ pub async fn ensure_fresh(issuer: &str, store_path: &Path) -> Result<Credentials
 
 /// Refreshes regardless of expiry. Used for a retry after receiving a 401.
 pub async fn force_refresh(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
+    force_refresh_with_policy(issuer, store_path, current_refresh_policy()?).await
+}
+
+async fn force_refresh_with_policy(
+    issuer: &str,
+    store_path: &Path,
+    policy: RefreshPolicy,
+) -> Result<Credentials, AuthError> {
     let c = store::load_from(store_path)?.ok_or(AuthError::NotLoggedIn)?;
+    if policy == RefreshPolicy::ReadOnly {
+        return Err(AuthError::ReadOnly);
+    }
     let fresh = token::refresh(issuer, &c.refresh_token, Some(&c.account_id)).await?;
     store::save_to(store_path, &fresh)?;
     Ok(fresh)
@@ -201,6 +250,45 @@ mod tests {
     fn an_expired_token_needs_refresh() {
         let now = 1_000_000;
         assert!(needs_refresh(&creds(Some(now - 1)), now));
+    }
+
+    #[test]
+    fn readonly_refresh_policy_accepts_only_unset_zero_or_one() {
+        assert_eq!(
+            refresh_policy(None).expect("unset must preserve normal behavior"),
+            RefreshPolicy::Allow
+        );
+        assert_eq!(
+            refresh_policy(Some(std::ffi::OsStr::new("0")))
+                .expect("zero must preserve normal behavior"),
+            RefreshPolicy::Allow
+        );
+        assert_eq!(
+            refresh_policy(Some(std::ffi::OsStr::new("1"))).expect("one must enable readonly"),
+            RefreshPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn readonly_refresh_policy_rejects_invalid_present_values() {
+        for value in ["", "2", "true", "readonly"] {
+            let err = refresh_policy(Some(std::ffi::OsStr::new(value)))
+                .expect_err("only zero and one are valid present values");
+            assert!(
+                matches!(err, AuthError::InvalidReadOnlyMode),
+                "{value:?} produced an unexpected error: {err:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_refresh_policy_rejects_a_nonunicode_value() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let err = refresh_policy(Some(std::ffi::OsStr::from_bytes(b"\xff")))
+            .expect_err("non-Unicode values must not disable readonly mode");
+        assert!(matches!(err, AuthError::InvalidReadOnlyMode));
     }
 
     #[test]
@@ -297,6 +385,110 @@ mod tests {
             matches!(err, AuthError::Http(_)),
             "got something other than Http: {err:?}"
         );
+    }
+
+    async fn assert_no_token_request(server: &wiremock::MockServer) {
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("request log should be available")
+                .is_empty(),
+            "readonly authentication must stop before posting a refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn readonly_ensure_fresh_rejects_an_unknown_expiry_before_refreshing_or_saving() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p = dir.path().join("auth.json");
+        let original = creds(None);
+        store::save_to(&p, &original).expect("save");
+        let s = token_server_returning(serde_json::json!({
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let err = ensure_fresh_with_policy(&s.uri(), &p, RefreshPolicy::ReadOnly)
+            .await
+            .expect_err("unknown expiry requires a refresh that readonly mode forbids");
+        assert!(
+            matches!(err, AuthError::ReadOnly),
+            "unexpected error: {err:?}"
+        );
+        assert_no_token_request(&s).await;
+        assert_eq!(store::load_from(&p).expect("load"), Some(original));
+    }
+
+    #[tokio::test]
+    async fn readonly_ensure_fresh_rejects_the_expiry_margin_before_refreshing_or_saving() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p = dir.path().join("auth.json");
+        let now = now_secs();
+        let original = creds(Some(now + EXPIRY_MARGIN_SECS));
+        store::save_to(&p, &original).expect("save");
+        let s = token_server_returning(serde_json::json!({
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let err = ensure_fresh_with_policy(&s.uri(), &p, RefreshPolicy::ReadOnly)
+            .await
+            .expect_err("the expiry margin requires a refresh that readonly mode forbids");
+        assert!(
+            matches!(err, AuthError::ReadOnly),
+            "unexpected error: {err:?}"
+        );
+        assert_no_token_request(&s).await;
+        assert_eq!(store::load_from(&p).expect("load"), Some(original));
+    }
+
+    #[tokio::test]
+    async fn readonly_ensure_fresh_returns_a_fresh_credential_without_a_refresh() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p = dir.path().join("auth.json");
+        let original = creds(Some(now_secs() + EXPIRY_MARGIN_SECS + 3600));
+        store::save_to(&p, &original).expect("save");
+        let s = token_server_returning(serde_json::json!({
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let got = ensure_fresh_with_policy(&s.uri(), &p, RefreshPolicy::ReadOnly)
+            .await
+            .expect("fresh credentials remain usable in readonly mode");
+        assert_eq!(got, original);
+        assert_no_token_request(&s).await;
+    }
+
+    #[tokio::test]
+    async fn readonly_force_refresh_stops_before_token_post_or_store_save() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p = dir.path().join("auth.json");
+        let original = creds(Some(now_secs() + EXPIRY_MARGIN_SECS + 3600));
+        store::save_to(&p, &original).expect("save");
+        let s = token_server_returning(serde_json::json!({
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let err = force_refresh_with_policy(&s.uri(), &p, RefreshPolicy::ReadOnly)
+            .await
+            .expect_err("readonly mode must block the 401 refresh path");
+        assert!(
+            matches!(err, AuthError::ReadOnly),
+            "unexpected error: {err:?}"
+        );
+        assert_no_token_request(&s).await;
+        assert_eq!(store::load_from(&p).expect("load"), Some(original));
     }
 
     /// A fake server whose `/oauth/token` just returns `body`. Never hits

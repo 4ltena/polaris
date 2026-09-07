@@ -6,3 +6,7 @@ AGENTS.md
 .codex/
 /.polaris/
 /scripts/__pycache__/
+
+# Local planning and handoff documents
+/docs/superpowers/
+/.superpowers/

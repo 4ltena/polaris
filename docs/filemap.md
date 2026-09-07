@@ -13,7 +13,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `CHANGELOG.md` — 変更履歴
 - `Cargo.toml` — workspace definition and shared dependencies
-- `README.md` — polaris
+- `README.md` — Polaris
 - `rust-toolchain.toml` — pinned toolchain
 
 ## `agents/file-inspector`
@@ -40,6 +40,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-cli`
 
 - `Cargo.toml` — manifest for the polaris-cli crate
+
+## `crates/polaris-cli/examples`
+
+- `cache_quality.rs` — Offline-testable driver for the cache-affinity quality matrix.
 
 ## `crates/polaris-cli/src`
 
@@ -86,6 +90,18 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `filemap.rs` — A snapshot test that confirms `docs/filemap.md` matches the actual state of the repository.
 
+## `crates/polaris-http`
+
+- `Cargo.toml` — manifest for the polaris-http crate
+
+## `crates/polaris-http/src`
+
+- `lib.rs` — Shared HTTP client setup.
+
+## `crates/polaris-http/src/fixtures`
+
+- `README.md` — TLSテスト用の証明書と鍵
+
 ## `crates/polaris-memory`
 
 - `Cargo.toml` — manifest for the polaris-memory crate
@@ -104,11 +120,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-provider/src`
 
+- `cache_pacing.rs` — Optional per-provider spacing of model request dispatches.
+- `cache_prefix.rs` — Fixed, opt-in instructions for the cache-prefix cost experiment.
 - `codex.rs` — A provider that speaks the Responses API using ChatGPT subscription
 - `codex_metrics.rs` — Opt-in, content-free diagnostics for each actual Codex HTTP attempt.
 - `lib.rs` — Provider abstraction. Transport-dependent parts live in each
 - `openai.rs` — OpenAI-compatible chat completions. Swap out `base_url` and you can hit
 - `sse.rs` — Incrementally decodes SSE (text/event-stream). Pushing a byte chunk
+- `turn_affinity.rs` — Opaque transport continuity scoped to one logical user turn.
 
 ## `crates/polaris-sandbox`
 
@@ -116,6 +135,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-sandbox/src`
 
+- `broker.rs` — Client for the outer native-sandbox broker.
 - `confine.rs` — Launching a process under confinement. Dispatches to a per-platform
 - `helper.rs` — The mutation operation executed inside the confined child.
 - `lib.rs` — Sandbox policy definitions, and delegation to OS mechanisms.
@@ -180,7 +200,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `context-efficiency.md` — コンテキストの効率化とローカル記憶
 - `filemap.md` — File map
+- `gpt6-cache-affinity-results.md` — 本文量を維持したキャッシュ再利用と品質検証
+- `gpt6-cache-cost-results.md` — GPT-6のキャッシュ率と費用の比較
+- `gpt6-cache-pacing-results.md` — 要求間隔とキャッシュ再利用の検証
 - `gpt6-efficiency-results.md` — GPT-6 medium 効率化の初回実測
+- `skill-scaling-benchmark.md` — skill/pluginを大量に含めた比較
+- `subagents.md` — subagent
+- `testing.md` — テスト
+- `usage.md` — 利用ガイド
 
 ## `docs/superpowers`
 

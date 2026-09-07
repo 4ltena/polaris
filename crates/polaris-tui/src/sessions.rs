@@ -6,10 +6,19 @@
 
 use std::path::{Path, PathBuf};
 
+use polaris_core::session_store::PersistedSession;
+
 use crate::persist;
 
 const PREVIEW_CHARS: usize = 60;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+    Legacy,
+    V2,
+}
+
+#[derive(Clone)]
 pub struct SessionSummary {
     pub id: String,
     pub path: PathBuf,
@@ -18,6 +27,7 @@ pub struct SessionSummary {
     pub message_count: usize,
     /// The first user message, trimmed to a short one-line preview.
     pub preview: String,
+    pub kind: SessionKind,
 }
 
 /// Scans `sessions_dir` for every `<id>.meta.json` that has a
@@ -63,9 +73,60 @@ pub fn list_sessions(sessions_dir: &Path) -> Vec<SessionSummary> {
             started_at_millis: meta.started_at_millis,
             message_count: session.messages.len(),
             preview,
+            kind: SessionKind::Legacy,
         });
     }
     out
+}
+
+/// Lists valid v2 sessions for the current project.  V2 intentionally stores a
+/// stable project identity rather than a display path, so these sessions stay
+/// in the current-project group in the picker.
+pub fn list_v2_sessions(
+    data_root: &Path,
+    database: &Path,
+    project_id: &str,
+    cwd: &str,
+) -> Vec<SessionSummary> {
+    let sessions_dir = data_root.join("sessions-v2");
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return Vec::new();
+    };
+
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let id = entry.file_name().into_string().ok()?;
+            let persisted = PersistedSession::open(data_root, database, project_id, &id).ok()?;
+            let snapshot = persisted.snapshot().ok()?;
+            if snapshot.state.project_id != project_id || snapshot.events.is_empty() {
+                return None;
+            }
+            let preview = snapshot
+                .events
+                .iter()
+                .find(|event| event.message.role == polaris_provider::Role::User)
+                .map(|event| preview_of(&event.message.content))
+                .unwrap_or_default();
+            let started_at_millis = entry
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis();
+            Some(SessionSummary {
+                id,
+                path: entry.path(),
+                cwd: cwd.to_string(),
+                started_at_millis,
+                message_count: snapshot.events.len(),
+                preview,
+                kind: SessionKind::V2,
+            })
+        })
+        .collect()
 }
 
 fn preview_of(content: &str) -> String {
@@ -184,6 +245,29 @@ mod tests {
     }
 
     #[test]
+    fn a_v2_session_is_listed_for_its_project() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let database = root.path().join("memory.sqlite3");
+        let persisted = PersistedSession::create(
+            root.path(),
+            &database,
+            "project-id",
+            polaris_core::conversation_state::HistoryMode::Legacy,
+            None,
+        )
+        .expect("create v2 session");
+        persisted
+            .append(Message::user("resume this v2 conversation"), true, None)
+            .expect("append message");
+
+        let sessions = list_v2_sessions(root.path(), &database, "project-id", "/tmp/project");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].kind, SessionKind::V2);
+        assert_eq!(sessions[0].preview, "resume this v2 conversation");
+        assert!(list_v2_sessions(root.path(), &database, "other-project", "/tmp/other").is_empty());
+    }
+
+    #[test]
     fn the_preview_is_truncated_for_a_long_first_message() {
         let dir = tempfile::tempdir().expect("temp dir");
         let long = "x".repeat(200);
@@ -209,6 +293,7 @@ mod tests {
             started_at_millis: 200,
             message_count: 1,
             preview: String::new(),
+            kind: SessionKind::Legacy,
         };
         let b = SessionSummary {
             id: "b".into(),
@@ -217,6 +302,7 @@ mod tests {
             started_at_millis: 100,
             message_count: 1,
             preview: String::new(),
+            kind: SessionKind::Legacy,
         };
 
         let groups = grouped(vec![a, b], "/tmp/current");
@@ -233,6 +319,7 @@ mod tests {
             started_at_millis: 100,
             message_count: 1,
             preview: String::new(),
+            kind: SessionKind::Legacy,
         };
         let new = SessionSummary {
             id: "new".into(),
@@ -241,6 +328,7 @@ mod tests {
             started_at_millis: 200,
             message_count: 1,
             preview: String::new(),
+            kind: SessionKind::Legacy,
         };
 
         let groups = grouped(vec![old, new], "/tmp/x");
@@ -258,6 +346,7 @@ mod tests {
             started_at_millis: 50,
             message_count: 1,
             preview: String::new(),
+            kind: SessionKind::Legacy,
         };
         let fresh = SessionSummary {
             id: "fresh".into(),
@@ -266,6 +355,7 @@ mod tests {
             started_at_millis: 300,
             message_count: 1,
             preview: String::new(),
+            kind: SessionKind::Legacy,
         };
 
         // Neither is the current directory, so order is purely recency.

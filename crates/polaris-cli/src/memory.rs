@@ -38,6 +38,18 @@ enum Command {
         #[arg(long)]
         max_bytes: Option<usize>,
     },
+    /// v2要約の出典IDを検証し、conversation:// URI経由で原文を取得する。
+    Source {
+        /// v2セッションUUID。
+        #[arg(long)]
+        session: String,
+        /// 要約が参照する出典ID。
+        id: String,
+        #[arg(long)]
+        start: Option<u64>,
+        #[arg(long)]
+        end: Option<u64>,
+    },
     /// 指定記録に埋め込みを付ける。本文を設定したローカルサーバーへ送信する。
     Embed {
         session: String,
@@ -129,7 +141,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let project = polaris_core::project::resolve_root(&cwd).canonicalize()?;
     let project_id = polaris_tui::persist::project_identity(&project)?;
     let home = std::env::var_os("HOME").ok_or("HOMEが設定されていません")?;
-    let state = PathBuf::from(home)
+    let state = PathBuf::from(home.clone())
         .join(".polaris/state")
         .join(polaris_core::project::project_id(&project));
     let database = state.join("memory.sqlite3");
@@ -231,6 +243,34 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 )?
             );
         }
+        Command::Source {
+            session,
+            id,
+            start,
+            end,
+        } => {
+            validate_session(&session)?;
+            validate_session(&id)?;
+            let data_root = PathBuf::from(&home).join(".polaris");
+            let persisted = polaris_core::session_store::PersistedSession::open(
+                &data_root,
+                &database,
+                &project_id,
+                &session,
+            )?;
+            let mut uri = format!("conversation://{id}");
+            if start.is_some() || end.is_some() {
+                let start = start.ok_or("--startと--endは両方指定してください")?;
+                let end = end.ok_or("--startと--endは両方指定してください")?;
+                uri.push_str(&format!("?start={start}&end={end}"));
+            }
+            let source = polaris_core::conversation_memory::read_source(
+                persisted.store.as_ref(),
+                &database,
+                &uri,
+            )?;
+            println!("{source}");
+        }
         Command::Embed {
             session,
             id,
@@ -273,13 +313,23 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             validate_session(&session)?;
             let _lock = polaris_tui::lock_memory(&state)?;
             let count = store.delete_session(&project_id, &session)?;
+            let v2_count = store.cleanup_forgotten_conversation(&project_id, &session)?;
             let directory = state
                 .join("memory-archives")
                 .join(format!("{session}.archive"));
             if directory.exists() {
                 std::fs::remove_dir_all(directory)?;
             }
-            println!("{count}件と保管原文を削除しました。再取り込みは禁止されます。");
+            let raw = PathBuf::from(&home)
+                .join(".polaris")
+                .join("sessions-v2")
+                .join(&session);
+            if raw.exists() {
+                std::fs::remove_dir_all(&raw)?;
+            }
+            println!(
+                "{count}件、v2索引{v2_count}件と対象セッションの保管原文を削除しました。再取り込みは禁止されます。"
+            );
         }
     }
     Ok(())

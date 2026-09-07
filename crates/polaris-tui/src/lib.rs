@@ -75,6 +75,77 @@ pub struct RunArgs<'a> {
     /// (see `polaris_core::config`).
     pub spawn_concurrency: usize,
     pub spawn_write_concurrency: usize,
+    /// Root-only automatic files.md regeneration, inherited by every TUI session reset.
+    pub files_md_auto_regenerate: bool,
+    /// Disabled configurations preserve legacy sessions by leaving workflow
+    /// state absent.
+    pub workflow_config: polaris_core::workflow::WorkflowConfig,
+    /// CLI input can override the configured initial phase for this launch.
+    pub initial_phase: Option<polaris_core::workflow::Phase>,
+    pub history_mode: polaris_core::conversation_state::HistoryMode,
+    pub strict_history: Option<Arc<polaris_core::conversation_memory::StrictHistory>>,
+    pub summary_usage: Option<polaris_provider::UsageMeter>,
+}
+
+struct WorkflowSessionArgs<'a> {
+    config: &'a polaris_core::workflow::WorkflowConfig,
+    initial_phase: Option<polaris_core::workflow::Phase>,
+    history_mode: polaris_core::conversation_state::HistoryMode,
+    cwd: &'a std::path::Path,
+    state_dir: &'a std::path::Path,
+    sessions_dir: &'a std::path::Path,
+    strict_history: Option<Arc<polaris_core::conversation_memory::StrictHistory>>,
+    summary_usage: Option<polaris_provider::UsageMeter>,
+    files_md_auto_regenerate: bool,
+}
+
+fn new_workflow_session(
+    args: WorkflowSessionArgs<'_>,
+) -> Result<polaris_core::session::Session, String> {
+    let WorkflowSessionArgs {
+        config,
+        initial_phase,
+        history_mode,
+        cwd,
+        state_dir,
+        sessions_dir,
+        strict_history,
+        summary_usage,
+        files_md_auto_regenerate,
+    } = args;
+    let mut session = polaris_core::session::Session::new();
+    session.disable_files_md_auto_regenerate = !files_md_auto_regenerate;
+    if config.enabled {
+        let workflow = polaris_core::workflow::SessionWorkflow::new(config.clone());
+        if let Some(phase) = initial_phase {
+            workflow.request_phase(phase)?;
+        }
+        session.workflow = Some(workflow);
+    } else if initial_phase.is_some() {
+        return Err("--phase には設定で [workflow].enabled = true が必要です".into());
+    }
+    // Explicit workflow opt-out with legacy history retains the JSONL lifecycle.
+    // Workflow state needs an atomic marker even when strict history is off.
+    if config.enabled || history_mode != polaris_core::conversation_state::HistoryMode::Legacy {
+        let data_root = sessions_dir
+            .parent()
+            .ok_or("sessions directory has no data root")?;
+        let project_id = persist::project_identity(cwd).map_err(|error| error.to_string())?;
+        let persistence = polaris_core::session_store::PersistedSession::create(
+            data_root,
+            &state_dir.join("memory.sqlite3"),
+            &project_id,
+            history_mode,
+            session.workflow.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+        session
+            .attach(persistence)
+            .map_err(|error| error.to_string())?;
+    }
+    session.strict_history = strict_history;
+    session.summary_usage = summary_usage;
+    Ok(session)
 }
 
 // Ancestors are read-only and must form an explicit, bounded same-project chain.
@@ -397,7 +468,23 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // at the two `append_message` call sites below) — an empty launch
     // that's immediately quit shouldn't leave a phantom entry in the
     // resume list.
-    let mut session = polaris_core::session::Session::default();
+    let mut session = match new_workflow_session(WorkflowSessionArgs {
+        config: &args.workflow_config,
+        initial_phase: args.initial_phase,
+        history_mode: args.history_mode,
+        cwd: &args.cwd,
+        state_dir: &args.state_dir,
+        sessions_dir: &args.sessions_dir,
+        strict_history: args.strict_history.clone(),
+        summary_usage: args.summary_usage.clone(),
+        files_md_auto_regenerate: args.files_md_auto_regenerate,
+    }) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("Can't start the workflow session: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut session_started_at_millis = now_millis();
     let mut session_path = args
         .sessions_dir
@@ -788,14 +875,17 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &terminal,
                                 &mut key_reader,
                                 &args.sessions_dir,
+                                &args.state_dir,
                                 &cwd_display,
+                                &args.workflow_config,
                                 &mut session,
                                 &mut session_path,
                                 &mut meta_path,
                                 &mut session_started_at_millis,
                                 &mut status,
                                 &mut local_lines,
-                            );
+                            )
+                            .await;
                             // A resumed session may be the same length as
                             // (or longer than) what's already printed but
                             // still a genuinely *different* conversation —
@@ -854,7 +944,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             handle_fork(
                                 &args.sessions_dir,
                                 &cwd_display,
-                                &session,
+                                &mut session,
                                 &mut session_path,
                                 &mut meta_path,
                                 &mut session_started_at_millis,
@@ -1098,14 +1188,17 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &terminal,
                         &mut key_reader,
                         &args.sessions_dir,
+                        &args.state_dir,
                         &cwd_display,
+                        &args.workflow_config,
                         &mut session,
                         &mut session_path,
                         &mut meta_path,
                         &mut session_started_at_millis,
                         &mut status,
                         &mut local_lines,
-                    );
+                    )
+                    .await;
                     // Same reasoning as the popup-selection path above: a
                     // resumed session's length alone can't be trusted to
                     // signal "this is a different conversation."
@@ -1161,7 +1254,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     handle_fork(
                         &args.sessions_dir,
                         &cwd_display,
-                        &session,
+                        &mut session,
                         &mut session_path,
                         &mut meta_path,
                         &mut session_started_at_millis,
@@ -1314,22 +1407,28 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // when given a length >= the vec's current length, so a stale
         // `checkpoint` would make that rollback quietly do nothing.
         let mut checkpoint = session.messages.len();
-        // A no-op after the first call for this session (see
-        // `write_meta_if_absent`'s docs) — this is the lazy point where an
-        // until-now-empty session actually starts existing on disk.
-        if let Err(e) = persist::write_meta_if_absent(
-            &meta_path,
-            &persist::SessionMeta {
-                cwd: cwd_display.clone(),
-                started_at_millis: session_started_at_millis,
-            },
-        ) {
-            fatal_message = Some(format!("Can't write the session metadata: {e}"));
-            break 'outer ExitCode::FAILURE;
+        if session.persistence.is_none() {
+            // Legacy sessions are created lazily. v2 already has an atomic
+            // marker and `Session::push_user` has appended the raw event.
+            if let Err(e) = persist::write_meta_if_absent(
+                &meta_path,
+                &persist::SessionMeta {
+                    cwd: cwd_display.clone(),
+                    started_at_millis: session_started_at_millis,
+                },
+            ) {
+                fatal_message = Some(format!("Can't write the session metadata: {e}"));
+                break 'outer ExitCode::FAILURE;
+            }
+            if let Err(e) = persist::append_message(
+                &session_path,
+                session.messages.last().expect("just pushed"),
+            ) {
+                fatal_message = Some(format!("Can't persist the message: {e}"));
+                break 'outer ExitCode::FAILURE;
+            }
         }
-        if let Err(e) =
-            persist::append_message(&session_path, session.messages.last().expect("just pushed"))
-        {
+        if let Err(e) = session.check_persistence() {
             fatal_message = Some(format!("Can't persist the message: {e}"));
             break 'outer ExitCode::FAILURE;
         }
@@ -1801,12 +1900,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             TurnOutcome::Done(Ok(result)) => {
                 let _ = result;
                 status = Status::Idle;
-                if history_compacted_this_turn {
+                if session.persistence.is_none() && history_compacted_this_turn {
                     if let Err(e) = persist::rewrite(&session_path, &session.messages) {
                         fatal_message = Some(format!("Can't persist the compacted session: {e}"));
                         break 'outer ExitCode::FAILURE;
                     }
-                } else if let Some(reply) = session.messages.last()
+                } else if session.persistence.is_none()
+                    && let Some(reply) = session.messages.last()
                     && let Err(e) = persist::append_message(&session_path, reply)
                 {
                     fatal_message = Some(format!("Can't persist the reply: {e}"));
@@ -1876,7 +1976,7 @@ fn run_resume_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
     groups: &[sessions::DirGroup],
-) -> Option<String> {
+) -> Option<sessions::SessionSummary> {
     let flat: Vec<&sessions::SessionSummary> =
         groups.iter().flat_map(|g| g.sessions.iter()).collect();
     let now = now_millis();
@@ -1902,7 +2002,7 @@ fn run_resume_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
         match reader.read_key() {
             Ok(KeyCode::Down) => selected = (selected + 1) % flat.len(),
             Ok(KeyCode::Up) => selected = (selected + flat.len() - 1) % flat.len(),
-            Ok(KeyCode::Enter) => return Some(flat[selected].id.clone()),
+            Ok(KeyCode::Enter) => return Some(flat[selected].clone()),
             Ok(KeyCode::Esc) => return None,
             Ok(_) => continue,
             Err(_) => return None,
@@ -1915,11 +2015,13 @@ fn run_resume_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
 /// `session_started_at_millis` to it in place. A cancelled picker (Esc,
 /// or nothing to resume) leaves every one of those untouched.
 #[allow(clippy::too_many_arguments)]
-fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
+async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
     sessions_dir: &std::path::Path,
+    state_dir: &std::path::Path,
     cwd_display: &str,
+    workflow_config: &polaris_core::workflow::WorkflowConfig,
     session: &mut polaris_core::session::Session,
     session_path: &mut PathBuf,
     meta_path: &mut PathBuf,
@@ -1927,17 +2029,144 @@ fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     status: &mut Status,
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
 ) {
-    let summaries = sessions::list_sessions(sessions_dir);
+    let mut summaries = sessions::list_sessions(sessions_dir);
+    let Some(data_root) = sessions_dir.parent() else {
+        *status = Status::Notice("v2セッションの保存先が不正です".into());
+        return;
+    };
+    let project_id = persist::project_identity(std::path::Path::new(cwd_display)).ok();
+    if let Some(project_id) = &project_id {
+        summaries.extend(sessions::list_v2_sessions(
+            data_root,
+            &state_dir.join("memory.sqlite3"),
+            project_id,
+            cwd_display,
+        ));
+    }
     let groups = sessions::grouped(summaries, cwd_display);
-    let Some(id) = run_resume_picker(terminal, reader, &groups) else {
+    let Some(selected) = run_resume_picker(terminal, reader, &groups) else {
         return;
     };
 
-    let new_session_path = sessions_dir.join(format!("{id}.jsonl"));
+    if selected.kind == sessions::SessionKind::V2 {
+        let Some(project_id) = project_id.as_deref() else {
+            *status = Status::Notice(
+                "プロジェクト識別子を取得できないためv2セッションを再開できません".into(),
+            );
+            return;
+        };
+        let strict_history = session.strict_history.clone();
+        let summary_usage = session.summary_usage.clone();
+        let examples = session.examples.clone();
+        let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+        let result = (|| -> Result<polaris_core::session::Session, String> {
+            let persistence = polaris_core::session_store::PersistedSession::open(
+                data_root,
+                &state_dir.join("memory.sqlite3"),
+                project_id,
+                &selected.id,
+            )
+            .map_err(|error| error.to_string())?;
+            let snapshot = persistence.snapshot().map_err(|error| error.to_string())?;
+            let saved_workflow = snapshot.state.workflow != Default::default()
+                || snapshot.state.gates != Default::default();
+            if saved_workflow && !workflow_config.enabled {
+                return Err("保存済みのワークフローが有効ですが、現在の設定では無効です。設定を有効にして再開してください".into());
+            }
+            let mut restored = polaris_core::session::Session::new();
+            restored.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
+            if workflow_config.enabled {
+                restored.workflow = Some(
+                    persistence
+                        .restore_workflow(workflow_config.clone())
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            restored
+                .attach(persistence)
+                .map_err(|error| error.to_string())?;
+            restored.strict_history = strict_history;
+            restored.summary_usage = summary_usage;
+            restored.examples = examples;
+            Ok(restored)
+        })();
+        match result {
+            Ok(mut restored) => {
+                if let Err(error) = restored.recover_history().await {
+                    *status = Status::Notice(format!("strict10履歴を復元できません: {error}"));
+                    return;
+                }
+                *session = restored;
+                *session_started_at_millis = selected.started_at_millis;
+                *session_path = sessions_dir.join(format!("{}.jsonl", selected.id));
+                *meta_path = session_path.with_extension("meta.json");
+                local_lines.clear();
+                *status = Status::Idle;
+            }
+            Err(error) => {
+                *status = Status::Notice(format!("v2セッションを再開できません: {error}"))
+            }
+        }
+        return;
+    }
+
+    let new_session_path = selected.path;
     let new_meta_path = new_session_path.with_extension("meta.json");
     match persist::load_session(&new_session_path) {
-        Ok((loaded, truncated)) => {
-            *session = loaded;
+        Ok((mut loaded, truncated)) => {
+            if let Some(previous) = session.persistence.clone() {
+                let Some(project_id) = project_id.as_deref() else {
+                    *status = Status::Notice(
+                        "プロジェクト識別子を取得できないため旧セッションを移行できません".into(),
+                    );
+                    return;
+                };
+                let strict_history = session.strict_history.clone();
+                let summary_usage = session.summary_usage.clone();
+                let examples = session.examples.clone();
+                let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+                let workflow = session.workflow.clone();
+                let mode = previous
+                    .snapshot()
+                    .map(|snapshot| snapshot.state.history_mode)
+                    .unwrap_or(polaris_core::conversation_state::HistoryMode::Legacy);
+                match polaris_core::session_store::PersistedSession::import(
+                    data_root,
+                    &state_dir.join("memory.sqlite3"),
+                    project_id,
+                    mode,
+                    workflow.as_ref(),
+                    &loaded.messages,
+                ) {
+                    Ok(persistence) => {
+                        let mut imported = polaris_core::session::Session::new();
+                        imported.disable_files_md_auto_regenerate =
+                            disable_files_md_auto_regenerate;
+                        imported.workflow = workflow;
+                        if let Err(error) = imported.attach(persistence) {
+                            *status =
+                                Status::Notice(format!("旧セッションを移行できません: {error}"));
+                            return;
+                        }
+                        imported.strict_history = strict_history;
+                        imported.summary_usage = summary_usage;
+                        imported.examples = examples;
+                        if let Err(error) = imported.recover_history().await {
+                            *status =
+                                Status::Notice(format!("strict10履歴を復元できません: {error}"));
+                            return;
+                        }
+                        *session = imported;
+                    }
+                    Err(error) => {
+                        *status = Status::Notice(format!("旧セッションを移行できません: {error}"));
+                        return;
+                    }
+                }
+            } else {
+                loaded.disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+                *session = loaded;
+            }
             *session_started_at_millis = persist::read_meta(&new_meta_path)
                 .map(|m| m.started_at_millis)
                 .unwrap_or_else(now_millis);
@@ -1946,14 +2175,14 @@ fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
             local_lines.clear();
             *status = if truncated {
                 Status::Notice(format!(
-                    "{} had a corrupt line; resumed from the messages before it",
+                    "{} に破損行があったため、その前までのメッセージを再開しました",
                     session_path.display()
                 ))
             } else {
                 Status::Idle
             };
         }
-        Err(e) => *status = Status::Notice(format!("can't resume: {e}")),
+        Err(e) => *status = Status::Notice(format!("セッションを再開できません: {e}")),
     }
 }
 
@@ -1970,7 +2199,52 @@ fn handle_new_session(
     status: &mut Status,
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
 ) {
-    *session = polaris_core::session::Session::default();
+    if let Some(previous) = session.persistence.clone() {
+        let strict_history = session.strict_history.clone();
+        let summary_usage = session.summary_usage.clone();
+        let examples = session.examples.clone();
+        let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+        let snapshot = match previous.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                *status = Status::Notice(format!("新しいv2セッションを作成できません: {error}"));
+                return;
+            }
+        };
+        let mut next = polaris_core::session::Session::new();
+        next.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
+        if let Some(workflow) = &session.workflow {
+            next.workflow = Some(polaris_core::workflow::SessionWorkflow::new(
+                workflow.config.clone(),
+            ));
+        }
+        let persistence = polaris_core::session_store::PersistedSession::create(
+            &previous.data_root,
+            &previous.database,
+            &snapshot.state.project_id,
+            snapshot.state.history_mode,
+            next.workflow.as_ref(),
+        );
+        match persistence.and_then(|persistence| {
+            next.attach(persistence)?;
+            Ok(())
+        }) {
+            Ok(()) => {
+                next.strict_history = strict_history;
+                next.summary_usage = summary_usage;
+                next.examples = examples;
+                *session = next;
+            }
+            Err(error) => {
+                *status = Status::Notice(format!("新しいv2セッションを作成できません: {error}"));
+                return;
+            }
+        }
+    } else {
+        let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+        *session = polaris_core::session::Session::default();
+        session.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
+    }
     *session_path = sessions_dir.join(format!("{}.jsonl", new_session_id()));
     *meta_path = session_path.with_extension("meta.json");
     *session_started_at_millis = now_millis();
@@ -1989,12 +2263,48 @@ fn handle_new_session(
 fn handle_fork(
     sessions_dir: &std::path::Path,
     cwd_display: &str,
-    session: &polaris_core::session::Session,
+    session: &mut polaris_core::session::Session,
     session_path: &mut PathBuf,
     meta_path: &mut PathBuf,
     session_started_at_millis: &mut u128,
     status: &mut Status,
 ) {
+    if let Some(previous) = session.persistence.clone() {
+        let strict_history = session.strict_history.clone();
+        let summary_usage = session.summary_usage.clone();
+        let examples = session.examples.clone();
+        let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+        let workflow_config = session
+            .workflow
+            .as_ref()
+            .map(|workflow| workflow.config.clone());
+        let persistence = previous.fork("");
+        let mut next = polaris_core::session::Session::new();
+        next.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
+        next.strict_history = strict_history;
+        next.summary_usage = summary_usage;
+        next.examples = examples;
+        match persistence.and_then(|persistence| {
+            if let Some(config) = workflow_config {
+                next.workflow = Some(persistence.restore_workflow(config)?);
+            }
+            let id = persistence.snapshot()?.state.session_id;
+            next.attach(persistence)?;
+            Ok(id)
+        }) {
+            Ok(id) => {
+                *session = next;
+                *session_path = sessions_dir.join(format!("{id}.jsonl"));
+                *meta_path = session_path.with_extension("meta.json");
+                *session_started_at_millis = now_millis();
+                *status = Status::Notice(format!("v2セッションへ分岐しました: {id}"));
+            }
+            Err(error) => {
+                *status = Status::Notice(format!("v2セッションを分岐できません: {error}"))
+            }
+        }
+        return;
+    }
     let has_references = session.messages.iter().any(|message| {
         message.content.contains("memory://")
             || message.content.starts_with("[Stored tool result ")
@@ -2456,9 +2766,14 @@ fn apply_slash_action(
     match action {
         slash::Action::Quit => SlashOutcome::Quit,
         slash::Action::Clear => {
-            session.messages.clear();
             local_lines.clear();
-            match persist::clear_session(session_path) {
+            let cleared = if session.persistence.is_some() {
+                session.clear_history()
+            } else {
+                session.messages.clear();
+                persist::clear_session(session_path)
+            };
+            match cleared {
                 Ok(()) => {
                     *status = Status::Idle;
                     SlashOutcome::Continue
@@ -2468,8 +2783,25 @@ fn apply_slash_action(
         }
         slash::Action::Status => {
             let cumulative_usage = usage_report.usage;
+            let workflow = session
+                .workflow
+                .as_ref()
+                .map(|workflow| {
+                    let state = workflow.state();
+                    let ids = state
+                        .skills
+                        .iter()
+                        .map(|skill| skill.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "; workflow phase: {}; skills: {}; manifest: {}",
+                        state.phase, ids, state.skill_manifest_hash
+                    )
+                })
+                .unwrap_or_default();
             *status = Status::Notice(format!(
-                "{provider_name} / {model_name} — tokens: in {} / out {} / cache {} / total {} — {} messages; 確認済み使用量、欠測 {} / 失敗 {}",
+                "{provider_name} / {model_name} — tokens: in {} / out {} / cache {} / total {} — {} messages{workflow}; 確認済み使用量、欠測 {} / 失敗 {}",
                 cumulative_usage.input_tokens,
                 cumulative_usage.output_tokens,
                 cumulative_usage.cached_tokens,
@@ -2478,6 +2810,33 @@ fn apply_slash_action(
                 usage_report.missing_responses,
                 usage_report.failed_requests,
             ));
+            SlashOutcome::Continue
+        }
+        slash::Action::Phase(requested) => {
+            let Some(workflow) = &session.workflow else {
+                *status = Status::Notice("workflowはこのセッションで無効です".into());
+                return SlashOutcome::Continue;
+            };
+            if requested.is_empty() {
+                *status = Status::Notice(format!("ワークフロー段階: {}", workflow.state().phase));
+                return SlashOutcome::Continue;
+            }
+            match requested.parse::<polaris_core::workflow::Phase>() {
+                Ok(phase) => match workflow.request_phase(phase) {
+                    Ok(()) => {
+                        if let Err(error) = session.checkpoint() {
+                            *status = Status::Notice(format!("phaseを保存できません: {error}"));
+                            return SlashOutcome::Continue;
+                        }
+                        let state = workflow.state();
+                        *status = Status::Notice(format!("ワークフロー段階: {}", state.phase));
+                    }
+                    Err(error) => {
+                        *status = Status::Notice(format!("phaseを設定できません: {error}"))
+                    }
+                },
+                Err(error) => *status = Status::Notice(error),
+            }
             SlashOutcome::Continue
         }
         slash::Action::Init => {
@@ -2618,8 +2977,47 @@ fn apply_slash_action(
 mod tests {
     use super::*;
     use approver::KeyReader;
+    use polaris_core::conversation_memory::{
+        EmbeddingModel, StrictEmbedder, StrictHistory, StrictSummaryProvider, SummaryRequest,
+    };
     use polaris_core::session::Session;
     use polaris_provider::Message;
+    use std::{future::Future, io, pin::Pin};
+
+    type StrictFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
+
+    struct TestSummary;
+    impl StrictSummaryProvider for TestSummary {
+        fn summarize<'a>(&'a self, _request: SummaryRequest) -> StrictFuture<'a, String> {
+            Box::pin(async {
+                Ok("{\"facts\":[],\"decisions\":[],\"constraints\":[],\"corrections\":[],\"open_items\":[],\"source_turn_ids\":[]}".into())
+            })
+        }
+    }
+
+    struct TestEmbedder(EmbeddingModel);
+    impl StrictEmbedder for TestEmbedder {
+        fn metadata(&self) -> &EmbeddingModel {
+            &self.0
+        }
+        fn embed_passage<'a>(&'a self, _text: &'a str) -> StrictFuture<'a, Vec<f32>> {
+            Box::pin(async { Ok(vec![0.0]) })
+        }
+        fn embed_query<'a>(&'a self, _text: &'a str) -> StrictFuture<'a, Vec<Vec<f32>>> {
+            Box::pin(async { Ok(vec![vec![0.0]]) })
+        }
+    }
+
+    fn test_strict_history() -> Arc<StrictHistory> {
+        Arc::new(StrictHistory::new(
+            Arc::new(TestSummary),
+            Arc::new(TestEmbedder(EmbeddingModel {
+                model: "test".into(),
+                revision: "v1".into(),
+                dimension: 1,
+            })),
+        ))
+    }
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyCode;
@@ -3572,7 +3970,10 @@ mod tests {
     #[test]
     fn handle_new_session_starts_a_fresh_file_without_touching_the_old_one() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut session = Session::default();
+        let mut session = Session {
+            disable_files_md_auto_regenerate: true,
+            ..Session::default()
+        };
         session.push_user("something from before");
         let old_path = dir.path().join("old.jsonl");
         persist::append_message(&old_path, session.messages.last().unwrap())
@@ -3594,6 +3995,7 @@ mod tests {
         );
 
         assert!(session.messages.is_empty());
+        assert!(session.disable_files_md_auto_regenerate);
         assert!(local_lines.is_empty());
         assert!(matches!(status, Status::Idle));
         assert_ne!(
@@ -3608,9 +4010,109 @@ mod tests {
     }
 
     #[test]
+    fn workflow_session_defaults_to_builtin_skills_and_supports_explicit_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        let mut config = polaris_core::config::Config::default();
+        for enabled in [true, false] {
+            if !enabled {
+                config.workflow.enabled = false;
+            }
+            let session = new_workflow_session(WorkflowSessionArgs {
+                config: &config.workflow,
+                initial_phase: None,
+                history_mode: config.history_mode,
+                cwd: dir.path(),
+                state_dir: dir.path(),
+                sessions_dir: &sessions_dir,
+                strict_history: None,
+                summary_usage: None,
+                files_md_auto_regenerate: config.files_md_auto_regenerate,
+            })
+            .unwrap();
+            assert_eq!(session.workflow.is_some(), enabled);
+            assert_eq!(session.persistence.is_some(), enabled);
+            assert!(session.strict_history.is_none());
+            if let Some(workflow) = &session.workflow {
+                let turn = workflow.begin_turn(&[]).unwrap();
+                assert_eq!(turn.ids, ["builtin:workflow-core"]);
+                assert_eq!(turn.state.phase, polaris_core::workflow::Phase::General);
+                let saved = session.persistence.as_ref().unwrap().snapshot().unwrap();
+                assert_eq!(
+                    saved.state.history_mode,
+                    polaris_core::conversation_state::HistoryMode::Legacy
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2_new_and_fork_preserve_strict_runtime_examples_and_usage_meter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).expect("sessions dir");
+        let mut session = Session::new();
+        let persistence = polaris_core::session_store::PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            polaris_core::conversation_state::HistoryMode::Strict10,
+            None,
+        )
+        .expect("create v2 session");
+        session.attach(persistence).expect("attach v2 session");
+        let strict = test_strict_history();
+        session.strict_history = Some(strict.clone());
+        session.summary_usage = Some(polaris_provider::UsageMeter::default());
+        session.examples = vec![Message::user("configured example")];
+        session.push_user("real turn");
+        session.check_persistence().expect("persist real turn");
+
+        let mut session_path = sessions_dir.join("current.jsonl");
+        let mut meta_path = sessions_dir.join("current.meta.json");
+        let mut started = 1;
+        let mut status = Status::Idle;
+        let mut local_lines = Vec::new();
+        handle_new_session(
+            &sessions_dir,
+            &mut session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+            &mut local_lines,
+        );
+        assert!(Arc::ptr_eq(
+            session.strict_history.as_ref().unwrap(),
+            &strict
+        ));
+        assert!(session.summary_usage.is_some());
+        assert_eq!(session.examples[0].content, "configured example");
+
+        handle_fork(
+            &sessions_dir,
+            "/tmp/project",
+            &mut session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+        );
+        assert!(Arc::ptr_eq(
+            session.strict_history.as_ref().unwrap(),
+            &strict
+        ));
+        assert!(session.summary_usage.is_some());
+        assert_eq!(session.examples[0].content, "configured example");
+    }
+
+    #[test]
     fn handle_resume_with_nothing_saved_dismisses_on_any_key_and_leaves_the_session_untouched() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut session = Session::default();
+        let mut session = Session {
+            disable_files_md_auto_regenerate: true,
+            ..Session::default()
+        };
         session.push_user("current, unsaved conversation");
         let original_path = dir.path().join("current.jsonl");
         let mut session_path = original_path.clone();
@@ -3622,18 +4124,22 @@ mod tests {
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
         let mut reader = ScriptedReader(std::collections::VecDeque::from([KeyCode::Enter]));
 
-        handle_resume(
-            &terminal,
-            &mut reader,
-            dir.path(),
-            "/tmp/current",
-            &mut session,
-            &mut session_path,
-            &mut meta_path,
-            &mut session_started_at_millis,
-            &mut status,
-            &mut local_lines,
-        );
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(handle_resume(
+                &terminal,
+                &mut reader,
+                dir.path(),
+                dir.path(),
+                "/tmp/current",
+                &polaris_core::workflow::WorkflowConfig::default(),
+                &mut session,
+                &mut session_path,
+                &mut meta_path,
+                &mut session_started_at_millis,
+                &mut status,
+                &mut local_lines,
+            ));
 
         assert_eq!(
             session.messages.len(),
@@ -3661,7 +4167,10 @@ mod tests {
         )
         .expect("seed saved session");
 
-        let mut session = Session::default();
+        let mut session = Session {
+            disable_files_md_auto_regenerate: true,
+            ..Session::default()
+        };
         session.push_user("current, unsaved conversation");
         let mut session_path = dir.path().join("current.jsonl");
         let mut meta_path = dir.path().join("current.meta.json");
@@ -3674,24 +4183,29 @@ mod tests {
         // Enter accepts it directly, same as the slash-command popup.
         let mut reader = ScriptedReader(std::collections::VecDeque::from([KeyCode::Enter]));
 
-        handle_resume(
-            &terminal,
-            &mut reader,
-            dir.path(),
-            "/tmp/current",
-            &mut session,
-            &mut session_path,
-            &mut meta_path,
-            &mut session_started_at_millis,
-            &mut status,
-            &mut local_lines,
-        );
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(handle_resume(
+                &terminal,
+                &mut reader,
+                dir.path(),
+                dir.path(),
+                "/tmp/current",
+                &polaris_core::workflow::WorkflowConfig::default(),
+                &mut session,
+                &mut session_path,
+                &mut meta_path,
+                &mut session_started_at_millis,
+                &mut status,
+                &mut local_lines,
+            ));
 
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].content, "resumed hi");
         assert_eq!(session_path, dir.path().join("saved.jsonl"));
         assert_eq!(meta_path, dir.path().join("saved.meta.json"));
         assert_eq!(session_started_at_millis, 500);
+        assert!(session.disable_files_md_auto_regenerate);
         assert!(
             local_lines.is_empty(),
             "switching conversations clears local-only output"
@@ -3728,18 +4242,22 @@ mod tests {
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
         let mut reader = ScriptedReader(std::collections::VecDeque::from([KeyCode::Esc]));
 
-        handle_resume(
-            &terminal,
-            &mut reader,
-            dir.path(),
-            "/tmp/current",
-            &mut session,
-            &mut session_path,
-            &mut meta_path,
-            &mut session_started_at_millis,
-            &mut status,
-            &mut local_lines,
-        );
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(handle_resume(
+                &terminal,
+                &mut reader,
+                dir.path(),
+                dir.path(),
+                "/tmp/current",
+                &polaris_core::workflow::WorkflowConfig::default(),
+                &mut session,
+                &mut session_path,
+                &mut meta_path,
+                &mut session_started_at_millis,
+                &mut status,
+                &mut local_lines,
+            ));
 
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].content, "current, unsaved conversation");
@@ -4004,6 +4522,70 @@ mod tests {
     }
 
     #[test]
+    fn phase_command_changes_an_enabled_workflow_and_rejects_unknown_names() {
+        let mut session = Session::new();
+        session.workflow = Some(polaris_core::workflow::SessionWorkflow::new(
+            polaris_core::workflow::WorkflowConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        ));
+        let mut status = Status::Idle;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let persistence = polaris_core::session_store::PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            polaris_core::conversation_state::HistoryMode::Legacy,
+            session.workflow.as_ref(),
+        )
+        .expect("create v2 session");
+        session.attach(persistence).expect("attach v2 session");
+        let session_path = dir.path().join("session.jsonl");
+        let mut local_lines = Vec::new();
+
+        call(
+            slash::Action::Phase("implement".into()),
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+        assert_eq!(
+            session.workflow.as_ref().unwrap().state().phase,
+            polaris_core::workflow::Phase::Implement
+        );
+        assert_eq!(
+            session
+                .persistence
+                .as_ref()
+                .expect("v2 persistence")
+                .snapshot()
+                .expect("snapshot")
+                .state
+                .workflow
+                .phase,
+            polaris_core::workflow::Phase::Implement,
+            "an idle /phase change must be durable before the next restart"
+        );
+        call(
+            slash::Action::Phase("not-a-phase".into()),
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+        assert_eq!(
+            session.workflow.as_ref().unwrap().state().phase,
+            polaris_core::workflow::Phase::Implement
+        );
+    }
+
+    #[test]
     fn pwd_reports_the_working_directory() {
         let mut session = Session::default();
         let mut status = Status::Idle;
@@ -4166,7 +4748,10 @@ mod tests {
     #[test]
     fn handle_fork_seeds_the_new_file_with_the_current_conversation_and_keeps_the_old_one() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut session = Session::default();
+        let mut session = Session {
+            disable_files_md_auto_regenerate: true,
+            ..Session::default()
+        };
         session.push_user("hello");
         session.push_assistant("hi there", Vec::new());
         let old_path = dir.path().join("old.jsonl");
@@ -4179,7 +4764,7 @@ mod tests {
         handle_fork(
             dir.path(),
             "/tmp/example",
-            &session,
+            &mut session,
             &mut session_path,
             &mut meta_path,
             &mut session_started_at_millis,
@@ -4187,6 +4772,7 @@ mod tests {
         );
 
         assert_ne!(session_path, old_path, "a fork should get its own file");
+        assert!(session.disable_files_md_auto_regenerate);
         let (forked, truncated) = persist::load_session(&session_path).expect("load fork");
         assert!(!truncated);
         assert_eq!(forked.messages.len(), 2);
@@ -4232,7 +4818,7 @@ mod tests {
         handle_fork(
             logs.path(),
             current.path().to_str().unwrap(),
-            &session,
+            &mut session,
             &mut session_path,
             &mut meta_path,
             &mut started,
@@ -4507,7 +5093,7 @@ mod tool_memory_settings_tests {
             handle_fork(
                 logs.path(),
                 "/project",
-                &session,
+                &mut session,
                 &mut path,
                 &mut meta,
                 &mut started,
@@ -4672,7 +5258,7 @@ mod tool_memory_settings_tests {
                 handle_fork(
                     logs.path(),
                     root.path().to_str().unwrap(),
-                    &loaded,
+                    &mut loaded,
                     &mut fork_path,
                     &mut meta_path,
                     &mut started,

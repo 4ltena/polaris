@@ -1,0 +1,14 @@
+[
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"hello","method":"hello","params":{}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"open","method":"session.open","session_id":"s","params":{}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"snapshot","method":"session.snapshot","session_id":"s","params":{}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"subscribe","method":"session.subscribe","session_id":"s","params":{"resume":{"engine_epoch":"e","subscription_id":"sub","event_seq":"9007199254740993"}}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"history","method":"history.page","session_id":"s","params":{"snapshot_id":"snap","cursor":"cursor","limit":32}},
+  {"protocol_version":1,"kind":"request","client_id":"client-example","request_id":"request-example","method":"draft.update","session_id":"session-example","params":{"expected_draft_revision":"4","text":"境界条件を確認する"}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"configure","method":"session.configure","session_id":"s","params":{"expected_configuration_revision":"3","provider":"fake","model":"example","effort":"medium"}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"start","method":"run.start","session_id":"s","params":{"expected_draft_revision":"4","expected_configuration_revision":"3","expected_policy_revision":"2"}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"cancel","method":"run.cancel","session_id":"s","params":{"run_id":"run","attempt_id":"attempt"}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"approval","method":"approval.resolve","session_id":"s","params":{"approval_id":"approval","run_id":"run","attempt_id":"attempt","policy_revision":"2","decision":"allow"}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"status","method":"request.status","session_id":"s","params":{"client_id":"original-client","request_id":"original-request"}},
+  {"protocol_version":1,"kind":"request","client_id":"c","request_id":"shutdown","method":"shutdown.request","params":{"engine_epoch":"e"}}
+]

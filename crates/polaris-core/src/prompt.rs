@@ -95,9 +95,32 @@ pub struct AlwaysOn {
     system: String,
     tools: Vec<ToolSpec>,
     skills_seen: usize,
+    #[cfg(unix)]
+    environment: String,
+    #[cfg(unix)]
+    agents_refresh: Option<crate::constitution::AgentsRefresh>,
 }
 
 impl AlwaysOn {
+    /// Trusted owner only: bind the original host sources, never a run copy.
+    /// No timer is started. Failure on the initial read is not an empty profile.
+    #[cfg(unix)]
+    pub fn with_agents_refresh(
+        mut self,
+        source: crate::constitution::AgentsRefresh,
+    ) -> std::io::Result<Self> {
+        self.system = build_system(&source.read()?, &self.environment);
+        self.agents_refresh = Some(source);
+        Ok(self)
+    }
+
+    pub(crate) fn system_for_request(&self) -> std::io::Result<String> {
+        #[cfg(unix)]
+        if let Some(source) = &self.agents_refresh {
+            return Ok(build_system(&source.read()?, &self.environment));
+        }
+        Ok(self.system.clone())
+    }
     /// The system prompt to send.
     pub fn system(&self) -> &str {
         &self.system
@@ -150,6 +173,10 @@ pub fn assemble_always_on(
         system: build_system(constitution, environment),
         tools: polaris_tools::all_specs(),
         skills_seen: skills.len(),
+        #[cfg(unix)]
+        environment: environment.to_owned(),
+        #[cfg(unix)]
+        agents_refresh: None,
     }
 }
 

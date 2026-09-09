@@ -1,0 +1,192 @@
+[
+  {
+    "type": "hello",
+    "payload": {
+      "protocol_version": 1,
+      "engine_epoch": "e",
+      "capabilities": [
+        "session_read",
+        "run_cancel"
+      ],
+      "limits": {
+        "frame_bytes": "1048576",
+        "subscription_events": "256",
+        "subscription_bytes": "4194304",
+        "text_batch_bytes": "32768",
+        "text_batch_ms": "50"
+      }
+    }
+  },
+  {
+    "type": "session.open",
+    "payload": {
+      "snapshot_id": "snap",
+      "session_id": "s",
+      "summary": "",
+      "session_revision": "0",
+      "content_revision": "0",
+      "plan_revision": "0",
+      "policy_revision": "0",
+      "position": {
+        "engine_epoch": "e",
+        "subscription_id": "sub",
+        "event_seq": "0"
+      },
+      "draft": {
+        "draft_revision": "0",
+        "text": "",
+        "attachment_ids": []
+      },
+      "configuration": {
+        "configuration_revision": "0",
+        "provider": "fake",
+        "model": "example",
+        "effort": "medium"
+      },
+      "tasks": [],
+      "runs": [],
+      "children": [],
+      "child_attempt_count": "0",
+      "unresolved_approvals": [],
+      "history_start_cursor": "history-start"
+    }
+  },
+  {
+    "type": "session.snapshot",
+    "payload": {
+      "snapshot_id": "snap",
+      "session_id": "s",
+      "summary": "",
+      "session_revision": "0",
+      "content_revision": "0",
+      "plan_revision": "0",
+      "policy_revision": "0",
+      "position": {
+        "engine_epoch": "e",
+        "subscription_id": "sub",
+        "event_seq": "0"
+      },
+      "draft": {
+        "draft_revision": "0",
+        "text": "",
+        "attachment_ids": []
+      },
+      "configuration": {
+        "configuration_revision": "0",
+        "provider": "fake",
+        "model": "example",
+        "effort": "medium"
+      },
+      "tasks": [],
+      "runs": [],
+      "children": [],
+      "child_attempt_count": "0",
+      "unresolved_approvals": [],
+      "history_start_cursor": "history-start"
+    }
+  },
+  {
+    "type": "session.subscribe",
+    "payload": {
+      "snapshot_id": "snap",
+      "session_id": "s",
+      "summary": "",
+      "session_revision": "0",
+      "content_revision": "0",
+      "plan_revision": "0",
+      "policy_revision": "0",
+      "position": {
+        "engine_epoch": "e",
+        "subscription_id": "sub",
+        "event_seq": "0"
+      },
+      "draft": {
+        "draft_revision": "0",
+        "text": "",
+        "attachment_ids": []
+      },
+      "configuration": {
+        "configuration_revision": "0",
+        "provider": "fake",
+        "model": "example",
+        "effort": "medium"
+      },
+      "tasks": [],
+      "runs": [],
+      "children": [],
+      "child_attempt_count": "0",
+      "unresolved_approvals": [],
+      "history_start_cursor": "history-start"
+    }
+  },
+  {
+    "type": "history.page",
+    "payload": {
+      "snapshot_id": "snap",
+      "session_revision": "1",
+      "messages": [
+        {
+          "message_id": "message",
+          "role": "assistant",
+          "text": "日本語",
+          "saved_byte_offset": "9"
+        }
+      ]
+    }
+  },
+  {
+    "type": "draft.update",
+    "payload": {
+      "session_revision": "5",
+      "draft_revision": "5"
+    }
+  },
+  {
+    "type": "session.configure",
+    "payload": {
+      "session_revision": "5",
+      "configuration": {
+        "configuration_revision": "4",
+        "provider": "fake",
+        "model": "example",
+        "effort": "medium"
+      }
+    }
+  },
+  {
+    "type": "run.start",
+    "payload": {
+      "session_revision": "6",
+      "run_id": "run",
+      "attempt_id": "attempt",
+      "state": "queued"
+    }
+  },
+  {
+    "type": "run.cancel",
+    "payload": {
+      "status": "cancel_requested"
+    }
+  },
+  {
+    "type": "approval.resolve",
+    "payload": {
+      "approval_id": "approval",
+      "state": "resolved",
+      "decision": "allow"
+    }
+  },
+  {
+    "type": "request.status",
+    "payload": {
+      "status": "not_found"
+    }
+  },
+  {
+    "type": "shutdown.request",
+    "payload": {
+      "engine_epoch": "e",
+      "state": "draining"
+    }
+  }
+]

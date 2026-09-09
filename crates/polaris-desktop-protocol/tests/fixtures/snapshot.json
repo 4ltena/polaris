@@ -1,0 +1,94 @@
+{
+  "snapshot_id": "snap",
+  "session_id": "s",
+  "summary": "合成の会話",
+  "session_revision": "18446744073709551615",
+  "content_revision": "9007199254740993",
+  "plan_revision": "1",
+  "policy_revision": "2",
+  "position": {
+    "engine_epoch": "e",
+    "subscription_id": "sub",
+    "event_seq": "9007199254740993"
+  },
+  "draft": {
+    "draft_revision": "4",
+    "text": "日本語",
+    "attachment_ids": [
+      "attachment"
+    ]
+  },
+  "configuration": {
+    "configuration_revision": "3",
+    "provider": "fake",
+    "model": "example",
+    "effort": "medium"
+  },
+  "tasks": [
+    {
+      "task_id": "task",
+      "title": "境界試験",
+      "state": "review_pending",
+      "acceptance": [
+        {
+          "criterion": "境界値を保持する",
+          "state": "passed",
+          "evidence": "合成の確認記録"
+        }
+      ],
+      "blockers": [
+        {
+          "run_id": "child",
+          "attempt_id": "child-attempt",
+          "kind": "outcome_unknown",
+          "detail": "合成の結果不明"
+        }
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "run_id": "run",
+      "attempt_id": "attempt",
+      "state": "awaiting_approval",
+      "task_ids": [
+        "task"
+      ]
+    }
+  ],
+  "children": [
+    {
+      "run_id": "child",
+      "attempt_id": "child-attempt",
+      "parent_run_id": "run",
+      "state": "queued",
+      "task_ids": [
+        "task"
+      ]
+    }
+  ],
+  "child_attempt_count": "1",
+  "unresolved_approvals": [
+    {
+      "approval_id": "approval",
+      "run_id": "run",
+      "attempt_id": "attempt",
+      "operation_id": "operation",
+      "operation": "edit",
+      "scope": "synthetic-target",
+      "payload_hash": "sha256:synthetic",
+      "policy_revision": "2",
+      "expires_at_unix_ms": "1893456000000",
+      "state": "pending",
+      "display": {
+        "title": "合成の承認",
+        "description": "fixture用の表示",
+        "choices": [
+          "allow",
+          "deny"
+        ]
+      }
+    }
+  ],
+  "history_start_cursor": "history-start"
+}

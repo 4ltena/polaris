@@ -364,6 +364,12 @@ impl RequestMetric {
     }
 
     pub(super) fn finish(&mut self, result: &Result<CompletionResponse, ProviderError>) {
+        let result = result.as_ref().map_err(|mut error| {
+            while let ProviderError::ReceivedUsage { source, .. } = error {
+                error = source.as_ref();
+            }
+            error
+        });
         self.outcome = match result {
             _ if self.server_cancelled => "cancelled",
             Ok(_) => "completed",
@@ -372,6 +378,8 @@ impl RequestMetric {
             Err(ProviderError::Decode(_)) => "decode_error",
             Err(ProviderError::Budget(_)) => "budget_error",
             Err(ProviderError::Unsupported(_)) => "unsupported_error",
+            Err(ProviderError::Observation { .. }) => "observation_error",
+            Err(ProviderError::ReceivedUsage { .. }) => unreachable!("unwrapped above"),
         };
     }
 
@@ -474,6 +482,22 @@ mod tests {
             },
             Some("medium"),
         )
+    }
+
+    #[test]
+    fn p43_observation_error_keeps_already_received_usage() {
+        let path = LogPath::new();
+        let mut metric = RequestMetric::new(&path.0, &body()).unwrap();
+        metric.usage = TokenUsage::parse(&serde_json::json!({"input_tokens":3,"output_tokens":4}));
+        metric.finish(&Err(ProviderError::Observation {
+            reason: crate::ObserverError::Full,
+            completed: None,
+        }));
+        assert_eq!(metric.outcome, "observation_error");
+        assert_eq!(metric.usage.input_tokens, Some(3));
+        assert_eq!(metric.usage.output_tokens, Some(4));
+        drop(metric);
+        assert_eq!(path.records().len(), 1);
     }
 
     #[test]

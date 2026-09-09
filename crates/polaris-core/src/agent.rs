@@ -18,6 +18,8 @@ use crate::stop::{StopReason, StopTracker};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
+    #[error("desktop event delivery stopped: {0}")]
+    Desktop(crate::desktop_events::EventFailure),
     #[error("stopped: {0:?}")]
     Stopped(StopReason),
     #[error("provider: {0}")]
@@ -30,9 +32,8 @@ pub enum AgentError {
 /// hands it to `dispatch`.
 ///
 /// `sandbox` and `helper` are needed by all of `write` / `edit` / `bash`.
-/// `gate` and `approver` are used only by `write` / `edit` (`bash` does not
-/// go through the predicate — see the `crate::approval` docs, and the
-/// per-tool behavior explanation near the top of this file).
+/// `gate` and `approver` guard writes, edits, and shell commands. Shell
+/// approval is independent of the write-target predicate.
 pub struct ToolContext<'a> {
     pub sandbox: &'a polaris_sandbox::SandboxPolicy,
     pub helper: &'a Path,
@@ -40,23 +41,11 @@ pub struct ToolContext<'a> {
     pub approver: &'a mut dyn crate::approval::Approver,
 }
 
-/// The `Approver` a subagent is given. Despite the name, it does not make
-/// a subagent's writes auto-approved: `spawn` pairs it with
-/// [`crate::approval::ApprovalPolicy::Never`], and under that policy
-/// [`crate::approval::Gate::check`] returns `Err` for anything the
-/// predicate flags as needing approval *before* it ever reaches an
-/// `Approver`. So this `ask` is unreachable in production, and a subagent
-/// write outside its declared root is refused by the gate — and by the
-/// sandbox behind it, whose writable roots `spawn` builds as the same
-/// object as the declaration — rather than waved through here.
-///
-/// It exists because `ToolContext` requires *some* `Approver`, and a
-/// subagent runs in the background with nobody to prompt. `Allow` is the
-/// honest answer for the one case that could reach it (a policy other than
-/// `Never`, which `spawn` never sets): there is no user to consult, so
-/// there is no approval to report.
+/// A test-only approver for fixtures that do not exercise user denial.
+#[cfg(test)]
 pub(crate) struct AutoApprove;
 
+#[cfg(test)]
 impl crate::approval::Approver for AutoApprove {
     fn ask(&mut self, _reason: &str) -> crate::approval::Decision {
         crate::approval::Decision::Allow
@@ -78,8 +67,8 @@ pub struct AgentOutcome {
 
 /// Pass in `always_on` as something [`crate::prompt::assemble_always_on`]
 /// has already assembled. It is not assembled inside the loop, so that the
-/// caller is made to guarantee the same string is sent every turn and the
-/// cache prefix never shifts.
+/// core keeps assembly bounded. A trusted refresh capability replaces only
+/// project rules at a request boundary; unchanged effective rules keep the prefix.
 ///
 /// This takes [`crate::prompt::AlwaysOn`] rather than a string and a
 /// `Vec<ToolSpec>` taken separately, so that what gets loaded every turn
@@ -117,6 +106,7 @@ pub async fn run(
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
     session.check_persistence()?;
+    session.request_prompt = Some(always_on.clone());
     run_loop(
         provider,
         session,
@@ -130,10 +120,69 @@ pub async fn run(
         spawn_concurrency,
         spawn_write_concurrency,
         "root",
-        events,
+        events.map(Into::into),
         ctx,
     )
     .await
+}
+
+/// Runs with a bounded desktop event sink. Cancellation stops polling the
+/// provider/agent future; it does not prove remote inference or a running
+/// synchronous tool has terminated. The controller must keep those distinct.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_desktop(
+    provider: &dyn Provider,
+    session: &mut Session,
+    audit: Arc<Mutex<AuditLog>>,
+    stop: &mut StopTracker,
+    always_on: &crate::prompt::AlwaysOn,
+    skills: &[polaris_skills::Skill],
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
+    events: crate::desktop_events::DesktopEventSink,
+    ctx: &mut ToolContext<'_>,
+) -> Result<AgentOutcome, AgentError> {
+    let control = events.control();
+    session.request_prompt = Some(always_on.clone());
+    if let Some(reason) = control.failure() {
+        return Err(AgentError::Desktop(reason));
+    }
+    let execution = run_loop(
+        provider,
+        session,
+        audit,
+        stop,
+        always_on.system(),
+        always_on.tools(),
+        skills,
+        agent_types,
+        provider_pool,
+        spawn_concurrency,
+        spawn_write_concurrency,
+        "root",
+        Some(crate::desktop_events::EventSink::Bounded(events)),
+        ctx,
+    );
+    tokio::select! {
+        biased;
+        _ = control.cancelled() => Err(AgentError::Desktop(control.failure().unwrap_or(crate::desktop_events::EventFailure::Cancelled))),
+        // Once the agent has observed and persisted completion, preserve its
+        // result and usage even if the display disconnects in that same poll.
+        result = execution => result,
+    }
+}
+
+pub(crate) fn check_event_delivery(
+    events: Option<&crate::desktop_events::EventSink>,
+) -> Result<(), AgentError> {
+    if let Some(crate::desktop_events::EventSink::Bounded(sink)) = events
+        && let Some(reason) = sink.control().failure()
+    {
+        return Err(AgentError::Desktop(reason));
+    }
+    Ok(())
 }
 
 /// The most directories one tool call may set `files.md` regeneration
@@ -189,6 +238,20 @@ async fn flush_directory_changes(
         return;
     }
     let mut changes = std::mem::take(pending);
+    // This legacy regeneration entry cannot receive the parent's gate.
+    // Refuse its unattended work rather than silently substituting Never.
+    if let Err(reason) = ctx.gate.check_unattended("automatic files.md regeneration") {
+        let _ = audit.lock().await.record(&Record {
+            tool: "files-md-writer",
+            detail: "automatic regeneration refused",
+            sandbox: Some(ctx.sandbox),
+            target: None,
+            result: &reason,
+            caller: "harness",
+        });
+        return;
+    }
+
     changes.new_dirs.sort();
     changes.new_dirs.dedup();
     changes.new_files_in_existing_dirs.sort();
@@ -331,7 +394,7 @@ pub(crate) async fn run_loop(
     spawn_concurrency: usize,
     spawn_write_concurrency: usize,
     caller: &str,
-    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    events: Option<crate::desktop_events::EventSink>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
     // Resolve once at the real user boundary; tool continuations retain this
@@ -341,7 +404,15 @@ pub(crate) async fn run_loop(
         .workflow
         .as_ref()
         .filter(|workflow| workflow.config.enabled)
-        .map(|workflow| workflow.begin_turn_from_disk(skills))
+        .map(|workflow| {
+            if matches!(&events, Some(crate::desktop_events::EventSink::Bounded(_))) {
+                // The desktop owner supplies a frozen, validated skill snapshot.
+                // Never reopen host paths while running an isolated root or child.
+                workflow.begin_turn(skills)
+            } else {
+                workflow.begin_turn_from_disk(skills)
+            }
+        })
         .transpose()
         .map_err(std::io::Error::other)?;
     let workflow_system = workflow_turn
@@ -398,6 +469,7 @@ pub(crate) async fn run_loop(
     // independently and cannot inherit transport state from their parent.
     let turn_context = polaris_provider::turn_affinity::TurnContext::new();
     loop {
+        check_event_delivery(events.as_ref())?;
         // Call unconditionally every turn. If this were only called on
         // error, a call pattern that never triggers an error would never
         // trip MaxTurns, and the loop could run forever.
@@ -471,16 +543,36 @@ pub(crate) async fn run_loop(
             request_messages.push(evidence.clone());
         }
         request_messages.extend_from_slice(&session.messages);
-        let res = provider
-            .complete_in_turn(
-                CompletionRequest {
-                    system: system.to_string(),
-                    messages: request_messages,
-                    tools: tools.to_vec(),
-                },
-                &turn_context,
-            )
-            .await?;
+        check_event_delivery(events.as_ref())?;
+        let observer = events
+            .as_ref()
+            .map(crate::desktop_events::EventSink::response_observer)
+            .transpose()
+            .map_err(AgentError::Desktop)?
+            .flatten();
+        let request = CompletionRequest {
+            system: match &session.request_prompt {
+                Some(prompt) => {
+                    let mut refreshed = prompt.system_for_request()?;
+                    if let Some(turn) = &workflow_turn {
+                        refreshed.push('\n');
+                        refreshed.push_str(&turn.body);
+                    }
+                    refreshed
+                }
+                None => system.to_string(),
+            },
+            messages: request_messages,
+            tools: tools.to_vec(),
+        };
+        let res = match observer.as_ref() {
+            Some(observer) => {
+                provider
+                    .complete_in_turn_with_observer(request, &turn_context, Some(observer))
+                    .await?
+            }
+            None => provider.complete_in_turn(request, &turn_context).await?,
+        };
 
         if res.tool_calls.is_empty() {
             let display_text = res.display_text();
@@ -523,6 +615,7 @@ pub(crate) async fn run_loop(
 
         let mut pending_changes = crate::dir_watch::DirChanges::default();
         for call in &res.tool_calls {
+            check_event_delivery(events.as_ref())?;
             // Read/bash (and spawn/skill) may consume the generated map.
             // Explicit map edits must also see the preceding regeneration.
             if !matches!(call.name.as_str(), "write" | "edit")
@@ -755,7 +848,7 @@ fn dispatch_conversation_read(
     saved: Option<&crate::session_store::PersistedSession>,
     call: &polaris_provider::ToolCall,
     path: &str,
-    events: Option<&tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    events: Option<&crate::desktop_events::EventSink>,
 ) -> Result<String, String> {
     if let Some(tx) = events {
         let _ = tx.send(crate::events::AgentEvent::ToolStarted {
@@ -763,6 +856,7 @@ fn dispatch_conversation_read(
             detail: call.arguments.to_string(),
         });
     }
+    check_event_delivery(events).map_err(|error| error.to_string())?;
     let result = saved
         .ok_or_else(|| "会話原文の永続保存が有効ではありません".to_string())
         .and_then(|saved| {
@@ -786,7 +880,7 @@ async fn dispatch_memory_read(
     memory: Option<&crate::tool_memory::ToolMemory>,
     call: &polaris_provider::ToolCall,
     path: &str,
-    events: Option<&tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    events: Option<&crate::desktop_events::EventSink>,
 ) -> Result<String, String> {
     if let Some(tx) = events {
         let _ = tx.send(crate::events::AgentEvent::ToolStarted {
@@ -794,6 +888,7 @@ async fn dispatch_memory_read(
             detail: call.arguments.to_string(),
         });
     }
+    check_event_delivery(events).map_err(|error| error.to_string())?;
     let result = async {
         let memory = memory
             .ok_or("tool memory is disabled; enable --tool-memory to retrieve saved results")?;
@@ -854,7 +949,7 @@ async fn dispatch(
     audit: Arc<Mutex<AuditLog>>,
     spawn_concurrency: usize,
     spawn_write_concurrency: usize,
-    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    events: Option<crate::desktop_events::EventSink>,
     workflow: Option<crate::spawn::ChildWorkflow>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<String, String> {
@@ -865,7 +960,12 @@ async fn dispatch(
         });
     }
 
+    check_event_delivery(events.as_ref()).map_err(|error| error.to_string())?;
     let mut pending_diff: Option<crate::events::Diff> = None;
+    let owned_port = match events.as_ref() {
+        Some(crate::desktop_events::EventSink::Bounded(sink)) => sink.execution(),
+        _ => None,
+    };
 
     let outcome: Result<String, String> = match call.name.as_str() {
         "read" => 'read: {
@@ -878,7 +978,24 @@ async fn dispatch(
                 .as_u64()
                 .map(|n| n as usize)
                 .unwrap_or(polaris_tools::read::DEFAULT_LIMIT);
-            polaris_tools::read::read(Path::new(path), offset, limit).map_err(|e| e.to_string())
+            if ctx.sandbox.isolated_boundary().is_some() {
+                let budget = match polaris_tools::isolated_read::output_budget() {
+                    Ok(budget) => budget,
+                    Err(error) => break 'read Err(error),
+                };
+                let request = polaris_tools::isolated_read::Request::Lines {
+                    path: path.into(),
+                    offset,
+                    limit,
+                    budget,
+                };
+                match isolated_read(owned_port, ctx.sandbox, ctx.helper, request).await {
+                    Ok(polaris_tools::isolated_read::Reply::Text(text)) => Ok(text),
+                    _ => Err("isolated read unavailable; no direct-read fallback".into()),
+                }
+            } else {
+                polaris_tools::read::read(Path::new(path), offset, limit).map_err(|e| e.to_string())
+            }
         }
         "write" => 'write: {
             let path = match call.arguments["path"].as_str() {
@@ -890,8 +1007,27 @@ async fn dispatch(
                 None => break 'write Err("content is missing".to_string()),
             };
             let path = Path::new(path);
-            if let Err(e) = ctx.gate.check(ctx.sandbox, path, ctx.approver) {
+            let approval = if owned_port.is_some() {
+                ctx.gate.check_owned_write(ctx.sandbox, path)
+            } else {
+                ctx.gate.check_async(ctx.sandbox, path, ctx.approver).await
+            };
+            if let Err(e) = approval {
                 break 'write Err(e);
+            }
+            check_event_delivery(events.as_ref()).map_err(|error| error.to_string())?;
+            if let Some(port) = owned_port {
+                break 'write owned_mutation(
+                    port,
+                    ctx.sandbox,
+                    ctx.helper,
+                    path,
+                    polaris_sandbox::Mutation::Write {
+                        path: path.into(),
+                        content: content.into(),
+                    },
+                )
+                .await;
             }
             // diffを送るため、上書き前の内容を先に読んでおく。読めない
             // (=存在しない)なら新規ファイル扱い。読み取り自体の失敗は
@@ -905,14 +1041,28 @@ async fn dispatch(
             // `read_to_string`だとreadツールなら決して見せない内容が
             // diffとして端末に出てしまう。読めなかった場合と同じ扱い
             // (=diffなし)にして、write本体の可否には手を触れない。
-            let old_content = if polaris_tools::path_policy::is_denied(path) {
-                None
+            let (old_content, diff_available) = if ctx.sandbox.isolated_boundary().is_some() {
+                // 本文取得は隔離helperだけ。owner不在・拒否は差分を省略する。
+                match isolated_read(
+                    owned_port,
+                    ctx.sandbox,
+                    ctx.helper,
+                    polaris_tools::isolated_read::Request::DiffBefore { path: path.into() },
+                )
+                .await
+                {
+                    Ok(polaris_tools::isolated_read::Reply::Text(text)) => (Some(text), true),
+                    Ok(polaris_tools::isolated_read::Reply::Missing) => (None, true),
+                    _ => (None, false),
+                }
+            } else if polaris_tools::path_policy::is_denied(path) {
+                (None, true)
             } else {
-                std::fs::read_to_string(path).ok()
+                (std::fs::read_to_string(path).ok(), true)
             };
             let result = polaris_tools::write::write(ctx.sandbox, ctx.helper, path, content)
                 .map_err(|e| e.to_string());
-            if result.is_ok() {
+            if result.is_ok() && diff_available {
                 let mut diff =
                     crate::events::compute_diff(old_content.as_deref().unwrap_or(""), content);
                 diff.is_new_file = old_content.is_none();
@@ -934,8 +1084,28 @@ async fn dispatch(
                 None => break 'edit Err("new is missing".to_string()),
             };
             let path = Path::new(path);
-            if let Err(e) = ctx.gate.check(ctx.sandbox, path, ctx.approver) {
+            let approval = if owned_port.is_some() {
+                ctx.gate.check_owned_write(ctx.sandbox, path)
+            } else {
+                ctx.gate.check_async(ctx.sandbox, path, ctx.approver).await
+            };
+            if let Err(e) = approval {
                 break 'edit Err(e);
+            }
+            check_event_delivery(events.as_ref()).map_err(|error| error.to_string())?;
+            if let Some(port) = owned_port {
+                break 'edit owned_mutation(
+                    port,
+                    ctx.sandbox,
+                    ctx.helper,
+                    path,
+                    polaris_sandbox::Mutation::Edit {
+                        path: path.into(),
+                        old: old.into(),
+                        new: new.into(),
+                    },
+                )
+                .await;
             }
             let result = polaris_tools::edit::edit(ctx.sandbox, ctx.helper, path, old, new)
                 .map_err(|e| e.to_string());
@@ -949,7 +1119,50 @@ async fn dispatch(
                 Some(c) => c,
                 None => break 'bash Err("command is missing".to_string()),
             };
-            polaris_tools::bash::run(ctx.sandbox, command).map_err(|e| e.to_string())
+            let approval = if owned_port.is_some() {
+                ctx.gate.check_owned_command(ctx.sandbox, command)
+            } else {
+                ctx.gate
+                    .check_command_async(ctx.sandbox, command, ctx.approver)
+                    .await
+            };
+            if let Err(e) = approval {
+                break 'bash Err(e);
+            }
+            check_event_delivery(events.as_ref()).map_err(|error| error.to_string())?;
+            if let Some(crate::desktop_events::EventSink::Bounded(sink)) = events.as_ref()
+                && let Some(port) = sink.execution()
+            {
+                let submitted = if port.has_execution_ceiling() {
+                    port.submit_confined_execution(ctx.sandbox, ctx.helper, command)
+                } else {
+                    port.submit(crate::desktop_execution::ExecutionCommand {
+                        policy: ctx.sandbox.clone(),
+                        program: PathBuf::from("/bin/sh"),
+                        args: vec!["-c".into(), command.into()],
+                        stdin: None,
+                    })
+                };
+                let waiting = match submitted {
+                    Ok(waiting) => waiting,
+                    Err(error) => break 'bash Err(error),
+                };
+                let result = match waiting.await {
+                    Ok(result) => result,
+                    Err(error) => break 'bash Err(error),
+                };
+                let text = result.text();
+                if result.end == crate::desktop_execution::ControlledEnd::Exited
+                    && result.status == Some(0)
+                    && result.problem.is_none()
+                {
+                    Ok(text)
+                } else {
+                    Err(text)
+                }
+            } else {
+                polaris_tools::bash::run(ctx.sandbox, command).map_err(|e| e.to_string())
+            }
         }
         "skill" => 'skill: {
             let q = match call.arguments["q"].as_str() {
@@ -985,7 +1198,7 @@ async fn dispatch(
             // Depth is fixed at 1 so this never recurses at runtime (a
             // subagent's tool list has no `spawn` in it), but the compiler
             // still has to give the future a finite size.
-            Ok(Box::pin(crate::spawn::run_wave_scoped(
+            Ok(Box::pin(crate::spawn::run_wave_with_gate(
                 tasks,
                 agent_types,
                 provider_pool,
@@ -996,6 +1209,7 @@ async fn dispatch(
                 spawn_write_concurrency,
                 events.clone(),
                 workflow,
+                ctx.gate,
             ))
             .await)
         }
@@ -1021,11 +1235,472 @@ async fn dispatch(
     outcome
 }
 
+/// CLIの隔離helper入口だけが呼ぶ。親のdispatchからは呼ばない。
+/// CLIは既存のcore依存を使い、本文処理はtoolsへ委譲する。
+pub fn serve_confined_read(input: impl std::io::Read) -> Vec<u8> {
+    polaris_tools::isolated_read::serve(input)
+}
+
+/// 隔離readは既存service ownerへ要求する。待機futureのDropが取消を通知し、
+/// childと未回収handleはserviceに残る。owner不在時に親で本文を読まない。
+async fn isolated_read(
+    port: Option<&crate::desktop_execution::ExecutionPort>,
+    policy: &polaris_sandbox::SandboxPolicy,
+    helper: &Path,
+    request: polaris_tools::isolated_read::Request,
+) -> Result<polaris_tools::isolated_read::Reply, String> {
+    let port = port.ok_or("isolated read requires an execution owner")?;
+    let payload = serde_json::to_string(&request).map_err(|_| "invalid isolated read request")?;
+    if payload.len() > polaris_tools::isolated_read::REQUEST_LIMIT {
+        return Err("isolated read request too large".into());
+    }
+    let readonly = policy
+        .restrict(polaris_sandbox::SandboxMode::ReadOnly, &[])
+        .map_err(|_| "isolated read policy could not be restricted")?;
+    let waiting = if port.has_read_helper() {
+        if !port.read_helper_matches(helper, &readonly) {
+            return Err("isolated read helper grant mismatch".into());
+        }
+        port.submit_confined_read(&request)?
+    } else {
+        port.submit(crate::desktop_execution::ExecutionCommand {
+            policy: readonly,
+            program: helper.into(),
+            args: vec!["--confined-read".into()],
+            stdin: Some(payload),
+        })?
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .map_err(|_| "isolated read timed out; cleanup remains owned")??;
+    if result.end != crate::desktop_execution::ControlledEnd::Exited
+        || result.status != Some(0)
+        || result.problem.is_some()
+        || !result.stdout_eof
+        || !result.stderr_eof
+        || result.stdout_truncated
+        || result.stderr_truncated
+    {
+        // 失敗時のstdout/stderrを本文として露出させない。
+        return Err("isolated read unavailable".into());
+    }
+    polaris_tools::isolated_read::decode(&result.stdout, &request)
+}
+
+async fn owned_mutation(
+    port: &crate::desktop_execution::ExecutionPort,
+    policy: &polaris_sandbox::SandboxPolicy,
+    helper: &Path,
+    path: &Path,
+    mutation: polaris_sandbox::Mutation,
+) -> Result<String, String> {
+    let waiting = if port.has_mutation_grant() {
+        port.submit_confined_mutation(policy, helper, &mutation)?
+    } else {
+        let payload = serde_json::to_string(&mutation).map_err(|e| e.to_string())?;
+        port.submit(crate::desktop_execution::ExecutionCommand {
+            policy: policy.clone(),
+            program: helper.into(),
+            args: vec!["--confined-apply".into()],
+            stdin: Some(payload),
+        })?
+    };
+    let result = waiting.await?;
+    if result.end != crate::desktop_execution::ControlledEnd::Exited
+        || result.problem.is_some()
+        || !result.stdout_eof
+        || !result.stderr_eof
+    {
+        return Err(result.text());
+    }
+    let status = result.status.ok_or_else(|| result.text())?;
+    polaris_tools::write::interpret_mutation_result(
+        policy,
+        path,
+        status,
+        &result.stdout,
+        &result.stderr,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use polaris_provider::{CompletionResponse, ToolCall};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn owned_mutation_uses_typed_grant_and_keeps_ungranted_requests_ordinary() {
+        use crate::desktop_execution::{ExecutionPort, ExecutionResult};
+        use polaris_desktop_protocol::ids::RunId;
+        use polaris_sandbox::{Mutation, SandboxMode, SandboxPolicy};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        for name in ["workspace", "workspace/home", "workspace/tmp", "runtime"] {
+            std::fs::create_dir(base.join(name)).unwrap();
+        }
+        let helper = base.join("runtime/helper");
+        std::fs::write(&helper, "dummy, not executed").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let policy = SandboxPolicy::isolated(
+            SandboxMode::WorkspaceWrite,
+            &base.join("workspace"),
+            &[base.join("runtime")],
+        )
+        .unwrap()
+        .with_isolated_environment(&base.join("workspace/home"), &base.join("workspace/tmp"))
+        .unwrap();
+        let run = RunId::new("mutation-dispatch").unwrap();
+        for granted in [false, true] {
+            let (port, mut receiver) = ExecutionPort::channel_with_read_helper_and_mutations(
+                run.clone(),
+                helper.clone(),
+                policy.restrict(SandboxMode::ReadOnly, &[]).unwrap(),
+                granted.then(|| policy.clone()),
+            )
+            .unwrap();
+            for mutation in [
+                Mutation::Write {
+                    path: "file".into(),
+                    content: "new".into(),
+                },
+                Mutation::Edit {
+                    path: "file".into(),
+                    old: "new".into(),
+                    new: "edited".into(),
+                },
+            ] {
+                let execute = owned_mutation(&port, &policy, &helper, Path::new("file"), mutation);
+                let inspect = async {
+                    let request = receiver.recv().await.unwrap();
+                    assert_eq!(request.is_authorized_mutation_for(&run), granted);
+                    assert_eq!(request.command.program, helper);
+                    assert_eq!(request.command.args, ["--confined-apply"]);
+                    let decoded: Mutation =
+                        serde_json::from_str(request.command.stdin.as_ref().unwrap()).unwrap();
+                    let path = match decoded {
+                        Mutation::Write { path, .. } | Mutation::Edit { path, .. } => path,
+                    };
+                    assert_eq!(
+                        path,
+                        if granted {
+                            base.join("workspace/file")
+                        } else {
+                            PathBuf::from("file")
+                        }
+                    );
+                    let mut result = ExecutionResult::not_started("fixture".into());
+                    result.end = crate::desktop_execution::ControlledEnd::Exited;
+                    result.status = Some(0);
+                    result.problem = None;
+                    result.stdout = "fixed helper result".into();
+                    request.reply.send(Arc::new(result)).unwrap();
+                };
+                let (result, ()) = tokio::join!(execute, inspect);
+                assert_eq!(result.unwrap(), "fixed helper result");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_read_dispatch_never_falls_back_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordinary.txt");
+        std::fs::write(&path, "DUMMY_PARENT_READ_PROOF").unwrap();
+        let call = polaris_provider::ToolCall {
+            id: "read-test".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": path}),
+        };
+        for isolated in [false, true] {
+            let policy = if isolated {
+                polaris_sandbox::SandboxPolicy::isolated(
+                    polaris_sandbox::SandboxMode::ReadOnly,
+                    dir.path(),
+                    &[],
+                )
+                .unwrap()
+            } else {
+                polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                    .unwrap()
+            };
+            let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+            let mut approver = AutoApprove;
+            let mut ctx = ToolContext {
+                sandbox: &policy,
+                helper: Path::new("/must-not-run"),
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let result = dispatch(
+                &call,
+                &[],
+                &[],
+                unused_provider_pool(),
+                dummy_audit(&dir),
+                1,
+                1,
+                None,
+                None,
+                &mut ctx,
+            )
+            .await;
+            if isolated {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().contains("DUMMY_PARENT_READ_PROOF"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn isolated_read_deadline_signals_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = polaris_sandbox::SandboxPolicy::isolated(
+            polaris_sandbox::SandboxMode::ReadOnly,
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        let (port, mut rx) = crate::desktop_execution::ExecutionPort::channel(
+            polaris_desktop_protocol::ids::RunId::new("isolated-deadline").unwrap(),
+        );
+        let waiting = tokio::spawn(async move {
+            isolated_read(
+                Some(&port),
+                &policy,
+                Path::new("/dummy-helper"),
+                isolated_dummy_request(),
+            )
+            .await
+        });
+        let request = rx.recv().await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(7), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(request.cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    fn isolated_dummy_request() -> polaris_tools::isolated_read::Request {
+        polaris_tools::isolated_read::Request::Lines {
+            path: PathBuf::from("/does-not-exist/dummy.txt"),
+            offset: 3,
+            limit: 2,
+            budget: 1024,
+        }
+    }
+    fn isolated_dummy_result(stdout: String) -> crate::desktop_execution::ExecutionResult {
+        crate::desktop_execution::ExecutionResult {
+            end: crate::desktop_execution::ControlledEnd::Exited,
+            status: Some(0),
+            stdout,
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            stdout_eof: true,
+            stderr_eof: true,
+            problem: None,
+        }
+    }
+    #[tokio::test]
+    async fn isolated_read_uses_owner_without_parent_file_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = polaris_sandbox::SandboxPolicy::isolated(
+            polaris_sandbox::SandboxMode::FullAccess,
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        let home = dir.path().join("home");
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&tmp).unwrap();
+        let policy = policy.with_isolated_environment(&home, &tmp).unwrap();
+        let boundary = policy.isolated_boundary().unwrap().clone();
+        let (port, mut rx) = crate::desktop_execution::ExecutionPort::channel(
+            polaris_desktop_protocol::ids::RunId::new("isolated-read").unwrap(),
+        );
+        let owner = tokio::spawn(async move {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.command.args, ["--confined-read"]);
+            assert_eq!(
+                request.command.policy.mode(),
+                polaris_sandbox::SandboxMode::ReadOnly
+            );
+            assert!(request.command.policy.writable_roots().is_empty());
+            let narrowed = request.command.policy.isolated_boundary().unwrap();
+            assert_eq!(narrowed.workspace, boundary.workspace);
+            assert_eq!(narrowed.readable_roots, boundary.readable_roots);
+            assert_eq!(
+                narrowed.environment.as_ref().unwrap().home,
+                boundary.environment.as_ref().unwrap().home
+            );
+            assert_eq!(
+                narrowed.environment.as_ref().unwrap().tmpdir,
+                boundary.environment.as_ref().unwrap().tmpdir
+            );
+            let wire: polaris_tools::isolated_read::Request =
+                serde_json::from_str(request.command.stdin.as_ref().unwrap()).unwrap();
+            assert!(matches!(
+                wire,
+                polaris_tools::isolated_read::Request::Lines {
+                    offset: 3,
+                    limit: 2,
+                    budget: 1024,
+                    ..
+                }
+            ));
+            request
+                .reply
+                .send(Arc::new(isolated_dummy_result(
+                    "{\"Text\":\"4\\tdummy\\n\"}".into(),
+                )))
+                .unwrap();
+        });
+        let result = isolated_read(
+            Some(&port),
+            &policy,
+            Path::new("/dummy-helper"),
+            isolated_dummy_request(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            polaris_tools::isolated_read::Reply::Text("4\tdummy\n".into())
+        );
+        owner.await.unwrap();
+        assert!(
+            isolated_read(
+                None,
+                &policy,
+                Path::new("/dummy-helper"),
+                isolated_dummy_request()
+            )
+            .await
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn isolated_read_uses_trusted_grant_and_rejects_mismatched_helper() {
+        use crate::desktop_execution::{ExecutionPort, SandboxMode, SandboxPolicy};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        for name in ["workspace", "workspace/home", "workspace/tmp", "runtime"] {
+            std::fs::create_dir(base.join(name)).unwrap();
+        }
+        let helper = base.join("runtime/helper");
+        std::fs::write(&helper, "dummy, never executed").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = SandboxPolicy::isolated(
+            SandboxMode::FullAccess,
+            &base.join("workspace"),
+            &[base.join("runtime")],
+        )
+        .unwrap()
+        .with_isolated_environment(&base.join("workspace/home"), &base.join("workspace/tmp"))
+        .unwrap();
+        let run = polaris_desktop_protocol::ids::RunId::new("trusted-read").unwrap();
+        let (port, mut rx) = ExecutionPort::channel_with_read_helper(
+            run.clone(),
+            helper.clone(),
+            policy.restrict(SandboxMode::ReadOnly, &[]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            isolated_read(
+                Some(&port),
+                &policy,
+                Path::new("/mismatch"),
+                isolated_dummy_request()
+            )
+            .await
+            .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+        let owner = tokio::spawn(async move {
+            let request = rx.recv().await.unwrap();
+            assert!(request.is_authorized_read_for(&run));
+            request
+                .reply
+                .send(Arc::new(isolated_dummy_result(
+                    "{\"Text\":\"4\\tdummy\\n\"}".into(),
+                )))
+                .unwrap();
+        });
+        assert!(
+            isolated_read(Some(&port), &policy, &helper, isolated_dummy_request())
+                .await
+                .is_ok()
+        );
+        owner.await.unwrap();
+    }
+    #[tokio::test]
+    async fn isolated_read_rejects_partial_or_unconfirmed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = polaris_sandbox::SandboxPolicy::isolated(
+            polaris_sandbox::SandboxMode::ReadOnly,
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        for kind in 0..4 {
+            let (port, mut rx) = crate::desktop_execution::ExecutionPort::channel(
+                polaris_desktop_protocol::ids::RunId::new("isolated-invalid").unwrap(),
+            );
+            let owner = tokio::spawn(async move {
+                let request = rx.recv().await.unwrap();
+                let mut result = isolated_dummy_result("DUMMY_UNTRUSTED_OUTPUT".into());
+                match kind {
+                    0 => result.stdout_truncated = true,
+                    1 => result.stdout_eof = false,
+                    2 => result.end = crate::desktop_execution::ControlledEnd::StopUnconfirmed,
+                    _ => {}
+                }
+                request.reply.send(Arc::new(result)).unwrap();
+            });
+            let error = isolated_read(
+                Some(&port),
+                &policy,
+                Path::new("/dummy-helper"),
+                isolated_dummy_request(),
+            )
+            .await
+            .unwrap_err();
+            assert!(!error.contains("DUMMY_UNTRUSTED_OUTPUT"));
+            owner.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn isolated_read_cancel_keeps_owner_and_signals_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = polaris_sandbox::SandboxPolicy::isolated(
+            polaris_sandbox::SandboxMode::ReadOnly,
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        let (port, mut rx) = crate::desktop_execution::ExecutionPort::channel(
+            polaris_desktop_protocol::ids::RunId::new("isolated-cancel").unwrap(),
+        );
+        let waiting = tokio::spawn(async move {
+            isolated_read(
+                Some(&port),
+                &policy,
+                Path::new("/dummy-helper"),
+                isolated_dummy_request(),
+            )
+            .await
+        });
+        let request = rx.recv().await.unwrap();
+        waiting.abort();
+        let _ = waiting.await;
+        assert!(request.cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     /// The tests share one audit log per temp directory, wrapped exactly
     /// the way production wraps it (see `run`'s docs on why it is shared
@@ -1118,6 +1793,170 @@ mod tests {
         replies: Mutex<Vec<CompletionResponse>>,
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_refresh_same_turn_keeps_workflow_and_raw_history() {
+        struct Changing {
+            path: PathBuf,
+            requests: Mutex<Vec<CompletionRequest>>,
+            change: bool,
+            invalid: bool,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Changing {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(req);
+                if requests.len() == 1 {
+                    if self.invalid {
+                        std::fs::write(&self.path, [0xff]).unwrap();
+                    } else {
+                        let rule = if self.change {
+                            "New rule."
+                        } else {
+                            "Old rule."
+                        };
+                        std::fs::write(
+                            &self.path,
+                            format!("## Always on\n{rule}\n## Other\nchanged outside section"),
+                        )
+                        .unwrap();
+                    }
+                    return Ok(CompletionResponse {
+                        tool_calls: vec![polaris_provider::ToolCall {
+                            id: "catalog".into(),
+                            name: "skill".into(),
+                            arguments: serde_json::json!({"q":""}),
+                        }],
+                        ..Default::default()
+                    });
+                }
+                assert_eq!(
+                    requests.last().unwrap().messages.last().unwrap().content,
+                    polaris_tools::skill::lookup::<polaris_skills::Skill>(&[], "")
+                );
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        for (change, invalid) in [(true, false), (false, false), (false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let path = root.join("AGENTS.md");
+            std::fs::write(&path, "## Always on\nOld rule.").unwrap();
+            let prompt = crate::prompt::assemble_always_on("", "fixed environment", &[])
+                .with_agents_refresh(crate::constitution::AgentsRefresh::new(None, &root).unwrap())
+                .unwrap();
+            let provider = Changing {
+                path,
+                requests: Mutex::new(vec![]),
+                change,
+                invalid,
+            };
+            let mut session = Session::new();
+            session.push_user("Do the task");
+            session.workflow = Some(crate::workflow::SessionWorkflow::new(
+                crate::workflow::WorkflowConfig {
+                    enabled: true,
+                    always: vec!["builtin:workflow-core".into()],
+                    ..Default::default()
+                },
+            ));
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let result = run(
+                &provider,
+                &mut session,
+                dummy_audit(&dir),
+                &mut StopTracker::new(4),
+                &prompt,
+                &[],
+                &[],
+                unused_provider_pool(),
+                1,
+                1,
+                None,
+                &mut ctx,
+            )
+            .await;
+            assert_eq!(result.is_ok(), !invalid);
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), if invalid { 1 } else { 2 });
+            assert!(requests[0].system.contains("Old rule."));
+            if !invalid {
+                assert_eq!(requests[0].system == requests[1].system, !change);
+                assert_eq!(requests[1].system.contains("New rule."), change);
+                let workflow = |s: &str| {
+                    s.split("## Required workflow instructions")
+                        .nth(1)
+                        .unwrap()
+                        .to_owned()
+                };
+                assert_eq!(workflow(&requests[0].system), workflow(&requests[1].system));
+                assert_eq!(
+                    polaris_provider::cache_key("m", None, &requests[0])
+                        == polaris_provider::cache_key("m", None, &requests[1]),
+                    !change
+                );
+            }
+            assert!(
+                session
+                    .messages
+                    .iter()
+                    .all(|m| !m.content.contains("Old rule.") && !m.content.contains("New rule."))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_refresh_initial_read_failure_makes_zero_provider_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("AGENTS.md");
+        std::fs::write(&path, "## Always on\nOriginal.").unwrap();
+        let prompt = crate::prompt::assemble_always_on("", "", &[])
+            .with_agents_refresh(crate::constitution::AgentsRefresh::new(None, &root).unwrap())
+            .unwrap();
+        std::fs::write(&path, [0xff]).unwrap();
+        let mut session = Session::new();
+        session.push_user("hello");
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let result = run(
+            &NeverCalled,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(2),
+            &prompt,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await;
+        assert!(matches!(result, Err(AgentError::Io(_))));
+        assert_eq!(session.messages.len(), 1);
+    }
+
     #[async_trait::async_trait]
     impl Provider for Scripted {
         async fn complete(
@@ -1135,6 +1974,655 @@ mod tests {
 
     struct TurnOnlyProvider {
         turn_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[tokio::test]
+    async fn desktop_stream_is_provisional_and_final_response_is_recorded_once() {
+        struct Streaming;
+        #[async_trait::async_trait]
+        impl polaris_provider::Provider for Streaming {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                panic!("desktop must pass the response observer");
+            }
+            async fn complete_in_turn_with_observer(
+                &self,
+                _: CompletionRequest,
+                _: &polaris_provider::turn_affinity::TurnContext,
+                observer: Option<&dyn polaris_provider::ResponseObserver>,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                let observer = observer.expect("desktop observer");
+                observer
+                    .try_emit(polaris_provider::ResponseEvent::TextDelta {
+                        output_index: 0,
+                        content_index: 0,
+                        text: "provisional",
+                    })
+                    .unwrap();
+                observer
+                    .try_emit(polaris_provider::ResponseEvent::FinalText {
+                        text: "authoritative",
+                        delta_matches: Some(false),
+                    })
+                    .unwrap();
+                Ok(CompletionResponse {
+                    text: "authoritative".into(),
+                    usage: Some(polaris_provider::Usage {
+                        input_tokens: 12,
+                        output_tokens: 3,
+                        total_tokens: 15,
+                        cached_tokens: 0,
+                    }),
+                    ..Default::default()
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, mut receiver, _) = crate::desktop_events::DesktopEventSink::channel(
+            polaris_desktop_protocol::ids::RunId::new("stream-final").unwrap(),
+        );
+        let mut session = Session::new();
+        session.push_user("hello");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let result = run_desktop(
+            &Streaming,
+            &mut session,
+            dummy_audit(&dir),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            sink,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "authoritative");
+        assert_eq!(result.usage.total_tokens, 15);
+        assert_eq!(result.usage_report.reported_responses, 1);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[1].content, "authoritative");
+        assert!(matches!(receiver.try_recv().unwrap().event,
+            crate::events::AgentEvent::TextDelta { request_id: 1, text, .. } if text == "provisional"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn desktop_observed_completion_keeps_usage_when_display_disconnects_in_same_poll() {
+        struct DisconnectOnReply(Mutex<Option<crate::desktop_events::DesktopEventReceiver>>);
+        #[async_trait::async_trait]
+        impl polaris_provider::Provider for DisconnectOnReply {
+            async fn complete(
+                &self,
+                _: polaris_provider::CompletionRequest,
+            ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError>
+            {
+                self.0.lock().unwrap().take();
+                Ok(completed_response())
+            }
+        }
+        fn completed_response() -> polaris_provider::CompletionResponse {
+            polaris_provider::CompletionResponse {
+                text: "completed".into(),
+                usage: Some(polaris_provider::Usage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    total_tokens: 15,
+                    cached_tokens: 0,
+                }),
+                ..Default::default()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, receiver, _) = crate::desktop_events::DesktopEventSink::channel(
+            polaris_desktop_protocol::ids::RunId::new("complete-disconnect").unwrap(),
+        );
+        let provider = DisconnectOnReply(Mutex::new(Some(receiver)));
+        let mut session = Session::new();
+        session.push_user("hello");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let outcome = run_desktop(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            sink,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.text, "completed");
+        assert_eq!(outcome.usage.input_tokens, 12);
+        assert_eq!(outcome.usage.output_tokens, 3);
+        assert_eq!(session.messages.last().unwrap().content, "completed");
+    }
+
+    #[tokio::test]
+    async fn desktop_owned_command_reaches_run_port_after_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = polaris_desktop_protocol::ids::RunId::new("owned-command").unwrap();
+        let (sink, _events, _) = crate::desktop_events::DesktopEventSink::channel(run_id.clone());
+        let (port, mut requests) = crate::desktop_execution::ExecutionPort::channel(run_id);
+        let sink = sink.with_execution(port).unwrap();
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                .unwrap();
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Never);
+        let mut approver = AutoApprove;
+        let call = polaris_provider::ToolCall {
+            id: "owned".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command":"not-a-real-shell-command"}),
+        };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: Path::new("/missing"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let execution = dispatch(
+            &call,
+            &[],
+            &[],
+            unused_provider_pool(),
+            dummy_audit(&dir),
+            1,
+            1,
+            Some(sink.into()),
+            None,
+            &mut ctx,
+        );
+        let owner = async {
+            let request = requests.recv().await.unwrap();
+            assert_eq!(request.command.program, Path::new("/bin/sh"));
+            assert_eq!(request.command.args, ["-c", "not-a-real-shell-command"]);
+            assert!(!request.cancelled.load(std::sync::atomic::Ordering::Acquire));
+            request
+                .reply
+                .send(Arc::new(crate::desktop_execution::ExecutionResult {
+                    end: crate::desktop_execution::ControlledEnd::Exited,
+                    status: Some(0),
+                    stdout: "owned-result".into(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    stdout_eof: true,
+                    stderr_eof: true,
+                    problem: None,
+                }))
+                .unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(execution, owner)
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap().contains("owned-result"));
+    }
+
+    #[tokio::test]
+    async fn desktop_owned_bash_port_failures_emit_finished() {
+        use crate::desktop_execution::{CAPACITY, ExecutionCommand, ExecutionPort};
+        use crate::events::AgentEvent;
+
+        struct OwnerApproves;
+        impl crate::approval::Approver for OwnerApproves {
+            fn ask(&mut self, _: &str) -> crate::approval::Decision {
+                panic!("only the execution owner may ask");
+            }
+        }
+
+        // submit拒否の2経路と、受付後の返信切断。実行workerは起動しない。
+        for failure in ["closed", "full", "reply-dropped"] {
+            let dir = tempfile::tempdir().unwrap();
+            let run_id = polaris_desktop_protocol::ids::RunId::new(failure).unwrap();
+            let (sink, mut events, control) =
+                crate::desktop_events::DesktopEventSink::channel(run_id.clone());
+            let (port, mut requests) = ExecutionPort::channel(run_id.clone());
+            let sandbox =
+                polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                    .unwrap();
+            let mut prefilled = Vec::new();
+            if failure == "full" {
+                for _ in 0..CAPACITY {
+                    prefilled.push(
+                        port.submit(ExecutionCommand {
+                            policy: sandbox.clone(),
+                            program: PathBuf::from("/never-executed-fixture"),
+                            args: vec![],
+                            stdin: None,
+                        })
+                        .unwrap(),
+                    );
+                }
+            } else if failure == "closed" {
+                requests.close();
+            }
+            let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+            let mut approver = OwnerApproves;
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: Path::new("/never-executed-helper"),
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let call = polaris_provider::ToolCall {
+                id: "port-failure".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "printf unexpected-direct-fallback"}),
+            };
+            let execution = dispatch(
+                &call,
+                &[],
+                &[],
+                unused_provider_pool(),
+                dummy_audit(&dir),
+                1,
+                1,
+                Some(sink.with_execution(port).unwrap().into()),
+                None,
+                &mut ctx,
+            );
+            let owner = async {
+                if failure == "reply-dropped" {
+                    let request = requests.recv().await.unwrap();
+                    assert_eq!(request.command.program, Path::new("/bin/sh"));
+                    assert_eq!(
+                        request.command.args,
+                        ["-c", "printf unexpected-direct-fallback"]
+                    );
+                    drop(request.reply);
+                }
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(execution, owner)
+            })
+            .await
+            .unwrap();
+            let expected = if failure == "reply-dropped" {
+                "desktop execution owner disconnected"
+            } else {
+                "desktop execution owner unavailable or full"
+            };
+            assert_eq!(result, Err(expected.into()), "{failure}");
+            assert_eq!(control.failure(), None, "event delivery remains available");
+            let started = events.try_recv().expect("Started");
+            assert_eq!(started.run_id, run_id);
+            assert_eq!(started.sequence, 1);
+            assert!(
+                matches!(started.event, AgentEvent::ToolStarted { name, .. } if name == "bash")
+            );
+            let finished = events.try_recv().expect("port failure must emit Finished");
+            assert_eq!(finished.run_id, run_id);
+            assert_eq!(finished.sequence, 2);
+            match finished.event {
+                AgentEvent::ToolFinished {
+                    name,
+                    detail,
+                    ok,
+                    result,
+                    ..
+                } => {
+                    assert_eq!(name, "bash");
+                    assert_eq!(detail, call.arguments.to_string());
+                    assert!(!ok);
+                    assert_eq!(result, expected);
+                }
+                other => panic!("unexpected terminal event: {other:?}"),
+            }
+            assert!(events.try_recv().is_err(), "exactly one terminal event");
+            if failure == "full" {
+                for _ in 0..CAPACITY {
+                    let request = requests.try_recv().unwrap();
+                    assert_eq!(
+                        request.command.program,
+                        Path::new("/never-executed-fixture")
+                    );
+                }
+            }
+            assert!(requests.try_recv().is_err(), "no extra command submitted");
+            drop(prefilled);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_mutations_are_owned_and_do_not_ask_a_second_approver() {
+        struct OwnerApproves;
+        impl crate::approval::Approver for OwnerApproves {
+            fn ask(&mut self, _: &str) -> crate::approval::Decision {
+                panic!("the durable execution owner must be the only approver");
+            }
+        }
+        for operation in ["write", "edit"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            std::fs::write(&target, "old").unwrap();
+            let run_id = polaris_desktop_protocol::ids::RunId::new("owned-mutation").unwrap();
+            let (sink, _events, _) =
+                crate::desktop_events::DesktopEventSink::channel(run_id.clone());
+            let (port, mut requests) = crate::desktop_execution::ExecutionPort::channel(run_id);
+            let sandbox = polaris_sandbox::SandboxPolicy::new(
+                polaris_sandbox::SandboxMode::WorkspaceWrite,
+                &[dir.path().to_path_buf()],
+            )
+            .unwrap();
+            let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+            let mut approver = OwnerApproves;
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: Path::new("/must-not-launch"),
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let call = polaris_provider::ToolCall {
+                id: "mutation".into(),
+                name: operation.into(),
+                arguments: serde_json::json!({"path":target,"content":"new","old":"old","new":"new"}),
+            };
+            let execution = dispatch(
+                &call,
+                &[],
+                &[],
+                unused_provider_pool(),
+                dummy_audit(&dir),
+                1,
+                1,
+                Some(sink.with_execution(port).unwrap().into()),
+                None,
+                &mut ctx,
+            );
+            let owner = async {
+                let request = requests.recv().await.unwrap();
+                assert_eq!(request.command.program, Path::new("/must-not-launch"));
+                assert_eq!(request.command.args, ["--confined-apply"]);
+                let payload: serde_json::Value =
+                    serde_json::from_str(request.command.stdin.as_ref().unwrap()).unwrap();
+                assert!(payload.to_string().contains("new"));
+                request
+                    .reply
+                    .send(Arc::new(
+                        crate::desktop_execution::ExecutionResult::not_started(
+                            "owner denied".into(),
+                        ),
+                    ))
+                    .unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(execution, owner)
+            })
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().contains("owner denied"));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_command_uses_the_async_approval_mailbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = polaris_desktop_protocol::ids::RunId::new("async-command").unwrap();
+        let (sink, _events, control) = crate::desktop_events::EventSink::desktop(run_id.clone());
+        let (mut approver, mut requests) = crate::desktop_approval::DesktopApprover::channel(
+            run_id,
+            4,
+            std::time::Duration::from_secs(2),
+            control,
+        );
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                .unwrap();
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+        let call = polaris_provider::ToolCall {
+            id: "command".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command":"printf p4-approval"}),
+        };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: Path::new("/bin/false"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let execution = dispatch(
+            &call,
+            &[],
+            &[],
+            unused_provider_pool(),
+            dummy_audit(&dir),
+            1,
+            1,
+            Some(sink),
+            None,
+            &mut ctx,
+        );
+        let controller = async {
+            let pending = requests.recv().await.unwrap();
+            assert_eq!(pending.run_id().as_str(), "async-command");
+            assert!(pending.reason().contains("p4-approval"));
+            assert!(pending.resolve(4, crate::approval::Decision::Allow));
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(execution, controller)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "p4-approval");
+    }
+
+    #[tokio::test]
+    async fn desktop_start_event_overflow_stops_before_approval_or_tool_execution() {
+        struct MustNotAsk;
+        impl crate::approval::Approver for MustNotAsk {
+            fn ask(&mut self, _: &str) -> crate::approval::Decision {
+                panic!("approval/tool path was reached after notification failure")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, _receiver, control) = crate::desktop_events::EventSink::desktop(
+            polaris_desktop_protocol::ids::RunId::new("full-start").unwrap(),
+        );
+        for _ in 0..crate::desktop_events::EVENT_CAPACITY {
+            sink.send(crate::events::AgentEvent::SpawnFinished {
+                agent_type: "fixture".into(),
+                ok: true,
+            })
+            .unwrap();
+        }
+        assert!(control.failure().is_none());
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[dir.path().to_path_buf()],
+        )
+        .unwrap();
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+        let target = dir.path().join("must-not-exist");
+        let call = polaris_provider::ToolCall {
+            id: "write".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path":target,"content":"must not write"}),
+        };
+        let result = dispatch(
+            &call,
+            &[],
+            &[],
+            unused_provider_pool(),
+            dummy_audit(&dir),
+            1,
+            1,
+            Some(sink),
+            None,
+            &mut ToolContext {
+                sandbox: &sandbox,
+                helper: Path::new("/bin/false"),
+                gate: &mut gate,
+                approver: &mut MustNotAsk,
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().contains("Full"));
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn desktop_delivery_cancels_a_pending_provider_without_a_completed_reply() {
+        struct PendingProvider(tokio::sync::Notify);
+        #[async_trait::async_trait]
+        impl polaris_provider::Provider for PendingProvider {
+            async fn complete(
+                &self,
+                _: polaris_provider::CompletionRequest,
+            ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError>
+            {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let provider = PendingProvider(tokio::sync::Notify::new());
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.push_user("hello");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (sink, receiver, _) = crate::desktop_events::DesktopEventSink::channel(
+            polaris_desktop_protocol::ids::RunId::new("cancel-provider").unwrap(),
+        );
+        let run = run_desktop(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            sink,
+            &mut ctx,
+        );
+        let disconnect = async {
+            provider.0.notified().await;
+            drop(receiver);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(run, disconnect)
+        })
+        .await
+        .expect("pending provider was not cancelled");
+        assert!(matches!(
+            result,
+            Err(AgentError::Desktop(
+                crate::desktop_events::EventFailure::ReceiverDropped
+            ))
+        ));
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "cancelled provider must not publish a completed reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_pre_cancel_does_not_call_provider_and_normal_completion_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Scripted {
+            replies: Mutex::new(vec![CompletionResponse {
+                text: "done".into(),
+                ..Default::default()
+            }]),
+        };
+        let mut session = Session::new();
+        session.push_user("hello");
+        let mut stop = StopTracker::new(10);
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (sink, _receiver, control) = crate::desktop_events::DesktopEventSink::channel(
+            polaris_desktop_protocol::ids::RunId::new("pre-cancel").unwrap(),
+        );
+        control.cancel();
+        let result = run_desktop(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            sink,
+            &mut ctx,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AgentError::Desktop(
+                crate::desktop_events::EventFailure::Cancelled
+            ))
+        ));
+        assert_eq!(provider.replies.lock().unwrap().len(), 1);
+        let (sink, _receiver, _) = crate::desktop_events::DesktopEventSink::channel(
+            polaris_desktop_protocol::ids::RunId::new("normal").unwrap(),
+        );
+        let result = run_desktop(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            sink,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "done");
+        assert!(provider.replies.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2572,30 +4060,266 @@ print("wrote")
     }
 
     #[tokio::test]
+    async fn d04_always_bash_requires_approval_before_execution() {
+        use crate::approval::{ApprovalPolicy, Decision, Gate};
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+        for mode in [
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::FullAccess,
+        ] {
+            for decision in [Decision::Deny, Decision::Allow] {
+                let dir = tempfile::tempdir().unwrap();
+                let proof = dir.path().canonicalize().unwrap().join("started");
+                let roots = if mode == SandboxMode::WorkspaceWrite {
+                    vec![dir.path().to_path_buf()]
+                } else {
+                    vec![]
+                };
+                let sandbox = SandboxPolicy::new(mode, &roots).unwrap();
+                let mut gate = Gate::new(ApprovalPolicy::Always);
+                let mut approver = RecordingApprover {
+                    decision,
+                    asked: 0,
+                    last_reason: None,
+                };
+                let command = if mode == SandboxMode::ReadOnly {
+                    "printf d04-ran".to_string()
+                } else {
+                    format!(
+                        "printf d04-ran > '{}' && cat '{}'",
+                        proof.display(),
+                        proof.display()
+                    )
+                };
+                let call = ToolCall {
+                    id: "d04".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": command}),
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let result = dispatch(
+                    &call,
+                    &[],
+                    &[],
+                    unused_provider_pool(),
+                    dummy_audit(&dir),
+                    1,
+                    1,
+                    Some(tx.into()),
+                    None,
+                    &mut ToolContext {
+                        sandbox: &sandbox,
+                        helper: Path::new("/bin/true"),
+                        gate: &mut gate,
+                        approver: &mut approver,
+                    },
+                )
+                .await;
+                assert_eq!(
+                    approver.asked, 1,
+                    "{mode:?}: command executed without asking: {result:?}"
+                );
+                assert!(approver.last_reason.unwrap().contains(&command));
+                if decision == Decision::Deny {
+                    assert!(result.unwrap_err().contains("did not approve"));
+                    assert!(!proof.exists(), "denied command started");
+                } else {
+                    assert_eq!(result.unwrap(), "d04-ran");
+                    if mode != SandboxMode::ReadOnly {
+                        assert_eq!(std::fs::read_to_string(&proof).unwrap(), "d04-ran");
+                    }
+                }
+                assert!(matches!(
+                    rx.try_recv().unwrap(),
+                    crate::events::AgentEvent::ToolStarted { .. }
+                ));
+                assert!(
+                    matches!(rx.try_recv().unwrap(), crate::events::AgentEvent::ToolFinished { ok, .. } if ok == (decision == Decision::Allow))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn d04_automatic_regeneration_cannot_drop_always() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let proof = root.join("automatic-child-started");
+        let mut agent = files_md_writer_agent_type();
+        agent.allowed_tools.push("bash".into());
+        let provider = Arc::new(Scripted {
+            replies: Mutex::new(vec![
+                bash_call(format!("printf started > '{}'", proof.display())),
+                CompletionResponse {
+                    text: serde_json::json!({"path": root.join("files.md"), "status": "ok"})
+                        .to_string(),
+                    ..Default::default()
+                },
+            ]),
+        });
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut pending = crate::dir_watch::DirChanges {
+            new_dirs: vec![root],
+            ..Default::default()
+        };
+        flush_directory_changes(
+            &mut pending,
+            &[agent],
+            provider,
+            dummy_audit(&dir),
+            None,
+            &mut ToolContext {
+                sandbox: &sandbox,
+                helper: Path::new("/bin/true"),
+                gate: &mut gate,
+                approver: &mut approver,
+            },
+        )
+        .await;
+        assert!(!proof.exists(), "automatic child dropped Always");
+        let audit = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        assert!(audit.contains("approval relay is unavailable"), "{audit}");
+        assert!(pending.new_dirs.is_empty());
+        assert_eq!(approver.asked, 0);
+    }
+
+    #[tokio::test]
+    async fn d04_spawn_inherits_always_including_schema_retry() {
+        use crate::approval::{ApprovalPolicy, Decision, Gate};
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+        struct Child {
+            replies: Mutex<Vec<CompletionResponse>>,
+            results: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Child {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.results.lock().unwrap().extend(
+                    req.messages
+                        .iter()
+                        .filter(|m| m.tool_call_id.is_some())
+                        .map(|m| m.content.clone()),
+                );
+                Ok(self.replies.lock().unwrap().remove(0))
+            }
+        }
+        for retry in [false, true] {
+            for policy in [
+                ApprovalPolicy::Always,
+                ApprovalPolicy::Never,
+                ApprovalPolicy::OnRequest,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().canonicalize().unwrap();
+                let proof = root.join("child-started");
+                let schema = root.join("schema.json");
+                std::fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+                let agent = polaris_skills::AgentType {
+                    name: "d04-child".into(),
+                    description: "fixture".into(),
+                    body: "fixture".into(),
+                    path: root.clone(),
+                    allowed_tools: vec!["bash".into()],
+                    access: polaris_skills::AgentAccess::ReadWrite,
+                    tier: "low".into(),
+                    wall_seconds: 30,
+                    max_turns: 10,
+                    workflow_phase: None,
+                    continuation: false,
+                    output_schema: schema,
+                };
+                let mut replies = Vec::new();
+                if retry {
+                    replies.push(CompletionResponse {
+                        text: "invalid json".into(),
+                        ..Default::default()
+                    });
+                }
+                replies.push(bash_call(format!(
+                    "printf d04-child-ran > '{}' && cat '{}'",
+                    proof.display(),
+                    proof.display()
+                )));
+                replies.push(CompletionResponse {
+                    text: "{}".into(),
+                    ..Default::default()
+                });
+                let results = Arc::new(Mutex::new(Vec::new()));
+                let provider = Arc::new(Child {
+                    replies: Mutex::new(replies),
+                    results: results.clone(),
+                });
+                let sandbox =
+                    SandboxPolicy::new(SandboxMode::WorkspaceWrite, std::slice::from_ref(&root))
+                        .unwrap();
+                let mut gate = Gate::new(policy);
+                let mut approver = RecordingApprover {
+                    decision: Decision::Allow,
+                    asked: 0,
+                    last_reason: None,
+                };
+                let call = ToolCall {
+                    id: "spawn-d04".into(),
+                    name: "spawn".into(),
+                    arguments: serde_json::json!({"tasks":[{"type":"d04-child","task":"fixture","write_root":root}]}),
+                };
+                let out = dispatch(
+                    &call,
+                    &[],
+                    &[agent],
+                    provider,
+                    dummy_audit(&dir),
+                    1,
+                    1,
+                    None,
+                    None,
+                    &mut ToolContext {
+                        sandbox: &sandbox,
+                        helper: Path::new("/bin/true"),
+                        gate: &mut gate,
+                        approver: &mut approver,
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&out).unwrap()[0]["ok"],
+                    true,
+                    "{out}"
+                );
+                let messages = results.lock().unwrap();
+                assert!(!messages.is_empty(), "child did not attempt a command");
+                if policy == ApprovalPolicy::Always {
+                    assert!(!proof.exists(), "child downgraded Always (retry={retry})");
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|m| m.contains("approval relay is unavailable")),
+                        "{messages:?}"
+                    );
+                } else {
+                    assert_eq!(std::fs::read_to_string(&proof).unwrap(), "d04-child-ran");
+                    assert!(messages.iter().any(|m| m == "d04-child-ran"));
+                }
+                assert_eq!(approver.asked, 0, "no child approval relay exists");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn bash_attempts_and_reports_without_ever_consulting_the_approver() {
-        // Fix round 1's point: `bash` is supposed to never go through the
-        // predicate, but there was no test confirming that at the wiring
-        // level. Run `bash` once under `ApprovalPolicy::Always` (which
-        // always asks regardless of `Verdict`), and confirm the approver
-        // was never asked. Always is chosen so that if `Gate::check` were
-        // ever mistakenly mixed into the `bash` arm, it would be caught
-        // regardless of whether the target path happened to be inside or
-        // outside the root (under `OnRequest`, it could be missed
-        // depending on which target path the leaked check happened to
-        // see).
-        //
-        // Fix round 2's point: the above only pinned down half — "doesn't
-        // ask". What the spec actually requires is the conjunction
-        // "attempt it, and report the result" (since what it will touch
-        // cannot be decided ahead of time, it doesn't refuse up front; it
-        // actually touches it and reports the outcome). Replacing the
-        // entire `bash` arm with a no-op (i.e., never executing anything
-        // at all) still left this test green (undetected across all 254
-        // passing tests). Run a command with a real side effect, and
-        // confirm both (1) that the side effect actually happened
-        // (evidence the confined child actually ran) and (2) that its
-        // output came back as the tool result (evidence the outcome of
-        // the attempt is being reported).
+        // Never preserves unattended confined execution. The real side
+        // effect and returned output prevent a no-op from passing.
         let root = tempfile::tempdir().expect("temp directory");
         let sandbox = polaris_sandbox::SandboxPolicy::new(
             polaris_sandbox::SandboxMode::WorkspaceWrite,

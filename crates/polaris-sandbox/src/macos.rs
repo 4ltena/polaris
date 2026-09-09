@@ -14,8 +14,59 @@ use crate::policy::{SandboxMode, SandboxPolicy};
 /// itself has been tampered with, the attacker already has root.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
+fn readable_ancestors(policy: &SandboxPolicy) -> Vec<&Path> {
+    policy
+        .isolated_boundary()
+        .into_iter()
+        .flat_map(|boundary| {
+            boundary
+                .readable_roots
+                .iter()
+                .flat_map(|root| root.ancestors().skip(1))
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Builds the SBPL profile body from the policy.
 pub fn build_profile(policy: &SandboxPolicy) -> String {
+    if let Some(boundary) = policy.isolated_boundary() {
+        let mut p = String::from(
+            "(version 1)\n(deny default)\n(allow process-fork process-exec)\n(allow signal (target same-sandbox))\n(allow sysctl-read (sysctl-name \"hw.pagesize\" \"hw.pagesize_compat\" \"hw.ncpu\" \"hw.memsize\" \"hw.activecpu\" \"kern.osrelease\" \"kern.osversion\" \"kern.ostype\"))\n(allow file-read* (literal \"/\" \"/dev/null\" \"/dev/urandom\" \"/dev/random\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
+        );
+        // deny-default and named sysctl grants alone did not reject
+        // KERN_PROCARGS2 on macOS. Explicitly deny other-process inspection;
+        // self inspection remains useful and sees only the fixed child env.
+        p.push_str("(deny process-info-pidinfo)\n(allow process-info-pidinfo (target self))\n");
+        for i in 0..boundary.readable_roots.len() {
+            p.push_str(&format!(
+                "(allow file-read* (subpath (param \"READABLE_ROOT_{i}\")))\n"
+            ));
+        }
+        // Toolchains canonicalize their executable/SDK paths. Metadata on exact
+        // ancestors permits traversal without exposing directory listings/content.
+        for i in 0..readable_ancestors(policy).len() {
+            p.push_str(&format!(
+                "(allow file-read-metadata (literal (param \"READABLE_ANCESTOR_{i}\")))\n"
+            ));
+        }
+        if boundary.environment.is_some() {
+            p.push_str("(allow file-read* file-write* (subpath (param \"ISOLATED_HOME\")))\n(allow file-read* file-write* (subpath (param \"ISOLATED_TMPDIR\")))\n");
+        }
+        if policy.mode() != SandboxMode::ReadOnly {
+            for i in 0..policy.writable_roots().len() {
+                p.push_str(&format!(
+                    "(allow file-write* (subpath (param \"WRITABLE_ROOT_{i}\")))\n"
+                ));
+            }
+        }
+        // Even FullAccess retains file/process isolation. Network is a separate grant.
+        if policy.mode() == SandboxMode::FullAccess {
+            p.push_str("(allow network*)\n");
+        }
+        return p;
+    }
     let mut p = String::from("(version 1)\n");
 
     if policy.mode() == SandboxMode::FullAccess {
@@ -124,6 +175,25 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
 /// arguments go after `--`, so the boundary isn't ambiguous.
 pub fn build_args(policy: &SandboxPolicy, program: &Path, args: &[String]) -> Vec<String> {
     let mut out = vec!["-p".to_string(), build_profile(policy)];
+    if let Some(boundary) = policy.isolated_boundary() {
+        out.push(format!(
+            "-DISOLATED_WORKSPACE={}",
+            boundary.workspace.display()
+        ));
+        for (i, root) in readable_ancestors(policy).iter().enumerate() {
+            out.push(format!("-DREADABLE_ANCESTOR_{i}={}", root.display()));
+        }
+        if let Some(environment) = &boundary.environment {
+            out.push(format!("-DISOLATED_HOME={}", environment.home.display()));
+            out.push(format!(
+                "-DISOLATED_TMPDIR={}",
+                environment.tmpdir.display()
+            ));
+        }
+        for (i, root) in boundary.readable_roots.iter().enumerate() {
+            out.push(format!("-DREADABLE_ROOT_{i}={}", root.display()));
+        }
+    }
     for (i, root) in policy.writable_roots().iter().enumerate() {
         out.push(format!("-DWRITABLE_ROOT_{i}={}", root.display()));
     }

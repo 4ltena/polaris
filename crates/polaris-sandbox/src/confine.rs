@@ -82,6 +82,14 @@ pub(crate) fn run_confined_with_broker(
     broker: Option<&crate::broker::BrokerConfig>,
 ) -> Result<Outcome, SandboxError> {
     if let Some(broker) = broker {
+        if policy.isolated_boundary().is_some() {
+            return Err(SandboxError::NotEnforced(
+                "broker cannot enforce isolated read boundary".into(),
+            ));
+        }
+        // Protocol v1 carries no child-environment policy. The external broker
+        // owns its process environment; native filtering below cannot protect
+        // that branch. Do not mutate parent credentials to simulate filtering.
         return crate::broker::run(broker, policy, program, args, stdin);
     }
 
@@ -170,14 +178,28 @@ pub(crate) fn run_confined_with_broker(
     })
 }
 
+pub(crate) fn build_command(
+    policy: &SandboxPolicy,
+    program: &Path,
+    args: &[String],
+) -> Result<Command, SandboxError> {
+    let mut command = build_native_command(policy, program, args)?;
+    crate::child_environment::apply(policy, &mut command)?;
+    Ok(command)
+}
+
 #[cfg(target_os = "macos")]
-fn build_command(
+fn build_native_command(
     policy: &SandboxPolicy,
     program: &Path,
     args: &[String],
 ) -> Result<Command, SandboxError> {
     let mut cmd = Command::new(crate::macos::SANDBOX_EXEC);
     cmd.args(crate::macos::build_args(policy, program, args));
+    if let Some(boundary) = policy.isolated_boundary() {
+        cmd.current_dir(&boundary.workspace);
+    }
+    crate::child_fds::install(&mut cmd);
     Ok(cmd)
 }
 
@@ -210,15 +232,24 @@ fn build_command(
 const SANDBOX_APPLY_FAILURE_ERRNO: i32 = 0x706f_6c61;
 
 #[cfg(target_os = "linux")]
-fn build_command(
+fn build_native_command(
     policy: &SandboxPolicy,
     program: &Path,
     args: &[String],
 ) -> Result<Command, SandboxError> {
     use std::os::unix::process::CommandExt;
 
+    if policy.isolated_boundary().is_some() {
+        return Err(SandboxError::NotEnforced(
+            "isolated workspace backend is not implemented on this platform".into(),
+        ));
+    }
+
     let mut cmd = Command::new(program);
     cmd.args(args);
+    // Register first: inherited descriptors must be marked even in FullAccess,
+    // before Landlock is applied. Neither step closes Rust's exec-error channel.
+    crate::child_fds::install(&mut cmd);
 
     let policy_for_child = policy.clone();
     // SAFETY: pre_exec only runs in the child, after fork and before exec.
@@ -241,7 +272,7 @@ fn build_command(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn build_command(
+fn build_native_command(
     _policy: &SandboxPolicy,
     _program: &Path,
     _args: &[String],
@@ -256,26 +287,24 @@ fn build_command(
 /// from confinement not being applicable (`NotEnforced`) and any other
 /// launch failure (`Io`; the binary is missing, etc.).
 ///
-/// This branch only has meaning on Linux. On macOS, `sandbox-exec`'s
-/// launch failure is an ordinary spawn failure — the binary itself is
-/// missing, and so on — and whether application succeeded is judged by
-/// `classify_apply_failure` from the exit status after the child has
-/// actually run.
-#[cfg(target_os = "linux")]
-fn classify_spawn_error(e: std::io::Error) -> SandboxError {
+/// FD restriction failures use a distinct sentinel on both native platforms.
+/// Linux Landlock has its own sentinel; macOS profile application is still
+/// classified from sandbox-exec's output after launch.
+pub(crate) fn classify_spawn_error(e: std::io::Error) -> SandboxError {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if e.raw_os_error() == Some(crate::child_fds::FAILURE_ERRNO) {
+        return SandboxError::NotEnforced(
+            "restricting inherited descriptors failed inside pre_exec".into(),
+        );
+    }
+    #[cfg(target_os = "linux")]
     if e.raw_os_error() == Some(SANDBOX_APPLY_FAILURE_ERRNO) {
-        SandboxError::NotEnforced(format!(
+        return SandboxError::NotEnforced(format!(
             "applying landlock failed inside pre_exec (detected via sentinel errno \
              {SANDBOX_APPLY_FAILURE_ERRNO}). The original error content is lost, since it \
              doesn't cross fork's notification path."
-        ))
-    } else {
-        SandboxError::Io(e)
+        ));
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn classify_spawn_error(e: std::io::Error) -> SandboxError {
     SandboxError::Io(e)
 }
 
@@ -306,7 +335,7 @@ fn classify_spawn_error(e: std::io::Error) -> SandboxError {
 /// leaving `ExitStatusExt::signal()` as `None`, so it's never touched by
 /// this at all.
 #[cfg(target_os = "macos")]
-fn classify_apply_failure(
+pub(crate) fn classify_apply_failure(
     status: &std::process::ExitStatus,
     stdout: &str,
     stderr: &str,
@@ -336,7 +365,7 @@ fn classify_apply_failure(
 /// already confirmed). Whatever the child does from here on is the
 /// child's own result, not a confinement failure.
 #[cfg(not(target_os = "macos"))]
-fn classify_apply_failure(
+pub(crate) fn classify_apply_failure(
     _status: &std::process::ExitStatus,
     _stdout: &str,
     _stderr: &str,
@@ -348,6 +377,237 @@ fn classify_apply_failure(
 mod tests {
     use super::*;
     use crate::policy::{SandboxMode, SandboxPolicy};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn isolated_environment_native_and_controlled_child_and_grandchild() {
+        const MARKER: &str = "POLARIS_ISOLATED_ENV_TEST_PARENT";
+        const POISONED: &[&str] = &[
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TZ",
+            "TERM",
+            "ORDINARY_LABEL",
+            "POLARIS_API_KEY",
+            "BASH_ENV",
+            "ENV",
+        ];
+        if std::env::var_os(MARKER).is_none() {
+            let mut parent = Command::new(std::env::current_exe().unwrap());
+            parent.args(["--exact", "confine::tests::isolated_environment_native_and_controlled_child_and_grandchild", "--nocapture"])
+                .env_clear().env(MARKER, "synthetic");
+            for name in POISONED {
+                parent.env(name, "synthetic-secret");
+            }
+            let out = parent.output().unwrap();
+            assert!(
+                out.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("isolated-env-verified"));
+            return;
+        }
+        // Do not use the deliberately poisoned TMPDIR to create the fixture.
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let home = root.path().join("home");
+        let tmpdir = root.path().join("tmp");
+        for path in [&home, &tmpdir] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let script = r#"
+set -eu
+test "$PATH" = /usr/bin:/bin
+test "$HOME" = "$PWD/home"
+test "$TMPDIR" = "$PWD/tmp"
+test "$LANG" = C
+test "$LC_ALL" = C
+test "$TZ" = UTC
+test "$TERM" = dumb
+test "${LC_CTYPE+x}" = ''
+test "${ORDINARY_LABEL+x}" = ''
+test "${POLARIS_API_KEY+x}" = ''
+test "${BASH_ENV+x}" = ''
+test "${ENV+x}" = ''
+test "${POLARIS_ISOLATED_ENV_TEST_PARENT+x}" = ''
+if test "$1" = read-only; then
+    if (printf forbidden > source-write) 2>/dev/null; then exit 42; fi
+else
+    printf allowed > source-write
+fi
+printf shell-ok | /bin/cat
+/bin/sh -c 'test "$PATH" = /usr/bin:/bin && test "$HOME" = "$PWD/home" && test "$TMPDIR" = "$PWD/tmp" && test "$LC_ALL" = C && test "${ORDINARY_LABEL+x}" = "" && test "${POLARIS_API_KEY+x}" = "" && printf grandchild-ok'
+"#;
+        for mode in [
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::FullAccess,
+        ] {
+            let policy = SandboxPolicy::isolated(
+                mode,
+                root.path(),
+                &[
+                    "/bin".into(),
+                    "/usr/bin".into(),
+                    "/usr/lib".into(),
+                    "/System/Library".into(),
+                ],
+            )
+            .unwrap()
+            .with_isolated_environment(&home, &tmpdir)
+            .unwrap();
+            for controlled in [false, true] {
+                let args = [
+                    "-c".into(),
+                    script.into(),
+                    "environment-test".into(),
+                    mode.as_str().into(),
+                ];
+                if controlled {
+                    let out = crate::run_confined_controlled(
+                        &policy,
+                        Path::new("/bin/sh"),
+                        &args,
+                        None,
+                        || false,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        out.status.and_then(|status| status.code()),
+                        Some(0),
+                        "{mode:?}: {out:?}"
+                    );
+                    assert_eq!(out.stdout, "shell-okgrandchild-ok");
+                } else {
+                    let out =
+                        run_confined_with_broker(&policy, Path::new("/bin/sh"), &args, None, None)
+                            .unwrap();
+                    assert_eq!(out.status, 0, "{mode:?}: {out:?}");
+                    assert_eq!(out.stdout, "shell-okgrandchild-ok");
+                }
+            }
+        }
+        for name in POISONED {
+            assert_eq!(std::env::var(name).unwrap(), "synthetic-secret");
+        }
+        println!("isolated-env-verified");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn isolated_environment_missing_configuration_blocks_both_launch_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let policy =
+            SandboxPolicy::isolated(SandboxMode::FullAccess, root.path(), &["/bin".into()])
+                .unwrap();
+        let marker = root.path().join("must-not-run");
+        let args = ["-c".into(), "echo ran > must-not-run".into()];
+        assert!(matches!(
+            run_confined_with_broker(&policy, Path::new("/bin/sh"), &args, None, None),
+            Err(SandboxError::NotEnforced(_))
+        ));
+        assert!(matches!(
+            crate::run_confined_controlled(&policy, Path::new("/bin/sh"), &args, None, || false),
+            Err(SandboxError::NotEnforced(_))
+        ));
+        assert!(!marker.exists());
+    }
+
+    // A separate test process supplies synthetic parent variables without
+    // set_var/remove_var races in the test runner or reading real credentials.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_environment_child_and_grandchild() {
+        const MARKER: &str = "POLARIS_ENVIRONMENT_TEST_PARENT";
+        if std::env::var_os(MARKER).is_none() {
+            let out = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "confine::tests::native_environment_child_and_grandchild",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", "/tmp")
+                .env("TMPDIR", "/tmp")
+                .env("LANG", "C")
+                .env(MARKER, "synthetic")
+                .env("ORDINARY_LABEL", "synthetic-secret")
+                .env("POLARIS_API_KEY", "synthetic-key")
+                .env("POLARIS_SANDBOX_BROKER_TOKEN", "synthetic-token")
+                .env("POLARIS_SANDBOX_BROKER", "/synthetic/socket")
+                .env("BASH_ENV", "/nonexistent-synthetic-startup")
+                .output()
+                .expect("synthetic parent");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("native-env-verified"));
+            return;
+        }
+        let before: Vec<_> = [
+            MARKER,
+            "ORDINARY_LABEL",
+            "POLARIS_API_KEY",
+            "POLARIS_SANDBOX_BROKER_TOKEN",
+            "POLARIS_SANDBOX_BROKER",
+            "BASH_ENV",
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var_os(k)))
+        .collect();
+        let script = r#"
+set -eu
+test "${ORDINARY_LABEL+x}" = ''
+test "${POLARIS_API_KEY+x}" = ''
+test "${POLARIS_SANDBOX_BROKER_TOKEN+x}" = ''
+test "${POLARIS_SANDBOX_BROKER+x}" = ''
+test "${BASH_ENV+x}" = ''
+test "${POLARIS_ENVIRONMENT_TEST_PARENT+x}" = ''
+test "$PATH" = /usr/bin:/bin
+test "$HOME" = /tmp
+test "$TMPDIR" = /tmp
+test "$LANG" = C
+printf shell-ok | cat
+/bin/sh -c 'test "${ORDINARY_LABEL+x}" = "" && test "${POLARIS_API_KEY+x}" = "" && test "${POLARIS_SANDBOX_BROKER_TOKEN+x}" = "" && printf grandchild-ok'
+"#;
+        let root = tempfile::tempdir().expect("root");
+        for mode in [
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::FullAccess,
+        ] {
+            let roots = if mode == SandboxMode::WorkspaceWrite {
+                vec![root.path().to_path_buf()]
+            } else {
+                vec![]
+            };
+            let policy = SandboxPolicy::new(mode, &roots).expect("policy");
+            // Explicit native selection: fake broker credentials remain in
+            // this parent. This is not a broker enforcement test.
+            let out = run_confined_with_broker(
+                &policy,
+                Path::new("/bin/sh"),
+                &["-c".into(), script.into()],
+                None,
+                None,
+            )
+            .expect("native sandbox");
+            assert_eq!(out.status, 0, "{mode:?}: {out:?}");
+            assert_eq!(out.stdout, "shell-okgrandchild-ok");
+        }
+        for (key, value) in before {
+            assert_eq!(std::env::var_os(key), value);
+        }
+        println!("native-env-verified");
+    }
 
     #[test]
     fn a_command_inside_the_root_succeeds_and_its_output_comes_back() {

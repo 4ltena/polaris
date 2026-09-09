@@ -12,11 +12,21 @@ use polaris_provider::Provider;
 use polaris_sandbox::{SandboxMode, SandboxPolicy};
 use polaris_skills::{AgentAccess, AgentType};
 
-use crate::agent::{AutoApprove, ToolContext, run_loop};
-use crate::approval::{ApprovalPolicy, Gate};
+use crate::agent::{ToolContext, run_loop};
+use crate::approval::{ApprovalPolicy, Approver, Decision, Gate};
+
 use crate::audit::AuditLog;
 use crate::session::Session;
 use crate::stop::StopTracker;
+
+/// There is no synchronous approval relay for background children.
+struct UnavailableApprover;
+
+impl Approver for UnavailableApprover {
+    fn ask(&mut self, _reason: &str) -> Decision {
+        Decision::Deny
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SpawnTask {
@@ -57,7 +67,7 @@ pub async fn run_one(
         audit,
         base_sandbox,
         helper,
-        events,
+        events.map(Into::into),
         None,
     )
     .await
@@ -71,9 +81,42 @@ pub(crate) async fn run_one_scoped(
     audit: Arc<Mutex<AuditLog>>,
     base_sandbox: &SandboxPolicy,
     helper: &Path,
-    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    events: Option<crate::desktop_events::EventSink>,
     workflow: Option<&ChildWorkflow>,
 ) -> TaskOutcome {
+    run_one_with_gate(
+        task,
+        agent_types,
+        provider,
+        audit,
+        base_sandbox,
+        helper,
+        events,
+        workflow,
+        &Gate::new(ApprovalPolicy::Never),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_with_gate(
+    task: &SpawnTask,
+    agent_types: &[AgentType],
+    provider: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    base_sandbox: &SandboxPolicy,
+    helper: &Path,
+    events: Option<crate::desktop_events::EventSink>,
+    workflow: Option<&ChildWorkflow>,
+    parent_gate: &Gate,
+) -> TaskOutcome {
+    let events = match events {
+        Some(crate::desktop_events::EventSink::Bounded(sink)) => match sink.child() {
+            Ok(child) => Some(crate::desktop_events::EventSink::Bounded(child)),
+            Err(error) => return TaskOutcome::Failed(error.to_string()),
+        },
+        events => events,
+    };
     if let Some(tx) = &events {
         let _ = tx.send(crate::events::AgentEvent::SpawnStarted {
             agent_type: task.agent_type.clone(),
@@ -81,6 +124,13 @@ pub(crate) async fn run_one_scoped(
         });
     }
 
+    if let Err(error) = crate::agent::check_event_delivery(events.as_ref()) {
+        return TaskOutcome::Failed(error.to_string());
+    }
+    let child_events = events
+        .as_ref()
+        .filter(|sink| matches!(sink, crate::desktop_events::EventSink::Bounded(_)))
+        .cloned();
     let outcome = polaris_provider::attempts::in_scope(
         polaris_provider::attempts::AttemptContext {
             parent_id: Some(format!("spawn:{}", task.agent_type)),
@@ -94,6 +144,8 @@ pub(crate) async fn run_one_scoped(
             base_sandbox,
             helper,
             workflow,
+            parent_gate,
+            child_events,
         ),
     )
     .await;
@@ -114,6 +166,7 @@ pub(crate) async fn run_one_scoped(
 /// still reliably reaches the `SpawnFinished` send in `run_one` — the same
 /// reason `dispatch`'s tool arms were restructured into labeled blocks in
 /// an earlier task.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_inner(
     task: &SpawnTask,
     agent_types: &[AgentType],
@@ -122,6 +175,8 @@ async fn run_one_inner(
     base_sandbox: &SandboxPolicy,
     helper: &Path,
     workflow: Option<&ChildWorkflow>,
+    parent_gate: &Gate,
+    events: Option<crate::desktop_events::EventSink>,
 ) -> TaskOutcome {
     let Some(agent) = agent_types.iter().find(|a| a.name == task.agent_type) else {
         let candidates = polaris_tools::skill::lookup(agent_types, &task.agent_type);
@@ -129,6 +184,14 @@ async fn run_one_inner(
             "unknown subagent type {:?}. {candidates}",
             task.agent_type
         ));
+    };
+
+    // Resolve only a catalog-validated role, once for both the first request
+    // and schema retry. None keeps legacy single-provider callers unchanged.
+    let provider = match provider.resolve_role(&agent.name) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => provider,
+        Err(error) => return TaskOutcome::Failed(error.to_string()),
     };
 
     // Depth 1: whatever `allowed-tools` says, `spawn` is excluded
@@ -164,8 +227,8 @@ async fn run_one_inner(
     let skills = workflow.map_or(&[][..], |context| context.skills.as_slice());
     session.push_user(&task.task);
     let mut stop = StopTracker::with_wall_seconds(agent.max_turns, agent.wall_seconds);
-    let mut gate = Gate::new(ApprovalPolicy::Never);
-    let mut approver = AutoApprove;
+    let mut gate = parent_gate.for_subagent();
+    let mut approver = UnavailableApprover;
     let mut ctx = ToolContext {
         sandbox: &sandbox,
         helper,
@@ -193,7 +256,7 @@ async fn run_one_inner(
         DEFAULT_CONCURRENCY,
         DEFAULT_WRITE_CONCURRENCY,
         &agent.name,
-        None,
+        events.clone(),
         &mut ctx,
     )
     .await;
@@ -225,8 +288,8 @@ async fn run_one_inner(
                 // `max-turns: 12` could quietly spend 24. `Gate` and the
                 // approver hold no budget, so those are rebuilt simply
                 // because `ctx` borrowed them mutably above.
-                let mut gate2 = Gate::new(ApprovalPolicy::Never);
-                let mut approver2 = AutoApprove;
+                let mut gate2 = parent_gate.for_subagent();
+                let mut approver2 = UnavailableApprover;
                 let mut ctx2 = ToolContext {
                     sandbox: &sandbox,
                     helper,
@@ -246,7 +309,7 @@ async fn run_one_inner(
                     DEFAULT_CONCURRENCY,
                     DEFAULT_WRITE_CONCURRENCY,
                     &agent.name,
-                    None,
+                    events.clone(),
                     &mut ctx2,
                 )
                 .await;
@@ -315,7 +378,8 @@ fn resolve_subagent_sandbox(
     base_sandbox: &SandboxPolicy,
 ) -> Result<SandboxPolicy, String> {
     match agent.access {
-        AgentAccess::Read => SandboxPolicy::new(SandboxMode::ReadOnly, &[])
+        AgentAccess::Read => base_sandbox
+            .restrict(SandboxMode::ReadOnly, &[])
             .map_err(|e| format!("cannot build read-only sandbox: {e}")),
         AgentAccess::ReadWrite => {
             let Some(root) = &task.write_root else {
@@ -330,7 +394,8 @@ fn resolve_subagent_sandbox(
                     "write_root {root} is outside the parent's own writable roots"
                 ));
             }
-            SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[canonical])
+            base_sandbox
+                .restrict(SandboxMode::WorkspaceWrite, &[canonical])
                 .map_err(|e| format!("cannot build subagent sandbox: {e}"))
         }
     }
@@ -422,6 +487,36 @@ pub async fn run_wave_scoped(
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     workflow: Option<ChildWorkflow>,
 ) -> String {
+    run_wave_with_gate(
+        tasks,
+        agent_types,
+        provider,
+        audit,
+        base_sandbox,
+        helper,
+        concurrency,
+        write_concurrency,
+        events.map(Into::into),
+        workflow,
+        &Gate::new(ApprovalPolicy::Never),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_wave_with_gate(
+    tasks: Vec<SpawnTask>,
+    agent_types: &[AgentType],
+    provider: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    base_sandbox: &SandboxPolicy,
+    helper: &Path,
+    concurrency: usize,
+    write_concurrency: usize,
+    events: Option<crate::desktop_events::EventSink>,
+    workflow: Option<ChildWorkflow>,
+    parent_gate: &Gate,
+) -> String {
     if let Err(msg) = check_no_write_root_overlap(&tasks) {
         let entries: Vec<serde_json::Value> = tasks
             .iter()
@@ -457,7 +552,7 @@ pub async fn run_wave_scoped(
             } else {
                 None
             };
-            let outcome = run_one_scoped(
+            let outcome = run_one_with_gate(
                 task,
                 agent_types,
                 provider,
@@ -466,6 +561,7 @@ pub async fn run_wave_scoped(
                 helper,
                 events,
                 workflow,
+                parent_gate,
             )
             .await;
             // A successful result has already been parsed as JSON by
@@ -534,6 +630,290 @@ fn check_no_write_root_overlap(tasks: &[SpawnTask]) -> Result<(), String> {
 mod tests {
     use super::*;
     use polaris_provider::{CompletionRequest, CompletionResponse, ToolCall};
+
+    #[tokio::test]
+    async fn role_resolution_validates_catalog_and_pins_schema_retry() {
+        use polaris_provider::{ProviderError, UsageMeter, role::RoleProvider};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Counting {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(text(if n == 0 {
+                    "invalid JSON"
+                } else {
+                    r#"{"path":"a.rs","responsibility":"fixture","test_file":null}"#
+                }))
+            }
+        }
+        struct ResolveOnce {
+            calls: AtomicUsize,
+            router: RoleProvider,
+        }
+        #[async_trait::async_trait]
+        impl Provider for ResolveOnce {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                panic!("child fell back to parent")
+            }
+            fn resolve_role(&self, role: &str) -> Result<Option<Arc<dyn Provider>>, ProviderError> {
+                assert_eq!(
+                    self.calls.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "resolved twice"
+                );
+                self.router.resolve_role(role)
+            }
+        }
+        let parent = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+        });
+        let child = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+        });
+        let router = Arc::new(ResolveOnce {
+            calls: AtomicUsize::new(0),
+            router: RoleProvider::new(
+                parent.clone(),
+                std::collections::HashMap::from([(
+                    "file-inspector".into(),
+                    child.clone() as Arc<dyn Provider>,
+                )]),
+            ),
+        });
+        let meter = UsageMeter::default();
+        let provider: Arc<dyn Provider> = Arc::new(meter.wrap(router.clone()));
+        let dir = tempfile::tempdir().unwrap();
+        let types = [file_inspector()];
+        let mut task = SpawnTask {
+            agent_type: "not-in-catalog".into(),
+            task: "inspect".into(),
+            write_root: None,
+        };
+        let result = run_one(
+            &task,
+            &types,
+            provider.clone(),
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            None,
+        )
+        .await;
+        assert!(matches!(result, TaskOutcome::Failed(_)));
+        assert_eq!(router.calls.load(Ordering::SeqCst), 0);
+        task.agent_type = "file-inspector".into();
+        let result = run_one(
+            &task,
+            &types,
+            provider,
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            None,
+        )
+        .await;
+        assert!(matches!(result, TaskOutcome::Ok(_)));
+        assert_eq!(router.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(parent.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(child.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(meter.snapshot().missing_responses, 2);
+
+        let missing: Arc<dyn Provider> =
+            Arc::new(RoleProvider::new(parent.clone(), Default::default()));
+        let result = run_one(
+            &task,
+            &types,
+            missing,
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            None,
+        )
+        .await;
+        assert!(matches!(result, TaskOutcome::Failed(_)));
+        assert_eq!(parent.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(child.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn desktop_same_type_parallel_children_keep_identity_through_schema_retry() {
+        use crate::desktop_events::{DesktopEventSink, EventSink};
+        use crate::events::AgentEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Rendezvous {
+            barrier: Arc<tokio::sync::Barrier>,
+            calls: AtomicUsize,
+            valid: bool,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Rendezvous {
+            async fn complete_in_turn_with_observer(
+                &self,
+                req: CompletionRequest,
+                _turn: &polaris_provider::turn_affinity::TurnContext,
+                observer: Option<&dyn polaris_provider::ResponseObserver>,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                let reply = self.complete(req).await?;
+                observer
+                    .unwrap()
+                    .try_emit(polaris_provider::ResponseEvent::TextDelta {
+                        output_index: 0,
+                        content_index: 0,
+                        text: &reply.text,
+                    })
+                    .unwrap();
+                Ok(reply)
+            }
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.barrier.wait().await;
+                }
+                Ok(text(if self.valid {
+                    r#"{"path":"a.rs","responsibility":"fixture","test_file":null}"#
+                } else {
+                    "invalid JSON"
+                }))
+            }
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let good = Arc::new(Rendezvous {
+            barrier: barrier.clone(),
+            calls: AtomicUsize::new(0),
+            valid: true,
+        });
+        let bad = Arc::new(Rendezvous {
+            barrier,
+            calls: AtomicUsize::new(0),
+            valid: false,
+        });
+        let (sink, mut rx, _) = DesktopEventSink::channel(
+            polaris_desktop_protocol::ids::RunId::new("parallel").unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let task = SpawnTask {
+            agent_type: "file-inspector".into(),
+            task: "identical task".into(),
+            write_root: None,
+        };
+        let types = [file_inspector()];
+        let sandbox = full_access();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                run_one_scoped(
+                    &task,
+                    &types,
+                    good.clone(),
+                    audit_in(dir.path()),
+                    &sandbox,
+                    Path::new("/bin/true"),
+                    Some(EventSink::from(sink.clone())),
+                    None
+                ),
+                run_one_scoped(
+                    &task,
+                    &types,
+                    bad.clone(),
+                    audit_in(dir.path()),
+                    &sandbox,
+                    Path::new("/bin/true"),
+                    Some(EventSink::from(sink.clone())),
+                    None
+                )
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(results.0, TaskOutcome::Ok(_)));
+        assert!(matches!(results.1, TaskOutcome::Failed(_)));
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(bad.calls.load(Ordering::SeqCst), 2);
+        let mut starts = Vec::new();
+        let mut finishes = Vec::new();
+        let mut text_ids = Vec::new();
+        let mut sequence = 0;
+        while let Ok(envelope) = rx.try_recv() {
+            sequence += 1;
+            assert_eq!(envelope.sequence, sequence);
+            assert_eq!(envelope.run_id.as_str(), "parallel");
+            let identity = envelope.child.expect("all child events carry identity");
+            match envelope.event {
+                AgentEvent::SpawnStarted { .. } => starts.push(identity),
+                AgentEvent::SpawnFinished { ok, .. } => finishes.push((identity, ok)),
+                AgentEvent::TextDelta { .. } => text_ids.push(identity),
+                _ => assert!(starts.contains(&identity)),
+            }
+        }
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0], starts[1]);
+        assert_eq!(finishes.len(), 2);
+        assert!(finishes.contains(&(starts[0].clone(), true)));
+        assert!(finishes.contains(&(starts[1].clone(), false)));
+        assert_eq!(text_ids.iter().filter(|id| **id == starts[0]).count(), 1);
+        assert_eq!(text_ids.iter().filter(|id| **id == starts[1]).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn desktop_child_drop_retains_started_identity_without_fabricated_end() {
+        use crate::desktop_events::{DesktopEventSink, EventSink};
+        use crate::events::AgentEvent;
+        struct Pending;
+        #[async_trait::async_trait]
+        impl Provider for Pending {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                std::future::pending().await
+            }
+        }
+        for cancel in [false, true] {
+            let (sink, mut rx, control) = DesktopEventSink::channel(
+                polaris_desktop_protocol::ids::RunId::new("drop").unwrap(),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let task = SpawnTask {
+                agent_type: "file-inspector".into(),
+                task: "wait".into(),
+                write_root: None,
+            };
+            let types = [file_inspector()];
+            let sandbox = full_access();
+            let mut future = Box::pin(run_one_scoped(
+                &task,
+                &types,
+                Arc::new(Pending),
+                audit_in(dir.path()),
+                &sandbox,
+                Path::new("/bin/true"),
+                Some(EventSink::from(sink)),
+                None,
+            ));
+            assert!(futures_util::poll!(&mut future).is_pending());
+            let started = rx.try_recv().unwrap();
+            assert!(matches!(started.event, AgentEvent::SpawnStarted { .. }));
+            assert!(started.child.is_some());
+            if cancel {
+                control.cancel();
+            }
+            drop(future);
+            while let Ok(event) = rx.try_recv() {
+                assert_eq!(event.child, started.child);
+                assert!(!matches!(event.event, AgentEvent::SpawnFinished { .. }));
+            }
+        }
+    }
 
     /// Same shape as `agent::tests::Scripted`: hands back the queued
     /// responses in order, then an empty one.
@@ -607,6 +987,131 @@ mod tests {
         SandboxPolicy::new(SandboxMode::FullAccess, &[]).expect("policy")
     }
 
+    #[tokio::test]
+    async fn desktop_spawn_started_failure_prevents_child_provider_calls() {
+        use crate::desktop_events::{
+            DesktopEventSink, EVENT_CAPACITY, EventFailure, EventSink, MAX_EVENT_BYTES,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 通常の起動正例を含め、fixture自体の失敗でゼロになっていないことも確認する。
+        for failure in [None, Some(EventFailure::Full), Some(EventFailure::Oversize)] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(counting_mock_provider_returning_valid_output(calls.clone()));
+            let (sink, _receiver, control) = DesktopEventSink::channel(
+                polaris_desktop_protocol::ids::RunId::new("started-test").unwrap(),
+            );
+            let events = EventSink::from(sink);
+            if failure == Some(EventFailure::Full) {
+                for _ in 0..EVENT_CAPACITY {
+                    events
+                        .send(crate::events::AgentEvent::SpawnFinished {
+                            agent_type: "prefill".into(),
+                            ok: true,
+                        })
+                        .unwrap();
+                }
+            }
+            assert_eq!(control.failure(), None);
+            let outcome = run_one_scoped(
+                &SpawnTask {
+                    agent_type: "file-inspector".into(),
+                    task: if failure == Some(EventFailure::Oversize) {
+                        "x".repeat(MAX_EVENT_BYTES + 1)
+                    } else {
+                        "inspect".into()
+                    },
+                    write_root: None,
+                },
+                &[file_inspector()],
+                provider,
+                audit_in(dir.path()),
+                &full_access(),
+                Path::new("/bin/true"),
+                Some(events),
+                None,
+            )
+            .await;
+            assert_eq!(control.failure(), failure);
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(failure.is_none()));
+            match (failure, outcome) {
+                (None, TaskOutcome::Ok(_)) => {}
+                (Some(reason), TaskOutcome::Failed(error)) => {
+                    assert!(error.contains(&format!("{reason:?}")), "{error}");
+                }
+                (_, outcome) => panic!("unexpected outcome: {outcome:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_schema_retry_inherits_cancellation() {
+        use crate::desktop_events::{DesktopEventSink, EventControl, EventFailure, EventSink};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CancelAfterInvalidReply {
+            provider: CountingProvider,
+            control: Option<EventControl>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for CancelAfterInvalidReply {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                let reply = self.provider.complete(req).await?;
+                // 初回providerが応答を返す時点で取消。schema不一致の再試行は起動しない。
+                if let Some(control) = &self.control {
+                    control.cancel();
+                }
+                Ok(reply)
+            }
+        }
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (sink, _receiver, control) = DesktopEventSink::channel(
+                polaris_desktop_protocol::ids::RunId::new("retry-test").unwrap(),
+            );
+            let provider = Arc::new(CancelAfterInvalidReply {
+                provider: CountingProvider {
+                    calls: calls.clone(),
+                    reply: Some("invalid JSON".into()),
+                    delay: None,
+                },
+                control: cancel.then(|| control.clone()),
+            });
+            let outcome = run_one_scoped(
+                &SpawnTask {
+                    agent_type: "file-inspector".into(),
+                    task: "inspect".into(),
+                    write_root: None,
+                },
+                &[file_inspector()],
+                provider,
+                audit_in(dir.path()),
+                &full_access(),
+                Path::new("/bin/true"),
+                Some(EventSink::from(sink)),
+                None,
+            )
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), if cancel { 1 } else { 2 });
+            assert_eq!(control.failure(), cancel.then_some(EventFailure::Cancelled));
+            let TaskOutcome::Failed(error) = outcome else {
+                panic!("invalid output accepted")
+            };
+            assert!(
+                error.contains(if cancel {
+                    "Cancelled"
+                } else {
+                    "schema mismatch after retry"
+                }),
+                "{error}"
+            );
+        }
+    }
     #[tokio::test]
     async fn child_meter_keeps_schema_retry_costs_on_success_and_failure() {
         for succeeds in [true, false] {
@@ -793,6 +1298,61 @@ mod tests {
         a.access = AgentAccess::ReadWrite;
         a.allowed_tools = vec!["read".into(), "write".into()];
         a
+    }
+
+    #[test]
+    fn isolated_subagents_keep_read_boundary_and_cwd_while_narrowing_writes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let selected = root.join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        for mode in [SandboxMode::WorkspaceWrite, SandboxMode::FullAccess] {
+            let parent = SandboxPolicy::isolated(mode, &root, &[runtime.path().into()]).unwrap();
+            for agent in [file_inspector(), read_write_type()] {
+                let writer = agent.access == AgentAccess::ReadWrite;
+                let task = SpawnTask {
+                    agent_type: agent.name.clone(),
+                    task: "inspect".into(),
+                    write_root: writer.then(|| selected.display().to_string()),
+                };
+                let child = resolve_subagent_sandbox(&agent, &task, &parent).unwrap();
+                assert_eq!(child.isolated_boundary().unwrap().workspace, root);
+                assert_eq!(
+                    child.isolated_boundary().unwrap().readable_roots,
+                    parent.isolated_boundary().unwrap().readable_roots
+                );
+                assert_eq!(child.contains(&selected.join("new.txt")), writer);
+                assert!(!child.contains(&root.join("sibling.txt")));
+                assert!(!child.contains(runtime.path()));
+                let expanded = SpawnTask {
+                    write_root: Some(root.display().to_string()),
+                    ..task
+                };
+                assert!(resolve_subagent_sandbox(&read_write_type(), &expanded, &child).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_subagents_refuse_a_missing_inherited_runtime() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let parent = SandboxPolicy::isolated(
+            SandboxMode::FullAccess,
+            workspace.path(),
+            &[runtime.path().into()],
+        )
+        .unwrap();
+        runtime.close().unwrap();
+        for agent in [file_inspector(), read_write_type()] {
+            let task = SpawnTask {
+                agent_type: agent.name.clone(),
+                task: "inspect".into(),
+                write_root: Some(workspace.path().display().to_string()),
+            };
+            assert!(resolve_subagent_sandbox(&agent, &task, &parent).is_err());
+        }
     }
 
     #[tokio::test]

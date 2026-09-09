@@ -5,6 +5,13 @@
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// 暫定表示用。正本応答へ二重連結せず、requestごとに置き換える。
+    TextDelta {
+        request_id: u64,
+        output_index: u64,
+        content_index: u64,
+        text: String,
+    },
     WorkflowResolved {
         phase: String,
         skill_ids: Vec<String>,
@@ -39,6 +46,85 @@ pub enum AgentEvent {
         tokens_before: u32,
         tokens_after: u32,
     },
+}
+
+impl AgentEvent {
+    /// Serialize/Debugや複製を行わず、キューが保持する確保領域を数える。
+    /// String/Vecの余剰capacityも含む。wireサイズの保証ではない。
+    pub(crate) fn fits_queue_budget(&self, limit: usize) -> bool {
+        struct Budget(usize);
+        impl Budget {
+            fn take(&mut self, bytes: usize) -> bool {
+                match self.0.checked_sub(bytes) {
+                    Some(left) => {
+                        self.0 = left;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            fn string(&mut self, text: &String) -> bool {
+                self.take(text.capacity())
+            }
+            fn vec<T>(&mut self, values: &Vec<T>) -> bool {
+                values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<T>())
+                    .is_some_and(|bytes| self.take(bytes))
+            }
+            fn strings(&mut self, values: &Vec<String>) -> bool {
+                self.vec(values) && values.iter().all(|text| self.string(text))
+            }
+            fn diff(&mut self, diff: &Diff) -> bool {
+                self.vec(&diff.hunks)
+                    && diff.hunks.iter().all(|hunk| {
+                        self.vec(&hunk.lines)
+                            && hunk.lines.iter().all(|line| {
+                                let (DiffLine::Context(text)
+                                | DiffLine::Added(text)
+                                | DiffLine::Removed(text)) = line;
+                                self.string(text)
+                            })
+                    })
+            }
+        }
+        let mut budget = Budget(limit);
+        if !budget.take(std::mem::size_of::<Self>()) {
+            return false;
+        }
+        match self {
+            Self::TextDelta { text, .. } => budget.string(text),
+            Self::WorkflowResolved {
+                phase,
+                skill_ids,
+                changed_skill_ids,
+                manifest_hash,
+            } => {
+                budget.string(phase)
+                    && budget.strings(skill_ids)
+                    && budget.strings(changed_skill_ids)
+                    && budget.string(manifest_hash)
+            }
+            Self::ToolStarted { name, detail } => budget.string(name) && budget.string(detail),
+            Self::ToolFinished {
+                name,
+                detail,
+                result,
+                diff,
+                ..
+            } => {
+                budget.string(name)
+                    && budget.string(detail)
+                    && budget.string(result)
+                    && diff.as_ref().is_none_or(|diff| budget.diff(diff))
+            }
+            Self::SpawnStarted { agent_type, task } => {
+                budget.string(agent_type) && budget.string(task)
+            }
+            Self::SpawnFinished { agent_type, .. } => budget.string(agent_type),
+            Self::HistoryCompacted { .. } => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +204,54 @@ pub fn compute_diff(old: &str, new: &str) -> Diff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_budget_checks_exact_boundary_and_nested_allocations() {
+        let event = AgentEvent::SpawnStarted {
+            agent_type: String::new(),
+            task: "abc".into(),
+        };
+        let bytes = std::mem::size_of::<AgentEvent>() + 3;
+        assert!(event.fits_queue_budget(bytes));
+        assert!(!event.fits_queue_budget(bytes - 1));
+        let event = AgentEvent::WorkflowResolved {
+            phase: String::new(),
+            skill_ids: Vec::with_capacity(20),
+            changed_skill_ids: vec![String::with_capacity(4096)],
+            manifest_hash: String::new(),
+        };
+        assert!(!event.fits_queue_budget(4096));
+        assert!(event.fits_queue_budget(8192));
+        let event = AgentEvent::ToolFinished {
+            name: String::new(),
+            detail: String::new(),
+            ok: true,
+            result: String::new(),
+            diff: Some(Diff {
+                is_new_file: false,
+                added: 0,
+                removed: 0,
+                hunks: vec![DiffHunk {
+                    lines: vec![DiffLine::Added(String::with_capacity(4096))],
+                }],
+            }),
+        };
+        assert!(!event.fits_queue_budget(4096));
+        assert!(event.fits_queue_budget(8192));
+        let event = AgentEvent::ToolFinished {
+            name: String::new(),
+            detail: String::new(),
+            ok: true,
+            result: String::new(),
+            diff: Some(Diff {
+                is_new_file: false,
+                added: 0,
+                removed: 0,
+                hunks: Vec::with_capacity(4096),
+            }),
+        };
+        assert!(!event.fits_queue_budget(4096));
+    }
 
     #[test]
     fn identical_text_produces_no_hunks() {

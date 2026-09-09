@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "=0.2.189"
 serde = { workspace = true }
 polaris-http = { path = "../polaris-http" }
 serde_json = { workspace = true }

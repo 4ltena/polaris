@@ -208,6 +208,10 @@ pub struct Folder {
     url_citations: Vec<crate::web_search::UrlCitation>,
     metrics_usage: metrics::TokenUsage,
     cancelled: bool,
+    received_bytes: usize,
+    failed: bool,
+    preview_text: String,
+    saw_delta: bool,
 }
 
 impl Default for Folder {
@@ -229,70 +233,143 @@ impl Folder {
             url_citations: Vec::new(),
             metrics_usage: metrics::TokenUsage::default(),
             cancelled: false,
+            received_bytes: 0,
+            failed: false,
+            preview_text: String::new(),
+            saw_delta: false,
         }
     }
 
     /// Pushes in a received byte fragment. Only complete events get
     /// interpreted.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProviderError> {
-        for ev in self.decoder.push(bytes) {
-            let data = ev.data.trim();
-            // A sentinel. Not JSON, so it isn't interpreted.
-            if data.is_empty() || data == "[DONE]" {
-                continue;
-            }
-            let v: Value = serde_json::from_str(data)
-                .map_err(|e| ProviderError::Decode(format!("SSE data is not JSON: {e}")))?;
+        self.push_observed(bytes, None)
+    }
 
-            if let Some(usage) = v.pointer("/response/usage") {
-                self.metrics_usage = metrics::TokenUsage::parse(usage);
+    fn push_observed(
+        &mut self,
+        bytes: &[u8],
+        observer: Option<&dyn crate::ResponseObserver>,
+    ) -> Result<(), ProviderError> {
+        if self.failed {
+            return Err(ProviderError::Decode("SSE folder already failed".into()));
+        }
+        let result = (|| {
+            self.received_bytes = crate::checked_size(
+                self.received_bytes,
+                bytes.len(),
+                crate::MAX_RESPONSE_BYTES,
+                "SSE response",
+            )?;
+            let mut decoder = std::mem::take(&mut self.decoder);
+            let result = decoder.push_each(bytes, |ev| self.take_event(ev, observer));
+            self.decoder = decoder;
+            result
+        })();
+        self.failed = result.is_err();
+        result
+    }
+
+    fn take_event(
+        &mut self,
+        ev: sse::SseEvent,
+        observer: Option<&dyn crate::ResponseObserver>,
+    ) -> Result<(), ProviderError> {
+        let data = ev.data.trim();
+        // A sentinel. Not JSON, so it isn't interpreted.
+        if data.is_empty() || data == "[DONE]" {
+            return Ok(());
+        }
+        let v: Value = serde_json::from_str(data)
+            .map_err(|e| ProviderError::Decode(format!("SSE data is not JSON: {e}")))?;
+
+        if let Some(usage) = v.pointer("/response/usage") {
+            self.metrics_usage = metrics::TokenUsage::parse(usage);
+        }
+        match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
+            "response.output_item.done" => self.take_item(&v)?,
+            "response.completed" => {
+                self.completed = true;
+                if std::env::var_os("POLARIS_DUMP_USAGE").is_some() {
+                    eprintln!(
+                        "[usage] {}",
+                        v.pointer("/response/usage")
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|| "<absent>".into())
+                    );
+                }
+                self.usage = v.pointer("/response/usage").and_then(|u| {
+                    let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
+                    let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
+                    let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
+                    let cached_tokens = u
+                        .pointer("/input_tokens_details/cached_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u32;
+                    Some(crate::Usage {
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        cached_tokens,
+                    })
+                });
             }
-            match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
-                "response.output_item.done" => self.take_item(&v)?,
-                "response.completed" => {
-                    self.completed = true;
-                    if std::env::var_os("POLARIS_DUMP_USAGE").is_some() {
-                        eprintln!(
-                            "[usage] {}",
-                            v.pointer("/response/usage")
-                                .map(|u| u.to_string())
-                                .unwrap_or_else(|| "<absent>".into())
-                        );
-                    }
-                    self.usage = v.pointer("/response/usage").and_then(|u| {
-                        let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
-                        let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
-                        let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
-                        let cached_tokens = u
-                            .pointer("/input_tokens_details/cached_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0) as u32;
-                        Some(crate::Usage {
-                            input_tokens,
-                            output_tokens,
-                            total_tokens,
-                            cached_tokens,
-                        })
-                    });
-                }
-                "response.failed" => {
-                    let msg = v
-                        .pointer("/response/error/message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("no reason given");
-                    return Err(ProviderError::Http(format!("the response failed: {msg}")));
-                }
-                "response.cancelled" => {
-                    self.cancelled = true;
-                    return Err(ProviderError::Http("the response was cancelled".into()));
-                }
-                // Deltas and everything else are skipped. Looking only at
-                // finalized items gives the same result, and doesn't drag
-                // in reassembly failure as a new way to break.
-                _ => {}
+            "response.failed" => {
+                let msg = v
+                    .pointer("/response/error/message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("no reason given");
+                return Err(ProviderError::Http(format!("the response failed: {msg}")));
             }
+            "response.cancelled" => {
+                self.cancelled = true;
+                return Err(ProviderError::Http("the response was cancelled".into()));
+            }
+            "response.output_text.delta" if observer.is_some() => {
+                let text = v
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ProviderError::Decode("text delta is missing".into()))?;
+                let output_index = v
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| ProviderError::Decode("delta output_index is missing".into()))?;
+                let content_index =
+                    v.get("content_index")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            ProviderError::Decode("delta content_index is missing".into())
+                        })?;
+                crate::checked_size(
+                    self.preview_text.len(),
+                    text.len(),
+                    crate::MAX_TEXT_BYTES,
+                    "text deltas",
+                )?;
+                self.preview_text.push_str(text);
+                self.saw_delta = true;
+                observer
+                    .unwrap()
+                    .try_emit(crate::ResponseEvent::TextDelta {
+                        output_index,
+                        content_index,
+                        text,
+                    })
+                    .map_err(|reason| ProviderError::Observation {
+                        reason,
+                        completed: None,
+                    })?;
+            }
+            // Without an observer, deltas remain ignored. Looking only at
+            // finalized items gives the same result, and doesn't drag
+            // in reassembly failure as a new way to break.
+            _ => {}
         }
         Ok(())
+    }
+
+    fn preview_matches(&self) -> Option<bool> {
+        self.saw_delta.then_some(self.preview_text == self.text)
     }
 
     fn take_item(&mut self, v: &Value) -> Result<(), ProviderError> {
@@ -315,12 +392,23 @@ impl Folder {
                     for p in parts {
                         self.url_citations.extend(parse_url_citations(p));
                         if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                            crate::checked_size(
+                                self.text.len(),
+                                t.len(),
+                                crate::MAX_TEXT_BYTES,
+                                "response text",
+                            )?;
                             self.text.push_str(t);
                         }
                     }
                 }
             }
             "function_call" => {
+                crate::check_limit(
+                    self.tool_calls.len() + 1,
+                    crate::MAX_TOOL_CALLS,
+                    "tool calls",
+                )?;
                 let id = item
                     .get("call_id")
                     .and_then(|s| s.as_str())
@@ -335,6 +423,7 @@ impl Folder {
                     .get("arguments")
                     .and_then(|s| s.as_str())
                     .unwrap_or("{}");
+                crate::check_limit(raw.len(), crate::MAX_ARGUMENT_BYTES, "tool arguments")?;
                 let arguments: Value = serde_json::from_str(raw).map_err(|e| {
                     ProviderError::Decode(format!("function_call's arguments is not JSON: {e}"))
                 })?;
@@ -372,7 +461,7 @@ impl Folder {
     /// Returns the folded result. If completion was never observed, this
     /// is a hard failure.
     pub fn finish(self) -> Result<CompletionResponse, ProviderError> {
-        if !self.completed {
+        if self.failed || !self.decoder.is_empty() || !self.completed {
             return Err(ProviderError::Decode(
                 "the stream ended without ever seeing response.completed".into(),
             ));
@@ -406,6 +495,7 @@ pub struct CodexProvider {
     tokens: Arc<dyn crate::TokenSource>,
     client: reqwest::Client,
     idle: Duration,
+    body_deadline: Duration,
     cache_namespace: Option<std::ffi::OsString>,
     cache_mode: Option<std::ffi::OsString>,
     cache_prefix: cache_prefix::CachePrefixProfile,
@@ -459,6 +549,7 @@ impl CodexProvider {
             tokens,
             client,
             idle,
+            body_deadline: crate::RESPONSE_DEADLINE,
             cache_namespace: std::env::var_os("POLARIS_CACHE_NAMESPACE"),
             cache_mode: std::env::var_os("POLARIS_CACHE_MODE"),
             cache_prefix: cache_prefix::CachePrefixProfile::from_env()?,
@@ -528,6 +619,7 @@ impl CodexProvider {
     /// than having the caller reuse a body across attempts) — but an
     /// explicit `set_effort` call (via `/model`) always wins over the
     /// token's plan-derived value when one has been made.
+    #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
         token: &crate::Token,
@@ -535,6 +627,7 @@ impl CodexProvider {
         turn: Option<&TurnContext>,
         logical: Option<&LogicalRequest>,
         retry_reason: Option<&str>,
+        observer: Option<&dyn crate::ResponseObserver>,
     ) -> Result<CompletionResponse, ProviderError> {
         let model = self.model.read().expect("model lock poisoned").clone();
         let override_effort = self
@@ -586,6 +679,8 @@ impl CodexProvider {
             metric.turn_affinity(self.turn_affinity, turn.is_some(), sent.is_some(), false);
         }
         let mut attempt_guard = None;
+        let mut delta_matches = None;
+        let mut received_usage = None;
         let result = async {
             let mut request = self
                 .client
@@ -619,12 +714,15 @@ impl CodexProvider {
                 ),
                 _ => None,
             };
-            let resp = request.send().await.map_err(|e| {
-                if let Some(metric) = metric.as_mut() {
-                    metric.transport_cause = Some(metrics::transport_cause(&e));
-                }
-                ProviderError::Http(e.to_string())
-            })?;
+            let resp = tokio::time::timeout(self.idle, request.send())
+                .await
+                .map_err(|_| ProviderError::Http("response headers deadline exceeded".into()))?
+                .map_err(|e| {
+                    if let Some(metric) = metric.as_mut() {
+                        metric.transport_cause = Some(metrics::transport_cause(&e));
+                    }
+                    ProviderError::Http(e.to_string())
+                })?;
 
             let status = resp.status();
             if let Some(metric) = metric.as_mut() {
@@ -643,33 +741,52 @@ impl CodexProvider {
                     received.is_some(),
                 );
             }
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                // Let the caller decide whether to refresh and retry.
-                return Err(ProviderError::Auth(format!("status {status}")));
-            }
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if !status.is_success() {
                 let hint = resp
                     .headers()
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("unknown")
                     .to_string();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(ProviderError::Http(format!(
-                    "rate limited. retry-after: {hint} seconds. {body}"
-                )));
-            }
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let bytes = crate::read_limited(
+                    resp,
+                    crate::MAX_ERROR_BYTES,
+                    self.idle.min(crate::ERROR_DEADLINE),
+                )
+                .await?;
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    return Err(ProviderError::Auth(format!("status {status}")));
+                }
+                let body = String::from_utf8_lossy(&bytes);
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(ProviderError::Http(format!(
+                        "rate limited. retry-after: {hint} seconds. {body}"
+                    )));
+                }
                 return Err(ProviderError::Http(format!("status {status}: {body}")));
+            }
+            if resp
+                .content_length()
+                .is_some_and(|len| len > crate::MAX_RESPONSE_BYTES as u64)
+            {
+                return Err(ProviderError::Decode(
+                    "HTTP response exceeds byte limit".into(),
+                ));
             }
 
             let mut folder = Folder::new();
             let mut stream = resp.bytes_stream();
+            let deadline = tokio::time::Instant::now() + self.body_deadline;
             loop {
                 // Measured against idle time. The response's overall length
                 // grows normally.
-                let next = tokio::time::timeout(self.idle, stream.next()).await;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(ProviderError::Http(
+                        "HTTP body read deadline exceeded".into(),
+                    ));
+                }
+                let next = tokio::time::timeout(self.idle.min(remaining), stream.next()).await;
                 match next {
                     Err(_) => {
                         if let Some(metric) = metric.as_mut() {
@@ -688,7 +805,8 @@ impl CodexProvider {
                             }
                             ProviderError::Http(e.to_string())
                         })?;
-                        let pushed = folder.push(&bytes);
+                        let pushed = folder.push_observed(&bytes, observer);
+                        received_usage = folder.usage;
                         if let Some(metric) = metric.as_mut() {
                             metric.usage = folder.metrics_usage;
                             metric.server_cancelled = folder.cancelled;
@@ -697,6 +815,7 @@ impl CodexProvider {
                     }
                 }
             }
+            delta_matches = folder.preview_matches();
             let completed = folder.finish()?;
             // A header only becomes reusable after the SSE itself confirms a
             // successful response. It remains opaque and is never logged.
@@ -707,14 +826,15 @@ impl CodexProvider {
             }
             Ok(completed)
         }
-        .await;
+        .await
+        .map_err(|error: ProviderError| error.with_received_usage(received_usage));
         if let Some(guard) = attempt_guard.as_mut() {
             guard.finish(&result);
         }
         if let Some(metric) = metric.as_mut() {
             metric.finish(&result);
         }
-        result
+        result.and_then(|response| crate::emit_final(response, observer, delta_matches))
     }
 }
 
@@ -728,7 +848,7 @@ impl Provider for CodexProvider {
             .map(AttemptLedger::begin_logical);
         let token = self.tokens.token().await?;
         match self
-            .attempt(&token, &req, None, logical.as_ref(), None)
+            .attempt(&token, &req, None, logical.as_ref(), None, None)
             .await
         {
             Err(ProviderError::Auth(_)) => {
@@ -740,6 +860,7 @@ impl Provider for CodexProvider {
                     None,
                     logical.as_ref(),
                     Some("401 unauthorized"),
+                    None,
                 )
                 .await
                 .map_err(|e| match e {
@@ -758,6 +879,15 @@ impl Provider for CodexProvider {
         req: CompletionRequest,
         turn: &TurnContext,
     ) -> Result<CompletionResponse, ProviderError> {
+        self.complete_in_turn_with_observer(req, turn, None).await
+    }
+
+    async fn complete_in_turn_with_observer(
+        &self,
+        req: CompletionRequest,
+        turn: &TurnContext,
+        observer: Option<&dyn crate::ResponseObserver>,
+    ) -> Result<CompletionResponse, ProviderError> {
         self.validate_optional_contracts()?;
         let logical = self
             .attempt_ledger
@@ -765,7 +895,7 @@ impl Provider for CodexProvider {
             .map(AttemptLedger::begin_logical);
         let token = self.tokens.token().await?;
         match self
-            .attempt(&token, &req, Some(turn), logical.as_ref(), None)
+            .attempt(&token, &req, Some(turn), logical.as_ref(), None, observer)
             .await
         {
             Err(ProviderError::Auth(_)) => {
@@ -776,6 +906,7 @@ impl Provider for CodexProvider {
                     Some(turn),
                     logical.as_ref(),
                     Some("401 unauthorized"),
+                    observer,
                 )
                 .await
                 .map_err(|e| match e {
@@ -843,6 +974,199 @@ mod tests {
                 "encrypted_content": encrypted_content,
             }
         })
+    }
+
+    #[derive(Default)]
+    struct ObserverFixture {
+        deltas: std::sync::Mutex<Vec<String>>,
+        finals: std::sync::Mutex<Vec<(String, Option<bool>)>>,
+        reject_delta: bool,
+        reject_final: bool,
+    }
+    impl crate::ResponseObserver for ObserverFixture {
+        fn try_emit(&self, event: crate::ResponseEvent<'_>) -> Result<(), crate::ObserverError> {
+            match event {
+                crate::ResponseEvent::TextDelta { text, .. } => {
+                    if self.reject_delta {
+                        return Err(crate::ObserverError::Full);
+                    }
+                    self.deltas.lock().unwrap().push(text.to_string());
+                }
+                crate::ResponseEvent::FinalText {
+                    text,
+                    delta_matches,
+                } => {
+                    if self.reject_final {
+                        return Err(crate::ObserverError::Closed);
+                    }
+                    self.finals
+                        .lock()
+                        .unwrap()
+                        .push((text.to_string(), delta_matches));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn observed_frames(delta: &str, final_text: &str) -> Vec<u8> {
+        let mut done = message_item(final_text);
+        done["output_index"] = serde_json::json!(0);
+        [frame("response.output_text.delta", serde_json::json!({"output_index":0,"content_index":0,"delta":delta})),
+            frame("response.output_item.done", done),
+            frame("response.completed", serde_json::json!({"response":{"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}))].concat()
+    }
+
+    #[test]
+    fn p43_delta_final_and_utf8_split_do_not_double_body() {
+        for delta in ["日本語", "different"] {
+            let bytes = observed_frames(delta, "日本語");
+            for split in 0..=bytes.len() {
+                let observer = ObserverFixture::default();
+                let mut folder = Folder::new();
+                folder
+                    .push_observed(&bytes[..split], Some(&observer))
+                    .unwrap();
+                folder
+                    .push_observed(&bytes[split..], Some(&observer))
+                    .unwrap();
+                let matches = folder.preview_matches();
+                let response = folder.finish().unwrap();
+                assert_eq!(response.text, "日本語");
+                assert_eq!(response.usage.unwrap().total_tokens, 7);
+                assert_eq!(matches, Some(delta == "日本語"));
+                assert_eq!(*observer.deltas.lock().unwrap(), vec![delta.to_string()]);
+            }
+            let mut plain = Folder::new();
+            plain.push(&bytes).unwrap();
+            assert_eq!(plain.preview_matches(), None);
+            assert_eq!(plain.finish().unwrap().text, "日本語");
+        }
+    }
+
+    #[test]
+    fn p43_interleaved_preview_order_and_missing_delta_are_visible() {
+        let observer = ObserverFixture::default();
+        let mut folder = Folder::new();
+        for (index, text) in [(1, "b"), (0, "a")] {
+            folder
+                .push_observed(
+                    &frame(
+                        "response.output_text.delta",
+                        serde_json::json!({"output_index":index,"content_index":0,"delta":text}),
+                    ),
+                    Some(&observer),
+                )
+                .unwrap();
+        }
+        for (index, text) in [(0, "a"), (1, "b")] {
+            let mut item = message_item(text);
+            item["output_index"] = serde_json::json!(index);
+            folder
+                .push_observed(&frame("response.output_item.done", item), Some(&observer))
+                .unwrap();
+        }
+        assert_eq!(folder.preview_matches(), Some(false));
+        folder
+            .push(&frame("response.completed", serde_json::json!({})))
+            .unwrap();
+        assert_eq!(folder.finish().unwrap().text, "ab");
+        let mut folder = Folder::new();
+        folder
+            .push_observed(
+                &frame(
+                    "response.output_text.delta",
+                    serde_json::json!({"output_index":0,"content_index":0,"delta":"a"}),
+                ),
+                Some(&observer),
+            )
+            .unwrap();
+        assert_eq!(folder.preview_matches(), Some(false));
+    }
+
+    #[test]
+    fn p43_text_toolcount_and_arguments_boundaries() {
+        for size in [
+            crate::MAX_TEXT_BYTES - 1,
+            crate::MAX_TEXT_BYTES,
+            crate::MAX_TEXT_BYTES + 1,
+        ] {
+            let mut folder = Folder::new();
+            assert_eq!(
+                folder
+                    .push(&frame(
+                        "response.output_item.done",
+                        message_item(&"x".repeat(size))
+                    ))
+                    .is_ok(),
+                size <= crate::MAX_TEXT_BYTES
+            );
+        }
+        for size in [
+            crate::MAX_TEXT_BYTES - 1,
+            crate::MAX_TEXT_BYTES,
+            crate::MAX_TEXT_BYTES + 1,
+        ] {
+            let observer = ObserverFixture::default();
+            let mut folder = Folder::new();
+            let result = folder.push_observed(&frame("response.output_text.delta", serde_json::json!({"output_index":0,"content_index":0,"delta":"x".repeat(size)})), Some(&observer));
+            assert_eq!(result.is_ok(), size <= crate::MAX_TEXT_BYTES);
+        }
+        for count in [
+            crate::MAX_TOOL_CALLS - 1,
+            crate::MAX_TOOL_CALLS,
+            crate::MAX_TOOL_CALLS + 1,
+        ] {
+            let mut folder = Folder::new();
+            let mut result = Ok(());
+            for _ in 0..count {
+                result = folder.push(&frame(
+                    "response.output_item.done",
+                    function_call_item("id", "read", "{}"),
+                ));
+            }
+            assert_eq!(result.is_ok(), count <= crate::MAX_TOOL_CALLS);
+        }
+        for size in [
+            crate::MAX_ARGUMENT_BYTES - 1,
+            crate::MAX_ARGUMENT_BYTES,
+            crate::MAX_ARGUMENT_BYTES + 1,
+        ] {
+            let raw = format!("\"{}\"", "x".repeat(size - 2));
+            let mut folder = Folder::new();
+            assert_eq!(
+                folder
+                    .push(&frame(
+                        "response.output_item.done",
+                        function_call_item("id", "read", &raw)
+                    ))
+                    .is_ok(),
+                size <= crate::MAX_ARGUMENT_BYTES
+            );
+        }
+        let mut folder = Folder::new();
+        folder.received_bytes = crate::MAX_RESPONSE_BYTES - 1;
+        folder.push(b" ").unwrap();
+        assert!(folder.push(b" ").is_err());
+        assert!(folder.finish().is_err());
+    }
+
+    #[test]
+    fn p43_observer_failure_stops_before_done() {
+        let observer = ObserverFixture {
+            reject_delta: true,
+            ..Default::default()
+        };
+        let mut folder = Folder::new();
+        assert!(matches!(
+            folder.push_observed(&observed_frames("a", "a"), Some(&observer)),
+            Err(ProviderError::Observation {
+                reason: crate::ObserverError::Full,
+                completed: None
+            })
+        ));
+        assert!(!folder.completed);
+        assert!(folder.finish().is_err());
     }
 
     #[test]
@@ -1617,6 +1941,226 @@ mod tests {
             .iter()
             .map(|f| String::from_utf8_lossy(f).to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn p43_codex_http_error_limits_and_read_deadlines() {
+        for status in [401, 429, 500] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_string("x".repeat(crate::MAX_ERROR_BYTES + 1)),
+                )
+                .mount(&server)
+                .await;
+            let tokens = Tokens::new();
+            let provider = CodexProvider::new(server.uri(), "fixture".into(), tokens).unwrap();
+            let result = provider.complete(req()).await;
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("limit")),
+                "status={status}"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+        for status in [200, 401, 429, 500] {
+            let (url, worker) = crate::tests::raw_reply(status, None).await;
+            let mut provider = CodexProvider::with_idle_timeout(
+                url,
+                "fixture".into(),
+                Tokens::new(),
+                Duration::from_millis(30),
+            )
+            .unwrap();
+            provider.body_deadline = Duration::from_millis(30);
+            let result = tokio::time::timeout(Duration::from_secs(1), provider.complete(req()))
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, Err(ProviderError::Http(_))),
+                "status={status}"
+            );
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn p43_rejected_codex_retains_received_usage() {
+        for tail in [
+            "data: {broken".to_string(),
+            "data: {broken\n\n".to_string(),
+            "x".repeat(crate::sse::MAX_SSE_EVENT_BYTES + 1),
+        ] {
+            let server = MockServer::start().await;
+            let mut body = observed_frames("normal", "normal");
+            body.extend_from_slice(tail.as_bytes());
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let meter = crate::UsageMeter::default();
+            let provider = meter.wrap(Arc::new(
+                CodexProvider::new(server.uri(), "fixture".into(), Tokens::new()).unwrap(),
+            ));
+            let result = provider.complete(req()).await;
+            assert!(
+                matches!(result, Err(ProviderError::ReceivedUsage { source, usage })
+            if matches!(*source, ProviderError::Decode(_)) && usage.total_tokens == 7)
+            );
+            assert_eq!(meter.snapshot().failed_requests, 0);
+            assert_eq!(meter.snapshot().usage.total_tokens, 7);
+            assert_eq!(meter.snapshot().reported_responses, 1);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn p43_completed_usage_survives_body_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let worker = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![];
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let headers = String::from_utf8(request).unwrap();
+            let len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            socket.read_exact(&mut vec![0; len]).await.unwrap();
+            let body = observed_frames("normal", "normal");
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            // Keep EOF pending until the client's total body deadline closes it.
+            let _ = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte))
+                .await
+                .unwrap();
+        });
+        let mut provider = CodexProvider::new(endpoint, "fixture".into(), Tokens::new()).unwrap();
+        provider.body_deadline = Duration::from_millis(50);
+        let meter = crate::UsageMeter::default();
+        let result = meter.wrap(Arc::new(provider)).complete(req()).await;
+        assert!(
+            matches!(result, Err(ProviderError::ReceivedUsage { source, usage })
+            if matches!(*source, ProviderError::Http(_)) && usage.total_tokens == 7)
+        );
+        assert_eq!(meter.snapshot().usage.total_tokens, 7);
+        assert_eq!(meter.snapshot().reported_responses, 1);
+        assert_eq!(meter.snapshot().failed_requests, 0);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn p43_codex_observer_meter_and_wire_compatibility() {
+        for mode in [
+            "none",
+            "observe",
+            "mismatch",
+            "reject_delta",
+            "reject_final",
+        ] {
+            let server = MockServer::start().await;
+            let body = observed_frames(
+                if mode == "mismatch" {
+                    "wrong"
+                } else {
+                    "normal"
+                },
+                "normal",
+            );
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            let ledger = AttemptLedger::default();
+            let provider = Arc::new(
+                CodexProvider::new(server.uri(), "fixture".into(), Tokens::new())
+                    .unwrap()
+                    .with_attempt_ledger(ledger.clone()),
+            );
+            let meter = crate::UsageMeter::default();
+            let metered = meter.wrap(provider);
+            let observer = ObserverFixture {
+                reject_delta: mode == "reject_delta",
+                reject_final: mode == "reject_final",
+                ..Default::default()
+            };
+            let hook: Option<&dyn crate::ResponseObserver> = (mode != "none").then_some(&observer);
+            let result = metered
+                .complete_in_turn_with_observer(req(), &TurnContext::new(), hook)
+                .await;
+            if mode == "reject_delta" {
+                assert!(matches!(
+                    result,
+                    Err(ProviderError::Observation {
+                        completed: None,
+                        ..
+                    })
+                ));
+                assert_eq!(meter.snapshot().failed_requests, 1);
+                assert_eq!(meter.snapshot().reported_responses, 0);
+            } else {
+                if mode == "reject_final" {
+                    assert!(
+                        matches!(result, Err(ProviderError::Observation { completed: Some(ref response), .. }) if response.text == "normal" && response.usage.unwrap().total_tokens == 7)
+                    );
+                } else {
+                    assert_eq!(result.unwrap().text, "normal");
+                }
+                assert_eq!(meter.snapshot().usage.total_tokens, 7);
+                assert_eq!(meter.snapshot().reported_responses, 1);
+                assert_eq!(meter.snapshot().failed_requests, 0);
+            }
+            if mode == "observe" || mode == "mismatch" {
+                assert_eq!(
+                    *observer.finals.lock().unwrap(),
+                    vec![("normal".into(), Some(mode == "observe"))]
+                );
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].body_json::<Value>().unwrap(),
+                build_body("fixture", &req(), None)
+            );
+            let attempts = ledger.snapshot();
+            assert_eq!(attempts.len(), 1);
+            if mode == "reject_delta" {
+                assert_eq!(attempts[0].status, crate::attempts::AttemptStatus::Failed);
+                assert_eq!(
+                    attempts[0].usage,
+                    crate::attempts::UsageObservation::Missing
+                );
+            } else {
+                assert_eq!(
+                    attempts[0].status,
+                    crate::attempts::AttemptStatus::Succeeded
+                );
+                assert_eq!(
+                    attempts[0].usage,
+                    crate::attempts::UsageObservation::Known {
+                        input_tokens: 3,
+                        output_tokens: 4,
+                        total_tokens: 7,
+                        cached_tokens: 0,
+                    }
+                );
+            }
+        }
     }
 
     /// The headers and body sent out must match the spec. If this is

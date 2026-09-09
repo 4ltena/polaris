@@ -20,49 +20,22 @@ pub fn default_path() -> Result<PathBuf, AuthError> {
 /// the real file never gets replaced with half-written content.
 pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
+    let mut protection = crate::protection::lock()?;
+    let path = protection.register_store(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec_pretty(c)
-        .map_err(|e| AuthError::Decode(format!("could not serialize credentials: {e}")))?;
+        .map_err(|_| AuthError::Decode("could not serialize credentials".into()))?;
 
-    // 0600 is guaranteed by both the open-time mode AND set_permissions.
-    // This is not redundancy. The two do not reach the same postcondition by
-    // separate routes — each covers only its own distinct path: mode covers
-    // the "tmp is created fresh" path (an ordinary save_to call goes
-    // through here almost every time), while set_permissions covers the "a
-    // previous write was interrupted before rename, leaving a
-    // loosely-permissioned tmp behind, and we're reopening it" path.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        // mode(0o600) only matters on the fresh-creation path this covers.
-        // Because open() embeds the mode into file creation at the instant
-        // it creates the file, no window ever opens where the file exists
-        // at the umask default (0644 in this environment) between creation
-        // and the point where the later set_permissions takes effect. With
-        // set_permissions alone tightening permissions after
-        // write_all/sync_all/drop, that window from the instant of creation
-        // to the moment it's tightened cannot be closed at all — this is a
-        // target that writes a plaintext OAuth access_token/refresh_token,
-        // and closing off that window matters.
-        //
-        // That said, this window is only observable through concurrent
-        // access from another process, so within this file's tests, which
-        // are single-threaded and sequential, removing this mode(0o600)
-        // cannot be detected (confirmed by individual mutation
-        // re-verification). This is the same kind of limitation as the
-        // atomicity of tmp+rename being unobservable in tests; following
-        // how polaris-sandbox's predicates are written to spell out "this
-        // is a mitigation, not a guarantee," we spell out here too that
-        // this is "untestable by nature," not "no test means it was
-        // forgotten." This is never grounds for deleting this line.
-        .mode(0o600)
-        .open(&tmp)?;
+    // Nonblocking open and regular-file checks precede truncation/body I/O.
+    // The helper creates new files at 0600; fchmod also tightens reused tmp files.
+    let mut f = crate::protection::open_regular(&tmp, true)?;
+    protection.remember(&f.metadata()?)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.set_len(0)?;
     f.write_all(&body)?;
     f.sync_all()?;
     drop(f);
@@ -73,24 +46,31 @@ pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     // path. Tested individually in
     // a_preexisting_loose_temp_file_is_still_corrected_to_owner_only.
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, &path)?;
+    protection.register_store(&path)?;
     Ok(())
 }
 
 /// Reads. Nonexistence is not a failure. Corruption is.
 pub fn load_from(path: &Path) -> Result<Option<Credentials>, AuthError> {
-    let body = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(AuthError::Io(e)),
+    let mut protection = crate::protection::lock()?;
+    let path = protection.register_store(path)?;
+    let file = match crate::protection::open_regular(&path, false) {
+        Ok(file) => file,
+        Err(AuthError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
+    protection.remember(&file.metadata()?)?;
+    let body = crate::protection::read_body(file)?;
     serde_json::from_slice(&body)
         .map(Some)
-        .map_err(|e| AuthError::Decode(format!("could not parse {}: {e}", path.display())))
+        .map_err(|_| AuthError::Decode("could not parse credentials".into()))
 }
 
 /// Deletes. The return value is whether the file actually existed.
 pub fn delete_at(path: &Path) -> Result<bool, AuthError> {
+    let mut protection = crate::protection::lock()?;
+    let path = protection.register_store(path)?;
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),

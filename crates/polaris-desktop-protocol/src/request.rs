@@ -13,10 +13,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 pub enum Method {
     #[serde(rename = "local.models")]
     LocalModels,
+    #[serde(rename = "workspace.read")]
+    WorkspaceRead,
+    #[serde(rename = "attachment.read")]
+    AttachmentRead,
     #[serde(rename = "hello")]
     Hello,
     #[serde(rename = "session.open")]
     SessionOpen,
+    #[serde(rename = "session.roles.configure")]
+    SessionRolesConfigure,
     #[serde(rename = "session.snapshot")]
     SessionSnapshot,
     #[serde(rename = "session.subscribe")]
@@ -112,6 +118,8 @@ pub struct SessionConfigure {
     pub provider: String,
     pub model: String,
     pub effort: String,
+    #[serde(default, skip_serializing_if = "crate::snapshot::HistoryMode::is_legacy")]
+    pub history_mode: crate::snapshot::HistoryMode,
 }
 }
 
@@ -199,12 +207,26 @@ pub struct ShutdownRequest {
 }
 }
 
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRead { pub selected_path: String }
+}
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentRead { pub path: String }
+}
+
 /// sessionの要否をenumの形で固定し、無関係なsessionの黙殺を防ぐ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestBody {
     LocalModels(SessionId, LocalModels),
+    WorkspaceRead(SessionId, WorkspaceRead),
+    AttachmentRead(SessionId, AttachmentRead),
     Hello,
     SessionOpen(SessionId),
+    SessionRolesConfigure(SessionId, crate::role_bindings::ConfigureRoleBindings),
     SessionSnapshot(SessionId),
     SessionSubscribe(SessionId, Subscribe),
     HistoryPage(SessionId, HistoryPage),
@@ -225,7 +247,10 @@ impl RequestBody {
         match self {
             Self::Hello => Method::Hello,
             Self::LocalModels(..) => Method::LocalModels,
+            Self::WorkspaceRead(..) => Method::WorkspaceRead,
+            Self::AttachmentRead(..) => Method::AttachmentRead,
             Self::SessionOpen(..) => Method::SessionOpen,
+            Self::SessionRolesConfigure(..) => Method::SessionRolesConfigure,
             Self::SessionSnapshot(..) => Method::SessionSnapshot,
             Self::SessionSubscribe(..) => Method::SessionSubscribe,
             Self::HistoryPage(..) => Method::HistoryPage,
@@ -244,8 +269,11 @@ impl RequestBody {
     pub fn session_id(&self) -> Option<&SessionId> {
         match self {
             Self::Hello | Self::ShutdownRequest(..) => None,
-            Self::LocalModels(s, _)
+            Self::WorkspaceRead(s, _)
+            | Self::AttachmentRead(s, _)
+            | Self::LocalModels(s, _)
             | Self::SessionOpen(s)
+            | Self::SessionRolesConfigure(s, _)
             | Self::SessionSnapshot(s)
             | Self::SessionSubscribe(s, _)
             | Self::HistoryPage(s, _)
@@ -327,6 +355,7 @@ impl<'de> Deserialize<'de> for Request {
                 let _: Empty = params!();
                 RequestBody::SessionOpen(session.unwrap())
             }
+            Method::SessionRolesConfigure => scoped!(SessionRolesConfigure),
             Method::SessionSnapshot => {
                 let _: Empty = params!();
                 RequestBody::SessionSnapshot(session.unwrap())
@@ -336,6 +365,8 @@ impl<'de> Deserialize<'de> for Request {
             Method::DraftUpdate => scoped!(DraftUpdate),
             Method::SessionConfigure => scoped!(SessionConfigure),
             Method::LocalModels => scoped!(LocalModels),
+            Method::WorkspaceRead => scoped!(WorkspaceRead),
+            Method::AttachmentRead => scoped!(AttachmentRead),
             Method::RunStart => scoped!(RunStart),
             Method::RunCancel => scoped!(RunCancel),
             Method::ApprovalResolve => scoped!(ApprovalResolve),
@@ -381,7 +412,10 @@ impl Serialize for Request {
             RequestBody::HistoryPage(_, p) => wire.serialize_field("params", p)?,
             RequestBody::DraftUpdate(_, p) => wire.serialize_field("params", p)?,
             RequestBody::SessionConfigure(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::SessionRolesConfigure(_, p) => wire.serialize_field("params", p)?,
             RequestBody::LocalModels(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::WorkspaceRead(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::AttachmentRead(_, p) => wire.serialize_field("params", p)?,
             RequestBody::RunStart(_, p) => wire.serialize_field("params", p)?,
             RequestBody::RunCancel(_, p) => wire.serialize_field("params", p)?,
             RequestBody::ApprovalResolve(_, p) => wire.serialize_field("params", p)?,

@@ -90,5 +90,7 @@
       }
     }
   ],
-  "history_start_cursor": "history-start"
+  "history_start_cursor": "history-start",
+  "role_bindings": [],
+  "role_catalog": []
 }

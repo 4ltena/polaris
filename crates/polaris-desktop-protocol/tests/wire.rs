@@ -154,6 +154,43 @@ fn snapshot_preserves_approval_acceptance_blockers_and_history_start() {
 }
 
 #[test]
+fn strict10_configuration_and_memory_status_roundtrip_without_nulls() {
+    use polaris_desktop_protocol::snapshot::HistoryMode;
+    let mut wire: Value = serde_json::from_str(include_str!("fixtures/snapshot.json")).unwrap();
+    let old: Snapshot = read(&wire);
+    assert_eq!(old.configuration.history_mode, HistoryMode::Legacy);
+    assert!(old.memory.is_none());
+    wire["configuration"]["history_mode"] = json!("strict10");
+    wire["memory"] = json!({"run_id":"run-memory", "phase":"ready", "detail":"準備完了",
+        "recent_raw_turns":"10", "retrieval_sources":["conversation://source-1-abcd?start=1&end=1"], "reference_tokens":"256",
+        "summary_usage":{"input_tokens":"100", "output_tokens":"10", "cached_tokens":"20",
+            "reported_responses":"1", "missing_responses":"0", "failed_requests":"0"}});
+    let updated = assert_wire::<Snapshot>(&wire);
+    assert_eq!(updated.configuration.history_mode, HistoryMode::Strict10);
+    assert!(updated.memory.unwrap().embedding_usage.is_none());
+    let mut event = values(include_str!("fixtures/events.json"))[0].clone();
+    event["type"] = json!("memory.updated");
+    event["payload"] = wire["memory"].clone();
+    assert!(matches!(
+        assert_wire::<Event>(&event).body,
+        EventBody::MemoryUpdated(_)
+    ));
+    let mut request = requests()
+        .into_iter()
+        .find(|v| v["method"] == "session.configure")
+        .unwrap();
+    request["params"]["history_mode"] = json!("strict10");
+    assert_wire::<Request>(&request);
+    request["params"]["history_mode"] = json!("invented");
+    assert!(codec::from_json::<Request>(&serde_json::to_vec(&request).unwrap()).is_err());
+    wire["memory"]["embedding_usage"] = Value::Null;
+    assert_eq!(
+        codec::from_json::<Snapshot>(&serde_json::to_vec(&wire).unwrap()),
+        Err(CodecError::Null)
+    );
+}
+
+#[test]
 fn status_not_found_accepted_completed_unknown_remain_distinct() {
     let wire = values(include_str!("fixtures/status.json"));
     let typed: Vec<_> = wire

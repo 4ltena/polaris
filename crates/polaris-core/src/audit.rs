@@ -21,12 +21,26 @@ mod private_file_tests {
     fn retains_open_file_when_its_name_is_replaced() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("audit");
-        let file = OpenOptions::new().create_new(true).append(true).mode(0o600).open(&path).unwrap();
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
         let mut audit = AuditLog::from_private_file(file).unwrap();
         let retained = root.path().join("retained");
         std::fs::rename(&path, &retained).unwrap();
         std::fs::write(&path, b"replacement").unwrap();
-        audit.record(&Record { tool: "test", detail: "entry", sandbox: None, target: None, result: "ok", caller: "root" }).unwrap();
+        audit
+            .record(&Record {
+                tool: "test",
+                detail: "entry",
+                sandbox: None,
+                target: None,
+                result: "ok",
+                caller: "root",
+            })
+            .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
         assert!(std::fs::read_to_string(retained).unwrap().contains("entry"));
     }
@@ -35,13 +49,24 @@ mod private_file_tests {
     fn refuses_nonappend_or_shared_file_without_writing() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("audit");
-        let file = OpenOptions::new().create_new(true).write(true).mode(0o600).open(&path).unwrap();
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
         assert!(AuditLog::from_private_file(file).is_err());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(AuditLog::from_private_file(OpenOptions::new().append(true).open(&path).unwrap()).is_err());
+        assert!(
+            AuditLog::from_private_file(OpenOptions::new().append(true).open(&path).unwrap())
+                .is_err()
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::hard_link(&path, root.path().join("alias")).unwrap();
-        assert!(AuditLog::from_private_file(OpenOptions::new().append(true).open(&path).unwrap()).is_err());
+        assert!(
+            AuditLog::from_private_file(OpenOptions::new().append(true).open(&path).unwrap())
+                .is_err()
+        );
         assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
     }
 }

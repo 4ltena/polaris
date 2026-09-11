@@ -6,6 +6,7 @@
 mod bootstrap;
 mod children;
 mod disk;
+mod memory;
 mod model;
 mod roles;
 mod source_apply;
@@ -18,6 +19,7 @@ pub use bootstrap::{
     ValidatedOwnerBootstrap, read_owner_bootstrap, validate_owner_configuration,
 };
 pub use children::SavedChild;
+pub use memory::{MemoryResources, MemorySnapshot, SavedMemory, SummaryWork};
 pub use model::{
     Acceptance, HistoryGap, InitialState, IntentReceipt, Marker, Operation, Published,
     RequestRecord, RequestResult, RunRecord, Sidecar, StoreError, StoreResult,

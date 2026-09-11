@@ -72,6 +72,11 @@ pub struct OwnerBootstrapDocument {
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_endpoint: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "polaris_desktop_protocol::snapshot::HistoryMode::is_legacy"
+    )]
+    pub history_mode: polaris_desktop_protocol::snapshot::HistoryMode,
 }
 
 /// Expected identity and digest come from the native publication, not its body.
@@ -168,6 +173,7 @@ fn validate(
         || document.store_identity != store.identity
         || document.policy_revision != saved.state.policy_revision
         || document.configuration_revision != saved.state.configuration.configuration_revision
+        || document.history_mode != saved.state.configuration.history_mode
         || !absolute(&document.source_path)
         || !bounded_text(document.project_id.as_str(), 128)
         || !bounded_text(document.session_id.as_str(), 128)

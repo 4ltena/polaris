@@ -16,7 +16,10 @@ fn reports_missing_api_key() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(exe)
         .args(["-p", "hello"])
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .env_remove("POLARIS_API_KEY")
         .output()
@@ -51,7 +54,10 @@ fn reports_a_broken_agent_type_without_crashing() {
     let out = Command::new(exe)
         .args(["-p", "hello"])
         .current_dir(project.path())
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env("POLARIS_API_KEY", "dummy-key")
         .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .output()

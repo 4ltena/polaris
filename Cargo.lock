@@ -1377,9 +1377,10 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "polaris-auth"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64",
+ "libc",
  "polaris-http",
  "reqwest",
  "serde",
@@ -1394,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -1416,11 +1417,14 @@ dependencies = [
 
 [[package]]
 name = "polaris-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "futures-util",
  "getrandom 0.3.4",
+ "libc",
+ "polaris-auth",
+ "polaris-desktop-protocol",
  "polaris-memory",
  "polaris-provider",
  "polaris-sandbox",
@@ -1439,8 +1443,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "polaris-desktop-protocol"
+version = "0.12.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "polaris-desktop-service"
+version = "0.12.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "polaris-auth",
+ "polaris-core",
+ "polaris-desktop-protocol",
+ "polaris-provider",
+ "polaris-sandbox",
+ "polaris-skills",
+ "polaris-tools",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "polaris-http"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "reqwest",
  "rustls",
@@ -1452,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-memory"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1465,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-provider"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1482,9 +1516,10 @@ dependencies = [
 
 [[package]]
 name = "polaris-sandbox"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "landlock",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -1493,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-skills"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "serde",
  "sha2",
@@ -1504,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tools"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "jsonschema",
  "polaris-sandbox",
@@ -1518,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tui"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "base64",

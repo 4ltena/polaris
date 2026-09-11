@@ -56,6 +56,12 @@ async fn ollama_inventory_and_show_preserve_unknown_and_remote() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
     let models = client.inventory().await.unwrap();
     assert_eq!(models[0].execution_location(), ExecutionLocation::Unknown);
     assert_eq!(models[0].capabilities().tools, Capability::Unknown);
@@ -84,19 +90,67 @@ async fn ollama_inventory_and_show_preserve_unknown_and_remote() {
 }
 
 #[tokio::test]
+async fn ollama_running_models_distinguish_loaded_and_unloaded_without_loading() {
+    let (server, client) = adapter(Runtime::Ollama).await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[
+            {"name":"resident"}, {"name":"downloaded"}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[
+            {"name":"resident", "model":"resident"}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let models = client.inventory_with_load_state().await.unwrap();
+    assert_eq!(models[0].load_state(), LoadState::Loaded);
+    assert_eq!(models[1].load_state(), LoadState::Unloaded);
+}
+
+#[tokio::test]
+async fn failed_or_malformed_ollama_running_probe_stays_unknown() {
+    for running in [json!({}), json!({"models":[{"name":null}]})] {
+        let (server, client) = adapter(Runtime::Ollama).await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"models":[{"name":"a"}]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(running))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            client.inventory_with_load_state().await.unwrap()[0].load_state(),
+            LoadState::Unknown
+        );
+    }
+}
+
+#[tokio::test]
 async fn lm_metadata_never_proves_local_and_selection_is_independent() {
     let (server, client) = adapter(Runtime::LmStudio).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[
             {"key":"a", "type":"llm", "max_context_length":8192,
+             "loaded_instances":[{"id":"a", "config":{"context_length":8192}}],
              "capabilities":{"vision":false,"trained_for_tool_use":true}},
-            {"key":"b", "type":"embedding"}
+            {"key":"b", "type":"embedding", "loaded_instances":[]}
         ]})))
         .expect(1)
         .mount(&server)
         .await;
-    let models = client.inventory().await.unwrap();
+    let models = client.inventory_with_load_state().await.unwrap();
     let a = client.select(&models[0]).await.unwrap();
     let b = client.select(&models[1]).await.unwrap();
     assert_eq!(a.model().id(), "a");
@@ -107,6 +161,28 @@ async fn lm_metadata_never_proves_local_and_selection_is_independent() {
     assert_eq!(b.model().capabilities().completion, Capability::Unsupported);
     assert_eq!(b.model().capabilities().tools, Capability::Unknown);
     assert_eq!(a.model().max_context_length(), Some(8192));
+    assert_eq!(a.model().load_state(), LoadState::Loaded);
+    assert_eq!(b.model().load_state(), LoadState::Unloaded);
+}
+
+#[tokio::test]
+async fn lm_missing_or_malformed_loaded_instances_stays_unknown() {
+    let (server, client) = adapter(Runtime::LmStudio).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[
+            {"key":"old"}, {"key":"malformed", "loaded_instances":true},
+            {"key":"null", "loaded_instances":[null]},
+            {"key":"bad-config", "loaded_instances":[{"id":"x", "config":{}}]}
+        ]})))
+        .mount(&server)
+        .await;
+    let models = client.inventory_with_load_state().await.unwrap();
+    assert!(
+        models
+            .iter()
+            .all(|model| model.load_state() == LoadState::Unknown)
+    );
 }
 
 #[tokio::test]

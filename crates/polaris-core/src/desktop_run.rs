@@ -217,6 +217,19 @@ fn execute(mut input: DesktopRunInput, sink: DesktopEventSink) -> DesktopRunComp
             .map_err(DesktopRunError::Agent)
     }))
     .unwrap_or(Err(DesktopRunError::Panicked));
+    if let Err(DesktopRunError::Agent(AgentError::Provider(error))) = &result {
+        // Diagnostics contain only a closed category, never an upstream error
+        // body, URL, account identifier or credential. Preserve the original
+        // failure even if the best-effort diagnostic append itself fails.
+        let _ = input.audit.blocking_lock().record(&crate::audit::Record {
+            tool: "provider",
+            detail: provider_failure_category(error),
+            sandbox: None,
+            target: None,
+            result: "failed",
+            caller: "root",
+        });
+    }
     if let Some(transcript) = input.session.desktop_transcript.take() {
         raw_history.extend(transcript.into_messages());
         input.session.messages = raw_history;
@@ -224,6 +237,62 @@ fn execute(mut input: DesktopRunInput, sink: DesktopEventSink) -> DesktopRunComp
     DesktopRunCompletion {
         session: input.session,
         result,
+    }
+}
+
+fn provider_failure_category(error: &polaris_provider::ProviderError) -> &'static str {
+    use polaris_provider::ProviderError;
+    match error {
+        ProviderError::ReceivedUsage { source, .. } => provider_failure_category(source),
+        ProviderError::Auth(message) => match message.as_str() {
+            "authentication_protection" => "authentication_protection",
+            "authentication_store" => "authentication_store",
+            "authentication_transport_or_status" => "authentication_transport_or_status",
+            "authentication_http_400" => "authentication_http_400",
+            "authentication_http_401" => "authentication_http_401",
+            "authentication_http_403" => "authentication_http_403",
+            "authentication_http_429" => "authentication_http_429",
+            "authentication_response_format" => "authentication_response_format",
+            "authentication_denied" => "authentication_denied",
+            "authentication_refresh_policy" => "authentication_refresh_policy",
+            "authentication_login_port" => "authentication_login_port",
+            _ => "authentication",
+        },
+        ProviderError::Http(_) => "http",
+        ProviderError::Decode(_) => "response_format",
+        ProviderError::Budget(_) => "request_budget",
+        ProviderError::Unsupported(_) => "unsupported_capability",
+        ProviderError::Observation { .. } => "response_delivery",
+    }
+}
+
+#[cfg(test)]
+mod failure_category_tests {
+    use super::*;
+    #[test]
+    fn provider_diagnostic_never_returns_upstream_text() {
+        use polaris_provider::ProviderError;
+        let private = "synthetic-token account@example.invalid upstream response";
+        for (error, expected) in [
+            (ProviderError::Auth(private.into()), "authentication"),
+            (
+                ProviderError::Auth("authentication_store".into()),
+                "authentication_store",
+            ),
+            (
+                ProviderError::Auth(format!("authentication_store {private}")),
+                "authentication",
+            ),
+            (ProviderError::Http(private.into()), "http"),
+            (ProviderError::Decode(private.into()), "response_format"),
+            (ProviderError::Budget(private.into()), "request_budget"),
+            (
+                ProviderError::Unsupported(private.into()),
+                "unsupported_capability",
+            ),
+        ] {
+            assert_eq!(provider_failure_category(&error), expected);
+        }
     }
 }
 

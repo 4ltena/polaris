@@ -27,6 +27,13 @@ pub use controlled::{
 pub use helper::Mutation;
 pub use policy::{SandboxMode, SandboxPolicy};
 
+/// Prevent trusted native utility children from inheriting unrelated descriptors.
+/// This only installs FD hygiene; it does not grant or enforce filesystem access.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn protect_child_descriptors(command: &mut std::process::Command) {
+    child_fds::install(command);
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     #[error("failed to apply the sandbox: {0}")]

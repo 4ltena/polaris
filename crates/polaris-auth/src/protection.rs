@@ -168,6 +168,7 @@ impl ProtectedPathsSnapshot {
 pub(crate) struct Registry {
     snapshot: ProtectedPathsSnapshot,
     failed: bool,
+    trusted_defaults: Option<[PathBuf; 2]>,
 }
 
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -183,9 +184,36 @@ pub(crate) fn lock() -> Result<MutexGuard<'static, Registry>, AuthError> {
     Ok(guard)
 }
 
+/// Install the desktop owner's OS-resolved home before any protected reads.
+/// This is process-lifetime authority, never a model-selected path. Rebinding
+/// is refused; existing protected names and inode identities are retained.
+pub fn use_trusted_home(home: &Path) -> Result<(), AuthError> {
+    if !home.is_absolute() || !valid_registered_path(home) {
+        return Err(AuthError::Protection);
+    }
+    let defaults = [
+        home.join(".polaris/auth.json"),
+        home.join(".polaris/api_key.json"),
+    ];
+    let mut registry = lock()?;
+    if let Some(existing) = &registry.trusted_defaults {
+        return if existing == &defaults {
+            Ok(())
+        } else {
+            Err(AuthError::Protection)
+        };
+    }
+    for path in &defaults {
+        registry.register_store(path)?;
+    }
+    registry.trusted_defaults = Some(defaults);
+    Ok(())
+}
+
 /// Runs a synchronous callback under the same lock as save/load/delete.
 /// Default stores and their temporary paths are registered from `default_path`
-/// on every call. Only filesystem metadata is inspected; no body is read.
+/// on every call, unless the native owner installed its trusted home. Only
+/// filesystem metadata is inspected; no body is read.
 ///
 /// The callback must not reenter this API or any auth storage operation, or
 /// wait for work that needs the auth lock. Complete snapshot copying inside
@@ -194,8 +222,16 @@ pub fn with_protected_paths<R>(
     callback: impl FnOnce(&ProtectedPathsSnapshot) -> R,
 ) -> Result<R, AuthError> {
     let mut registry = lock()?;
-    registry.register_store(&crate::store::default_path()?)?;
-    registry.register_store(&crate::api_key::default_path()?)?;
+    let defaults = match &registry.trusted_defaults {
+        Some(paths) => paths.clone(),
+        None => [
+            crate::store::default_path()?,
+            crate::api_key::default_path()?,
+        ],
+    };
+    for path in &defaults {
+        registry.register_store(path)?;
+    }
     // Refresh registered names as well, retaining old identities after rotation.
     let paths: Vec<_> = registry.snapshot.paths.iter().cloned().collect();
     for path in paths {

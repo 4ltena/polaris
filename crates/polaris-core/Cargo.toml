@@ -5,7 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Fault injection is opt-in for cross-crate regression tests only.
+execution-test-support = []
+
 [dependencies]
+polaris-auth = { path = "../polaris-auth" }
+polaris-desktop-protocol = { path = "../polaris-desktop-protocol" }
 polaris-provider = { path = "../polaris-provider" }
 polaris-memory = { path = "../polaris-memory" }
 polaris-sandbox = { path = "../polaris-sandbox" }
@@ -23,6 +29,7 @@ toml = { workspace = true }
 tokio = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
+libc = "=0.2.189"
 
 [dev-dependencies]
 async-trait = { workspace = true }

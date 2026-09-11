@@ -19,13 +19,7 @@ use std::{
 pub const SCHEMA_VERSION: u32 = 2;
 pub const REAL_TURN_WINDOW: usize = 10;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HistoryMode {
-    #[default]
-    Legacy,
-    Strict10,
-}
+pub use polaris_desktop_protocol::snapshot::HistoryMode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

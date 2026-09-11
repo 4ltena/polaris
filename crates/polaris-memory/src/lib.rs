@@ -25,6 +25,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("invalid memory input: {0}")]
     InvalidInput(&'static str),
+    #[error("conversation evidence with provenance exceeds 256 o200k tokens")]
+    ConversationEvidenceBudgetExceeded,
     #[error("invalid stored embedding")]
     InvalidEmbedding,
     #[error("session was forgotten; importing it again is disabled")]

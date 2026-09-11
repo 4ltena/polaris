@@ -655,10 +655,12 @@ pub(crate) async fn run_loop(
             let outcome = if let Some(path) = conversation_path {
                 dispatch_conversation_read(
                     session.persistence.as_ref(),
+                    session.desktop_memory.as_deref(),
                     call,
                     path,
                     events.as_ref(),
                 )
+                .await
             } else if let Some(path) = memory_path {
                 dispatch_memory_read(session.tool_memory.as_ref(), call, path, events.as_ref())
                     .await
@@ -844,8 +846,9 @@ fn include_summary_usage(
     main
 }
 
-fn dispatch_conversation_read(
+async fn dispatch_conversation_read(
     saved: Option<&crate::session_store::PersistedSession>,
+    desktop: Option<&crate::desktop_memory::DesktopMemory>,
     call: &polaris_provider::ToolCall,
     path: &str,
     events: Option<&crate::desktop_events::EventSink>,
@@ -857,13 +860,17 @@ fn dispatch_conversation_read(
         });
     }
     check_event_delivery(events).map_err(|error| error.to_string())?;
-    let result = saved
-        .ok_or_else(|| "会話原文の永続保存が有効ではありません".to_string())
-        .and_then(|saved| {
-            saved.snapshot().map_err(|error| error.to_string())?;
-            crate::conversation_memory::read_source(&saved.store, &saved.database, path)
-                .map_err(|error| error.to_string())
-        });
+    let result = if let Some(desktop) = desktop {
+        desktop.read(path).await.map_err(|error| error.to_string())
+    } else {
+        saved
+            .ok_or_else(|| "会話原文の永続保存が有効ではありません".to_string())
+            .and_then(|saved| {
+                saved.snapshot().map_err(|error| error.to_string())?;
+                crate::conversation_memory::read_source(&saved.store, &saved.database, path)
+                    .map_err(|error| error.to_string())
+            })
+    };
     if let Some(tx) = events {
         let _ = tx.send(crate::events::AgentEvent::ToolFinished {
             name: "read".into(),

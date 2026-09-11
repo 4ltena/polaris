@@ -1,4 +1,4 @@
-//! In-memory request history with optional durable v2 storage.
+//! Request history with optional durable v2 storage or a v3 desktop owner port.
 
 use polaris_provider::{Message, ReasoningItem, ToolCall};
 
@@ -32,6 +32,8 @@ pub struct Session {
     /// Desktop-only unmodified turn output, independent of request projections.
     /// The trusted worker initializes this; it is never a replacement for disk publication.
     pub desktop_transcript: Option<DesktopTranscript>,
+    /// Trusted v3 owner port. It can prepare request context but cannot replace raw history.
+    pub desktop_memory: Option<std::sync::Arc<crate::desktop_memory::DesktopMemory>>,
 }
 
 #[derive(Default, Clone)]
@@ -292,6 +294,9 @@ impl Session {
     }
 
     pub fn uses_strict_history(&self) -> std::io::Result<bool> {
+        if self.desktop_memory.is_some() {
+            return Ok(true);
+        }
         Ok(self
             .persistence
             .as_ref()
@@ -329,6 +334,11 @@ impl Session {
     /// never appended as another user turn or fed into the raw archive.
     pub async fn prepare_history(&mut self) -> std::io::Result<Option<Message>> {
         self.check_persistence()?;
+        if let Some(memory) = &self.desktop_memory {
+            let (messages, evidence) = memory.prepare().await?;
+            self.messages = messages;
+            return Ok(evidence);
+        }
         if !self.uses_strict_history()? {
             return Ok(None);
         }

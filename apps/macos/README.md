@@ -50,7 +50,7 @@ sips --setProperty dpiWidth 144 --setProperty dpiHeight 144 \
 
 v0.12.0の配布版では`Contents/Resources/Polaris.icns`を`CFBundleIconFile`から参照し、`LSMinimumSystemVersion`を13.5とした。SwiftPMのリソースbundleは生成accessorに合わせて.app直下に置く。この配置はアプリ全体の署名に対応していない。署名・公証対応は別の変更として扱い、同梱helperの最終バイト列と`execution-helper.json`のSHA-256を常に一致させる。
 
-DMGの`.background/space-earth.png`へ生成背景を置き、`Applications`を`/Applications`へのリンクにする。Finderを閉じた状態で、`ds-store==1.3.3`と`mac-alias==2.2.3`を用意したビルド用Pythonから`write-dmg-layout.py /absolute/mounted/dmg`を実行すると、当該DMGの配置だけを保存する。利用者のFinder設定は変更しない。通常アンマウント後、`hdiutil convert`の`UDZO`形式で圧縮し、`hdiutil verify`と展開後のハッシュを確認する。
+DMG内の`Polaris.app/Contents/Resources/InstallerBackground.png`へ生成背景を置き、`Applications`を`/Applications`へのリンクにする。背景をアプリ内に格納することで、隠しファイル表示が有効でもインストール画面に背景用フォルダを出さない。Finderを閉じた状態で、`ds-store==1.3.3`と`mac-alias==2.2.3`を用意したビルド用Pythonから`write-dmg-layout.py /absolute/mounted/dmg`を実行すると、当該DMGの配置だけを保存する。利用者のFinder設定は変更しない。通常アンマウント後、`hdiutil convert`の`UDZO`形式で圧縮し、`hdiutil verify`と展開後のハッシュを確認する。
 
 同梱するスキルはGit管理された`skills/`、子エージェント定義は`agents/`から取得する。ビルド元の`.polaris/skills`やホームの個人設定はアプリへコピーしない。これらのローカル設定を作らずに、新しく取得したソースから組み立てられる。実行時のプロジェクト・ホームからのスキル探索は従来どおりである。
 
@@ -93,7 +93,7 @@ open -n /absolute/path/PolarisDesktop.app --args \
 
 v0.12.0ではSwift 236件と梱包試験6件が成功した。Git管理されたスキルとエージェント定義を使い、個人設定も既存のSwiftビルドキャッシュもない環境で組立てを確認している。strict10修正後の追加実モデル確認は省略した。
 
-配布準備ではrelease構成の回帰を加えた梱包試験7件が成功した。最適化ビルド、4実行物のアーキテクチャとシステムライブラリ依存、helperの最終SHA、533ファイルのDMG内・移設先との一致、所有者・権限・link条件を確認した。圧縮DMGの`hdiutil verify`と、Finderでの背景・上下配置・ファイル名の可読性も確認済み。今回の配布用アプリから追加の実モデル送信は行っていない。
+配布準備ではrelease構成の回帰を加えた梱包試験7件が成功した。最適化ビルド、4実行物のアーキテクチャとシステムライブラリ依存、helperの最終SHA、534ファイルのDMG内・移設先との一致、所有者・権限・link条件を確認した。圧縮DMGの`hdiutil verify`と、Finderでの背景・上下配置・ファイル名の可読性も確認済み。今回の配布用アプリから追加の実モデル送信は行っていない。
 
 Swiftの自動試験は次で実行する。
 

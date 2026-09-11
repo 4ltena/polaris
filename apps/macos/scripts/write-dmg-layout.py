@@ -25,7 +25,7 @@ def main():
     applications = mount / "Applications"
     if not applications.is_symlink() or applications.readlink() != Path("/Applications"):
         parser.error("Applicationsは/Applicationsへのリンクにしてください。")
-    background = mount / ".background/space-earth.png"
+    background = mount / "Polaris.app/Contents/Resources/InstallerBackground.png"
     if not background.is_file() or background.is_symlink():
         parser.error("配布用の背景画像がありません。")
     with DSStore.open(str(mount / ".DS_Store"), "w+") as store:

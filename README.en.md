@@ -82,7 +82,7 @@ Building the desktop workspace from source requires macOS 13 or later and Swift 
 
 The v0.12.0 source passed 1,689 Rust tests, 236 Swift tests, and six packaging tests, along with Clippy, formatting, and filemap checks. The macOS app was also built and assembled without local user settings or an existing Swift build cache.
 
-Distribution checks passed all seven packaging tests, including release configuration, and verified the DMG integrity, 533 app file hashes, ownership and permissions after extraction, and the vertical Finder layout. No additional real-model request was sent from the distribution app.
+Distribution checks passed all seven packaging tests, including release configuration, and verified the DMG integrity, 534 app file hashes, ownership and permissions after extraction, and the vertical Finder layout. No additional real-model request was sent from the distribution app.
 
 The `strict10` retrieval defect is fixed, with automated regression checks and history restoration verified. The additional real-model check after that fix and the PRE01 comparison rerun were skipped. Speech input has synthetic-test coverage only; Windows and Linux device checks were outside scope. Web search cannot be enabled in the current CLI. See the [macOS checks](apps/macos/README.md#検査) and [changelog](CHANGELOG.md) for details.
 

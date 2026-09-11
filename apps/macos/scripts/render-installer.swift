@@ -43,7 +43,7 @@ try png("background@2x.png", width: 1280, height: 1040) {
         let size: CGFloat = index % 9 == 0 ? 1.6 : 0.8
         NSBezierPath(ovalIn: NSRect(x: x, y: y, width: size, height: size)).fill()
     }
-    let earth = NSBezierPath(ovalIn: NSRect(x: -110, y: -575, width: 860, height: 860))
+    let earth = NSBezierPath(ovalIn: NSRect(x: -680, y: -1715, width: 2000, height: 2000))
     NSGraphicsContext.saveGraphicsState()
     earth.addClip()
     NSGradient(starting: color(0.025, 0.06, 0.10), ending: color(0.14, 0.28, 0.39))!
@@ -62,11 +62,12 @@ try png("background@2x.png", width: 1280, height: 1040) {
     // アプリからApplicationsへの移動方向。アイコン自体はFinderに配置する。
     color(0.75, 0.84, 0.91, 0.7).setStroke()
     let arrow = NSBezierPath()
-    arrow.move(to: NSPoint(x: 320, y: 300))
-    arrow.line(to: NSPoint(x: 320, y: 254))
-    arrow.move(to: NSPoint(x: 313, y: 261))
-    arrow.line(to: NSPoint(x: 320, y: 254))
-    arrow.line(to: NSPoint(x: 327, y: 261))
+    // Finderのアイコン中心112・380の中点246を、下原点の274へ変換する。
+    arrow.move(to: NSPoint(x: 320, y: 297))
+    arrow.line(to: NSPoint(x: 320, y: 251))
+    arrow.move(to: NSPoint(x: 313, y: 258))
+    arrow.line(to: NSPoint(x: 320, y: 251))
+    arrow.line(to: NSPoint(x: 327, y: 258))
     arrow.lineWidth = 1.2
     arrow.stroke()
     // Finderは画像背景の上でも黒いファイル名を使うため、名前の下だけ明るくする。
@@ -75,13 +76,6 @@ try png("background@2x.png", width: 1280, height: 1040) {
         NSBezierPath(roundedRect: NSRect(x: 242, y: y, width: 156, height: 29),
             xRadius: 7, yRadius: 7).fill()
     }
-    let paragraph = NSMutableParagraphStyle()
-    paragraph.alignment = .center
-    ("PolarisをApplicationsへドラッグ" as NSString).draw(
-        in: NSRect(x: 40, y: 32, width: 560, height: 22), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 13), .foregroundColor: color(0.74, 0.82, 0.88),
-            .paragraphStyle: paragraph
-        ])
 }
 
 let iconset = output.appendingPathComponent("Polaris.iconset", isDirectory: true)

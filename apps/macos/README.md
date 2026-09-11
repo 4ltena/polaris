@@ -21,6 +21,8 @@ python3 apps/macos/scripts/assemble-app.py \
 
 `--execution-helper`と`--toolchain-package`を省略すると、実行helperを同梱しないアプリになる。組立てスクリプトは既存の出力先を上書きせず、起動や署名も行わない。
 
+同梱するスキルはGit管理された`skills/`、子エージェント定義は`agents/`から取得する。ビルド元の`.polaris/skills`やホームの個人設定はアプリへコピーしない。これらのローカル設定を作らずに、新しく取得したソースから組み立てられる。実行時のプロジェクト・ホームからのスキル探索は従来どおりである。
+
 使い捨ての設定ファイルで起動するには、絶対パスを`--settings-path`へ渡す。
 
 ```sh

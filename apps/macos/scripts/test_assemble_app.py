@@ -3,15 +3,86 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
+import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("assembly", Path(__file__).with_name("assemble-app.py"))
 assembly = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(assembly)
+REPOSITORY = Path(__file__).resolve().parents[3]
 
 
 class HelperAssemblyTests(unittest.TestCase):
+    def assemble_checkout(self, root, with_local_skills=False):
+        repository = root / "source"
+        package = repository / "apps/macos"
+        binary_directory = package / ".build/bin"
+        resources = binary_directory / "PolarisDesktop_PolarisDesktop.bundle"
+        resources.mkdir(parents=True)
+        (resources / "release.json").write_text('{"version": "0.12.0"}')
+        (binary_directory / "PolarisDesktop").write_bytes(b"compiled native executable")
+        shutil.copytree(REPOSITORY / "skills", repository / "skills")
+        shutil.copytree(REPOSITORY / "agents", repository / "agents")
+        if with_local_skills:
+            local = repository / ".polaris/skills"
+            (local / "verify-a-change").mkdir(parents=True)
+            (local / "verify-a-change/SKILL.md").write_text("private local override")
+            (local / "private-only").mkdir()
+            (local / "private-only/SKILL.md").write_text("local notes must stay local")
+        else:
+            self.assertFalse((repository / ".polaris").exists())
+        service = root / "service-helper"
+        execution = root / "execution-helper"
+        for helper in [service, execution]:
+            helper.write_bytes(b"compiled " + helper.name.encode())
+            helper.chmod(0o700)
+        destination = root / "PolarisDesktop.app"
+        arguments = [
+            "assemble-app.py", "--service-helper", str(service),
+            "--execution-helper", str(execution), "--destination", str(destination),
+        ]
+        # Stub compilation only. Exercise the real resource copy, manifest,
+        # metadata and final publication paths against a clean source fixture.
+        with patch.object(assembly, "__file__", str(package / "scripts/assemble-app.py")), \
+                patch.object(assembly.sys, "argv", arguments), \
+                patch.object(assembly.subprocess, "run"), \
+                patch.object(assembly.subprocess, "check_output", return_value=str(binary_directory)):
+            assembly.main()
+        return destination
+
+    def assert_bundled_catalogs(self, app):
+        for catalog in ["skills", "agents"]:
+            expected = {
+                path.relative_to(REPOSITORY / catalog): path.read_bytes()
+                for path in (REPOSITORY / catalog).rglob("*") if path.is_file()
+            }
+            destination = app / "Contents/Resources" / catalog
+            actual = {
+                path.relative_to(destination): path.read_bytes()
+                for path in destination.rglob("*") if path.is_file()
+            }
+            self.assertTrue(expected)
+            self.assertEqual(actual, expected)
+
+    def test_execution_app_assembles_without_project_local_skills(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.assemble_checkout(Path(directory))
+            self.assert_bundled_catalogs(app)
+            with (app / "Contents/Info.plist").open("rb") as stream:
+                self.assertEqual(plistlib.load(stream)["CFBundleShortVersionString"], "0.12.0")
+            helper = app / "Contents/Helpers/polaris-execution-helper"
+            self.assertEqual(helper.read_bytes(), b"compiled execution-helper")
+            manifest = json.loads((app / "Contents/Resources/execution-helper.json").read_text())
+            self.assertEqual(manifest["sha256"], hashlib.sha256(helper.read_bytes()).hexdigest())
+
+    def test_local_overrides_do_not_change_the_packaged_catalogs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.assemble_checkout(Path(directory), with_local_skills=True)
+            self.assert_bundled_catalogs(app)
+
     def test_runtime_copy_preserves_executable_and_rejects_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

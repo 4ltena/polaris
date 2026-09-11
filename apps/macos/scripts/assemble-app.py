@@ -128,7 +128,8 @@ def main():
         if arguments.execution_helper is not None:
             package_execution_helper(arguments.execution_helper, contents)
             repository = package.parent.parent
-            copy_runtime_tree(repository / ".polaris" / "skills", contents / "Resources" / "skills")
+            # 同梱資源はGit管理する正本から取得し、ビルド元の個人設定を混入させない。
+            copy_runtime_tree(repository / "skills", contents / "Resources" / "skills")
             copy_runtime_tree(repository / "agents", contents / "Resources" / "agents")
             if arguments.toolchain_package:
                 (contents / "Resources" / "toolchains").mkdir()

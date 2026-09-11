@@ -963,6 +963,7 @@ mod tests {
                         attachment_ids: vec![],
                     },
                     configuration: Configuration {
+                        history_mode: Default::default(),
                         configuration_revision: DecimalU64::new(0),
                         provider: "fake".into(),
                         model: "fake".into(),

@@ -1,4 +1,4 @@
-//! Strict ten-turn preparation over the shared v2 session store.
+//! Shared strict ten-turn preparation with v2 publication and v3 owner integration.
 //!
 //! This module deliberately owns no session state. The session layer appends raw
 //! events first; `prepare` then uses short locks only to snapshot and publish.
@@ -120,59 +120,7 @@ impl StrictHistory {
             .await?;
         let snapshot = store.lock()?.snapshot()?;
         let view = published_view(&snapshot.state)?;
-        let vectors = self.embedder.embed_query(query).await?;
-        if vectors.is_empty() {
-            return Err(io::Error::other(
-                "embedding helper returned no query vector",
-            ));
-        }
-        let metadata = self.embedder.metadata().clone();
-        let mut hits = BTreeMap::<(String, String, i64, i64, i64), ConversationHit>::new();
-        let memory = MemoryStore::open(database).map_err(io::Error::other)?;
-        for values in vectors {
-            validate_vector(&values, &metadata)?;
-            let found = memory
-                .search_conversation(ConversationQuery {
-                    published: &view,
-                    keywords: query,
-                    embedding: QueryEmbedding {
-                        model: metadata.model.clone(),
-                        revision: metadata.revision.clone(),
-                        dimension: metadata.dimension,
-                        values,
-                    },
-                })
-                .map_err(io::Error::other)?;
-            for hit in found {
-                let key = (
-                    hit.scope.session_id.clone(),
-                    hit.source.id.clone(),
-                    hit.scope.epoch,
-                    hit.source.start_turn,
-                    hit.source.end_turn,
-                );
-                match hits.get(&key) {
-                    Some(old) if old.score >= hit.score => {}
-                    _ => {
-                        hits.insert(key, hit);
-                    }
-                }
-            }
-        }
-        let mut retrieval: Vec<_> = hits.into_values().collect();
-        retrieval.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-        let tokenizer = tiktoken_rs::o200k_base_singleton();
-        let mut tokens: usize = 0;
-        let mut bounded = Vec::new();
-        for hit in retrieval {
-            let count = tokenizer.encode_with_special_tokens(&hit.render()).len();
-            if bounded.len() == 3 || tokens.saturating_add(count) > 768 {
-                continue;
-            }
-            tokens += count;
-            bounded.push(hit);
-        }
-        let retrieval = bounded;
+        let retrieval = self.retrieve(&view, database, query).await?;
         let final_snapshot = store.lock()?.snapshot()?;
         if !same_snapshot(&snapshot, &final_snapshot) {
             return Err(io::Error::other(
@@ -261,57 +209,179 @@ impl StrictHistory {
         let pending = match reusable {
             Some(item) => item,
             None => {
-                let messages = turn_messages(&snapshot, turn)?;
-                let summary = self
-                    .summary
-                    .summarize(SummaryRequest {
-                        source_turn_id: turn,
-                        messages,
-                        model: SUMMARY_MODEL,
-                        effort: SUMMARY_EFFORT,
-                        prompt_version: SUMMARY_PROMPT_VERSION,
-                    })
-                    .await?;
-                if summary.trim().is_empty() {
-                    return Err(io::Error::other(
-                        "summary provider returned an empty summary",
-                    ));
-                }
-                validate_summary(&summary, turn)?;
-                let values = self.embedder.embed_passage(&summary).await?;
-                let metadata = self.embedder.metadata().clone();
-                validate_vector(&values, &metadata)?;
-                let summary_input_hash = content_hash(summary.as_bytes());
-                PendingSummary {
-                    scope,
-                    id: id.clone(),
-                    source: SourceMetadata {
-                        id: format!("source-{turn}-{suffix}"),
-                        start_turn: turn
-                            .try_into()
-                            .map_err(|_| io::Error::other("turn overflow"))?,
-                        end_turn: turn
-                            .try_into()
-                            .map_err(|_| io::Error::other("turn overflow"))?,
-                        raw_hash: snapshot.raw_hash.clone(),
-                    },
-                    summary_hash: content_hash(summary.as_bytes()),
-                    summary,
-                    model: SUMMARY_MODEL.into(),
-                    effort: SUMMARY_EFFORT.into(),
-                    prompt_version: SUMMARY_PROMPT_VERSION.into(),
-                    embedding: EmbeddingMetadata {
-                        model: metadata.model,
-                        revision: metadata.revision,
-                        dimension: metadata.dimension,
-                        input_hash: summary_input_hash,
-                        values,
-                    },
-                }
+                let summary = self.summarize_turn(&snapshot, turn).await?;
+                self.embed_summary(&snapshot, turn, summary).await?
             }
         };
         publish_summary_snapshot(store, database, &snapshot, &pending)
     }
+
+    /// Shared processing only: callers own durable intent, publication and cancellation.
+    pub(crate) fn embedding_metadata(&self) -> &EmbeddingModel {
+        self.embedder.metadata()
+    }
+
+    pub(crate) async fn retrieve(
+        &self,
+        view: &polaris_memory::conversation::PublishedView,
+        database: &Path,
+        query: &str,
+    ) -> io::Result<Vec<ConversationHit>> {
+        if query.trim().is_empty() {
+            return Err(io::Error::other("strict10 query is empty"));
+        }
+        let vectors = self.embedder.embed_query(query).await?;
+        if vectors.is_empty() {
+            return Err(io::Error::other(
+                "embedding helper returned no query vector",
+            ));
+        }
+        let metadata = self.embedder.metadata().clone();
+        let mut hits = BTreeMap::<(String, String, i64, i64, i64), ConversationHit>::new();
+        let memory = MemoryStore::open(database).map_err(io::Error::other)?;
+        for values in vectors {
+            validate_vector(&values, &metadata)?;
+            let found = memory
+                .search_conversation(ConversationQuery {
+                    published: view,
+                    keywords: query,
+                    embedding: QueryEmbedding {
+                        model: metadata.model.clone(),
+                        revision: metadata.revision.clone(),
+                        dimension: metadata.dimension,
+                        values,
+                    },
+                })
+                .map_err(io::Error::other)?;
+            for hit in found {
+                let key = (
+                    hit.scope.session_id.clone(),
+                    hit.source.id.clone(),
+                    hit.scope.epoch,
+                    hit.source.start_turn,
+                    hit.source.end_turn,
+                );
+                match hits.get(&key) {
+                    Some(old) if old.score >= hit.score => {}
+                    _ => {
+                        hits.insert(key, hit);
+                    }
+                }
+            }
+        }
+        let mut retrieval: Vec<_> = hits.into_values().collect();
+        retrieval.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        let tokenizer = tiktoken_rs::o200k_base_singleton();
+        let mut tokens: usize = 0;
+        let mut bounded = Vec::new();
+        for hit in retrieval {
+            let count = tokenizer.encode_with_special_tokens(&hit.render()).len();
+            if bounded.len() == 3 || tokens.saturating_add(count) > 768 {
+                continue;
+            }
+            tokens += count;
+            bounded.push(hit);
+        }
+        Ok(bounded)
+    }
+
+    pub(crate) async fn summarize_turn(
+        &self,
+        snapshot: &ConversationSnapshot,
+        turn: u64,
+    ) -> io::Result<String> {
+        let summary = self
+            .summary
+            .summarize(SummaryRequest {
+                source_turn_id: turn,
+                messages: turn_messages(snapshot, turn)?,
+                model: SUMMARY_MODEL,
+                effort: SUMMARY_EFFORT,
+                prompt_version: SUMMARY_PROMPT_VERSION,
+            })
+            .await?;
+        summary_evidence(snapshot, turn, &summary)?;
+        Ok(summary)
+    }
+
+    pub(crate) async fn embed_summary(
+        &self,
+        snapshot: &ConversationSnapshot,
+        turn: u64,
+        summary: String,
+    ) -> io::Result<PendingSummary> {
+        let evidence = summary_evidence(snapshot, turn, &summary)?;
+        let values = self.embedder.embed_passage(&summary).await?;
+        let metadata = self.embedder.metadata().clone();
+        validate_vector(&values, &metadata)?;
+        let summary_hash = content_hash(summary.as_bytes());
+        Ok(PendingSummary {
+            scope: evidence.scope,
+            id: evidence.id,
+            source: evidence.source,
+            summary_hash: summary_hash.clone(),
+            summary,
+            model: SUMMARY_MODEL.into(),
+            effort: SUMMARY_EFFORT.into(),
+            prompt_version: SUMMARY_PROMPT_VERSION.into(),
+            embedding: EmbeddingMetadata {
+                model: metadata.model,
+                revision: metadata.revision,
+                dimension: metadata.dimension,
+                input_hash: summary_hash,
+                values,
+            },
+        })
+    }
+}
+
+/// Construct the same complete evidence used by retrieval before spending on
+/// embedding or saving a summary that could never fit the injection budget.
+pub(crate) fn summary_evidence(
+    snapshot: &ConversationSnapshot,
+    turn: u64,
+    summary: &str,
+) -> io::Result<ConversationHit> {
+    validate_summary(summary, turn)?;
+    let generation = snapshot
+        .state
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("conversation generation overflow"))?;
+    let scope = Scope {
+        project_id: snapshot.state.project_id.clone(),
+        session_id: snapshot.state.session_id.clone(),
+        epoch: snapshot
+            .state
+            .epoch
+            .try_into()
+            .map_err(|_| io::Error::other("epoch overflow"))?,
+        generation: generation
+            .try_into()
+            .map_err(|_| io::Error::other("generation overflow"))?,
+    };
+    let suffix = snapshot
+        .raw_hash
+        .get(..16)
+        .ok_or_else(|| io::Error::other("invalid raw hash"))?;
+    let evidence = ConversationHit {
+        scope,
+        id: format!("strict10-{turn}-{suffix}"),
+        source: SourceMetadata {
+            id: format!("source-{turn}-{suffix}"),
+            start_turn: turn
+                .try_into()
+                .map_err(|_| io::Error::other("turn overflow"))?,
+            end_turn: turn
+                .try_into()
+                .map_err(|_| io::Error::other("turn overflow"))?,
+            raw_hash: snapshot.raw_hash.clone(),
+        },
+        summary: summary.into(),
+        score: 0.0,
+    };
+    evidence.injection_tokens().map_err(io::Error::other)?;
+    Ok(evidence)
 }
 
 fn unsummarized_expired_turn(snapshot: &ConversationSnapshot) -> io::Result<Option<u64>> {
@@ -357,7 +427,7 @@ fn same_snapshot(left: &ConversationSnapshot, right: &ConversationSnapshot) -> b
         && serde_json::to_vec(&left.events).ok() == serde_json::to_vec(&right.events).ok()
 }
 
-fn validate_summary(summary: &str, turn: u64) -> io::Result<()> {
+pub(crate) fn validate_summary(summary: &str, turn: u64) -> io::Result<()> {
     let tokens = tiktoken_rs::o200k_base_singleton()
         .encode_with_special_tokens(summary)
         .len();
@@ -480,7 +550,7 @@ pub fn resolve_conversation_uri(
 }
 
 type ParsedSourceUri = (String, Option<(i64, i64)>, usize);
-fn parse_uri(uri: &str) -> io::Result<ParsedSourceUri> {
+pub(crate) fn parse_uri(uri: &str) -> io::Result<ParsedSourceUri> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "conversation URI is invalid");
     let rest = uri.strip_prefix("conversation://").ok_or_else(invalid)?;
     let (source, query) = rest.split_once('?').unwrap_or((rest, ""));
@@ -515,7 +585,7 @@ fn parse_uri(uri: &str) -> io::Result<ParsedSourceUri> {
     Ok((source.into(), range, offset.unwrap_or(0)))
 }
 
-fn source_page(
+pub(crate) fn source_page(
     source: &str,
     start: i64,
     end: i64,
@@ -676,6 +746,39 @@ impl LocalStdioEmbedder {
             ));
         }
         let request = serde_json::json!({"kind": kind, "text": text}).to_string();
+        let response = self.helper_call(Some(request)).await?;
+        self.parse_vectors(response)
+    }
+
+    /// Bounded offline model/package readiness; never sends a provider request.
+    pub async fn preflight(&self) -> io::Result<serde_json::Value> {
+        let receipt = self.helper_call(None).await?;
+        let packages = receipt
+            .get("packages")
+            .and_then(serde_json::Value::as_object);
+        if receipt.as_object().is_none_or(|r| r.len() != 4)
+            || receipt["model"] != self.metadata.model
+            || receipt["revision"] != self.metadata.revision
+            || receipt["dimension"].as_i64() != Some(self.metadata.dimension)
+            || packages.is_none_or(|p| {
+                p.len() != 4
+                    || ["torch", "transformers", "tokenizers", "safetensors"]
+                        .iter()
+                        .any(|name| {
+                            p.get(*name)
+                                .and_then(serde_json::Value::as_str)
+                                .is_none_or(|v| v.is_empty() || v.len() > 128)
+                        })
+            })
+        {
+            return Err(io::Error::other(
+                "埋め込み資源の準備結果が契約と一致しません",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    async fn helper_call(&self, request: Option<String>) -> io::Result<serde_json::Value> {
         use std::process::Stdio;
         use tokio::{io::AsyncWriteExt, process::Command};
         // Each helper gets a fresh private directory. `TempDir` removes only this
@@ -684,7 +787,8 @@ impl LocalStdioEmbedder {
             .prefix("embedding-call-")
             .tempdir_in(&self.run_temp)?;
         let deadline = tokio::time::Instant::now() + self.timeout;
-        let mut child = Command::new(&self.python)
+        let mut command = Command::new(&self.python);
+        command
             .arg("-I")
             .arg("-B")
             .arg(&self.helper)
@@ -709,14 +813,19 @@ impl LocalStdioEmbedder {
             .env("OMP_NUM_THREADS", self.cpu_threads.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        if request.is_none() {
+            command.arg("--preflight");
+        }
+        let mut child = command.spawn()?;
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("embedding stdin is unavailable"))?;
         let write = async {
-            stdin.write_all(format!("{request}\n").as_bytes()).await?;
+            if let Some(request) = request {
+                stdin.write_all(format!("{request}\n").as_bytes()).await?;
+            }
             stdin.shutdown().await
         };
         match tokio::time::timeout_at(deadline, write).await {
@@ -769,6 +878,10 @@ impl LocalStdioEmbedder {
             .map_err(|_| io::Error::other("embedding helper stdout is not UTF-8"))?;
         let response: serde_json::Value = serde_json::from_str(output.trim())
             .map_err(|_| io::Error::other("embedding helper returned invalid JSON"))?;
+        Ok(response)
+    }
+
+    fn parse_vectors(&self, response: serde_json::Value) -> io::Result<(Vec<Vec<f32>>, u32)> {
         let vectors = response
             .get("vectors")
             .and_then(serde_json::Value::as_array)
@@ -813,6 +926,64 @@ mod tests {
     use crate::conversation_state::ConversationStateV2;
 
     const ID: &str = "00000000-0000-4000-8000-000000000001";
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cancelled_local_embedding_reaps_owned_helper_and_records_unknown_usage() {
+        use polaris_provider::attempts::{AttemptLedger, AttemptStatus, UsageObservation};
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model");
+        let temporary = root.path().join("calls");
+        std::fs::create_dir(&model).unwrap();
+        std::fs::create_dir(&temporary).unwrap();
+        let helper = root.path().join("fixture.py");
+        // Deterministic process fixture: no model, packages, network or subprocesses.
+        std::fs::write(&helper, "import os, sys, time\nfrom pathlib import Path\nroot = Path(sys.argv[sys.argv.index('--model-path') + 1])\n(root / 'pid').write_text(str(os.getpid()))\nwhile True: time.sleep(0.01)\n").unwrap();
+        let ledger = AttemptLedger::default();
+        let mut embedder = LocalStdioEmbedder::new(
+            "/usr/bin/python3".into(),
+            helper,
+            model.clone(),
+            temporary.clone(),
+            "fixture".into(),
+            1,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        embedder.attempt_ledger = Some(ledger.clone());
+        let task = tokio::spawn(async move { embedder.embed_query("pending fixture").await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let pid: i32 = loop {
+            if let Ok(pid) = std::fs::read_to_string(model.join("pid")) {
+                break pid.parse().unwrap();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owned Python fixture did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        loop {
+            // Signal zero only observes the child created above; it sends no signal.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled embedding child was not reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(std::fs::read_dir(temporary).unwrap().count(), 0);
+        let records = ledger.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, AttemptStatus::Cancelled);
+        assert_eq!(records[0].usage, UsageObservation::Missing);
+    }
 
     struct Summary;
     impl StrictSummaryProvider for Summary {

@@ -65,7 +65,7 @@ pub fn is_denied(path: &Path) -> bool {
         }
     }
 
-    if is_proc_environ(path) || is_gh_hosts_file(path) {
+    if is_proc_environ(path) || is_gh_hosts_file(path) || is_harness_credential(path) {
         return true;
     }
 
@@ -100,6 +100,27 @@ pub fn is_denied(path: &Path) -> bool {
         return true;
     }
     false
+}
+
+/// OAuth/API stores and their atomic-write temporary files are credentials,
+/// while ordinary source-tree auth.json and harness configuration remain readable.
+fn is_harness_credential(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase());
+    let Some(name) = name else { return false };
+    let directory = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().to_lowercase());
+    match directory.as_deref() {
+        Some(".polaris") => matches!(
+            name.as_str(),
+            "auth.json" | "auth.json.tmp" | "api_key.json" | "api_key.json.tmp"
+        ),
+        Some(".codex") => matches!(name.as_str(), "auth.json" | "auth.json.tmp"),
+        _ => false,
+    }
 }
 
 /// `/proc/<pid>/environ` (Linux) contains a process's environment variables
@@ -139,6 +160,22 @@ fn is_gh_hosts_file(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn denies_harness_credentials_and_atomic_temporary_files() {
+        for path in [
+            "/home/u/.polaris/auth.json",
+            "/home/u/.polaris/auth.json.tmp",
+            "/home/u/.polaris/api_key.json",
+            "/home/u/.polaris/api_key.json.tmp",
+            "/home/u/.POLARIS/AUTH.JSON",
+            "/home/u/.codex/auth.json",
+        ] {
+            assert!(is_denied(Path::new(path)), "{path}");
+        }
+        assert!(!is_denied(Path::new("/project/src/auth.json")));
+        assert!(!is_denied(Path::new("/home/u/.polaris/config.toml")));
+    }
 
     #[test]
     fn denies_secret_bearing_paths() {

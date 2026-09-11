@@ -6,6 +6,11 @@ use std::path::Path;
 
 use crate::budget::count_tokens;
 
+#[cfg(unix)]
+mod refresh;
+#[cfg(unix)]
+pub use refresh::AgentsRefresh;
+
 /// The ceiling on the number of tokens allowed for the constitution block.
 ///
 /// Was 150, cut to 100 to make room in `budget::BUDGET_LIMIT` (990) for two
@@ -190,12 +195,16 @@ pub fn load_from(global_agents: Option<&Path>, project_root: &Path) -> String {
     let global = global_agents.map(read_block).unwrap_or_default();
     let project = read_block(&project_root.join("AGENTS.md"));
 
+    combine(&global, &project)
+}
+
+fn combine(global: &str, project: &str) -> String {
     match (global.is_empty(), project.is_empty()) {
         (true, true) => String::new(),
-        (true, false) => cap(&project, CONSTITUTION_LIMIT),
-        (false, true) => cap(&global, CONSTITUTION_LIMIT),
+        (true, false) => cap(project, CONSTITUTION_LIMIT),
+        (false, true) => cap(global, CONSTITUTION_LIMIT),
         (false, false) => {
-            let global_capped = cap(&global, CONSTITUTION_LIMIT / 2);
+            let global_capped = cap(global, CONSTITUTION_LIMIT / 2);
             let global_tokens = count_tokens(&global_capped);
             // Also deduct the token cost of the newline used to join them.
             // With a word-boundary-sensitive tokenizer like o200k_base, a
@@ -206,7 +215,7 @@ pub fn load_from(global_agents: Option<&Path>, project_root: &Path) -> String {
             let project_limit = CONSTITUTION_LIMIT
                 .saturating_sub(global_tokens)
                 .saturating_sub(separator_tokens);
-            let project_capped = cap(&project, project_limit);
+            let project_capped = cap(project, project_limit);
             format!("{global_capped}\n{project_capped}")
         }
     }

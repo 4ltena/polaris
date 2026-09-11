@@ -14,6 +14,7 @@
 pub mod api_key;
 pub mod login;
 pub mod pkce;
+pub mod protection;
 pub mod store;
 pub mod token;
 
@@ -36,6 +37,8 @@ pub const AUTH_READ_ONLY_ENV: &str = "POLARIS_AUTH_READ_ONLY";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[error("authentication path protection is unavailable")]
+    Protection,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("HTTP error: {0}")]

@@ -1,9 +1,12 @@
-//! In-memory request history with optional durable v2 storage.
+//! Request history with optional durable v2 storage or a v3 desktop owner port.
 
 use polaris_provider::{Message, ReasoningItem, ToolCall};
 
 #[derive(Default, Clone)]
 pub struct Session {
+    /// Installed by root entry points only; new child sessions do not inherit it.
+    #[doc(hidden)]
+    pub request_prompt: Option<crate::prompt::AlwaysOn>,
     pub messages: Vec<Message>,
     /// Configuration-provided examples; never real user turns or raw events.
     pub examples: Vec<Message>,
@@ -26,6 +29,75 @@ pub struct Session {
     /// Stops only root-triggered automatic `files.md` regeneration. Manual
     /// `spawn` remains available, and the default preserves legacy behavior.
     pub disable_files_md_auto_regenerate: bool,
+    /// Desktop-only unmodified turn output, independent of request projections.
+    /// The trusted worker initializes this; it is never a replacement for disk publication.
+    pub desktop_transcript: Option<DesktopTranscript>,
+    /// Trusted v3 owner port. It can prepare request context but cannot replace raw history.
+    pub desktop_memory: Option<std::sync::Arc<crate::desktop_memory::DesktopMemory>>,
+}
+
+#[derive(Default, Clone)]
+pub struct DesktopTranscript {
+    messages: Vec<Message>,
+}
+impl DesktopTranscript {
+    pub(crate) fn into_messages(self) -> Vec<Message> {
+        self.messages
+    }
+}
+
+/// Deterministic request-only annotations for a user-authorized continuation.
+/// Missing tool outcomes are explicitly unknown and never trigger reexecution.
+/// The durable raw history remains unchanged, including its interrupted calls.
+pub fn desktop_request_history(raw: &[Message]) -> std::io::Result<Vec<Message>> {
+    use polaris_provider::Role;
+    let mut projected = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for message in raw {
+        if message.role != Role::Tool {
+            for id in pending.drain(..) {
+                projected.push(Message::tool_result(&id,
+                    "中断により結果は不明です。外部への影響を確認してから続行してください。自動再実行はしていません。"));
+            }
+        }
+        match message.role {
+            Role::Assistant => {
+                if message.tool_call_id.is_some() {
+                    return Err(std::io::Error::other("invalid assistant history"));
+                }
+                for call in &message.tool_calls {
+                    if call.id.is_empty() || pending.contains(&call.id) {
+                        return Err(std::io::Error::other("invalid tool call history"));
+                    }
+                    pending.push(call.id.clone());
+                }
+            }
+            Role::Tool => {
+                if !message.tool_calls.is_empty() {
+                    return Err(std::io::Error::other("invalid tool result history"));
+                }
+                let Some(index) = message
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| pending.iter().position(|p| p == id))
+                else {
+                    return Err(std::io::Error::other("orphan tool result history"));
+                };
+                pending.remove(index);
+            }
+            Role::User => {
+                if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
+                    return Err(std::io::Error::other("invalid user history"));
+                }
+            }
+        }
+        projected.push(message.clone());
+    }
+    for id in pending {
+        projected.push(Message::tool_result(&id,
+            "中断により結果は不明です。外部への影響を確認してから続行してください。自動再実行はしていません。"));
+    }
+    Ok(projected)
 }
 
 impl Session {
@@ -148,6 +220,23 @@ impl Session {
         if self.persistence_error.is_some() {
             return;
         }
+        if let Some(transcript) = &mut self.desktop_transcript {
+            transcript.messages.push(message);
+            // Validate before cloning into the mutable request view. Partial
+            // tool groups are legitimate until completion, but user injection
+            // or an oversized turn prevents further provider/tool dispatch.
+            if let Err(error) = crate::desktop_store::validate_turn_suffix(
+                &transcript.messages,
+                polaris_desktop_protocol::run_state::Observation::Cancelled,
+            ) {
+                transcript.messages.pop();
+                self.persistence_error = Some(error.to_string());
+                return;
+            }
+            self.messages
+                .push(transcript.messages.last().unwrap().clone());
+            return;
+        }
         if let Some(persistence) = &self.persistence
             && let Err(error) =
                 persistence.append(message.clone(), starts_turn, self.workflow.as_ref())
@@ -205,6 +294,9 @@ impl Session {
     }
 
     pub fn uses_strict_history(&self) -> std::io::Result<bool> {
+        if self.desktop_memory.is_some() {
+            return Ok(true);
+        }
         Ok(self
             .persistence
             .as_ref()
@@ -242,6 +334,11 @@ impl Session {
     /// never appended as another user turn or fed into the raw archive.
     pub async fn prepare_history(&mut self) -> std::io::Result<Option<Message>> {
         self.check_persistence()?;
+        if let Some(memory) = &self.desktop_memory {
+            let (messages, evidence) = memory.prepare().await?;
+            self.messages = messages;
+            return Ok(evidence);
+        }
         if !self.uses_strict_history()? {
             return Ok(None);
         }
@@ -283,5 +380,68 @@ impl Session {
         }
         self.messages = prepared.messages;
         Ok((!evidence.is_empty()).then(|| Message::user(evidence)))
+    }
+}
+
+#[cfg(test)]
+mod desktop_transcript_tests {
+    //! Raw output must survive request-only retention and refuse excess before dispatch.
+    use super::*;
+    #[test]
+    fn interrupted_request_projection_closes_unknown_calls_without_changing_raw() {
+        let raw = vec![
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "missing".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command":"do not repeat"}),
+                }],
+            ),
+            Message::user("continue after inspecting effects"),
+        ];
+        let projected = desktop_request_history(&raw).unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[1].tool_call_id.as_deref(), Some("missing"));
+        assert!(projected[1].content.contains("結果は不明"));
+        assert_eq!(projected[2].content, raw[1].content);
+        assert!(desktop_request_history(&[Message::tool_result("orphan", "value")]).is_err());
+    }
+    #[test]
+    fn request_projection_does_not_replace_original_tool_output() {
+        let mut session = Session::new();
+        session.desktop_transcript = Some(Default::default());
+        session.push_assistant_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path":"file"}),
+            }],
+            vec![],
+        );
+        session.push_tool_result("call", "full original evidence");
+        session.messages[1].content = "retained excerpt".into();
+        session.push_assistant("done", vec![]);
+        assert_eq!(
+            session.desktop_transcript.unwrap().messages[1].content,
+            "full original evidence"
+        );
+    }
+    #[test]
+    fn oversized_or_user_suffix_stops_further_messages_without_truncating() {
+        for bad in [
+            Message::user("injected"),
+            Message::assistant("\0".repeat(22_000)),
+        ] {
+            let mut session = Session::new();
+            session.desktop_transcript = Some(Default::default());
+            session.push_message(bad, false);
+            assert!(session.check_persistence().is_err());
+            session.push_assistant("must not continue", vec![]);
+            assert!(session.messages.is_empty());
+            assert!(session.desktop_transcript.unwrap().messages.is_empty());
+        }
     }
 }

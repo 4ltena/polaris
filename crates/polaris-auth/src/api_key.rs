@@ -24,8 +24,9 @@ pub fn default_path() -> Result<PathBuf, AuthError> {
 /// open-time mode and the post-write `set_permissions` call are needed.
 pub fn save_to(path: &Path, key: &str) -> Result<(), AuthError> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
+    let mut protection = crate::protection::lock()?;
+    let path = protection.register_store(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -33,31 +34,36 @@ pub fn save_to(path: &Path, key: &str) -> Result<(), AuthError> {
     let body = serde_json::to_vec_pretty(&Stored {
         key: key.to_string(),
     })
-    .map_err(|e| AuthError::Decode(format!("could not serialize the API key: {e}")))?;
+    .map_err(|_| AuthError::Decode("could not serialize the API key".into()))?;
 
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    // Nonblocking open and regular-file checks precede truncation/body I/O.
+    // The helper creates new files at 0600; fchmod also tightens reused tmp files.
+    let mut f = crate::protection::open_regular(&tmp, true)?;
+    protection.remember(&f.metadata()?)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.set_len(0)?;
     f.write_all(&body)?;
     f.sync_all()?;
     drop(f);
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, &path)?;
+    protection.register_store(&path)?;
     Ok(())
 }
 
 /// Reads. Nonexistence is not a failure. Corruption is.
 pub fn load_from(path: &Path) -> Result<Option<String>, AuthError> {
-    let body = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(AuthError::Io(e)),
+    let mut protection = crate::protection::lock()?;
+    let path = protection.register_store(path)?;
+    let file = match crate::protection::open_regular(&path, false) {
+        Ok(file) => file,
+        Err(AuthError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
+    protection.remember(&file.metadata()?)?;
+    let body = crate::protection::read_body(file)?;
     let stored: Stored = serde_json::from_slice(&body)
-        .map_err(|e| AuthError::Decode(format!("could not parse {}: {e}", path.display())))?;
+        .map_err(|_| AuthError::Decode("could not parse the API key".into()))?;
     Ok(Some(stored.key))
 }
 

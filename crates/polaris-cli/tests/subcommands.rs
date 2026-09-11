@@ -36,7 +36,10 @@ fn the_logout_subcommand_runs_without_a_prompt() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .arg("logout")
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .output()
         .expect("could not launch");
     assert!(
@@ -67,7 +70,10 @@ fn logout_never_touches_the_codex_store() {
 
     let out = Command::new(bin())
         .arg("logout")
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .output()
         .expect("could not launch");
     assert!(out.status.success(), "logout failed");
@@ -118,7 +124,10 @@ fn the_default_provider_is_still_openai() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .args(["-p", "x"])
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
@@ -140,7 +149,10 @@ fn a_logged_out_codex_run_names_the_login_command() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .args(["-p", "a few lines"])
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env("POLARIS_PROVIDER", "codex")
         .env_remove("POLARIS_API_KEY")
         .output()
@@ -193,7 +205,10 @@ fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
 
     let out = Command::new(bin())
         .args(["-p", "x"])
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
         .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
@@ -222,7 +237,10 @@ fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
 fn tui_mode_with_no_key_anywhere_reaches_onboarding() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
         .output()
@@ -257,7 +275,10 @@ fn saved_codex_credentials_are_used_without_an_explicit_provider() {
     .expect("cannot write");
 
     let out = Command::new(bin())
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
         .output()
@@ -284,7 +305,10 @@ fn exec_with_an_argument_reaches_the_one_shot_path() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .args(["exec", "do the thing"])
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
@@ -311,7 +335,10 @@ fn exec_with_no_argument_reads_the_prompt_from_stdin() {
     let home = tempfile::tempdir().expect("temp directory");
     let mut child = Command::new(bin())
         .arg("exec")
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
@@ -344,7 +371,10 @@ fn sandbox_runs_a_command_under_confinement_and_reports_its_output() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .args(["sandbox", "--", "echo", "hello-from-sandbox"])
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .output()
         .expect("could not launch");
     assert!(
@@ -365,7 +395,10 @@ fn sandbox_propagates_the_childs_exit_code() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .args(["sandbox", "--", "sh", "-c", "exit 7"])
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .output()
         .expect("could not launch");
     assert_eq!(out.status.code(), Some(7));
@@ -379,7 +412,10 @@ fn doctor_runs_successfully_with_no_credentials() {
     let home = tempfile::tempdir().expect("temp directory");
     let out = Command::new(bin())
         .arg("doctor")
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
         .output()
@@ -418,7 +454,10 @@ fn doctor_reports_codex_as_default_when_only_codex_credentials_are_saved() {
 
     let out = Command::new(bin())
         .arg("doctor")
-        .env("HOME", home.path())
+        .env(
+            "HOME",
+            home.path().canonicalize().expect("physical home path"),
+        )
         .env_remove("POLARIS_PROVIDER")
         .env_remove("POLARIS_API_KEY")
         .output()

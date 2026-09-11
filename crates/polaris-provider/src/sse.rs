@@ -16,58 +16,70 @@ pub struct SseEvent {
     pub data: String,
 }
 
-/// Finds the first blank-line separator (`"\n\n"` or `"\r\n\r\n"`) that
-/// appears in the buffer. Returns `(separator start position, separator
-/// byte length)`. CRLF and LF forms can be mixed, so both are scanned and
-/// whichever comes first is used.
-fn find_block_separator(buf: &[u8]) -> Option<(usize, usize)> {
-    let lf = buf.windows(2).position(|w| w == b"\n\n");
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(l), Some(c)) if c < l => Some((c, 4)),
-        (Some(l), _) => Some((l, 2)),
-        (None, Some(c)) => Some((c, 4)),
-        (None, None) => None,
-    }
-}
+/// Raw frame bytes, including the terminating blank line.
+pub const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 impl SseDecoder {
     pub fn new() -> Self {
         Self { buf: Vec::new() }
     }
 
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
-        // A multibyte character can be split across a push boundary, so we
-        // accumulate raw bytes without decoding. Decoding only after
-        // slicing out a complete block (terminated by a blank line) means
-        // a split character never gets mangled into U+FFFD.
-        self.buf.extend_from_slice(bytes);
+    /// Compatibility collector for callers needing a batch. Production uses
+    /// push_each so a network chunk never becomes an unbounded event vector.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, crate::ProviderError> {
+        crate::check_limit(bytes.len(), crate::MAX_RESPONSE_BYTES, "SSE chunk")?;
         let mut out = Vec::new();
-        // Slice out complete blocks (terminated by a blank line, "\n\n" or
-        // "\r\n\r\n") one at a time.
-        while let Some((idx, sep_len)) = find_block_separator(&self.buf) {
-            let block_bytes: Vec<u8> = self.buf[..idx].to_vec();
-            self.buf.drain(..idx + sep_len);
-            let block = String::from_utf8_lossy(&block_bytes);
-            let mut event: Option<String> = None;
-            let mut data_lines: Vec<&str> = Vec::new();
+        self.push_each(bytes, |event| {
+            out.push(event);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Consume exactly one frame at a time. Scan only the new suffix, so a
+    /// delimiter-free slow stream does not repeatedly rescan its entire buffer.
+    pub fn push_each(
+        &mut self,
+        bytes: &[u8],
+        mut consume: impl FnMut(SseEvent) -> Result<(), crate::ProviderError>,
+    ) -> Result<(), crate::ProviderError> {
+        for byte in bytes {
+            crate::checked_size(self.buf.len(), 1, MAX_SSE_EVENT_BYTES, "SSE frame")?;
+            self.buf.push(*byte);
+            let separator = if self.buf.ends_with(b"\r\n\r\n") {
+                4
+            } else if self.buf.ends_with(b"\n\n") {
+                2
+            } else {
+                continue;
+            };
+            let block = std::str::from_utf8(&self.buf[..self.buf.len() - separator])
+                .map_err(|e| crate::ProviderError::Decode(format!("SSE is not UTF-8: {e}")))?;
+            let mut event = None;
+            let mut data = String::new();
+            let mut has_data = false;
             for line in block.split('\n') {
                 let line = line.strip_suffix('\r').unwrap_or(line);
-                if let Some(v) = line.strip_prefix("event:") {
-                    event = Some(v.trim().to_string());
-                } else if let Some(v) = line.strip_prefix("data:") {
-                    data_lines.push(v.strip_prefix(' ').unwrap_or(v));
+                if let Some(value) = line.strip_prefix("event:") {
+                    event = Some(value.trim().to_string());
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    if has_data {
+                        data.push('\n');
+                    }
+                    data.push_str(value.strip_prefix(' ').unwrap_or(value));
+                    has_data = true;
                 }
-                // Comment lines (starting with ":") and blank lines are ignored.
             }
-            if !data_lines.is_empty() || event.is_some() {
-                out.push(SseEvent {
-                    event,
-                    data: data_lines.join("\n"),
-                });
+            self.buf.clear();
+            if has_data || event.is_some() {
+                consume(SseEvent { event, data })?;
             }
         }
-        out
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
     }
 }
 
@@ -82,9 +94,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn p43_frame_boundary_and_unterminated_buffer_are_bounded() {
+        for size in [
+            MAX_SSE_EVENT_BYTES - 1,
+            MAX_SSE_EVENT_BYTES,
+            MAX_SSE_EVENT_BYTES + 1,
+        ] {
+            let mut decoder = SseDecoder::new();
+            let mut frame = b"data: ".to_vec();
+            frame.resize(size - 2, b'x');
+            frame.extend_from_slice(b"\n\n");
+            let mut consumed = 0;
+            let result = decoder.push_each(&frame, |_| {
+                consumed += 1;
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), size <= MAX_SSE_EVENT_BYTES);
+            assert_eq!(consumed, usize::from(size <= MAX_SSE_EVENT_BYTES));
+            assert!(decoder.buf.len() <= MAX_SSE_EVENT_BYTES);
+        }
+        let mut decoder = SseDecoder::new();
+        decoder
+            .push_each(&vec![b'x'; MAX_SSE_EVENT_BYTES], |_| panic!("unterminated"))
+            .unwrap();
+        assert!(decoder.push_each(b"x", |_| panic!("unterminated")).is_err());
+        assert_eq!(decoder.buf.len(), MAX_SSE_EVENT_BYTES);
+    }
+
+    #[test]
+    fn p43_consumer_failure_stops_before_later_frames() {
+        let mut decoder = SseDecoder::new();
+        let mut seen = 0;
+        let result = decoder.push_each(b"data: first\n\ndata: second\n\n", |_| {
+            seen += 1;
+            Err(crate::ProviderError::Http("stop".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
     fn parses_single_event_block() {
         let mut d = SseDecoder::new();
-        let evs = d.push(b"event: message\ndata: {\"x\":1}\n\n");
+        let evs = d.push(b"event: message\ndata: {\"x\":1}\n\n").unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].event.as_deref(), Some("message"));
         assert_eq!(evs[0].data, "{\"x\":1}");
@@ -93,9 +145,9 @@ mod tests {
     #[test]
     fn reassembles_across_chunk_boundaries() {
         let mut d = SseDecoder::new();
-        assert!(d.push(b"data: hel").is_empty()); // partway through
-        assert!(d.push(b"lo\n").is_empty()); // line complete but block not yet terminated
-        let evs = d.push(b"\n"); // blank line finalizes the block
+        assert!(d.push(b"data: hel").unwrap().is_empty()); // partway through
+        assert!(d.push(b"lo\n").unwrap().is_empty()); // line complete but block not yet terminated
+        let evs = d.push(b"\n").unwrap(); // blank line finalizes the block
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data, "hello");
     }
@@ -103,14 +155,14 @@ mod tests {
     #[test]
     fn concatenates_multiple_data_lines() {
         let mut d = SseDecoder::new();
-        let evs = d.push(b"data: a\ndata: b\n\n");
+        let evs = d.push(b"data: a\ndata: b\n\n").unwrap();
         assert_eq!(evs[0].data, "a\nb");
     }
 
     #[test]
     fn handles_two_events_in_one_push() {
         let mut d = SseDecoder::new();
-        let evs = d.push(b"data: 1\n\ndata: 2\n\n");
+        let evs = d.push(b"data: 1\n\ndata: 2\n\n").unwrap();
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].data, "1");
         assert_eq!(evs[1].data, "2");
@@ -121,8 +173,8 @@ mod tests {
         // "★" = E2 98 85. Push the first two bytes first, then deliver the
         // remaining byte plus the block terminator in the following push.
         let mut d = SseDecoder::new();
-        assert!(d.push(b"data: \xe2\x98").is_empty());
-        let evs = d.push(b"\x85\n\n");
+        assert!(d.push(b"data: \xe2\x98").unwrap().is_empty());
+        let evs = d.push(b"\x85\n\n").unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data, "★");
 
@@ -133,11 +185,11 @@ mod tests {
         let mut line = b"data: ".to_vec();
         line.extend_from_slice(s.as_bytes());
         let mid = line.len() - 1; // cut through the 1st and 2nd bytes of the trailing "♪" (3 bytes)
-        assert!(d2.push(&line[..mid]).is_empty());
-        let evs2 = d2.push(&line[mid..]);
+        assert!(d2.push(&line[..mid]).unwrap().is_empty());
+        let evs2 = d2.push(&line[mid..]).unwrap();
         // There's no block terminator (blank line) yet, so nothing is finalized here.
         assert!(evs2.is_empty());
-        let evs3 = d2.push(b"\n\n");
+        let evs3 = d2.push(b"\n\n").unwrap();
         assert_eq!(evs3.len(), 1);
         assert_eq!(evs3[0].data, s);
     }
@@ -145,7 +197,7 @@ mod tests {
     #[test]
     fn crlf_framed_event_terminates() {
         let mut d = SseDecoder::new();
-        let evs = d.push(b"data: hello\r\n\r\n");
+        let evs = d.push(b"data: hello\r\n\r\n").unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data, "hello");
     }
@@ -153,9 +205,9 @@ mod tests {
     #[test]
     fn crlf_reassembles_across_boundary() {
         let mut d = SseDecoder::new();
-        assert!(d.push(b"data: hel").is_empty());
-        assert!(d.push(b"lo\r\n").is_empty());
-        let evs = d.push(b"\r\n");
+        assert!(d.push(b"data: hel").unwrap().is_empty());
+        assert!(d.push(b"lo\r\n").unwrap().is_empty());
+        let evs = d.push(b"\r\n").unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data, "hello");
     }

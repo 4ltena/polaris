@@ -5,7 +5,9 @@
 //! The party being asked is a trait so that tests don't need real terminal
 //! input.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 use polaris_sandbox::SandboxPolicy;
 use polaris_tools::predicate::{Verdict, predict};
@@ -16,7 +18,7 @@ pub enum ApprovalPolicy {
     Never,
     /// Ask only when out of scope.
     OnRequest,
-    /// Ask before every mutating operation.
+    /// Ask before every mutating operation and every shell command.
     Always,
 }
 
@@ -28,15 +30,73 @@ pub enum Decision {
 
 pub trait Approver {
     fn ask(&mut self, reason: &str) -> Decision;
+
+    /// Legacy implementations keep their synchronous behavior. UI approvers
+    /// must override this method with a nonblocking future.
+    fn ask_async<'a>(
+        &'a mut self,
+        reason: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Decision> + 'a>> {
+        Box::pin(async move { self.ask(reason) })
+    }
 }
 
 pub struct Gate {
     policy: ApprovalPolicy,
+    approval_available: bool,
 }
 
 impl Gate {
     pub fn new(policy: ApprovalPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            approval_available: true,
+        }
+    }
+
+    /// Preserve the parent's policy without granting unattended approval.
+    pub(crate) fn for_subagent(&self) -> Self {
+        Self {
+            policy: self.policy,
+            approval_available: false,
+        }
+    }
+
+    /// A legacy background entry cannot carry this gate or relay approval.
+    pub(crate) fn check_unattended(&self, operation: &str) -> Result<(), String> {
+        if self.policy == ApprovalPolicy::Always {
+            return Err(format!(
+                "subagent approval relay is unavailable; operation refused: {operation}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Shell commands are opaque: Always asks regardless of their contents.
+    /// Approval does not change the sandbox policy passed to execution.
+    pub fn check_command(
+        &mut self,
+        sandbox: &SandboxPolicy,
+        command: &str,
+        approver: &mut dyn Approver,
+    ) -> Result<(), String> {
+        let Some(reason) = self.command_request(sandbox, command)? else {
+            return Ok(());
+        };
+        Self::finish(&reason, approver.ask(&reason))
+    }
+
+    /// Async counterpart of `check_command`, using the same policy decision.
+    pub(crate) async fn check_command_async(
+        &mut self,
+        sandbox: &SandboxPolicy,
+        command: &str,
+        approver: &mut dyn Approver,
+    ) -> Result<(), String> {
+        let Some(reason) = self.command_request(sandbox, command)? else {
+            return Ok(());
+        };
+        Self::finish(&reason, approver.ask_async(&reason).await)
     }
 
     /// Call before a mutating operation. Returns `Ok(())` if it may proceed,
@@ -47,9 +107,75 @@ impl Gate {
         target: &Path,
         approver: &mut dyn Approver,
     ) -> Result<(), String> {
-        let verdict = predict(sandbox, target);
+        let Some(reason) = self.write_request(sandbox, target)? else {
+            return Ok(());
+        };
+        Self::finish(&reason, approver.ask(&reason))
+    }
 
-        let reason = match (&verdict, self.policy) {
+    /// Async counterpart of `check`. A UI implementation must override
+    /// `Approver::ask_async`; the default preserves legacy synchronous input.
+    pub async fn check_async(
+        &mut self,
+        sandbox: &SandboxPolicy,
+        target: &Path,
+        approver: &mut dyn Approver,
+    ) -> Result<(), String> {
+        let Some(reason) = self.write_request(sandbox, target)? else {
+            return Ok(());
+        };
+        Self::finish(&reason, approver.ask_async(&reason).await)
+    }
+
+    /// Only for the internal execution port whose owner persists and resolves
+    /// every request before spawning. Keep Never's static refusal; move the
+    /// interactive question to that owner instead of asking twice.
+    pub(crate) fn check_owned_write(
+        &self,
+        sandbox: &SandboxPolicy,
+        target: &Path,
+    ) -> Result<(), String> {
+        Self {
+            policy: self.policy,
+            approval_available: true,
+        }
+        .write_request(sandbox, target)
+        .map(|_| ())
+    }
+
+    pub(crate) fn check_owned_command(
+        &self,
+        sandbox: &SandboxPolicy,
+        command: &str,
+    ) -> Result<(), String> {
+        Self {
+            policy: self.policy,
+            approval_available: true,
+        }
+        .command_request(sandbox, command)
+        .map(|_| ())
+    }
+
+    fn command_request(
+        &self,
+        sandbox: &SandboxPolicy,
+        command: &str,
+    ) -> Result<Option<String>, String> {
+        if self.policy != ApprovalPolicy::Always {
+            return Ok(None);
+        }
+        self.approval_request(format!(
+            "running command {command:?}. policy {}",
+            sandbox.describe()
+        ))
+    }
+
+    fn write_request(
+        &self,
+        sandbox: &SandboxPolicy,
+        target: &Path,
+    ) -> Result<Option<String>, String> {
+        let reason = match (predict(sandbox, target), self.policy) {
             (Verdict::Allowed, ApprovalPolicy::Always) => {
                 format!(
                     "writing to {}. policy {}",
@@ -57,18 +183,27 @@ impl Gate {
                     sandbox.describe()
                 )
             }
-            (Verdict::Allowed, _) => return Ok(()),
-            (Verdict::NeedsApproval { reason }, _) => reason.clone(),
+            (Verdict::Allowed, _) => return Ok(None),
+            (Verdict::NeedsApproval { reason }, _) => reason,
         };
+        self.approval_request(reason)
+    }
 
-        // When there's no one configured to ask, refuse without asking.
-        // Letting it through would mean running unattended is itself an
-        // expansion of privilege.
+    /// Shared preflight for both sync and async calls, before invoking an approver.
+    fn approval_request(&self, reason: String) -> Result<Option<String>, String> {
         if self.policy == ApprovalPolicy::Never {
             return Err(reason);
         }
+        if !self.approval_available {
+            return Err(format!(
+                "subagent approval relay is unavailable; operation refused: {reason}"
+            ));
+        }
+        Ok(Some(reason))
+    }
 
-        match approver.ask(&reason) {
+    fn finish(reason: &str, decision: Decision) -> Result<(), String> {
+        match decision {
             Decision::Allow => Ok(()),
             Decision::Deny => Err(format!("the user did not approve: {reason}")),
         }
@@ -93,6 +228,179 @@ mod tests {
 
     fn workspace(root: &std::path::Path) -> SandboxPolicy {
         SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.to_path_buf()]).expect("policy")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p42_async_override_yields_to_ui_for_allow_and_deny() {
+        struct UiApprover {
+            entered: Option<tokio::sync::oneshot::Sender<String>>,
+            answer: Option<tokio::sync::oneshot::Receiver<Decision>>,
+        }
+        impl Approver for UiApprover {
+            fn ask(&mut self, _: &str) -> Decision {
+                panic!("async gate called the blocking legacy method");
+            }
+            fn ask_async<'a>(
+                &'a mut self,
+                reason: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Decision> + 'a>> {
+                Box::pin(async move {
+                    self.entered
+                        .take()
+                        .unwrap()
+                        .send(reason.to_string())
+                        .unwrap();
+                    self.answer.take().unwrap().await.unwrap()
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = workspace(dir.path());
+        let target = sandbox.writable_roots()[0].join("normal.txt");
+        for command in [false, true] {
+            for decision in [Decision::Allow, Decision::Deny] {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+                let mut approver = UiApprover {
+                    entered: Some(entered_tx),
+                    answer: Some(answer_rx),
+                };
+                let mut gate = Gate::new(ApprovalPolicy::Always);
+                let check = async {
+                    let approver: &mut dyn Approver = &mut approver;
+                    if command {
+                        gate.check_command_async(&sandbox, "printf normal", approver)
+                            .await
+                    } else {
+                        gate.check_async(&sandbox, &target, approver).await
+                    }
+                };
+                let ui = async {
+                    let reason = entered_rx.await.unwrap();
+                    tokio::task::yield_now().await;
+                    answer_tx.send(decision).unwrap();
+                    reason
+                };
+                let (result, reason) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        tokio::join!(check, ui)
+                    })
+                    .await
+                    .unwrap();
+                if command {
+                    assert!(reason.contains("printf normal"));
+                } else {
+                    assert!(reason.contains(&target.display().to_string()));
+                }
+                match decision {
+                    Decision::Allow => assert_eq!(result, Ok(())),
+                    Decision::Deny => {
+                        assert_eq!(result, Err(format!("the user did not approve: {reason}")))
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn p42_sync_async_policy_and_reason_parity_with_legacy_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sandbox = workspace(dir.path());
+        for policy in [
+            ApprovalPolicy::Never,
+            ApprovalPolicy::OnRequest,
+            ApprovalPolicy::Always,
+        ] {
+            for child in [false, true] {
+                for decision in [Decision::Allow, Decision::Deny] {
+                    for operation in 0..3 {
+                        let target = if operation == 0 {
+                            sandbox.writable_roots()[0].join("inside.txt")
+                        } else {
+                            outside.path().join("outside.txt")
+                        };
+                        let make_gate = || {
+                            let gate = Gate::new(policy);
+                            if child { gate.for_subagent() } else { gate }
+                        };
+                        let mut sync_gate = make_gate();
+                        let mut async_gate = make_gate();
+                        let mut sync_approver = Scripted {
+                            answers: vec![decision],
+                            asked: vec![],
+                        };
+                        let mut async_approver = Scripted {
+                            answers: vec![decision],
+                            asked: vec![],
+                        };
+                        let (sync_result, async_result) = if operation == 2 {
+                            (
+                                sync_gate.check_command(
+                                    &sandbox,
+                                    "printf normal",
+                                    &mut sync_approver,
+                                ),
+                                async_gate
+                                    .check_command_async(
+                                        &sandbox,
+                                        "printf normal",
+                                        &mut async_approver,
+                                    )
+                                    .await,
+                            )
+                        } else {
+                            (
+                                sync_gate.check(&sandbox, &target, &mut sync_approver),
+                                async_gate
+                                    .check_async(&sandbox, &target, &mut async_approver)
+                                    .await,
+                            )
+                        };
+                        assert_eq!(
+                            sync_result, async_result,
+                            "{policy:?} child={child} operation={operation}"
+                        );
+                        assert_eq!(sync_approver.asked, async_approver.asked);
+                        let needs_approval = policy == ApprovalPolicy::Always || operation == 1;
+                        let should_ask =
+                            needs_approval && policy != ApprovalPolicy::Never && !child;
+                        assert_eq!(async_approver.asked.len(), usize::from(should_ask));
+                        assert_eq!(
+                            async_result.is_ok(),
+                            !needs_approval || (should_ask && decision == Decision::Allow)
+                        );
+                        if child && needs_approval && policy != ApprovalPolicy::Never {
+                            assert!(
+                                async_result
+                                    .unwrap_err()
+                                    .contains("approval relay is unavailable")
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn d04_child_keeps_write_approval_and_refuses_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = workspace(dir.path());
+        let mut approver = Scripted {
+            answers: vec![],
+            asked: vec![],
+        };
+        let mut child = Gate::new(ApprovalPolicy::Always).for_subagent();
+        let reason = child
+            .check(
+                &sandbox,
+                &sandbox.writable_roots()[0].join("normal.txt"),
+                &mut approver,
+            )
+            .unwrap_err();
+        assert!(reason.contains("approval relay is unavailable"));
+        assert!(approver.asked.is_empty());
     }
 
     #[test]

@@ -223,3 +223,66 @@ fn an_edit_whose_marker_is_absent_is_a_request_problem_not_a_policy_denial() {
         "content changed despite the failure"
     );
 }
+
+#[test]
+#[cfg(target_os = "macos")]
+fn isolated_read_real_helper_returns_only_allowed_dummy_text() {
+    use polaris_tools::isolated_read::{OUTPUT_BUDGET, Reply, Request};
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let tmp = root.path().join("tmp");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&tmp).unwrap();
+    let helper = Path::new(env!("CARGO_BIN_EXE_polaris"))
+        .canonicalize()
+        .unwrap();
+    let policy = SandboxPolicy::isolated(
+        SandboxMode::ReadOnly,
+        root.path(),
+        std::slice::from_ref(&helper),
+    )
+    .unwrap()
+    .with_isolated_environment(&home, &tmp)
+    .unwrap();
+    let inside = policy
+        .isolated_boundary()
+        .unwrap()
+        .workspace
+        .join("ordinary.txt");
+    let denied = outside.path().join("ordinary.txt");
+    std::fs::write(&inside, "DUMMY_INSIDE\nsecond\n").unwrap();
+    std::fs::write(&denied, "DUMMY_OUTSIDE_MUST_NOT_APPEAR").unwrap();
+    for (path, allowed) in [(inside, true), (denied, false)] {
+        let request = Request::Lines {
+            path,
+            offset: 0,
+            limit: 1,
+            budget: OUTPUT_BUDGET,
+        };
+        let payload = serde_json::to_string(&request).unwrap();
+        let start = std::time::Instant::now();
+        let result = polaris_sandbox::run_confined_controlled(
+            &policy,
+            &helper,
+            &["--confined-read".into()],
+            Some(&payload),
+            || start.elapsed() >= std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(result.end, polaris_sandbox::ControlledEnd::Exited);
+        assert_eq!(result.status.and_then(|s| s.code()), Some(0));
+        assert!(result.pending.is_none() && result.stdout_eof && result.stderr_eof);
+        assert!(!result.stdout_truncated && !result.stderr_truncated);
+        assert!(!result.stdout.contains("DUMMY_OUTSIDE_MUST_NOT_APPEAR"));
+        let reply = polaris_tools::isolated_read::decode(&result.stdout, &request).unwrap();
+        if allowed {
+            assert!(
+                matches!(&reply, Reply::Text(text) if text.starts_with("1\tDUMMY_INSIDE\n")),
+                "dummy reply: {reply:?}"
+            );
+        } else {
+            assert_eq!(reply, Reply::Unavailable);
+        }
+    }
+}

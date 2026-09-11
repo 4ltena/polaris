@@ -65,6 +65,26 @@ fn read_with_budget(
     limit: usize,
     budget: Option<usize>,
 ) -> Result<String, ToolError> {
+    read_impl(path, offset, limit, budget, false)
+}
+
+/// 隔離helper専用。本文は開いたFDの型と実読取上限でも制限する。
+pub(crate) fn read_isolated(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    budget: usize,
+) -> Result<String, ToolError> {
+    read_impl(path, offset, limit, Some(budget), true)
+}
+
+fn read_impl(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    budget: Option<usize>,
+    bounded: bool,
+) -> Result<String, ToolError> {
     let output_cap = budget.unwrap_or(MAX_READ_OUTPUT_BYTES);
     if path_policy::is_denied(path) {
         return Err(ToolError::PathDenied(path.display().to_string()));
@@ -98,7 +118,11 @@ fn read_with_budget(
         });
     }
 
-    let body = std::fs::read_to_string(path)?;
+    let body = if bounded {
+        crate::isolated_read::bounded_text(path, MAX_READ_BYTES)?
+    } else {
+        std::fs::read_to_string(path)?
+    };
 
     // An empty file, limit=0, and an offset past the total line count are
     // all alike in that "there are zero target lines", but they mean
@@ -183,6 +207,38 @@ mod tests {
         }
         f.flush().expect("can't flush");
         f
+    }
+
+    #[test]
+    fn harness_credentials_are_denied_directly_and_through_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join(".polaris");
+        std::fs::create_dir(&store).unwrap();
+        for name in [
+            "auth.json",
+            "api_key.json",
+            "auth.json.tmp",
+            "api_key.json.tmp",
+        ] {
+            let path = store.join(name);
+            std::fs::write(&path, "DUMMY_SECRET_SENTINEL").unwrap();
+            assert!(matches!(
+                read(&path, 0, 20),
+                Err(crate::ToolError::PathDenied(_))
+            ));
+            #[cfg(unix)]
+            {
+                let alias = root.path().join(format!("alias-{name}"));
+                std::os::unix::fs::symlink(&path, &alias).unwrap();
+                assert!(matches!(
+                    read(&alias, 0, 20),
+                    Err(crate::ToolError::PathDenied(_))
+                ));
+            }
+        }
+        let ordinary = root.path().join("auth.json");
+        std::fs::write(&ordinary, "ordinary config").unwrap();
+        assert!(read(&ordinary, 0, 20).unwrap().contains("ordinary config"));
     }
 
     #[test]

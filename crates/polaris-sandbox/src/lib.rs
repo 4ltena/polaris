@@ -5,7 +5,10 @@
 //! to platform-specific mechanisms.
 
 mod broker;
+mod child_environment;
+mod child_fds;
 pub mod confine;
+mod controlled;
 pub mod helper;
 pub mod policy;
 pub mod stage;
@@ -17,8 +20,19 @@ pub mod macos;
 pub mod linux;
 
 pub use confine::{Outcome, run_confined};
+pub use controlled::{
+    ControlledEnd, ControlledOutcome, PendingCleanup, run_confined_controlled,
+    run_confined_controlled_authorized, take_pending_cleanups,
+};
 pub use helper::Mutation;
 pub use policy::{SandboxMode, SandboxPolicy};
+
+/// Prevent trusted native utility children from inheriting unrelated descriptors.
+/// This only installs FD hygiene; it does not grant or enforce filesystem access.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn protect_child_descriptors(command: &mut std::process::Command) {
+    child_fds::install(command);
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {

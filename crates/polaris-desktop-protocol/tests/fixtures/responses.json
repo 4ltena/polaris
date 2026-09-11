@@ -1,0 +1,4 @@
+[
+  {"protocol_version":1,"kind":"response","client_id":"c","request_id":"cancel","result":{"type":"run.cancel","payload":{"status":"cancel_requested"}}},
+  {"protocol_version":1,"kind":"response","client_id":"c","request_id":"start","error":{"code":"revision_conflict","message":"下書きの版が異なります"}}
+]

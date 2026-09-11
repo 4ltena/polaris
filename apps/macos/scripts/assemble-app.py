@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ローカル実機確認用の未配布.appを組み立てる。起動や署名は行わない。"""
+"""指定した構成の.appを組み立てる。起動・署名・配布は行わない。"""
 
 import argparse
 import hashlib
@@ -71,6 +71,7 @@ def main():
     parser.add_argument("--service-helper", type=Path, required=True)
     parser.add_argument("--execution-helper", type=Path)
     parser.add_argument("--toolchain-package", type=Path, action="append", default=[])
+    parser.add_argument("--configuration", choices=["debug", "release"], default="debug")
     parser.add_argument("--destination", type=Path)
     arguments = parser.parse_args()
     # Validate before spending the Swift build slot. No Cargo build or discovery.
@@ -86,7 +87,7 @@ def main():
         raise RuntimeError("既存の .build/PolarisDesktop.app を別の場所へ移してから再実行してください。")
 
     command = ["swift", "build", "--package-path", str(package),
-               "--scratch-path", str(scratch), "--configuration", "debug"]
+               "--scratch-path", str(scratch), "--configuration", arguments.configuration]
     subprocess.run(command + ["--product", "PolarisDesktop"], check=True)
     binary_directory = Path(subprocess.check_output(command + ["--show-bin-path"], text=True).strip())
     executable = binary_directory / "PolarisDesktop"
@@ -146,7 +147,7 @@ def main():
         subprocess.run(["/usr/bin/plutil", "-lint", str(contents / "Info.plist")], check=True)
         app.rename(destination)
 
-    print("ローカル確認用アプリを作成しました：", destination)
+    print("アプリを作成しました：", destination)
     print("隔離起動例：")
     print(f'open -n "{destination}" --args --settings-path /tmp/polaris-native-review/settings.json')
 

@@ -16,7 +16,7 @@ REPOSITORY = Path(__file__).resolve().parents[3]
 
 
 class HelperAssemblyTests(unittest.TestCase):
-    def assemble_checkout(self, root, with_local_skills=False):
+    def assemble_checkout(self, root, with_local_skills=False, configuration=None):
         repository = root / "source"
         package = repository / "apps/macos"
         binary_directory = package / ".build/bin"
@@ -44,14 +44,25 @@ class HelperAssemblyTests(unittest.TestCase):
             "assemble-app.py", "--service-helper", str(service),
             "--execution-helper", str(execution), "--destination", str(destination),
         ]
-        # Stub compilation only. Exercise the real resource copy, manifest,
+        if configuration is not None:
+            arguments += ["--configuration", configuration]
+        # Stub external commands. Exercise the real resource copy, manifest,
         # metadata and final publication paths against a clean source fixture.
         with patch.object(assembly, "__file__", str(package / "scripts/assemble-app.py")), \
                 patch.object(assembly.sys, "argv", arguments), \
-                patch.object(assembly.subprocess, "run"), \
-                patch.object(assembly.subprocess, "check_output", return_value=str(binary_directory)):
+                patch.object(assembly.subprocess, "run") as run, \
+                patch.object(assembly.subprocess, "check_output", return_value=str(binary_directory)) as output:
             assembly.main()
+        expected = configuration or "debug"
+        for command in [run.call_args_list[0].args[0], output.call_args.args[0]]:
+            self.assertEqual(command[command.index("--configuration") + 1], expected)
         return destination
+
+    def test_release_build_packages_matching_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.assemble_checkout(Path(directory), configuration="release")
+            self.assert_bundled_catalogs(app)
+            self.assertTrue((app / "PolarisDesktop_PolarisDesktop.bundle/release.json").is_file())
 
     def assert_bundled_catalogs(self, app):
         for catalog in ["skills", "agents"]:

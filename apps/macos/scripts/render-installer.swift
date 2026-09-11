@@ -70,12 +70,6 @@ try png("background@2x.png", width: 1280, height: 1040) {
     arrow.line(to: NSPoint(x: 327, y: 258))
     arrow.lineWidth = 1.2
     arrow.stroke()
-    // Finderは画像背景の上でも黒いファイル名を使うため、名前の下だけ明るくする。
-    color(0.76, 0.84, 0.90, 0.94).setFill()
-    for y: CGFloat in [325, 57] {
-        NSBezierPath(roundedRect: NSRect(x: 242, y: y, width: 156, height: 29),
-            xRadius: 7, yRadius: 7).fill()
-    }
 }
 
 let iconset = output.appendingPathComponent("Polaris.iconset", isDirectory: true)

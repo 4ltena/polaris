@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument("--revision", required=True)
     parser.add_argument("--dimension", type=int, required=True)
     parser.add_argument("--max-tokens", type=int, required=True)
+    parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
     if args.dimension != 384 or args.max_tokens != 512 or not args.revision:
         raise ValueError("fixed embedding helper arguments are invalid")
@@ -116,6 +117,16 @@ def main():
         args.model_path, local_files_only=True, trust_remote_code=False, use_safetensors=True
     )
     model.eval()
+    if args.preflight:
+        from importlib.metadata import version
+        if model.config.hidden_size != 384:
+            raise ValueError("fixed model dimension is invalid")
+        print(json.dumps({"model": "intfloat/multilingual-e5-small", "dimension": 384,
+                          "revision": args.revision,
+                          "packages": {name: version(name) for name in
+                                       ("torch", "transformers", "tokenizers", "safetensors")}},
+                         separators=(",", ":")), flush=True)
+        return
     for line in sys.stdin:
         request = json.loads(line)
         if set(request) != {"kind", "text"} or request["kind"] not in {"query", "passage"}:

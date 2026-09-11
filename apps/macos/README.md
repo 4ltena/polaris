@@ -1,16 +1,30 @@
 # macOSデスクトップ
 
-このディレクトリは、macOS 13以降で動作するSwiftUI版PolarisのSwift Packageである。v0.12.0の実装は完了した。生成する`.app`は未署名のローカル確認用で、RC化・配布・公開は行っていない。承認が必要な追加検証は利用者の指示により省略した。
+このディレクトリは、macOS 13以降を対象としたSwiftUI版PolarisのSwift Packageである。[v0.12.0 “Alrescha”](https://github.com/4ltena/polaris/releases/tag/v0.12.0)ではApple Silicon向けDMGを配布する。実モデル接続、ファイル・Git・作業表示、ローカルモデル、復旧、strict10の会話記憶を備える。
 
 アプリは選択したプロジェクトの外側に会話と設定を保存する。登録済みフォルダのidentityが変わった場合、保存済み会話を残して再接続を拒否する。同じsettings pathを二つのアプリから同時に使うこともできない。終了は下書きと復旧結果の保存を確認してから完了する。
+
+## 配布パッケージ
+
+[polaris-0.12.0-arm64.dmg](https://github.com/4ltena/polaris/releases/download/v0.12.0/polaris-0.12.0-arm64.dmg)はApple Silicon、macOS 13.5以降向け。Intel Mac用・Universal版ではない。同梱Node.jsの最低OSに合わせ、ソース側のmacOS 13より配布版の要件を高くしている。
+
+1. DMGを開き、上側の宇宙にあるPolarisを、下側の地球にあるApplicationsへドラッグする。
+2. コピー終了後、Applications内のPolarisを開く。既存版が動作している場合は、通常終了してから置き換える。
+3. 「ようこそ → GPT接続 → ローカルモデル → プロジェクトと権限 → テーマ → 確認して開始」の6ページを進める。接続設定は後回しにもできる。
+
+Developer ID署名・公証はない。開発元を確認できない場合は[Appleの案内](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac)を参照。取得したDMGはReleaseの`polaris-0.12.0-SHA256SUMS.txt`と照合できる。
+
+同梱するのはrelease構成のSwiftUIアプリ、service helper、実行helper、スキル2件、エージェント定義・Schema、Node.js 24.11.1と各ライセンスである。個人の認証・設定・会話やモデルキャッシュは含めない。npm、Python、Rust、Swiftなどの追加ビルド環境は同梱せず、ホストの環境を隔離実行へ自動流用しない。Git表示にはmacOSの`/usr/bin/git`を使うため、Apple Command Line Toolsが必要な環境もある。`strict10`は下記の固定埋め込み資源を別途設定する。
+
+アプリはコピーした利用者の所有である必要がある。DMG上からの直接起動や、管理者がroot所有で配置したアプリは起動時の所有者検査を通らない場合がある。通常のFinderコピーを使い、システム用の`.pkg`としては配布しない。
 
 ## 組立て
 
 macOS 13以降、Swift 6、現在のcheckoutでビルドしたservice helperが必要である。モデル実行を確認する場合は、実行helperと移設可能なtoolchain packageも明示する。いずれも絶対パスで渡す。
 
 ```sh
-cargo build -p polaris-desktop-service --bin polaris-desktop-service
-cargo build -p polaris-cli --bin polaris
+cargo build --locked -p polaris-desktop-service --bin polaris-desktop-service
+cargo build --locked -p polaris-cli --bin polaris
 
 python3 apps/macos/scripts/assemble-app.py \
   --service-helper "$PWD/target/debug/polaris-desktop-service" \
@@ -20,6 +34,23 @@ python3 apps/macos/scripts/assemble-app.py \
 ```
 
 `--execution-helper`と`--toolchain-package`を省略すると、実行helperを同梱しないアプリになる。組立てスクリプトは既存の出力先を上書きせず、起動や署名も行わない。
+
+通常はdebug構成。最適化する場合はCargoに`--release`を付け、`target/release`のhelperを渡し、組立てにも`--configuration release`を指定する。
+
+配布画面の背景とアイコンは、既存SVGから次で生成する。Finderでは640×520の背景に対し、PolarisとApplicationsを同じ横位置で上下に配置する。
+
+```sh
+swift apps/macos/scripts/render-installer.swift /absolute/path/artwork \
+  "$PWD/apps/macos/Sources/PolarisDesktop/Resources/polaris-banner-white.svg"
+iconutil --convert icns --output /absolute/path/artwork/Polaris.icns \
+  /absolute/path/artwork/Polaris.iconset
+sips --setProperty dpiWidth 144 --setProperty dpiHeight 144 \
+  /absolute/path/artwork/background@2x.png
+```
+
+v0.12.0の配布版では`Contents/Resources/Polaris.icns`を`CFBundleIconFile`から参照し、`LSMinimumSystemVersion`を13.5とした。SwiftPMのリソースbundleは生成accessorに合わせて.app直下に置く。この配置はアプリ全体の署名に対応していない。署名・公証対応は別の変更として扱い、同梱helperの最終バイト列と`execution-helper.json`のSHA-256を常に一致させる。
+
+DMGの`.background/space-earth.png`へ生成背景を置き、`Applications`を`/Applications`へのリンクにする。Finderを閉じた状態で、`ds-store==1.3.3`と`mac-alias==2.2.3`を用意したビルド用Pythonから`write-dmg-layout.py /absolute/mounted/dmg`を実行すると、当該DMGの配置だけを保存する。利用者のFinder設定は変更しない。通常アンマウント後、`hdiutil convert`の`UDZO`形式で圧縮し、`hdiutil verify`と展開後のハッシュを確認する。
 
 同梱するスキルはGit管理された`skills/`、子エージェント定義は`agents/`から取得する。ビルド元の`.polaris/skills`やホームの個人設定はアプリへコピーしない。これらのローカル設定を作らずに、新しく取得したソースから組み立てられる。実行時のプロジェクト・ホームからのスキル探索は従来どおりである。
 
@@ -59,6 +90,10 @@ open -n /absolute/path/PolarisDesktop.app --args \
 許可の受付と反映結果の保存は別の段階である。「反映結果」の成否と書込み・削除・復旧の件数を確認する。元ファイルが候補作成後に外部編集されていた場合は競合として扱い、その内容を上書きしない。回答の成否が不明なときは許可を繰り返さず、保存済み状態を読み直す。結果が未記録の表示を反映成功とは判断しない。
 
 ## 検査
+
+v0.12.0ではSwift 236件と梱包試験6件が成功した。Git管理されたスキルとエージェント定義を使い、個人設定も既存のSwiftビルドキャッシュもない環境で組立てを確認している。strict10修正後の追加実モデル確認は省略した。
+
+配布準備ではrelease構成の回帰を加えた梱包試験7件が成功した。最適化ビルド、4実行物のアーキテクチャとシステムライブラリ依存、helperの最終SHA、533ファイルのDMG内・移設先との一致、所有者・権限・link条件を確認した。圧縮DMGの`hdiutil verify`と、Finderでの背景・上下配置・ファイル名の可読性も確認済み。今回の配布用アプリから追加の実モデル送信は行っていない。
 
 Swiftの自動試験は次で実行する。
 

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2800" height="2000" viewBox="0 0 1484 1060"><title>最初のA案を基にした軌道線</title><defs>
+ <linearGradient id="silver-horizontal" x1="0" y1="0" x2="0.6" y2="1"><stop stop-color="#929391" stop-opacity=".45"/><stop offset=".4" stop-color="#f1f2ef"/><stop offset="1" stop-color="#a2a4a1" stop-opacity=".65"/></linearGradient>
+ <linearGradient id="silver-rise" x1="0" y1="1" x2="1" y2="0"><stop stop-color="#7c807c" stop-opacity=".35"/><stop offset=".55" stop-color="#e7e9e5"/><stop offset="1" stop-color="#a1a3a0" stop-opacity=".5"/></linearGradient>
+ <linearGradient id="silver-fall" x1="0" y1="0" x2=".4" y2="1"><stop stop-color="#90928e" stop-opacity=".55"/><stop offset=".5" stop-color="#bfc3bd" stop-opacity=".65"/><stop offset="1" stop-color="#747972" stop-opacity=".12"/></linearGradient>
+</defs>
+<g fill="none" stroke-width="2.15" stroke-linecap="round">
+ <path id="orbit-horizontal" stroke="url(#silver-horizontal)" d="M -160 354 C -112 304 69 254 236 224 C 491 177 852 150 996 189 C 1127 225 888 324 621 358 C 302 406 20 415 -100 358"/>
+ <path id="orbit-rising" stroke="url(#silver-rise)" d="M -100 670 C 65 805 475 658 625 372 C 704 222 695 87 605 -2"/>
+ <path id="orbit-sweeping" stroke="url(#silver-fall)" d="M -40 9 C 188 64 461 246 586 419 C 706 584 583 696 362 718 C 220 733 66 715 -35 705"/>
+ <path id="orbit-descending" stroke="url(#silver-fall)" d="M 116 -4 C 157 72 196 148 236 224 C 318 386 397 552 489 741"/>
+</g></svg>

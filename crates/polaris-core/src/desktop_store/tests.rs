@@ -19,6 +19,7 @@ fn initial() -> InitialState {
             attachment_ids: vec![AttachmentId::new("attachment").unwrap()],
         },
         configuration: Configuration {
+            history_mode: Default::default(),
             configuration_revision: DecimalU64::new(0),
             provider: "fake".into(),
             model: "model".into(),
@@ -59,6 +60,7 @@ fn configure(id: &str, revision: u64) -> Request {
         RequestBody::SessionConfigure(
             session(),
             SessionConfigure {
+                history_mode: Default::default(),
                 expected_configuration_revision: DecimalU64::new(revision),
                 provider: "fake2".into(),
                 model: "model2".into(),
@@ -116,6 +118,7 @@ fn s01_sidecar_changes_preserve_content_and_publish_together() {
     writer.apply(&configure("c", 0), None).unwrap();
     let after = writer.snapshot().unwrap();
     let configured = Configuration {
+        history_mode: Default::default(),
         configuration_revision: DecimalU64::new(1),
         provider: "fake2".into(),
         model: "model2".into(),

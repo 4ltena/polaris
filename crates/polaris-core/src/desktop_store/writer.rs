@@ -126,6 +126,7 @@ impl StoreRoot {
         let guard = directory.open("writer.lock", true, true)?;
         acquire(&guard)?;
         let state = Sidecar {
+            conversation_memory: None,
             session_revision: DecimalU64::new(0),
             draft: initial.draft,
             configuration: initial.configuration,
@@ -206,6 +207,11 @@ impl StoreRoot {
                 } else {
                     RunState::Interrupted
                 };
+                if let Some(memory) = &mut record.memory {
+                    memory.phase = polaris_desktop_protocol::snapshot::MemoryPhase::OutcomeUnknown;
+                    memory.detail =
+                        "前回の実行が中断されました。未確定の要約は自動再送しません".into();
+                }
                 changed = true;
             }
         }
@@ -245,6 +251,7 @@ fn reconcile(
 }
 
 fn validate_ledger(p: &Published) -> StoreResult<()> {
+    super::memory::validate(p)?;
     super::children::validate(&p.state)?;
     super::source_apply::validate(&p.state)?;
     use std::collections::BTreeSet;
@@ -489,7 +496,7 @@ impl Writer {
         self.commit(next, false)
     }
 
-    fn commit(&mut self, mut next: Published, content_changed: bool) -> StoreResult<()> {
+    pub(super) fn commit(&mut self, mut next: Published, content_changed: bool) -> StoreResult<()> {
         self.ready()?;
         next.marker.session_revision = self.published.marker.session_revision.checked_add(1)?;
         next.state.session_revision = next.marker.session_revision;
@@ -506,6 +513,14 @@ impl Writer {
         self.published = next;
         self.recovery_required = false;
         Ok(())
+    }
+
+    pub(super) fn memory_raw_prefix(&self, offset: DecimalU64, hash: &str) -> StoreResult<Vec<u8>> {
+        self.ready()?;
+        if offset > self.published.marker.raw_offset {
+            return Err(StoreError::Corrupt("記憶の原文範囲"));
+        }
+        disk::prefix(&self.directory, disk::RAW, offset, hash)
     }
 
     fn acceptance(&self, record: &RequestRecord) -> Acceptance {
@@ -613,6 +628,7 @@ impl Writer {
                     state.configuration.provider = params.provider.clone();
                     state.configuration.model = params.model.clone();
                     state.configuration.effort = params.effort.clone();
+                    state.configuration.history_mode = params.history_mode;
                     RequestResult::Configured {
                         configuration_revision: state.configuration.configuration_revision,
                         configuration: state.configuration.clone(),
@@ -670,6 +686,8 @@ impl Writer {
                         operations: Vec::new(),
                         result_id: None,
                         usage: None,
+                        memory: None,
+                        memory_resources: None,
                         workflow: state.workflow.clone(),
                         history_gap: None,
                     });
@@ -1080,11 +1098,12 @@ impl Writer {
             .iter()
             .position(|o| &o.operation_id == operation)
             .ok_or(StoreError::NotFound)?;
-        if record
+        if (record
             .operations
             .iter()
             .enumerate()
             .any(|(i, o)| i != op && o.result_id.is_none())
+            && outcome != Observation::OutcomeUnknown)
             || record.operations[op]
                 .result_id
                 .as_ref()

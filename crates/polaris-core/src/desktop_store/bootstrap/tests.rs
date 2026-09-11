@@ -1,3 +1,4 @@
+//! Owner bootstrap metadata, identity, configuration and provider validation tests.
 use super::*;
 use crate::desktop_store::{DesktopRoot, InitialState, Writer};
 use polaris_desktop_protocol::snapshot::{Configuration, Draft};
@@ -44,6 +45,7 @@ impl Fixture {
                         attachment_ids: vec![],
                     },
                     configuration: Configuration {
+                        history_mode: Default::default(),
                         configuration_revision: DecimalU64::new(3),
                         provider: "codex".into(),
                         model: "gpt-6-astra".into(),
@@ -54,6 +56,7 @@ impl Fixture {
             )
             .unwrap();
         let document = OwnerBootstrapDocument {
+            history_mode: Default::default(),
             schema_version: 1,
             project_id: project,
             session_id: session,

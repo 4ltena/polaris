@@ -95,6 +95,10 @@ pub struct RunRecord {
     /// None means no usage observation has been published, not zero consumption.
     #[serde(default)]
     pub usage: Option<polaris_provider::UsageReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<polaris_desktop_protocol::snapshot::MemoryStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_resources: Option<super::MemoryResources>,
     /// Frozen at acceptance, replaced atomically with the terminal checkpoint.
     #[serde(default)]
     pub workflow: Option<super::SavedWorkflow>,
@@ -148,6 +152,8 @@ pub struct RequestRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sidecar {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_memory: Option<super::SavedMemory>,
     /// Controller-only evidence; never an RPC/model execution capability.
     #[serde(default)]
     pub source_applies: Vec<super::SavedSourceApply>,

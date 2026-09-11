@@ -56,7 +56,8 @@ impl FromStr for Phase {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
     pub enabled: bool,
     pub initial_phase: Phase,

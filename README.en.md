@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <strong>v0.11.0 “Sadalmelik”</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
+  <strong>v0.12.0 “Alrescha” · Implementation complete, unreleased</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
 </p>
 
 <p align="center">
@@ -17,17 +17,19 @@
 
 Polaris is a Rust CLI/TUI agent that sends the model the instructions and material needed for the current task. Its built-in workflow records the working phase and loads shared rules and phase-required skills separately from ordinary skill search.
 
+v0.12.0 integrates model execution, files, Git, task state, local models, recovery, and strict10 conversation memory into the macOS desktop. The app is an unsigned local build; no RC or public release has been created. Additional checks requiring approval were skipped. See the [macOS guide](apps/macos/README.md) for verified behavior and remaining validation limits.
+
 ## Comparison with stock Codex
 
-Eight synthetic task types cover planning, requirements, data design, implementation planning, and plan review. Both tools requested `gpt-6-astra` with `medium` effort. The table totals 16 matched trials with two turns each; Polaris had workflow enabled.
+Both tools requested `gpt-6-astra` with `medium` effort; Polaris had workflow enabled. These partial results cover 15 matched PRE02–08 trials with two turns each against Codex CLI 0.154.0. The additional PRE01 measurement was skipped.
 
-| Metric | Polaris | Stock Codex CLI 0.153.4 | Reduction |
+| Metric | Polaris | Stock Codex CLI 0.154.0 | Reduction |
 | --- | ---: | ---: | ---: |
-| Total tokens | **99,530** | 493,518 | **79.8%** |
-| Hypothetical API cost | **$2.46658** | $4.16582 | **40.8%** |
-| Quality checks | 16/16 passed | 16/16 passed | — |
+| Total tokens | **95,139** | 467,901 | **79.7%** |
+| Hypothetical API cost | **$2.37915** | $3.600914 | **33.9%** |
+| Quality checks | 15/15 passed | 15/15 passed | — |
 
-Total tokens include input and output; cached input is already part of input. Cost uses API prices frozen in the measurement specification, not actual Codex billing. These short synthetic tasks were measured at different times and do not establish reductions for general coding work or long conversations. See the [method, quality checks, timing, and limitations](docs/preimplementation-evaluation.md).
+Total tokens include input and output; cached input is already part of input. Cost uses API prices frozen in the measurement specification, not actual Codex billing. Polaris took 23.5% longer across these 15 trials. These short synthetic tasks were run sequentially and do not establish reductions for general coding work or long conversations. See the [method, quality checks, timing, and limitations](docs/preimplementation-evaluation.md#v0120とcodex-01540の途中結果).
 
 ## Getting started
 

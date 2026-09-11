@@ -12,7 +12,91 @@ pub struct AuditLog {
     file: File,
 }
 
+#[cfg(all(test, unix))]
+mod private_file_tests {
+    use super::*;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    #[test]
+    fn retains_open_file_when_its_name_is_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("audit");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let mut audit = AuditLog::from_private_file(file).unwrap();
+        let retained = root.path().join("retained");
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        audit
+            .record(&Record {
+                tool: "test",
+                detail: "entry",
+                sandbox: None,
+                target: None,
+                result: "ok",
+                caller: "root",
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert!(std::fs::read_to_string(retained).unwrap().contains("entry"));
+    }
+
+    #[test]
+    fn refuses_nonappend_or_shared_file_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("audit");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(AuditLog::from_private_file(file).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            AuditLog::from_private_file(OpenOptions::new().append(true).open(&path).unwrap())
+                .is_err()
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&path, root.path().join("alias")).unwrap();
+        assert!(
+            AuditLog::from_private_file(OpenOptions::new().append(true).open(&path).unwrap())
+                .is_err()
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+    }
+}
+
 impl AuditLog {
+    /// Consume an already securely opened private append-only file. The trusted
+    /// caller owns path/parent validation; this entry never reopens that path.
+    #[cfg(unix)]
+    pub fn from_private_file(file: File) -> std::io::Result<Self> {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        let metadata = file.metadata()?;
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+            || flags & libc::O_APPEND == 0
+            || !matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private append-only audit file required",
+            ));
+        }
+        Ok(Self { file })
+    }
+
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self { file })

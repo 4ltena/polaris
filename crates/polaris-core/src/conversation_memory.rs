@@ -2,6 +2,7 @@
 //! Does not generate summaries, call models, or change the active context.
 
 use crate::conversation_state::{ConversationSnapshot, ConversationStateV2, ConversationStore};
+pub use polaris_memory::Error as ConversationMemoryError;
 use polaris_memory::{
     MemoryStore,
     conversation::{AncestorRange, PendingSummary, PublishedView, Scope},
@@ -14,6 +15,7 @@ pub use strict_history::{
     StrictEmbedder, StrictHistory, StrictRecovery, StrictSummaryProvider, SummaryRequest,
     read_source, resolve_conversation_uri,
 };
+pub(crate) use strict_history::{parse_uri, source_page, summary_evidence, validate_summary};
 
 fn number(value: u64) -> io::Result<i64> {
     value

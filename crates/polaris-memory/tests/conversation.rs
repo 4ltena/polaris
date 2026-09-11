@@ -243,21 +243,74 @@ fn query_model_revision_and_dimension_must_match() {
 }
 
 #[test]
-fn full_rendered_hit_never_exceeds_the_256_token_injection_limit() {
+fn oversized_provenance_is_rejected_before_index_insertion() {
     let mut store = MemoryStore::open(":memory:").unwrap();
     let s = scope("s", 0, 1);
     let mut item = pending("one", s.clone(), 1, vec![1., 0.]);
     item.source.id = (0..100).map(|n| format!("source{n},")).collect();
+    let error = store.insert_pending_summary(&item).unwrap_err();
+    assert!(error.to_string().contains("provenance exceeds 256"));
+    assert!(store.pending_summary(&s, "one").unwrap().is_none());
+}
+
+#[test]
+fn previously_stored_oversized_provenance_is_diagnosed_instead_of_hidden() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("memory.sqlite3");
+    let mut store = MemoryStore::open(&database).unwrap();
+    let s = scope("s", 0, 1);
+    let item = pending("one", s.clone(), 4, vec![1., 0.]);
     store.insert_pending_summary(&item).unwrap();
     let published = view(s, &["one"]);
     store
         .publish_pending(&published, &["one".into()], || Ok(()))
         .unwrap();
-    assert!(
+    assert_eq!(
+        store.search_conversation(query(&published)).unwrap().len(),
+        1
+    );
+    // Simulate the rows accepted by the former body-only admission check.
+    let legacy = rusqlite::Connection::open(database).unwrap();
+    legacy.pragma_update(None, "foreign_keys", false).unwrap();
+    let oversized: String = (0..100).map(|n| format!("source{n},")).collect();
+    legacy
+        .execute(
+            "UPDATE conversation_sources_v2 SET source_id=?1",
+            [&oversized],
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "UPDATE conversation_summaries_v2 SET source_id=?1",
+            [&oversized],
+        )
+        .unwrap();
+    drop(legacy);
+    let error = store.search_conversation(query(&published)).unwrap_err();
+    assert!(error.to_string().contains("provenance exceeds 256"));
+    // Once three higher-ranked sources fill the selection, an unselected old
+    // oversized row must not prevent their use.
+    for (index, id) in ["a", "b", "c"].iter().enumerate() {
         store
-            .search_conversation(query(&published))
-            .unwrap()
-            .is_empty()
+            .insert_pending_summary(&pending(
+                id,
+                published.scope.clone(),
+                index as i64 + 1,
+                vec![1., 0.],
+            ))
+            .unwrap();
+    }
+    let all = view(published.scope, &["a", "b", "c", "one"]);
+    store
+        .publish_pending(&all, &["a".into(), "b".into(), "c".into()], || Ok(()))
+        .unwrap();
+    let selected = store.search_conversation(query(&all)).unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|hit| hit.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c"]
     );
 }
 
@@ -338,5 +391,75 @@ fn invalid_summary_shapes_and_foreign_source_ids_never_enter_index() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[test]
+fn uuid_provenance_keeps_both_short_gui_summaries_retrievable() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    // Synthetic G10 records: both summaries were accepted, but the second was
+    // silently dropped when duplicate provenance inflated it to 261 tokens.
+    let records = [
+        (
+            "e38e170f3b5ae388c51f69e6d45c7f229476fcb8e92474931429b02128d0f07a",
+            r#"{"facts":["Quoted user identified the first record's passphrase as 「藍色の彗星」 and storage number as 7319.","Quoted assistant replied 「第1記録を受領しました。」"],"decisions":[],"constraints":["Quoted user requested no tools, no repetition of the values, and only the reply 「第1記録を受領しました。」"],"corrections":[],"open_items":[],"source_turn_ids":[1]}"#,
+        ),
+        (
+            "7234e90bd3f4a6e3ad3afe701a142a46406062dc9cde4639a7258ed19653195a",
+            r#"{"facts":["第2記録の合言葉は「銀の灯台」、保管番号は4826。","The user described a conversation-memory connection test.","The assistant replied exactly「第2記録を受領しました。」"],"decisions":[],"constraints":["The historical user requested no tools, no repetition of the values, and only「第2記録を受領しました。」as the reply."],"corrections":[],"open_items":[],"source_turn_ids":[2]}"#,
+        ),
+    ];
+    let mut ids = Vec::new();
+    let mut published_scope = scope("A67720E5-DDCB-4938-9768-3C5F4D9669C5", 1, 2);
+    published_scope.project_id = "E6A67165-4834-489D-BC89-BCDF1FE757CD".into();
+    let tokenizer = tiktoken_rs::o200k_base_singleton();
+    for (index, (raw_hash, summary)) in records.iter().enumerate() {
+        let turn = index as i64 + 1;
+        let id = format!("strict10-{turn}-{}", &raw_hash[..16]);
+        let mut item_scope = published_scope.clone();
+        item_scope.generation = turn;
+        let mut item = pending(&id, item_scope, turn, vec![1., 0.]);
+        item.source.id = format!("source-{turn}-{}", &raw_hash[..16]);
+        item.source.raw_hash = (*raw_hash).into();
+        item.summary = (*summary).into();
+        item.summary_hash = hash(summary);
+        assert!(tokenizer.encode_with_special_tokens(summary).len() <= 256);
+        store.insert_pending_summary(&item).unwrap();
+        ids.push(id);
+    }
+    let published = PublishedView {
+        scope: published_scope,
+        visible_ids: ids.clone(),
+        ancestors: vec![],
+    };
+    store
+        .publish_pending(&published, &[ids[1].clone()], || Ok(()))
+        .unwrap();
+    let hits = store.search_conversation(query(&published)).unwrap();
+    assert_eq!(
+        hits.len(),
+        2,
+        "both complete summaries must remain retrievable"
+    );
+    let second = hits.iter().find(|hit| hit.source.start_turn == 2).unwrap();
+    assert!(second.render().contains("銀の灯台"));
+    assert!(second.render().contains("4826"));
+    assert!(second.render().contains("?start=2&end=2"));
+    assert!(second.render().contains(records[1].0));
+    assert!(
+        hits.iter()
+            .all(|hit| tokenizer.encode_with_special_tokens(&hit.render()).len() <= 256)
+    );
+    assert!(
+        tokenizer
+            .encode_with_special_tokens(
+                &hits
+                    .iter()
+                    .map(|hit| hit.render())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+            .len()
+            <= 768
     );
 }

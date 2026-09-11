@@ -51,7 +51,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct OpenAiProvider {
     base_url: String,
-    api_key: String,
+    api_key: Option<String>,
     // `RwLock`, not a plain `String`/`Option<String>` — `set_model`/
     // `set_effort` take `&self` so they can be called through the same
     // shared `&dyn Provider` the rest of the harness already holds (see
@@ -60,6 +60,7 @@ pub struct OpenAiProvider {
     effort: std::sync::RwLock<Option<String>>,
     client: reqwest::Client,
     attempt_ledger: Option<AttemptLedger>,
+    body_deadline: Duration,
 }
 
 impl OpenAiProvider {
@@ -94,11 +95,36 @@ impl OpenAiProvider {
             .map_err(|e| ProviderError::Http(format!("could not build HTTP client: {e}")))?;
         Ok(Self {
             base_url,
-            api_key,
+            api_key: Some(api_key),
             model: std::sync::RwLock::new(model),
             effort: std::sync::RwLock::new(None),
             client,
             attempt_ledger: None,
+            body_deadline: crate::RESPONSE_DEADLINE,
+        })
+    }
+
+    /// Internal transport for a fixed local selection. Never discovers credentials
+    /// or CA files through the shared cloud client builder.
+    pub(crate) fn for_local(
+        selection: &crate::local::ModelSelection,
+    ) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(2))
+            .read_timeout(READ_TIMEOUT)
+            .timeout(READ_TIMEOUT + crate::RESPONSE_DEADLINE)
+            .build()
+            .map_err(|_| ProviderError::Http("could not build local client".into()))?;
+        Ok(Self {
+            base_url: format!("{}v1", selection.endpoint().as_str()),
+            api_key: None,
+            model: std::sync::RwLock::new(selection.model().id().to_owned()),
+            effort: std::sync::RwLock::new(None),
+            client,
+            attempt_ledger: None,
+            body_deadline: crate::RESPONSE_DEADLINE,
         })
     }
 
@@ -225,38 +251,65 @@ impl Provider for OpenAiProvider {
             })
             .transpose()
             .map_err(|error| ProviderError::Budget(error.to_string()))?;
+        let mut received_usage = None;
         let result = async {
-            let resp = self
+            let request = self
                 .client
-                .post(format!("{}/chat/completions", self.base_url))
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    // `reqwest::Error`'s `Display` doesn't say whether it was
-                    // a timeout (it only prints something like `error sending
-                    // request for url (...)`). Without checking `is_timeout()`
-                    // and spelling out here that this failed because of the
-                    // idle timeout, the user can't tell a dropped connection
-                    // apart from a timeout.
-                    if e.is_timeout() {
-                        ProviderError::Http(format!(
-                            "the request timed out (no response for a while): {e}"
-                        ))
-                    } else {
-                        ProviderError::Http(e.to_string())
-                    }
-                })?;
+                .post(format!("{}/chat/completions", self.base_url));
+            let request = match &self.api_key {
+                Some(key) => request.bearer_auth(key),
+                None => request,
+            };
+            let resp = request.json(&body).send().await.map_err(|e| {
+                // `reqwest::Error`'s `Display` doesn't say whether it was
+                // a timeout (it only prints something like `error sending
+                // request for url (...)`). Without checking `is_timeout()`
+                // and spelling out here that this failed because of the
+                // idle timeout, the user can't tell a dropped connection
+                // apart from a timeout.
+                if e.is_timeout() {
+                    ProviderError::Http(format!(
+                        "the request timed out (no response for a while): {e}"
+                    ))
+                } else {
+                    ProviderError::Http(e.to_string())
+                }
+            })?;
 
-            if !resp.status().is_success() {
-                return Err(ProviderError::Http(format!("status {}", resp.status())));
+            let status = resp.status();
+            let limit = if status.is_success() {
+                crate::MAX_RESPONSE_BYTES
+            } else {
+                crate::MAX_ERROR_BYTES
+            };
+            let deadline = if status.is_success() {
+                self.body_deadline
+            } else {
+                self.body_deadline.min(crate::ERROR_DEADLINE)
+            };
+            let bytes = crate::read_limited(resp, limit, deadline).await?;
+            if !status.is_success() {
+                return Err(ProviderError::Http(format!("status {status}")));
             }
+            let v: Value =
+                serde_json::from_slice(&bytes).map_err(|e| ProviderError::Decode(e.to_string()))?;
 
-            let v: Value = resp
-                .json()
-                .await
-                .map_err(|e| ProviderError::Decode(e.to_string()))?;
+            let usage = v.get("usage").and_then(|u| {
+                let input_tokens = u.get("prompt_tokens")?.as_u64()? as u32;
+                let output_tokens = u.get("completion_tokens")?.as_u64()? as u32;
+                let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
+                let cached_tokens = u
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                Some(crate::Usage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cached_tokens,
+                })
+            });
+            received_usage = usage;
 
             // If `choices` is missing/empty, or choices[0].message is missing,
             // the response couldn't be interpreted. Without turning this into
@@ -306,13 +359,13 @@ impl Provider for OpenAiProvider {
                     "message has neither content nor tool_calls".into(),
                 ));
             }
-            let text = content_field
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string();
+            let text = content_field.and_then(|c| c.as_str()).unwrap_or_default();
+            crate::check_limit(text.len(), crate::MAX_TEXT_BYTES, "response text")?;
+            let text = text.to_string();
 
             let mut tool_calls = Vec::new();
             if let Some(calls) = tool_calls_field.and_then(|tc| tc.as_array()) {
+                crate::check_limit(calls.len(), crate::MAX_TOOL_CALLS, "tool calls")?;
                 for c in calls {
                     // If function.name is missing/empty, it reaches the
                     // dispatcher looking like "an unknown tool with an empty
@@ -345,6 +398,7 @@ impl Provider for OpenAiProvider {
                         })?;
 
                     let raw = c["function"]["arguments"].as_str().unwrap_or("{}");
+                    crate::check_limit(raw.len(), crate::MAX_ARGUMENT_BYTES, "tool arguments")?;
                     let arguments: Value = serde_json::from_str(raw)
                         .map_err(|e| ProviderError::Decode(e.to_string()))?;
                     tool_calls.push(ToolCall {
@@ -355,22 +409,6 @@ impl Provider for OpenAiProvider {
                 }
             }
 
-            let usage = v.get("usage").and_then(|u| {
-                let input_tokens = u.get("prompt_tokens")?.as_u64()? as u32;
-                let output_tokens = u.get("completion_tokens")?.as_u64()? as u32;
-                let total_tokens = u.get("total_tokens")?.as_u64()? as u32;
-                let cached_tokens = u
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
-                Some(crate::Usage {
-                    input_tokens,
-                    output_tokens,
-                    total_tokens,
-                    cached_tokens,
-                })
-            });
-
             Ok(CompletionResponse {
                 text,
                 tool_calls,
@@ -379,7 +417,8 @@ impl Provider for OpenAiProvider {
                 ..CompletionResponse::default()
             })
         }
-        .await;
+        .await
+        .map_err(|error: ProviderError| error.with_received_usage(received_usage));
         if let Some(guard) = attempt_guard.as_mut() {
             guard.finish(&result);
         }
@@ -401,6 +440,198 @@ mod tests {
     use crate::{Message, ToolCall};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn p43_unterminated_success_and_http_errors_have_total_read_deadline() {
+        for status in [200, 401, 429, 500] {
+            let (url, worker) = crate::tests::raw_reply(status, None).await;
+            let mut provider = OpenAiProvider::new(url, "dummy".into(), "fixture".into()).unwrap();
+            provider.body_deadline = Duration::from_millis(30);
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                provider.complete(CompletionRequest {
+                    system: String::new(),
+                    messages: vec![],
+                    tools: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("deadline")),
+                "status={status}"
+            );
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn p43_openai_text_args_and_callcount_boundary_matrix() {
+        for kind in ["text", "args", "calls"] {
+            let limit = match kind {
+                "text" => crate::MAX_TEXT_BYTES,
+                "args" => crate::MAX_ARGUMENT_BYTES,
+                _ => crate::MAX_TOOL_CALLS,
+            };
+            for size in [limit - 1, limit, limit + 1] {
+                let server = MockServer::start().await;
+                let mut message = serde_json::json!({"content":"normal"});
+                match kind {
+                    "text" => message["content"] = Value::String("x".repeat(size)),
+                    "args" => message["tool_calls"] = serde_json::json!([{"id":"id","function":{"name":"read","arguments":format!("\"{}\"", "x".repeat(size - 2))}}]),
+                    _ => message["tool_calls"] = Value::Array((0..size).map(|i| serde_json::json!({"id":format!("id{i}"),"function":{"name":"read","arguments":"{}"}})).collect()),
+                }
+                Mock::given(method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"choices":[{"message":message}]})),
+                    )
+                    .mount(&server)
+                    .await;
+                let provider =
+                    OpenAiProvider::new(server.uri(), "dummy".into(), "fixture".into()).unwrap();
+                let result = provider
+                    .complete(CompletionRequest {
+                        system: String::new(),
+                        messages: vec![],
+                        tools: vec![],
+                    })
+                    .await;
+                assert_eq!(result.is_ok(), size <= limit, "{kind} size={size}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn p43_rejected_openai_retains_received_usage() {
+        let tool = serde_json::json!({"id":"call", "function":{"name":"bash", "arguments":"{}"}});
+        for message in [
+            serde_json::json!({"content":"x".repeat(crate::MAX_TEXT_BYTES + 1)}),
+            serde_json::json!({"tool_calls":vec![tool; crate::MAX_TOOL_CALLS + 1]}),
+            serde_json::json!({"tool_calls":[{"id":"call", "function":{"name":"bash", "arguments":" ".repeat(crate::MAX_ARGUMENT_BYTES + 1)}}]}),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"message":message}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}
+                })))
+                .mount(&server)
+                .await;
+            let meter = crate::UsageMeter::default();
+            let provider = meter.wrap(std::sync::Arc::new(
+                OpenAiProvider::new(server.uri(), "dummy".into(), "fixture".into()).unwrap(),
+            ));
+            let result = provider
+                .complete(CompletionRequest {
+                    system: String::new(),
+                    messages: vec![],
+                    tools: vec![],
+                })
+                .await;
+            assert!(
+                matches!(result, Err(ProviderError::ReceivedUsage { source, usage })
+            if matches!(*source, ProviderError::Decode(_)) && usage.total_tokens == 7)
+            );
+            assert_eq!(meter.snapshot().failed_requests, 0);
+            assert_eq!(meter.snapshot().usage.total_tokens, 7);
+            assert_eq!(meter.snapshot().reported_responses, 1);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn p43_openai_final_notification_keeps_usage_and_one_request() {
+        struct Observer {
+            reject: bool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::ResponseObserver for Observer {
+            fn try_emit(
+                &self,
+                event: crate::ResponseEvent<'_>,
+            ) -> Result<(), crate::ObserverError> {
+                assert!(matches!(
+                    event,
+                    crate::ResponseEvent::FinalText {
+                        text: "normal",
+                        delta_matches: None
+                    }
+                ));
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.reject {
+                    Err(crate::ObserverError::Closed)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for reject in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"choices":[{"message":{"content":"normal"}}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}))).mount(&server).await;
+            let provider = std::sync::Arc::new(
+                OpenAiProvider::new(server.uri(), "dummy".into(), "fixture".into()).unwrap(),
+            );
+            let meter = crate::UsageMeter::default();
+            let provider = meter.wrap(provider);
+            let observer = Observer {
+                reject,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let result = provider
+                .complete_in_turn_with_observer(
+                    CompletionRequest {
+                        system: String::new(),
+                        messages: vec![],
+                        tools: vec![],
+                    },
+                    &crate::turn_affinity::TurnContext::new(),
+                    Some(&observer),
+                )
+                .await;
+            if reject {
+                assert!(
+                    matches!(result, Err(ProviderError::Observation { completed: Some(ref response), .. }) if response.usage.unwrap().total_tokens == 7)
+                );
+            } else {
+                assert_eq!(result.unwrap().text, "normal");
+            }
+            let usage = meter.snapshot();
+            assert_eq!(usage.usage.total_tokens, 7);
+            assert_eq!(usage.reported_responses, 1);
+            assert_eq!(usage.failed_requests, 0);
+            assert_eq!(observer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn p43_http_success_and_errors_have_byte_limits() {
+        for status in [200, 429, 500] {
+            let server = MockServer::start().await;
+            let body = if status == 200 {
+                serde_json::json!({"choices":[{"message":{"content":"x".repeat(4 * 1024 * 1024 + 1)}}]}).to_string()
+            } else {
+                "x".repeat(64 * 1024 + 1)
+            };
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            let p = OpenAiProvider::new(server.uri(), "dummy".into(), "fixture".into()).unwrap();
+            let result = p
+                .complete(CompletionRequest {
+                    system: String::new(),
+                    messages: vec![],
+                    tools: vec![],
+                })
+                .await;
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("limit")),
+                "status={status}: expected a byte limit error"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn parses_tool_call_from_response() {

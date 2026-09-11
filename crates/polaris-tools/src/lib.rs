@@ -2,6 +2,7 @@
 
 pub mod bash;
 pub mod edit;
+pub mod isolated_read;
 pub mod path_policy;
 pub mod predicate;
 pub mod read;

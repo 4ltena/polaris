@@ -44,8 +44,25 @@ pub(crate) fn run_mutation(
         Some(&payload),
     )?;
 
-    if outcome.status == 0 {
-        return Ok(outcome.stdout.trim().to_string());
+    interpret_mutation_result(
+        policy,
+        path,
+        outcome.status,
+        &outcome.stdout,
+        &outcome.stderr,
+    )
+}
+
+/// Interpret an owned helper's completed output without executing it again.
+pub fn interpret_mutation_result(
+    policy: &SandboxPolicy,
+    path: &Path,
+    status: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Result<String, ToolError> {
+    if status == 0 {
+        return Ok(stdout.trim().to_string());
     }
 
     // Labeling every non-zero exit as "the policy denied it" would deliver
@@ -62,7 +79,7 @@ pub(crate) fn run_mutation(
     // A helper that fails to launch, or any unanticipated shape of failure,
     // falls through to this side, so the conservative default doesn't
     // change.
-    if let Some(reason) = polaris_sandbox::helper::request_problem(&outcome.stderr) {
+    if let Some(reason) = polaris_sandbox::helper::request_problem(stderr) {
         return Err(ToolError::MutationFailed {
             path: path.display().to_string(),
             detail: reason.to_string(),
@@ -72,7 +89,7 @@ pub(crate) fn run_mutation(
     Err(ToolError::WriteDenied {
         path: path.display().to_string(),
         policy: policy.describe(),
-        detail: outcome.stderr.trim().to_string(),
+        detail: stderr.trim().to_string(),
     })
 }
 

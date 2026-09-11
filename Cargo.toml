@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -31,3 +31,8 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 jsonschema = { version = "0.51", default-features = false }
 similar = "2"
 unicode-width = "0.2"
+
+# Native debug apps verify large local models and packaged helper bytes before Hello.
+# Keep the complete SHA-256 checks fast without changing the application debug profile.
+[profile.dev.package.sha2]
+opt-level = 3

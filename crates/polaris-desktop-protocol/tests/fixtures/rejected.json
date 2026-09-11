@@ -1,0 +1,9 @@
+[
+  {"reason":"schema","wire":"{\"protocol_version\":1,\"kind\":\"request\",\"client_id\":\"c\",\"request_id\":\"r\",\"method\":\"run.start\",\"params\":{}}"},
+  {"reason":"schema","wire":"{\"protocol_version\":1,\"kind\":\"request\",\"client_id\":\"c\",\"request_id\":\"r\",\"method\":\"hello\",\"session_id\":\"s\",\"params\":{}}"},
+  {"reason":"schema","wire":"{\"protocol_version\":1,\"kind\":\"request\",\"client_id\":\"c\",\"request_id\":\"r\",\"method\":\"unknown\",\"params\":{}}"},
+  {"reason":"duplicate_key","wire":"{\"protocol_version\":1,\"kind\":\"request\",\"client_id\":\"c\",\"request_id\":\"r\",\"method\":\"hello\",\"params\":{\"x\":1,\"x\":2}}"},
+  {"reason":"null","wire":"{\"protocol_version\":1,\"kind\":\"request\",\"client_id\":\"c\",\"request_id\":\"r\",\"method\":\"hello\",\"params\":null}"},
+  {"reason":"unsupported_version","wire":"{\"protocol_version\":2,\"kind\":\"request\",\"client_id\":\"c\",\"request_id\":\"r\",\"method\":\"hello\",\"params\":{}}"},
+  {"reason":"schema","wire":"{\"protocol_version\":1,\"kind\":\"request\",\"client_id\":\"c\",\"request_id\":\"r\",\"method\":\"draft.update\",\"session_id\":\"s\",\"params\":{\"expected_draft_revision\":\"18446744073709551616\",\"text\":\"\"}}"}
+]

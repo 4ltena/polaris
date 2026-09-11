@@ -1,0 +1,28 @@
+[package]
+name = "polaris-desktop-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+polaris-auth = { path = "../polaris-auth" }
+polaris-tools = { path = "../polaris-tools" }
+polaris-sandbox = { path = "../polaris-sandbox" }
+async-trait.workspace = true
+polaris-skills = { path = "../polaris-skills" }
+polaris-core = { path = "../polaris-core" }
+polaris-provider = { path = "../polaris-provider" }
+polaris-desktop-protocol = { path = "../polaris-desktop-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+libc = "=0.2.189"
+
+[dev-dependencies]
+polaris-core = { path = "../polaris-core", features = ["execution-test-support"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

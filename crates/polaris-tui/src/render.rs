@@ -200,6 +200,9 @@ fn format_tool_result_preview(result: &str) -> Vec<String> {
 /// subagents.
 pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
     match event {
+        // Desktop-only provisional text is replaced by the authoritative
+        // completion. The legacy TUI continues to render that completion once.
+        AgentEvent::TextDelta { .. } => Vec::new(),
         AgentEvent::WorkflowResolved {
             phase,
             skill_ids,

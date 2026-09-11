@@ -1,4 +1,9 @@
-//! 保存専用desktop serviceと、TempDir専用のP3 fake service。実provider・認証は接続しない。
+//! Durable storage IPC and explicitly configured native-owner execution.
+
+#[cfg(target_os = "macos")]
+mod startup;
+#[cfg(target_os = "macos")]
+pub use startup::{StartedOwner, StartupError, start_owner};
 
 mod engine;
 #[cfg(unix)]
@@ -21,20 +26,24 @@ pub use launch_arguments::{
 mod package_manifest;
 #[cfg(target_os = "macos")]
 pub use package_manifest::{PackageManifestError, PackagedExecutionHelper, read_package_manifest};
-mod execution;
 #[cfg(target_os = "macos")]
 mod auth_tokens;
+mod execution;
 #[cfg(target_os = "macos")]
 pub use auth_tokens::DesktopAuthTokens;
 #[cfg(target_os = "macos")]
 mod configured_factory;
 #[cfg(target_os = "macos")]
+mod memory_resources;
+#[cfg(target_os = "macos")]
 pub use configured_factory::{
-    ConfiguredRunFactory, ConfirmedSourceGrant, FactoryError, TrustedBackend, TrustedFactoryResources,
-    WorkspacePreparationRecipe,
+    ConfiguredRunFactory, ConfirmedSourceGrant, FactoryError, TrustedBackend,
+    TrustedFactoryResources, TrustedMemoryIndex, WorkspacePreparationRecipe,
 };
-mod transport;
+#[cfg(target_os = "macos")]
+pub use memory_resources::ResourceError as MemoryResourceError;
 mod recovery_transport;
+mod transport;
 pub use recovery_transport::{RecoveryTransport, RecoveryTransportError};
 #[cfg(target_os = "macos")]
 pub use recovery_transport::{serve_source_recovery, serve_source_recovery_draining};
@@ -49,17 +58,17 @@ mod core_integration_tests;
 pub use engine::{DesktopService, FakeService, Options, ServiceConfig, project_id, session_id};
 #[cfg(target_os = "macos")]
 pub use engine::{
-    SourceApplyRuntime, SourceRecoveryHandle, TrustedRunCompletion, TrustedRunFactory, TrustedRunInputs,
-    TrustedSourceFactory,
+    SourceApplyRuntime, SourceRecoveryHandle, TrustedHistoryResources, TrustedRunCompletion,
+    TrustedRunFactory, TrustedRunInputs, TrustedSourceFactory,
 };
 pub use transport::{Exit, ServiceError};
 
 #[cfg(target_os = "macos")]
+mod production_source_factory;
+#[cfg(target_os = "macos")]
 mod source_apply;
 #[cfg(target_os = "macos")]
 mod source_apply_io;
-#[cfg(target_os = "macos")]
-mod production_source_factory;
 #[cfg(target_os = "macos")]
 pub use production_source_factory::ProductionSourceFactory;
 #[cfg(target_os = "macos")]
@@ -67,3 +76,8 @@ pub use source_apply::{
     CurrentSourcePolicy, PreparedSourceRecovery, SourceApplyClock, SourceApplyController,
     SourceApplyError, SourceApplyRequest, SourceApplyState, SourceDecisionReceipt,
 };
+
+#[cfg(target_os = "macos")]
+mod workspace_view;
+#[cfg(target_os = "macos")]
+pub use workspace_view::{WorkspaceSourceIdentity, WorkspaceViewReader};

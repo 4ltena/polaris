@@ -3,6 +3,76 @@
 use crate::{ids::*, run_state::RunState};
 use serde::{Deserialize, Serialize};
 
+/// 原文保存期間とは独立した、要求履歴の構成方式。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryMode {
+    #[default]
+    Legacy,
+    Strict10,
+}
+impl HistoryMode {
+    pub fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPhase {
+    Preparing,
+    Ready,
+    Failed,
+    OutcomeUnknown,
+}
+
+crate::object_wire! {
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryUsage {
+    pub input_tokens: DecimalU64,
+    pub output_tokens: DecimalU64,
+    pub cached_tokens: DecimalU64,
+    pub reported_responses: DecimalU64,
+    pub missing_responses: DecimalU64,
+    pub failed_requests: DecimalU64,
+}
+}
+
+crate::object_wire! {
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingUsage {
+    pub requests: DecimalU64,
+    pub completed: DecimalU64,
+    pub failed: DecimalU64,
+    pub unknown: DecimalU64,
+    pub input_tokens: DecimalU64,
+}
+}
+
+crate::object_wire! {
+/// Last strict10 run only. Tokens with missing coverage are known subtotals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryStatus {
+    pub run_id: RunId,
+    pub phase: MemoryPhase,
+    pub detail: String,
+    pub recent_raw_turns: DecimalU64,
+    pub retrieval_sources: Vec<String>,
+    pub reference_tokens: DecimalU64,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub main_usage: Option<MemoryUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub summary_usage: Option<MemoryUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub embedding_usage: Option<EmbeddingUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub total_usage: Option<MemoryUsage>,
+}
+}
+
 crate::object_wire! {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +101,8 @@ pub struct Configuration {
     pub provider: String,
     pub model: String,
     pub effort: String,
+    #[serde(default, skip_serializing_if = "HistoryMode::is_legacy")]
+    pub history_mode: HistoryMode,
 }
 }
 
@@ -175,6 +247,10 @@ pub struct Snapshot {
     pub position: Position,
     pub draft: Draft,
     pub configuration: Configuration,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub memory: Option<MemoryStatus>,
+    pub role_bindings: Vec<crate::role_bindings::RoleBinding>,
+    pub role_catalog: Vec<crate::role_bindings::RoleDescriptor>,
     pub tasks: Vec<Task>,
     pub runs: Vec<Run>,
     pub children: Vec<Child>,

@@ -42,6 +42,9 @@ pub struct ProtocolError {
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     LocalModels,
+    WorkspaceRead,
+    AttachmentRead,
+    RoleConfigure,
     SessionRead,
     HistoryRead,
     DraftUpdate,
@@ -240,6 +243,12 @@ crate::object_wire! {
 pub enum SuccessResult {
     #[serde(rename = "local.models")]
     LocalModels(crate::local_models::LocalModelsResult),
+    #[serde(rename = "workspace.read")]
+    WorkspaceRead(crate::workspace_view::WorkspaceView),
+    #[serde(rename = "attachment.read")]
+    AttachmentRead(crate::workspace_view::AttachmentView),
+    #[serde(rename = "session.roles.configure")]
+    SessionRolesConfigure(crate::role_bindings::RoleBindingsConfigured),
     #[serde(rename = "hello")]
     Hello(Hello),
     #[serde(rename = "session.open")]
@@ -278,6 +287,9 @@ impl SuccessResult {
         match self {
             Self::Hello(_) => Method::Hello,
             Self::LocalModels(_) => Method::LocalModels,
+            Self::WorkspaceRead(_) => Method::WorkspaceRead,
+            Self::AttachmentRead(_) => Method::AttachmentRead,
+            Self::SessionRolesConfigure(_) => Method::SessionRolesConfigure,
             Self::SessionOpen(_) => Method::SessionOpen,
             Self::SessionSnapshot(_) => Method::SessionSnapshot,
             Self::SessionSubscribe(_) => Method::SessionSubscribe,
@@ -329,10 +341,9 @@ impl Response {
             Ok(SuccessResult::LocalModels(result)),
             crate::request::RequestBody::LocalModels(_, params),
         ) = (&self.outcome, &request.body)
+            && (result.provider != params.provider || result.endpoint != params.endpoint)
         {
-            if result.provider != params.provider || result.endpoint != params.endpoint {
-                return Err(CorrelationError::Method);
-            }
+            return Err(CorrelationError::Method);
         }
         Ok(())
     }

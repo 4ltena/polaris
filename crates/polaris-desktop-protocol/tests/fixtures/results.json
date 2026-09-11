@@ -48,7 +48,9 @@
       "children": [],
       "child_attempt_count": "0",
       "unresolved_approvals": [],
-      "history_start_cursor": "history-start"
+      "history_start_cursor": "history-start",
+      "role_bindings": [],
+      "role_catalog": []
     }
   },
   {
@@ -82,7 +84,9 @@
       "children": [],
       "child_attempt_count": "0",
       "unresolved_approvals": [],
-      "history_start_cursor": "history-start"
+      "history_start_cursor": "history-start",
+      "role_bindings": [],
+      "role_catalog": []
     }
   },
   {
@@ -116,7 +120,9 @@
       "children": [],
       "child_attempt_count": "0",
       "unresolved_approvals": [],
-      "history_start_cursor": "history-start"
+      "history_start_cursor": "history-start",
+      "role_bindings": [],
+      "role_catalog": []
     }
   },
   {

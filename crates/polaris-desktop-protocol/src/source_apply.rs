@@ -6,6 +6,46 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 pub const MAX_SOURCE_APPLY_ITEMS: usize = 32;
 pub const MAX_SOURCE_APPLY_RESULT_BYTES: usize = 256 * 1024;
 
+/// Projection of a retained source-apply report. This is evidence about the
+/// apply operation, and is intentionally independent of the run outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceApplyResultStatus {
+    Applied,
+    Failed,
+    Partial,
+    Unknown,
+}
+
+/// The bounded failure kinds emitted by the macOS apply implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceApplyFailureKind {
+    ProtectionUnavailable,
+    InvalidChangeSet,
+    UnsupportedEntry,
+    Conflict,
+    Secret,
+    AncestorChanged,
+    CrossDevice,
+    Io,
+    RestoreConflict,
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceApplyResultSummary {
+    pub result_id: ResultId,
+    pub status: SourceApplyResultStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub failure_kind: Option<SourceApplyFailureKind>,
+    pub installed_count: DecimalU64,
+    pub deleted_count: DecimalU64,
+    pub restored_count: DecimalU64,
+}
+}
+
 crate::object_wire! {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +66,9 @@ pub struct SourceApplySummary {
     pub intent_committed: bool,
     /// A persisted result is not a claim that applying succeeded.
     pub result_saved: bool,
+    /// A bounded projection of a retained report, when a result was saved.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub result: Option<SourceApplyResultSummary>,
 }
 }
 

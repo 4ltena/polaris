@@ -63,6 +63,10 @@ pub enum EventBody {
     DraftUpdated(Draft),
     #[serde(rename = "configuration.updated")]
     ConfigurationUpdated(Configuration),
+    #[serde(rename = "memory.updated")]
+    MemoryUpdated(MemoryStatus),
+    #[serde(rename = "role_bindings.updated")]
+    RoleBindingsUpdated(crate::role_bindings::RoleBindingsConfigured),
     #[serde(rename = "approval.requested")]
     ApprovalRequested(PendingApproval),
     #[serde(rename = "approval.resolved")]
@@ -119,6 +123,8 @@ impl<'de> Deserialize<'de> for Event {
                 | "child.updated"
                 | "draft.updated"
                 | "configuration.updated"
+                | "memory.updated"
+                | "role_bindings.updated"
                 | "approval.requested"
                 | "approval.resolved"
                 | "approval.expired"
@@ -165,6 +171,8 @@ impl Serialize for Event {
             EventBody::ChildUpdated(p) => payload!("child.updated", p),
             EventBody::DraftUpdated(p) => payload!("draft.updated", p),
             EventBody::ConfigurationUpdated(p) => payload!("configuration.updated", p),
+            EventBody::MemoryUpdated(p) => payload!("memory.updated", p),
+            EventBody::RoleBindingsUpdated(p) => payload!("role_bindings.updated", p),
             EventBody::ApprovalRequested(p) => payload!("approval.requested", p),
             EventBody::ApprovalResolved(p) => payload!("approval.resolved", p),
             EventBody::ApprovalExpired(p) => payload!("approval.expired", p),

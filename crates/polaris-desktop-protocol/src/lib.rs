@@ -37,11 +37,13 @@ pub mod event;
 pub mod ids;
 pub mod request;
 pub mod response;
+pub mod role_bindings;
 pub mod run_state;
 pub mod snapshot;
 pub mod source_apply;
 pub mod source_recovery;
 pub mod validate;
+pub mod workspace_view;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 

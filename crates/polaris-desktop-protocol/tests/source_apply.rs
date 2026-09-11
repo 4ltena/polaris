@@ -1,3 +1,4 @@
+//! Source application wire contracts, correlation and bounded pagination tests.
 use polaris_desktop_protocol::{
     codec,
     ids::*,
@@ -316,4 +317,29 @@ fn source_direct_results_cannot_bypass_count_or_byte_budgets() {
     assert!(serde_json::to_vec(&result).is_err());
     let value = json!({"approval_id":"approval","payload_hash":"a","session_revision":"7","entries":[{"relative_path":"x".repeat(MAX_SOURCE_APPLY_RESULT_BYTES)}]});
     assert!(serde_json::from_value::<SourceApplyPageResult>(value).is_err());
+}
+
+#[test]
+fn source_apply_result_projection_is_optional_bounded_and_typed() {
+    let mut value = serde_json::to_value(summary()).unwrap();
+    assert!(value.get("result").is_none());
+    value["result"] = json!({
+        "result_id":"saved-result",
+        "status":"partial",
+        "failure_kind":"conflict",
+        "installed_count":"1",
+        "deleted_count":"2",
+        "restored_count":"3"
+    });
+    let parsed: SourceApplySummary = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        parsed.result.as_ref().unwrap().status,
+        SourceApplyResultStatus::Partial
+    );
+    assert_eq!(
+        parsed.result.as_ref().unwrap().failure_kind,
+        Some(SourceApplyFailureKind::Conflict)
+    );
+    value["result"]["failure_kind"] = json!("unbounded_report_text");
+    assert!(serde_json::from_value::<SourceApplySummary>(value).is_err());
 }

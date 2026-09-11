@@ -17,11 +17,13 @@ revision = "固定したモデルrevision"
 
 strict10は`runtime`、`model_path`、`revision`の3値が揃わなければ開始しない。helperは固定したローカル`multilingual-e5-small` snapshotだけを読み、`manifest.json`のrevision・全ファイル・SHA-256を確認する。実行中の取得、ネットワークアクセス、動的コード読込みは行わない。問い合わせには`query: `、本文には`passage: `のprefixを付け、512 tokenizer tokenを超える本文は切り詰めず拒否する。
 
-strict10またはworkflowを有効にした会話は`~/.polaris/sessions-v2/<UUID>/`へ保存する。raw JSONLは追記後に同期し、状態markerと世代付きsnapshotは比較交換で公開する。索引公開と削除はSQLite tombstoneのトランザクションに含める。競合・破損・削除済み会話で停止しても、raw履歴を破棄しない。legacyのJSONL snapshotとは保存形式も回復範囲も異なる。
+CLI/TUIでstrict10またはworkflowを有効にした会話は`~/.polaris/sessions-v2/<UUID>/`へ保存する。raw JSONLは追記後に同期し、状態markerと世代付きsnapshotは比較交換で公開する。索引公開と削除はSQLite tombstoneのトランザクションに含める。競合・破損・削除済み会話で停止しても、raw履歴を破棄しない。legacyのJSONL snapshotとは保存形式も回復範囲も異なる。
+
+macOS GUIでは履歴設定からstrict10を明示選択する。原文は既存のv3保存先へ全件保持し、sessions-v2へ複製しない。埋め込み設定はOSユーザーの`~/.polaris/config.toml`から読み、主接続と同じCodex/OpenAI認証系の専用`gpt-6-astra/medium`で要約する。検索範囲は同じproject/session/epoch。主回答・要約・ローカル埋め込みの使用量を分け、結果不明の要約は自動再送しない。実GUIの12入力で検索不具合を検出して修正し、自動回帰・接続・履歴復元は確認済み。追加実送信を省略したため、修正後の実モデル受入は未検証である。
 
 索引の検索結果は`conversation://…` URIで出典範囲を表す。URIはファイルパスではなく、プロジェクト、会話、epoch、generation、raw hashで照合する識別子である。元の本文はこの一致を確認してから読む。
 
-strict10は直近10実ユーザーターンのtool往復を含む原文を要求へ残し、それ以前を1ターン256参照トークン以内の型付き要約として索引化する。検索で要求へ戻す要約は最大3件・合計768参照トークンで、原文を確認する場合は`conversation://`を`read`へ渡す。原文の1ページは最大4KiB・1,024参照トークンで、続きのURIが返る。検索結果は過去の引用であり、現在の指示や承認にはならない。
+strict10は直近10実ユーザーターンのtool往復を含む原文を要求へ残し、それ以前を型付き要約として索引化する。要約は出典情報を含めて1件256参照トークン以内、検索で要求へ戻すものは最大3件・合計768参照トークンとする。超過する要約は主要求を始めず診断し、切り詰めや自動再送は行わない。原文を確認する場合は`conversation://`を`read`へ渡す。原文の1ページは最大4KiB・1,024参照トークンで、続きのURIが返る。検索結果は過去の引用であり、現在の指示や承認にはならない。
 
 固定常時コンテキストの基礎上限は従来どおり990参照トークンである。workflowの明示skillと状態表示に最大384、Web定義用に96を別枠で確保し、合計1,470を設計上限とする。これは実入力の測定値ではなく、履歴・要約・取得結果は別に加算される。Web実接続は未確認のため有効化できない。
 

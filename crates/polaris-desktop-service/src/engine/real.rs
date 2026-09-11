@@ -20,6 +20,11 @@ use polaris_provider::{Message, Provider, Role};
 /// Skills and agent types are immutable trusted snapshots; no host disk reload.
 /// Legacy history hooks remain unavailable.
 pub trait TrustedRunFactory: Send + Sync {
+    /// Immutable trusted catalog used to validate next-run role choices.
+    fn role_catalog(&self) -> &[polaris_skills::AgentType] {
+        &[]
+    }
+
     fn prepare(
         &self,
         target: &RunTarget,
@@ -109,6 +114,16 @@ pub struct TrustedRunInputs {
     pub spawn_write_concurrency: usize,
     /// Preopened trusted backend only; never resolved from a model-supplied path.
     pub tool_memory: Option<polaris_core::tool_memory::ToolMemory>,
+    pub history: Option<TrustedHistoryResources>,
+}
+
+/// Verified before provider admission; a dedicated summary client and per-run meter.
+pub struct TrustedHistoryResources {
+    pub summary_provider: Arc<dyn Provider>,
+    pub embedder: Arc<dyn polaris_core::conversation_memory::StrictEmbedder>,
+    pub database: std::path::PathBuf,
+    pub identity: polaris_core::desktop_store::MemoryResources,
+    pub embedding_usage: polaris_provider::attempts::AttemptLedger,
 }
 
 pub(super) struct TrustedRuns {
@@ -180,7 +195,7 @@ impl DesktopService {
 }
 
 enum PrepareOutcome {
-    Prepared(TrustedRunInputs),
+    Prepared(Box<TrustedRunInputs>),
     Failed,
     PanicUnknown,
 }
@@ -205,7 +220,7 @@ impl PrepareJob {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     factory.prepare(&target, &published)
                 })) {
-                    Ok(Ok(inputs)) => PrepareOutcome::Prepared(inputs),
+                    Ok(Ok(inputs)) => PrepareOutcome::Prepared(Box::new(inputs)),
                     Ok(Err(_)) => PrepareOutcome::Failed,
                     Err(payload) => {
                         // Factory owns cleanup of partial preparation on unwind. A
@@ -236,10 +251,10 @@ impl Drop for PrepareJob {
     fn drop(&mut self) {
         // Emergency blocking-owner destruction only. Normal loops poll and
         // retain returned inputs. Never detach a preparation thread.
-        if let Some(worker) = self.worker.take() {
-            if let Err(payload) = worker.join() {
-                std::mem::forget(payload);
-            }
+        if let Some(worker) = self.worker.take()
+            && let Err(payload) = worker.join()
+        {
+            std::mem::forget(payload);
         }
     }
 }
@@ -257,6 +272,11 @@ pub(super) struct RealRun {
     cancelled: bool,
     worker: Option<DesktopRun>,
     events: Option<DesktopEventReceiver>,
+    memory: Option<polaris_core::desktop_memory::DesktopMemoryOwner>,
+    summary_usage: Option<polaris_provider::UsageMeter>,
+    main_usage: polaris_provider::UsageMeter,
+    embedding_usage: Option<polaris_provider::attempts::AttemptLedger>,
+    last_memory_event: Option<polaris_desktop_protocol::snapshot::MemoryStatus>,
     // Retain the sanitized copy through core/native cleanup and durable finish.
     _prepared: Option<Arc<PreparedWorkspace>>,
     prefix: Vec<Message>,
@@ -264,6 +284,7 @@ pub(super) struct RealRun {
     outcome: Option<Observation>,
     workflow: Option<SavedWorkflow>,
     output_rejected: bool,
+    memory_evidence_over_budget: bool,
     joined: bool,
     sequence: u64,
 }
@@ -276,12 +297,18 @@ impl RealRun {
             cancelled: false,
             worker: None,
             events: None,
+            memory: None,
+            summary_usage: None,
+            main_usage: Default::default(),
+            embedding_usage: None,
+            last_memory_event: None,
             _prepared: None,
             prefix: vec![],
             suffix: vec![],
             outcome: None,
             workflow: None,
             output_rejected: false,
+            memory_evidence_over_budget: false,
             joined: false,
             sequence: 0,
         }
@@ -299,6 +326,9 @@ impl RealRun {
         target: &RunTarget,
         mut store: Option<&mut Writer>,
     ) -> Result<Vec<EventBody>, ServiceError> {
+        if let Some(memory) = &mut self.memory {
+            memory.poll(store.as_deref_mut(), self.cancelled);
+        }
         if let Preparation::Running(job) = &mut self.preparation
             && let Some(outcome) = job.poll()
         {
@@ -306,7 +336,7 @@ impl RealRun {
             match outcome {
                 PrepareOutcome::Prepared(inputs) => {
                     self._prepared = Some(inputs.prepared.clone());
-                    self.prepared_inputs = Some(inputs);
+                    self.prepared_inputs = Some(*inputs);
                 }
                 PrepareOutcome::Failed => self.outcome = Some(Observation::Failed),
                 PrepareOutcome::PanicUnknown => self.outcome = Some(Observation::OutcomeUnknown),
@@ -350,6 +380,15 @@ impl RealRun {
         match joined {
             Ok(completion) => {
                 self.output_rejected = completion.session.persistence_error.is_some();
+                // Only a typed local failure may add detail; provider errors stay private.
+                self.memory_evidence_over_budget = matches!(
+                    &completion.result,
+                    Err(DesktopRunError::Agent(AgentError::Io(error)))
+                        if matches!(
+                            error.get_ref().and_then(|cause| cause.downcast_ref::<polaris_core::conversation_memory::ConversationMemoryError>()),
+                            Some(polaris_core::conversation_memory::ConversationMemoryError::ConversationEvidenceBudgetExceeded)
+                        )
+                );
                 if completion.session.messages.len() < self.prefix.len()
                     || !completion
                         .session
@@ -385,6 +424,142 @@ impl RealRun {
         }
         Ok(updates)
     }
+
+    fn prepare_memory(
+        &mut self,
+        history: Option<TrustedHistoryResources>,
+        target: &RunTarget,
+        store: &mut Writer,
+        total: &polaris_provider::UsageMeter,
+    ) -> Result<Option<Arc<polaris_core::desktop_memory::DesktopMemory>>, ServiceError> {
+        let expected = store
+            .snapshot()?
+            .state
+            .runs
+            .iter()
+            .find(|r| r.run.run_id == target.run_id)
+            .ok_or(StoreError::NotFound)?
+            .configuration
+            .history_mode;
+        if history.is_some()
+            != (expected == polaris_desktop_protocol::snapshot::HistoryMode::Strict10)
+        {
+            return Err(ServiceError::Options);
+        }
+        let Some(history) = history else {
+            return Ok(None);
+        };
+        store.bind_memory(target, history.identity.clone())?;
+        let summary = Arc::new(polaris_core::strict_provider::ProviderSummary::new(
+            Arc::new(total.wrap(history.summary_provider)),
+        ));
+        self.summary_usage = Some(summary.usage.clone());
+        self.embedding_usage = Some(history.embedding_usage);
+        let strict = Arc::new(polaris_core::conversation_memory::StrictHistory::new(
+            summary,
+            history.embedder,
+        ));
+        let (memory, owner) = polaris_core::desktop_memory::DesktopMemory::pair(
+            target.clone(),
+            strict,
+            history.database,
+            history.identity,
+        )
+        .map_err(|_| ServiceError::Options)?;
+        self.memory = Some(owner);
+        Ok(Some(memory))
+    }
+
+    fn checkpoint_memory(
+        &mut self,
+        target: &RunTarget,
+        store: &mut Writer,
+        total: &polaris_provider::UsageMeter,
+    ) -> Result<Option<EventBody>, ServiceError> {
+        use polaris_desktop_protocol::snapshot::{EmbeddingUsage, MemoryPhase};
+        use polaris_provider::attempts::{AttemptStatus, UsageObservation};
+        let Some(mut status) = store
+            .snapshot()?
+            .state
+            .runs
+            .iter()
+            .find(|r| r.run.run_id == target.run_id)
+            .and_then(|r| r.memory.clone())
+        else {
+            return Ok(None);
+        };
+        status.total_usage = observed_usage(total.snapshot());
+        status.main_usage = observed_usage(self.main_usage.snapshot());
+        status.summary_usage = self
+            .summary_usage
+            .as_ref()
+            .and_then(|m| observed_usage(m.snapshot()));
+        if let Some(ledger) = &self.embedding_usage {
+            let records = ledger.snapshot();
+            if !records.is_empty() {
+                let mut usage = EmbeddingUsage {
+                    requests: DecimalU64::new(records.len() as u64),
+                    ..Default::default()
+                };
+                for record in records {
+                    match record.status {
+                        AttemptStatus::Succeeded => {
+                            usage.completed =
+                                usage.completed.checked_add(1).map_err(StoreError::from)?
+                        }
+                        AttemptStatus::Failed => {
+                            usage.failed = usage.failed.checked_add(1).map_err(StoreError::from)?
+                        }
+                        AttemptStatus::Running | AttemptStatus::Cancelled => {
+                            usage.unknown =
+                                usage.unknown.checked_add(1).map_err(StoreError::from)?
+                        }
+                    }
+                    if let UsageObservation::Known { input_tokens, .. } = record.usage {
+                        usage.input_tokens = usage
+                            .input_tokens
+                            .checked_add(u64::from(input_tokens))
+                            .map_err(StoreError::from)?;
+                    }
+                }
+                status.embedding_usage = Some(usage);
+            }
+        }
+        if let Some(outcome) = self.outcome {
+            if outcome == Observation::OutcomeUnknown {
+                status.phase = MemoryPhase::OutcomeUnknown;
+                status.detail = "実行結果が不明です。要約を自動再送していません".into();
+            } else if status.phase == MemoryPhase::Preparing {
+                status.phase = MemoryPhase::Failed;
+                status.detail =
+                    "会話記憶の準備を完了できなかったため主要求を開始していません".into();
+            }
+            if self.memory_evidence_over_budget {
+                status.detail = "出典情報を含む記憶が256トークンを超えたため主要求を開始していません。要約は自動再送していません".into();
+            }
+        }
+        store.record_memory_status(target, status.clone())?;
+        if self.last_memory_event.as_ref() == Some(&status) {
+            return Ok(None);
+        }
+        self.last_memory_event = Some(status.clone());
+        Ok(Some(EventBody::MemoryUpdated(status)))
+    }
+}
+
+fn observed_usage(
+    report: polaris_provider::UsageReport,
+) -> Option<polaris_desktop_protocol::snapshot::MemoryUsage> {
+    (report.reported_responses + report.missing_responses + report.failed_requests > 0).then(|| {
+        polaris_desktop_protocol::snapshot::MemoryUsage {
+            input_tokens: DecimalU64::new(u64::from(report.usage.input_tokens)),
+            output_tokens: DecimalU64::new(u64::from(report.usage.output_tokens)),
+            cached_tokens: DecimalU64::new(u64::from(report.usage.cached_tokens)),
+            reported_responses: DecimalU64::new(report.reported_responses),
+            missing_responses: DecimalU64::new(report.missing_responses),
+            failed_requests: DecimalU64::new(report.failed_requests),
+        }
+    })
 }
 
 /// Translate only stable child lifecycle events; persist before any UI exposure.
@@ -653,20 +828,38 @@ impl Engine {
                         real.outcome = Some(Observation::Cancelled);
                         active.execution.cancel();
                     } else {
-                        let inputs = real
+                        let mut inputs = real
                             .prepared_inputs
                             .take()
                             .expect("validated retained inputs");
+                        let desktop_memory = real.prepare_memory(
+                            inputs.history.take(),
+                            &active.target,
+                            &mut self.store,
+                            &active.usage,
+                        );
+                        if desktop_memory.is_err() {
+                            real.outcome = Some(Observation::Failed);
+                        }
                         let input = DesktopRunInput {
                             run_id: active.target.run_id.clone(),
                             prepared: inputs.prepared,
                             execution: active.execution.port.clone(),
-                            provider: Arc::new(active.usage.wrap(inputs.provider)),
-                            provider_pool: Arc::new(active.usage.wrap(inputs.provider_pool)),
+                            provider: Arc::new(
+                                active
+                                    .usage
+                                    .wrap(Arc::new(real.main_usage.wrap(inputs.provider))),
+                            ),
+                            provider_pool: Arc::new(
+                                active
+                                    .usage
+                                    .wrap(Arc::new(real.main_usage.wrap(inputs.provider_pool))),
+                            ),
                             session: Session {
                                 messages: real.prefix.clone(),
                                 tool_memory: inputs.tool_memory,
                                 workflow,
+                                desktop_memory: desktop_memory.unwrap_or(None),
                                 ..Session::new()
                             },
                             always_on: inputs.always_on,
@@ -677,12 +870,14 @@ impl Engine {
                             spawn_concurrency: inputs.spawn_concurrency,
                             spawn_write_concurrency: inputs.spawn_write_concurrency,
                         };
-                        match DesktopRun::start(input) {
-                            Ok((worker, events)) => {
-                                real.worker = Some(worker);
-                                real.events = Some(events);
+                        if real.outcome.is_none() {
+                            match DesktopRun::start(input) {
+                                Ok((worker, events)) => {
+                                    real.worker = Some(worker);
+                                    real.events = Some(events);
+                                }
+                                Err(_) => real.outcome = Some(Observation::Failed),
                             }
-                            Err(_) => real.outcome = Some(Observation::Failed),
                         }
                     }
                 } else {
@@ -691,8 +886,27 @@ impl Engine {
             }
         }
         if real.outcome.is_some() {
+            // An unresolved summary may have consumed a provider request. Preserve
+            // its durable intent and refuse automatic replay after restart.
+            if self
+                .store
+                .snapshot()?
+                .state
+                .runs
+                .iter()
+                .find(|r| r.run.run_id == active.target.run_id)
+                .is_some_and(|r| {
+                    r.operations
+                        .iter()
+                        .any(|op| op.operation_id != active.operation && op.result_id.is_none())
+                })
+            {
+                real.outcome = Some(Observation::OutcomeUnknown);
+            }
             active.execution.cancel();
         }
+        let memory_event =
+            real.checkpoint_memory(&active.target, &mut self.store, &active.usage)?;
         active.execution.step(&mut self.store, &active.target)?;
         let approval_events = active.execution.take_approval_events();
         self.cleanups.step();
@@ -700,6 +914,9 @@ impl Engine {
         if let Some(out) = out {
             self.emit_all(child_events, out)?;
             self.emit_all(approval_events, out)?;
+            if let Some(event) = memory_event {
+                self.emit(event, out)?;
+            }
         }
         let active = self.active.as_mut().ok_or(ServiceError::Worker)?;
         let real = active.real.as_mut().ok_or(ServiceError::Worker)?;

@@ -3,13 +3,16 @@
 mod local_models;
 #[cfg(target_os = "macos")]
 mod real;
+mod role_bindings;
 #[cfg(target_os = "macos")]
 mod source_owner;
 #[cfg(target_os = "macos")]
 mod source_recovery;
 mod source_view;
 #[cfg(target_os = "macos")]
-pub use real::{TrustedRunCompletion, TrustedRunFactory, TrustedRunInputs};
+pub use real::{
+    TrustedHistoryResources, TrustedRunCompletion, TrustedRunFactory, TrustedRunInputs,
+};
 #[cfg(target_os = "macos")]
 pub use source_owner::{SourceApplyRuntime, TrustedSourceFactory};
 #[cfg(target_os = "macos")]
@@ -128,10 +131,19 @@ pub struct DesktopService {
     engine: Option<Engine>,
 }
 impl DesktopService {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_workspace_reader(mut self, reader: crate::WorkspaceViewReader) -> Self {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.workspace_reader = Some(reader);
+        }
+        self
+    }
+
     pub fn open(config: ServiceConfig) -> Result<Self, ServiceError> {
         Self::open_storage(
             config,
             Configuration {
+                history_mode: Default::default(),
                 configuration_revision: DecimalU64::new(0),
                 provider: "unconfigured".into(),
                 model: String::new(),
@@ -501,6 +513,8 @@ impl Drop for DisconnectGuard {
 }
 
 struct Engine {
+    #[cfg(target_os = "macos")]
+    workspace_reader: Option<crate::WorkspaceViewReader>,
     local_models: Option<local_models::InventoryJob>,
     inventory_generation: u64,
     store: Writer,
@@ -543,6 +557,7 @@ impl Engine {
                     attachment_ids: vec![],
                 },
                 configuration: Configuration {
+                    history_mode: Default::default(),
                     configuration_revision: DecimalU64::new(0),
                     provider: "fake".into(),
                     model: "scripted".into(),
@@ -571,6 +586,8 @@ impl Engine {
             store,
             session,
             production: false,
+            #[cfg(target_os = "macos")]
+            workspace_reader: None,
             local_models: None,
             inventory_generation: 0,
             #[cfg(target_os = "macos")]
@@ -715,8 +732,17 @@ impl Engine {
                         Capability::RequestStatus,
                         Capability::Shutdown,
                     ];
+                    #[cfg(target_os = "macos")]
+                    if self.workspace_reader.is_some() {
+                        capabilities
+                            .extend([Capability::WorkspaceRead, Capability::AttachmentRead]);
+                    }
                     if self.source_enabled() {
                         capabilities.push(Capability::SourceApplyResolve);
+                    }
+                    if self.real_enabled() {
+                        capabilities.push(Capability::LocalModels);
+                        capabilities.push(Capability::RoleConfigure);
                     }
                     if self.production {
                         capabilities.retain(|c| *c != Capability::SessionConfigure);
@@ -756,7 +782,53 @@ impl Engine {
         }
         match &request.body {
             RequestBody::Hello => unreachable!(),
+            RequestBody::WorkspaceRead(_, params) => {
+                #[cfg(target_os = "macos")]
+                {
+                    if self.draining || self.active.is_some() || params.selected_path.len() > 4096 {
+                        return Err(error(ErrorCode::SessionBusy));
+                    }
+                    let reader = self
+                        .workspace_reader
+                        .as_ref()
+                        .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?;
+                    Ok(SuccessResult::WorkspaceRead(reader.read(
+                        if params.selected_path.is_empty() {
+                            None
+                        } else {
+                            Some(&params.selected_path)
+                        },
+                    )))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = params;
+                    Err(error(ErrorCode::CapabilityUnavailable))
+                }
+            }
+            RequestBody::AttachmentRead(_, params) => {
+                #[cfg(target_os = "macos")]
+                {
+                    if self.draining || self.active.is_some() || params.path.len() > 4096 {
+                        return Err(error(ErrorCode::SessionBusy));
+                    }
+                    self.workspace_reader
+                        .as_ref()
+                        .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?;
+                    Ok(SuccessResult::AttachmentRead(
+                        crate::WorkspaceViewReader::read_attachment(std::path::Path::new(
+                            &params.path,
+                        )),
+                    ))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = params;
+                    Err(error(ErrorCode::CapabilityUnavailable))
+                }
+            }
             RequestBody::LocalModels(..) => Err(error(ErrorCode::CapabilityUnavailable)),
+            RequestBody::SessionRolesConfigure(..) => self.configure_role_bindings(request, events),
             RequestBody::SessionOpen(_) => {
                 Ok(SuccessResult::SessionOpen(Box::new(self.snapshot(false)?)))
             }
@@ -1097,6 +1169,9 @@ impl Engine {
             position: position.clone(),
             draft: state.draft.clone(),
             configuration: state.configuration.clone(),
+            memory: state.runs.last().and_then(|r| r.memory.clone()),
+            role_bindings: role_bindings::to_wire(state.role_bindings.as_ref()),
+            role_catalog: self.role_catalog_wire(),
             tasks: state.tasks.clone(),
             runs: state.runs.iter().map(|r| r.run.clone()).collect(),
             children: state.children.iter().map(|c| c.child.clone()).collect(),

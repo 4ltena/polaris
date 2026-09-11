@@ -107,6 +107,10 @@ struct Args {
     #[arg(long, hide = true)]
     confined_apply: bool,
 
+    /// OS隔離された子で有界readを一件実行する内部入口。
+    #[arg(long, hide = true, conflicts_with = "confined_apply")]
+    confined_read: bool,
+
     /// The sandbox policy.
     #[arg(long, value_enum, default_value_t = SandboxModeArg::WorkspaceWrite)]
     sandbox: SandboxModeArg,
@@ -594,6 +598,9 @@ async fn main() -> ExitCode {
         None => {}
     }
 
+    if args.confined_read {
+        return run_confined_read();
+    }
     if args.confined_apply {
         return run_confined_apply();
     }
@@ -791,6 +798,16 @@ async fn main() -> ExitCode {
 
     let approval_policy: ApprovalPolicy = args.approval.into();
 
+    // Resolve the same two sources once; reads happen before each root request.
+    #[cfg(unix)]
+    let agents_refresh = match constitution::AgentsRefresh::from_home(&cwd) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("AGENTS.mdの読取元を準備できません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(unix))]
     let constitution = constitution::load(&cwd);
     let environment = constitution::environment_block(&cwd, None);
 
@@ -845,10 +862,19 @@ async fn main() -> ExitCode {
         eprintln!("agent type skipped: {s}");
     }
 
-    // What rides along on every turn is assembled here exactly once. The
-    // assembly itself lives in polaris-core, and the budget tests call the
-    // same function. Reassembling or appending to it here would make what
-    // production sends diverge from what the tests measure.
+    // Core owns both initial assembly and bounded request-boundary refresh.
+    // TUI retains this capability across turns; children keep their own prompts.
+    #[cfg(unix)]
+    let always_on = match prompt::assemble_always_on("", &environment, &discovered.skills)
+        .with_agents_refresh(agents_refresh)
+    {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            eprintln!("AGENTS.mdを読み込めません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(unix))]
     let always_on = prompt::assemble_always_on(&constitution, &environment, &discovered.skills);
 
     match args.prompt.clone() {
@@ -1162,8 +1188,17 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Entry point when running as a confined child. Executes the one JSON
-/// mutation read from stdin, then exits.
+/// 隔離read専用。要求と応答を有界にし、失敗本文をstderrへ出さない。
+fn run_confined_read() -> ExitCode {
+    use std::io::Write;
+    let reply = polaris_core::agent::serve_confined_read(std::io::stdin().lock());
+    match std::io::stdout().lock().write_all(&reply) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+/// Entry point for one confined JSON mutation.
 fn run_confined_apply() -> ExitCode {
     use std::io::Read;
 
@@ -1482,6 +1517,13 @@ mod tests {
         // fails lazily on first use. With nothing saved anywhere, we want
         // onboarding to fire, so this must stay "openai".
         assert_eq!(default_provider_name(false, false), "openai");
+    }
+
+    #[test]
+    fn confined_read_parses_without_prompt_and_conflicts_with_mutation() {
+        let args = Args::try_parse_from(["polaris", "--confined-read"]).unwrap();
+        assert!(args.confined_read);
+        assert!(Args::try_parse_from(["polaris", "--confined-read", "--confined-apply"]).is_err());
     }
 
     #[test]

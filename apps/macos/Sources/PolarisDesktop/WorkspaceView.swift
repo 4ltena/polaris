@@ -26,7 +26,7 @@ struct WorkspaceView: View {
                 let layout = state.layout.fitted(width: geometry.size.width, height: geometry.size.height)
                 HStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 0) {
-                        VStack(alignment: .leading, spacing: 0) {
+                        VStack(spacing: 0) {
                             if let logo {
                                 // 背景を持たない原本SVGをサイドメニューへ重ねる。
                                 Image(nsImage: logo).resizable().renderingMode(.template).scaledToFit()
@@ -35,9 +35,9 @@ struct WorkspaceView: View {
                             } else { Text("polaris").font(.title2) }
                             if let release {
                                 Text(release.title).font(.caption2).foregroundStyle(.secondary)
-                                    .padding(.horizontal, 10)
                             }
-                        }.padding(.horizontal, 10).padding(.top, 14).padding(.bottom, 18)
+                        }.frame(maxWidth: .infinity)
+                            .padding(.horizontal, 14).padding(.top, 14).padding(.bottom, 18)
                         if snapshot.isDemo {
                             Text("画面デモ · 実行・保存・送信なし")
                                 .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14)

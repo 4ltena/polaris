@@ -41,6 +41,9 @@ struct WorkspaceComposerInput: View {
     let onDiscardDeferredVoice: (() -> Void)?
     let attachmentNotice: String?
     @State private var inspectedAttachment: WorkspaceComposerAttachmentPreview?
+    @State private var inputExpanded = false
+    @State private var inputOverflows = false
+    private let compactInputHeight: CGFloat = 50
 
     init(text: Binding<String>, isComposing: Binding<Bool>, attachments: [WorkspaceAttachment],
          models: [WorkspaceModelConfiguration], selectedModel: WorkspaceModelConfiguration,
@@ -90,9 +93,22 @@ struct WorkspaceComposerInput: View {
                     }
                 }.frame(maxHeight: 35)
             }
-            WorkspaceTextInput(text: $text, onComposition: { isComposing = $0 }, onSend: sendIfAllowed)
-                .frame(minHeight: 75, maxHeight: 130)
+            WorkspaceTextInput(text: $text, onComposition: { isComposing = $0 }, onSend: sendIfAllowed,
+                               overflowHeight: compactInputHeight, onOverflowChanged: { inputOverflows = $0 })
+                .frame(height: inputExpanded ? 180 : compactInputHeight)
+                .padding(.trailing, 28)
                 .accessibilityLabel("指示を入力。Enterで送信、Shift Enterで改行")
+                .overlay(alignment: .topTrailing) {
+                    if inputOverflows || inputExpanded {
+                        Button { inputExpanded.toggle() } label: {
+                            Image(systemName: inputExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                                .frame(width: 28, height: 28)
+                        }.buttonStyle(.borderless)
+                            .accessibilityLabel(inputExpanded ? "入力欄を縮小" : "入力欄を拡大")
+                            .help(isComposing ? "文字の変換を確定すると、入力欄の高さを変更できます" : (inputExpanded ? "入力欄を縮小" : "入力欄を拡大"))
+                            .disabled(isComposing)
+                    }
+                }
             HStack(spacing: 6) {
                 Menu {
                     Button("ファイルを添付…") { onSelectAttachments?() }.disabled(onSelectAttachments == nil)
@@ -103,12 +119,15 @@ struct WorkspaceComposerInput: View {
                 Menu {
                     Text("次の送信に対する希望。実権限はエンジンが判定します。")
                     ForEach(PermissionPreference.allCases, id: \.self) { permission in
-                        Button(permission.title) { onSelectPermission(permission) }
+                        Button { onSelectPermission(permission) } label: {
+                            Label(permission.title, systemImage: permissionSymbol(permission))
+                        }
                     }
-                } label: { Image(systemName: "lock.shield") }
+                } label: { Image(systemName: permissionSymbol(selectedPermission)) }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24)
                     .accessibilityLabel("権限：\(selectedPermission?.title ?? "プロジェクト設定")")
                     .help(selectedPermission?.title ?? "プロジェクトの権限設定を使用")
+                Spacer(minLength: 0)
                 Menu {
                     ForEach(models) { option in
                         Button("\(option.title) · \(option.destination)\(option.unavailableReason.map { " · \($0)" } ?? "")") {
@@ -117,7 +136,6 @@ struct WorkspaceComposerInput: View {
                     }
                 } label: { Text(selectedModel.title).lineLimit(1) }
                     .menuStyle(.borderlessButton).help("次の要求：\(selectedModel.id) · \(selectedModel.destination) · \(selectedModel.effort)")
-                Spacer(minLength: 0)
                 Button { onVoice?(phase == .recording ? .stop : .start) } label: {
                     Image(systemName: phase == .recording ? "stop.circle" : "mic")
                 }
@@ -146,6 +164,9 @@ struct WorkspaceComposerInput: View {
             }
             if let attachmentNotice { note(attachmentNotice) }
         }
+        .onChange(of: text.isEmpty && !isComposing) { shouldCollapse in
+            if shouldCollapse { inputExpanded = false }
+        }
         .sheet(item: $inspectedAttachment) { attachment in
             VStack(alignment: .leading, spacing: 16) {
                 Text(attachment.name).font(.headline)
@@ -158,6 +179,16 @@ struct WorkspaceComposerInput: View {
 
     private func note(_ text: String) -> some View {
         Text(text).font(.caption).foregroundStyle(.secondary)
+    }
+
+    private func permissionSymbol(_ permission: PermissionPreference?) -> String {
+        switch permission {
+        case .readOnly: "eye"
+        case .readCreate: "square.and.pencil"
+        case .readCreateBuild: "hammer"
+        case .readCreateBuildExternal: "globe"
+        case nil: "lock.shield"
+        }
     }
 
     private func sendIfAllowed() {

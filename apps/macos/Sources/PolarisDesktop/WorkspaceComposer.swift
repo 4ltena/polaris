@@ -89,6 +89,8 @@ struct WorkspaceTextInput: NSViewRepresentable {
     @Binding var text: String
     let onComposition: (Bool) -> Void
     let onSend: () -> Void
+    var overflowHeight: CGFloat = 50
+    var onOverflowChanged: ((Bool) -> Void)? = nil
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSScrollView()
@@ -108,6 +110,8 @@ struct WorkspaceTextInput: NSViewRepresentable {
         input.string = text
         input.onSend = onSend
         input.onComposition = onComposition
+        input.overflowHeight = overflowHeight
+        input.onOverflowChanged = { [weak coordinator = context.coordinator] in coordinator?.parent.onOverflowChanged?($0) }
         input.setAccessibilityLabel("指示入力")
         scroll.documentView = input
         scroll.hasVerticalScroller = true
@@ -118,9 +122,14 @@ struct WorkspaceTextInput: NSViewRepresentable {
         context.coordinator.parent = self
         guard let input = scroll.documentView as? WorkspaceInputTextView else { return }
         input.onSend = onSend; input.onComposition = onComposition
+        input.overflowHeight = overflowHeight
         if input.string != text && !input.hasMarkedText() {
             input.string = text
         }
+        input.scheduleOverflowCheck()
+    }
+    static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+        (scroll.documentView as? WorkspaceInputTextView)?.onOverflowChanged = nil
     }
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: WorkspaceTextInput
@@ -129,6 +138,7 @@ struct WorkspaceTextInput: NSViewRepresentable {
             guard let input = notification.object as? NSTextView else { return }
             parent.text = input.string
             parent.onComposition(input.hasMarkedText())
+            (input as? WorkspaceInputTextView)?.scheduleOverflowCheck()
         }
     }
 }
@@ -136,6 +146,33 @@ struct WorkspaceTextInput: NSViewRepresentable {
 final class WorkspaceInputTextView: NSTextView {
     var onSend: (() -> Void)?
     var onComposition: ((Bool) -> Void)?
+    var onOverflowChanged: ((Bool) -> Void)?
+    var overflowHeight: CGFloat = 50
+    private var overflowCheckScheduled = false
+    private var lastOverflow: Bool?
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        scheduleOverflowCheck()
+    }
+
+    func scheduleOverflowCheck() {
+        guard !overflowCheckScheduled else { return }
+        overflowCheckScheduled = true
+        // ネイティブの文字配置が確定した後にSwiftUIの表示状態を更新する。
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            defer { self.overflowCheckScheduled = false }
+            guard let layout = self.layoutManager, let container = self.textContainer else { return }
+            layout.ensureLayout(for: container)
+            let contentHeight = max(layout.usedRect(for: container).maxY, layout.extraLineFragmentRect.maxY)
+                + self.textContainerInset.height * 2
+            let overflows = contentHeight > self.overflowHeight + 0.5
+            guard self.lastOverflow != overflows else { return }
+            self.lastOverflow = overflows
+            self.onOverflowChanged?(overflows)
+        }
+    }
     static func shouldSend(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, marked: Bool) -> Bool {
         (keyCode == 36 || keyCode == 76) && !marked
             && modifiers.intersection([.shift, .option, .control, .command]).isEmpty
@@ -146,10 +183,12 @@ final class WorkspaceInputTextView: NSTextView {
             onSend?()
         } else { super.keyDown(with: event) }
         onComposition?(hasMarkedText())
+        scheduleOverflowCheck()
     }
     override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
         super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
         onComposition?(hasMarkedText())
+        scheduleOverflowCheck()
     }
-    override func unmarkText() { super.unmarkText(); onComposition?(hasMarkedText()) }
+    override func unmarkText() { super.unmarkText(); onComposition?(hasMarkedText()); scheduleOverflowCheck() }
 }

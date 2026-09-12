@@ -15,6 +15,7 @@ final class DesktopModel: ObservableObject {
     @Published private(set) var connectionSummary = ""
     private(set) var preparationSeconds: TimeInterval?
     private var preparationStarted: TimeInterval = 0
+    private var splashDelayTask: Task<Void, Never>?
     private var screenIsPrepared = false
     private var connectionsArePrepared = false
     private let startupConnections: StartupConnections
@@ -73,6 +74,8 @@ final class DesktopModel: ObservableObject {
         startInFlight = true
         defer { startInFlight = false }
         isStarting = true
+        splashDelayTask?.cancel()
+        splashDelayTask = nil
         preparationID = nil
         startupConnections.cancel()
         screenIsPrepared = false
@@ -116,6 +119,8 @@ final class DesktopModel: ObservableObject {
     func screenPrepared(_ id: UUID, succeeded: Bool) {
         guard preparationID == id, isStarting, startupError == nil else { return }
         guard succeeded else {
+            splashDelayTask?.cancel()
+            splashDelayTask = nil
             preparationID = nil
             startupError = "次の画面を描画できませんでした。再試行してください。"
             startupConnections.cancel()
@@ -179,12 +184,25 @@ final class DesktopModel: ObservableObject {
     }
 
     private func finishPreparationIfReady() {
-        guard isStarting, startupError == nil, preparationID != nil else { return }
+        guard isStarting, startupError == nil, let id = preparationID else { return }
         guard screenIsPrepared, connectionsArePrepared else {
             stage = screenIsPrepared ? .connections : .interface
             return
         }
-        preparationSeconds = ProcessInfo.processInfo.systemUptime - preparationStarted
+        let elapsed = ProcessInfo.processInfo.systemUptime - preparationStarted
+        // Count preparation toward the minimum display time; never block the UI.
+        if elapsed < 1 {
+            guard splashDelayTask == nil else { return }
+            splashDelayTask = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(1 - elapsed)) }
+                catch { return }
+                guard let self, self.preparationID == id else { return }
+                self.splashDelayTask = nil
+                self.finishPreparationIfReady()
+            }
+            return
+        }
+        preparationSeconds = elapsed
         stage = .ready
         isStarting = false
     }

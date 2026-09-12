@@ -6,6 +6,14 @@ import PolarisSettings
 
 @MainActor
 final class NativeIntegrationTests: XCTestCase {
+    private func waitForPreparedScreen(_ model: DesktopModel) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while model.isStarting, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(model.isStarting)
+    }
+
     private func location() throws -> URL {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("polaris-native-owner-\(UUID())")
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false)
@@ -65,7 +73,8 @@ final class NativeIntegrationTests: XCTestCase {
         XCTAssertNil(model.workspace.service); XCTAssertEqual(model.preparedSize, NSSize(width: 1280, height: 780))
         let current = try XCTUnwrap(model.preparationID)
         model.screenPrepared(UUID(), succeeded: true); XCTAssertTrue(model.isStarting)
-        model.screenPrepared(current, succeeded: true); XCTAssertFalse(model.isStarting)
+        model.screenPrepared(current, succeeded: true)
+        try await waitForPreparedScreen(model)
         await model.startOnce(); XCTAssertEqual(model.preparationID, current)
     }
     func testUnavailablePackagedHelperKeepsPersistedBindingWithoutFallback() async throws {
@@ -314,7 +323,8 @@ extension NativeIntegrationTests {
         XCTAssertNil(owner.service?.failure)
         let generation = try XCTUnwrap(model.preparationID)
         model.screenPrepared(UUID(), succeeded: true); XCTAssertTrue(model.isStarting)
-        model.screenPrepared(generation, succeeded: true); XCTAssertFalse(model.isStarting)
+        model.screenPrepared(generation, succeeded: true)
+        try await waitForPreparedScreen(model)
         let closed = await model.prepareToQuit()
         XCTAssertTrue(closed)
         XCTAssertTrue(owner.service?.shutdownReady == true)

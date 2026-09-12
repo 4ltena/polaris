@@ -6,6 +6,31 @@ import PolarisSettings
 @testable import PolarisDesktop
 
 final class DesktopModelTests: XCTestCase {
+    @MainActor
+    private func waitForSplash(_ model: DesktopModel) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while model.isStarting, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    @MainActor
+    func testSplashRemainsVisibleForAtLeastOneSecond() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("polaris-splash-duration-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = DesktopModel(arguments: ["--settings-path", directory.appendingPathComponent("settings.json").path])
+        let started = ContinuousClock.now
+        await model.start()
+        model.screenPrepared(try XCTUnwrap(model.preparationID), succeeded: true)
+        XCTAssertTrue(model.isStarting)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(model.isStarting)
+        try await waitForSplash(model)
+        XCTAssertFalse(model.isStarting)
+        XCTAssertGreaterThanOrEqual(started.duration(to: .now), .seconds(1))
+    }
+
     private actor ConnectionGate {
         var continuation: CheckedContinuation<StartupConnections.Outcome, Never>?
         func wait(started: XCTestExpectation) async -> StartupConnections.Outcome {
@@ -42,6 +67,7 @@ final class DesktopModelTests: XCTestCase {
         for _ in 0..<200 where model.isStarting {
             try await Task.sleep(for: .milliseconds(5))
         }
+        try await waitForSplash(model)
         XCTAssertFalse(model.isStarting)
         XCTAssertTrue(model.connectionSummary.contains("時間切れ"))
         let settled = model.connectionSummary
@@ -103,6 +129,7 @@ final class DesktopModelTests: XCTestCase {
         model.screenPrepared(try XCTUnwrap(model.preparationID), succeeded: false)
         await model.start()
         model.screenPrepared(try XCTUnwrap(model.preparationID), succeeded: true)
+        try await waitForSplash(model)
         XCTAssertFalse(model.isStarting)
         XCTAssertTrue(model.connectionSummary.contains("今回の接続状態は未確認"))
         XCTAssertFalse(model.connectionSummary.contains("到達を確認"))
@@ -162,6 +189,7 @@ final class DesktopModelTests: XCTestCase {
         model.screenPrepared(oldID, succeeded: true)
         XCTAssertTrue(model.isStarting)
         model.screenPrepared(newID, succeeded: true)
+        try await waitForSplash(model)
         XCTAssertFalse(model.isStarting)
         XCTAssertNotNil(model.preparationSeconds)
     }
@@ -187,6 +215,7 @@ final class DesktopModelTests: XCTestCase {
         }
         await fulfillment(of: [drawn], timeout: 10)
         XCTAssertEqual(host.rasterizedSize, NSSize(width: 960, height: 680))
+        try await waitForSplash(model)
         XCTAssertFalse(model.isStarting)
         XCTAssertTrue(window.contentView === host)
         host.prepare(generation: id) { _ in XCTFail("同じ世代を再準備しない") }
@@ -225,11 +254,13 @@ final class DesktopModelTests: XCTestCase {
         let model = DesktopModel(arguments: ["--settings-path", url.path])
         await model.startOnce()
         if let id = model.preparationID { model.screenPrepared(id, succeeded: true) }
+        try await waitForSplash(model)
         XCTAssertFalse(model.isStarting)
         XCTAssertNil(model.startupError)
         try Data("broken".utf8).write(to: url)
         await model.startOnce()
         if let id = model.preparationID { model.screenPrepared(id, succeeded: true) }
+        try await waitForSplash(model)
         XCTAssertFalse(model.isStarting)
         XCTAssertNil(model.startupError)
         await model.start()
@@ -361,6 +392,7 @@ final class DesktopModelTests: XCTestCase {
         await model.start()
         XCTAssertNil(model.startupError)
         if let id = model.preparationID { model.screenPrepared(id, succeeded: true) }
+        try await waitForSplash(model)
         XCTAssertFalse(model.isStarting)
         XCTAssertEqual(model.document, document)
         XCTAssertEqual(model.document.draft.preferences.theme, .light)

@@ -86,7 +86,7 @@ impl Fake {
             0 => vec![],
             3 => all
                 .iter()
-                .filter(|t| matches!(t.name, "read" | "bash" | "skill"))
+                .filter(|t| matches!(t.name.as_str(), "read" | "bash" | "skill"))
                 .map(|t| t.name.to_string())
                 .collect(),
             6 => all.iter().map(|t| t.name.to_string()).collect(),
@@ -107,7 +107,8 @@ impl Fake {
         if n > self.limit {
             return Err(ProviderError::Budget("fixture request cap reached".into()));
         };
-        r.tools.retain(|t| self.allowed.iter().any(|x| x == t.name));
+        r.tools
+            .retain(|t| self.allowed.iter().any(|x| x == &t.name));
         self.replies
             .lock()
             .unwrap()
@@ -261,6 +262,7 @@ async fn run(a: Args) -> Result<(), String> {
             .push(Message::assistant(text(example, "assistant")?));
     }
     let workflow_config = WorkflowConfig {
+        mode: polaris_core::workflow::WorkflowMode::Manual,
         enabled: workflow,
         initial_phase: Phase::Implement,
         always: vec!["builtin:workflow-core".into()],

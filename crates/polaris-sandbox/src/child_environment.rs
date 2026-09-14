@@ -23,6 +23,30 @@ const ALLOWED: &[&str] = &[
     "TERM",
 ];
 
+pub(crate) fn is_runtime_variable(name: &str) -> bool {
+    ALLOWED.contains(&name)
+        || [
+            "LD_", "DYLD_", "_RLD_", "PYTHON", "NODE_", "RUBY", "PERL", "BASH", "GIT_", "POLARIS_",
+            "LC_", "DOTNET_", "RUSTC_", "CARGO_", "JDK_", "JAVA_", "_JAVA_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || matches!(
+            name,
+            "ENV"
+                | "ZDOTDIR"
+                | "SHELLOPTS"
+                | "BASHOPTS"
+                | "IFS"
+                | "CDPATH"
+                | "CLASSPATH"
+                | "SSL_CERT_FILE"
+                | "SSL_CERT_DIR"
+                | "OPENSSL_CONF"
+                | "OPENSSL_MODULES"
+        )
+}
+
 fn select(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Vec<(&'static str, OsString)> {
     ALLOWED
         .iter()

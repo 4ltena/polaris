@@ -81,7 +81,7 @@ pub fn run_confined_controlled_authorized(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use native::{PendingCleanup, take_pending_cleanups};
+pub use native::{ManagedStdio, ManagedStdioPipes, PendingCleanup, take_pending_cleanups};
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[derive(Debug)]
@@ -105,7 +105,9 @@ pub fn take_pending_cleanups() -> Vec<PendingCleanup> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod native {
+    mod managed;
     use super::*;
+    pub use managed::{ManagedStdio, ManagedStdioPipes};
     use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;

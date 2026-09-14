@@ -24,6 +24,8 @@ pub use controlled::{
     ControlledEnd, ControlledOutcome, PendingCleanup, run_confined_controlled,
     run_confined_controlled_authorized, take_pending_cleanups,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use controlled::{ManagedStdio, ManagedStdioPipes};
 pub use helper::Mutation;
 pub use policy::{SandboxMode, SandboxPolicy};
 

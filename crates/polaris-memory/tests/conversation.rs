@@ -463,3 +463,667 @@ fn uuid_provenance_keeps_both_short_gui_summaries_retrievable() {
             <= 768
     );
 }
+
+fn related_item(id: &str, scope: Scope, text: &str, vector: Vec<f32>) -> PendingSummary {
+    let mut item = pending(id, scope, 1, vector);
+    item.summary = serde_json::json!({
+        "facts": [text], "decisions": [], "constraints": [], "corrections": [],
+        "open_items": [], "source_turn_ids": [1]
+    })
+    .to_string();
+    item.summary_hash = hash(&item.summary);
+    item.embedding.input_hash = item.summary_hash.clone();
+    item
+}
+
+#[test]
+fn related_candidates_match_japanese_content_and_keep_semantic_evidence_separate() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    let published = view(scope("s", 0, 1), &["keyword", "semantic"]);
+    for (id, text, vector) in [
+        ("keyword", "藍色の彗星の保管番号は7319", vec![0., 1.]),
+        ("semantic", "銀の灯台の保管番号は4826", vec![1., 0.]),
+    ] {
+        store
+            .insert_pending_summary(&related_item(id, published.scope.clone(), text, vector))
+            .unwrap();
+    }
+    let mut q = query(&published);
+    q.keywords = "7319 藍色";
+    let hits = store.related_summary_candidates(q).unwrap();
+    assert_eq!(
+        hits.keyword
+            .iter()
+            .map(|h| h.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["keyword"]
+    );
+    assert_eq!(
+        hits.semantic
+            .iter()
+            .map(|h| h.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["semantic"]
+    );
+    assert!(hits.keyword[0].similarity < hits.semantic[0].similarity);
+    for metadata in [
+        "facts",
+        "source_turn_ids",
+        "gpt-6-astra",
+        "sync.missing_key",
+    ] {
+        let mut q = query(&published);
+        q.keywords = metadata;
+        let hits = store.related_summary_candidates(q).unwrap();
+        assert!(
+            hits.keyword.is_empty(),
+            "metadata or an unknown identifier is not a content match"
+        );
+        assert_eq!(
+            hits.semantic.len(),
+            2,
+            "suggestions remain explicitly separate from exact evidence"
+        );
+    }
+}
+
+#[test]
+fn related_candidates_are_bounded_stable_and_keyword_order_does_not_use_similarity() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    let mut published = view(scope("s", 0, 8), &[]);
+    for (generation, id, text, vector) in [
+        (1, "a", "共通 語", vec![1., 0.]),
+        (2, "b", "共通 語", vec![0., 1.]),
+        (3, "c", "共通 語", vec![-1., 0.]),
+        (3, "d", "共通 語", vec![1., 0.]),
+        (4, "e", "別候補", vec![0., 1.]),
+        (5, "f", "別候補", vec![1., 0.]),
+        (6, "g", "別候補", vec![-1., 0.]),
+        (7, "h", "別候補", vec![1., 0.]),
+    ] {
+        store
+            .insert_pending_summary(&related_item(id, scope("s", 0, generation), text, vector))
+            .unwrap();
+        published.visible_ids.push(id.into());
+    }
+    let read = |published: &PublishedView| {
+        let mut q = query(published);
+        q.keywords = "共通 語";
+        store.related_summary_candidates(q).unwrap()
+    };
+    let first = read(&published);
+    assert_eq!(
+        first
+            .keyword
+            .iter()
+            .map(|h| h.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["c", "d", "b"]
+    );
+    assert_eq!(
+        first
+            .semantic
+            .iter()
+            .map(|h| h.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["h", "f", "e"]
+    );
+    published.visible_ids.reverse();
+    assert_eq!(read(&published), first);
+}
+
+#[test]
+fn related_candidates_obey_exact_ancestor_grants_and_tombstones() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    for (session, epoch, generation, id) in [
+        ("parent", 0, 1, "old"),
+        ("parent", 0, 2, "future"),
+        ("parent", 1, 1, "epoch"),
+        ("other", 0, 1, "foreign"),
+        ("child", 0, 1, "local"),
+    ] {
+        store
+            .insert_pending_summary(&related_item(
+                id,
+                scope(session, epoch, generation),
+                "anchor",
+                vec![1., 0.],
+            ))
+            .unwrap();
+    }
+    let mut published = view(scope("child", 0, 1), &["local"]);
+    published.ancestors.push(AncestorRange {
+        session_id: "parent".into(),
+        epoch: 0,
+        generation: 1,
+        visible_ids: vec!["old".into()],
+    });
+    let mut q = query(&published);
+    q.keywords = "anchor";
+    let hits = store.related_summary_candidates(q).unwrap();
+    assert_eq!(
+        hits.keyword
+            .iter()
+            .map(|h| h.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["local", "old"]
+    );
+    published.ancestors[0].visible_ids.push("future".into());
+    assert!(store.related_summary_candidates(query(&published)).is_err());
+    published.ancestors[0].visible_ids.pop();
+    store.delete_session("p", "parent").unwrap();
+    let hits = store.related_summary_candidates(query(&published)).unwrap();
+    assert_eq!(
+        hits.semantic
+            .iter()
+            .map(|h| h.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["local"]
+    );
+    store.delete_session("p", "child").unwrap();
+    assert!(matches!(
+        store.related_summary_candidates(query(&published)),
+        Err(Error::SessionForgotten)
+    ));
+}
+
+#[test]
+fn related_candidates_reject_missing_ambiguous_and_foreign_grants() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("memory.sqlite");
+    let mut store = MemoryStore::open(path.to_str().unwrap()).unwrap();
+    let mut published = view(scope("s", 0, 2), &["one"]);
+    assert!(store.related_summary_candidates(query(&published)).is_err());
+    store
+        .insert_pending_summary(&related_item(
+            "one",
+            scope("s", 0, 1),
+            "anchor",
+            vec![1., 0.],
+        ))
+        .unwrap();
+    assert_eq!(
+        store
+            .related_summary_candidates(query(&published))
+            .unwrap()
+            .semantic
+            .len(),
+        1
+    );
+    published.scope.project_id = "different-project".into();
+    assert!(store.related_summary_candidates(query(&published)).is_err());
+    published.scope.project_id = "p".into();
+    store
+        .insert_pending_summary(&related_item(
+            "two",
+            scope("s", 0, 2),
+            "anchor",
+            vec![1., 0.],
+        ))
+        .unwrap();
+    // Normal publication rejects reused IDs. Simulate a corrupt index instead.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other
+        .execute_batch(
+            "BEGIN; PRAGMA defer_foreign_keys=ON;
+        UPDATE conversation_summaries_v2 SET summary_id='one' WHERE generation=2;
+        UPDATE conversation_vectors_v2 SET summary_id='one' WHERE generation=2; COMMIT;",
+        )
+        .unwrap();
+    assert!(
+        store.related_summary_candidates(query(&published)).is_err(),
+        "a repeated ID is not resolved by row order"
+    );
+}
+
+#[test]
+fn related_candidates_hide_other_embedding_versions_but_reject_inconsistent_input() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    let published = view(scope("s", 0, 1), &["one"]);
+    store
+        .insert_pending_summary(&related_item(
+            "one",
+            published.scope.clone(),
+            "anchor",
+            vec![1., 0.],
+        ))
+        .unwrap();
+    for (model, revision, values) in [
+        ("e5", "r2", vec![1., 0.]),
+        ("other", "r1", vec![1., 0.]),
+        ("e5", "r1", vec![1., 0., 0.]),
+    ] {
+        let mut q = query(&published);
+        q.embedding.model = model.into();
+        q.embedding.revision = revision.into();
+        q.embedding.dimension = values.len() as i64;
+        q.embedding.values = values;
+        assert_eq!(
+            store.related_summary_candidates(q).unwrap(),
+            Default::default()
+        );
+    }
+    let mut bad = related_item("bad", published.scope.clone(), "anchor", vec![1., 0.]);
+    bad.embedding.input_hash = hash("wrong input");
+    store.insert_pending_summary(&bad).unwrap();
+    assert!(
+        store
+            .related_summary_candidates(query(&view(published.scope, &["bad"])))
+            .is_err()
+    );
+}
+
+#[test]
+fn related_candidates_reject_corrupt_index_content_and_allow_verified_outer_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("memory.sqlite");
+    let mut store = MemoryStore::open(path.to_str().unwrap()).unwrap();
+    let published = view(scope("s", 0, 1), &["one"]);
+    store
+        .insert_pending_summary(&related_item(
+            "one",
+            published.scope.clone(),
+            "anchor",
+            vec![1., 0.],
+        ))
+        .unwrap();
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.pragma_update(None, "journal_mode", "WAL").unwrap();
+    store
+        .with_verified_structured_deltas(&[], || {
+            let before = store.related_summary_candidates(query(&published))?;
+            assert_eq!(before.semantic.len(), 1);
+            store.preflight_related_summary_scan(&published, "anchor")?;
+            other
+                .execute("UPDATE conversation_summaries_v2 SET summary='corrupt'", [])
+                .unwrap();
+            assert_eq!(store.related_summary_candidates(query(&published))?, before);
+            store.preflight_related_summary_scan(&published, "anchor")?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(store.related_summary_candidates(query(&published)).is_err());
+    assert!(matches!(
+        store.preflight_related_summary_scan(&published, "anchor"),
+        Err(Error::InvalidInput("summary hash does not match summary"))
+    ));
+}
+
+#[test]
+fn related_candidates_reject_unbounded_queries_without_partial_results() {
+    let store = MemoryStore::open(":memory:").unwrap();
+    let mut published = view(scope("s", 0, 1), &[]);
+    let many_terms = (0..129)
+        .map(|n| format!("word{n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for keywords in ["", "  ", &"x".repeat(65537), &many_terms] {
+        let mut q = query(&published);
+        q.keywords = keywords;
+        assert!(store.related_summary_candidates(q).is_err());
+    }
+    published.visible_ids = (0..16385).map(|n| format!("id{n}")).collect();
+    assert!(store.related_summary_candidates(query(&published)).is_err());
+}
+
+#[test]
+fn related_candidates_rank_current_then_nearest_ancestor_before_independent_generations() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    for (session, generation, id) in [
+        ("child", 1, "local"),
+        ("z-near", 100, "near"),
+        ("a-far", 200, "far-a"),
+        ("a-far", 201, "far-b"),
+    ] {
+        store
+            .insert_pending_summary(&related_item(
+                id,
+                scope(session, 0, generation),
+                "anchor",
+                vec![1., 0.],
+            ))
+            .unwrap();
+    }
+    let mut published = view(scope("child", 0, 1), &["local"]);
+    published.ancestors = vec![
+        AncestorRange {
+            session_id: "z-near".into(),
+            epoch: 0,
+            generation: 100,
+            visible_ids: vec!["near".into()],
+        },
+        AncestorRange {
+            session_id: "a-far".into(),
+            epoch: 0,
+            generation: 201,
+            visible_ids: vec!["far-a".into(), "far-b".into()],
+        },
+    ];
+    let mut q = query(&published);
+    q.keywords = "anchor";
+    let hits = store.related_summary_candidates(q).unwrap();
+    assert_eq!(
+        hits.keyword
+            .iter()
+            .map(|h| h.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["local", "near", "far-b"]
+    );
+    let hits = store.related_summary_candidates(query(&published)).unwrap();
+    assert_eq!(
+        hits.semantic
+            .iter()
+            .map(|h| h.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["local", "near", "far-b"],
+        "semantic ties preserve scope authority ordering too"
+    );
+}
+
+#[test]
+fn related_summary_ids_are_scoped_and_do_not_merge_different_sessions() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    store
+        .insert_pending_summary(&related_item(
+            "same-id",
+            scope("child", 0, 1),
+            "anchor child",
+            vec![1., 0.],
+        ))
+        .unwrap();
+    let mut parent = related_item(
+        "same-id",
+        scope("parent", 0, 100),
+        "anchor parent",
+        vec![1., 0.],
+    );
+    parent.source.raw_hash = hash("parent raw");
+    store.insert_pending_summary(&parent).unwrap();
+    let mut published = view(scope("child", 0, 1), &["same-id"]);
+    published.ancestors.push(AncestorRange {
+        session_id: "parent".into(),
+        epoch: 0,
+        generation: 100,
+        visible_ids: vec!["same-id".into()],
+    });
+    let mut q = query(&published);
+    q.keywords = "anchor";
+    let hits = store.related_summary_candidates(q).unwrap();
+    assert_eq!(
+        hits.keyword
+            .iter()
+            .map(|h| h.pending.scope.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["child", "parent"]
+    );
+    assert_ne!(
+        hits.keyword[0].pending.source.raw_hash,
+        hits.keyword[1].pending.source.raw_hash
+    );
+}
+
+#[test]
+fn related_query_chunks_share_one_scan_and_rank_all_parts() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    let published = view(scope("s", 0, 1), &["a-diagonal", "b-second", "z-first"]);
+    for (id, vector) in [
+        ("a-diagonal", vec![1., 1.]),
+        ("b-second", vec![0., 1.]),
+        ("z-first", vec![1., 0.]),
+    ] {
+        store
+            .insert_pending_summary(&related_item(
+                id,
+                published.scope.clone(),
+                "old context",
+                vector,
+            ))
+            .unwrap();
+    }
+    let first = query(&published).embedding;
+    let mut second = first.clone();
+    second.values = vec![0., 1.];
+    let mut verified = 0;
+    let result = store
+        .related_summary_chunks_checked(
+            &published,
+            "different query",
+            &[first.clone(), second.clone()],
+            |_| {
+                verified += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(verified, 3, "each visible row must be checked only once");
+    assert!(result.keyword.is_empty());
+    assert_eq!(
+        result
+            .semantic
+            .iter()
+            .map(|c| c.pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["b-second", "z-first", "a-diagonal"]
+    );
+    assert_eq!(result.semantic[0].similarity, 1.0);
+    assert_eq!(result.semantic[1].similarity, 1.0);
+    assert_eq!(
+        store
+            .related_summary_chunks_checked(
+                &published,
+                "different query",
+                &[second, first.clone()],
+                |_| Ok(())
+            )
+            .unwrap(),
+        result
+    );
+    let mut all_parts = vec![first.clone(); 32];
+    all_parts[31].values = vec![0., 1.];
+    assert_eq!(
+        store
+            .related_summary_chunks_checked(&published, "different query", &all_parts, |_| Ok(()))
+            .unwrap(),
+        result
+    );
+    let mut bad = first.clone();
+    bad.revision = "other".into();
+    for parts in [vec![], vec![first.clone(); 33], vec![first, bad]] {
+        assert!(
+            store
+                .related_summary_chunks_checked(&published, "different query", &parts, |_| panic!(
+                    "invalid chunks must fail before scanning"
+                ))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn related_scan_budget_is_distinct_from_invalid_or_missing_evidence() {
+    let store = MemoryStore::open(":memory:").unwrap();
+    let mut published = view(scope("s", 0, 1), &[]);
+    published.visible_ids = (0..16_385).map(|n| format!("id{n}")).collect();
+    let failure = store
+        .related_summary_candidates(query(&published))
+        .unwrap_err();
+    assert_eq!(
+        failure.to_string(),
+        "related summary budget exceeded: grants"
+    );
+    // Inside the work budget, missing grants must remain an evidence failure.
+    published.visible_ids.pop();
+    assert!(matches!(
+        store.related_summary_candidates(query(&published)),
+        Err(Error::InvalidInput("related summary grant is absent"))
+    ));
+}
+
+#[test]
+fn related_preflight_checks_index_without_requiring_query_vectors() {
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    let published = view(scope("s", 0, 1), &["anchor"]);
+    store
+        .insert_pending_summary(&related_item(
+            "anchor",
+            published.scope.clone(),
+            "anchor",
+            vec![1., 0.],
+        ))
+        .unwrap();
+    store
+        .preflight_related_summary_scan(&published, "anchor")
+        .unwrap();
+    store
+        .preflight_related_summary_scan(&published, "unrelated")
+        .unwrap();
+    let mut verified = 0;
+    let candidates = store
+        .keyword_summary_candidates_checked(&published, "anchor", |_| {
+            verified += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(verified, 1);
+    assert_eq!(candidates.len(), 1);
+    // A successful preflight does not waive the later owner's evidence check.
+    assert!(matches!(
+        store.keyword_summary_candidates_checked(&published, "unrelated", |_| {
+            Err(Error::InvalidInput("owner evidence differs"))
+        }),
+        Err(Error::InvalidInput("owner evidence differs"))
+    ));
+    for invalid in ["".to_string(), " ".into(), "x".repeat(65_537)] {
+        assert!(matches!(
+            store.preflight_related_summary_scan(&published, &invalid),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    let terms = (0..129)
+        .map(|n| format!("t{n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(matches!(
+        store.preflight_related_summary_scan(&published, &terms),
+        Err(Error::RelatedSummaryBudgetExceeded(
+            polaris_memory::conversation::RelatedSummaryBudget::QueryTerms
+        ))
+    ));
+    let mut missing = published.clone();
+    missing.visible_ids.push("missing".into());
+    assert!(matches!(
+        store.preflight_related_summary_scan(&missing, "unrelated"),
+        Err(Error::InvalidInput("related summary grant is absent"))
+    ));
+}
+
+#[test]
+fn related_scan_row_limit_is_shared_by_preflight_and_candidate_scan() {
+    use polaris_memory::conversation::RelatedSummaryBudget;
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    let mut published = view(scope("s", 0, 1), &[]);
+    let mut serialized_bytes = 0;
+    while serialized_bytes <= 4 * 1024 * 1024 {
+        let id = format!("row-{:04}", published.visible_ids.len());
+        let item = related_item(
+            &id,
+            published.scope.clone(),
+            "anchor",
+            vec![0.12345679; 4096],
+        );
+        serialized_bytes += serde_json::to_vec(&item).unwrap().len();
+        store.insert_pending_summary(&item).unwrap();
+        published.visible_ids.push(id);
+    }
+    assert!(matches!(
+        store.preflight_related_summary_scan(&published, "anchor"),
+        Err(Error::RelatedSummaryBudgetExceeded(
+            RelatedSummaryBudget::SerializedRows
+        ))
+    ));
+    assert!(matches!(
+        store.keyword_summary_candidates_checked(&published, "anchor", |_| Ok(())),
+        Err(Error::RelatedSummaryBudgetExceeded(
+            RelatedSummaryBudget::SerializedRows
+        ))
+    ));
+    let last = published.visible_ids.pop().unwrap();
+    store
+        .preflight_related_summary_scan(&published, "anchor")
+        .unwrap();
+    let mut verified = 0;
+    let candidates = store
+        .keyword_summary_candidates_checked(&published, "anchor", |_| {
+            verified += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(verified, published.visible_ids.len());
+    assert_eq!(candidates.len(), 3);
+    published.visible_ids.push(last.clone());
+    // An inspected row's failed proof cannot become an optional-budget omission.
+    assert!(matches!(
+        store.keyword_summary_candidates_checked(&published, "anchor", |pending| {
+            if pending.id == last {
+                return Err(Error::InvalidInput("owner evidence differs"));
+            }
+            Ok(())
+        }),
+        Err(Error::InvalidInput("owner evidence differs"))
+    ));
+}
+
+#[test]
+fn related_preflight_and_ranked_scan_share_the_matching_work_limit() {
+    use polaris_memory::conversation::RelatedSummaryBudget;
+    let mut store = MemoryStore::open(":memory:").unwrap();
+    let mut published = view(scope("s", 0, 1), &[]);
+    // Spaces keep each legitimate evidence block below its token limit while
+    // exercising byte-based matching work independently of serialized rows.
+    let text = format!("anchor{}", " ".repeat(3000));
+    let terms = (0..128)
+        .map(|n| format!("word{n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut match_bytes = 0;
+    let mut serialized_bytes = 0;
+    while match_bytes <= 64 * 1024 * 1024 {
+        let id = format!("match-{:04}", published.visible_ids.len());
+        let item = related_item(&id, published.scope.clone(), &text, vec![1., 0.]);
+        serialized_bytes += serde_json::to_vec(&item).unwrap().len();
+        match_bytes += text.len() * 128;
+        store.insert_pending_summary(&item).unwrap();
+        published.visible_ids.push(id);
+    }
+    assert!(serialized_bytes < 4 * 1024 * 1024);
+    assert!(matches!(
+        store.preflight_related_summary_scan(&published, &terms),
+        Err(Error::RelatedSummaryBudgetExceeded(
+            RelatedSummaryBudget::MatchingWork
+        ))
+    ));
+    assert!(matches!(
+        store.keyword_summary_candidates_checked(&published, &terms, |_| Ok(())),
+        Err(Error::RelatedSummaryBudgetExceeded(
+            RelatedSummaryBudget::MatchingWork
+        ))
+    ));
+    let mut q = query(&published);
+    q.keywords = &terms;
+    assert!(matches!(
+        store.related_summary_candidates(q),
+        Err(Error::RelatedSummaryBudgetExceeded(
+            RelatedSummaryBudget::MatchingWork
+        ))
+    ));
+    published.visible_ids.pop();
+    store
+        .preflight_related_summary_scan(&published, &terms)
+        .unwrap();
+    assert!(
+        store
+            .keyword_summary_candidates_checked(&published, &terms, |_| Ok(()))
+            .unwrap()
+            .is_empty()
+    );
+}

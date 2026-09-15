@@ -8,6 +8,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 pub mod conversation;
+pub mod structured;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
@@ -27,6 +28,8 @@ pub enum Error {
     InvalidInput(&'static str),
     #[error("conversation evidence with provenance exceeds 256 o200k tokens")]
     ConversationEvidenceBudgetExceeded,
+    #[error("related summary budget exceeded: {0}")]
+    RelatedSummaryBudgetExceeded(conversation::RelatedSummaryBudget),
     #[error("invalid stored embedding")]
     InvalidEmbedding,
     #[error("session was forgotten; importing it again is disabled")]
@@ -177,6 +180,15 @@ impl MemoryStore {
         )?;
         transaction.commit()?;
         conversation::initialize(&connection)?;
+        Ok(Self { connection })
+    }
+
+    /// Opens an existing writable index without creation, schema repair or permission changes.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(Self { connection })
     }
 

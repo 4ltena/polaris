@@ -4,6 +4,7 @@
 //! invents one: callers pass the marker they just read, and publishing keeps the
 //! marker write inside the same short SQLite transaction as its index checks.
 
+use crate::structured::{StructuredDelta, insert_delta};
 use crate::{Error, MemoryStore, Result};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,19 @@ use std::collections::{BTreeSet, HashMap};
 const MAX_SUMMARY_TOKENS: usize = 256;
 const MAX_INJECTED_TOKENS: usize = 768;
 const RRF_K: f64 = 60.0;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_STRUCTURED_INDEX_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+#[cfg(test)]
+pub(crate) fn after_structured_index_commit(check: impl FnOnce() + 'static) {
+    AFTER_STRUCTURED_INDEX_COMMIT.with(|slot| *slot.borrow_mut() = Some(Box::new(check)));
+}
+
+mod related;
+pub use related::{RelatedSummaryBudget, RelatedSummaryCandidate, RelatedSummaryCandidates};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Scope {
@@ -40,6 +54,26 @@ pub struct PublishedView {
     pub scope: Scope,
     pub visible_ids: Vec<String>,
     pub ancestors: Vec<AncestorRange>,
+}
+
+/// Checks for one frozen owner, inside the publication transaction. The owner
+/// streams saved v3 deltas and verifies each indexed v2 summary before returning.
+pub struct PublicationReceiptVerifier<'a> {
+    structured: &'a mut dyn FnMut(&StructuredDelta) -> Result<()>,
+    summaries: &'a mut SummaryVerifier<'a>,
+}
+type SummaryVerifier<'a> =
+    dyn FnMut(&mut dyn FnMut(&PendingSummary) -> Result<()>) -> Result<()> + 'a;
+impl PublicationReceiptVerifier<'_> {
+    pub fn submit_structured(&mut self, delta: &StructuredDelta) -> Result<()> {
+        (self.structured)(delta)
+    }
+    pub fn verify_summaries(
+        &mut self,
+        mut verify: impl FnMut(&PendingSummary) -> Result<()>,
+    ) -> Result<()> {
+        (self.summaries)(&mut verify)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +164,7 @@ summary_id={} project_id={} session_id={} epoch={} generation={} raw_hash={}\n{}
 /// The sole input to raw recovery. It is an index identity, never a path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceReference {
+    pub summary_id: String,
     pub scope: Scope,
     pub source: SourceMetadata,
 }
@@ -172,6 +207,46 @@ pub(crate) fn initialize(connection: &rusqlite::Connection) -> Result<()> {
 }
 
 impl MemoryStore {
+    /// Add v3 only after validating the existing index and every owner receipt.
+    /// DDL and proof checks share one writer transaction; any error rolls both back.
+    pub fn enable_structured_memory_with_receipt_stream<S>(
+        &mut self,
+        published: &PublishedView,
+        prior: &crate::structured::StructuredPublicationView,
+        scanner: &mut S,
+    ) -> Result<()>
+    where
+        S: FnMut(
+            &crate::structured::PublicationScope,
+            &[String],
+            &mut PublicationReceiptVerifier<'_>,
+        ) -> Result<()>,
+    {
+        validate_publication_receipt_view(published, prior)?;
+        if published.scope.generation != prior.scope.generation {
+            return Err(Error::InvalidInput(
+                "initialization receipt generation differs",
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Preparing these reads checks required tables/columns even for empty grants.
+        // Never call initialize here: missing existing tables must not be repaired.
+        for sql in [
+            "SELECT project_id,session_id FROM memory_forgotten_sessions LIMIT 0",
+            "SELECT project_id,session_id,epoch,generation,source_id,start_turn,end_turn,raw_hash FROM conversation_sources_v2 LIMIT 0",
+            "SELECT project_id,session_id,epoch,generation,summary_id,source_id,summary,summary_hash,model,effort,prompt_version FROM conversation_summaries_v2 LIMIT 0",
+            "SELECT project_id,session_id,epoch,generation,summary_id,embedding_model,revision,dimension,input_hash,embedding FROM conversation_vectors_v2 LIMIT 0",
+        ] {
+            tx.prepare(sql)?;
+        }
+        crate::structured::enable_structured_schema(&tx)?;
+        verify_publication_stream(&tx, published, &[], prior, scanner)?;
+        verify_summary_markers(&tx, published)?;
+        tx.commit()?;
+        Ok(())
+    }
     /// Holds the SQLite writer transaction while a core marker is atomically
     /// renamed. This is the general publication primitive for raw/workflow/
     /// clear/fork markers: it checks the session tombstone and every visible
@@ -323,6 +398,49 @@ impl MemoryStore {
     where
         F: FnOnce() -> Result<()>,
     {
+        self.publish_pending_checked(published, pending_ids, |_| Ok(()), publish)
+    }
+
+    /// Validate all frozen owner receipts, including v2-only scopes, while the
+    /// same SQLite writer guard protects the pending rows and marker callback.
+    pub fn publish_pending_with_receipt_stream<F, S>(
+        &mut self,
+        published: &PublishedView,
+        pending_ids: &[String],
+        prior: &crate::structured::StructuredPublicationView,
+        scanner: &mut S,
+        publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+        S: FnMut(
+            &crate::structured::PublicationScope,
+            &[String],
+            &mut PublicationReceiptVerifier<'_>,
+        ) -> Result<()>,
+    {
+        validate_publication_receipt_view(published, prior)?;
+        self.publish_pending_checked(
+            published,
+            pending_ids,
+            |connection| {
+                verify_publication_stream(connection, published, pending_ids, prior, scanner)?;
+                verify_summary_markers(connection, published)
+            },
+            publish,
+        )
+    }
+
+    fn publish_pending_checked<F>(
+        &mut self,
+        published: &PublishedView,
+        pending_ids: &[String],
+        verify: impl FnOnce(&rusqlite::Connection) -> Result<()>,
+        publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         validate_view(published)?;
         let requested: BTreeSet<_> = pending_ids.iter().collect();
         if requested.is_empty()
@@ -359,9 +477,223 @@ impl MemoryStore {
                 ));
             }
         }
-        publish()?;
+        verify(&tx)?;
+        let result = publish();
+        // Pending rows are already committed. This guard made no index writes,
+        // so no fallible index commit follows a durable marker publication.
+        tx.rollback()?;
+        result
+    }
+
+    /// Commit the structured index before its marker. A second transaction
+    /// holds the forget/cleanup lock while the marker is published. Failed
+    /// marker publication leaves reusable, invisible rows, never visible IDs
+    /// whose index transaction may subsequently roll back.
+    pub fn publish_pending_with_structured<F>(
+        &mut self,
+        published: &PublishedView,
+        pending_ids: &[String],
+        structured: &StructuredDelta,
+        structured_view: &crate::structured::StructuredPublicationView,
+        prior_structured: &[StructuredDelta],
+        publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let expected_count = structured_view.ancestors.iter().fold(
+            structured_view.visible_publication_ids.len(),
+            |count, ancestor| count.saturating_add(ancestor.visible_publication_ids.len()),
+        );
+        let saved: std::collections::BTreeMap<_, _> = prior_structured
+            .iter()
+            .map(|delta| {
+                (
+                    (
+                        delta.publication.scope.session_id.as_str(),
+                        delta.publication.scope.epoch,
+                        delta.publication.publication_id.as_str(),
+                    ),
+                    delta,
+                )
+            })
+            .collect();
+        if saved.len() != prior_structured.len() || saved.len() != expected_count {
+            return Err(Error::InvalidInput(
+                "structured prior publication set mismatch",
+            ));
+        }
+        self.publish_pending_with_structured_reader(
+            published,
+            pending_ids,
+            structured,
+            structured_view,
+            &mut |scope, id| {
+                saved
+                    .get(&(scope.session_id.as_str(), scope.epoch, id))
+                    .map(|delta| (*delta).clone())
+                    .ok_or(Error::InvalidInput(
+                        "structured prior publication set mismatch",
+                    ))
+            },
+            publish,
+        )
+    }
+
+    /// The raw owner supplies one saved receipt at a time, only after this
+    /// transaction has checked its exact marker grant and forgotten-session state.
+    pub fn publish_pending_with_structured_reader<F, R>(
+        &mut self,
+        published: &PublishedView,
+        pending_ids: &[String],
+        structured: &StructuredDelta,
+        structured_view: &crate::structured::StructuredPublicationView,
+        read_prior: &mut R,
+        publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+        R: FnMut(&crate::structured::PublicationScope, &str) -> Result<StructuredDelta>,
+    {
+        self.publish_pending_with_structured_receipt_stream(
+            published,
+            pending_ids,
+            structured,
+            structured_view,
+            &mut |scope, ids, submit| {
+                for id in ids {
+                    let delta = read_prior(scope, id)?;
+                    if delta.publication.publication_id != *id {
+                        return Err(Error::InvalidInput(
+                            "structured prior publication scope mismatch",
+                        ));
+                    }
+                    submit.submit_structured(&delta)?;
+                }
+                submit.verify_summaries(|_| Ok(()))
+            },
+            publish,
+        )
+    }
+
+    /// Scan each frozen owner once per publication attempt. Even empty v3 scopes
+    /// are visited, after tombstone checks, because they can contain v2 memory.
+    pub fn publish_pending_with_structured_receipt_stream<F, S>(
+        &mut self,
+        published: &PublishedView,
+        pending_ids: &[String],
+        structured: &StructuredDelta,
+        structured_view: &crate::structured::StructuredPublicationView,
+        scanner: &mut S,
+        publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+        S: FnMut(
+            &crate::structured::PublicationScope,
+            &[String],
+            &mut PublicationReceiptVerifier<'_>,
+        ) -> Result<()>,
+    {
+        structured_view.check_receipt_capacity(Some(&structured.publication.publication_id))?;
+        validate_publication_receipt_view(published, structured_view)?;
+        validate_view(published)?;
+        if structured.publication.scope.project_id != published.scope.project_id
+            || structured.publication.scope.session_id != published.scope.session_id
+            || structured.publication.scope.epoch != published.scope.epoch
+            || structured.publication.scope.generation != published.scope.generation
+        {
+            return Err(Error::InvalidInput(
+                "structured publication scope does not match marker",
+            ));
+        }
+        let requested: BTreeSet<_> = pending_ids.iter().collect();
+        if requested.is_empty()
+            || requested.len() != pending_ids.len()
+            || requested
+                .iter()
+                .any(|id| !published.visible_ids.contains(*id))
+        {
+            return Err(Error::InvalidInput(
+                "published IDs must be nonempty, unique, and marker-visible",
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reject_forgotten(&tx, &published.scope)?;
+        for id in &published.visible_ids {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_summaries_v2 WHERE project_id=?1 AND session_id=?2 AND epoch=?3 AND generation<=?4 AND summary_id=?5)",
+                params![published.scope.project_id,published.scope.session_id,published.scope.epoch,published.scope.generation,id], |r| r.get(0))?;
+            if !exists {
+                return Err(Error::InvalidInput(
+                    "published marker names an absent summary",
+                ));
+            }
+        }
+        for id in requested {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_summaries_v2 WHERE project_id=?1 AND session_id=?2 AND epoch=?3 AND generation=?4 AND summary_id=?5)",
+                params![published.scope.project_id,published.scope.session_id,published.scope.epoch,published.scope.generation,id], |r| r.get(0))?;
+            if !exists {
+                return Err(Error::InvalidInput(
+                    "pending summary is absent or belongs to another scope",
+                ));
+            }
+        }
+        insert_delta(&tx, structured, structured_view)?;
+        verify_publication_stream(&tx, published, pending_ids, structured_view, scanner)?;
+        verify_summary_markers(&tx, published)?;
+        // Compare only on this connection: its own commit preserves data_version,
+        // while another connection's commit invalidates all verified index rows.
+        // Both readings hold IMMEDIATE transactions, including the marker write.
+        let verified_version: i64 = tx.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
         tx.commit()?;
-        Ok(())
+        #[cfg(test)]
+        AFTER_STRUCTURED_INDEX_COMMIT.with(|slot| {
+            if let Some(check) = slot.borrow_mut().take() {
+                check();
+            }
+        });
+        let guard = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_version: i64 = guard.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
+        if current_version != verified_version {
+            return Err(Error::InvalidInput(
+                "structured index changed before marker publication",
+            ));
+        }
+        reject_forgotten(&guard, &published.scope)?;
+        crate::structured::validate_delta_authority(&guard, structured, structured_view)?;
+        verify_summary_markers(&guard, published)?;
+        for id in &published.visible_ids {
+            let exists: bool = guard.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_summaries_v2 WHERE project_id=?1 AND session_id=?2 AND epoch=?3 AND generation<=?4 AND summary_id=?5)",
+                params![published.scope.project_id,published.scope.session_id,published.scope.epoch,published.scope.generation,id], |r|r.get(0))?;
+            if !exists {
+                return Err(Error::InvalidInput("structured marker lost summary"));
+            }
+        }
+        for id in structured_view
+            .visible_publication_ids
+            .iter()
+            .chain(std::iter::once(&structured.publication.publication_id))
+        {
+            let exists: bool = guard.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_publications_v3 WHERE project_id=?1 AND session_id=?2 AND epoch=?3 AND generation<=?4 AND publication_id=?5)",
+                params![published.scope.project_id,published.scope.session_id,published.scope.epoch,published.scope.generation,id], |r|r.get(0))?;
+            if !exists {
+                return Err(Error::InvalidInput("structured marker lost publication"));
+            }
+        }
+        crate::structured::verify_stored_delta(&guard, structured)?;
+        let result = publish();
+        // This phase made no index changes. No fallible index commit follows
+        // a durable marker rename.
+        guard.rollback()?;
+        result
     }
 
     /// Hybrid keyword/vector RRF over only summaries named by the current marker
@@ -539,8 +871,9 @@ impl MemoryStore {
     {
         validate_view(published)?;
         validate_id(source_id)?;
-        let tx = self.connection.unchecked_transaction()?;
-        reject_forgotten(&tx, &published.scope)?;
+        let transaction = self.structured_read_transaction()?;
+        let tx = &self.connection;
+        reject_forgotten(tx, &published.scope)?;
         let mut scopes = vec![(published.scope.clone(), published.visible_ids.clone())];
         for ancestor in &published.ancestors {
             let scope = Scope {
@@ -549,7 +882,7 @@ impl MemoryStore {
                 epoch: ancestor.epoch,
                 generation: ancestor.generation,
             };
-            if !is_forgotten(&tx, &scope)? {
+            if !is_forgotten(tx, &scope)? {
                 scopes.push((scope, ancestor.visible_ids.clone()));
             }
         }
@@ -584,6 +917,7 @@ impl MemoryStore {
                         return Err(Error::AmbiguousRecordId);
                     }
                     found = Some(SourceReference {
+                        summary_id,
                         scope: Scope {
                             generation,
                             ..scope.clone()
@@ -597,7 +931,9 @@ impl MemoryStore {
             return Err(Error::RecordNotFound);
         };
         let result = read(reference)?;
-        tx.commit()?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok(result)
     }
 
@@ -628,10 +964,10 @@ impl MemoryStore {
     }
 }
 
-fn is_forgotten(tx: &rusqlite::Transaction<'_>, scope: &Scope) -> Result<bool> {
+fn is_forgotten(tx: &rusqlite::Connection, scope: &Scope) -> Result<bool> {
     Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_forgotten_sessions WHERE project_id=?1 AND session_id=?2)", params![scope.project_id, scope.session_id], |r| r.get(0))?)
 }
-fn reject_forgotten(tx: &rusqlite::Transaction<'_>, scope: &Scope) -> Result<()> {
+fn reject_forgotten(tx: &rusqlite::Connection, scope: &Scope) -> Result<()> {
     if is_forgotten(tx, scope)? {
         Err(Error::SessionForgotten)
     } else {
@@ -710,6 +1046,302 @@ fn validate_pending(p: &PendingSummary) -> Result<()> {
         ));
     }
     validate_embedding(&p.embedding.values, p.embedding.dimension)
+}
+
+pub(crate) fn verify_prior_structured<R>(
+    conn: &rusqlite::Connection,
+    view: &crate::structured::StructuredPublicationView,
+    read: &mut R,
+) -> Result<()>
+where
+    R: FnMut(&crate::structured::PublicationScope, &str) -> Result<StructuredDelta>,
+{
+    verify_prior_structured_stream(conn, view, &mut |scope, ids, submit| {
+        for id in ids {
+            let delta = read(scope, id)?;
+            // Preserve the per-ID reader contract even when another granted
+            // publication would be valid for the unordered stream interface.
+            if delta.publication.publication_id != *id {
+                return Err(Error::InvalidInput(
+                    "structured prior publication scope mismatch",
+                ));
+            }
+            submit(&delta)?;
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn verify_prior_structured_stream<S>(
+    conn: &rusqlite::Connection,
+    view: &crate::structured::StructuredPublicationView,
+    scanner: &mut S,
+) -> Result<()>
+where
+    S: FnMut(
+        &crate::structured::PublicationScope,
+        &[String],
+        &mut dyn FnMut(&StructuredDelta) -> Result<()>,
+    ) -> Result<()>,
+{
+    verify_prior_stream(conn, view, scanner, false)
+}
+
+fn verify_prior_stream<S>(
+    conn: &rusqlite::Connection,
+    view: &crate::structured::StructuredPublicationView,
+    scanner: &mut S,
+    include_empty: bool,
+) -> Result<()>
+where
+    S: FnMut(
+        &crate::structured::PublicationScope,
+        &[String],
+        &mut dyn FnMut(&StructuredDelta) -> Result<()>,
+    ) -> Result<()>,
+{
+    crate::structured::validate_structured_view(view)?;
+    reject_forgotten(
+        conn,
+        &Scope {
+            project_id: view.scope.project_id.clone(),
+            session_id: view.scope.session_id.clone(),
+            epoch: view.scope.epoch,
+            generation: view.scope.generation,
+        },
+    )?;
+    for (scope, ids) in crate::structured::publication_scopes(view) {
+        if ids.is_empty() && !include_empty {
+            continue;
+        }
+        // This check precedes the raw owner's callback, including for ancestors.
+        reject_forgotten(
+            conn,
+            &Scope {
+                project_id: scope.project_id.clone(),
+                session_id: scope.session_id.clone(),
+                epoch: scope.epoch,
+                generation: scope.generation,
+            },
+        )?;
+        let expected: BTreeSet<_> = ids.iter().map(String::as_str).collect();
+        let mut seen = BTreeSet::new();
+        let mut first_error = None;
+        let scanned = scanner(&scope, ids, &mut |delta| {
+            if first_error.is_some() {
+                return Err(Error::InvalidInput(
+                    "structured receipt stream verification failed",
+                ));
+            }
+            let verified = (|| {
+                let actual = &delta.publication;
+                if actual.scope.project_id != scope.project_id
+                    || actual.scope.session_id != scope.session_id
+                    || actual.scope.epoch != scope.epoch
+                    || actual.scope.generation > scope.generation
+                {
+                    return Err(Error::InvalidInput(
+                        "structured prior publication scope mismatch",
+                    ));
+                }
+                let Some(&id) = expected.get(actual.publication_id.as_str()) else {
+                    return Err(Error::InvalidInput("structured receipt outside grants"));
+                };
+                if seen.contains(id) {
+                    return Err(Error::InvalidInput("structured receipt submitted twice"));
+                }
+                crate::structured::verify_stored_delta(conn, delta)?;
+                seen.insert(id);
+                Ok(())
+            })();
+            match verified {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    first_error = Some(error);
+                    Err(Error::InvalidInput(
+                        "structured receipt stream verification failed",
+                    ))
+                }
+            }
+        });
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        scanned?;
+        if seen.len() != expected.len() {
+            return Err(Error::InvalidInput("structured receipt missing"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_publication_stream<S>(
+    conn: &rusqlite::Connection,
+    published: &PublishedView,
+    pending_ids: &[String],
+    prior: &crate::structured::StructuredPublicationView,
+    scanner: &mut S,
+) -> Result<()>
+where
+    S: FnMut(
+        &crate::structured::PublicationScope,
+        &[String],
+        &mut PublicationReceiptVerifier<'_>,
+    ) -> Result<()>,
+{
+    let mut used = 0usize;
+    verify_prior_stream(
+        conn,
+        prior,
+        &mut |scope, ids, structured| {
+            let summary_ids = if scope.session_id == published.scope.session_id {
+                &published.visible_ids
+            } else {
+                &published
+                    .ancestors
+                    .iter()
+                    .find(|a| a.session_id == scope.session_id)
+                    .ok_or(Error::InvalidInput("publication ancestor missing"))?
+                    .visible_ids
+            };
+            let summary_scope = Scope {
+                project_id: scope.project_id.clone(),
+                session_id: scope.session_id.clone(),
+                epoch: scope.epoch,
+                generation: scope.generation,
+            };
+            let mut checked = false;
+            let mut first_error = None;
+            let scanned = scanner(
+                scope,
+                ids,
+                &mut PublicationReceiptVerifier {
+                    structured,
+                    summaries: &mut |verify| {
+                        let result = (|| {
+                            if checked || first_error.is_some() {
+                                return Err(Error::InvalidInput(
+                                    "summary receipts already checked",
+                                ));
+                            }
+                            for id in summary_ids {
+                                if scope.session_id == published.scope.session_id
+                                    && pending_ids.contains(id)
+                                {
+                                    continue;
+                                }
+                                let pending = read_summary_receipt(conn, &summary_scope, id)?;
+                                used = used
+                                    .checked_add(
+                                        serde_json::to_vec(&pending)
+                                            .map_err(|_| {
+                                                Error::InvalidInput(
+                                                    "publication summary serialization failed",
+                                                )
+                                            })?
+                                            .len(),
+                                    )
+                                    .filter(|n| *n <= 64 * 1024 * 1024)
+                                    .ok_or(Error::InvalidInput(
+                                        "publication summary receipt byte limit",
+                                    ))?;
+                                verify(&pending)?;
+                            }
+                            checked = true;
+                            Ok(())
+                        })();
+                        match result {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                if first_error.is_none() {
+                                    first_error = Some(error);
+                                }
+                                Err(Error::InvalidInput("summary receipt verification failed"))
+                            }
+                        }
+                    },
+                },
+            );
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            scanned?;
+            if !checked {
+                return Err(Error::InvalidInput("summary receipts not checked"));
+            }
+            Ok(())
+        },
+        true,
+    )
+}
+
+fn validate_publication_receipt_view(
+    published: &PublishedView,
+    prior: &crate::structured::StructuredPublicationView,
+) -> Result<()> {
+    validate_view(published)?;
+    crate::structured::validate_structured_view(prior)?;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for id in published
+        .visible_ids
+        .iter()
+        .chain(published.ancestors.iter().flat_map(|a| &a.visible_ids))
+    {
+        count = count.saturating_add(1);
+        bytes = bytes.saturating_add(id.len());
+    }
+    if count > 65_536 || bytes > 4 * 1024 * 1024 {
+        return Err(Error::InvalidInput("publication summary grant limit"));
+    }
+    if published.scope.project_id != prior.scope.project_id
+        || published.scope.session_id != prior.scope.session_id
+        || published.scope.epoch != prior.scope.epoch
+        || prior.scope.generation > published.scope.generation
+        || published.ancestors.len() != prior.ancestors.len()
+        || published
+            .ancestors
+            .iter()
+            .zip(&prior.ancestors)
+            .any(|(a, b)| {
+                a.session_id != b.session_id || a.epoch != b.epoch || a.generation != b.generation
+            })
+    {
+        return Err(Error::InvalidInput(
+            "publication and frozen receipt scopes differ",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_summary_markers(conn: &rusqlite::Connection, view: &PublishedView) -> Result<()> {
+    let scopes = std::iter::once((view.scope.clone(), &view.visible_ids)).chain(
+        view.ancestors.iter().map(|a| {
+            (
+                Scope {
+                    project_id: view.scope.project_id.clone(),
+                    session_id: a.session_id.clone(),
+                    epoch: a.epoch,
+                    generation: a.generation,
+                },
+                &a.visible_ids,
+            )
+        }),
+    );
+    for (scope, ids) in scopes {
+        reject_forgotten(conn, &scope)?;
+        for id in ids {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM conversation_summaries_v2 WHERE project_id=?1 AND session_id=?2 AND epoch=?3 AND generation<=?4 AND summary_id=?5",
+                params![scope.project_id,scope.session_id,scope.epoch,scope.generation,id], |row| row.get(0))?;
+            if count != 1 {
+                return Err(Error::InvalidInput(
+                    "frozen summary marker is missing or ambiguous",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_view(view: &PublishedView) -> Result<()> {
@@ -820,6 +1452,64 @@ fn cosine(query: &[f32], stored: &[f32]) -> Result<f64> {
     }
     Ok((dot / (a.sqrt() * b.sqrt())).clamp(-1.0, 1.0))
 }
+fn read_summary_receipt(
+    conn: &rusqlite::Connection,
+    scope: &Scope,
+    id: &str,
+) -> Result<PendingSummary> {
+    // Bound each allocation in SQL, including corrupt row contents.
+    // A missing/duplicate scoped ID is an incomplete index, not no-hit.
+    let mut statement = conn.prepare(
+        "SELECT s.summary_id,
+         CASE WHEN length(CAST(s.source_id AS BLOB))<=1024 THEN s.source_id END,
+         c.start_turn,c.end_turn,
+         CASE WHEN length(c.raw_hash)=64 THEN c.raw_hash END,
+         CASE WHEN length(CAST(s.summary AS BLOB))<=65536 THEN s.summary END,
+         CASE WHEN length(s.summary_hash)=64 THEN s.summary_hash END,
+         CASE WHEN length(CAST(s.model AS BLOB))<=1024 THEN s.model END,
+         CASE WHEN length(CAST(s.effort AS BLOB))<=1024 THEN s.effort END,
+         CASE WHEN length(CAST(s.prompt_version AS BLOB))<=1024 THEN s.prompt_version END,
+         CASE WHEN length(CAST(v.embedding_model AS BLOB))<=1024 THEN v.embedding_model END,
+         CASE WHEN length(CAST(v.revision AS BLOB))<=1024 THEN v.revision END,
+         v.dimension,
+         CASE WHEN length(v.input_hash)=64 THEN v.input_hash END,
+         CASE WHEN length(v.embedding)<=16384 THEN v.embedding END,
+         s.generation
+         FROM conversation_summaries_v2 s
+         JOIN conversation_sources_v2 c USING(project_id,session_id,epoch,generation,source_id)
+         JOIN conversation_vectors_v2 v USING(project_id,session_id,epoch,generation,summary_id)
+         WHERE s.project_id=?1 AND s.session_id=?2 AND s.epoch=?3
+         AND s.generation<=?4 AND s.summary_id=?5 LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![
+        scope.project_id,
+        scope.session_id,
+        scope.epoch,
+        scope.generation,
+        id
+    ])?;
+    let row = rows
+        .next()?
+        .ok_or(Error::InvalidInput("related summary grant is absent"))?;
+    let pending = read_pending(
+        row,
+        Scope {
+            generation: row.get(15)?,
+            ..scope.clone()
+        },
+    )?;
+    if rows.next()?.is_some() {
+        return Err(Error::InvalidInput("related summary grant is ambiguous"));
+    }
+    validate_pending(&pending)?;
+    if pending.embedding.input_hash != pending.summary_hash {
+        return Err(Error::InvalidInput(
+            "related summary embedding input mismatch",
+        ));
+    }
+    Ok(pending)
+}
+
 fn read_pending(row: &rusqlite::Row<'_>, scope: Scope) -> rusqlite::Result<PendingSummary> {
     let bytes: Vec<u8> = row.get(14)?;
     let dimension: i64 = row.get(12)?;

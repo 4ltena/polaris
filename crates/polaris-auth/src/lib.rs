@@ -11,10 +11,12 @@
 //! become invalid. Keeping an independent store makes this accident
 //! impossible in principle.
 
+pub mod accounts;
 pub mod api_key;
 pub mod login;
 pub mod pkce;
 pub mod protection;
+pub mod quota;
 pub mod store;
 pub mod token;
 
@@ -39,6 +41,10 @@ pub const AUTH_READ_ONLY_ENV: &str = "POLARIS_AUTH_READ_ONLY";
 pub enum AuthError {
     #[error("authentication path protection is unavailable")]
     Protection,
+    #[error("authentication account storage is busy")]
+    Busy,
+    #[error("authentication account storage requires recovery")]
+    RecoveryRequired,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("HTTP error: {0}")]
@@ -59,6 +65,10 @@ pub enum AuthError {
     PortInUse(String),
     #[error("not logged in")]
     NotLoggedIn,
+    #[error("the account is already registered")]
+    AlreadyRegistered,
+    #[error("the account registry is full")]
+    AccountLimit,
     #[error("authentication refresh is disabled by {AUTH_READ_ONLY_ENV}=1")]
     ReadOnly,
     #[error("{AUTH_READ_ONLY_ENV} must be unset, 0, or 1")]

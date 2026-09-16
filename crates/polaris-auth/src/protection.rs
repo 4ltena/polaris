@@ -168,7 +168,7 @@ impl ProtectedPathsSnapshot {
 pub(crate) struct Registry {
     snapshot: ProtectedPathsSnapshot,
     failed: bool,
-    trusted_defaults: Option<[PathBuf; 2]>,
+    trusted_defaults: Option<Vec<PathBuf>>,
 }
 
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -191,9 +191,11 @@ pub fn use_trusted_home(home: &Path) -> Result<(), AuthError> {
     if !home.is_absolute() || !valid_registered_path(home) {
         return Err(AuthError::Protection);
     }
-    let defaults = [
+    let defaults = vec![
         home.join(".polaris/auth.json"),
         home.join(".polaris/api_key.json"),
+        home.join(".polaris/mcp/servers.json"),
+        home.join(".polaris/mcp/secrets.json"),
     ];
     let mut registry = lock()?;
     if let Some(existing) = &registry.trusted_defaults {
@@ -206,8 +208,27 @@ pub fn use_trusted_home(home: &Path) -> Result<(), AuthError> {
     for path in &defaults {
         registry.register_store(path)?;
     }
+    registry.register_subtree(home.join(".polaris/accounts"))?;
     registry.trusted_defaults = Some(defaults);
     Ok(())
+}
+
+/// Register one host-read source file (not a store) and its current inode.
+/// Call before any model-visible reader can reach it.
+pub fn protect_path(path: &Path) -> Result<(), AuthError> {
+    lock()?.register_path(path)
+}
+
+pub fn trusted_home() -> Result<PathBuf, AuthError> {
+    let registry = lock()?;
+    registry
+        .trusted_defaults
+        .as_ref()
+        .and_then(|paths| paths.first())
+        .and_then(|path| path.parent())
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf)
+        .ok_or(AuthError::Protection)
 }
 
 /// Runs a synchronous callback under the same lock as save/load/delete.
@@ -221,13 +242,30 @@ pub fn use_trusted_home(home: &Path) -> Result<(), AuthError> {
 pub fn with_protected_paths<R>(
     callback: impl FnOnce(&ProtectedPathsSnapshot) -> R,
 ) -> Result<R, AuthError> {
+    let account_home = trusted_home().ok();
+    if let Some(home) = account_home {
+        return crate::accounts::directory::with_reader_protection(&home, callback);
+    }
     let mut registry = lock()?;
+    with_protected_paths_locked(&mut registry, callback)
+}
+
+fn with_protected_paths_locked<R>(
+    registry: &mut Registry,
+    callback: impl FnOnce(&ProtectedPathsSnapshot) -> R,
+) -> Result<R, AuthError> {
     let defaults = match &registry.trusted_defaults {
         Some(paths) => paths.clone(),
-        None => [
-            crate::store::default_path()?,
-            crate::api_key::default_path()?,
-        ],
+        None => {
+            let auth = crate::store::default_path()?;
+            let parent = auth.parent().ok_or(AuthError::Protection)?;
+            vec![
+                parent.join("mcp/servers.json"),
+                parent.join("mcp/secrets.json"),
+                auth,
+                crate::api_key::default_path()?,
+            ]
+        }
     };
     for path in &defaults {
         registry.register_store(path)?;
@@ -235,12 +273,63 @@ pub fn with_protected_paths<R>(
     // Refresh registered names as well, retaining old identities after rotation.
     let paths: Vec<_> = registry.snapshot.paths.iter().cloned().collect();
     for path in paths {
+        if path.file_name().is_some_and(|name| name == "accounts") {
+            continue;
+        }
         registry.register_path(&path)?;
     }
     Ok(callback(&registry.snapshot))
 }
 
+pub(crate) fn merge_account_identities(
+    identities: &BTreeSet<ProtectedIdentity>,
+) -> Result<(), AuthError> {
+    let mut registry = lock()?;
+    for identity in identities {
+        registry.remember_identity(*identity)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn with_account_identities<R>(
+    identities: &BTreeSet<ProtectedIdentity>,
+    callback: impl FnOnce(&ProtectedPathsSnapshot) -> R,
+) -> Result<R, AuthError> {
+    let mut registry = lock()?;
+    for identity in identities {
+        registry.remember_identity(*identity)?;
+    }
+    with_protected_paths_locked(&mut registry, callback)
+}
+
+/// Hold the protection lock while a host-owned store inspects or replaces files.
+/// Register every destination before opening it and every new descriptor before
+/// writing protected bytes. Never reenter protection or wait for asynchronous
+/// work while this guard is held.
+pub struct StoreProtectionGuard(MutexGuard<'static, Registry>);
+
+pub fn protect_store(path: &Path) -> Result<StoreProtectionGuard, AuthError> {
+    let mut guard = lock()?;
+    guard.register_store(path)?;
+    Ok(StoreProtectionGuard(guard))
+}
+
+impl StoreProtectionGuard {
+    pub fn remember_file(&mut self, file: &File) -> Result<(), AuthError> {
+        let metadata = file.metadata()?;
+        require_regular(&metadata)?;
+        self.0.remember(&metadata)
+    }
+}
+
 impl Registry {
+    fn register_subtree(&mut self, path: PathBuf) -> Result<(), AuthError> {
+        if !valid_registered_path(&path) {
+            return Err(AuthError::Protection);
+        }
+        self.insert_path(path)
+    }
+
     pub(crate) fn register_store(&mut self, path: &Path) -> Result<PathBuf, AuthError> {
         // Validate both names before mutating the persistent registry.
         let store = PreparedPath::new(path)?;
@@ -278,10 +367,13 @@ impl Registry {
     }
 
     pub(crate) fn remember(&mut self, metadata: &Metadata) -> Result<(), AuthError> {
-        let identity = ProtectedIdentity {
+        self.remember_identity(ProtectedIdentity {
             dev: metadata.dev(),
             ino: metadata.ino(),
-        };
+        })
+    }
+
+    fn remember_identity(&mut self, identity: ProtectedIdentity) -> Result<(), AuthError> {
         if self.failed
             || (!self.snapshot.identities.contains(&identity)
                 && self.snapshot.identities.len() >= MAX_IDENTITIES)
@@ -342,9 +434,16 @@ mod tests {
         // The test process HOME is isolated by the test runner. No environment
         // mutation is needed inside this parallel test suite.
         with_protected_paths(|snapshot| {
+            let parent = store::default_path()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf();
             for path in [
                 store::default_path().unwrap(),
                 api_key::default_path().unwrap(),
+                parent.join("mcp/servers.json"),
+                parent.join("mcp/secrets.json"),
             ] {
                 assert!(
                     snapshot

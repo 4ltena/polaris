@@ -242,8 +242,9 @@ fn open_absolute_regular(path: &Path) -> Result<File, ()> {
     open_at(&directory, name, libc::O_RDONLY | libc::O_NONBLOCK).map_err(|_| ())
 }
 
-fn open_at(parent: &File, name: &OsStr, flags: i32) -> Result<File, ()> {
-    let name = CString::new(name.as_bytes()).map_err(|_| ())?;
+pub(crate) fn open_at(parent: &File, name: &OsStr, flags: i32) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     let descriptor = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -252,12 +253,16 @@ fn open_at(parent: &File, name: &OsStr, flags: i32) -> Result<File, ()> {
         )
     };
     if descriptor < 0 {
-        return Err(());
+        return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
-fn denied(path: &Path, metadata: &std::fs::Metadata, registry: &ProtectedPathsSnapshot) -> bool {
+pub(crate) fn denied(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    registry: &ProtectedPathsSnapshot,
+) -> bool {
     polaris_tools::path_policy::is_denied(path)
         || registry.paths().iter().any(|p| path.starts_with(p))
         || registry
@@ -459,7 +464,7 @@ fn git_view(
         }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let run = |args: &[&str]| git_command(root, args, deadline);
+    let run = |args: &[&str]| polaris_core::project_git::read_only_git(root, args, deadline);
     let Ok(status) = run(&[
         "status",
         "--porcelain=v1",
@@ -541,8 +546,9 @@ fn git_view(
                 && parts[0].bytes().all(|b| b.is_ascii_hexdigit())
             {
                 let object = format!("{}:{}", parts[0], path);
-                if let Ok(body) = run(&["show", "--no-ext-diff", "--no-textconv", &object])
-                    .and_then(|v| String::from_utf8(v).map_err(|_| ()))
+                if let Some(body) = run(&["show", "--no-ext-diff", "--no-textconv", &object])
+                    .ok()
+                    .and_then(|v| String::from_utf8(v).ok())
                 {
                     let diff = run(&[
                         "show",
@@ -626,103 +632,6 @@ fn safe_git_tree(
         }
     }
     true
-}
-
-fn git_command(root: &File, args: &[&str], deadline: std::time::Instant) -> Result<Vec<u8>, ()> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-    if std::time::Instant::now() >= deadline {
-        return Err(());
-    }
-    let mut command = Command::new("/usr/bin/git");
-    command
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .args([
-            "--no-pager",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.attributesFile=/dev/null",
-            "-c",
-            "diff.external=",
-            "-c",
-            "log.showSignature=false",
-            "-c",
-            "core.worktree=.",
-            "-c",
-            "core.bare=false",
-            "-c",
-            "status.renames=false",
-        ])
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    polaris_sandbox::protect_child_descriptors(&mut command);
-    let fd = root.as_raw_fd();
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fchdir(fd) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().map_err(|_| ())?;
-    let mut out = child.stdout.take().ok_or(())?;
-    unsafe {
-        libc::fcntl(out.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
-    }
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match out.read(&mut chunk) {
-            Ok(n) => {
-                bytes.extend_from_slice(&chunk[..n]);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(());
-            }
-        }
-        if bytes.len() > MAX_BODY_BYTES || std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                loop {
-                    match out.read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-                        Err(_) => break,
-                    }
-                    if bytes.len() > MAX_BODY_BYTES {
-                        return Err(());
-                    }
-                }
-                return if status.success() { Ok(bytes) } else { Err(()) };
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(());
-            }
-        }
-    }
 }
 
 #[cfg(test)]

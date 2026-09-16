@@ -5,6 +5,8 @@
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// 保存世代を照合済みの取得結果。分類による送信停止も含む。
+    MemoryPrepared(crate::conversation_memory::observation::MemoryObservation),
     /// 暫定表示用。正本応答へ二重連結せず、requestごとに置き換える。
     TextDelta {
         request_id: u64,
@@ -17,6 +19,15 @@ pub enum AgentEvent {
         skill_ids: Vec<String>,
         changed_skill_ids: Vec<String>,
         manifest_hash: String,
+    },
+    /// M6-2: a model request is running. A long silence between these two is
+    /// normal work, never evidence that the run stopped.
+    ModelRequestStarted {
+        turn: u64,
+    },
+    ModelRequestFinished {
+        turn: u64,
+        ok: bool,
     },
     ToolStarted {
         name: String,
@@ -93,6 +104,8 @@ impl AgentEvent {
             return false;
         }
         match self {
+            Self::ModelRequestStarted { .. } | Self::ModelRequestFinished { .. } => true,
+            Self::MemoryPrepared(observation) => budget.strings(&observation.source_uris),
             Self::TextDelta { text, .. } => budget.string(text),
             Self::WorkflowResolved {
                 phase,
@@ -304,5 +317,28 @@ mod tests {
         // 6行を超えないことだけを固定する)。
         assert!(context_count > 0);
         assert!(context_count <= 6);
+    }
+}
+
+#[cfg(test)]
+mod memory_observation_tests {
+    use super::*;
+    #[test]
+    fn m17_event_accounts_for_retained_uri_capacity() {
+        let mut observation = crate::conversation_memory::observation::MemoryObservation {
+            mode: crate::conversation_state::HistoryMode::Structured10,
+            retrieval_status: Some(
+                polaris_desktop_protocol::snapshot::MemoryRetrievalStatus::Found,
+            ),
+            source_uris: vec!["conversation://fixture?start=1&end=1".into()],
+            reference_tokens: 40,
+            related_omission: None,
+        };
+        assert!(AgentEvent::MemoryPrepared(observation.clone()).fits_queue_budget(1024));
+        observation.source_uris[0].reserve(crate::desktop_events::MAX_EVENT_BYTES);
+        assert!(
+            !AgentEvent::MemoryPrepared(observation)
+                .fits_queue_budget(crate::desktop_events::MAX_EVENT_BYTES)
+        );
     }
 }

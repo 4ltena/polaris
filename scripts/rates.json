@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "currency": "USD",
+  "note": "保存済みの換算規則であり、現行の公式料金の確認ではない。API換算とCodex creditは別の体系で、混ぜない。表に無いモデルの費用は不明とし、既知モデルの単価を流用しない。",
+  "cache_rule": {
+    "applies_from": "2026-09-16",
+    "field": "models.<model>.cache",
+    "values": "省略＝cache階層が該当する（通常）。\"not_applicable\"＝そのモデルはcacheを持たない。",
+    "effect": "該当しないモデルは、費用を出すときだけcache読取り・書込みを定義上ゼロとし、全額課金の入力＝入力の全量として導く。生の観測は未報告のまま保持し、観測値にこの規則を混ぜない。0以外のcacheが報告されたら矛盾として残す。",
+    "reason": "cacheを持たないモデルは未報告が欠測ではないため、そのままでは費用が永久に不明になる。",
+    "applied_by": "crates/polaris-core/src/measurement/price.rs と scripts/benchmark_costs.py の両方"
+  },
+  "models": {
+    "gpt-6-astra": {
+      "rates_as_of": "2026-09-07",
+      "sources": [
+        "https://developers.openai.com/api/docs/models/gpt-6-astra",
+        "https://developers.openai.com/api/docs/guides/prompt-caching",
+        "https://learn.chatgpt.com/docs/pricing"
+      ],
+      "api_per_million": {
+        "billed_input": "10",
+        "cache_read": "1",
+        "cache_write": "12.5",
+        "output": "50"
+      },
+      "codex_credit_per_million": {
+        "billed_input": "250",
+        "cache_read": "25",
+        "output": "1250"
+      },
+      "codex_credit_requires_zero_cache_write": true,
+      "long_context": {
+        "input_tokens_above": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      }
+    }
+  }
+}

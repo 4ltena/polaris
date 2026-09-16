@@ -21,6 +21,13 @@ def record(output=2):
                       'total_tokens': 10 + output, 'cached_tokens': 0}}
 
 
+def freeze_rates(root):
+    """Put the frozen price list where a real work directory carries it."""
+    source = Path(__file__).resolve().parent / 'rates.json'
+    (root / 'rates.json').write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+    return root
+
+
 class LauncherTests(unittest.TestCase):
     def test_plan_balances_48_trials_and_preserves_96_requests(self):
         trials = runner.trial_plan()
@@ -33,7 +40,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_ledger_missing_usage_output_excess_and_failed_attempt_stop(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = freeze_rates(Path(directory))
             self.assertEqual(runner.ledger_status(root), (0, 0.0))
             for bad in (record(4097), {**record(), 'status': 'running'},
                         {**record(), 'usage': {'state': 'missing'}},
@@ -46,7 +53,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_cumulative_limits_and_claim_are_not_reset(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = freeze_rates(Path(directory))
             (root / 'attempts.json').write_text(json.dumps(ledger([record()] * 97)))
             with self.assertRaises(ValueError):
                 runner.ledger_status(root)
@@ -102,7 +109,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_cannot_skip_incomplete_previous_trial(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = freeze_rates(Path(directory))
             with patch.object(runner, 'verify', return_value={'trials': runner.trial_plan()}):
                 with patch.object(runner.subprocess, 'run') as child:
                     with self.assertRaises(FileNotFoundError):

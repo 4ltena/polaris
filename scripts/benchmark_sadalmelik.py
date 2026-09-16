@@ -33,8 +33,12 @@ LIMITS = {
     "hosted_actions": 20,
     "cost_usd": "40.00",
 }
-PRICES = {"input_per_million": "10.00", "cache_write_per_million": "12.50",
-          "output_per_million": "50.00"}
+# The one price list, the same file the Rust measurement embeds.
+_RATES = json.loads((Path(__file__).resolve().parent / "rates.json")
+                    .read_text(encoding="utf-8"))["models"][MODEL]["api_per_million"]
+PRICES = {"input_per_million": _RATES["billed_input"],
+          "cache_write_per_million": _RATES["cache_write"],
+          "output_per_million": _RATES["output"]}
 MATRIX = (
     (0, 0, 0), (0, 3, 1), (0, 6, 3),
     (3, 0, 1), (3, 3, 3), (3, 6, 0),

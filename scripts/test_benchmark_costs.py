@@ -101,6 +101,43 @@ class BenchmarkCostsTests(unittest.TestCase):
         self.assertFalse(with_write['codex_credit_scenario_complete'])
         self.assertIsNone(with_write['codex_credit_scenario'])
 
+    def test_a_model_the_table_says_has_no_cache_is_priced_without_one(self):
+        import benchmark_costs
+        original = benchmark_costs.CACHE_APPLIES
+        benchmark_costs.CACHE_APPLIES = False
+        try:
+            # Nothing is reported for either share because there is no cache.
+            absent = classify_row(metric(usage={
+                'input_tokens': 1000, 'output_tokens': 200,
+            }))
+            self.assertTrue(absent['complete'], absent['errors'])
+            # 1,000 at 10 plus 200 at 50, per million: the same figure the
+            # Rust module produces for the same rule.
+            self.assertEqual(absent['standard_api_hypothetical_usd'], '0.02')
+            # Zero is what such a model consistently reports.
+            zero = classify_row(metric(usage={
+                'input_tokens': 1000, 'cache_read_tokens': 0,
+                'cache_write_tokens': 0, 'output_tokens': 200,
+            }))
+            self.assertTrue(zero['complete'], zero['errors'])
+            self.assertEqual(zero['standard_api_hypothetical_usd'], '0.02')
+            # A figure above zero contradicts the table and is left showing.
+            for field in ('cache_read_tokens', 'cache_write_tokens'):
+                contradicted = classify_row(metric(usage={
+                    'input_tokens': 1000, 'output_tokens': 200, field: 1,
+                }))
+                self.assertFalse(contradicted['complete'])
+                self.assertIn('cache_declared_absent', contradicted['errors'])
+        finally:
+            benchmark_costs.CACHE_APPLIES = original
+
+    def test_an_unreadable_cache_declaration_is_refused(self):
+        import benchmark_costs
+        self.assertTrue(benchmark_costs._cache_applies({}))
+        self.assertFalse(benchmark_costs._cache_applies({'cache': 'not_applicable'}))
+        with self.assertRaises(ValueError):
+            benchmark_costs._cache_applies({'cache': 'maybe'})
+
     def test_cli_reads_explicit_folder_and_emits_only_machine_json(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

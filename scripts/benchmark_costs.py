@@ -6,7 +6,7 @@ comparison.  It consumes only the small usage records emitted by
 ``codex_metrics`` and never emits request bodies, responses, or identifiers.
 """
 import argparse
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import json
 from pathlib import Path
 import sys
@@ -14,21 +14,52 @@ import sys
 
 MODEL = 'gpt-6-astra'
 EFFORT = 'medium'
-LONG_CONTEXT_LIMIT = 272_000
 MAX_METRIC_PATHS = 128
 
 MILLION = Decimal('1000000')
-API_RATES = {
-    'ordinary_input': Decimal('10'),
-    'cache_read': Decimal('1'),
-    'cache_write': Decimal('12.5'),
-    'output': Decimal('50'),
-}
-CREDIT_RATES = {
-    'ordinary_input': Decimal('250'),
-    'cache_read': Decimal('25'),
-    'output': Decimal('1250'),
-}
+
+# The one price list.  The Rust measurement code embeds this same file, so
+# the two sides cannot drift into pricing the same usage differently.
+RATES_PATH = Path(__file__).resolve().parent / 'rates.json'
+
+
+def _load_rates(model=MODEL):
+    table = json.loads(RATES_PATH.read_text(encoding='utf-8'))
+    entry = table['models'].get(model)
+    if entry is None:
+        # Another model's figures would look like a measurement and be none.
+        raise KeyError(f'rates.json does not name {model}')
+    return entry
+
+
+def _cache_applies(entry):
+    """Whether the model in the table has a cache at all.
+
+    ``not_applicable`` makes both cache shares zero by definition when a cost
+    is worked out; the record keeps saying whatever it said.  The Rust
+    measurement code reads the same field from the same file, so the two
+    sides cannot price a cacheless model differently.  A word nobody defined
+    is refused rather than read as either answer.
+    """
+    declared = entry.get('cache')
+    if declared is None:
+        return True
+    if declared == 'not_applicable':
+        return False
+    raise ValueError(f'rates.json declares an unreadable cache value: {declared!r}')
+
+
+_RATES = _load_rates()
+CACHE_APPLIES = _cache_applies(_RATES)
+LONG_CONTEXT_LIMIT = _RATES['long_context']['input_tokens_above']
+LONG_INPUT_MULTIPLIER = Decimal(_RATES['long_context']['input_multiplier'])
+LONG_OUTPUT_MULTIPLIER = Decimal(_RATES['long_context']['output_multiplier'])
+RATES_AS_OF = _RATES['rates_as_of']
+PRICING_SOURCES = list(_RATES['sources'])
+API_RATES = {name: Decimal(value)
+             for name, value in _RATES['api_per_million'].items()}
+CREDIT_RATES = {name: Decimal(value)
+                for name, value in _RATES['codex_credit_per_million'].items()}
 USAGE_FIELDS = ('input_tokens', 'cache_read_tokens', 'cache_write_tokens',
                 'output_tokens', 'total_tokens')
 
@@ -38,8 +69,15 @@ def _integer(value):
 
 
 def _decimal_text(value):
-    """Produce a stable JSON-safe Decimal representation."""
-    return format(value, 'f')
+    """Produce a stable JSON-safe Decimal representation.
+
+    Quantizing to the unit of account pads with zeros; they are removed so
+    the emitted text keeps the shape earlier records already have.
+    """
+    text = format(value, 'f')
+    if '.' not in text:
+        return text
+    return text.rstrip('0').rstrip('.') or '0'
 
 
 def _usage_summary(usage):
@@ -58,8 +96,18 @@ def _usage_summary(usage):
             continue
         known[field] = value
 
-    required = USAGE_FIELDS[:4]
-    for field in required:
+    cache_fields = ('cache_read_tokens', 'cache_write_tokens')
+    if not CACHE_APPLIES:
+        # There is no cache to report, so an absent figure is not a missing
+        # measurement: it is zero by the table's rule, and the record above
+        # still says nothing was reported.  One above zero is the table and
+        # the provider disagreeing, left showing rather than absorbed.
+        for field in cache_fields:
+            if known[field] is None:
+                known[field] = 0
+        if any(known[field] > 0 for field in cache_fields):
+            errors.append('cache_declared_absent')
+    for field in USAGE_FIELDS[:4]:
         if known[field] is None:
             errors.append('missing_' + field)
 
@@ -77,15 +125,27 @@ def _usage_summary(usage):
     return known, errors, not errors
 
 
+def _quantize(value):
+    """Round to the unit of account, one micro-USD, half away from zero.
+
+    The Rust measurement code counts in whole micro-USD, so the two agree
+    only if the same rounding is applied here.  Every rate in the table lands
+    on a whole micro-USD except the cache write, which is half a one per
+    token.
+    """
+    return value.quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
+
+
 def _price(known, rates, long_context_multipliers):
-    multiplier = (Decimal('2'), Decimal('1.5')) if (
+    multiplier = (LONG_INPUT_MULTIPLIER, LONG_OUTPUT_MULTIPLIER) if (
         long_context_multipliers and known['input_tokens'] > LONG_CONTEXT_LIMIT
     ) else (Decimal('1'), Decimal('1'))
     input_multiplier, output_multiplier = multiplier
     ordinary = known['input_tokens'] - known['cache_read_tokens'] - known['cache_write_tokens']
-    return ((rates['ordinary_input'] * ordinary + rates['cache_read'] * known['cache_read_tokens']
-             + rates.get('cache_write', Decimal('0')) * known['cache_write_tokens']) * input_multiplier
-            + rates['output'] * known['output_tokens'] * output_multiplier) / MILLION
+    return _quantize(
+        ((rates['billed_input'] * ordinary + rates['cache_read'] * known['cache_read_tokens']
+          + rates.get('cache_write', Decimal('0')) * known['cache_write_tokens']) * input_multiplier
+         + rates['output'] * known['output_tokens'] * output_multiplier) / MILLION)
 
 
 def classify_row(row):
@@ -128,15 +188,11 @@ def summarize_rows(rows, label):
         'contract': {
             'model': MODEL,
             'effort': EFFORT,
-            'rates_as_of': '2026-09-07',
-            'pricing_sources': [
-                'https://developers.openai.com/api/docs/models/gpt-6-astra',
-                'https://developers.openai.com/api/docs/guides/prompt-caching',
-                'https://learn.chatgpt.com/docs/pricing',
-            ],
+            'rates_as_of': RATES_AS_OF,
+            'pricing_sources': PRICING_SOURCES,
             'standard_api_rates_per_million_tokens': {
-                'ordinary_input_usd': '10', 'cache_read_usd': '1',
-                'cache_write_usd': '12.5', 'output_usd': '50',
+                f'{name}_usd': _decimal_text(value)
+                for name, value in API_RATES.items()
             },
             'standard_api_hypothetical': True,
             'codex_credit_scenario_is_not_invoice_or_rate_limit': True,

@@ -5,6 +5,7 @@ use polaris_core::{
     agent::{self, ToolContext},
     approval::{ApprovalPolicy, Approver, Decision, Gate},
     audit::AuditLog,
+    measurement::{Observed, price},
     prompt,
     session::Session,
     stop::StopTracker,
@@ -144,6 +145,7 @@ async fn run_turn(
     };
     if arm == "candidate-workflow-only" {
         session.workflow = Some(SessionWorkflow::new(WorkflowConfig {
+            mode: polaris_core::workflow::WorkflowMode::Manual,
             enabled: true,
             initial_phase: Phase::Implement,
             always: vec!["builtin:workflow-core".into()],
@@ -215,17 +217,15 @@ fn assess(metric: &Value, outcome: &agent::AgentOutcome, expected: &Value) -> Va
     let request_model_match = metric["model"] == MODEL && metric["effort"] == EFFORT;
     let answer_pass =
         serde_json::from_str::<Value>(&outcome.text).is_ok_and(|value| &value == expected);
-    let input_multiplier = if u.input_tokens > 272_000 { 2.0 } else { 1.0 };
-    let output_multiplier = if u.input_tokens > 272_000 { 1.5 } else { 1.0 };
-    let noncached = u.input_tokens.saturating_sub(u.cached_tokens) as f64;
-    // Frozen M0 rates; a missing cache-write breakdown remains unknown.
-    let upper = ((noncached * 12.5 + u.cached_tokens as f64) * input_multiplier
-        + u.output_tokens as f64 * 50.0 * output_multiplier)
-        / 1_000_000.0;
-    let lower = ((noncached * 10.0 + u.cached_tokens as f64) * input_multiplier
-        + u.output_tokens as f64 * 50.0 * output_multiplier)
-        / 1_000_000.0;
-    let limit_pass = u.output_tokens <= 4096 && upper <= 40.0;
+    // The shared price list; a missing cache-write breakdown stays unknown,
+    // so the figure is an interval and never a single cost.
+    let rates = price::Rates::embedded().expect("the embedded price list must parse");
+    let interval = price::api_cost_interval(&rates, MODEL, &Observed::from_metrics_row(metric));
+    let (lower, upper) = interval.map_or((None, None), |(lower, upper)| {
+        (Some(price::usd(lower)), Some(price::usd(upper)))
+    });
+    let limit_pass =
+        u.output_tokens <= 4096 && interval.is_some_and(|(_, upper)| upper <= 40 * 1_000_000);
     let pass = usage_matches
         && request_model_match
         && answer_pass
@@ -454,6 +454,10 @@ mod tests {
                 Fake.complete(req).await
             }
         }
+        let implement = polaris_skills::workflow_profile::recommended_bindings()
+            .into_iter()
+            .find(|skill| skill.name == "implement")
+            .expect("shipped implementation skill");
         for (arm, expected) in [
             ("candidate-features-off", false),
             ("candidate-workflow-only", true),
@@ -470,10 +474,7 @@ mod tests {
             let requests = capture.0.lock().unwrap();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].contains("Workflow focus: implement."), expected);
-            assert_eq!(
-                requests[0].contains("Work within the approved specification."),
-                expected
-            );
+            assert_eq!(requests[0].contains(implement.body.trim()), expected);
         }
     }
 }

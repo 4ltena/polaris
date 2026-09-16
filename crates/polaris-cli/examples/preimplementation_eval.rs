@@ -7,6 +7,7 @@ use polaris_core::{
     agent::{self, ToolContext},
     approval::{ApprovalPolicy, Approver, Decision, Gate},
     audit::AuditLog,
+    measurement::{Observed, price},
     prompt,
     session::Session,
     stop::StopTracker,
@@ -266,6 +267,7 @@ fn workflow_for(case: &PublicCase, arm: &str) -> Option<SessionWorkflow> {
         phase_skills.insert(phase, vec![format!("builtin:{}", case.phase)]);
     }
     Some(SessionWorkflow::new(WorkflowConfig {
+        mode: polaris_core::workflow::WorkflowMode::Manual,
         enabled: true,
         initial_phase: phase,
         always: vec!["builtin:workflow-core".into()],
@@ -324,20 +326,11 @@ fn metrics(path: &Path) -> Result<Vec<Value>, String> {
         .map(|line| serde_json::from_str(line).map_err(|_| "metrics invalid".into()))
         .collect()
 }
-fn cost_upper(input: u64, output: u64, cached: u64) -> Option<f64> {
-    if cached > input {
-        return None;
-    }
-    let (input_multiplier, output_multiplier) = if input > 272_000 {
-        (2.0, 1.5)
-    } else {
-        (1.0, 1.0)
-    };
-    Some(
-        (((input - cached) as f64 * 12.5 + cached as f64) * input_multiplier
-            + output as f64 * 50.0 * output_multiplier)
-            / 1_000_000.0,
-    )
+/// The one price list, shared with the aggregation scripts. A table that
+/// does not parse is a build-time mistake, so it fails here rather than
+/// letting a figure written into this file stand in for it.
+fn rates() -> price::Rates {
+    price::Rates::embedded().expect("the embedded price list must parse")
 }
 fn assess(outcome: &agent::AgentOutcome, metric: &Value) -> Value {
     let usage = outcome.usage;
@@ -353,10 +346,9 @@ fn assess(outcome: &agent::AgentOutcome, metric: &Value) -> Value {
     let matches = input == Some(usage.input_tokens.into())
         && output == Some(usage.output_tokens.into())
         && cached == Some(usage.cached_tokens.into());
-    let upper = input
-        .zip(output)
-        .zip(cached)
-        .and_then(|((input, output), cached)| cost_upper(input, output, cached));
+    let rates = rates();
+    let observed = Observed::from_metrics_row(metric);
+    let upper = price::api_cost_upper(&rates, MODEL, &observed).map(price::usd);
     let write_value = metric.pointer("/usage/cache_write_tokens");
     let cache_write = write_value.and_then(Value::as_u64);
     // The upper bound already prices every non-read input token as a write.
@@ -369,19 +361,11 @@ fn assess(outcome: &agent::AgentOutcome, metric: &Value) -> Value {
                 .is_some_and(|(input, read)| read <= input && write <= input - read)
         }),
     };
-    let exact = if split_valid {
-        input
-            .zip(output)
-            .zip(cached)
-            .zip(cache_write)
-            .map(|(((i, o), r), w)| {
-                let (im, om) = if i > 272_000 { (2.0, 1.5) } else { (1.0, 1.0) };
-                (((i - r - w) as f64 * 10.0 + w as f64 * 12.5 + r as f64) * im
-                    + o as f64 * 50.0 * om)
-                    / 1_000_000.0
-            })
-    } else {
-        None
+    // Only a cost with every share reported counts as exact; the shared
+    // price list is what decides that, not a formula written here.
+    let exact = match (split_valid, price::api_cost_of(&rates, MODEL, &observed)) {
+        (true, price::Cost::Exact { micro_usd }) => Some(price::usd(micro_usd)),
+        _ => None,
     };
     let post_response_limit_pass = usage.output_tokens <= MAX_OUTPUT;
     let usage_total_consistent =

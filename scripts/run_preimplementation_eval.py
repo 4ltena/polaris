@@ -12,9 +12,20 @@ import time
 ARMS = ('candidate-features-off', 'candidate-workflow-only')
 REQUIRED_FILES = frozenset({'execution-contract.json', 'benchmark_preimplementation.py',
                             'run_preimplementation_eval.py', 'pricing.json', 'source-receipt.json',
+                            'rates.json',
                             'fixtures/preimplementation-cases.json',
                             'fixtures/preimplementation-receipt.json'}
                            | {'inputs/PRE%02d.json' % n for n in range(1, 9)})
+
+def rates(work):
+    """The frozen copy of the one price list, from the work directory.
+
+    Reading the copy rather than the file next to this script is what makes
+    the hash check above cover the rates actually spent against.  The copy is
+    frozen from the repository's ``scripts/rates.json``, the same file the
+    Rust measurement code embeds.
+    """
+    return json.loads((work / 'rates.json').read_text(encoding='utf-8'))['models']['gpt-6-astra']
 
 
 def digest(path):
@@ -107,6 +118,7 @@ def ledger_status(work, cap=96, initial_cost=0.0):
     ledger = json.loads(path.read_text())
     if ledger['budget'] != {'max_physical_attempts': cap} or ledger['halted']:
         raise ValueError('ledger halted or budget mismatch')
+    table = rates(work)
     records = ledger['records']
     cost = initial_cost
     for record in records:
@@ -120,8 +132,15 @@ def ledger_status(work, cap=96, initial_cost=0.0):
         i, o, total, cache = values
         if i + o != total or cache > i or o > 4096:
             raise ValueError('usage or observed output limit')
-        cost += ((i - cache) * 12.5 + cache) * (2 if i > 272000 else 1) / 1e6
-        cost += o * 50 * (1.5 if i > 272000 else 1) / 1e6
+        # Before the cache-write split is known, every non-cached input token
+        # is reserved at the cache-write rate, which is the dearest.
+        long = i > table['long_context']['input_tokens_above']
+        api = table['api_per_million']
+        input_multiplier = float(table['long_context']['input_multiplier']) if long else 1.0
+        output_multiplier = float(table['long_context']['output_multiplier']) if long else 1.0
+        cost += ((i - cache) * float(api['cache_write']) + cache * float(api['cache_read'])) \
+            * input_multiplier / 1e6
+        cost += o * float(api['output']) * output_multiplier / 1e6
     if len(records) > cap or not math.isfinite(cost) or cost > 40:
         raise ValueError('observed cumulative limit')
     return len(records), cost

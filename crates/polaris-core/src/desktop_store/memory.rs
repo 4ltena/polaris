@@ -1,19 +1,28 @@
 //! strict10のv3公開境界。モデルを呼ばず、v2 writerを開かない。
 use super::*;
+use crate::conversation_memory::structured::{StructuredIntent, ValidatedStructuredResponse};
 use crate::conversation_state::{
-    ConversationSnapshot, ConversationStateV2, RawEventV2, content_hash,
+    ConversationSnapshot, ConversationStateV2, RawEventV2, StructuredCoverage, content_hash,
 };
 use polaris_desktop_protocol::{
     ids::*,
     request::RunTarget,
     snapshot::{HistoryMode, MemoryPhase, MemoryStatus},
 };
+use polaris_memory::structured::StructuredDelta;
 use polaris_memory::{
     MemoryStore,
     conversation::{PendingSummary, PublishedView, Scope},
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::Path};
+
+mod fork;
+mod frozen;
+mod initialize;
+mod related;
+pub(super) use fork::{fork_seed, validate_transition};
+pub(in crate::desktop_store) use frozen::with_inherited_prompt_attachments;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +66,21 @@ struct SummaryAttempt {
     operation_id: OperationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    structured: Option<StructuredAttempt>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredAttempt {
+    intent: StructuredIntent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response: Option<SavedStructuredResponse>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedStructuredResponse {
+    pub summary: String,
+    pub delta: StructuredDelta,
+    pub coverage: StructuredCoverage,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +89,10 @@ struct PublishedSource {
     generation: DecimalU64,
     summary_id: String,
     source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    structured_publication_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    structured_coverage: Option<StructuredCoverage>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +103,8 @@ pub struct SavedMemory {
     generation: DecimalU64,
     sources: Vec<PublishedSource>,
     attempts: Vec<SummaryAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ancestors: Vec<fork::FrozenAncestor>,
 }
 
 /// 原文は公開済みprefixからの読取り投影だけ。ここからv2保存は行わない。
@@ -87,6 +117,39 @@ pub struct MemorySnapshot {
     workflow: Option<SavedWorkflow>,
 }
 impl MemorySnapshot {
+    pub fn structured_view(
+        &self,
+    ) -> StoreResult<polaris_memory::structured::StructuredPublicationView> {
+        let state = &self.conversation.state;
+        if state.history_mode != HistoryMode::Structured10 {
+            return Err(StoreError::RunConflict);
+        }
+        Ok(polaris_memory::structured::StructuredPublicationView {
+            scope: polaris_memory::structured::PublicationScope {
+                project_id: state.project_id.clone(),
+                session_id: state.session_id.clone(),
+                epoch: number(state.epoch)?,
+                generation: number(state.generation)?,
+            },
+            visible_publication_ids: state.visible_structured_publication_ids.clone(),
+            ancestors: state
+                .ancestors
+                .iter()
+                .map(|ancestor| {
+                    Ok(
+                        polaris_memory::structured::StructuredAncestorPublicationRange {
+                            session_id: ancestor.session_id.clone(),
+                            epoch: number(ancestor.epoch)?,
+                            generation: number(ancestor.generation)?,
+                            visible_publication_ids: ancestor
+                                .visible_structured_publication_ids
+                                .clone(),
+                        },
+                    )
+                })
+                .collect::<StoreResult<_>>()?,
+        })
+    }
     pub fn view(&self) -> StoreResult<PublishedView> {
         let state = &self.conversation.state;
         Ok(PublishedView {
@@ -97,7 +160,18 @@ impl MemorySnapshot {
                 generation: number(state.generation)?,
             },
             visible_ids: state.visible_summary_ids.clone(),
-            ancestors: vec![],
+            ancestors: state
+                .ancestors
+                .iter()
+                .map(|ancestor| {
+                    Ok(polaris_memory::conversation::AncestorRange {
+                        session_id: ancestor.session_id.clone(),
+                        epoch: number(ancestor.epoch)?,
+                        generation: number(ancestor.generation)?,
+                        visible_ids: ancestor.visible_summary_ids.clone(),
+                    })
+                })
+                .collect::<StoreResult<_>>()?,
         })
     }
     pub fn expired_turn(&self) -> StoreResult<Option<u64>> {
@@ -126,6 +200,8 @@ pub struct SummaryWork {
     pub operation_id: OperationId,
     /// Only a newly published intent authorizes a new summary request.
     pub newly_started: bool,
+    pub structured_intent: Option<StructuredIntent>,
+    pub structured_response: Option<SavedStructuredResponse>,
 }
 
 fn hash(value: &str) -> bool {
@@ -150,7 +226,10 @@ fn run_index(p: &Published, target: &RunTarget) -> StoreResult<usize> {
 fn active(p: &Published, target: &RunTarget) -> StoreResult<()> {
     let run = &p.state.runs[run_index(p, target)?];
     if !run.run.state.permits_start()
-        || run.configuration.history_mode != HistoryMode::Strict10
+        || !matches!(
+            run.configuration.history_mode,
+            HistoryMode::Strict10 | HistoryMode::Structured10
+        )
         || run.policy_revision != p.state.policy_revision
         || run.configuration != p.state.configuration
     {
@@ -183,6 +262,7 @@ fn project(
     recent.drain(..recent.len().saturating_sub(10));
     Ok(ConversationSnapshot {
         state: ConversationStateV2 {
+            workflow_config: None,
             schema_version: 2,
             project_id: p.marker.project_id.as_str().into(),
             session_id: p.marker.session_id.as_str().into(),
@@ -190,9 +270,15 @@ fn project(
             generation: m.generation.get(),
             raw_commit_offset: offset.get(),
             raw_commit_hash: raw_hash.clone(),
-            history_mode: HistoryMode::Strict10,
+            history_mode: p.state.configuration.history_mode,
             recent_turn_ids: recent,
             visible_summary_ids: m.sources.iter().map(|s| s.summary_id.clone()).collect(),
+            visible_structured_publication_ids: m
+                .sources
+                .iter()
+                .filter_map(|s| s.structured_publication_id.clone())
+                .collect(),
+            structured_coverage: m.sources.last().and_then(|s| s.structured_coverage.clone()),
             workflow: p
                 .state
                 .workflow
@@ -205,7 +291,17 @@ fn project(
                 .as_ref()
                 .map(|w| w.gates.clone())
                 .unwrap_or_default(),
-            ancestors: vec![],
+            ancestors: m
+                .ancestors
+                .iter()
+                .map(|ancestor| crate::conversation_state::AncestorRange {
+                    session_id: ancestor.marker.session_id.as_str().into(),
+                    epoch: ancestor.marker.epoch.get(),
+                    generation: ancestor.generation.get(),
+                    visible_summary_ids: ancestor.summary_ids.clone(),
+                    visible_structured_publication_ids: ancestor.structured_ids.clone(),
+                })
+                .collect(),
         },
         raw_hash,
         raw_offset: offset.get(),
@@ -214,11 +310,17 @@ fn project(
 }
 
 pub(super) fn validate(p: &Published) -> StoreResult<()> {
+    fork::validate(p)?;
     for run in &p.state.runs {
         if let Some(status) = &run.memory {
             validate_status(status)?;
             if status.run_id != run.run.run_id
-                || run.configuration.history_mode != HistoryMode::Strict10
+                || (status.retrieval_status.is_some()
+                    && run.configuration.history_mode != HistoryMode::Structured10)
+                || !matches!(
+                    run.configuration.history_mode,
+                    HistoryMode::Strict10 | HistoryMode::Structured10
+                )
                 || run.memory_resources.is_none()
             {
                 return Err(StoreError::Corrupt("実行の記憶状態"));
@@ -241,6 +343,29 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
         return Err(StoreError::Corrupt("記憶の保存版・世代"));
     }
     let mut turns = BTreeSet::new();
+    // Hash all required raw boundaries in one pass, including their newline.
+    let required: BTreeSet<_> = m
+        .attempts
+        .iter()
+        .filter_map(|a| a.structured.as_ref())
+        .map(|a| a.intent.coverage.last_source_sequence)
+        .collect();
+    let mut boundaries = std::collections::BTreeMap::new();
+    let mut raw_bytes = 0u64;
+    use sha2::{Digest, Sha256};
+    let mut raw_digest = Sha256::new();
+    for event in &p.raw {
+        let bytes = serde_json::to_vec(event)?;
+        raw_bytes += bytes.len() as u64 + 1;
+        raw_digest.update(&bytes);
+        raw_digest.update(b"\n");
+        if required.contains(&event.sequence) {
+            boundaries.insert(
+                event.sequence,
+                (raw_bytes, format!("{:x}", raw_digest.clone().finalize())),
+            );
+        }
+    }
     for (index, source) in m.sources.iter().enumerate() {
         if !turns.insert(source.source.turn)
             || source.generation.get() != index as u64 + 1
@@ -253,8 +378,39 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
         {
             return Err(StoreError::Corrupt("記憶の公開出典"));
         }
+        let attempt = m
+            .attempts
+            .iter()
+            .find(|a| a.source.turn == source.source.turn)
+            .ok_or(StoreError::Corrupt("公開記憶のattempt不在"))?;
+        if attempt.source != source.source {
+            return Err(StoreError::Corrupt("公開記憶の原文対応"));
+        }
+        match (
+            &attempt.structured,
+            &source.structured_publication_id,
+            &source.structured_coverage,
+        ) {
+            (None, None, None) => {}
+            (Some(structured), Some(id), Some(coverage)) => {
+                let response = structured
+                    .response
+                    .as_ref()
+                    .ok_or(StoreError::Corrupt("公開記憶の応答不在"))?;
+                if &response.delta.publication.publication_id != id
+                    || &response.coverage != coverage
+                    || u64::try_from(response.delta.publication.scope.generation).ok()
+                        != Some(source.generation.get())
+                {
+                    return Err(StoreError::Corrupt("公開記憶と構造化応答の対応"));
+                }
+            }
+            _ => return Err(StoreError::Corrupt("公開記憶の構造化対応")),
+        }
     }
     let mut attempts = BTreeSet::new();
+    let source_events: std::collections::BTreeMap<_, _> =
+        p.raw.iter().map(|e| (e.sequence, e)).collect();
     for attempt in &m.attempts {
         if !attempts.insert(attempt.source.turn) {
             return Err(StoreError::Corrupt("要約の重複"));
@@ -276,6 +432,83 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
                 return Err(StoreError::Corrupt("要約結果が未確定"));
             }
         }
+        if let Some(structured) = &attempt.structured {
+            crate::conversation_memory::structured::source_budget(&structured.intent.sources)?;
+            let mut previous = None;
+            for source in &structured.intent.sources {
+                let event = source_events
+                    .get(&source.sequence)
+                    .ok_or(StoreError::Corrupt("構造化source不在"))?;
+                if previous.is_some_and(|p| p >= source.sequence)
+                    || event.epoch != m.epoch.get()
+                    || source.role != event.message.role
+                    || source.content != event.message.content
+                    || source.source_id
+                        != format!(
+                            "source-v3:{}:{}:{}:{}",
+                            p.marker.project_id.as_str(),
+                            p.marker.session_id.as_str(),
+                            event.epoch,
+                            event.sequence
+                        )
+                {
+                    return Err(StoreError::Corrupt("構造化sourceの原文拘束"));
+                }
+                previous = Some(source.sequence);
+            }
+            let valid_source_end = if structured.intent.sources.is_empty() {
+                // An empty extraction must inherit the same fully covered raw
+                // prefix from an earlier *published structured* summary.
+                structured.intent.coverage.raw_offset == attempt.source.raw_offset.get()
+                    && structured.intent.coverage.prefix_hash == attempt.source.raw_hash
+                    && m.sources.iter().any(|prior| {
+                        prior.source.turn < attempt.source.turn
+                            && prior.structured_publication_id.is_some()
+                            && prior.structured_coverage.as_ref()
+                                == Some(&structured.intent.coverage)
+                            && prior.source.raw_offset == attempt.source.raw_offset
+                            && prior.source.raw_hash == attempt.source.raw_hash
+                            && m.attempts.iter().any(|saved| {
+                                saved.source == prior.source
+                                    && saved
+                                        .structured
+                                        .as_ref()
+                                        .and_then(|s| s.response.as_ref())
+                                        .is_some()
+                            })
+                    })
+            } else {
+                previous == Some(structured.intent.coverage.last_source_sequence)
+            };
+            if !valid_source_end
+                || structured.intent.coverage.epoch != m.epoch.get()
+                || structured.intent.coverage.raw_offset > attempt.source.raw_offset.get()
+                || !hash(&structured.intent.coverage.prefix_hash)
+                || boundaries.get(&structured.intent.coverage.last_source_sequence)
+                    != Some(&(
+                        structured.intent.coverage.raw_offset,
+                        structured.intent.coverage.prefix_hash.clone(),
+                    ))
+            {
+                return Err(StoreError::Corrupt("構造化coverageの保存内容"));
+            }
+            if let Some(response) = &structured.response {
+                polaris_memory::structured::validate_delta(&response.delta)
+                    .map_err(std::io::Error::other)?;
+                let publication = &response.delta.publication;
+                if response.coverage != structured.intent.coverage
+                    || attempt.summary.as_deref() != Some(&response.summary)
+                    || publication.raw_hash != attempt.source.raw_hash
+                    || publication.scope.project_id != p.marker.project_id.as_str()
+                    || publication.scope.session_id != p.marker.session_id.as_str()
+                    || u64::try_from(publication.scope.epoch).ok() != Some(m.epoch.get())
+                    || publication.prompt_version
+                        != crate::conversation_memory::structured::STRUCTURED_PROMPT_VERSION
+                {
+                    return Err(StoreError::Corrupt("構造化応答の保存内容"));
+                }
+            }
+        }
     }
     for source in m
         .sources
@@ -295,14 +528,45 @@ pub(super) fn validate(p: &Published) -> StoreResult<()> {
 }
 
 fn validate_status(status: &MemoryStatus) -> StoreResult<()> {
-    if status.detail.len() > 1024
+    use polaris_desktop_protocol::snapshot::MemoryRetrievalStatus;
+    let structured = status.retrieval_status.is_some();
+    if (status.related_omission.is_some()
+        && !matches!(
+            status.retrieval_status,
+            Some(MemoryRetrievalStatus::Found | MemoryRetrievalStatus::PendingReconfirmation)
+        ))
+        || status.detail.len() > 1024
         || status.recent_raw_turns.get() > 10
-        || status.retrieval_sources.len() > 3
-        || status.reference_tokens.get() > 768
+        || status.retrieval_sources.len() > if structured { 256 } else { 3 }
         || status
             .retrieval_sources
             .iter()
-            .any(|uri| uri.len() > 1024 || crate::conversation_memory::parse_uri(uri).is_err())
+            .map(String::len)
+            .sum::<usize>()
+            > 64 * 1024
+        || status
+            .retrieval_sources
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != status.retrieval_sources.len()
+        || status.reference_tokens.get() > 768
+        || status.retrieval_sources.iter().any(|uri| {
+            if structured && uri.starts_with("conversation://structured/") {
+                crate::conversation_memory::structured::sources::parse_source_uri(uri).is_err()
+            } else {
+                uri.len() > 1024 || crate::conversation_memory::parse_uri(uri).is_err()
+            }
+        })
+        || (matches!(
+            status.retrieval_status,
+            Some(
+                MemoryRetrievalStatus::NotFound
+                    | MemoryRetrievalStatus::AmbiguousEntity
+                    | MemoryRetrievalStatus::ExtractionIncomplete
+                    | MemoryRetrievalStatus::EvidenceBudgetExceeded
+            )
+        ) && !status.retrieval_sources.is_empty())
     {
         return Err(StoreError::Corrupt("記憶状態の上限"));
     }
@@ -331,6 +595,7 @@ impl Writer {
                 generation: DecimalU64::new(0),
                 sources: vec![],
                 attempts: vec![],
+                ancestors: vec![],
             });
         }
         let index = run_index(&next, target)?;
@@ -345,6 +610,8 @@ impl Writer {
             recent_raw_turns: DecimalU64::new(0),
             retrieval_sources: vec![],
             reference_tokens: DecimalU64::new(0),
+            retrieval_status: None,
+            related_omission: None,
             main_usage: None,
             summary_usage: None,
             embedding_usage: None,
@@ -361,7 +628,11 @@ impl Writer {
         validate_status(&status)?;
         let mut next = self.snapshot()?;
         let index = run_index(&next, target)?;
-        if status.run_id != target.run_id || next.state.runs[index].memory_resources.is_none() {
+        if status.run_id != target.run_id
+            || next.state.runs[index].memory_resources.is_none()
+            || (status.retrieval_status.is_some()
+                && next.state.runs[index].configuration.history_mode != HistoryMode::Structured10)
+        {
             return Err(StoreError::RunConflict);
         }
         if next.state.runs[index].memory.as_ref() == Some(&status) {
@@ -435,6 +706,24 @@ impl Writer {
                 .map(serde_json::from_slice)
                 .collect::<Result<Vec<RawEventV2>, _>>()?;
             let source = project(&next, raw, prior.source.raw_offset, prior.source.raw_hash)?;
+            if let Some(structured) = &prior.structured {
+                if crate::conversation_memory::structured::structured_summary_intent(&source)?
+                    .as_ref()
+                    != Some(&structured.intent)
+                {
+                    return Err(StoreError::Corrupt("保存済み構造化source map"));
+                }
+                if let Some(response) = &structured.response {
+                    crate::conversation_memory::structured::validate_saved_response(
+                        &source,
+                        turn,
+                        &structured.intent,
+                        &response.summary,
+                        &response.delta,
+                        &response.coverage,
+                    )?;
+                }
+            }
             return Ok(SummaryWork {
                 expected: expected.clone(),
                 source,
@@ -442,8 +731,11 @@ impl Writer {
                 summary: prior.summary,
                 operation_id: prior.operation_id,
                 newly_started: false,
+                structured_intent: prior.structured.as_ref().map(|value| value.intent.clone()),
+                structured_response: prior.structured.and_then(|value| value.response),
             });
         }
+        fork::reserve(&next, turn, &next.marker.raw_hash)?;
         let operation_id = OperationId::new(format!("memory-{}-{turn}", digest))?;
         let index = run_index(&next, target)?;
         if next
@@ -457,6 +749,9 @@ impl Writer {
         next.state.runs[index].operations.push(Operation {
             operation_id: operation_id.clone(),
             result_id: None,
+            mcp: None,
+            prompt: None,
+            recipe: None,
         });
         let source = SourceStamp {
             turn: DecimalU64::new(turn),
@@ -465,6 +760,18 @@ impl Writer {
             raw_hash: next.marker.raw_hash.clone(),
             content_revision: next.marker.content_revision,
         };
+        let structured_intent =
+            if expected.conversation.state.history_mode == HistoryMode::Structured10 {
+                Some(
+                    crate::conversation_memory::structured::structured_summary_intent(
+                        &expected.conversation,
+                    )
+                    .map_err(std::io::Error::other)?
+                    .ok_or(StoreError::Corrupt("構造化抽出対象がありません"))?,
+                )
+            } else {
+                None
+            };
         next.state
             .conversation_memory
             .as_mut()
@@ -476,6 +783,10 @@ impl Writer {
                 attempt_id: target.attempt_id.clone(),
                 operation_id: operation_id.clone(),
                 summary: None,
+                structured: structured_intent.clone().map(|intent| StructuredAttempt {
+                    intent,
+                    response: None,
+                }),
             });
         self.commit(next, false)?;
         Ok(SummaryWork {
@@ -485,6 +796,8 @@ impl Writer {
             summary: None,
             operation_id,
             newly_started: true,
+            structured_intent,
+            structured_response: None,
         })
     }
 
@@ -527,6 +840,83 @@ impl Writer {
         self.commit(next, false)
     }
 
+    pub fn save_structured_response(
+        &mut self,
+        target: &RunTarget,
+        work: &SummaryWork,
+        response: &ValidatedStructuredResponse,
+    ) -> StoreResult<()> {
+        self.check_memory_snapshot(target, &work.expected)?;
+        crate::conversation_memory::summary_evidence(&work.source, work.turn, &response.summary)?;
+        let intent = work
+            .structured_intent
+            .as_ref()
+            .ok_or(StoreError::RunConflict)?;
+        crate::conversation_memory::structured::validate_saved_response(
+            &work.source,
+            work.turn,
+            intent,
+            &response.summary,
+            &response.delta,
+            &response.coverage,
+        )?;
+        if response.coverage != intent.coverage
+            || response.delta.publication.raw_hash != work.source.raw_hash
+            || response.delta.publication.scope.generation
+                != number(
+                    work.expected
+                        .conversation
+                        .state
+                        .generation
+                        .checked_add(1)
+                        .ok_or(StoreError::Overflow)?,
+                )?
+        {
+            return Err(StoreError::Corrupt("構造化抽出結果の出典・世代"));
+        }
+        let saved = SavedStructuredResponse {
+            summary: response.summary.clone(),
+            delta: response.delta.clone(),
+            coverage: response.coverage.clone(),
+        };
+        let mut next = self.snapshot()?;
+        let attempt = next
+            .state
+            .conversation_memory
+            .as_mut()
+            .ok_or(StoreError::NotFound)?
+            .attempts
+            .iter_mut()
+            .find(|a| {
+                a.operation_id == work.operation_id
+                    && a.run_id == target.run_id
+                    && a.attempt_id == target.attempt_id
+            })
+            .ok_or(StoreError::NotFound)?;
+        let structured = attempt.structured.as_mut().ok_or(StoreError::RunConflict)?;
+        if structured.intent != *intent
+            || structured
+                .response
+                .as_ref()
+                .is_some_and(|old| old != &saved)
+        {
+            return Err(StoreError::RunConflict);
+        }
+        attempt.summary = Some(saved.summary.clone());
+        structured.response = Some(saved.clone());
+        let index = run_index(&next, target)?;
+        let operation = next.state.runs[index]
+            .operations
+            .iter_mut()
+            .find(|o| o.operation_id == work.operation_id)
+            .ok_or(StoreError::NotFound)?;
+        operation.result_id = Some(ResultId::new(format!(
+            "summary-{}",
+            content_hash(saved.summary.as_bytes())
+        ))?);
+        self.commit(next, false)
+    }
+
     /// The pending index and raw-prefix provenance are checked before one v3 publication.
     pub fn publish_memory(
         &mut self,
@@ -536,6 +926,9 @@ impl Writer {
         database: &Path,
     ) -> StoreResult<()> {
         self.check_memory_snapshot(target, &work.expected)?;
+        if work.structured_intent.is_some() {
+            return Err(StoreError::RunConflict);
+        }
         let mut next = self.snapshot()?;
         let m = memory(&next)?;
         let attempt = m
@@ -573,16 +966,94 @@ impl Writer {
             generation,
             summary_id: pending.id.clone(),
             source_id: pending.source.id.clone(),
+            structured_publication_id: None,
+            structured_coverage: None,
         });
         let mut db = MemoryStore::open(database).map_err(std::io::Error::other)?;
         db.insert_pending_summary(pending)
             .map_err(std::io::Error::other)?;
-        db.publish_pending(&view, std::slice::from_ref(&pending.id), || {
-            self.commit(next, false)
-                .map_err(|e| polaris_memory::Error::Io(std::io::Error::other(e)))
-        })
-        .map_err(std::io::Error::other)?;
-        Ok(())
+        frozen::publish(self, &mut db, &view, &pending.id, None, next)
+    }
+
+    pub fn publish_structured_memory(
+        &mut self,
+        target: &RunTarget,
+        work: &SummaryWork,
+        pending: &PendingSummary,
+        response: &SavedStructuredResponse,
+        database: &Path,
+    ) -> StoreResult<()> {
+        self.check_memory_snapshot(target, &work.expected)?;
+        crate::conversation_memory::structured::validate_saved_response(
+            &work.source,
+            work.turn,
+            work.structured_intent
+                .as_ref()
+                .ok_or(StoreError::RunConflict)?,
+            &response.summary,
+            &response.delta,
+            &response.coverage,
+        )?;
+        let mut next = self.snapshot()?;
+        let attempt = memory(&next)?
+            .attempts
+            .iter()
+            .find(|a| a.operation_id == work.operation_id)
+            .ok_or(StoreError::NotFound)?
+            .clone();
+        if attempt.summary.as_deref() != Some(&pending.summary)
+            || attempt
+                .structured
+                .as_ref()
+                .and_then(|value| value.response.as_ref())
+                != Some(response)
+            || response.delta.publication.raw_hash != attempt.source.raw_hash
+        {
+            return Err(StoreError::Corrupt("構造化記憶の公開内容"));
+        }
+        let generation = memory(&next)?.generation.checked_add(1)?;
+        let suffix = &attempt.source.raw_hash[..16];
+        let mut view = work.expected.view()?;
+        view.scope.generation = number(generation.get())?;
+        if pending.scope != view.scope
+            || pending.id != format!("strict10-{}-{suffix}", work.turn)
+            || pending.source.id != format!("source-{}-{suffix}", work.turn)
+            || pending.source.raw_hash != attempt.source.raw_hash
+            || response.delta.publication.scope
+                != (polaris_memory::structured::PublicationScope {
+                    project_id: view.scope.project_id.clone(),
+                    session_id: view.scope.session_id.clone(),
+                    epoch: view.scope.epoch,
+                    generation: view.scope.generation,
+                })
+        {
+            return Err(StoreError::Corrupt("構造化記憶のscope"));
+        }
+        self.memory_raw_prefix(attempt.source.raw_offset, &attempt.source.raw_hash)?;
+        view.visible_ids.push(pending.id.clone());
+        let memory = next.state.conversation_memory.as_mut().unwrap();
+        memory.generation = generation;
+        memory.sources.push(PublishedSource {
+            source: attempt.source,
+            generation,
+            summary_id: pending.id.clone(),
+            source_id: pending.source.id.clone(),
+            structured_publication_id: Some(response.delta.publication.publication_id.clone()),
+            structured_coverage: Some(response.coverage.clone()),
+        });
+        let mut db = MemoryStore::open(database).map_err(std::io::Error::other)?;
+        db.enable_structured_memory()
+            .map_err(std::io::Error::other)?;
+        db.insert_pending_summary(pending)
+            .map_err(std::io::Error::other)?;
+        frozen::publish(
+            self,
+            &mut db,
+            &view,
+            &pending.id,
+            Some(&response.delta),
+            next,
+        )
     }
 
     pub fn read_memory_source(
@@ -592,57 +1063,110 @@ impl Writer {
         uri: &str,
     ) -> StoreResult<String> {
         let expected = self.memory_snapshot(target)?;
-        let (id, requested, offset) = crate::conversation_memory::parse_uri(uri)?;
-        let p = self.snapshot()?;
-        let receipt = memory(&p)?
-            .sources
-            .iter()
-            .find(|s| s.source_id == id)
-            .ok_or(StoreError::NotFound)?;
-        let view = expected.view()?;
         let db = MemoryStore::open(database).map_err(std::io::Error::other)?;
-        db.with_conversation_source(&view, &id, |reference| {
-            let fail = || polaris_memory::Error::InvalidInput("v3 source scope/hash mismatch");
-            if reference.scope.project_id != view.scope.project_id
-                || reference.scope.session_id != view.scope.session_id
-                || reference.scope.epoch != view.scope.epoch
-                || reference.scope.generation != receipt.generation.get() as i64
-                || reference.source.raw_hash != receipt.source.raw_hash
-                || reference.source.start_turn != receipt.source.turn.get() as i64
-                || reference.source.end_turn != reference.source.start_turn
-            {
-                return Err(fail());
+        frozen::with_receipts(self, target, &expected, &db, |owners| {
+            if uri.starts_with("conversation://structured/") {
+                let (publication, source, offset) =
+                    crate::conversation_memory::structured::sources::parse_source_uri(uri)?;
+                return frozen::resolve_source(
+                    owners,
+                    &db,
+                    &expected.structured_view()?,
+                    &publication,
+                    &source,
+                )?
+                .page(offset)
+                .map_err(Into::into);
             }
-            let (start, end) =
-                requested.unwrap_or((reference.source.start_turn, reference.source.end_turn));
-            if start != reference.source.start_turn || end != reference.source.end_turn {
-                return Err(fail());
-            }
-            let bytes = self
-                .memory_raw_prefix(receipt.source.raw_offset, &receipt.source.raw_hash)
-                .map_err(|e| polaris_memory::Error::Io(std::io::Error::other(e)))?;
-            let events = bytes
-                .split(|b| *b == b'\n')
-                .filter(|line| !line.is_empty())
-                .map(serde_json::from_slice)
-                .collect::<Result<Vec<RawEventV2>, _>>()
-                .map_err(|_| fail())?;
-            let events: Vec<_> = events
-                .iter()
-                .filter(|e| {
-                    e.epoch == p.marker.epoch.get() && e.turn_id == receipt.source.turn.get()
-                })
-                .collect();
-            if content_hash(&serde_json::to_vec(&events).map_err(|_| fail())?)
-                != receipt.source.turn_hash
-            {
-                return Err(fail());
-            }
-            let payload = serde_json::to_string(&events).map_err(|_| fail())?;
-            crate::conversation_memory::source_page(&id, start, end, offset, &payload)
-                .map_err(polaris_memory::Error::Io)
+            let (id, requested, offset) = crate::conversation_memory::parse_uri(uri)?;
+            db.with_conversation_source(&expected.view()?, &id, |reference| {
+                let read = || -> StoreResult<String> {
+                    let scope = polaris_memory::structured::PublicationScope {
+                        project_id: reference.scope.project_id.clone(),
+                        session_id: reference.scope.session_id.clone(),
+                        epoch: reference.scope.epoch,
+                        generation: reference.scope.generation,
+                    };
+                    let owner = owners
+                        .iter()
+                        .find(|owner| owner.matches(&scope))
+                        .ok_or(StoreError::NotFound)?;
+                    let proof = owner
+                        .summaries
+                        .get(&reference.summary_id)
+                        .ok_or(StoreError::NotFound)?;
+                    let receipt = &proof.source;
+                    if reference.scope.generation != number(receipt.generation.get())?
+                        || reference.source.id != receipt.source_id
+                        || reference.source.raw_hash != receipt.source.raw_hash
+                        || reference.source.start_turn != number(receipt.source.turn.get())?
+                        || reference.source.end_turn != reference.source.start_turn
+                    {
+                        return Err(StoreError::Corrupt("原文参照の保存出典不一致"));
+                    }
+                    let (start, end) = requested
+                        .unwrap_or((reference.source.start_turn, reference.source.end_turn));
+                    if start != reference.source.start_turn || end != reference.source.end_turn {
+                        return Err(StoreError::Corrupt("原文参照の範囲不一致"));
+                    }
+                    let events = owner.summary_raw(proof)?;
+                    let payload = serde_json::to_string(&events)?;
+                    crate::conversation_memory::source_page(&id, start, end, offset, &payload)
+                        .map_err(Into::into)
+                };
+                Ok(read())
+            })
+            .map_err(std::io::Error::other)?
         })
-        .map_err(std::io::Error::other)
+    }
+
+    /// Mandatory-only comparison for owner regression tests. Production uses
+    /// the shared mandatory/related transaction in `related`.
+    #[cfg(test)]
+    pub(crate) fn prepare_structured_memory(
+        &self,
+        target: &RunTarget,
+        expected: &MemorySnapshot,
+        database: &Path,
+    ) -> StoreResult<crate::conversation_memory::structured::packing::StructuredContext> {
+        // Reject invalid owners and projections before creating or migrating
+        // the automatic path's database. The shared read path checks again.
+        self.check_memory_snapshot(target, expected)?;
+        expected.structured_view()?;
+        expected.related_query()?;
+        let db = MemoryStore::open(database).map_err(std::io::Error::other)?;
+        self.prepare_structured_memory_from_store(target, expected, &db)
+    }
+
+    #[cfg(test)]
+    fn prepare_structured_memory_from_store(
+        &self,
+        target: &RunTarget,
+        expected: &MemorySnapshot,
+        db: &MemoryStore,
+    ) -> StoreResult<crate::conversation_memory::structured::packing::StructuredContext> {
+        frozen::with_receipts(self, target, expected, db, |owners| {
+            self.prepare_structured_memory_from_receipts(expected, db, owners)
+        })
+    }
+
+    fn prepare_structured_memory_from_receipts(
+        &self,
+        expected: &MemorySnapshot,
+        db: &MemoryStore,
+        owners: &[frozen::FrozenMemory<'_>],
+    ) -> StoreResult<crate::conversation_memory::structured::packing::StructuredContext> {
+        let view = expected.structured_view()?;
+        crate::conversation_memory::structured::packing::prepare_context(
+            db,
+            &expected.conversation,
+            &view,
+            expected.related_query()?,
+            |publication, source| {
+                frozen::resolve_source(owners, db, &view, &publication.publication_id, source)
+                    .map_err(std::io::Error::other)
+            },
+        )
         .map_err(Into::into)
     }
 }

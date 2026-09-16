@@ -1,0 +1,405 @@
+{
+  "fixture_version": 3,
+  "case_id": "m3-rename-withdrawal-01",
+  "status": "expected-results-only",
+  "storage_scope": "project-A/session-A/epoch-1",
+  "inputs": [
+    {
+      "id": "T1",
+      "text": "project Aの製品名はLumen、設定キーはsync.retry_limitです。本番の再試行上限を3回と決定します。実装計画P1は、この決定に従って本番設定を変更する計画です。",
+      "input_sha256": "bbcebff95df9e4c4a2b56c25d5eaeac724cb641378a723746458a4f99f41c907",
+      "synthetic_assistant_reply": "確認"
+    },
+    {
+      "id": "T2",
+      "text": "project AのLumenをAsterへ改名します。同じ製品です。設定キーsync.retry_limitは変更しません。",
+      "input_sha256": "28e8ab84447fd32b51cdc696c4a727e9bfe5cf41833fdf5eeab5e6db8ba3c1e5",
+      "synthetic_assistant_reply": "確認"
+    },
+    {
+      "id": "T3",
+      "text": "project Bにも別製品Lumenがあります。project Aの製品とは別物で、今回の改名対象ではありません。",
+      "input_sha256": "dd59bce7cbc4e09db4f619dcedcea6f37bf555a7f0d53327b358681312c6a86a",
+      "synthetic_assistant_reply": "確認"
+    },
+    {
+      "id": "T4",
+      "text": "「本番の再試行上限5回」は検討案です。まだ採用していません。",
+      "input_sha256": "ee594387f7fc43a3695ff8c9f93c1352ca6364ddb43612fe0623e0ae3aa4abce",
+      "synthetic_assistant_reply": "確認"
+    },
+    {
+      "id": "T5",
+      "text": "本番の再試行上限3回という決定を撤回します。代わりの値は未定です。",
+      "input_sha256": "001a8d028ac556992be18a116ab45923fb7f2c684055fc1af56bf9916723826d",
+      "synthetic_assistant_reply": "確認"
+    }
+  ],
+  "filler": {
+    "turn_start": 6,
+    "turn_end": 105,
+    "user_template": "無関係な確認番号{turn}です。返答は「確認」のみ。",
+    "synthetic_assistant_reply": "確認"
+  },
+  "query": "旧Lumenの本番再試行設定を反映して。",
+  "expected_entities": [
+    {
+      "id": "product-A",
+      "current_name": "Aster",
+      "aliases": [
+        "Lumen"
+      ],
+      "kind": "product",
+      "subject_project": "A",
+      "sources": [
+        "T1",
+        "T2"
+      ]
+    },
+    {
+      "id": "setting-A",
+      "current_name": "sync.retry_limit",
+      "aliases": [],
+      "kind": "configuration_key",
+      "subject_project": "A",
+      "sources": [
+        "T1",
+        "T2"
+      ]
+    },
+    {
+      "id": "mentioned-product-B",
+      "current_name": "Lumen",
+      "aliases": [],
+      "kind": "product",
+      "subject_project": "B",
+      "sources": [
+        "T3"
+      ],
+      "scope_note": "project A内で言及された別製品。project Bへの保存権限は付与しない。"
+    }
+  ],
+  "expected_facts_after_T5": [
+    {
+      "id": "decision-3",
+      "entity_id": "setting-A",
+      "value": 3,
+      "unit": "retries",
+      "condition": "production",
+      "status": "superseded",
+      "reason": "withdrawn",
+      "successor_fact_id": null,
+      "sources": [
+        "T1",
+        "T5"
+      ]
+    },
+    {
+      "id": "proposal-5",
+      "entity_id": "setting-A",
+      "value": 5,
+      "unit": "retries",
+      "condition": "production",
+      "status": "proposed",
+      "sources": [
+        "T4"
+      ]
+    },
+    {
+      "id": "unresolved-limit",
+      "entity_id": "setting-A",
+      "value": null,
+      "unit": "retries",
+      "condition": "production",
+      "status": "active",
+      "kind": "unresolved",
+      "sources": [
+        "T5"
+      ]
+    },
+    {
+      "id": "plan-P1",
+      "entity_id": "setting-A",
+      "status": "needs_reconfirmation",
+      "depends_on": [
+        "decision-3"
+      ],
+      "sources": [
+        "T1",
+        "T5"
+      ]
+    }
+  ],
+  "probe_branches": [
+    {
+      "id": "compression-boundary",
+      "branch_after_turn": 15,
+      "query_turn": 16,
+      "direct_turns": [
+        7,
+        16
+      ]
+    },
+    {
+      "id": "100-intervening-turns",
+      "branch_after_turn": 105,
+      "query_turn": 106,
+      "direct_turns": [
+        97,
+        106
+      ]
+    },
+    {
+      "id": "restart",
+      "branch_after_turn": 15,
+      "restart_before_query": true,
+      "query_turn": 16,
+      "direct_turns": [
+        7,
+        16
+      ]
+    }
+  ],
+  "expected_probe": {
+    "entity_id": "product-A",
+    "current_name": "Aster",
+    "setting_key": "sync.retry_limit",
+    "current_value": null,
+    "reason": "withdrawn_without_replacement",
+    "action": "clarify_without_setting_write",
+    "required_sources": [
+      "T1",
+      "T2",
+      "T5"
+    ],
+    "forbidden_applied_values": [
+      3,
+      5
+    ],
+    "setting_file_content_unchanged": true,
+    "external_calls": 0,
+    "max_reference_tokens": 768
+  },
+  "negative_cases": [
+    {
+      "id": "unrelated-session",
+      "published_ancestor_ids": [],
+      "expect": "not_found"
+    },
+    {
+      "id": "explicit-ancestor",
+      "allow_exact_sources": [
+        "T1",
+        "T2",
+        "T5"
+      ],
+      "expect": "withdrawn_without_replacement"
+    },
+    {
+      "id": "cross-project",
+      "storage_scope": "project-B/session-B/epoch-1",
+      "expect": "no_project_A_sources"
+    },
+    {
+      "id": "unknown-key",
+      "query": "sync.missing_keyの現在値は？",
+      "expect": "not_found"
+    },
+    {
+      "id": "source-hash-mismatch",
+      "expect": "source_integrity_error_no_value_fallback"
+    },
+    {
+      "id": "withdrawal-publication-interrupted",
+      "expect": "consistent_snapshot_no_current_3_after_durable_T5"
+    },
+    {
+      "id": "mandatory-evidence-over-budget",
+      "expect": "evidence_budget_exceeded_no_setting_write"
+    },
+    {
+      "id": "user-hypothesis",
+      "branch_after_turn": 2,
+      "filler_turns": [
+        3,
+        15
+      ],
+      "source_turn": 16,
+      "source_role": "user",
+      "source_text": "もしAsterの本番の再試行上限を7回にしたら、どんな問題がありますか。今の3回を採用した決定はそのままです。",
+      "source_text_sha256": "bf772fd07613ee0c7317c2da981d8f201c2f5aead34db1ca63ffa31b23251f74",
+      "query_turn": 17,
+      "query": "Asterの本番の再試行上限として現在有効な値は？",
+      "expected_decision_value": 3,
+      "expected_status": "active",
+      "external_calls": 0,
+      "seed_only": true,
+      "expect": "semantic_classification_preserves_authority",
+      "expected_speech_act": "hypothetical",
+      "expected_authority": "user"
+    },
+    {
+      "id": "user-quotation",
+      "branch_after_turn": 2,
+      "filler_turns": [
+        3,
+        15
+      ],
+      "source_turn": 16,
+      "source_role": "user",
+      "source_text": "文書の引用です：「Asterの本番の再試行上限を7回にする」。これは今回採用した決定ではありません。",
+      "source_text_sha256": "c5a16eff83a84f5dfe8fc2ef3b5a1b8d23b2d33c84394318873886052a0b3f48",
+      "query_turn": 17,
+      "query": "Asterの本番の再試行上限として現在有効な値は？",
+      "expected_decision_value": 3,
+      "expected_status": "active",
+      "external_calls": 0,
+      "seed_only": true,
+      "expect": "semantic_classification_preserves_authority",
+      "expected_speech_act": "quote",
+      "expected_authority": "user"
+    },
+    {
+      "id": "rejected-proposal",
+      "branch_after_turn": 2,
+      "filler_turns": [
+        3,
+        15
+      ],
+      "source_turn": 16,
+      "source_role": "user",
+      "source_text": "Asterの本番の再試行上限を7回にする案は却下します。現在の3回は維持します。",
+      "source_text_sha256": "7db49fc79609a1facfd18a22a7e103f6211697b6b5f72c6b95d42e1ab585c789",
+      "query_turn": 17,
+      "query": "Asterの本番の再試行上限として現在有効な値は？",
+      "expected_decision_value": 3,
+      "expected_status": "active",
+      "external_calls": 0,
+      "seed_only": true,
+      "expect": "semantic_classification_preserves_authority",
+      "expected_speech_act": "reject",
+      "expected_authority": "user"
+    },
+    {
+      "id": "assistant-false-correction",
+      "branch_after_turn": 2,
+      "filler_turns": [
+        3,
+        15
+      ],
+      "source_turn": 16,
+      "source_role": "assistant",
+      "source_text": "Asterの本番の再試行上限を7回に変更することが決定しました。",
+      "source_text_sha256": "67a72bce63520317048ee2de33a51e497f5b9b7c2c88ff8cf6cff45e66f3dfce",
+      "query_turn": 17,
+      "query": "Asterの本番の再試行上限として現在有効な値は？",
+      "expected_decision_value": 3,
+      "expected_status": "active",
+      "external_calls": 0,
+      "seed_only": true,
+      "expect": "semantic_classification_preserves_authority",
+      "seed_user_input": "このメモを確認してください。決定は変えません。",
+      "expected_speech_act": "assert",
+      "expected_authority": "non_user"
+    },
+    {
+      "id": "tool-quoted-correction",
+      "branch_after_turn": 2,
+      "filler_turns": [
+        3,
+        15
+      ],
+      "source_turn": 16,
+      "source_role": "tool",
+      "source_text": "引用メモ: Asterの本番の再試行上限を7回に変更する。",
+      "source_text_sha256": "63af78545efe5d480de1edc59d021387e28a0ee6f476393e80a37073f4d2c992",
+      "query_turn": 17,
+      "query": "Asterの本番の再試行上限として現在有効な値は？",
+      "expected_decision_value": 3,
+      "expected_status": "active",
+      "external_calls": 0,
+      "seed_only": true,
+      "expect": "semantic_classification_preserves_authority",
+      "seed_user_input": "このメモを確認してください。決定は変えません。",
+      "paired_assistant_tool_call": {
+        "id": "quoted-file-read",
+        "name": "read",
+        "arguments": {
+          "path": "fixture/quoted-note.txt"
+        }
+      },
+      "tool_call_id": "quoted-file-read",
+      "pair_seeded_in_same_turn": true,
+      "expected_speech_act": "quote",
+      "expected_authority": "non_user"
+    },
+    {
+      "id": "japanese-correction-paraphrase",
+      "branch_after_turn": 2,
+      "filler_turns": [
+        3,
+        15
+      ],
+      "source_turn": 16,
+      "source_role": "user",
+      "source_text": "Asterの本番の再試行上限は、3回ではなく7回にしてください。",
+      "source_text_sha256": "87699b6f4ef25d5f6825cc4846aa9adbef4b1c8939c2e570366583250fafb2e1",
+      "query_turn": 17,
+      "query": "Asterの本番の再試行上限として現在有効な値は？",
+      "expected_decision_value": 7,
+      "expected_status": "active",
+      "external_calls": 0,
+      "seed_only": true,
+      "expect": "semantic_classification_preserves_authority",
+      "expected_speech_act": "correct",
+      "expected_authority": "user"
+    },
+    {
+      "id": "english-correction",
+      "branch_after_turn": 2,
+      "filler_turns": [
+        3,
+        15
+      ],
+      "source_turn": 16,
+      "source_role": "user",
+      "source_text": "Set Aster production sync.retry_limit to 7 retries instead of the previously approved 3 retries.",
+      "source_text_sha256": "3044aae1b0900cfd8d6ef869f5b53df24311fec88d2010fcd12d1cc9f3872963",
+      "query_turn": 17,
+      "query": "Asterの本番の再試行上限として現在有効な値は？",
+      "expected_decision_value": 7,
+      "expected_status": "active",
+      "external_calls": 0,
+      "seed_only": true,
+      "expect": "semantic_classification_preserves_authority",
+      "expected_speech_act": "correct",
+      "expected_authority": "user"
+    }
+  ],
+  "notes": [
+    "入力のSHAはfixture本文の同一性用であり、本番raw_commit_hashではない。",
+    "各probeは回答を共有しない独立した保存状態から開始する。",
+    "期待結果を手入力したfixtureであり、現行実装の成功結果ではない。"
+  ],
+  "setting_fixture": {
+    "relative_path": "config.toml",
+    "initial_content": "[sync]\nretry_limit = 1\n",
+    "initial_sha256": "1f8798abf15b22831547d33a21ffc881494715347457b4222e199cd3a7a7abff",
+    "role": "実設定と決定の違いを確認する合成作業コピー"
+  },
+  "positive_control": {
+    "branch_after_turn": 4,
+    "query_turn": 5,
+    "query": "旧Lumenの本番再試行設定を反映して。",
+    "expected_entity_id": "product-A",
+    "expected_current_name": "Aster",
+    "expected_decision_value": 3,
+    "expected_content": "[sync]\nretry_limit = 3\n",
+    "scope": "許可済みの合成作業コピー内だけ",
+    "required_sources": [
+      "T1",
+      "T2"
+    ],
+    "external_calls": 0
+  }
+}

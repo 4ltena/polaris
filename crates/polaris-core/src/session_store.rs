@@ -5,7 +5,7 @@ use crate::{
     conversation_state::{
         ConversationSnapshot, ConversationStateV2, ConversationStore, HistoryMode,
     },
-    workflow::{SessionWorkflow, WorkflowConfig},
+    workflow::{SessionWorkflow, WorkflowConfig, WorkflowMode},
 };
 use polaris_memory::MemoryStore;
 use polaris_provider::{Message, Role};
@@ -52,10 +52,29 @@ impl PersistedSession {
         let mut state = ConversationStateV2::new(project_id.into(), new_session_id()?)?;
         state.history_mode = mode;
         if let Some(workflow) = workflow {
+            state.workflow_config = Some(
+                crate::conversation_state::SavedWorkflowConfigV1::capture(&workflow.config),
+            );
             state.workflow = workflow.state();
             state.gates = workflow.gates.clone();
         }
-        MemoryStore::open(database).map_err(io::Error::other)?;
+        let mut memory = MemoryStore::open(database).map_err(io::Error::other)?;
+        // A structured session is saved only after its index migration reads back.
+        if mode == HistoryMode::Structured10 {
+            memory
+                .enable_structured_memory()
+                .map_err(io::Error::other)?;
+            if memory
+                .structured_memory_schema_version()
+                .map_err(io::Error::other)?
+                != Some(polaris_memory::structured::STRUCTURED_MEMORY_SCHEMA_VERSION)
+            {
+                return Err(io::Error::other(
+                    "structured memory migration did not read back",
+                ));
+            }
+        }
+        drop(memory);
         let store = ConversationStore::create(data_root, state)?;
         Ok(Self {
             store: Arc::new(store),
@@ -67,7 +86,8 @@ impl PersistedSession {
 
     pub fn open(data_root: &Path, database: &Path, project_id: &str, id: &str) -> io::Result<Self> {
         let store = ConversationStore::open(data_root, project_id, id)?;
-        let generation = store.lock()?.snapshot()?.state.generation;
+        let initial = store.lock()?.snapshot()?;
+        let generation = initial.state.generation;
         let this = Self {
             store: Arc::new(store),
             database: database.into(),
@@ -142,16 +162,32 @@ impl PersistedSession {
         starts_turn: bool,
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<()> {
-        self.update(Some((message, starts_turn)), workflow)
+        self.update(&[(message, starts_turn)], workflow)
+    }
+
+    /// Publishes a completed assistant/tool suffix and its workflow checkpoint
+    /// under one writer lock and one state marker. Batch messages are never a
+    /// new real user turn.
+    pub fn append_batch(
+        &self,
+        messages: &[Message],
+        workflow: Option<&SessionWorkflow>,
+    ) -> io::Result<()> {
+        let events: Vec<_> = messages
+            .iter()
+            .cloned()
+            .map(|message| (message, false))
+            .collect();
+        self.update(&events, workflow)
     }
 
     pub fn checkpoint(&self, workflow: Option<&SessionWorkflow>) -> io::Result<()> {
-        self.update(None, workflow)
+        self.update(&[], workflow)
     }
 
     fn update(
         &self,
-        event: Option<(Message, bool)>,
+        events: &[(Message, bool)],
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<()> {
         let mut cursor = self.cursor()?;
@@ -162,11 +198,17 @@ impl PersistedSession {
                 "保存世代が変わりました。原文を保持して停止しました",
             ));
         }
-        if event.is_none()
+        if events.is_empty()
             && before.state.raw_commit_hash == before.raw_hash
             && before.state.raw_commit_offset == before.raw_offset
             && workflow.is_none_or(|workflow| {
-                before.state.workflow == workflow.state() && before.state.gates == workflow.gates
+                before.state.workflow == workflow.state()
+                    && before.state.gates == workflow.gates
+                    && before
+                        .state
+                        .workflow_config
+                        .as_ref()
+                        .is_some_and(|config| config.config == workflow.config)
             })
         {
             let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
@@ -178,12 +220,19 @@ impl PersistedSession {
         // The old writer's forget is serialized with both raw append and marker.
         memory
             .with_conversation_marker(&published_view(&before.state)?, || {
-                let snapshot = match event {
-                    Some((message, starts_turn)) => lock.append(message, starts_turn)?,
-                    None => before.clone(),
-                };
+                crate::conversation_memory::reject_unpublished_structured_attempt(
+                    &self.store,
+                    &before,
+                )?;
+                let mut snapshot = before.clone();
+                for (message, starts_turn) in events {
+                    snapshot = lock.append(message.clone(), *starts_turn)?;
+                }
                 let mut next = snapshot.state.clone();
                 if let Some(workflow) = workflow {
+                    next.workflow_config = Some(
+                        crate::conversation_state::SavedWorkflowConfigV1::capture(&workflow.config),
+                    );
                     next.workflow = workflow.state();
                     next.gates = workflow.gates.clone();
                 }
@@ -248,13 +297,32 @@ impl PersistedSession {
         messages: &[Message],
     ) -> io::Result<Self> {
         let this = Self::create(data_root, database, project_id, mode, workflow)?;
-        for message in messages {
-            this.append(message.clone(), message.role == Role::User, workflow)?;
-        }
+        let events: Vec<_> = messages
+            .iter()
+            .cloned()
+            .map(|message| {
+                let starts_turn = message.role == Role::User;
+                (message, starts_turn)
+            })
+            .collect();
+        this.update(&events, workflow)?;
         Ok(this)
     }
 
     pub fn restore_workflow(&self, config: WorkflowConfig) -> io::Result<SessionWorkflow> {
+        let (workflow, needs_checkpoint) = self.prepare_workflow(config)?;
+        if needs_checkpoint {
+            self.checkpoint(Some(&workflow))?;
+        }
+        Ok(workflow)
+    }
+
+    /// Restore without writing so callers can validate explicit overrides first.
+    /// The flag requests a checkpoint for a missing saved configuration.
+    pub fn prepare_workflow(
+        &self,
+        mut config: WorkflowConfig,
+    ) -> io::Result<(SessionWorkflow, bool)> {
         let state = self.snapshot()?.state;
         let mut gates = state.gates;
         // Resume has not verified that the working files still match evidence.
@@ -262,7 +330,17 @@ impl PersistedSession {
         if let Some(verification) = &mut gates.verification {
             verification.stale = true;
         }
-        SessionWorkflow::restore(config, gates, state.workflow).map_err(io::Error::other)
+        let needs_checkpoint = state.workflow_config.is_none();
+        let config = match state.workflow_config {
+            Some(saved) => saved.config,
+            None => {
+                config.mode = WorkflowMode::Manual;
+                config
+            }
+        };
+        let workflow =
+            SessionWorkflow::restore(config, gates, state.workflow).map_err(io::Error::other)?;
+        Ok((workflow, needs_checkpoint))
     }
 }
 
@@ -270,6 +348,10 @@ impl PersistedSession {
 mod tests {
     use super::*;
     use crate::session::Session;
+
+    fn workflow(config: WorkflowConfig) -> SessionWorkflow {
+        SessionWorkflow::new(config)
+    }
 
     fn create(root: &Path) -> PersistedSession {
         PersistedSession::create(
@@ -334,6 +416,44 @@ mod tests {
     }
 
     #[test]
+    fn every_history_mode_can_be_created_and_resumed_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("memory.sqlite3");
+        for mode in [
+            HistoryMode::Legacy,
+            HistoryMode::Strict10,
+            HistoryMode::Structured10,
+        ] {
+            let saved =
+                PersistedSession::create(dir.path(), &database, "project", mode, None).unwrap();
+            let id = saved.snapshot().unwrap().state.session_id;
+            let reopened = PersistedSession::open(dir.path(), &database, "project", &id).unwrap();
+            assert_eq!(reopened.snapshot().unwrap().state.history_mode, mode);
+        }
+        let broken = tempfile::tempdir().unwrap();
+        let database = broken.path().join("memory.sqlite3");
+        MemoryStore::open(&database).unwrap();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE memory_schema_meta (component TEXT PRIMARY KEY NOT NULL, schema_version INTEGER NOT NULL);
+                 INSERT INTO memory_schema_meta VALUES ('structured_memory', 99);",
+            )
+            .unwrap();
+        assert!(
+            PersistedSession::create(
+                broken.path(),
+                &database,
+                "project",
+                HistoryMode::Structured10,
+                None
+            )
+            .is_err()
+        );
+        assert!(!broken.path().join("sessions-v2").exists(), "nothing saved");
+    }
+
+    #[test]
     fn forgotten_session_rejects_raw_append_and_resume() {
         let dir = tempfile::tempdir().unwrap();
         let saved = create(dir.path());
@@ -362,6 +482,107 @@ mod tests {
         let expected = saved.snapshot().unwrap();
         saved.checkpoint(None).unwrap();
         assert_eq!(saved.snapshot().unwrap().state, expected.state);
+    }
+
+    #[test]
+    fn saved_workflow_config_is_authoritative_for_resume_and_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved_config = WorkflowConfig {
+            enabled: false,
+            mode: WorkflowMode::Manual,
+            ..Default::default()
+        };
+        let saved_workflow = workflow(saved_config.clone());
+        let saved = PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            HistoryMode::Legacy,
+            Some(&saved_workflow),
+        )
+        .unwrap();
+        let mut changed_config = saved_config.clone();
+        changed_config.enabled = true;
+        changed_config.mode = WorkflowMode::Adaptive;
+        changed_config.initial_phase = crate::workflow::Phase::Review;
+
+        let resumed = saved.restore_workflow(changed_config.clone()).unwrap();
+        assert_eq!(resumed.config, saved_config);
+        assert!(!resumed.config.enabled);
+
+        let child = saved.fork(&"a".repeat(64)).unwrap();
+        let forked = child.restore_workflow(changed_config).unwrap();
+        assert_eq!(forked.config, saved_config);
+    }
+
+    #[test]
+    fn legacy_workflow_config_defaults_to_manual_and_is_checkpointed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = create(dir.path());
+        let current = WorkflowConfig {
+            enabled: false,
+            mode: WorkflowMode::Adaptive,
+            initial_phase: crate::workflow::Phase::Implement,
+            ..Default::default()
+        };
+
+        let restored = saved.restore_workflow(current.clone()).unwrap();
+        assert_eq!(restored.config.mode, WorkflowMode::Manual);
+        assert!(!restored.config.enabled);
+        let first = saved.snapshot().unwrap();
+        assert_eq!(first.state.generation, 1);
+        assert_eq!(
+            first.state.workflow_config.unwrap().config.mode,
+            WorkflowMode::Manual
+        );
+
+        let again = saved.restore_workflow(current).unwrap();
+        assert_eq!(again.config.mode, WorkflowMode::Manual);
+        assert_eq!(saved.snapshot().unwrap().state.generation, 1);
+    }
+
+    #[test]
+    fn unknown_saved_workflow_config_schema_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = create(dir.path());
+        let path = saved.store.directory().join("state.json");
+        let mut state: ConversationStateV2 =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state.workflow_config = Some(crate::conversation_state::SavedWorkflowConfigV1 {
+            schema_version: 99,
+            config: WorkflowConfig::default(),
+        });
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(saved.restore_workflow(WorkflowConfig::default()).is_err());
+    }
+
+    #[test]
+    fn append_batch_publishes_suffix_and_workflow_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WorkflowConfig::default();
+        let workflow = workflow(config);
+        let saved = PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            HistoryMode::Legacy,
+            Some(&workflow),
+        )
+        .unwrap();
+        saved
+            .append(Message::user("turn"), true, Some(&workflow))
+            .unwrap();
+        let before = saved.snapshot().unwrap().state.generation;
+        saved
+            .append_batch(
+                &[Message::assistant("answer"), Message::assistant("detail")],
+                Some(&workflow),
+            )
+            .unwrap();
+        let after = saved.snapshot().unwrap();
+        assert_eq!(after.state.generation, before + 1);
+        assert_eq!(after.events.len(), 3);
+        assert!(after.events[1..].iter().all(|event| !event.starts_turn));
     }
 
     #[test]

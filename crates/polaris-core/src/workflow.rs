@@ -6,6 +6,17 @@ use std::{collections::BTreeMap, fmt, str::FromStr};
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
 pub const WORKFLOW_TOKEN_LIMIT: usize = 384;
 
+/// Selects whether workflow focus can be proposed by the model.  Manual is
+/// deliberately the default so existing CLI and TUI phase controls retain
+/// their established behaviour.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMode {
+    #[default]
+    Manual,
+    Adaptive,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -60,9 +71,21 @@ impl FromStr for Phase {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
     pub enabled: bool,
+    #[serde(default)]
+    pub mode: WorkflowMode,
     pub initial_phase: Phase,
     pub always: Vec<String>,
     pub phase_skills: BTreeMap<Phase, Vec<String>>,
+}
+
+/// The fixed skill body selected for one provider request, paired with the
+/// controller state observed at that request boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowProfile {
+    pub state: WorkflowStateV1,
+    pub body: String,
+    pub ids: Vec<String>,
+    pub tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,7 +174,17 @@ impl WorkflowGatesV1 {
 pub struct Workflow {
     state: WorkflowStateV1,
     pending_phase: Option<Phase>,
+    reservation: Option<WorkflowReservation>,
+    next_reservation: u64,
     active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkflowReservation {
+    id: u64,
+    phase: Phase,
+    from_revision: u64,
+    publishing: bool,
 }
 impl Workflow {
     pub fn restore(state: WorkflowStateV1) -> Result<Self, String> {
@@ -172,6 +205,15 @@ impl Workflow {
 
     /// Called only by explicit UI/CLI input or structured parent configuration.
     pub fn request_phase(&mut self, phase: Phase) -> Result<(), String> {
+        // A manual request received before durable publishing wins over a
+        // model proposal. Once publishing has started it becomes the next
+        // boundary request and can never rewrite the acknowledged revision.
+        if self
+            .reservation
+            .is_some_and(|reservation| !reservation.publishing)
+        {
+            self.reservation = None;
+        }
         if self.active {
             self.pending_phase = Some(phase);
         } else {
@@ -199,16 +241,24 @@ impl Workflow {
     /// Resolve skills and validate their budget BEFORE opening a turn. The hash
     /// freezes the resolved bodies; callers retain that same snapshot for tools.
     pub fn begin_turn(&mut self, manifest_hash: String) -> Result<WorkflowStateV1, String> {
+        // Kept for the in-memory legacy controller API. Durable session
+        // callers use `start_turn` and checkpoint a pending phase first.
+        if self.active {
+            return Err("作業ターンが既に実行中です".into());
+        }
+        if let Some(phase) = self.pending_phase {
+            self.apply_phase(phase)?;
+            self.pending_phase = None;
+        }
+        self.start_turn(manifest_hash)
+    }
+    fn start_turn(&mut self, manifest_hash: String) -> Result<WorkflowStateV1, String> {
         if self.active {
             return Err("作業ターンが既に実行中です".into());
         }
         if manifest_hash.is_empty() {
             return Err("skill manifest hashがありません".into());
         }
-        if let Some(phase) = self.pending_phase {
-            self.apply_phase(phase)?;
-        }
-        self.pending_phase = None;
         self.state.skill_manifest_hash = manifest_hash;
         self.active = true;
         Ok(self.state.clone())
@@ -274,71 +324,55 @@ impl SessionWorkflow {
             .controller
             .lock()
             .map_err(|_| "workflow状態を取得できません")?;
-        let phase = controller.next_phase();
         let mut candidates = polaris_skills::workflow_profile::recommended_bindings();
         candidates.extend_from_slice(skills);
-        let profile = polaris_skills::workflow_profile::resolve(
-            &self.config.always,
-            self.config
-                .phase_skills
-                .get(&phase)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-            &candidates,
-        )
-        .map_err(|error| error.to_string())?;
-        let verification = match &self.gates.verification {
-            None => "missing",
-            Some(evidence) if evidence.stale => "stale",
-            Some(evidence) if evidence.passed => "passed",
-            Some(_) => "failed",
-        };
-        // Gates are evidence, never authorization instructions. Keep diagnostics
-        // bounded without embedding arbitrary external targets or all grant data.
-        let body = format!(
-            "{}\nWorkflow focus: {phase}. Spec approval: {}. Verification: {verification}. External grants: {} (existing tool permission checks still apply).\n",
-            profile.body,
-            if self.gates.approved_spec_hash.is_some() {
-                "recorded"
-            } else {
-                "missing"
-            },
-            self.gates.external_grants.len()
-        );
-        let tokens = crate::budget::count_tokens(&body);
-        if tokens > WORKFLOW_TOKEN_LIMIT {
-            return Err(format!(
-                "段階別skillと状態表示が上限を超えました: {tokens}/{WORKFLOW_TOKEN_LIMIT} tokens"
-            ));
-        }
-        let entries: Vec<WorkflowSkillV1> = profile
-            .entries
-            .into_iter()
-            .map(|entry| WorkflowSkillV1 {
-                id: entry.id,
-                source: entry.source,
-                body_hash: entry.body_hash,
-            })
-            .collect();
-        let mut changed_skill_ids = Vec::new();
-        if !controller.state.skill_manifest_hash.is_empty() {
-            for entry in entries.iter().chain(&controller.state.skills) {
-                if (!entries.contains(entry) || !controller.state.skills.contains(entry))
-                    && !changed_skill_ids.contains(&entry.id)
+        let phases: Vec<Phase> = match self.config.mode {
+            WorkflowMode::Manual => {
+                let mut phases = vec![controller.state.phase];
+                if let Some(pending) = controller.pending_phase
+                    && pending != controller.state.phase
                 {
-                    changed_skill_ids.push(entry.id.clone());
+                    phases.push(pending);
                 }
+                phases
             }
+            // Freeze every phase at the real-turn boundary. A later adaptive
+            // transition only selects from this snapshot; it never reads disk
+            // or a changing catalog in the middle of a user turn.
+            WorkflowMode::Adaptive => Phase::ALL.to_vec(),
+        };
+        let profiles = resolve_profiles(&self.config, &candidates, &phases)?;
+        // The resolver's skill-only limit is necessary but not sufficient:
+        // validate the final state diagnostics for every snapshot that an
+        // adaptive turn may select before any provider request is sent.
+        for (phase, frozen) in &profiles {
+            let mut snapshot = controller.state.clone();
+            snapshot.phase = *phase;
+            build_profile(snapshot, frozen, &self.gates)?;
         }
-        controller.begin_turn(profile.manifest_hash)?;
-        controller.state.skills = entries;
-        let state = controller.state.clone();
+        let current = profiles
+            .get(&controller.state.phase)
+            .expect("current phase is always resolved");
+        let had_manifest = !controller.state.skill_manifest_hash.is_empty();
+        let previous_skills = controller.state.skills.clone();
+        controller.start_turn(current.manifest_hash.clone())?;
+        controller.state.skills = current.entries.clone();
+        let profile = build_profile(controller.state.clone(), current, &self.gates)?;
+        let changed_skill_ids = if had_manifest {
+            changed_skill_ids(&previous_skills, &profile.state.skills)
+        } else {
+            Vec::new()
+        };
         Ok(WorkflowTurn {
-            body,
-            ids: profile.ids,
-            tokens,
-            state,
+            body: profile.body.clone(),
+            ids: profile.ids.clone(),
+            tokens: profile.tokens,
+            state: profile.state.clone(),
             changed_skill_ids,
+            mode: self.config.mode,
+            config: self.config.clone(),
+            candidates,
+            profiles,
             controller: self.controller.clone(),
         })
     }
@@ -349,16 +383,42 @@ impl SessionWorkflow {
         &self,
         skills: &[polaris_skills::Skill],
     ) -> Result<WorkflowTurn, String> {
-        let phase = self
+        self.begin_turn(&self.refresh_required_skills(skills)?)
+    }
+
+    /// Reads mandatory user skills once at a real-turn boundary. Callers that
+    /// retry a child schema response retain this returned snapshot rather than
+    /// reopening host paths in the retry.
+    pub(crate) fn refresh_required_skills(
+        &self,
+        skills: &[polaris_skills::Skill],
+    ) -> Result<Vec<polaris_skills::Skill>, String> {
+        let controller = self
             .controller
             .lock()
-            .map_err(|_| "workflow状態を取得できません")?
-            .next_phase();
+            .map_err(|_| "workflow状態を取得できません")?;
+        let phases: Vec<Phase> = match self.config.mode {
+            WorkflowMode::Manual => {
+                let mut phases = vec![controller.state.phase];
+                if let Some(pending) = controller.pending_phase
+                    && pending != controller.state.phase
+                {
+                    phases.push(pending);
+                }
+                phases
+            }
+            WorkflowMode::Adaptive => Phase::ALL.to_vec(),
+        };
+        drop(controller);
         let names: Vec<&str> = self
             .config
             .always
             .iter()
-            .chain(self.config.phase_skills.get(&phase).into_iter().flatten())
+            .chain(
+                phases
+                    .iter()
+                    .flat_map(|phase| self.config.phase_skills.get(phase).into_iter().flatten()),
+            )
             .map(String::as_str)
             .collect();
         let mut refreshed = skills.to_vec();
@@ -377,7 +437,7 @@ impl SessionWorkflow {
                 skill.body = body;
             }
         }
-        self.begin_turn(&refreshed)
+        Ok(refreshed)
     }
 }
 pub struct WorkflowTurn {
@@ -386,7 +446,380 @@ pub struct WorkflowTurn {
     pub tokens: usize,
     pub state: WorkflowStateV1,
     pub changed_skill_ids: Vec<String>,
+    mode: WorkflowMode,
+    config: WorkflowConfig,
+    candidates: Vec<polaris_skills::Skill>,
+    profiles: BTreeMap<Phase, FrozenWorkflowProfile>,
     controller: std::sync::Arc<std::sync::Mutex<Workflow>>,
+}
+
+#[derive(Debug, Clone)]
+struct FrozenWorkflowProfile {
+    body: String,
+    manifest_hash: String,
+    ids: Vec<String>,
+    entries: Vec<WorkflowSkillV1>,
+}
+
+impl WorkflowTurn {
+    /// Metadata from the catalog frozen at this real-turn boundary. Bodies
+    /// remain private to workflow profile resolution; optional discovery only
+    /// receives names, descriptions, stable IDs, and source identities.
+    pub(crate) fn catalog_entries(&self) -> Vec<polaris_tools::skill::SkillCatalogEntry> {
+        skill_catalog_entries(&self.candidates)
+    }
+
+    /// Complete skills frozen at the real-turn boundary. This is deliberately
+    /// only exposed within core so exact `skill` lookup can disclose the same
+    /// body whose metadata was advertised, including refreshed mandatory and
+    /// built-in entries.
+    pub(crate) fn skill_corpus(&self) -> &[polaris_skills::Skill] {
+        &self.candidates
+    }
+}
+
+pub(crate) fn skill_catalog_entries(
+    skills: &[polaris_skills::Skill],
+) -> Vec<polaris_tools::skill::SkillCatalogEntry> {
+    skills
+        .iter()
+        .map(|skill| {
+            let source_identity = skill.path.to_string_lossy().into_owned();
+            let id = if source_identity.starts_with("builtin:") {
+                format!("builtin:{}", skill.name)
+            } else {
+                format!("user:{}", skill.name)
+            };
+            polaris_tools::skill::SkillCatalogEntry {
+                id,
+                source_identity,
+                name: normalize_metadata(&skill.name),
+                description: normalize_metadata(&skill.description),
+            }
+        })
+        .collect()
+}
+
+impl WorkflowTurn {
+    /// Refreshes the manual turn's single fixed profile after its owner has
+    /// durably committed a phase that was pending before this real turn
+    /// started. The profile still comes from this turn's captured catalog;
+    /// callers must not use this after the first provider request.
+    pub fn refresh_manual_profile(&mut self, gates: &WorkflowGatesV1) -> Result<(), String> {
+        if self.mode != WorkflowMode::Manual {
+            return Err("adaptive modeではmanual profileを更新できません".into());
+        }
+        let state = self
+            .controller
+            .lock()
+            .map_err(|_| "workflow状態を取得できません")?
+            .state
+            .clone();
+        let frozen = self.frozen_for(state.phase)?;
+        let profile = build_profile(state, &frozen, gates)?;
+        self.body = profile.body;
+        self.ids = profile.ids;
+        self.tokens = profile.tokens;
+        self.state = profile.state;
+        Ok(())
+    }
+
+    /// Returns the profile for the currently committed focus. Pending manual
+    /// work is deliberately not applied here: its owner must checkpoint it
+    /// through `prepare_pending` before the next provider request.
+    pub fn profile(&self, gates: &WorkflowGatesV1) -> Result<WorkflowProfile, String> {
+        if self.mode == WorkflowMode::Manual {
+            return Ok(WorkflowProfile {
+                state: self.state.clone(),
+                body: self.body.clone(),
+                ids: self.ids.clone(),
+                tokens: self.tokens,
+            });
+        }
+        let state = self
+            .controller
+            .lock()
+            .map_err(|_| "workflow状態を取得できません")?
+            .state
+            .clone();
+        let frozen = self
+            .profiles
+            .get(&state.phase)
+            .ok_or("この実ターンに固定された段階skillがありません")?;
+        build_profile(state, frozen, gates)
+    }
+
+    /// Prepares a manual request that was queued while the real turn was
+    /// active. It has the same durable reservation boundary as a model
+    /// proposal, but does not need a model-supplied revision.
+    pub fn prepare_pending(
+        &self,
+        gates: &WorkflowGatesV1,
+    ) -> Result<Option<PreparedWorkflowTransition>, String> {
+        let mut controller = self
+            .controller
+            .lock()
+            .map_err(|_| "workflow状態を取得できません")?;
+        let Some(phase) = controller.pending_phase else {
+            return Ok(None);
+        };
+        self.prepare(&mut controller, phase, gates, true).map(Some)
+    }
+
+    /// Reserves an adaptive model proposal without changing the committed
+    /// state. The caller persists `candidate.state` outside the mutex, then
+    /// calls `commit` only after its durable ACK.
+    pub fn prepare_transition(
+        &self,
+        phase: Phase,
+        expected_revision: u64,
+        gates: &WorkflowGatesV1,
+    ) -> Result<PreparedWorkflowTransition, String> {
+        if self.mode != WorkflowMode::Adaptive {
+            return Err("manual modeではmodelによるworkflow変更はできません".into());
+        }
+        let mut controller = self
+            .controller
+            .lock()
+            .map_err(|_| "workflow状態を取得できません")?;
+        if controller.state.revision != expected_revision {
+            return Err("workflow revisionが競合しました".into());
+        }
+        if controller.pending_phase.is_some() {
+            return Err("手動のworkflow変更が保留中です".into());
+        }
+        self.prepare(&mut controller, phase, gates, false)
+    }
+
+    fn prepare(
+        &self,
+        controller: &mut Workflow,
+        phase: Phase,
+        gates: &WorkflowGatesV1,
+        pending: bool,
+    ) -> Result<PreparedWorkflowTransition, String> {
+        if controller.reservation.is_some() {
+            return Err("workflow変更は保存確認待ちです".into());
+        }
+        let previous = controller.state.clone();
+        let frozen = self.frozen_for(phase)?;
+        let revision = if phase == previous.phase {
+            previous.revision
+        } else {
+            previous
+                .revision
+                .checked_add(1)
+                .ok_or("workflow revisionが上限に達しました")?
+        };
+        let mut candidate_state = previous.clone();
+        candidate_state.phase = phase;
+        candidate_state.revision = revision;
+        let candidate = build_profile(candidate_state, &frozen, gates)?;
+        let reservation_id = controller.next_reservation;
+        controller.next_reservation = controller.next_reservation.wrapping_add(1);
+        controller.reservation = Some(WorkflowReservation {
+            id: reservation_id,
+            phase,
+            from_revision: previous.revision,
+            publishing: false,
+        });
+        Ok(PreparedWorkflowTransition {
+            previous,
+            candidate,
+            reservation_id,
+            pending,
+            controller: self.controller.clone(),
+            finished: false,
+        })
+    }
+
+    /// Resolves a manually queued phase from the catalog snapshot captured at
+    /// real-turn start. This never reads disk or a changed skill catalog.
+    fn frozen_for(&self, phase: Phase) -> Result<FrozenWorkflowProfile, String> {
+        if let Some(frozen) = self.profiles.get(&phase) {
+            return Ok(frozen.clone());
+        }
+        resolve_profiles(&self.config, &self.candidates, &[phase])?
+            .remove(&phase)
+            .ok_or_else(|| "この実ターンに固定された段階skillがありません".into())
+    }
+}
+
+fn normalize_metadata(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A candidate state reserved for a single durable checkpoint. This owns no
+/// mutex guard and is therefore safe to carry across an async persistence
+/// await. Dropping it releases an uncommitted reservation.
+pub struct PreparedWorkflowTransition {
+    pub previous: WorkflowStateV1,
+    pub candidate: WorkflowProfile,
+    reservation_id: u64,
+    pending: bool,
+    controller: std::sync::Arc<std::sync::Mutex<Workflow>>,
+    finished: bool,
+}
+
+impl PreparedWorkflowTransition {
+    pub fn is_noop(&self) -> bool {
+        self.previous.phase == self.candidate.state.phase
+            && self.previous.revision == self.candidate.state.revision
+    }
+
+    /// Marks the reservation as externally publishing. Manual changes after
+    /// this point queue for the following boundary instead of rewriting this
+    /// candidate.
+    pub fn begin_persist(&mut self) -> Result<(), String> {
+        let id = self.reservation_id;
+        let mut controller = self
+            .controller
+            .lock()
+            .map_err(|_| "workflow状態を取得できません")?;
+        let reservation = controller
+            .reservation
+            .as_mut()
+            .filter(|reservation| reservation.id == id)
+            .ok_or("workflow変更の予約が失効しました")?;
+        reservation.publishing = true;
+        Ok(())
+    }
+
+    pub fn commit(mut self) -> Result<WorkflowStateV1, String> {
+        let id = self.reservation_id;
+        let mut controller = self
+            .controller
+            .lock()
+            .map_err(|_| "workflow状態を取得できません")?;
+        let reservation = controller
+            .reservation
+            .as_ref()
+            .copied()
+            .filter(|reservation| reservation.id == id && reservation.publishing)
+            .ok_or("workflow変更の予約が失効しました")?;
+        if reservation.from_revision != self.previous.revision {
+            return Err("workflow変更の保存前revisionが一致しません".into());
+        }
+        controller.reservation = None;
+        controller.state = self.candidate.state.clone();
+        if self.pending && controller.pending_phase == Some(reservation.phase) {
+            controller.pending_phase = None;
+        }
+        self.finished = true;
+        Ok(controller.state.clone())
+    }
+
+    pub fn cancel(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        let id = self.reservation_id;
+        if let Ok(mut controller) = self.controller.lock()
+            && controller
+                .reservation
+                .is_some_and(|reservation| reservation.id == id)
+        {
+            controller.reservation = None;
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for PreparedWorkflowTransition {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.release();
+        }
+    }
+}
+
+fn resolve_profiles(
+    config: &WorkflowConfig,
+    candidates: &[polaris_skills::Skill],
+    phases: &[Phase],
+) -> Result<BTreeMap<Phase, FrozenWorkflowProfile>, String> {
+    phases
+        .iter()
+        .map(|phase| {
+            let profile = polaris_skills::workflow_profile::resolve(
+                &config.always,
+                config
+                    .phase_skills
+                    .get(phase)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                candidates,
+            )
+            .map_err(|error| error.to_string())?;
+            let entries = profile
+                .entries
+                .into_iter()
+                .map(|entry| WorkflowSkillV1 {
+                    id: entry.id,
+                    source: entry.source,
+                    body_hash: entry.body_hash,
+                })
+                .collect();
+            Ok((
+                *phase,
+                FrozenWorkflowProfile {
+                    body: profile.body,
+                    manifest_hash: profile.manifest_hash,
+                    ids: profile.ids,
+                    entries,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn build_profile(
+    mut state: WorkflowStateV1,
+    frozen: &FrozenWorkflowProfile,
+    gates: &WorkflowGatesV1,
+) -> Result<WorkflowProfile, String> {
+    state.skill_manifest_hash = frozen.manifest_hash.clone();
+    state.skills = frozen.entries.clone();
+    let verification = match &gates.verification {
+        None => "missing",
+        Some(evidence) if evidence.stale => "stale",
+        Some(evidence) if evidence.passed => "passed",
+        Some(_) => "failed",
+    };
+    let body = format!(
+        "{}\nWorkflow focus: {}. Spec approval: {}. Verification: {verification}. External grants: {} (existing tool permission checks still apply).\n",
+        frozen.body,
+        state.phase,
+        if gates.approved_spec_hash.is_some() {
+            "recorded"
+        } else {
+            "missing"
+        },
+        gates.external_grants.len(),
+    );
+    let tokens = crate::budget::count_tokens(&body);
+    if tokens > WORKFLOW_TOKEN_LIMIT {
+        return Err(format!(
+            "段階別skillと状態表示が上限を超えました: {tokens}/{WORKFLOW_TOKEN_LIMIT} tokens"
+        ));
+    }
+    Ok(WorkflowProfile {
+        state,
+        body,
+        ids: frozen.ids.clone(),
+        tokens,
+    })
+}
+
+fn changed_skill_ids(previous: &[WorkflowSkillV1], next: &[WorkflowSkillV1]) -> Vec<String> {
+    let mut changed = Vec::new();
+    for entry in next.iter().chain(previous) {
+        if (!next.contains(entry) || !previous.contains(entry)) && !changed.contains(&entry.id) {
+            changed.push(entry.id.clone());
+        }
+    }
+    changed
 }
 impl Drop for WorkflowTurn {
     fn drop(&mut self) {
@@ -508,6 +941,14 @@ mod tests {
             runtime.request_phase(Phase::Review).unwrap();
             assert_eq!(runtime.state(), turn.state);
             drop(turn);
+            let checkpoint = runtime.begin_turn(&[]).unwrap();
+            let mut pending = checkpoint
+                .prepare_pending(&WorkflowGatesV1::default())
+                .unwrap()
+                .unwrap();
+            pending.begin_persist().unwrap();
+            pending.commit().unwrap();
+            drop(checkpoint);
             assert_eq!(runtime.begin_turn(&[]).unwrap().state.phase, Phase::Review);
         }
     }
@@ -536,6 +977,226 @@ mod tests {
         assert_eq!(second.phase, Phase::Verify);
         assert_eq!(second.revision, 1);
         assert_eq!(second.skill_manifest_hash, "second");
+    }
+    #[test]
+    fn adaptive_transition_reserves_then_commits_without_mutating_first() {
+        let runtime = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            mode: WorkflowMode::Adaptive,
+            always: vec!["builtin:workflow-core".into()],
+            phase_skills: Phase::ALL
+                .into_iter()
+                .filter(|phase| *phase != Phase::General)
+                .map(|phase| (phase, vec![format!("builtin:{phase}")]))
+                .collect(),
+            ..Default::default()
+        });
+        let turn = runtime.begin_turn(&[]).unwrap();
+        let before = turn.profile(&WorkflowGatesV1::default()).unwrap();
+        let mut prepared = turn
+            .prepare_transition(
+                Phase::Implement,
+                before.state.revision,
+                &WorkflowGatesV1::default(),
+            )
+            .unwrap();
+        assert_eq!(prepared.previous, before.state);
+        assert_eq!(prepared.candidate.state.phase, Phase::Implement);
+        assert_eq!(runtime.state(), before.state);
+        prepared.begin_persist().unwrap();
+        let committed = prepared.commit().unwrap();
+        assert_eq!(committed.phase, Phase::Implement);
+        assert_eq!(committed.revision, 1);
+        assert_eq!(
+            turn.profile(&WorkflowGatesV1::default()).unwrap().state,
+            committed
+        );
+    }
+
+    #[test]
+    fn manual_request_invalidates_unpublished_model_reservation() {
+        let runtime = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            mode: WorkflowMode::Adaptive,
+            always: vec!["builtin:workflow-core".into()],
+            ..Default::default()
+        });
+        let turn = runtime.begin_turn(&[]).unwrap();
+        let mut prepared = turn
+            .prepare_transition(Phase::Review, 0, &WorkflowGatesV1::default())
+            .unwrap();
+        runtime.request_phase(Phase::Verify).unwrap();
+        assert!(prepared.begin_persist().is_err());
+        let pending = turn
+            .prepare_pending(&WorkflowGatesV1::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.candidate.state.phase, Phase::Verify);
+    }
+
+    #[test]
+    fn manual_request_during_publish_waits_for_the_next_boundary() {
+        let runtime = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            mode: WorkflowMode::Adaptive,
+            always: vec!["builtin:workflow-core".into()],
+            ..Default::default()
+        });
+        let turn = runtime.begin_turn(&[]).unwrap();
+        let mut prepared = turn
+            .prepare_transition(Phase::Review, 0, &WorkflowGatesV1::default())
+            .unwrap();
+        prepared.begin_persist().unwrap();
+        runtime.request_phase(Phase::Verify).unwrap();
+        assert_eq!(prepared.commit().unwrap().phase, Phase::Review);
+        let pending = turn
+            .prepare_pending(&WorkflowGatesV1::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.candidate.state.phase, Phase::Verify);
+    }
+
+    #[test]
+    fn profile_does_not_apply_pending_phase_without_checkpoint() {
+        let runtime = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            always: vec!["builtin:workflow-core".into()],
+            ..Default::default()
+        });
+        let turn = runtime.begin_turn(&[]).unwrap();
+        runtime.request_phase(Phase::Review).unwrap();
+        assert_eq!(
+            turn.profile(&WorkflowGatesV1::default())
+                .unwrap()
+                .state
+                .phase,
+            Phase::General
+        );
+        let mut pending = turn
+            .prepare_pending(&WorkflowGatesV1::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.candidate.state.phase, Phase::Review);
+        pending.begin_persist().unwrap();
+        pending.commit().unwrap();
+        assert_eq!(runtime.state().phase, Phase::Review);
+    }
+
+    #[test]
+    fn manual_pending_refreshes_only_at_the_next_real_turn_boundary() {
+        let runtime = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            always: vec!["builtin:workflow-core".into()],
+            phase_skills: Phase::ALL
+                .into_iter()
+                .filter(|phase| *phase != Phase::General)
+                .map(|phase| (phase, vec![format!("builtin:{phase}")]))
+                .collect(),
+            ..Default::default()
+        });
+        let first = runtime.begin_turn(&[]).unwrap();
+        let general_body = first.body.clone();
+        runtime.request_phase(Phase::Review).unwrap();
+        // A request during a real turn never rewrites that turn's prompt.
+        assert_eq!(
+            first.profile(&WorkflowGatesV1::default()).unwrap().body,
+            general_body
+        );
+        drop(first);
+
+        let mut next = runtime.begin_turn(&[]).unwrap();
+        let mut pending = next
+            .prepare_pending(&WorkflowGatesV1::default())
+            .unwrap()
+            .unwrap();
+        pending.begin_persist().unwrap();
+        pending.commit().unwrap();
+        next.refresh_manual_profile(&WorkflowGatesV1::default())
+            .unwrap();
+        assert_eq!(next.state.phase, Phase::Review);
+        assert!(next.body.contains("builtin:review"));
+
+        runtime.request_phase(Phase::Verify).unwrap();
+        assert_eq!(
+            next.profile(&WorkflowGatesV1::default()).unwrap().body,
+            next.body
+        );
+    }
+
+    #[test]
+    fn pending_same_phase_is_a_durable_noop_and_is_consumed() {
+        let runtime = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            always: vec!["builtin:workflow-core".into()],
+            ..Default::default()
+        });
+        let turn = runtime.begin_turn(&[]).unwrap();
+        runtime.request_phase(Phase::General).unwrap();
+        let pending = turn
+            .prepare_pending(&WorkflowGatesV1::default())
+            .unwrap()
+            .unwrap();
+        assert!(pending.is_noop());
+        let mut pending = pending;
+        pending.begin_persist().unwrap();
+        pending.commit().unwrap();
+        assert!(
+            turn.prepare_pending(&WorkflowGatesV1::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn noop_transition_is_invalidated_by_manual_change_before_persisting() {
+        let runtime = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            mode: WorkflowMode::Adaptive,
+            always: vec!["builtin:workflow-core".into()],
+            ..Default::default()
+        });
+        let turn = runtime.begin_turn(&[]).unwrap();
+        let mut prepared = turn
+            .prepare_transition(Phase::General, 0, &WorkflowGatesV1::default())
+            .unwrap();
+        assert!(prepared.is_noop());
+        runtime.request_phase(Phase::Review).unwrap();
+        assert!(prepared.begin_persist().is_err());
+        assert_eq!(
+            turn.prepare_pending(&WorkflowGatesV1::default())
+                .unwrap()
+                .unwrap()
+                .candidate
+                .state
+                .phase,
+            Phase::Review
+        );
+    }
+
+    #[test]
+    fn noop_transition_queues_manual_change_after_persisting() {
+        let runtime = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            mode: WorkflowMode::Adaptive,
+            always: vec!["builtin:workflow-core".into()],
+            ..Default::default()
+        });
+        let turn = runtime.begin_turn(&[]).unwrap();
+        let mut prepared = turn
+            .prepare_transition(Phase::General, 0, &WorkflowGatesV1::default())
+            .unwrap();
+        prepared.begin_persist().unwrap();
+        runtime.request_phase(Phase::Review).unwrap();
+        assert_eq!(prepared.commit().unwrap().phase, Phase::General);
+        assert_eq!(
+            turn.prepare_pending(&WorkflowGatesV1::default())
+                .unwrap()
+                .unwrap()
+                .candidate
+                .state
+                .phase,
+            Phase::Review
+        );
     }
     #[test]
     fn fork_drops_grants_and_changed_artifacts_stay_stale() {

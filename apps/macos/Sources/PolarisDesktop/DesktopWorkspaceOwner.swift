@@ -9,6 +9,8 @@ final class DesktopWorkspaceOwner: ObservableObject {
     @Published private(set) var binding: WorkspaceBinding?
     @Published private(set) var error: String?
     @Published private(set) var isRecovering = false
+    /// The home tree helper; launched only when the tree is first shown.
+    let home: HomeBrowseModel
     private let helper: () throws -> URL
     private let factory: ((URL, ServiceClient.PersistentStore, String) throws -> WorkspaceServiceModel)?
     private var preparing = false
@@ -17,6 +19,7 @@ final class DesktopWorkspaceOwner: ObservableObject {
     init(helper: @escaping () throws -> URL = DesktopWorkspaceOwner.packagedHelper,
          factory: ((URL, ServiceClient.PersistentStore, String) throws -> WorkspaceServiceModel)? = nil) {
         self.helper = helper; self.factory = factory
+        home = HomeBrowseModel(helper: helper)
     }
 
     nonisolated static func packagedHelper() throws -> URL {
@@ -143,9 +146,10 @@ final class DesktopWorkspaceOwner: ObservableObject {
     func quit() async -> Bool {
         guard !preparing, !quitting else { return false }
         quitting = true; defer { quitting = false }
-        guard let service else { return true }
+        guard let service else { await home.shutdown(); return true }
         let closed = await service.saveAndClose()
         if !closed { error = "終了を取り消しました。下書きの保存状態を確認してください。" }
+        else { await home.shutdown() }
         return closed
     }
 

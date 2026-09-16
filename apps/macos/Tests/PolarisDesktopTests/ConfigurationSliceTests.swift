@@ -99,7 +99,17 @@ private actor OwnedClientTransport: WorkspaceServiceTransport {
   func takeEvents() async throws -> [ServiceValue] { try await client.takeEvents() }
   func close() async -> ServiceClient.Exit? { await client.close() }
   func hasUnreapedChild() async -> Bool { await client.hasUnreapedChild() }
-  func ownedOrderlyExitStatus() async -> Int32? { await client.ownedOrderlyExitStatus() }
+  func ownedOrderlyExitStatus() async -> Int32? {
+    let status = await client.ownedOrderlyExitStatus()
+    if let status {
+      let ownsChild = await client.hasUnreapedChild()
+      let exit = await client.observedExit()
+      XCTAssertFalse(ownsChild, "A recoverable startup diagnosis must publish the owned exit first")
+      XCTAssertEqual(exit?.status, status)
+      XCTAssertEqual(exit?.forced, false)
+    }
+    return status
+  }
 }
 
 @MainActor
@@ -182,6 +192,57 @@ final class ConfigurationSliceTests: XCTestCase {
     XCTAssertThrowsError(try WorkspaceMemoryStatus(memory([.string("file:///not-a-reference")], "769")))
     let event: ServiceValue = .object(["protocol_version": .number("1"), "kind": .string("event"), "engine_epoch": .string("e"), "subscription_id": .string("sub"), "event_seq": .string("1"), "session_id": .string("s"), "session_revision": .string("2"), "type": .string("memory.updated"), "payload": memory([], "0")])
     XCTAssertNoThrow(try ServiceSchema.validateEvent(event, epoch: "e"))
+    let structuredSources = (1...4).map { ServiceValue.string("conversation://structured/publication?source=source-\($0)&offset=0") }
+    fields["retrieval_sources"] = .array(structuredSources)
+    fields["retrieval_status"] = .string("pending_reconfirmation")
+    let structured = try WorkspaceMemoryStatus(.object(fields))
+    XCTAssertEqual(structured.retrievalStatus, "pending_reconfirmation")
+    XCTAssertEqual(structured.retrievalSources.count, 4)
+    fields["retrieval_sources"] = .array(structuredSources + [.string("conversation://source-1-hash?start=1&end=1")])
+    XCTAssertEqual(try WorkspaceMemoryStatus(.object(fields)).retrievalSources.count, 5)
+    fields["retrieval_sources"] = .array([.string("conversation://" + String(repeating: "x", count: 1024))])
+    XCTAssertThrowsError(try WorkspaceMemoryStatus(.object(fields)))
+    fields["retrieval_sources"] = .array(structuredSources)
+    fields["retrieval_status"] = .string("not_found")
+    XCTAssertThrowsError(try WorkspaceMemoryStatus(.object(fields)))
+    fields["retrieval_sources"] = .array([])
+    XCTAssertEqual(try WorkspaceMemoryStatus(.object(fields)).retrievalStatus, "not_found")
+    fields["retrieval_status"] = .string("invented")
+    XCTAssertThrowsError(try WorkspaceMemoryStatus(.object(fields)))
+  }
+  func testRelatedOmissionRetainsTypedReasonsAndRejectsInvalidPairs() throws {
+    var fields: [String: ServiceValue] = [
+      "run_id": .string("run"), "phase": .string("ready"), "detail": .string("prepared"),
+      "recent_raw_turns": .string("10"), "retrieval_sources": .array([]), "reference_tokens": .string("0"),
+    ]
+    let legacy = try WorkspaceMemoryStatus(.object(fields))
+    XCTAssertNil(legacy.relatedOmission)
+    XCTAssertNil(legacy.relatedOmissionDetail)
+    let reasons = [
+      "query_terms": "検索語数", "grants": "参照権限の件数", "serialized_rows": "索引の読み取り量",
+      "matching_work": "キーワード照合量", "vector_work": "ベクトル処理量", "raw_proof_work": "原文照合量",
+    ]
+    for (reason, title) in reasons {
+      fields["related_omission"] = .string(reason)
+      for status in ["found", "pending_reconfirmation"] {
+        fields["retrieval_status"] = .string(status)
+        let parsed = try WorkspaceMemoryStatus(.object(fields))
+        XCTAssertEqual(parsed.relatedOmission, reason)
+        XCTAssertEqual(parsed.retrievalStatus, status)
+        XCTAssertEqual(parsed.relatedOmissionDetail, "補足検索を省略：\(title)の上限に達しました。必須の記憶は保持しています。")
+      }
+      for status in [nil, "not_found", "ambiguous_entity", "extraction_incomplete", "evidence_budget_exceeded"] as [String?] {
+        fields["retrieval_status"] = status.map(ServiceValue.string)
+        XCTAssertThrowsError(try WorkspaceMemoryStatus(.object(fields)), reason)
+      }
+    }
+    fields["retrieval_status"] = .string("found")
+    fields["related_omission"] = .string("invented")
+    XCTAssertThrowsError(try WorkspaceMemoryStatus(.object(fields)))
+    // null is rejected at the wire codec before a ServiceValue can exist.
+    XCTAssertThrowsError(try ServiceCodec.json(Data(#"{"related_omission":null}"#.utf8)))
+    fields.removeValue(forKey: "related_omission")
+    XCTAssertNil(try WorkspaceMemoryStatus(.object(fields)).relatedOmission)
   }
   func testLostACKRestartUsesOriginalLedgerIDWithoutConfigureResend() async throws {
     let (m,t,settings,root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }

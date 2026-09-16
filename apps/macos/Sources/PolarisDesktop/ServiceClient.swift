@@ -62,6 +62,14 @@ actor ServiceClient {
     var bytes: Data
     var offset = 0
   }
+  /// Written by Foundation's termination callback, outside this actor.
+  private final class TerminationObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: (status: Int32, orderly: Bool)?
+    func reset() { lock.lock(); defer { lock.unlock() }; value = nil }
+    func record(status: Int32, orderly: Bool) { lock.lock(); defer { lock.unlock() }; value = (status, orderly) }
+    func read() -> (status: Int32, orderly: Bool)? { lock.lock(); defer { lock.unlock() }; return value }
+  }
   private let helperURL: URL
   private let clientID: String
   private let configuration: Configuration
@@ -95,15 +103,18 @@ actor ServiceClient {
   private var killed = false
   private var started = false
   private var hello: ServiceHello?
+  private let homeBrowse: Bool
   private var failure: ServiceError?
   private var exit: Exit?
   private var orderlyExit = false
+  private let terminationObservation = TerminationObservation()
   private var exitWaiters: [CheckedContinuation<Exit?, Never>] = []
 
   init(
     helperURL: URL, clientID: String = UUID().uuidString,
     configuration: Configuration = Configuration(), persistentStore: PersistentStore? = nil,
-    recoveryMode: RecoveryMode = .disabled, ownerLaunch: OwnerServiceLaunch? = nil
+    recoveryMode: RecoveryMode = .disabled, ownerLaunch: OwnerServiceLaunch? = nil,
+    homeBrowse: Bool = false
   ) throws {
     guard helperURL.isFileURL, helperURL.path.hasPrefix("/"), helperURL.query == nil,
       helperURL.fragment == nil
@@ -120,6 +131,11 @@ actor ServiceClient {
     else { throw ServiceError.capacity }
     guard recoveryMode == .disabled || persistentStore != nil else { throw ServiceError.schema }
     guard ownerLaunch == nil || (recoveryMode == .resultOnly && persistentStore != nil) else { throw ServiceError.schema }
+    // The home helper never shares a store, recovery channel or owner launch.
+    guard !homeBrowse || (persistentStore == nil && recoveryMode == .disabled && ownerLaunch == nil) else {
+      throw ServiceError.schema
+    }
+    self.homeBrowse = homeBrowse
     self.ownerLaunch = ownerLaunch
     self.recoveryMode = recoveryMode
     self.helperURL = helperURL
@@ -143,15 +159,21 @@ actor ServiceClient {
     } else { channel = nil }
     recovery = channel?.client
     started = true
+    terminationObservation.reset()
     let child = Process()
     let stdin = Pipe()
     let stdout = Pipe()
     child.executableURL = helperURL
-    child.arguments = ownerLaunch?.arguments ?? ((persistentStore?.arguments ?? []) + (channel == nil ? [] : ["--source-recovery-fd2"]))
+    child.arguments = homeBrowse ? ["--browse-home"]
+      : ownerLaunch?.arguments ?? ((persistentStore?.arguments ?? []) + (channel == nil ? [] : ["--source-recovery-fd2"]))
     child.environment = [:]
     child.standardInput = stdin
     child.standardOutput = stdout
     child.standardError = channel?.childEndpoint ?? FileHandle.nullDevice
+    let observation = terminationObservation
+    child.terminationHandler = { child in
+      observation.record(status: child.terminationStatus, orderly: child.terminationReason == .exit)
+    }
     do {
       try child.run()
     } catch {
@@ -257,6 +279,12 @@ actor ServiceClient {
   func ownedOrderlyExitStatus() async -> Int32? {
     for _ in 0..<20 {
       if let exit { return orderlyExit ? exit.status : nil }
+      if let observed = terminationObservation.read() {
+        // Publish the same owned-exit state as the pump before offering recovery.
+        // Foundation has already reaped the child when this callback runs.
+        await finishOwnedExit(status: observed.status, orderly: observed.orderly)
+        return orderlyExit ? exit?.status : nil
+      }
       guard process != nil else { return nil }
       try? await Task.sleep(for: .milliseconds(10))
     }
@@ -341,7 +369,10 @@ actor ServiceClient {
           snapshotGeneration: session.flatMap { snapshotGenerations[Data($0.utf8)] },
           readRequest: readRequest,
           deadline: .now
-            + (method == "hello" ? configuration.helloTimeout : configuration.requestTimeout),
+            + (method == "hello" ? configuration.helloTimeout
+               // Owner jobs bound their own connect and catalog time.
+               : ["mcp.catalog.check", "mcp.setup.detect", "mcp.setup.register"].contains(method) ? .seconds(300)
+               : configuration.requestTimeout),
           continuation: continuation)
         outbox.append(Output(bytes: bytes))
         outputBytes += bytes.count
@@ -393,18 +424,7 @@ actor ServiceClient {
         // Foundation reaps the child; isRunning false precedes no blocking wait.
         // Descendants may retain stdout. Their EOF is not the helper's exit,
         // and this Exit claims only the owned helper, never shutdown.ready.
-        let status = child.terminationStatus
-        orderlyExit = child.terminationReason == .exit
-        let forced = terminatedAt != nil
-        if closingAt == nil { beginClose(.eof) }
-        try? output?.close()
-        output = nil
-        exit = Exit(status: status, forced: forced)
-        process = nil
-        await recovery?.close()
-        let waiters = exitWaiters
-        exitWaiters.removeAll()
-        for waiter in waiters { waiter.resume(returning: exit) }
+        await finishOwnedExit(status: child.terminationStatus, orderly: child.terminationReason == .exit)
         return
       }
       if recoveryMode == .disabled, let closingAt, closingAt + configuration.exitGrace <= .now, terminatedAt == nil {
@@ -418,6 +438,23 @@ actor ServiceClient {
       // This pump is never tied to caller cancellation.
       try? await Task.sleep(for: .milliseconds(5))
     }
+  }
+
+  /// Shared by the pump and the synchronous Foundation termination observation.
+  /// Actor isolation publishes one exit and releases each waiter exactly once.
+  private func finishOwnedExit(status: Int32, orderly: Bool) async {
+    guard process != nil, exit == nil else { return }
+    orderlyExit = orderly
+    let forced = terminatedAt != nil
+    if closingAt == nil { beginClose(.eof) }
+    try? output?.close()
+    output = nil
+    exit = Exit(status: status, forced: forced)
+    process = nil
+    await recovery?.close()
+    let waiters = exitWaiters
+    exitWaiters.removeAll()
+    for waiter in waiters { waiter.resume(returning: exit) }
   }
 
   private func readAvailable() throws {

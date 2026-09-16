@@ -144,3 +144,19 @@ fn owner_accepts_all_tiers_max_decimal_and_unicode_without_coercion() {
     a[13] = OsString::from_vec(vec![255]);
     assert!(parse_launch_args(&a).is_err());
 }
+
+#[test]
+fn browse_home_is_exactly_one_argument() {
+    assert!(matches!(
+        parse_launch_args(&["--browse-home".into()]),
+        Ok(LaunchArguments::BrowseHome)
+    ));
+    for extra in [
+        vec!["--browse-home", "--source-recovery-fd2"],
+        vec!["--browse-home", "/Users/other"],
+        vec!["--browse-home="],
+    ] {
+        let args: Vec<OsString> = extra.into_iter().map(Into::into).collect();
+        assert!(parse_launch_args(&args).is_err());
+    }
+}

@@ -14,6 +14,8 @@ pub enum LaunchArguments {
         recovery_fd2: bool,
     },
     OwnerV1(OwnerLaunchArguments),
+    /// Exactly `--browse-home`: the read-only home helper, with no store.
+    BrowseHome,
 }
 /// These values still require native authority/bootstrap/store validation.
 /// OwnerV1 always requires the fixed recovery-fd2 flag; it grants no runtime.
@@ -88,6 +90,9 @@ pub(crate) fn parse_sha256(s: &str) -> Result<[u8; 32], LaunchArgumentsError> {
     Ok(hash)
 }
 pub fn parse_launch_args(args: &[OsString]) -> Result<LaunchArguments, LaunchArgumentsError> {
+    if args.len() == 1 && args[0] == "--browse-home" {
+        return Ok(LaunchArguments::BrowseHome);
+    }
     if (args.len() == 6 || args.len() == 7)
         && args[0] == "--store-root"
         && args[2] == "--project-id"

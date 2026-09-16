@@ -65,6 +65,13 @@ async fn run(
     let reader = Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)?;
     let writer = Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)?;
     match args {
+        LaunchArguments::BrowseHome => {
+            drop(recovery);
+            #[cfg(target_os = "macos")]
+            polaris_desktop_service::serve_home_browser(reader, writer).await?;
+            #[cfg(not(target_os = "macos"))]
+            return Err("このOSのhome閲覧は未対応です".into());
+        }
         LaunchArguments::Legacy { store, .. } => {
             let mut service =
                 tokio::task::spawn_blocking(move || DesktopService::open(store)).await??;

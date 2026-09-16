@@ -102,8 +102,8 @@ pub fn is_denied(path: &Path) -> bool {
     false
 }
 
-/// OAuth/API stores and their atomic-write temporary files are credentials,
-/// while ordinary source-tree auth.json and harness configuration remain readable.
+/// OAuth/API stores, their atomic-write temporary files and MCP detector sources
+/// are credentials; ordinary source-tree auth.json and Polaris configuration remain readable.
 fn is_harness_credential(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -113,13 +113,26 @@ fn is_harness_credential(path: &Path) -> bool {
         .parent()
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().to_lowercase());
+    let grandparent = path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().to_lowercase());
+    if directory.as_deref() == Some("mcp") && grandparent.as_deref() == Some(".polaris") {
+        let store = name.strip_suffix(".tmp").unwrap_or(&name);
+        return matches!(
+            store,
+            "servers.json" | "secrets.json" | "catalog.json" | "owner.lock"
+        );
+    }
     match directory.as_deref() {
         Some(".polaris") => matches!(
             name.as_str(),
             "auth.json" | "auth.json.tmp" | "api_key.json" | "api_key.json.tmp"
         ),
-        Some(".codex") => matches!(name.as_str(), "auth.json" | "auth.json.tmp"),
-        _ => false,
+        Some(".codex") => matches!(name.as_str(), "auth.json" | "auth.json.tmp" | "config.toml"),
+        // MCP detector sources may hold header and environment credentials.
+        _ => name == ".claude.json",
     }
 }
 
@@ -170,11 +183,18 @@ mod tests {
             "/home/u/.polaris/api_key.json.tmp",
             "/home/u/.POLARIS/AUTH.JSON",
             "/home/u/.codex/auth.json",
+            "/home/u/.codex/config.toml",
+            "/home/u/.claude.json",
+            "/home/u/.polaris/mcp/secrets.json",
+            "/home/u/.polaris/mcp/secrets.json.tmp",
+            "/home/u/.polaris/mcp/servers.json",
+            "/home/u/.polaris/mcp/catalog.json",
         ] {
             assert!(is_denied(Path::new(path)), "{path}");
         }
         assert!(!is_denied(Path::new("/project/src/auth.json")));
         assert!(!is_denied(Path::new("/home/u/.polaris/config.toml")));
+        assert!(!is_denied(Path::new("/project/mcp/servers.json")));
     }
 
     #[test]

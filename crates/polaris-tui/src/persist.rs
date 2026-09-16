@@ -69,6 +69,28 @@ pub fn load_session(path: &Path) -> io::Result<(Session, bool)> {
     ))
 }
 
+/// Reads a legacy JSONL session without repairing or truncating it. Startup
+/// preflight uses this before it is allowed to create a v2 import target.
+pub fn read_session_strict(path: &Path) -> io::Result<Session> {
+    let bytes = std::fs::read(path)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "session is not UTF-8"))?;
+    let mut messages = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        messages.push(
+            serde_json::from_str::<Message>(line)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "session is corrupt"))?,
+        );
+    }
+    Ok(Session {
+        messages,
+        ..Session::default()
+    })
+}
+
 /// Appends one message as a single JSON line. Creates the file if it
 /// doesn't exist yet.
 pub fn append_message(path: &Path, message: &Message) -> io::Result<()> {

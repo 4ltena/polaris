@@ -186,6 +186,122 @@ pub async fn refresh(
     .await
 }
 
+#[cfg(not(test))]
+const BOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Tests exercise the same deadline path without waiting 30 s.
+#[cfg(test)]
+const BOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const BOUND_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Which identity rule a bound token response must satisfy.
+pub(crate) enum IdentityRule<'a> {
+    /// A new code exchange must name its account.
+    Required,
+    /// A refresh may omit id_token and keep this account; a present value
+    /// must be a valid token for the same account.
+    SameAccount(&'a str),
+}
+
+/// One POST to the fixed token endpoint with a 30 s deadline, a 1 MiB
+/// response cap and no redirects. It never retries and never puts a response
+/// body into the error.
+pub(crate) async fn post_token_bound(
+    issuer: &str,
+    form: &[(&str, &str)],
+    fallback_refresh: Option<&str>,
+    identity: IdentityRule<'_>,
+) -> Result<Credentials, AuthError> {
+    let client = polaris_http::client_builder()
+        .map_err(|_| AuthError::Http("client_configuration".into()))?
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(BOUND_TIMEOUT)
+        .build()
+        .map_err(|_| AuthError::Http("client_configuration".into()))?;
+    let mut response = client
+        .post(format!("{issuer}/oauth/token"))
+        .form(form)
+        .send()
+        .await
+        .map_err(|error| {
+            AuthError::Http(
+                if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "transport"
+                }
+                .into(),
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AuthError::Http(format!("status {}", status.as_u16())));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        AuthError::Http(
+            if error.is_timeout() {
+                "timeout"
+            } else {
+                "transport"
+            }
+            .into(),
+        )
+    })? {
+        if body.len() + chunk.len() > BOUND_RESPONSE_BYTES {
+            return Err(AuthError::Decode("response_too_large".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| AuthError::Decode("invalid_json".into()))?;
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let access_token =
+        text("access_token").ok_or_else(|| AuthError::Decode("access_token".into()))?;
+    let refresh_token = text("refresh_token")
+        .or(fallback_refresh)
+        .ok_or_else(|| AuthError::Decode("refresh_token".into()))?;
+    let named = match value.get("id_token") {
+        None => None,
+        Some(token) => Some(
+            token
+                .as_str()
+                .and_then(account_id_from_id_token)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| AuthError::Decode("id_token".into()))?,
+        ),
+    };
+    let account_id = match (identity, named) {
+        (IdentityRule::Required, Some(id)) => id,
+        (IdentityRule::Required, None) => return Err(AuthError::Decode("id_token".into())),
+        (IdentityRule::SameAccount(kept), None) => kept.to_owned(),
+        (IdentityRule::SameAccount(kept), Some(id)) if id == kept => id,
+        (IdentityRule::SameAccount(_), Some(_)) => {
+            return Err(AuthError::Denied("different_account".into()));
+        }
+    };
+    let expires_at = match value.get("expires_in") {
+        None => None,
+        Some(seconds) => Some(
+            now_secs().saturating_add(
+                seconds
+                    .as_u64()
+                    .ok_or_else(|| AuthError::Decode("expires_in".into()))?,
+            ),
+        ),
+    };
+    Ok(Credentials {
+        access_token: access_token.to_owned(),
+        refresh_token: refresh_token.to_owned(),
+        account_id,
+        expires_at,
+    })
+}
+
 /// account_id lives in the id_token payload. For tests, builds a
 /// JWT-shaped, 3-part string wrapping `{"chatgpt_account_id":"acct-1"}` in
 /// base64url. Doesn't verify the signature (it was received from the server

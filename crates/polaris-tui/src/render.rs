@@ -200,9 +200,22 @@ fn format_tool_result_preview(result: &str) -> Vec<String> {
 /// subagents.
 pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
     match event {
+        AgentEvent::MemoryPrepared(observation) => observation
+            .display_lines()
+            .into_iter()
+            .map(|line| {
+                HistoryLine::plain(Line::from(Span::styled(
+                    sanitize(&line),
+                    Style::default().add_modifier(Modifier::DIM),
+                )))
+            })
+            .collect(),
         // Desktop-only provisional text is replaced by the authoritative
         // completion. The legacy TUI continues to render that completion once.
-        AgentEvent::TextDelta { .. } => Vec::new(),
+        // Model request boundaries are host bookkeeping, not transcript.
+        AgentEvent::TextDelta { .. }
+        | AgentEvent::ModelRequestStarted { .. }
+        | AgentEvent::ModelRequestFinished { .. } => Vec::new(),
         AgentEvent::WorkflowResolved {
             phase,
             skill_ids,
@@ -1584,7 +1597,9 @@ pub fn render_approval_modal(frame: &mut Frame, reason: &str) {
         sanitize(reason)
     );
     frame.render_widget(
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("approve?")),
+        Paragraph::new(text)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("approve?")),
         area,
     );
 }
@@ -3341,5 +3356,29 @@ mod tests {
         assert!(sanitized.contains('\n'));
         assert!(sanitized.contains('\t'));
         assert_eq!(sanitized, "a\u{fffd}b\u{fffd}c\u{fffd}d\ne\tf");
+    }
+}
+
+#[cfg(test)]
+mod memory_observation_tests {
+    use super::*;
+    #[test]
+    fn m17_live_memory_matches_common_terminal_projection_and_escapes_uri_controls() {
+        let observation = polaris_core::conversation_memory::observation::MemoryObservation {
+            mode: polaris_core::conversation_state::HistoryMode::Structured10,
+            retrieval_status: Some(polaris_core::conversation_memory::structured::packing::RetrievalStatus::PendingReconfirmation),
+            source_uris: vec!["conversation://fixture?start=1&end=1\n\u{1b}[2J".into()],
+            reference_tokens: 40, related_omission: None,
+        };
+        let expected = observation.display_lines().join("\n");
+        let lines = format_event_for_live_print(&AgentEvent::MemoryPrepared(observation));
+        let actual = lines
+            .iter()
+            .map(|line| line.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(actual, expected);
+        assert!(actual.contains("要再確認") && actual.contains("40 tokens"));
+        assert!(!actual.contains('\u{1b}'));
     }
 }

@@ -30,6 +30,10 @@ const MAX_MODEL_FILES: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ResourceError {
     #[error(
+        "structured10はデスクトップ版では選択・表示が未接続のため使用できません。CLI・TUIでは明示的に指定できます"
+    )]
+    StructuredUnavailable,
+    #[error(
         "strict10はCodexまたはOpenAI接続で使用してください。ローカル主接続には対応していません"
     )]
     Provider,
@@ -69,6 +73,7 @@ impl ResourceError {
     /// Fixed startup-only exit contract; never transmits paths or upstream errors.
     pub fn exit_code(self) -> i32 {
         match self {
+            Self::StructuredUnavailable => 79,
             Self::Provider => 80,
             Self::Configuration => 81,
             Self::Path => 82,
@@ -128,6 +133,9 @@ fn prepare_with(
         &polaris_core::conversation_memory::LocalStdioEmbedder,
     ) -> Result<serde_json::Value, ResourceError>,
 ) -> Result<Option<TrustedMemoryIndex>, ResourceError> {
+    if mode.is_structured() {
+        return Err(ResourceError::StructuredUnavailable);
+    }
     if mode == HistoryMode::Legacy {
         return Ok(None);
     }

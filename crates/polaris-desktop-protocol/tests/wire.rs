@@ -168,6 +168,50 @@ fn strict10_configuration_and_memory_status_roundtrip_without_nulls() {
     let updated = assert_wire::<Snapshot>(&wire);
     assert_eq!(updated.configuration.history_mode, HistoryMode::Strict10);
     assert!(updated.memory.unwrap().embedding_usage.is_none());
+    wire["configuration"]["history_mode"] = json!("structured10");
+    let structured = assert_wire::<Snapshot>(&wire);
+    assert_eq!(
+        structured.configuration.history_mode,
+        HistoryMode::Structured10
+    );
+    for status in [
+        "found",
+        "not_found",
+        "ambiguous_entity",
+        "pending_reconfirmation",
+        "extraction_incomplete",
+        "evidence_budget_exceeded",
+    ] {
+        wire["memory"]["retrieval_status"] = json!(status);
+        assert_wire::<Snapshot>(&wire);
+    }
+    wire["memory"]["retrieval_status"] = json!("invented");
+    assert!(codec::from_json::<Snapshot>(&serde_json::to_vec(&wire).unwrap()).is_err());
+    wire["memory"]["retrieval_status"] = Value::Null;
+    assert_eq!(
+        codec::from_json::<Snapshot>(&serde_json::to_vec(&wire).unwrap()),
+        Err(CodecError::Null)
+    );
+    wire["memory"]["retrieval_status"] = json!("found");
+    for reason in [
+        "query_terms",
+        "grants",
+        "serialized_rows",
+        "matching_work",
+        "vector_work",
+        "raw_proof_work",
+    ] {
+        wire["memory"]["related_omission"] = json!(reason);
+        assert_wire::<Snapshot>(&wire);
+    }
+    wire["memory"]["related_omission"] = json!("invented");
+    assert!(codec::from_json::<Snapshot>(&serde_json::to_vec(&wire).unwrap()).is_err());
+    wire["memory"]["related_omission"] = Value::Null;
+    assert_eq!(
+        codec::from_json::<Snapshot>(&serde_json::to_vec(&wire).unwrap()),
+        Err(CodecError::Null)
+    );
+    wire["memory"]["related_omission"] = json!("query_terms");
     let mut event = values(include_str!("fixtures/events.json"))[0].clone();
     event["type"] = json!("memory.updated");
     event["payload"] = wire["memory"].clone();
@@ -175,6 +219,17 @@ fn strict10_configuration_and_memory_status_roundtrip_without_nulls() {
         assert_wire::<Event>(&event).body,
         EventBody::MemoryUpdated(_)
     ));
+    wire["memory"]
+        .as_object_mut()
+        .unwrap()
+        .remove("related_omission");
+    assert!(
+        assert_wire::<Snapshot>(&wire)
+            .memory
+            .unwrap()
+            .related_omission
+            .is_none()
+    );
     let mut request = requests()
         .into_iter()
         .find(|v| v["method"] == "session.configure")

@@ -31,12 +31,22 @@ struct WorkspaceEmbeddingUsage: Equatable {
 struct WorkspaceMemoryStatus: Equatable {
   let runID: String; let phase: String; let detail: String; let recentRawTurns: UInt64
   let retrievalSources: [String]; let referenceTokens: UInt64
+  let retrievalStatus: String?
+  let relatedOmission: String?
   let summaryUsage: WorkspaceMemoryUsage?; let mainUsage: WorkspaceMemoryUsage?; let embeddingUsage: WorkspaceEmbeddingUsage?; let totalUsage: WorkspaceMemoryUsage?
   init(_ value: ServiceValue) throws {
     try ServiceSchema.memory.check(value)
-    guard case .array(let sources) = value["retrieval_sources"], sources.count <= 3,
-          sources.allSatisfy({ $0.string?.hasPrefix("conversation://") == true }),
+    retrievalStatus = value["retrieval_status"]?.string
+    relatedOmission = value["related_omission"]?.string
+    if relatedOmission != nil && retrievalStatus != "found" && retrievalStatus != "pending_reconfirmation" { throw ServiceError.schema }
+    let structured = retrievalStatus != nil
+    guard case .array(let sources) = value["retrieval_sources"], sources.count <= (structured ? 256 : 3),
+          sources.allSatisfy({ $0.string?.hasPrefix("conversation://") == true
+            && ($0.string?.utf8.count ?? Int.max) <= (structured && $0.string?.hasPrefix("conversation://structured/") == true ? 8192 : 1024) }),
+          sources.reduce(0, { $0 + ($1.string?.utf8.count ?? 0) }) <= 64 * 1024,
+          Set(sources.compactMap(\.string)).count == sources.count,
           let tokens = value["reference_tokens"]?.decimal, tokens <= 768 else { throw ServiceError.schema }
+    if let retrievalStatus, ["not_found", "ambiguous_entity", "extraction_incomplete", "evidence_budget_exceeded"].contains(retrievalStatus), !sources.isEmpty { throw ServiceError.schema }
     runID = value["run_id"]!.string!; phase = value["phase"]!.string!; detail = value["detail"]!.string!
     recentRawTurns = value["recent_raw_turns"]!.decimal!; retrievalSources = sources.map { $0.string! }; referenceTokens = tokens
     summaryUsage = try value["summary_usage"].map(WorkspaceMemoryUsage.init)
@@ -46,6 +56,19 @@ struct WorkspaceMemoryStatus: Equatable {
   }
   var phaseTitle: String {
     switch phase { case "preparing": "準備中"; case "ready": "準備完了"; case "failed": "準備失敗"; default: "結果不明" }
+  }
+  var relatedOmissionDetail: String? {
+    let reason: String
+    switch relatedOmission {
+    case "query_terms": reason = "検索語数"
+    case "grants": reason = "参照権限の件数"
+    case "serialized_rows": reason = "索引の読み取り量"
+    case "matching_work": reason = "キーワード照合量"
+    case "vector_work": reason = "ベクトル処理量"
+    case "raw_proof_work": reason = "原文照合量"
+    default: return nil
+    }
+    return "補足検索を省略：\(reason)の上限に達しました。必須の記憶は保持しています。"
   }
 }
 

@@ -112,6 +112,24 @@ fn legacy_does_not_read_resources_or_invoke_probe() {
 }
 
 #[test]
+fn structured10_is_refused_before_any_resource_read_or_probe() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing");
+    assert!(matches!(
+        prepare_with(
+            HistoryMode::Structured10,
+            BootstrapProvider::Ollama,
+            &missing,
+            &missing,
+            &missing,
+            |_| panic!("structured10 must not invoke preflight"),
+        ),
+        Err(ResourceError::StructuredUnavailable)
+    ));
+    assert!(!missing.exists());
+}
+
+#[test]
 fn local_primary_is_refused_before_reading_config_or_probing() {
     let missing = Path::new("/missing");
     for provider in [BootstrapProvider::Ollama, BootstrapProvider::Lmstudio] {

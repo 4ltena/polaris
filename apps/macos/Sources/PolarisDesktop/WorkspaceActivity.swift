@@ -28,21 +28,7 @@ struct WorkspaceActivityView: View {
                 Spacer()
                 Text("残り \(activity.tasks.count - activity.completedCount) 件")
             }.font(.caption).foregroundStyle(.secondary)
-            HStack(spacing: 5) {
-                ForEach(Array(activity.tasks.prefix(16))) { task in
-                    Button {
-                        inspectedTaskID = inspectedTaskID == task.id ? nil : task.id
-                    } label: { WorkspaceTaskSquare(status: task.status) }
-                        .buttonStyle(.plain).padding(2).contentShape(Rectangle())
-                        .accessibilityLabel("\(task.title)、\(task.status.title)")
-                        .help("\(task.title)：\(task.status.title)")
-                }
-                if activity.tasks.count > 16 {
-                    Button("ほか\(activity.tasks.count - 16)件") { tasksOpen = true }
-                        .font(.caption)
-                }
-                if activity.tasks.isEmpty { Text("作業はまだありません").font(.caption).foregroundStyle(.secondary) }
-            }
+            WorkspaceTaskStrip(tasks: activity.tasks, inspectedTaskID: $inspectedTaskID)
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     if let inspected {
@@ -160,6 +146,38 @@ struct WorkspaceActivityView: View {
             Divider()
             ScrollView { LazyVStack(alignment: .leading, spacing: 4, content: content).padding(8) }
         }.frame(width: 420, height: 410).onExitCommand(perform: close)
+    }
+}
+
+struct WorkspaceTaskStrip: View {
+    let tasks: [WorkspaceTask]
+    @Binding var inspectedTaskID: String?
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 5) {
+                ForEach(tasks) { task in
+                    let isSelected = inspectedTaskID == task.id
+                    Button {
+                        inspectedTaskID = isSelected ? nil : task.id
+                    } label: {
+                        WorkspaceTaskSquare(status: task.status).padding(6)
+                            .background(isSelected ? Color.accentColor.opacity(0.14) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 5))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 5)
+                                    .strokeBorder(isSelected ? Color.primary.opacity(0.7) : .clear, lineWidth: 1)
+                            }
+                            .contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("\(task.title)、\(task.status.title)")
+                        .accessibilityAddTraits(isSelected ? .isSelected : [])
+                        .help("\(task.title)：\(task.status.title)")
+                }
+                if tasks.isEmpty { Text("作業はまだありません").font(.caption).foregroundStyle(.secondary) }
+            }
+        }.frame(height: 36)
     }
 }
 

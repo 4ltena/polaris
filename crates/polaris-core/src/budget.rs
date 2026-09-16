@@ -10,6 +10,120 @@ pub const BUDGET_LIMIT: usize = 990;
 /// The ceiling on the number of always-on tools.
 pub const MAX_TOOLS: usize = 6;
 
+/// Adaptive control is accounted separately from the unchanged baseline.
+pub const STATE_SCHEMA_LIMIT: usize = 256;
+pub const MCP_META_SCHEMA_LIMIT: usize = 256;
+pub const MCP_SELECTED_SCHEMA_LIMIT: usize = 4096;
+pub const MCP_CANDIDATE_LIMIT: usize = 768;
+
+pub fn validate_mcp_meta_schema() -> std::io::Result<()> {
+    let specs = [polaris_tools::mcp_catalog_spec()];
+    for wire in [
+        polaris_provider::openai::tool_wire_shape(&specs),
+        polaris_provider::codex::tool_wire_shape(&specs),
+    ] {
+        if count_tokens(&serde_json::to_string(&wire).map_err(std::io::Error::other)?)
+            > MCP_META_SCHEMA_LIMIT
+        {
+            return Err(std::io::Error::other(
+                "MCP操作の定義が256tokensを超えました",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Counts full production tool wire, including aliases and descriptions.
+pub fn validate_mcp_tool_budget(tools: &[ToolSpec]) -> std::io::Result<()> {
+    if tools.len() > 4 {
+        return Err(std::io::Error::other("MCP toolの選択は4件以内です"));
+    }
+    for wire in [
+        polaris_provider::openai::tool_wire_shape(tools),
+        polaris_provider::codex::tool_wire_shape(tools),
+    ] {
+        if count_tokens(&serde_json::to_string(&wire).map_err(std::io::Error::other)?)
+            > MCP_SELECTED_SCHEMA_LIMIT
+        {
+            return Err(std::io::Error::other(
+                "MCP toolの定義が4096tokensを超えました",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_state_schema() -> std::io::Result<()> {
+    let specs = [polaris_tools::state_spec()];
+    for wire in [
+        polaris_provider::openai::tool_wire_shape(&specs),
+        polaris_provider::codex::tool_wire_shape(&specs),
+    ] {
+        let text = serde_json::to_string(&wire).map_err(std::io::Error::other)?;
+        if count_tokens(&text) > STATE_SCHEMA_LIMIT {
+            return Err(std::io::Error::other(
+                "state toolの定義が256tokensを超えました",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reference-token counts of the complete logical context in each provider's
+/// production wire shape. These include history and JSON framing, and are not
+/// billed token usage or transport-specific model/effort metadata.
+#[derive(Debug, serde::Serialize)]
+pub struct RequestContextTokens {
+    pub system: usize,
+    pub openai_context: usize,
+    pub codex_context: usize,
+    pub openai_tools: usize,
+    pub codex_tools: usize,
+    pub openai_state: usize,
+    pub codex_state: usize,
+}
+
+pub fn request_context_tokens(
+    request: &polaris_provider::CompletionRequest,
+) -> RequestContextTokens {
+    let openai = polaris_provider::openai::build_body("", request, None);
+    let codex = polaris_provider::codex::build_body("", request, None);
+    let mut openai_context = serde_json::json!({"messages":openai["messages"]});
+    let mut codex_context =
+        serde_json::json!({"instructions":codex["instructions"], "input":codex["input"]});
+    for (context, wire) in [(&mut openai_context, &openai), (&mut codex_context, &codex)] {
+        if let Some(tools) = wire.get("tools") {
+            context["tools"] = tools.clone();
+        }
+    }
+    let state: Vec<_> = request
+        .tools
+        .iter()
+        .filter(|tool| tool.name == "state")
+        .cloned()
+        .collect();
+    let state_tokens = |wire: Vec<serde_json::Value>| {
+        if wire.is_empty() {
+            0
+        } else {
+            count_tokens(&serde_json::to_string(&wire).expect("tool wire is JSON"))
+        }
+    };
+    RequestContextTokens {
+        system: count_tokens(&request.system),
+        openai_context: count_tokens(&openai_context.to_string()),
+        codex_context: count_tokens(&codex_context.to_string()),
+        openai_tools: openai
+            .get("tools")
+            .map_or(0, |tools| count_tokens(&tools.to_string())),
+        codex_tools: codex
+            .get("tools")
+            .map_or(0, |tools| count_tokens(&tools.to_string())),
+        openai_state: state_tokens(polaris_provider::openai::tool_wire_shape(&state)),
+        codex_state: state_tokens(polaris_provider::codex::tool_wire_shape(&state)),
+    }
+}
+
 /// Counts using the reference tokenizer. The actual count shifts from
 /// provider to provider, so budget judgments are always made against this
 /// one reference.
@@ -43,6 +157,131 @@ pub fn always_on_tokens(system_prompt: &str, tools: &[ToolSpec]) -> usize {
 mod tests {
     use super::*;
     use crate::prompt::SYSTEM_PROMPT;
+
+    #[test]
+    fn mcp_meta_and_owned_tool_wire_have_separate_measured_budgets() {
+        let meta = [polaris_tools::mcp_catalog_spec()];
+        for wire in [
+            polaris_provider::openai::tool_wire_shape(&meta),
+            polaris_provider::codex::tool_wire_shape(&meta),
+        ] {
+            let count = count_tokens(&serde_json::to_string(&wire).unwrap());
+            println!("MCP meta tool wire: {count} reference tokens");
+            assert!(count <= MCP_META_SCHEMA_LIMIT, "{count}");
+        }
+        let tool = ToolSpec {
+            name: format!("mcp_{}", "a".repeat(60)),
+            description: "fixture".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        };
+        assert!(validate_mcp_tool_budget(&vec![tool.clone(); 4]).is_ok());
+        assert!(validate_mcp_tool_budget(&vec![tool.clone(); 5]).is_err());
+        let mut oversized = tool;
+        oversized.parameters["description"] =
+            serde_json::json!("long schema description ".repeat(4096));
+        assert!(validate_mcp_tool_budget(&[oversized]).is_err());
+        assert_eq!(polaris_tools::all_specs().len(), MAX_TOOLS);
+        assert!(
+            polaris_tools::all_specs()
+                .iter()
+                .all(|tool| tool.name != "mcp_catalog")
+        );
+    }
+
+    #[test]
+    fn workflow_modes_measure_all_phases_and_full_wire_without_claiming_cost_savings() {
+        use crate::workflow::{Phase, SessionWorkflow, WorkflowMode};
+        use polaris_provider::{CompletionRequest, Message};
+        let baseline = crate::prompt::assemble_always_on("", "", &[]);
+        let config = crate::config::Config::default().workflow;
+        let manual = SessionWorkflow::new(config.clone())
+            .begin_turn(&[])
+            .unwrap()
+            .body
+            .clone();
+        let mut adaptive_config = config;
+        adaptive_config.mode = WorkflowMode::Adaptive;
+        let workflow = SessionWorkflow::new(adaptive_config);
+        let turn = workflow.begin_turn(&[]).unwrap();
+        let all_phases = polaris_skills::workflow_profile::recommended_bindings()
+            .iter()
+            .map(|skill| format!("### {}\n{}", skill.name, skill.body))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut history = vec![Message::user(
+            "Implement the agreed task; retain constraints and report remaining work.",
+        )];
+        for phase in Phase::ALL {
+            let mut prepared = turn
+                .prepare_transition(phase, workflow.state().revision, &workflow.gates)
+                .unwrap();
+            prepared.begin_persist().unwrap();
+            prepared.commit().unwrap();
+            let profile = turn.profile(&workflow.gates).unwrap();
+            assert!(profile.tokens <= 384);
+            let mut keys = Vec::new();
+            for (mode, body, adaptive) in [
+                ("off", "", false),
+                ("manual", manual.as_str(), false),
+                ("all_phases_fixture", all_phases.as_str(), true),
+                ("adaptive", profile.body.as_str(), true),
+            ] {
+                let mut tools = baseline.tools().to_vec();
+                if adaptive {
+                    tools.push(polaris_tools::state_spec());
+                }
+                let request = CompletionRequest {
+                    system: format!("{}\n{body}", baseline.system()),
+                    messages: history.clone(),
+                    tools,
+                };
+                assert_eq!(
+                    request.tools.iter().any(|tool| tool.name == "state"),
+                    adaptive
+                );
+                let counts = request_context_tokens(&request);
+                assert!(
+                    counts.openai_context > counts.system && counts.codex_context > counts.system
+                );
+                for (transport, wire) in [
+                    (
+                        "openai",
+                        polaris_provider::openai::build_body("fixture", &request, Some("medium")),
+                    ),
+                    (
+                        "codex",
+                        polaris_provider::codex::build_body("fixture", &request, Some("medium")),
+                    ),
+                ] {
+                    println!(
+                        "workflow_comparison phase={phase} mode={mode} transport={transport} full_fixture_wire={}",
+                        count_tokens(&wire.to_string())
+                    );
+                }
+                assert_eq!(counts.openai_state > 0, adaptive);
+                assert_eq!(counts.codex_state > 0, adaptive);
+                let key = polaris_provider::cache_key("fixture", Some("medium"), &request);
+                let mut grown = CompletionRequest {
+                    system: request.system.clone(),
+                    messages: request.messages.clone(),
+                    tools: request.tools.clone(),
+                };
+                grown.messages.push(Message::assistant(
+                    "History grows without changing the prefix.",
+                ));
+                assert_eq!(
+                    key,
+                    polaris_provider::cache_key("fixture", Some("medium"), &grown)
+                );
+                keys.push(key);
+            }
+            assert_ne!(
+                keys[1], keys[3],
+                "adaptive context must invalidate the manual prefix key"
+            );
+            history.push(Message::assistant("Observed step completed."));
+        }
+    }
 
     #[test]
     fn always_on_context_stays_within_budget() {

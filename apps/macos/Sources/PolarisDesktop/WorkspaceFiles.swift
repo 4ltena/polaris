@@ -12,26 +12,38 @@ struct WorkspaceFilesView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                ScrollView(.horizontal) {
-                    HStack(spacing: 2) {
-                        ForEach(selection.openIDs, id: \.self) { id in
-                            let file = activity.files.first { $0.id == id }
-                            HStack(spacing: 2) {
-                                Button {
-                                    state.openFile(id, conversationID: activity.conversationID)
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        Text(file?.path.components(separatedBy: "/").last ?? "対象なし")
-                                        if let file { WorkspaceFileMarks(file: file) }
-                                    }
-                                }.buttonStyle(WorkspaceRowStyle(selected: selection.selectedID == id))
-                                Button { state.closeFile(id, conversationID: activity.conversationID) } label: {
-                                    Image(systemName: "xmark").font(.caption)
-                                }.buttonStyle(.borderless).padding(.trailing, 6)
-                                    .accessibilityLabel("\(file?.path ?? id)のタブを閉じる")
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 2) {
+                            ForEach(selection.openIDs, id: \.self) { id in
+                                let file = activity.files.first { $0.id == id }
+                                HStack(spacing: 2) {
+                                    Button {
+                                        state.openFile(id, conversationID: activity.conversationID)
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Text(file?.path.components(separatedBy: "/").last ?? "対象なし")
+                                            if let file { WorkspaceFileMarks(file: file) }
+                                        }
+                                    }.buttonStyle(WorkspaceRowStyle(selected: selection.selectedID == id))
+                                    Button { state.closeFile(id, conversationID: activity.conversationID) } label: {
+                                        Image(systemName: "xmark").font(.caption)
+                                    }.buttonStyle(.borderless).padding(.trailing, 6)
+                                        .accessibilityLabel("\(file?.path ?? id)のタブを閉じる")
+                                }.id(id)
                             }
-                        }
-                    }.padding(6)
+                        }.padding(6)
+                    }
+                    .onAppear { if let id = selection.selectedID { proxy.scrollTo(id) } }
+                    .onChange(of: selection.selectedID) { id in
+                        if let id { proxy.scrollTo(id) }
+                    }
+                    .onChange(of: state.fileFocusRequest) { _ in
+                        if let id = selection.selectedID { proxy.scrollTo(id) }
+                    }
+                    .onChange(of: activity.conversationID) { _ in
+                        if let id = selection.selectedID { proxy.scrollTo(id) }
+                    }
                 }.frame(height: 45)
                 Divider()
                 if let file = selected {

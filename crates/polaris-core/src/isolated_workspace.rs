@@ -15,6 +15,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
+mod registered;
+pub use registered::RegisteredDirectory;
+
 /// Every bound is mandatory; zero permits no corresponding resource.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -337,6 +340,13 @@ fn snapshot_inner(
             .permissions(Permissions::from_mode(0o700))
             .tempdir_in(&temp_parent),
     )?;
+    // M6-5: recorded so a later start can remove it if this process is killed.
+    crate::scratch_registry::record(
+        root.path(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs()),
+    );
     let workspace = root.path().join("workspace");
     let home = root.path().join("home");
     let tmp = root.path().join("tmp");
@@ -362,6 +372,7 @@ fn snapshot_inner(
     after_open();
     let mut copier = Copier {
         secrets,
+        private_owner: None,
         limits,
         entries: 0,
         files: 0,
@@ -388,6 +399,7 @@ fn snapshot_inner(
 
 struct Copier<'a> {
     secrets: &'a RegisteredSecrets,
+    private_owner: Option<u32>,
     limits: Limits,
     entries: usize,
     files: usize,
@@ -461,6 +473,12 @@ impl Copier<'_> {
                 return Err(error(&path, ErrorKind::Io));
             }
             let stat = unsafe { stat.assume_init() };
+            if self
+                .private_owner
+                .is_some_and(|uid| stat.st_uid != uid || stat.st_mode as u32 & 0o7022 != 0)
+            {
+                return Err(error(&path, ErrorKind::InvalidPath));
+            }
             let kind = stat.st_mode & libc::S_IFMT;
             let reason = if polaris_tools::path_policy::is_denied(&policy_path)
                 || polaris_tools::path_policy::is_denied(&path)
@@ -736,6 +754,7 @@ fn scan(
     }
     let mut walker = Copier {
         secrets,
+        private_owner: None,
         limits,
         entries: 0,
         files: 0,

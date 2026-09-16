@@ -70,6 +70,11 @@ impl StopTracker {
         self.streak = 0;
     }
 
+    /// Turns already started; the host uses it to label an event.
+    pub fn turns(&self) -> u32 {
+        self.turns
+    }
+
     pub fn observe_turn(&mut self) -> Option<StopReason> {
         self.turns += 1;
         if self.turns >= self.max_turns {

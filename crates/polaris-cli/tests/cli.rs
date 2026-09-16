@@ -87,3 +87,46 @@ fn help_mentions_the_three_environment_variables() {
         assert!(text.contains(var), "--help is missing {var}: {text}");
     }
 }
+
+/// A project config alone cannot start the experimental structured10 mode.
+#[test]
+fn project_config_cannot_start_structured10_without_the_explicit_flag() {
+    let exe = env!("CARGO_BIN_EXE_polaris");
+    let home = tempfile::tempdir().expect("temp directory");
+    let project = tempfile::tempdir().expect("temp directory");
+    std::fs::create_dir_all(project.path().join(".polaris")).unwrap();
+    std::fs::write(
+        project.path().join(".polaris/config.toml"),
+        "history_mode = \"structured10\"\n",
+    )
+    .unwrap();
+    let sessions = home.path().join(".polaris/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join("legacy-1.jsonl"),
+        "{\"role\":\"user\",\"content\":\"old\"}\n",
+    )
+    .unwrap();
+    // A legacy import also creates a new session.
+    for args in [
+        &["-p", "hello"][..],
+        &["--resume", "legacy-1", "-p", "hello"],
+    ] {
+        let out = Command::new(exe)
+            .args(args)
+            .current_dir(project.path())
+            .env("HOME", home.path().canonicalize().unwrap())
+            .env_remove("POLARIS_DATA_DIR")
+            .env("POLARIS_API_KEY", "dummy-key")
+            .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
+            .output()
+            .expect("could not launch");
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--history-mode structured10"),
+            "{args:?}: {err}"
+        );
+        assert!(!home.path().join(".polaris/sessions-v2").exists());
+    }
+}

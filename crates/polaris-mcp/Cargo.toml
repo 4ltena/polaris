@@ -1,0 +1,29 @@
+[package]
+name = "polaris-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rmcp = { version = "=3.3.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest"] }
+polaris-auth = { path = "../polaris-auth" }
+polaris-sandbox = { path = "../polaris-sandbox" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true }
+thiserror = { workspace = true }
+libc = "=0.2.189"
+tokio = { workspace = true }
+futures-util = { workspace = true }
+base64 = { workspace = true }
+reqwest-mcp = { package = "reqwest", version = "=0.13.5", default-features = false, features = ["json", "stream", "rustls"] }
+sse-stream = "=0.2.6"
+
+[features]
+# Deterministic catalog expiry for cross-crate tests only.
+test-support = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

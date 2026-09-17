@@ -83,6 +83,7 @@ impl Fixture {
                     body: RequestBody::RunStart(
                         SessionId::new("session").unwrap(),
                         RunStart {
+                            mcp_prompt: None,
                             expected_draft_revision: DecimalU64::new(0),
                             expected_configuration_revision: DecimalU64::new(0),
                             expected_policy_revision: DecimalU64::new(0),

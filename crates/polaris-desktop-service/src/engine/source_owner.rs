@@ -701,6 +701,7 @@ mod recovery_tests {
                     body: RequestBody::RunStart(
                         e.session.clone(),
                         RunStart {
+                            mcp_prompt: None,
                             expected_draft_revision: DecimalU64::new(0),
                             expected_configuration_revision: DecimalU64::new(0),
                             expected_policy_revision: DecimalU64::new(0),

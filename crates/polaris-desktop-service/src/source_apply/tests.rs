@@ -57,6 +57,7 @@ fn terminal_writer(root: &PrototypeRoot, session: &str) -> Writer {
             body: RequestBody::RunStart(
                 sid,
                 RunStart {
+                    mcp_prompt: None,
                     expected_draft_revision: DecimalU64::new(0),
                     expected_configuration_revision: DecimalU64::new(0),
                     expected_policy_revision: DecimalU64::new(7),

@@ -5,6 +5,20 @@ use crate::transport::read_frame;
 use polaris_desktop_protocol::{codec, request::*};
 use tokio::{io::AsyncWriteExt, net::unix::pipe, task::JoinHandle, time::sleep};
 
+// A failed assertion must not leave the process-wide reclaimer waiting on a
+// synthetic cleanup forever and prevent unrelated production-owner tests exiting.
+struct DeferredCleanupRelease(Arc<AtomicBool>);
+impl DeferredCleanupRelease {
+    fn release(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+impl Drop for DeferredCleanupRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct PendingUsageProvider;
 #[async_trait::async_trait]
 impl polaris_provider::Provider for PendingUsageProvider {
@@ -300,12 +314,14 @@ async fn regression_cleanup_continues_after_eof_deadline_and_storage_error_witho
             .unwrap()
             .unwrap();
         sleep(Duration::from_millis(30)).await;
-        let released = engine
-            .active
-            .as_mut()
-            .unwrap()
-            .execution
-            .inject_unconfirmed_cleanup();
+        let released = DeferredCleanupRelease(
+            engine
+                .active
+                .as_mut()
+                .unwrap()
+                .execution
+                .inject_unconfirmed_cleanup(),
+        );
         engine.failed = storage_error;
         let (client, task) = connect(engine);
         drop(client.tx);
@@ -315,7 +331,7 @@ async fn regression_cleanup_continues_after_eof_deadline_and_storage_error_witho
             .unwrap();
         assert_eq!(outcome.is_err(), storage_error);
         assert!(!engine.ready);
-        released.store(true, Ordering::Release);
+        released.release();
         let deadline = Instant::now() + Duration::from_secs(1);
         while !engine
             .active
@@ -573,12 +589,14 @@ async fn execution_unconfirmed_cleanup_and_storage_failure_both_suppress_ready()
         .unwrap();
     // 通知後もjoinがまだ終了していない境界を待つ。
     sleep(Duration::from_millis(30)).await;
-    let released = engine
-        .active
-        .as_mut()
-        .unwrap()
-        .execution
-        .inject_unconfirmed_cleanup();
+    let released = DeferredCleanupRelease(
+        engine
+            .active
+            .as_mut()
+            .unwrap()
+            .execution
+            .inject_unconfirmed_cleanup(),
+    );
     for _ in 0..8 {
         engine.settle(&out).unwrap();
         assert!(!engine.ready && engine.active.is_some());
@@ -589,7 +607,7 @@ async fn execution_unconfirmed_cleanup_and_storage_failure_both_suppress_ready()
                 .is_terminal()
         );
     }
-    released.store(true, Ordering::Release);
+    released.release();
     // 保存失敗のsticky状態を注入。未保存結果を持ったままreadyを拒否する。
     engine.failed = true;
     assert!(engine.settle(&out).is_err());
@@ -850,6 +868,7 @@ fn start(id: &str, draft_revision: u64, config_revision: u64) -> Request {
         RequestBody::RunStart(
             session_id(),
             RunStart {
+                mcp_prompt: None,
                 expected_draft_revision: DecimalU64::new(draft_revision),
                 expected_configuration_revision: DecimalU64::new(config_revision),
                 expected_policy_revision: DecimalU64::new(0),
@@ -2258,4 +2277,128 @@ async fn continuous_reads_do_not_starve_finite_fake_steps() {
     .unwrap();
     drop(client.tx);
     task.await.unwrap().1.unwrap();
+}
+
+#[test]
+fn run_details_pages_rebuild_every_byte_and_refuse_foreign_or_expired_cursors() {
+    use polaris_desktop_protocol::run_details::RunDetailsRequest;
+    let (_root, mut engine) = service();
+    hello(&mut engine);
+    let run = begin(&mut engine);
+    let operation = engine.active.as_ref().unwrap().operation.clone();
+    engine.store.record_intent(&run, operation.clone()).unwrap();
+    let body = format!("a{}", "あ".repeat(40_000));
+    engine
+        .store
+        .finish_with_messages(
+            &run,
+            &operation,
+            Observation::Succeeded,
+            ResultId::new("details-result").unwrap(),
+            vec![
+                polaris_provider::Message::assistant_with_tool_calls(
+                    "",
+                    vec![polaris_provider::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path":"dummy"}),
+                    }],
+                ),
+                polaris_provider::Message::tool_result("call", body),
+                polaris_provider::Message::assistant("完了"),
+            ],
+        )
+        .unwrap();
+    let before = engine.store.snapshot().unwrap().marker;
+    let oracle = engine.store.project_run_details(&run).unwrap();
+    let ask = |engine: &mut Engine,
+               snapshot_id: Option<String>,
+               cursor: Option<String>,
+               target: &RunTarget| {
+        direct(
+            engine,
+            &request(
+                "details",
+                RequestBody::RunDetails(
+                    session_id(),
+                    RunDetailsRequest {
+                        run_id: target.run_id.clone(),
+                        attempt_id: target.attempt_id.clone(),
+                        snapshot_id,
+                        cursor,
+                    },
+                ),
+            ),
+        )
+    };
+    let mut rebuilt: Vec<(String, String)> = Vec::new();
+    let mut next = None;
+    let mut snapshot = None;
+    let mut pages = 0;
+    loop {
+        let Ok(SuccessResult::RunDetails(page)) =
+            ask(&mut engine, snapshot.clone(), next.clone(), &run)
+        else {
+            panic!("page");
+        };
+        pages += 1;
+        assert!(page.fragments.len() <= 4);
+        assert!(page.fragments.iter().map(|f| f.text.len()).sum::<usize>() <= 64 * 1024);
+        for fragment in page.fragments {
+            match rebuilt.last_mut() {
+                Some((id, text)) if *id == fragment.entry_id => {
+                    assert_eq!(fragment.offset.get() as usize, text.len());
+                    text.push_str(&fragment.text);
+                }
+                _ => {
+                    assert_eq!(fragment.offset.get(), 0);
+                    rebuilt.push((fragment.entry_id, fragment.text));
+                }
+            }
+        }
+        snapshot = Some(page.snapshot_id);
+        next = page.next_cursor;
+        if next.is_none() {
+            break;
+        }
+    }
+    assert!(pages >= 2);
+    let expected: Vec<_> = oracle
+        .entries
+        .iter()
+        .map(|e| (e.id.clone(), e.text.clone()))
+        .collect();
+    assert_eq!(rebuilt, expected);
+
+    let Ok(SuccessResult::RunDetails(first)) = ask(&mut engine, None, None, &run) else {
+        panic!("first");
+    };
+    let cursor = first.next_cursor.clone().unwrap();
+    let id = Some(first.snapshot_id.clone());
+    let other = RunTarget {
+        run_id: run.run_id.clone(),
+        attempt_id: AttemptId::new("other-attempt").unwrap(),
+    };
+    let (entry, offset) = cursor.rsplit_once(':').unwrap();
+    let mid_char = format!("{entry}:{}", offset.parse::<usize>().unwrap() + 1);
+    for (snapshot, cursor, target) in [
+        (id.clone(), Some(cursor.clone()), &other),
+        (id.clone(), Some(mid_char), &run),
+        (Some("details-stale".into()), Some(cursor.clone()), &run),
+    ] {
+        assert_eq!(
+            ask(&mut engine, snapshot, cursor, target).unwrap_err().code,
+            ErrorCode::RevisionConflict
+        );
+    }
+    engine.details.as_mut().unwrap().expires = Instant::now();
+    assert_eq!(
+        ask(&mut engine, id, Some(cursor), &run).unwrap_err().code,
+        ErrorCode::RevisionConflict
+    );
+    assert_eq!(
+        ask(&mut engine, None, None, &other).unwrap_err().code,
+        ErrorCode::NotFound
+    );
+    assert_eq!(engine.store.snapshot().unwrap().marker, before);
 }

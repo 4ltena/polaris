@@ -58,8 +58,8 @@ mod core_integration_tests;
 pub use engine::{DesktopService, FakeService, Options, ServiceConfig, project_id, session_id};
 #[cfg(target_os = "macos")]
 pub use engine::{
-    SourceApplyRuntime, SourceRecoveryHandle, TrustedHistoryResources, TrustedRunCompletion,
-    TrustedRunFactory, TrustedRunInputs, TrustedSourceFactory,
+    SourceApplyRuntime, SourceRecoveryHandle, TrustedHistoryResources, TrustedMcpResources,
+    TrustedRunCompletion, TrustedRunFactory, TrustedRunInputs, TrustedSourceFactory,
 };
 pub use transport::{Exit, ServiceError};
 
@@ -77,6 +77,10 @@ pub use source_apply::{
     SourceApplyError, SourceApplyRequest, SourceApplyState, SourceDecisionReceipt,
 };
 
+#[cfg(target_os = "macos")]
+mod home_browse;
+#[cfg(target_os = "macos")]
+pub use home_browse::serve_home_browser;
 #[cfg(target_os = "macos")]
 mod workspace_view;
 #[cfg(target_os = "macos")]

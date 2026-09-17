@@ -337,6 +337,7 @@ mod tests {
                     RequestBody::RunStart(
                         e.session.clone(),
                         request::RunStart {
+                            mcp_prompt: None,
                             expected_draft_revision: p.state.draft.draft_revision,
                             expected_configuration_revision: p
                                 .state

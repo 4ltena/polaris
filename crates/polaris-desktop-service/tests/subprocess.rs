@@ -112,6 +112,7 @@ async fn actual_child_pipe_stream_history_and_ready_exit_without_stdin_eof() {
             RequestBody::RunStart(
                 session_id(),
                 RunStart {
+                    mcp_prompt: None,
                     expected_draft_revision: DecimalU64::new(1),
                     expected_configuration_revision: DecimalU64::new(0),
                     expected_policy_revision: DecimalU64::new(0),

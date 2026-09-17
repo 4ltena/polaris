@@ -180,6 +180,7 @@ async fn same_root_across_os_children_preserves_draft_ledger_and_rejects_executi
             RequestBody::RunStart(
                 session(),
                 RunStart {
+                    mcp_prompt: None,
                     expected_draft_revision: saved.draft.draft_revision,
                     expected_configuration_revision: saved.configuration.configuration_revision,
                     expected_policy_revision: saved.policy_revision,
@@ -253,6 +254,7 @@ async fn seeded_dummy_raw_survives_recovery_without_inference_or_reexecution() {
                 body: RequestBody::RunStart(
                     session(),
                     RunStart {
+                        mcp_prompt: None,
                         expected_draft_revision: DecimalU64::new(0),
                         expected_configuration_revision: DecimalU64::new(0),
                         expected_policy_revision: DecimalU64::new(0),

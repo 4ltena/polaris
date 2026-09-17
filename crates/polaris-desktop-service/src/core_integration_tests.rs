@@ -208,6 +208,7 @@ fn run_scenario(cancel_at_approval: bool) {
                 RequestBody::RunStart(
                     session_id.clone(),
                     RunStart {
+                        mcp_prompt: None,
                         expected_draft_revision: DecimalU64::new(0),
                         expected_configuration_revision: DecimalU64::new(0),
                         expected_policy_revision: DecimalU64::new(0),
@@ -232,12 +233,15 @@ fn run_scenario(cancel_at_approval: bool) {
     let mut session = Session::new();
     session.push_user("fixture input");
     let (mut worker, mut events) = DesktopRun::start(DesktopRunInput {
-        run_id: target.run_id.clone(),
+        target: target.clone(),
         prepared: prepared.clone(),
         execution: execution.port.clone(),
         provider: provider.clone(),
         provider_pool: provider.clone(),
         session,
+        request_context: polaris_core::desktop_run::DesktopRequestContext::Prepared(
+            store.project_request_history(&target).unwrap(),
+        ),
         always_on: polaris_core::prompt::assemble_always_on("", "", &[]),
         skills: vec![],
         agent_types: vec![],

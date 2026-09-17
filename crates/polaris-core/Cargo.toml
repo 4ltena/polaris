@@ -14,6 +14,7 @@ polaris-auth = { path = "../polaris-auth" }
 polaris-desktop-protocol = { path = "../polaris-desktop-protocol" }
 polaris-provider = { path = "../polaris-provider" }
 polaris-memory = { path = "../polaris-memory" }
+polaris-mcp = { path = "../polaris-mcp" }
 polaris-sandbox = { path = "../polaris-sandbox" }
 polaris-skills = { path = "../polaris-skills" }
 polaris-tools = { path = "../polaris-tools" }
@@ -30,6 +31,9 @@ tokio = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
 libc = "=0.2.189"
+async-trait = { workspace = true }
 
 [dev-dependencies]
+polaris-mcp = { path = "../polaris-mcp", features = ["test-support"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 async-trait = { workspace = true }

@@ -10,3 +10,10 @@ AGENTS.md
 # Local planning and handoff documents
 /docs/superpowers/
 /.superpowers/
+
+# Credentials. Never committed, never shared, never read by a tool:
+# `path_policy` denies `.env` and any `.env.*`, and the sync manifest
+# excludes the same names before a tree is staged.
+.env
+.env.*
+!.env.example

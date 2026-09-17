@@ -74,7 +74,15 @@ fn storage_root(data_dir: Option<&OsStr>, home: Option<&OsStr>) -> std::io::Resu
     }
 }
 
-fn storage_root_from_env() -> std::io::Result<PathBuf> {
+/// Serializes every test that swaps `POLARIS_DATA_DIR`. The variable is
+/// process-wide, so a lock per test module excludes nothing: two modules
+/// each holding their own mutex will still overwrite each other's
+/// directory, and the loser sees its files vanish mid-test. One lock,
+/// beside the variable it guards.
+#[cfg(test)]
+pub(crate) static DATA_DIR_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn storage_root_from_env() -> std::io::Result<PathBuf> {
     let data_dir = std::env::var_os("POLARIS_DATA_DIR");
     let home = std::env::var_os("HOME");
     storage_root(data_dir.as_deref(), home.as_deref())
@@ -114,6 +122,36 @@ fn sessions_dir_at(storage_root: &Path) -> std::io::Result<PathBuf> {
 /// `polaris-tui::persist::SessionMeta`).
 pub fn sessions_dir() -> std::io::Result<PathBuf> {
     sessions_dir_at(&storage_root_from_env()?)
+}
+
+fn desktop_store_root_at(storage_root: &Path) -> std::io::Result<PathBuf> {
+    let dir = storage_root.join("desktop");
+    std::fs::create_dir_all(&dir)?;
+    // `DesktopRoot::open_owned` requires the directory to be this user's and
+    // unreadable by anyone else, so the permissions are set rather than
+    // hoped for: `create_dir_all` honours the umask, which may leave the
+    // group and other bits on.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    // The same call also insists on an absolute canonical path.
+    dir.canonicalize()
+}
+
+/// The durable store a desktop session writer opens:
+/// `~/.polaris/desktop/` by default, or `<POLARIS_DATA_DIR>/desktop/`.
+/// Created with the owner-only permissions the store itself checks for.
+///
+/// This is the one place the location is decided. The CLI resolves it here;
+/// the macOS app still passes its own `--store-root` from Application
+/// Support and has not been moved, so a recipe ledger written from the
+/// terminal and one written from the app do not yet meet. The consequence
+/// is that finished steps are not shared between the two entry points —
+/// neither ever reuses the other's record wrongly.
+pub fn desktop_store_root() -> std::io::Result<PathBuf> {
+    desktop_store_root_at(&storage_root_from_env()?)
 }
 
 #[cfg(test)]

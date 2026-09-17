@@ -490,3 +490,34 @@ fn completion_generates_a_script_for_every_supported_shell() {
         );
     }
 }
+
+/// 明示指定は登録がある場合だけ意味を持ち、別providerとは併用できない。
+#[test]
+fn an_explicit_account_is_refused_without_a_registration_or_outside_codex() {
+    let home = tempfile::tempdir().expect("temp directory");
+    let home = home.path().canonicalize().expect("physical home path");
+    let run = |provider: &str| {
+        Command::new(bin())
+            .args(["-p", "x", "--account", "reg-missing"])
+            .env("HOME", &home)
+            .env("POLARIS_PROVIDER", provider)
+            .env("POLARIS_API_KEY", "synthetic-only")
+            .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
+            .output()
+            .expect("could not launch")
+    };
+    let openai = run("openai");
+    assert!(!openai.status.success());
+    assert!(
+        String::from_utf8_lossy(&openai.stderr).contains("--accountはcodexのみ"),
+        "{}",
+        String::from_utf8_lossy(&openai.stderr)
+    );
+    let codex = run("codex");
+    assert!(!codex.status.success());
+    assert!(
+        String::from_utf8_lossy(&codex.stderr).contains("polaris account login"),
+        "{}",
+        String::from_utf8_lossy(&codex.stderr)
+    );
+}

@@ -77,10 +77,14 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("test fixture certificate chain");
         let key = PrivateKeyDer::from_pem_slice(KEY.as_bytes()).expect("test fixture private key");
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(chain, key)
-            .expect("matching test fixture key");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("test fixture protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .expect("matching test fixture key");
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await

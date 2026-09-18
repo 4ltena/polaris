@@ -16,6 +16,8 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -15,8 +15,39 @@ use serde_json::Value;
 
 #[path = "cache_prefix.rs"]
 mod cache_prefix;
+
+/// A per-process suffix for the cache routing key.
+///
+/// `POLARIS_CACHE_SCOPE=conversation`. Absent keeps the shared content hash,
+/// which is what polaris has always sent.
+///
+/// The content hash alone is shared by every run of the same project with
+/// the same tools — including agents running side by side — so they are all
+/// routed to one shard and evict each other's prefix there. Upstream keys on
+/// the session id for this reason. Measured on 2026-09-18: this changes no
+/// cost by itself (the cache took 0 tokens either way on this transport),
+/// and is kept because sending several conversations to one shard under one
+/// key is wrong regardless of what it costs.
+fn conversation_scoped_key() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static NONCE: OnceLock<Option<String>> = OnceLock::new();
+    NONCE
+        .get_or_init(|| {
+            (std::env::var_os("POLARIS_CACHE_SCOPE").as_deref()
+                == Some(std::ffi::OsStr::new("conversation")))
+            .then(|| {
+                let mut bytes = [0u8; 8];
+                use std::io::Read;
+                let _ = std::fs::File::open("/dev/urandom")
+                    .and_then(|mut file| file.read_exact(&mut bytes));
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            })
+        })
+        .as_deref()
+}
+
 #[path = "codex_metrics.rs"]
-mod metrics;
+pub(crate) mod metrics;
 
 use crate::attempts::{AttemptLedger, LogicalRequest};
 use crate::cache_pacing::{Gate as PacingGate, Mode as PacingMode};
@@ -182,7 +213,15 @@ fn build_body_with_instructions(
         "include": ["reasoning.encrypted_content"],
         // Routing hint combined with the backend's prefix hash. It neither
         // pins a machine nor guarantees a cache hit; see `crate::cache_key`.
-        "prompt_cache_key": crate::cache_key(model, effort, &effective_req),
+        "prompt_cache_key": match conversation_scoped_key() {
+            // One conversation, one routing key. The content hash alone is
+            // shared by every run of the same project with the same tools —
+            // including agents running side by side — so they are sent to the
+            // one shard and evict each other's prefix there. Upstream keys on
+            // the session id for this reason.
+            Some(nonce) => format!("{}-{nonce}", crate::cache_key(model, effort, &effective_req)),
+            None => crate::cache_key(model, effort, &effective_req),
+        },
     });
     let tools = tool_wire_shape(&req.tools);
     if !tools.is_empty() {
@@ -270,7 +309,7 @@ impl Folder {
         result
     }
 
-    fn take_event(
+    pub(crate) fn take_event(
         &mut self,
         ev: sse::SseEvent,
         observer: Option<&dyn crate::ResponseObserver>,
@@ -460,6 +499,18 @@ impl Folder {
 
     /// Returns the folded result. If completion was never observed, this
     /// is a hard failure.
+    /// Whether `response.completed` has arrived. The websocket transport
+    /// reads frames one at a time and needs to know when to stop; the HTTP
+    /// path learns the same thing from the stream ending.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.completed
+    }
+
+    /// What the provider reported for this response, for the request record.
+    pub(crate) fn usage(&self) -> metrics::TokenUsage {
+        self.metrics_usage
+    }
+
     pub fn finish(self) -> Result<CompletionResponse, ProviderError> {
         if self.failed || !self.decoder.is_empty() || !self.completed {
             return Err(ProviderError::Decode(
@@ -504,6 +555,10 @@ pub struct CodexProvider {
     attempt_ledger: Option<AttemptLedger>,
     web_search: WebSearchConfig,
     request_caps: Option<crate::attempts::RequestCaps>,
+    /// The open socket, when this run uses one. Held here rather than per
+    /// turn because the continuation it carries is what makes the transport
+    /// worth having, and a socket reopened every turn carries none.
+    socket: tokio::sync::Mutex<Option<crate::codex_ws::Session>>,
     visible_request_byte_limit: Option<usize>,
 }
 
@@ -558,6 +613,7 @@ impl CodexProvider {
             attempt_ledger: None,
             web_search: WebSearchConfig::default(),
             request_caps: None,
+            socket: tokio::sync::Mutex::new(None),
             visible_request_byte_limit: None,
         })
     }
@@ -619,6 +675,91 @@ impl CodexProvider {
     /// than having the caller reuse a body across attempts) — but an
     /// explicit `set_effort` call (via `/model`) always wins over the
     /// token's plan-derived value when one has been made.
+    /// One round trip over the open socket, or `None` to use HTTP instead.
+    ///
+    /// `None` means "this transport could not answer" and is not a failure:
+    /// the caller falls through. A failure the caller must see — the model
+    /// refusing, a budget — comes back as `Some(Err(..))`.
+    ///
+    /// **The saving is in what is not sent.** When the socket holds a
+    /// continuation whose shape matches and whose history this request
+    /// extends, only the new items go out and the server supplies the rest
+    /// from what it already holds. When it does not, the whole input goes
+    /// out and the continuation is omitted — which is the same request the
+    /// HTTP path would have made, minus the connection setup.
+    async fn over_socket(
+        &self,
+        body: &serde_json::Value,
+        token: &crate::Token,
+        observer: Option<&dyn crate::ResponseObserver>,
+    ) -> Option<Result<CompletionResponse, ProviderError>> {
+        // A transport that silently falls back is a transport nobody can
+        // tell is working. Every decision it makes is said out loud while it
+        // is behind a flag.
+        let note = |what: &str| eprintln!("[ws] {what}");
+        let mut held = self.socket.lock().await;
+        if held.is_none() {
+            match crate::codex_ws::Session::open(&self.base, token).await {
+                Ok(session) => {
+                    note("接続しました");
+                    *held = Some(session);
+                }
+                // The upgrade failed: no socket, no error to the caller.
+                Err(error) => {
+                    note(&format!("接続できません（{error:?}）。HTTPへ落ちます"));
+                    return None;
+                }
+            }
+        }
+        let session = held.as_mut()?;
+        let shape = crate::codex_ws::Shape::of(body);
+        let input: Vec<serde_json::Value> = body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut frame = body.clone();
+        // Always present on this transport even when empty or absent: the
+        // server reads the frame by shape, and omitting a field it expects
+        // is not the same as sending it empty.
+        frame["tool_choice"] = serde_json::Value::String("auto".into());
+        frame["parallel_tool_calls"] = serde_json::Value::Bool(false);
+        if frame.get("reasoning").is_none() {
+            frame["reasoning"] = serde_json::Value::Null;
+        }
+        match session
+            .continuation_for(&shape)
+            .and_then(|held| crate::codex_ws::delta(&held.baseline, &input).map(|d| (held.response_id.clone(), d)))
+        {
+            Some((previous, delta)) => {
+                note(&format!("継続あり。送る項目 {}件（全体 {}件）", delta.len(), input.len()));
+                frame["previous_response_id"] = serde_json::Value::String(previous);
+                frame["input"] = serde_json::Value::Array(delta);
+            }
+            None => {
+                note(&format!(
+                    "継続なし（{}）。全体 {}件を送ります",
+                    session.why_no_continuation(&shape, &input),
+                    input.len()
+                ));
+                frame.as_object_mut()?.remove("previous_response_id");
+            }
+        }
+        match session.round_trip(frame, input, observer).await {
+            Ok((completed, usage)) => {
+                note(&format!("応答 {usage:?}"));
+                Some(Ok(completed))
+            }
+            Err(error) => {
+                note(&format!("失敗（{error:?}）。HTTPへ落ちます"));
+                // A broken socket is not reusable: the server's idea of the
+                // conversation and this one have parted ways.
+                *held = None;
+                None
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
@@ -657,6 +798,16 @@ impl CodexProvider {
                     "visible request exceeds UTF-8 byte limit".into(),
                 ));
             }
+        }
+        // The socket, when this run uses one. Tried before the HTTP request
+        // and never instead of it: a failure here — the upgrade, a frame, a
+        // continuation the server no longer holds — falls through to the
+        // path below rather than failing the run. The transport is an
+        // optimisation; the run is not.
+        if crate::codex_ws::enabled()
+            && let Some(answer) = self.over_socket(&body, token, observer).await
+        {
+            return answer;
         }
         let prefix_diagnostics = self.cache_prefix.diagnostics(&model, req);
         let mut metric = metrics::RequestMetric::from_env(&body, prefix_diagnostics)?;
@@ -922,6 +1073,10 @@ impl Provider for CodexProvider {
 
     fn set_model(&self, model: &str) {
         *self.model.write().expect("model lock poisoned") = model.to_string();
+    }
+
+    fn model(&self) -> Option<String> {
+        Some(self.model.read().expect("model lock poisoned").clone())
     }
 
     fn set_effort(&self, effort: Option<&str>) {

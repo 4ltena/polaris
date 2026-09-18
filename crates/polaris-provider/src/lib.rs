@@ -4,6 +4,8 @@
 pub mod attempts;
 pub mod cache_pacing;
 pub mod codex;
+mod codex_ws;
+pub mod decision;
 pub mod local;
 pub mod local_inference;
 pub mod openai;
@@ -347,14 +349,41 @@ pub struct UsageReport {
     pub failed_requests: u64,
 }
 
+/// The total, and the same total split by the model that produced it.
+///
+/// Kept beside `UsageReport` rather than inside it so that type stays `Copy`
+/// and every existing caller is untouched. A run that mixes weights is one
+/// undifferentiated number without this, and the weights differ in price by
+/// a factor of fifty — which makes the total alone useless for saying what a
+/// run cost.
+#[derive(Default)]
+struct Metered {
+    report: UsageReport,
+    by_model: std::collections::BTreeMap<String, Usage>,
+}
+
 /// Shared observation of actual provider calls, including calls whose
 /// results are discarded (empty summaries, schema retries, failed children).
 #[derive(Clone, Default)]
-pub struct UsageMeter(std::sync::Arc<std::sync::Mutex<UsageReport>>);
+pub struct UsageMeter(std::sync::Arc<std::sync::Mutex<Metered>>);
 
 impl UsageMeter {
     pub fn snapshot(&self) -> UsageReport {
-        *self.0.lock().expect("usage meter poisoned")
+        self.0.lock().expect("usage meter poisoned").report
+    }
+
+    /// Consumption per model, for the calls whose provider named one.
+    ///
+    /// A provider that does not know its model is absent from this map rather
+    /// than filed under a guess, so the per-model totals may add up to less
+    /// than [`Self::snapshot`]. That shortfall is the honest statement: those
+    /// tokens were spent, and which model spent them is not known here.
+    pub fn by_model(&self) -> std::collections::BTreeMap<String, Usage> {
+        self.0
+            .lock()
+            .expect("usage meter poisoned")
+            .by_model
+            .clone()
     }
 
     pub fn wrap<P>(&self, provider: P) -> MeteredProvider<P> {
@@ -364,8 +393,10 @@ impl UsageMeter {
         }
     }
 
-    fn record(&self, result: &Result<CompletionResponse, ProviderError>) {
-        let mut report = self.0.lock().expect("usage meter poisoned");
+    fn record(&self, model: Option<String>, result: &Result<CompletionResponse, ProviderError>) {
+        let mut held = self.0.lock().expect("usage meter poisoned");
+        let held = &mut *held;
+        let report = &mut held.report;
         let received = match result {
             Ok(response) => Some(response.usage),
             Err(ProviderError::Observation {
@@ -378,11 +409,16 @@ impl UsageMeter {
         match received {
             Some(Some(usage)) => {
                 report.reported_responses = report.reported_responses.saturating_add(1);
-                let total = &mut report.usage;
-                total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
-                total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
-                total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
-                total.cached_tokens = total.cached_tokens.saturating_add(usage.cached_tokens);
+                let add = |total: &mut Usage| {
+                    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+                    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+                    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+                    total.cached_tokens = total.cached_tokens.saturating_add(usage.cached_tokens);
+                };
+                add(&mut report.usage);
+                if let Some(model) = model {
+                    add(held.by_model.entry(model).or_default());
+                }
             }
             Some(None) => report.missing_responses = report.missing_responses.saturating_add(1),
             None => report.failed_requests = report.failed_requests.saturating_add(1),
@@ -401,8 +437,8 @@ impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
             // Drop may run during unwinding; do not panic again on poison.
-            let mut report = self.meter.0.lock().unwrap_or_else(|e| e.into_inner());
-            report.failed_requests = report.failed_requests.saturating_add(1);
+            let mut held = self.meter.0.lock().unwrap_or_else(|e| e.into_inner());
+            held.report.failed_requests = held.report.failed_requests.saturating_add(1);
         }
     }
 }
@@ -450,8 +486,24 @@ where
         }))
     }
 
+    // Metered the same way a role is. A weight that routed to a cheaper
+    // model but stopped being counted would make the saving unmeasurable,
+    // which is the one thing the routing exists to demonstrate.
+    fn resolve_tier(
+        &self,
+        tier: &str,
+    ) -> Result<Option<std::sync::Arc<dyn Provider>>, ProviderError> {
+        Ok(self.provider.resolve_tier(tier)?.map(|provider| {
+            std::sync::Arc::new(self.meter.wrap(provider)) as std::sync::Arc<dyn Provider>
+        }))
+    }
+
     fn set_model(&self, model: &str) {
         self.provider.set_model(model);
+    }
+
+    fn model(&self) -> Option<String> {
+        self.provider.model()
     }
 
     fn set_effort(&self, effort: Option<&str>) {
@@ -474,6 +526,10 @@ where
             meter: &self.meter,
             completed: false,
         };
+        // Read before the call, not after: a provider's model can be changed
+        // between requests, and what is being recorded is the model that
+        // answered this one.
+        let model = self.provider.model();
         let result = match turn {
             Some(turn) => {
                 self.provider
@@ -482,7 +538,7 @@ where
             }
             None => self.provider.complete(req).await,
         };
-        self.meter.record(&result);
+        self.meter.record(model, &result);
         guard.completed = true;
         result
     }
@@ -637,6 +693,20 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// Resolves the provider a declared weight is worth, by the weight's own
+    /// spelling. Separate from `resolve_role` because the two answer
+    /// different questions: a role is who is doing the work, a weight is how
+    /// much the work is expected to need, and a run may configure either,
+    /// both or neither. `None` means this weight names nothing, which is the
+    /// caller's cue to fall back rather than to fail — an unconfigured
+    /// weight is the normal state, unlike an unregistered role.
+    fn resolve_tier(
+        &self,
+        _tier: &str,
+    ) -> Result<Option<std::sync::Arc<dyn Provider>>, ProviderError> {
+        Ok(None)
+    }
+
     /// Switches which model subsequent `complete` calls use. Takes `&self`
     /// (not `&mut self`) so it can be called through the same shared
     /// `&dyn Provider` reference the rest of the harness already holds —
@@ -645,6 +715,23 @@ pub trait Provider: Send + Sync {
     /// that don't need to support switching (test doubles, anything with
     /// a fixed model).
     fn set_model(&self, _model: &str) {}
+
+    /// The model the next `complete` would send to, when this provider knows
+    /// which one that is.
+    ///
+    /// For accounting only. The weights a run routes between differ in price
+    /// by a factor of fifty, so one undifferentiated total cannot say what a
+    /// run cost; this is how consumption is filed against the model that
+    /// produced it. A wrapper that forwards requests forwards this too.
+    ///
+    /// **`None` is not a model name, and nothing may invent one.** An
+    /// implementation that genuinely does not know returns `None`, and its
+    /// consumption is then recorded in the total but against no model —
+    /// which reads as "spent, attribution unknown" rather than as a guess
+    /// that would quietly move tokens onto the wrong price.
+    fn model(&self) -> Option<String> {
+        None
+    }
 
     /// Switches the reasoning effort subsequent `complete` calls request,
     /// same `&self`-via-interior-mutability reasoning as `set_model`.
@@ -689,8 +776,17 @@ macro_rules! delegate_provider {
             ) -> Result<Option<std::sync::Arc<dyn Provider>>, ProviderError> {
                 (**self).resolve_role(role)
             }
+            fn resolve_tier(
+                &self,
+                tier: &str,
+            ) -> Result<Option<std::sync::Arc<dyn Provider>>, ProviderError> {
+                (**self).resolve_tier(tier)
+            }
             fn set_model(&self, model: &str) {
                 (**self).set_model(model);
+            }
+            fn model(&self) -> Option<String> {
+                (**self).model()
             }
             fn set_effort(&self, effort: Option<&str>) {
                 (**self).set_effort(effort);
@@ -940,13 +1036,54 @@ mod tests {
             .unwrap();
         assert_eq!(outer.snapshot().reported_responses, 1);
         assert_eq!(inner.snapshot().reported_responses, 1);
-        outer.record(&Ok(CompletionResponse::default()));
-        outer.record(&Err(ProviderError::Http("failed".into())));
+        outer.record(None, &Ok(CompletionResponse::default()));
+        outer.record(None, &Err(ProviderError::Http("failed".into())));
         let report = outer.snapshot();
         assert_eq!(report.usage.total_tokens, 0);
         assert_eq!(report.reported_responses, 1);
         assert_eq!(report.missing_responses, 1);
         assert_eq!(report.failed_requests, 1);
+    }
+
+    /// A run routes between weights that differ in price by a factor of
+    /// fifty, so one total cannot be turned into money. Consumption is filed
+    /// against the model that produced it, and a provider that does not know
+    /// its model is left out of the split rather than filed under a guess —
+    /// the shortfall against the total is then readable as "spent,
+    /// attribution unknown".
+    #[test]
+    fn consumption_is_filed_against_the_model_that_produced_it() {
+        let meter = UsageMeter::default();
+        let spent = |input: u32, output: u32| {
+            Ok(CompletionResponse {
+                usage: Some(Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: input + output,
+                    cached_tokens: 0,
+                }),
+                ..Default::default()
+            })
+        };
+        meter.record(Some("gpt-6-astra".into()), &spent(100, 10));
+        meter.record(Some("gpt-5.6-luna".into()), &spent(50, 5));
+        meter.record(Some("gpt-6-astra".into()), &spent(100, 10));
+        // A provider with no model of its own still spends.
+        meter.record(None, &spent(7, 1));
+
+        let split = meter.by_model();
+        assert_eq!(split["gpt-6-astra"].input_tokens, 200);
+        assert_eq!(split["gpt-6-astra"].output_tokens, 20);
+        assert_eq!(split["gpt-5.6-luna"].input_tokens, 50);
+        assert_eq!(split.len(), 2, "the unattributed call names no model");
+
+        // The total counts every call, so it exceeds the split by exactly
+        // what could not be attributed.
+        let total = meter.snapshot();
+        assert_eq!(total.usage.input_tokens, 257);
+        assert_eq!(total.reported_responses, 4);
+        let attributed: u32 = split.values().map(|held| held.input_tokens).sum();
+        assert_eq!(total.usage.input_tokens - attributed, 7);
     }
 
     #[test]
@@ -961,8 +1098,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        meter.record(&Ok(response.clone()));
-        meter.record(&Ok(response));
+        meter.record(None, &Ok(response.clone()));
+        meter.record(None, &Ok(response));
         let report = meter.snapshot();
         assert_eq!(report.usage.input_tokens, u32::MAX);
         assert_eq!(report.usage.output_tokens, 2);
@@ -982,6 +1119,68 @@ mod tests {
         ) -> Result<CompletionResponse, ProviderError> {
             Ok(self.reply.clone())
         }
+    }
+
+    /// The wrapper asks the provider it wraps, and takes `None` for an
+    /// answer. Substituting a placeholder here would move real tokens onto
+    /// whatever price that placeholder happened to be given later.
+    #[tokio::test]
+    async fn the_wrapper_never_invents_a_model_for_a_provider_that_has_none() {
+        struct Named(&'static str);
+        #[async_trait::async_trait]
+        impl Provider for Named {
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                Ok(CompletionResponse {
+                    usage: Some(Usage {
+                        input_tokens: 3,
+                        output_tokens: 1,
+                        total_tokens: 4,
+                        cached_tokens: 0,
+                    }),
+                    ..Default::default()
+                })
+            }
+            fn model(&self) -> Option<String> {
+                Some(self.0.to_owned())
+            }
+        }
+        let empty = || CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+        };
+
+        // Knows its model: the consumption is filed under it.
+        let meter = UsageMeter::default();
+        meter
+            .wrap(std::sync::Arc::new(Named("gpt-5.6-terra")) as std::sync::Arc<dyn Provider>)
+            .complete(empty())
+            .await
+            .unwrap();
+        assert_eq!(meter.by_model()["gpt-5.6-terra"].total_tokens, 4);
+
+        // Does not: counted in the total, filed under nothing.
+        let meter = UsageMeter::default();
+        meter
+            .wrap(std::sync::Arc::new(Canned {
+                reply: CompletionResponse {
+                    usage: Some(Usage {
+                        input_tokens: 3,
+                        output_tokens: 1,
+                        total_tokens: 4,
+                        cached_tokens: 0,
+                    }),
+                    ..Default::default()
+                },
+            }) as std::sync::Arc<dyn Provider>)
+            .complete(empty())
+            .await
+            .unwrap();
+        assert!(meter.by_model().is_empty(), "{:?}", meter.by_model());
+        assert_eq!(meter.snapshot().usage.total_tokens, 4);
     }
 
     #[tokio::test]
@@ -1060,6 +1259,30 @@ mod tests {
         let mut d = sse::SseDecoder::new();
         let evs = d.push(b"data: hello\n\n").unwrap();
         assert_eq!(evs[0].data, "hello");
+    }
+
+    #[test]
+    fn dynamic_tool_wire_and_cache_key_preserve_owned_names_and_schema_changes() {
+        let owned = polaris_tools::ToolSpec {
+            name: format!("mcp_{}", "a".repeat(60)),
+            description: String::from("Synthetic runtime catalog item"),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        };
+        let mut request = CompletionRequest {
+            system: "fixed".into(),
+            messages: vec![Message::user("fixture")],
+            tools: vec![owned],
+        };
+        let openai = openai::tool_wire_shape(&request.tools);
+        let codex = codex::tool_wire_shape(&request.tools);
+        assert_eq!(openai[0]["function"]["name"], request.tools[0].name);
+        assert_eq!(codex[0]["name"], request.tools[0].name);
+        assert_eq!(openai[0]["function"]["parameters"], codex[0]["parameters"]);
+        let initial = cache_key("fixture", Some("medium"), &request);
+        request.tools[0].parameters["required"] = serde_json::json!(["path"]);
+        assert_ne!(initial, cache_key("fixture", Some("medium"), &request));
+        request.tools.clear();
+        assert_ne!(initial, cache_key("fixture", Some("medium"), &request));
     }
 
     struct CannedTokens {

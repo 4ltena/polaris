@@ -170,3 +170,58 @@ async fn role_resolved_errors_and_cancellation_reach_outer_meter() {
     assert_eq!(meter.snapshot().failed_requests, 2);
     assert_eq!(meter.snapshot().reported_responses, 0);
 }
+
+#[tokio::test]
+async fn weights_route_to_their_own_provider_and_an_unset_one_says_so() {
+    let parent = fake("parent");
+    let low = fake("low");
+    let ultra = fake("ultra");
+    let router = RoleProvider::new(parent.clone(), HashMap::new()).with_tiers(HashMap::from([
+        ("low".into(), low.clone() as Arc<dyn Provider>),
+        ("ultra".into(), ultra.clone() as Arc<dyn Provider>),
+    ]));
+    // An unconfigured weight is the normal state, so it is `None` and the
+    // caller falls back — where an unregistered role is an error.
+    assert!(router.resolve_tier("medium").unwrap().is_none());
+    assert!(router.resolve_role("anything").is_err());
+    // A run that routes by weight alone still has to send delegations to
+    // the parent. Refusing them would take `spawn` away from the CLI, which
+    // has no role bindings at all.
+    let weights_only = RoleProvider::tiers_only(
+        parent.clone(),
+        HashMap::from([("low".into(), low.clone() as Arc<dyn Provider>)]),
+    );
+    assert!(weights_only.resolve_role("anything").unwrap().is_none());
+    assert!(weights_only.resolve_tier("low").unwrap().is_some());
+
+    // Two weights in flight at once. Nothing is being switched on a shared
+    // instance, so neither can arrive at the other's provider — this is the
+    // property that made per-task `set_model` unusable.
+    let light = router.resolve_tier("low").unwrap().unwrap();
+    let heavy = router.resolve_tier("ultra").unwrap().unwrap();
+    let (a, b) = tokio::join!(light.complete(request()), heavy.complete(request()));
+    assert_eq!(a.unwrap().text, "low");
+    assert_eq!(b.unwrap().text, "ultra");
+    assert_eq!(parent.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(low.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ultra.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_weights_usage_is_counted_like_any_other() {
+    // A weight that routed to a cheaper model but stopped being counted
+    // would make the saving impossible to measure, which is the whole
+    // point of routing by weight.
+    let low = fake("low");
+    let router: Arc<dyn Provider> = Arc::new(
+        RoleProvider::new(fake("parent"), HashMap::new())
+            .with_tiers(HashMap::from([("low".into(), low as Arc<dyn Provider>)])),
+    );
+    let meter = UsageMeter::default();
+    let metered = meter.wrap(router);
+    let resolved = metered.resolve_tier("low").unwrap().unwrap();
+    assert_eq!(resolved.complete(request()).await.unwrap().text, "low");
+    let snapshot = meter.snapshot();
+    assert_eq!(snapshot.reported_responses, 1);
+    assert_eq!(snapshot.usage.total_tokens, 3);
+}

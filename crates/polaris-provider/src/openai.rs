@@ -170,6 +170,66 @@ pub fn tool_wire_shape(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
+/// Builds the same wire body used for transport and deterministic budget checks.
+pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) -> Value {
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": req.system,
+    })];
+    for m in &req.messages {
+        let mut entry = serde_json::json!({
+            "role": role_str(m.role),
+            "content": m.content,
+        });
+        // If an assistant turn called a tool, its `tool_calls` ride
+        // along on this same message when sent back. The API matches
+        // these against the `tool_call_id` of the `role: "tool"`
+        // message that follows. `arguments` is parsed into a JSON
+        // value once on receipt, and symmetrically turned back into a
+        // JSON string on send (on the wire, both are strings).
+        if !m.tool_calls.is_empty() {
+            let calls: Vec<Value> = m
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": {
+                            "name": c.name,
+                            "arguments": c.arguments.to_string(),
+                        }
+                    })
+                })
+                .collect();
+            entry["tool_calls"] = Value::Array(calls);
+        }
+        if let Some(id) = &m.tool_call_id {
+            entry["tool_call_id"] = Value::String(id.clone());
+        }
+        messages.push(entry);
+    }
+
+    let tools = tool_wire_shape(&req.tools);
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        // See `crate::cache_key`. Sent here for the same reason as
+        // in `codex::build_body`: a stable prefix is only reused if
+        // the backend is pointed at the shard holding it.
+        "prompt_cache_key": crate::cache_key(model, effort, req),
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = Value::String(effort.to_string());
+    }
+
+    body
+}
+
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
@@ -177,62 +237,9 @@ impl Provider for OpenAiProvider {
             .attempt_ledger
             .as_ref()
             .map(AttemptLedger::begin_logical);
-        let mut messages = vec![serde_json::json!({
-            "role": "system",
-            "content": req.system,
-        })];
-        for m in &req.messages {
-            let mut entry = serde_json::json!({
-                "role": role_str(m.role),
-                "content": m.content,
-            });
-            // If an assistant turn called a tool, its `tool_calls` ride
-            // along on this same message when sent back. The API matches
-            // these against the `tool_call_id` of the `role: "tool"`
-            // message that follows. `arguments` is parsed into a JSON
-            // value once on receipt, and symmetrically turned back into a
-            // JSON string on send (on the wire, both are strings).
-            if !m.tool_calls.is_empty() {
-                let calls: Vec<Value> = m
-                    .tool_calls
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "id": c.id,
-                            "type": "function",
-                            "function": {
-                                "name": c.name,
-                                "arguments": c.arguments.to_string(),
-                            }
-                        })
-                    })
-                    .collect();
-                entry["tool_calls"] = Value::Array(calls);
-            }
-            if let Some(id) = &m.tool_call_id {
-                entry["tool_call_id"] = Value::String(id.clone());
-            }
-            messages.push(entry);
-        }
-
-        let tools = tool_wire_shape(&req.tools);
-
         let model = self.model.read().expect("model lock poisoned").clone();
         let effort = self.effort.read().expect("effort lock poisoned").clone();
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            // See `crate::cache_key`. Sent here for the same reason as
-            // in `codex::build_body`: a stable prefix is only reused if
-            // the backend is pointed at the shard holding it.
-            "prompt_cache_key": crate::cache_key(&model, effort.as_deref(), &req),
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools);
-        }
-        if let Some(effort) = effort.as_deref() {
-            body["reasoning_effort"] = Value::String(effort.to_string());
-        }
+        let body = build_body(&model, &req, effort.as_deref());
 
         // This is immediately before reqwest starts the physical request. An
         // unpolled completion never reaches this point; a dropped future is
@@ -427,6 +434,10 @@ impl Provider for OpenAiProvider {
 
     fn set_model(&self, model: &str) {
         *self.model.write().expect("model lock poisoned") = model.to_string();
+    }
+
+    fn model(&self) -> Option<String> {
+        Some(self.model.read().expect("model lock poisoned").clone())
     }
 
     fn set_effort(&self, effort: Option<&str>) {

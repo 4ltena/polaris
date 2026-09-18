@@ -3,6 +3,8 @@
 
 pub mod approver;
 mod clipboard;
+#[cfg(test)]
+mod continuation_tests;
 pub mod input;
 mod memory;
 pub mod onboarding;
@@ -36,6 +38,13 @@ use approver::{CrosstermKeyReader, TuiApprover};
 use input::{InputAction, apply_key};
 use render::Status;
 
+/// CLI-owned constructor, invoked only when a selected strict session needs it.
+pub type HistoryBackend = (
+    Arc<polaris_core::conversation_memory::StrictHistory>,
+    polaris_provider::UsageMeter,
+);
+pub type HistoryBackendFactory = Arc<dyn Fn() -> Result<HistoryBackend, String> + Send + Sync>;
+
 /// Everything `run()` needs, already built by `polaris-cli::main()` the
 /// same way the one-shot path builds it. `polaris-tui` never constructs a
 /// provider or a sandbox policy itself.
@@ -44,6 +53,8 @@ pub struct RunArgs<'a> {
     /// Provider` for the root's own turns and an owned handle it can hand
     /// to a wave of subagents (see `agent::run`'s `provider_pool`).
     pub provider: Arc<dyn Provider>,
+    /// A fixed independent selector; model-picker changes affect only the primary.
+    pub mcp_selection_provider: Option<Arc<dyn Provider>>,
     pub provider_name: String,
     pub model_name: String,
     /// Seeds the footer with the caller's selected effort; otherwise use
@@ -65,6 +76,8 @@ pub struct RunArgs<'a> {
     pub sandbox: SandboxPolicy,
     pub helper: PathBuf,
     pub approval_policy: ApprovalPolicy,
+    /// Explicit permission for MCP tool calls and registration; each still asks.
+    pub mcp_external: bool,
     pub always_on: &'a AlwaysOn,
     pub skills: &'a [Skill],
     /// The subagent types `spawn` can resolve a task against.
@@ -83,8 +96,29 @@ pub struct RunArgs<'a> {
     /// CLI input can override the configured initial phase for this launch.
     pub initial_phase: Option<polaris_core::workflow::Phase>,
     pub history_mode: polaris_core::conversation_state::HistoryMode,
+    /// CLI has already resolved this target against the selected project.  The
+    /// TUI must not retry that lookup or fall back to a fresh session.
+    pub continuation: Option<PreparedContinuation>,
+    /// Only an explicit CLI reconfiguration may replace the saved mode.
+    pub workflow_mode_overridden: bool,
     pub strict_history: Option<Arc<polaris_core::conversation_memory::StrictHistory>>,
     pub summary_usage: Option<polaris_provider::UsageMeter>,
+    pub history_backend_factory: Option<HistoryBackendFactory>,
+}
+
+/// A durable session selected by the CLI before entering the interactive UI.
+/// The distinction is retained because only a resume performs strict-history
+/// recovery; a fork has already made its independent child durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinuationKind {
+    Resume,
+    Fork,
+}
+
+#[derive(Clone)]
+pub struct PreparedContinuation {
+    pub kind: ContinuationKind,
+    pub persistence: polaris_core::session_store::PersistedSession,
 }
 
 struct WorkflowSessionArgs<'a> {
@@ -96,10 +130,91 @@ struct WorkflowSessionArgs<'a> {
     sessions_dir: &'a std::path::Path,
     strict_history: Option<Arc<polaris_core::conversation_memory::StrictHistory>>,
     summary_usage: Option<polaris_provider::UsageMeter>,
+    history_backend_factory: Option<&'a HistoryBackendFactory>,
     files_md_auto_regenerate: bool,
+    continuation: Option<PreparedContinuation>,
+    workflow_mode_overridden: bool,
+    skills: &'a [Skill],
 }
 
-fn new_workflow_session(
+fn ensure_history_backend(
+    session: &mut polaris_core::session::Session,
+    mode: polaris_core::conversation_state::HistoryMode,
+    factory: Option<&HistoryBackendFactory>,
+) -> Result<(), String> {
+    use polaris_core::conversation_state::HistoryMode;
+    if matches!(mode, HistoryMode::Strict10 | HistoryMode::Structured10)
+        && session.strict_history.is_none()
+    {
+        let (history, usage) = factory.ok_or("履歴の埋め込み・要約backendがありません")?()?;
+        session.strict_history = Some(history);
+        session.summary_usage = Some(usage);
+    }
+    Ok(())
+}
+
+/// Recover saved responses before workflow checkpoints. Replace the visible
+/// session only after recovery and explicit configuration validation succeed.
+pub async fn restore_prepared_continuation(
+    session: &mut polaris_core::session::Session,
+    continuation: &PreparedContinuation,
+    config: &polaris_core::workflow::WorkflowConfig,
+    workflow_mode_overridden: bool,
+    skills: &[Skill],
+    history_backend_factory: Option<&HistoryBackendFactory>,
+) -> Result<(), String> {
+    let mut candidate_session = session.clone();
+    let mode = continuation
+        .persistence
+        .snapshot()
+        .map_err(|error| error.to_string())?
+        .state
+        .history_mode;
+    ensure_history_backend(&mut candidate_session, mode, history_backend_factory)?;
+    candidate_session
+        .attach(continuation.persistence.clone())
+        .map_err(|error| format!("v2セッションを接続できません: {error}"))?;
+    candidate_session
+        .recover_saved_history()
+        .await
+        .map_err(|error| format!("保存済みの履歴を復元できません: {error}"))?;
+    let (restored, needs_checkpoint) = continuation
+        .persistence
+        .prepare_workflow(config.clone())
+        .map_err(|error| format!("ワークフロー状態を復元できません: {error}"))?;
+    let workflow = if workflow_mode_overridden {
+        let mut candidate_config = restored.config.clone();
+        candidate_config.enabled = config.enabled;
+        candidate_config.mode = config.mode;
+        let candidate = polaris_core::workflow::SessionWorkflow::restore(
+            candidate_config,
+            restored.gates.clone(),
+            restored.state(),
+        )
+        .map_err(|error| format!("workflow設定を検証できません: {error}"))?;
+        if candidate.config.enabled {
+            drop(
+                candidate
+                    .begin_turn_from_disk(skills)
+                    .map_err(|error| format!("workflow設定を検証できません: {error}"))?,
+            );
+        }
+        candidate
+    } else {
+        restored
+    };
+    if needs_checkpoint || workflow_mode_overridden {
+        continuation
+            .persistence
+            .checkpoint(Some(&workflow))
+            .map_err(|error| format!("workflow設定を保存できません: {error}"))?;
+    }
+    candidate_session.workflow = Some(workflow);
+    *session = candidate_session;
+    Ok(())
+}
+
+async fn new_workflow_session(
     args: WorkflowSessionArgs<'_>,
 ) -> Result<polaris_core::session::Session, String> {
     let WorkflowSessionArgs {
@@ -111,11 +226,28 @@ fn new_workflow_session(
         sessions_dir,
         strict_history,
         summary_usage,
+        history_backend_factory,
         files_md_auto_regenerate,
+        continuation,
+        workflow_mode_overridden,
+        skills,
     } = args;
     let mut session = polaris_core::session::Session::new();
     session.disable_files_md_auto_regenerate = !files_md_auto_regenerate;
-    if config.enabled {
+    session.strict_history = strict_history;
+    session.summary_usage = summary_usage;
+    let has_continuation = continuation.is_some();
+    if let Some(continuation) = continuation {
+        restore_prepared_continuation(
+            &mut session,
+            &continuation,
+            config,
+            workflow_mode_overridden,
+            skills,
+            history_backend_factory,
+        )
+        .await?;
+    } else if config.enabled {
         let workflow = polaris_core::workflow::SessionWorkflow::new(config.clone());
         if let Some(phase) = initial_phase {
             workflow.request_phase(phase)?;
@@ -126,7 +258,10 @@ fn new_workflow_session(
     }
     // Explicit workflow opt-out with legacy history retains the JSONL lifecycle.
     // Workflow state needs an atomic marker even when strict history is off.
-    if config.enabled || history_mode != polaris_core::conversation_state::HistoryMode::Legacy {
+    if !has_continuation
+        && (config.enabled || history_mode != polaris_core::conversation_state::HistoryMode::Legacy)
+    {
+        ensure_history_backend(&mut session, history_mode, history_backend_factory)?;
         let data_root = sessions_dir
             .parent()
             .ok_or("sessions directory has no data root")?;
@@ -143,8 +278,6 @@ fn new_workflow_session(
             .attach(persistence)
             .map_err(|error| error.to_string())?;
     }
-    session.strict_history = strict_history;
-    session.summary_usage = summary_usage;
     Ok(session)
 }
 
@@ -338,6 +471,24 @@ fn reset_conversation_view(
 /// and keep the *viewed content* fixed instead of letting the window
 /// silently shift under the user by the number of newly appended lines
 /// (see the two call sites in `run()`).
+/// An MCP call in the failed turn may already have been sent. Keep it and
+/// close unanswered calls as unknown instead of dropping the evidence; other
+/// turns roll back to the user's message as before.
+fn keep_or_roll_back(
+    session: &mut polaris_core::session::Session,
+    checkpoint: usize,
+) -> std::io::Result<()> {
+    if session.messages[checkpoint.min(session.messages.len())..]
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .any(|call| call.name.starts_with("mcp_"))
+    {
+        return session.recover_interrupted_tools();
+    }
+    session.messages.truncate(checkpoint);
+    Ok(())
+}
+
 fn append_live_event(
     event: &polaris_core::AgentEvent,
     history: &mut Vec<render::HistoryLine>,
@@ -455,19 +606,17 @@ fn area_height_for_history(footer_height: u16, terminal_height: u16) -> u16 {
 pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     let usage_meter = polaris_provider::UsageMeter::default();
     args.provider = Arc::new(usage_meter.wrap(args.provider.clone()));
+    args.mcp_selection_provider = args
+        .mcp_selection_provider
+        .map(|provider| Arc::new(usage_meter.wrap(provider)) as Arc<dyn Provider>);
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         eprintln!("polaris: refusing to start the TUI on a non-interactive terminal");
         return ExitCode::FAILURE;
     }
 
-    // Always starts empty, regardless of directory or what was said last
-    // time — there's no implicit "the" session per project anymore, only
-    // however many saved conversations `/resume` can list. A fresh id is
-    // picked now but nothing is written to `args.sessions_dir` until the
-    // first message actually goes out (see `persist::write_meta_if_absent`
-    // at the two `append_message` call sites below) — an empty launch
-    // that's immediately quit shouldn't leave a phantom entry in the
-    // resume list.
+    // A launch without an explicit continuation starts empty: there is no
+    // implicit session per project. Its JSONL id remains unwritten until the
+    // first message; a prepared continuation retains its resolved v2 id.
     let mut session = match new_workflow_session(WorkflowSessionArgs {
         config: &args.workflow_config,
         initial_phase: args.initial_phase,
@@ -477,8 +626,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         sessions_dir: &args.sessions_dir,
         strict_history: args.strict_history.clone(),
         summary_usage: args.summary_usage.clone(),
+        history_backend_factory: args.history_backend_factory.as_ref(),
         files_md_auto_regenerate: args.files_md_auto_regenerate,
-    }) {
+        continuation: args.continuation.clone(),
+        workflow_mode_overridden: args.workflow_mode_overridden,
+        skills: args.skills,
+    })
+    .await
+    {
         Ok(session) => session,
         Err(error) => {
             eprintln!("Can't start the workflow session: {error}");
@@ -486,10 +641,24 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         }
     };
     let mut session_started_at_millis = now_millis();
-    let mut session_path = args
-        .sessions_dir
-        .join(format!("{}.jsonl", new_session_id()));
+    let session_id = session
+        .persistence
+        .as_ref()
+        .and_then(|saved| saved.snapshot().ok())
+        .map(|snapshot| snapshot.state.session_id)
+        .unwrap_or_else(new_session_id);
+    let mut session_path = args.sessions_dir.join(format!("{session_id}.jsonl"));
     let mut meta_path = session_path.with_extension("meta.json");
+
+    if args
+        .continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.kind == ContinuationKind::Resume)
+        && let Err(error) = session.recover_history().await
+    {
+        eprintln!("strict10履歴を復元できません: {error}");
+        return ExitCode::FAILURE;
+    }
 
     // One handle for the whole process, shared with any subagent `spawn`
     // starts — see `agent::run`'s docs on why the audit log is shared
@@ -625,6 +794,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         .unwrap_or_else(|| render::DEFAULT_EFFORT.to_string());
     let mut status = Status::Idle;
     let mut key_reader = CrosstermKeyReader;
+    // Each turn gets its own MCP runtime; connections and grants never carry over.
+    let mcp_ceiling =
+        polaris_core::mcp::operation::ExternalCeiling::host_external(args.mcp_external);
+    let mcp_host = polaris_core::mcp::local::LocalHost::open(&args.cwd, false).ok();
+    let mcp_setup = mcp_host
+        .as_ref()
+        .map(|host| Arc::new(host.setup_tool(mcp_ceiling)));
+    let mut mcp_turns = 0u64;
     let mut fatal_message: Option<String> = None;
     // Set when a `HistoryCompacted` event is drained mid-turn (see the
     // `events_rx.recv()`/`try_recv` sites below) — `session.messages`
@@ -878,6 +1055,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &args.state_dir,
                                 &cwd_display,
                                 &args.workflow_config,
+                                args.workflow_mode_overridden,
+                                args.skills,
+                                args.history_backend_factory.as_ref(),
                                 &mut session,
                                 &mut session_path,
                                 &mut meta_path,
@@ -1191,6 +1371,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &args.state_dir,
                         &cwd_display,
                         &args.workflow_config,
+                        args.workflow_mode_overridden,
+                        args.skills,
+                        args.history_backend_factory.as_ref(),
                         &mut session,
                         &mut session_path,
                         &mut meta_path,
@@ -1488,6 +1671,21 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // `session`, `audit`, ...) ends when this block does — the match
         // below needs `&mut session` again, which it can't have while
         // any of these are still alive.
+        session.mcp_setup = mcp_setup.clone();
+        mcp_turns += 1;
+        let mut mcp_runtime = mcp_host.as_ref().and_then(|host| {
+            host.runtime("tui", &format!("turn-{mcp_turns}"), mcp_ceiling)
+                .ok()
+                .flatten()
+                .map(|(mut runtime, _)| {
+                    host.configure_preselection(
+                        &mut runtime,
+                        args.mcp_selection_provider.clone(),
+                        None,
+                    );
+                    runtime
+                })
+        });
         let outcome = {
             let mut stop = StopTracker::new(args.max_turns);
             let mut gate = Gate::new(approval_policy);
@@ -1534,7 +1732,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             // throttle the actual turn. Events are small and a turn's
             // worth of them is bounded by the turn itself.
             let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-            let agent_future = agent::run(
+            let agent_future = agent::run_with_mcp(
                 args.provider.as_ref(),
                 &mut session,
                 audit.clone(),
@@ -1547,6 +1745,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 args.spawn_write_concurrency,
                 Some(events_tx),
                 &mut ctx,
+                mcp_runtime.as_mut(),
             );
             tokio::pin!(agent_future);
             let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -1895,6 +2094,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             }
             turn_outcome
         };
+        if let Some(runtime) = mcp_runtime.as_mut() {
+            // An unconfirmed stop parks the child with the shared cleanup owner.
+            let _ = runtime.shutdown().await;
+        }
 
         match outcome {
             TurnOutcome::Done(Ok(result)) => {
@@ -1923,14 +2126,18 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 // would be rejected every time, so roll `session.messages`
                 // back to right after the user's message — the only state
                 // that was ever actually persisted for this turn.
-                session.messages.truncate(checkpoint);
                 status = Status::Error(e.to_string());
+                if let Err(error) = keep_or_roll_back(&mut session, checkpoint) {
+                    status = Status::Error(error.to_string());
+                }
             }
             TurnOutcome::Interrupted => {
                 // Same rollback as the error case above — an interrupted
                 // turn can equally have left an unbalanced tool-call tail.
-                session.messages.truncate(checkpoint);
                 status = Status::Notice("interrupted".to_string());
+                if let Err(error) = keep_or_roll_back(&mut session, checkpoint) {
+                    status = Status::Error(error.to_string());
+                }
             }
             TurnOutcome::Fatal => break ExitCode::FAILURE,
         }
@@ -2022,6 +2229,9 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     state_dir: &std::path::Path,
     cwd_display: &str,
     workflow_config: &polaris_core::workflow::WorkflowConfig,
+    workflow_mode_overridden: bool,
+    skills: &[Skill],
+    history_backend_factory: Option<&HistoryBackendFactory>,
     session: &mut polaris_core::session::Session,
     session_path: &mut PathBuf,
     meta_path: &mut PathBuf,
@@ -2059,7 +2269,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
         let summary_usage = session.summary_usage.clone();
         let examples = session.examples.clone();
         let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
-        let result = (|| -> Result<polaris_core::session::Session, String> {
+        let result = async {
             let persistence = polaris_core::session_store::PersistedSession::open(
                 data_root,
                 &state_dir.join("memory.sqlite3"),
@@ -2067,29 +2277,26 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 &selected.id,
             )
             .map_err(|error| error.to_string())?;
-            let snapshot = persistence.snapshot().map_err(|error| error.to_string())?;
-            let saved_workflow = snapshot.state.workflow != Default::default()
-                || snapshot.state.gates != Default::default();
-            if saved_workflow && !workflow_config.enabled {
-                return Err("保存済みのワークフローが有効ですが、現在の設定では無効です。設定を有効にして再開してください".into());
-            }
             let mut restored = polaris_core::session::Session::new();
             restored.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
-            if workflow_config.enabled {
-                restored.workflow = Some(
-                    persistence
-                        .restore_workflow(workflow_config.clone())
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            restored
-                .attach(persistence)
-                .map_err(|error| error.to_string())?;
             restored.strict_history = strict_history;
             restored.summary_usage = summary_usage;
             restored.examples = examples;
-            Ok(restored)
-        })();
+            restore_prepared_continuation(
+                &mut restored,
+                &PreparedContinuation {
+                    kind: ContinuationKind::Resume,
+                    persistence,
+                },
+                workflow_config,
+                workflow_mode_overridden,
+                skills,
+                history_backend_factory,
+            )
+            .await?;
+            Ok::<_, String>(restored)
+        }
+        .await;
         match result {
             Ok(mut restored) => {
                 if let Err(error) = restored.recover_history().await {
@@ -2744,6 +2951,39 @@ fn apply_selection_copy(text: &str, copy_fn: impl FnOnce(&str) -> Result<(), Str
 /// `AGENTS.md`, the deleted credentials file) but likewise never go near
 /// the model or `session.messages`. `New` and `Resume` are never actually
 /// dispatched here — see their match arms below.
+/// What `/mcp` prints. Registration and admission only: nothing is
+/// connected to and no model is asked, so this is safe to run at any time
+/// and says nothing about whether a server is currently answering.
+fn mcp_state_lines(cwd: &std::path::Path) -> Vec<String> {
+    let Ok(host) = polaris_core::mcp::local::LocalHost::open(cwd, false) else {
+        return vec!["MCPの設定を読めません。".into()];
+    };
+    // The report is what a run would admit, so it is read under the same
+    // ceiling a run without `--mcp-external` would use: a stricter view
+    // here would show servers a run can actually use as unavailable.
+    let report = match host
+        .state_report(polaris_core::mcp::operation::ExternalCeiling::host_external(false))
+    {
+        Ok(report) => report,
+        Err(error) => return vec![format!("MCPの状態を読めません: {error}")],
+    };
+    if report.is_empty() {
+        return vec!["登録されたMCPサーバーはありません。".into()];
+    }
+    let mut lines = vec![format!("MCPサーバー {}件", report.len())];
+    for server in report {
+        let state = match (&server.quarantine, server.enabled_here) {
+            // A refused server is refused whether or not this project
+            // enabled it, so the reason comes first.
+            (Some(reason), _) => format!("使えません（{reason}）"),
+            (None, false) => "このプロジェクトでは無効".to_owned(),
+            (None, true) => "有効".to_owned(),
+        };
+        lines.push(format!("  {} — {state}", server.server_id));
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_slash_action(
     action: slash::Action,
@@ -2759,7 +2999,7 @@ fn apply_slash_action(
     // rather than removed, since removing it would mean touching every
     // `apply_slash_action`/`call` call site (production and test) for a
     // signature change with no behavior difference.
-    _skills: &[polaris_skills::Skill],
+    skills: &[polaris_skills::Skill],
     cwd: &std::path::Path,
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
 ) -> SlashOutcome {
@@ -2821,22 +3061,109 @@ fn apply_slash_action(
                 *status = Status::Notice(format!("ワークフロー段階: {}", workflow.state().phase));
                 return SlashOutcome::Continue;
             }
-            match requested.parse::<polaris_core::workflow::Phase>() {
-                Ok(phase) => match workflow.request_phase(phase) {
-                    Ok(()) => {
-                        if let Err(error) = session.checkpoint() {
-                            *status = Status::Notice(format!("phaseを保存できません: {error}"));
-                            return SlashOutcome::Continue;
-                        }
-                        let state = workflow.state();
-                        *status = Status::Notice(format!("ワークフロー段階: {}", state.phase));
-                    }
-                    Err(error) => {
-                        *status = Status::Notice(format!("phaseを設定できません: {error}"))
-                    }
-                },
-                Err(error) => *status = Status::Notice(error),
+            let configured = (|| -> Result<polaris_core::workflow::SessionWorkflow, String> {
+                session
+                    .check_persistence()
+                    .map_err(|error| error.to_string())?;
+                let phase = requested.parse::<polaris_core::workflow::Phase>()?;
+                let candidate = polaris_core::workflow::SessionWorkflow::restore(
+                    workflow.config.clone(),
+                    workflow.gates.clone(),
+                    workflow.state(),
+                )?;
+                candidate.request_phase(phase)?;
+                if candidate.config.enabled {
+                    drop(candidate.begin_turn_from_disk(skills)?);
+                }
+                if let Some(saved) = &session.persistence {
+                    saved
+                        .checkpoint(Some(&candidate))
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(candidate)
+            })();
+            match configured {
+                Ok(candidate) => {
+                    *status =
+                        Status::Notice(format!("ワークフロー段階: {}", candidate.state().phase));
+                    session.workflow = Some(candidate);
+                }
+                Err(error) => *status = Status::Notice(format!("phaseを保存できません: {error}")),
             }
+            SlashOutcome::Continue
+        }
+        slash::Action::Workflow(requested) => {
+            if let Err(error) = session.check_persistence() {
+                *status = Status::Notice(format!("workflow設定を保存できません: {error}"));
+                return SlashOutcome::Continue;
+            }
+            let Some(current) = &session.workflow else {
+                *status = Status::Notice("workflowはこのセッションで無効です".into());
+                return SlashOutcome::Continue;
+            };
+            if requested.is_empty() {
+                *status = Status::Notice(format!(
+                    "workflow: {}",
+                    if current.config.enabled {
+                        match current.config.mode {
+                            polaris_core::workflow::WorkflowMode::Manual => "manual",
+                            polaris_core::workflow::WorkflowMode::Adaptive => "adaptive",
+                        }
+                    } else {
+                        "off"
+                    }
+                ));
+                return SlashOutcome::Continue;
+            }
+            let mode = requested.strip_prefix("mode ").unwrap_or(&requested);
+            let mut config = current.config.clone();
+            match mode {
+                "manual" => {
+                    config.enabled = true;
+                    config.mode = polaris_core::workflow::WorkflowMode::Manual;
+                }
+                "adaptive" => {
+                    config.enabled = true;
+                    config.mode = polaris_core::workflow::WorkflowMode::Adaptive;
+                }
+                "off" => {
+                    config.enabled = false;
+                    config.mode = polaris_core::workflow::WorkflowMode::Manual;
+                }
+                _ => {
+                    *status = Status::Notice(
+                        "workflow modeは manual、adaptive、off のいずれかです".into(),
+                    );
+                    return SlashOutcome::Continue;
+                }
+            }
+            let candidate = match polaris_core::workflow::SessionWorkflow::restore(
+                config,
+                current.gates.clone(),
+                current.state(),
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    *status = Status::Notice(format!("workflow設定を検証できません: {error}"));
+                    return SlashOutcome::Continue;
+                }
+            };
+            if candidate.config.enabled
+                && let Err(error) = candidate.begin_turn_from_disk(skills)
+            {
+                *status = Status::Notice(format!("workflow設定を検証できません: {error}"));
+                return SlashOutcome::Continue;
+            }
+            let Some(persistence) = &session.persistence else {
+                *status = Status::Notice("workflow設定を保存するセッションがありません".into());
+                return SlashOutcome::Continue;
+            };
+            if let Err(error) = persistence.checkpoint(Some(&candidate)) {
+                *status = Status::Notice(format!("workflow設定を保存できません: {error}"));
+                return SlashOutcome::Continue;
+            }
+            session.workflow = Some(candidate);
+            *status = Status::Notice(format!("workflow: {mode}"));
             SlashOutcome::Continue
         }
         slash::Action::Init => {
@@ -2858,6 +3185,13 @@ fn apply_slash_action(
         }
         slash::Action::Pwd => {
             *status = Status::Notice(cwd.display().to_string());
+            SlashOutcome::Continue
+        }
+        slash::Action::Mcp => {
+            for line in mcp_state_lines(cwd) {
+                local_lines.push(ratatui::text::Line::from(line));
+            }
+            *status = Status::Idle;
             SlashOutcome::Continue
         }
         slash::Action::Copy => {
@@ -2975,6 +3309,31 @@ fn apply_slash_action(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_turn_keeps_possible_mcp_sends_as_unknown_and_rolls_back_others() {
+        use polaris_provider::{Message, ToolCall};
+        let turn = |name: &str| {
+            let mut session = polaris_core::session::Session::new();
+            session.push_user("request");
+            session.messages.push(Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call".into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ));
+            session
+        };
+        let mut mcp = turn("mcp_fixture__tool");
+        keep_or_roll_back(&mut mcp, 1).unwrap();
+        assert_eq!(mcp.messages.len(), 3);
+        assert!(mcp.messages[2].content.contains("結果は不明"));
+        let mut bash = turn("bash");
+        keep_or_roll_back(&mut bash, 1).unwrap();
+        assert_eq!(bash.messages.len(), 1);
+    }
+
     use super::*;
     use approver::KeyReader;
     use polaris_core::conversation_memory::{
@@ -4009,8 +4368,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workflow_session_defaults_to_builtin_skills_and_supports_explicit_opt_out() {
+    #[tokio::test]
+    async fn workflow_session_defaults_to_builtin_skills_and_supports_explicit_opt_out() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join("sessions");
         let mut config = polaris_core::config::Config::default();
@@ -4027,8 +4386,13 @@ mod tests {
                 sessions_dir: &sessions_dir,
                 strict_history: None,
                 summary_usage: None,
+                history_backend_factory: None,
                 files_md_auto_regenerate: config.files_md_auto_regenerate,
+                continuation: None,
+                workflow_mode_overridden: false,
+                skills: &[],
             })
+            .await
             .unwrap();
             assert_eq!(session.workflow.is_some(), enabled);
             assert_eq!(session.persistence.is_some(), enabled);
@@ -4044,6 +4408,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_resume_uses_the_selected_v2_identity_history_and_workflow() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source_config = polaris_core::workflow::WorkflowConfig {
+            enabled: true,
+            mode: polaris_core::workflow::WorkflowMode::Adaptive,
+            initial_phase: polaris_core::workflow::Phase::Review,
+            ..Default::default()
+        };
+        let source_workflow = polaris_core::workflow::SessionWorkflow::new(source_config.clone());
+        let persistence = polaris_core::session_store::PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            polaris_core::conversation_state::HistoryMode::Legacy,
+            Some(&source_workflow),
+        )
+        .expect("create source");
+        let source_id = persistence
+            .snapshot()
+            .expect("source snapshot")
+            .state
+            .session_id;
+        let mut seeded = Session::new();
+        seeded.attach(persistence.clone()).expect("attach source");
+        seeded.push_user("saved user turn");
+
+        let current_config = polaris_core::workflow::WorkflowConfig {
+            enabled: true,
+            initial_phase: polaris_core::workflow::Phase::Implement,
+            ..Default::default()
+        };
+        let session = new_workflow_session(WorkflowSessionArgs {
+            config: &current_config,
+            initial_phase: None,
+            history_mode: polaris_core::conversation_state::HistoryMode::Legacy,
+            cwd: dir.path(),
+            state_dir: dir.path(),
+            sessions_dir: &dir.path().join("sessions"),
+            strict_history: None,
+            summary_usage: None,
+            history_backend_factory: None,
+            files_md_auto_regenerate: true,
+            continuation: Some(PreparedContinuation {
+                kind: ContinuationKind::Resume,
+                persistence,
+            }),
+            workflow_mode_overridden: false,
+            skills: &[],
+        })
+        .await
+        .expect("resume selected session");
+
+        assert_eq!(
+            session
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .state
+                .session_id,
+            source_id
+        );
+        assert_eq!(session.messages[0].content, "saved user turn");
+        assert_eq!(session.workflow.as_ref().unwrap().config, source_config);
+        assert_eq!(
+            session.workflow.as_ref().unwrap().state().phase,
+            polaris_core::workflow::Phase::Review
+        );
     }
 
     #[test]
@@ -4133,6 +4569,9 @@ mod tests {
                 dir.path(),
                 "/tmp/current",
                 &polaris_core::workflow::WorkflowConfig::default(),
+                false,
+                &[],
+                None,
                 &mut session,
                 &mut session_path,
                 &mut meta_path,
@@ -4192,6 +4631,9 @@ mod tests {
                 dir.path(),
                 "/tmp/current",
                 &polaris_core::workflow::WorkflowConfig::default(),
+                false,
+                &[],
+                None,
                 &mut session,
                 &mut session_path,
                 &mut meta_path,
@@ -4251,6 +4693,9 @@ mod tests {
                 dir.path(),
                 "/tmp/current",
                 &polaris_core::workflow::WorkflowConfig::default(),
+                false,
+                &[],
+                None,
                 &mut session,
                 &mut session_path,
                 &mut meta_path,
@@ -4586,6 +5031,69 @@ mod tests {
     }
 
     #[test]
+    fn workflow_command_reconfigures_and_checkpoints_before_exposing_mode() {
+        let mut session = Session::new();
+        session.workflow = Some(polaris_core::workflow::SessionWorkflow::new(
+            polaris_core::workflow::WorkflowConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        ));
+        let mut status = Status::Idle;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let persistence = polaris_core::session_store::PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            polaris_core::conversation_state::HistoryMode::Legacy,
+            session.workflow.as_ref(),
+        )
+        .expect("create v2 session");
+        session.attach(persistence).expect("attach v2 session");
+        let session_path = dir.path().join("session.jsonl");
+        let mut local_lines = Vec::new();
+
+        call(
+            slash::Action::Workflow("mode adaptive".into()),
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+        assert_eq!(
+            session.workflow.as_ref().unwrap().config.mode,
+            polaris_core::workflow::WorkflowMode::Adaptive
+        );
+        assert_eq!(
+            session
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .state
+                .workflow_config
+                .unwrap()
+                .config
+                .mode,
+            polaris_core::workflow::WorkflowMode::Adaptive
+        );
+
+        call(
+            slash::Action::Workflow("off".into()),
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+        assert!(!session.workflow.as_ref().unwrap().config.enabled);
+    }
+
+    #[test]
     fn pwd_reports_the_working_directory() {
         let mut session = Session::default();
         let mut status = Status::Idle;
@@ -4607,6 +5115,54 @@ mod tests {
             Status::Notice(n) => assert_eq!(n, dir.path().display().to_string()),
             _ => panic!("expected a Notice"),
         }
+    }
+
+    /// The registry lives under `HOME`, not under the project, so "nothing is
+    /// registered" has to be **created** here rather than assumed. Assuming it
+    /// made this test pass only on a machine whose owner had never registered
+    /// an MCP server, and fail for everyone else — observed on 2026-09-18,
+    /// where registering three servers turned this into `left: 4, right: 1`.
+    #[test]
+    fn mcp_reports_state_into_the_transcript_without_connecting_or_asking_a_model() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        // SAFETY: serialized by `HOME_LOCK`; restored before the assertions.
+        unsafe {
+            std::env::set_var("HOME", empty.path());
+        }
+        let mut session = polaris_core::session::Session::new();
+        let mut status = Status::Idle;
+        let session_path = dir.path().join("session.jsonl");
+        let mut local_lines = Vec::new();
+
+        call(
+            slash::Action::Mcp,
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+
+        match prev {
+            Some(p) => unsafe { std::env::set_var("HOME", p) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert_eq!(local_lines.len(), 1, "{local_lines:?}");
+        assert!(
+            local_lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("登録されたMCPサーバーはありません")),
+            "{local_lines:?}"
+        );
+        // A local command: nothing is sent and nothing joins the history.
+        assert!(session.messages.is_empty());
+        assert!(matches!(status, Status::Idle));
     }
 
     #[test]

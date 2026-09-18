@@ -11,7 +11,7 @@
 //! real command set, read from its `slash_command.rs`, is ~65 entries —
 //! most depend on a subsystem polaris doesn't have (MCP client, IDE
 //! integration, multi-agent orchestration, background terminals,
-//! terminal pets, ...) and stay out for that reason: `/mcp`, `/apps`,
+//! terminal pets, ...) and stay out for that reason: `/apps`,
 //! `/plugins`, `/vim`, `/keymap`, `/hooks`, `/import`,
 //! `/memories`, `/theme`, `/pets`, `/ide`, `/plan`, `/goal`, `/agents`,
 //! `/subagents`, `/side`, `/btw`, `/ps`, `/stop`, `/title`,
@@ -45,6 +45,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "show or set the explicit workflow phase",
     },
     SlashCommand {
+        name: "workflow",
+        description: "show workflow mode or set it to manual, adaptive, or off",
+    },
+    SlashCommand {
         name: "skills",
         description: "browse the skills polaris discovered in this project",
     },
@@ -67,6 +71,10 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "init",
         description: "create an AGENTS.md file with instructions for polaris",
+    },
+    SlashCommand {
+        name: "mcp",
+        description: "show registered MCP servers and why any are unavailable",
     },
     SlashCommand {
         name: "model",
@@ -127,6 +135,9 @@ pub enum Action {
     /// Empty means display the current phase. A nonempty value is checked by
     /// the session so unknown names are rejected rather than coerced.
     Phase(String),
+    /// Empty displays the durable mode. `manual`, `adaptive`, and `off` are
+    /// checked by the session before a new configuration is published.
+    Workflow(String),
     /// Same interception story as `New`/`Resume` below — the caller
     /// shows a full-screen, browse-only picker over the discovered
     /// skills (needs the terminal, which `apply_slash_action` doesn't
@@ -155,6 +166,9 @@ pub enum Action {
     /// `provider.set_model(...)` and swaps the display copy
     /// `apply_slash_action` doesn't own.
     Model,
+    /// Local and display-only: registration and admission state, read
+    /// without connecting to any server and without asking the model.
+    Mcp,
     Diff,
     /// Not a local command — the caller expands this (plus the carried
     /// extra instructions, if any were typed after the command name) into
@@ -212,12 +226,14 @@ pub fn parse(line: &str) -> Option<Action> {
         "" | "help" => Action::Help,
         "status" => Action::Status,
         "phase" => Action::Phase(extra),
+        "workflow" => Action::Workflow(extra),
         "skills" => Action::Skills,
         "new" => Action::New,
         "resume" => Action::Resume,
         "clear" => Action::Clear,
         "compact" => Action::Compact,
         "init" => Action::Init,
+        "mcp" => Action::Mcp,
         "model" => Action::Model,
         "diff" => Action::Diff,
         "review" => Action::Review(extra),
@@ -268,6 +284,9 @@ mod tests {
         assert!(matches!(parse("/help"), Some(Action::Help)));
         assert!(matches!(parse("/status"), Some(Action::Status)));
         assert!(matches!(parse("/phase"), Some(Action::Phase(value)) if value.is_empty()));
+        assert!(
+            matches!(parse("/workflow mode adaptive"), Some(Action::Workflow(value)) if value == "mode adaptive")
+        );
         assert!(matches!(parse("/skills"), Some(Action::Skills)));
         assert!(matches!(parse("/new"), Some(Action::New)));
         assert!(matches!(parse("/resume"), Some(Action::Resume)));

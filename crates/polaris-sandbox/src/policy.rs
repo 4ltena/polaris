@@ -35,6 +35,8 @@ pub struct IsolatedBoundary {
     pub workspace: PathBuf,
     pub readable_roots: Vec<PathBuf>,
     pub environment: Option<IsolatedEnvironment>,
+    /// Connections to and listeners on loopback only; other hosts stay denied.
+    pub loopback_network: bool,
 }
 
 /// Parent-prepared scratch directories, separate from source write authority.
@@ -44,18 +46,51 @@ pub struct IsolatedEnvironment {
     pub home: PathBuf,
     pub tmpdir: PathBuf,
     private_siblings: bool,
+    private_container: Option<PathBuf>,
     // Trusted, copied runtime directories only; never inherited host PATH text.
     pub(crate) runtime_bin_dirs: Vec<PathBuf>,
 }
 
 impl IsolatedEnvironment {
     pub(crate) fn validate(&self, workspace: &Path) -> Result<(), SandboxError> {
+        if let Some(container) = &self.private_container {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                for path in [container, &self.home, &self.tmpdir] {
+                    let metadata = path.symlink_metadata()?;
+                    if !metadata.is_dir()
+                        || metadata.uid() != unsafe { libc::geteuid() }
+                        || metadata.mode() & 0o7077 != 0
+                        || path.canonicalize()? != *path
+                    {
+                        return Err(SandboxError::NotEnforced(
+                            "invalid private scratch directory".into(),
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            return Err(SandboxError::NotEnforced(
+                "private scratch is unsupported".into(),
+            ));
+            if container.starts_with(workspace)
+                || workspace.starts_with(container)
+                || self.home.parent() != Some(container)
+                || self.tmpdir.parent() != Some(container)
+            {
+                return Err(SandboxError::NotEnforced(
+                    "private scratch overlaps workspace".into(),
+                ));
+            }
+        }
         for path in [&self.home, &self.tmpdir] {
             if path.canonicalize()? != *path
                 || !path.is_dir()
                 || path == workspace
                 || !(path.starts_with(workspace)
-                    || (self.private_siblings && path.parent() == workspace.parent()))
+                    || (self.private_siblings && path.parent() == workspace.parent())
+                    || self.private_container.is_some())
             {
                 return Err(SandboxError::NotEnforced(
                     "isolated environment must be a dedicated workspace child or private-root sibling".into(),
@@ -131,6 +166,25 @@ impl SandboxPolicy {
         workspace: &Path,
         runtime_roots: &[PathBuf],
     ) -> Result<Self, SandboxError> {
+        Self::isolated_boundary_policy(mode, workspace, runtime_roots)
+    }
+
+    /// The trusted host must admit and pin a dedicated registered cwd, reject
+    /// secrets/aliases/unsafe entries, and revalidate before each spawn. This
+    /// does not sanitize it or authorize writes outside the registered subtree.
+    pub fn isolated_registered(
+        mode: SandboxMode,
+        workspace: &Path,
+        runtime_roots: &[PathBuf],
+    ) -> Result<Self, SandboxError> {
+        Self::isolated_boundary_policy(mode, workspace, runtime_roots)
+    }
+
+    fn isolated_boundary_policy(
+        mode: SandboxMode,
+        workspace: &Path,
+        runtime_roots: &[PathBuf],
+    ) -> Result<Self, SandboxError> {
         let workspace = workspace.canonicalize()?;
         let mut readable_roots = vec![workspace.clone()];
         for root in runtime_roots {
@@ -160,12 +214,27 @@ impl SandboxPolicy {
                 workspace,
                 readable_roots,
                 environment: None,
+                loopback_network: false,
             }),
         })
     }
 
     pub fn isolated_boundary(&self) -> Option<&IsolatedBoundary> {
         self.isolated.as_ref()
+    }
+
+    /// A read-only isolated child that talks to a local app over loopback.
+    pub fn with_loopback_network(mut self) -> Result<Self, SandboxError> {
+        let read_only = self.mode == SandboxMode::ReadOnly;
+        match self.isolated.as_mut() {
+            Some(boundary) if read_only => boundary.loopback_network = true,
+            _ => {
+                return Err(SandboxError::NotEnforced(
+                    "loopback network requires a read-only isolated policy".into(),
+                ));
+            }
+        }
+        Ok(self)
     }
 
     /// Register existing, dedicated directories prepared by the snapshot owner.
@@ -184,6 +253,7 @@ impl SandboxPolicy {
             home: home.canonicalize()?,
             tmpdir: tmpdir.canonicalize()?,
             private_siblings: false,
+            private_container: None,
             runtime_bin_dirs: Vec::new(),
         };
         environment.validate(&boundary.workspace)?;
@@ -205,6 +275,7 @@ impl SandboxPolicy {
             home: home.canonicalize()?,
             tmpdir: tmpdir.canonicalize()?,
             private_siblings: true,
+            private_container: None,
             runtime_bin_dirs: Vec::new(),
         };
         if environment.home.parent() != boundary.workspace.parent()
@@ -215,6 +286,39 @@ impl SandboxPolicy {
             ));
         }
         environment.validate(&boundary.workspace)?;
+        boundary.environment = Some(environment);
+        Ok(self)
+    }
+
+    /// The host owns a separate private container for both scratch directories
+    /// and retains it until child/group cleanup completes. No container-wide
+    /// access is granted; only home and tmpdir become readable/writable.
+    pub fn with_isolated_private_environment(
+        mut self,
+        container: &Path,
+        home: &Path,
+        tmpdir: &Path,
+    ) -> Result<Self, SandboxError> {
+        let boundary = self.isolated.as_mut().ok_or_else(|| {
+            SandboxError::NotEnforced("private environment requires an isolated policy".into())
+        })?;
+        let environment = IsolatedEnvironment {
+            home: home.into(),
+            tmpdir: tmpdir.into(),
+            private_siblings: false,
+            private_container: Some(container.into()),
+            runtime_bin_dirs: Vec::new(),
+        };
+        environment.validate(&boundary.workspace)?;
+        if boundary
+            .readable_roots
+            .iter()
+            .any(|root| root.starts_with(container) || container.starts_with(root))
+        {
+            return Err(SandboxError::NotEnforced(
+                "private scratch overlaps readable roots".into(),
+            ));
+        }
         boundary.environment = Some(environment);
         Ok(self)
     }

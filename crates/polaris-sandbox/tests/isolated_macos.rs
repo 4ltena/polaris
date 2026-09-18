@@ -207,3 +207,56 @@ fn isolated_read_only_can_read_copy_but_cannot_write_it() {
         "scratch"
     );
 }
+
+#[test]
+fn loopback_network_reaches_local_listeners_only() {
+    let copy = tempfile::tempdir().unwrap();
+    let runtimes: Vec<PathBuf> = ["/System", "/usr/lib", "/bin", "/usr/bin"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let probe = |policy: &SandboxPolicy, host: &str| {
+        run_confined(
+            policy,
+            Path::new("/usr/bin/nc"),
+            &[
+                "-z".into(),
+                "-G".into(),
+                "2".into(),
+                host.into(),
+                port.clone(),
+            ],
+            None,
+        )
+        .unwrap()
+        .status
+    };
+    let read_only = isolated_policy(SandboxMode::ReadOnly, copy.path(), &runtimes);
+    assert_ne!(probe(&read_only, "127.0.0.1"), 0);
+    let loopback = read_only.clone().with_loopback_network().unwrap();
+    assert_eq!(probe(&loopback, "127.0.0.1"), 0);
+    // Another host is refused by the profile itself, not by a network timeout.
+    let external = run_confined(
+        &loopback,
+        Path::new("/usr/bin/nc"),
+        &[
+            "-v".into(),
+            "-z".into(),
+            "-G".into(),
+            "2".into(),
+            "192.0.2.1".into(),
+            "9".into(),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_ne!(external.status, 0);
+    assert!(
+        external.stderr.contains("Operation not permitted"),
+        "{external:?}"
+    );
+    let writable = isolated_policy(SandboxMode::WorkspaceWrite, copy.path(), &runtimes);
+    assert!(writable.with_loopback_network().is_err());
+}

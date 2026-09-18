@@ -33,7 +33,7 @@ fn readable_ancestors(policy: &SandboxPolicy) -> Vec<&Path> {
 pub fn build_profile(policy: &SandboxPolicy) -> String {
     if let Some(boundary) = policy.isolated_boundary() {
         let mut p = String::from(
-            "(version 1)\n(deny default)\n(allow process-fork process-exec)\n(allow signal (target same-sandbox))\n(allow sysctl-read (sysctl-name \"hw.pagesize\" \"hw.pagesize_compat\" \"hw.ncpu\" \"hw.memsize\" \"hw.activecpu\" \"kern.osrelease\" \"kern.osversion\" \"kern.ostype\"))\n(allow file-read* (literal \"/\" \"/dev/null\" \"/dev/urandom\" \"/dev/random\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
+            "(version 1)\n(deny default)\n(allow process-fork process-exec)\n(allow signal (target same-sandbox))\n(allow sysctl-read (sysctl-name \"hw.pagesize\" \"hw.pagesize_compat\" \"hw.ncpu\" \"hw.memsize\" \"hw.activecpu\" \"kern.osrelease\" \"kern.osversion\" \"kern.ostype\" \"kern.hostname\" \"kern.version\" \"hw.machine\"))\n(allow file-read* (literal \"/\" \"/dev/null\" \"/dev/urandom\" \"/dev/random\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
         );
         // deny-default and named sysctl grants alone did not reject
         // KERN_PROCARGS2 on macOS. Explicitly deny other-process inspection;
@@ -64,6 +64,9 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
         // Even FullAccess retains file/process isolation. Network is a separate grant.
         if policy.mode() == SandboxMode::FullAccess {
             p.push_str("(allow network*)\n");
+        }
+        if boundary.loopback_network {
+            p.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n(allow network-inbound network-bind (local ip \"localhost:*\"))\n");
         }
         return p;
     }
@@ -210,6 +213,34 @@ mod tests {
 
     fn workspace(roots: &[std::path::PathBuf]) -> SandboxPolicy {
         SandboxPolicy::new(SandboxMode::WorkspaceWrite, roots).expect("can't create policy")
+    }
+
+    /// `uname(3)` fills its five fields from five sysctls, and a program that
+    /// calls it gets no partial answer: Node aborts in `GetOSInformation` when
+    /// any one of them is refused, taking the process with it. Observed on
+    /// 2026-09-18, when every node-based MCP server died at startup inside the
+    /// isolated boundary and reached the caller only as a transport failure.
+    ///
+    /// None of the five says anything the other four do not: the OS name, its
+    /// release and version, the machine's own name, and the CPU architecture.
+    #[test]
+    fn the_isolated_profile_permits_every_field_uname_reads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let policy = SandboxPolicy::isolated_registered(SandboxMode::ReadOnly, dir.path(), &[])
+            .expect("an isolated policy");
+        let p = build_profile(&policy);
+        for name in [
+            "kern.ostype",
+            "kern.osrelease",
+            "kern.version",
+            "kern.hostname",
+            "hw.machine",
+        ] {
+            assert!(
+                p.contains(&format!("\"{name}\"")),
+                "uname reads {name} and the profile does not permit it:\n{p}"
+            );
+        }
     }
 
     #[test]

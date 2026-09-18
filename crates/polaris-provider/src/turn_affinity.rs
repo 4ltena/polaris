@@ -35,6 +35,7 @@ impl TurnAffinityMode {
 
 /// Request properties which make a server-issued turn state safe to reuse.
 /// No implementation exposes or logs these values.
+#[derive(Clone)]
 pub(crate) struct TurnIdentity {
     pub(crate) origin: String,
     pub(crate) account_id: String,
@@ -60,7 +61,9 @@ struct StoredState {
 
 /// A fresh instance is required for every `run_loop`.
 #[derive(Default)]
-pub struct TurnContext(Mutex<Option<StoredState>>);
+pub struct TurnContext {
+    state: Mutex<Option<StoredState>>,
+}
 
 impl TurnContext {
     pub fn new() -> Self {
@@ -68,12 +71,13 @@ impl TurnContext {
     }
 
     /// Drops the opaque state after a completed history compaction.
+    ///
     pub fn clear(&self) {
-        *self.0.lock().expect("turn context lock poisoned") = None;
+        *self.state.lock().expect("turn context lock poisoned") = None;
     }
 
     pub(crate) fn take_matching(&self, identity: &TurnIdentity) -> Option<HeaderValue> {
-        let mut state = self.0.lock().expect("turn context lock poisoned");
+        let mut state = self.state.lock().expect("turn context lock poisoned");
         match state.as_ref() {
             Some(stored) if stored.identity.matches(identity) => Some(stored.value.clone()),
             Some(_) => {
@@ -87,7 +91,7 @@ impl TurnContext {
 
     pub(crate) fn store_first(&self, identity: TurnIdentity, mut value: HeaderValue) {
         value.set_sensitive(true);
-        let mut state = self.0.lock().expect("turn context lock poisoned");
+        let mut state = self.state.lock().expect("turn context lock poisoned");
         if state.is_none() {
             *state = Some(StoredState { identity, value });
         }

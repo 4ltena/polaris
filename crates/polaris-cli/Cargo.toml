@@ -13,6 +13,7 @@ path = "src/main.rs"
 polaris-memory = { path = "../polaris-memory" }
 polaris-auth = { path = "../polaris-auth" }
 polaris-core = { path = "../polaris-core" }
+polaris-mcp = { path = "../polaris-mcp" }
 polaris-provider = { path = "../polaris-provider" }
 polaris-sandbox = { path = "../polaris-sandbox" }
 polaris-skills = { path = "../polaris-skills" }

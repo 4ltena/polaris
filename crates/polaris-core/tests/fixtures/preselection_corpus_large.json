@@ -1,0 +1,927 @@
+{
+  "schema_version": 1,
+  "note": "事前選定の比較に使う固定コーパスの拡大版。2026-09-18作成。元の24件・5課題・19件の正解ラベルをそのまま含み、5課題のどれにも当たらない領域からダミーを足して候補数を増やしてある。足したツールはどの課題でも正解ではないので、ラベルは構成上そのまま正しい。測るのは1つだけで、候補が8倍になっても正解を順位の上へ持って来られるかである。near_missの20件は動詞の形だけが近く対象が違うもので、意図的に不正解としてある。元のコーパスとは別ファイルであり、数値を混ぜて比較しない。",
+  "servers": {
+    "files": [
+      {
+        "key": "read_file",
+        "name": "read_file",
+        "description": "read a file from the workspace"
+      },
+      {
+        "key": "write_file",
+        "name": "write_file",
+        "description": "write a file in the workspace"
+      },
+      {
+        "key": "grep",
+        "name": "grep",
+        "description": "search file contents by pattern"
+      },
+      {
+        "key": "list_dir",
+        "name": "list_dir",
+        "description": "list the entries of a directory"
+      },
+      {
+        "key": "resize_assets",
+        "name": "resize_assets",
+        "description": "resize and optimize raster assets"
+      },
+      {
+        "key": "read_exif",
+        "name": "read_exif",
+        "description": "read image metadata without modifying the file"
+      }
+    ],
+    "vcs": [
+      {
+        "key": "git_log",
+        "name": "git_log",
+        "description": "show the commit history of a path"
+      },
+      {
+        "key": "git_blame",
+        "name": "git_blame",
+        "description": "show who last changed each line"
+      },
+      {
+        "key": "git_diff",
+        "name": "git_diff",
+        "description": "show the working tree changes"
+      },
+      {
+        "key": "open_pr",
+        "name": "open_pr",
+        "description": "open a pull request on the remote"
+      }
+    ],
+    "build": [
+      {
+        "key": "run_tests",
+        "name": "run_tests",
+        "description": "run the project's test suite"
+      },
+      {
+        "key": "build_project",
+        "name": "build_project",
+        "description": "compile the project"
+      },
+      {
+        "key": "lint",
+        "name": "lint",
+        "description": "run the linter over the project"
+      },
+      {
+        "key": "update_deps",
+        "name": "update_deps",
+        "description": "update dependency versions and the lockfile"
+      },
+      {
+        "key": "audit_deps",
+        "name": "audit_deps",
+        "description": "check dependencies for known advisories"
+      }
+    ],
+    "ops": [
+      {
+        "key": "deploy",
+        "name": "deploy",
+        "description": "deploy the current build to production"
+      },
+      {
+        "key": "rollback",
+        "name": "rollback",
+        "description": "roll the production deployment back"
+      },
+      {
+        "key": "read_logs",
+        "name": "read_logs",
+        "description": "read recent production logs"
+      },
+      {
+        "key": "read_metrics",
+        "name": "read_metrics",
+        "description": "read production latency and error rates"
+      },
+      {
+        "key": "restart_service",
+        "name": "restart_service",
+        "description": "restart a production service"
+      }
+    ],
+    "comms": [
+      {
+        "key": "slack_post",
+        "name": "slack_post",
+        "description": "post a message to a channel"
+      },
+      {
+        "key": "send_email",
+        "name": "send_email",
+        "description": "send an email to a mailing list"
+      },
+      {
+        "key": "create_ticket",
+        "name": "create_ticket",
+        "description": "create an issue in the tracker"
+      },
+      {
+        "key": "search_docs",
+        "name": "search_docs",
+        "description": "search the team's written documents"
+      }
+    ],
+    "calendar": [
+      {
+        "key": "create_event",
+        "name": "create_event",
+        "description": "create an event in the calendar"
+      },
+      {
+        "key": "list_events",
+        "name": "list_events",
+        "description": "list events in a date range"
+      },
+      {
+        "key": "find_free_slot",
+        "name": "find_free_slot",
+        "description": "find a time when everyone is free"
+      },
+      {
+        "key": "cancel_event",
+        "name": "cancel_event",
+        "description": "cancel a scheduled event"
+      },
+      {
+        "key": "set_reminder",
+        "name": "set_reminder",
+        "description": "set a reminder before an event"
+      },
+      {
+        "key": "share_calendar",
+        "name": "share_calendar",
+        "description": "share a calendar with another person"
+      }
+    ],
+    "crm": [
+      {
+        "key": "create_contact",
+        "name": "create_contact",
+        "description": "create a contact record"
+      },
+      {
+        "key": "find_contact",
+        "name": "find_contact",
+        "description": "look up a contact by name or email"
+      },
+      {
+        "key": "log_call",
+        "name": "log_call",
+        "description": "record that a call took place"
+      },
+      {
+        "key": "update_deal_stage",
+        "name": "update_deal_stage",
+        "description": "move a deal to another pipeline stage"
+      },
+      {
+        "key": "list_pipeline",
+        "name": "list_pipeline",
+        "description": "list the deals in a pipeline"
+      },
+      {
+        "key": "assign_owner",
+        "name": "assign_owner",
+        "description": "assign an account owner to a customer"
+      },
+      {
+        "key": "export_leads",
+        "name": "export_leads",
+        "description": "export leads to a spreadsheet"
+      }
+    ],
+    "payments": [
+      {
+        "key": "create_charge",
+        "name": "create_charge",
+        "description": "charge a customer's saved card"
+      },
+      {
+        "key": "refund_charge",
+        "name": "refund_charge",
+        "description": "refund a completed charge"
+      },
+      {
+        "key": "list_invoices",
+        "name": "list_invoices",
+        "description": "list invoices for a customer"
+      },
+      {
+        "key": "create_subscription",
+        "name": "create_subscription",
+        "description": "start a recurring subscription"
+      },
+      {
+        "key": "cancel_subscription",
+        "name": "cancel_subscription",
+        "description": "cancel a recurring subscription"
+      },
+      {
+        "key": "read_payout",
+        "name": "read_payout",
+        "description": "read the next scheduled payout"
+      },
+      {
+        "key": "apply_coupon",
+        "name": "apply_coupon",
+        "description": "apply a discount coupon to an order"
+      },
+      {
+        "key": "verify_card",
+        "name": "verify_card",
+        "description": "verify a card without charging it"
+      }
+    ],
+    "commerce": [
+      {
+        "key": "create_product",
+        "name": "create_product",
+        "description": "create a product in the storefront"
+      },
+      {
+        "key": "update_price",
+        "name": "update_price",
+        "description": "change the price of a product"
+      },
+      {
+        "key": "read_stock",
+        "name": "read_stock",
+        "description": "read the stock level of a product"
+      },
+      {
+        "key": "fulfil_order",
+        "name": "fulfil_order",
+        "description": "mark an order as fulfilled"
+      },
+      {
+        "key": "create_shipment",
+        "name": "create_shipment",
+        "description": "create a shipment for an order"
+      },
+      {
+        "key": "track_parcel",
+        "name": "track_parcel",
+        "description": "track a parcel by its number"
+      },
+      {
+        "key": "list_returns",
+        "name": "list_returns",
+        "description": "list the returns awaiting approval"
+      }
+    ],
+    "travel": [
+      {
+        "key": "search_flights",
+        "name": "search_flights",
+        "description": "search for flights between two cities"
+      },
+      {
+        "key": "book_flight",
+        "name": "book_flight",
+        "description": "book a flight for a traveller"
+      },
+      {
+        "key": "search_hotels",
+        "name": "search_hotels",
+        "description": "search for hotels in a city"
+      },
+      {
+        "key": "book_hotel",
+        "name": "book_hotel",
+        "description": "book a hotel room"
+      },
+      {
+        "key": "read_itinerary",
+        "name": "read_itinerary",
+        "description": "read a traveller's itinerary"
+      },
+      {
+        "key": "cancel_booking",
+        "name": "cancel_booking",
+        "description": "cancel a travel booking"
+      },
+      {
+        "key": "read_visa_rules",
+        "name": "read_visa_rules",
+        "description": "read the visa rules for a destination"
+      }
+    ],
+    "hr": [
+      {
+        "key": "submit_leave",
+        "name": "submit_leave",
+        "description": "submit a leave request"
+      },
+      {
+        "key": "approve_leave",
+        "name": "approve_leave",
+        "description": "approve a pending leave request"
+      },
+      {
+        "key": "read_headcount",
+        "name": "read_headcount",
+        "description": "read the headcount of a team"
+      },
+      {
+        "key": "start_onboarding",
+        "name": "start_onboarding",
+        "description": "start the onboarding checklist for a new hire"
+      },
+      {
+        "key": "read_payslip",
+        "name": "read_payslip",
+        "description": "read an employee's payslip"
+      },
+      {
+        "key": "schedule_review",
+        "name": "schedule_review",
+        "description": "schedule a performance review"
+      },
+      {
+        "key": "post_job",
+        "name": "post_job",
+        "description": "post a job opening to the careers page"
+      }
+    ],
+    "maps": [
+      {
+        "key": "geocode",
+        "name": "geocode",
+        "description": "turn an address into coordinates"
+      },
+      {
+        "key": "reverse_geocode",
+        "name": "reverse_geocode",
+        "description": "turn coordinates into an address"
+      },
+      {
+        "key": "route_between",
+        "name": "route_between",
+        "description": "find a driving route between two points"
+      },
+      {
+        "key": "search_nearby",
+        "name": "search_nearby",
+        "description": "search for places near a point"
+      },
+      {
+        "key": "read_traffic",
+        "name": "read_traffic",
+        "description": "read current road traffic conditions"
+      },
+      {
+        "key": "elevation_at",
+        "name": "elevation_at",
+        "description": "read the elevation at a coordinate"
+      }
+    ],
+    "weather": [
+      {
+        "key": "read_forecast",
+        "name": "read_forecast",
+        "description": "read the weather forecast for a place"
+      },
+      {
+        "key": "read_observation",
+        "name": "read_observation",
+        "description": "read the current weather observation"
+      },
+      {
+        "key": "read_warning",
+        "name": "read_warning",
+        "description": "read active severe weather warnings"
+      },
+      {
+        "key": "read_climate_normal",
+        "name": "read_climate_normal",
+        "description": "read the long-term climate average for a place"
+      }
+    ],
+    "translate": [
+      {
+        "key": "translate_text",
+        "name": "translate_text",
+        "description": "translate text into another language"
+      },
+      {
+        "key": "detect_language",
+        "name": "detect_language",
+        "description": "detect which language a text is written in"
+      },
+      {
+        "key": "transliterate",
+        "name": "transliterate",
+        "description": "transliterate a name into another script"
+      },
+      {
+        "key": "list_glossaries",
+        "name": "list_glossaries",
+        "description": "list the translation glossaries available"
+      }
+    ],
+    "spreadsheet": [
+      {
+        "key": "read_range",
+        "name": "read_range",
+        "description": "read a range of cells from a spreadsheet"
+      },
+      {
+        "key": "write_range",
+        "name": "write_range",
+        "description": "write values into a range of cells"
+      },
+      {
+        "key": "add_sheet",
+        "name": "add_sheet",
+        "description": "add a new sheet to a spreadsheet"
+      },
+      {
+        "key": "apply_formula",
+        "name": "apply_formula",
+        "description": "apply a formula down a column"
+      },
+      {
+        "key": "create_pivot",
+        "name": "create_pivot",
+        "description": "create a pivot table from a range"
+      },
+      {
+        "key": "format_cells",
+        "name": "format_cells",
+        "description": "change the formatting of a cell range"
+      },
+      {
+        "key": "freeze_rows",
+        "name": "freeze_rows",
+        "description": "freeze the header rows of a sheet"
+      }
+    ],
+    "social": [
+      {
+        "key": "post_update",
+        "name": "post_update",
+        "description": "publish a post to a social account"
+      },
+      {
+        "key": "schedule_post",
+        "name": "schedule_post",
+        "description": "schedule a post for later"
+      },
+      {
+        "key": "read_mentions",
+        "name": "read_mentions",
+        "description": "read recent mentions of an account"
+      },
+      {
+        "key": "read_followers",
+        "name": "read_followers",
+        "description": "read the follower count of an account"
+      },
+      {
+        "key": "reply_comment",
+        "name": "reply_comment",
+        "description": "reply to a comment on a post"
+      },
+      {
+        "key": "boost_post",
+        "name": "boost_post",
+        "description": "pay to promote an existing post"
+      }
+    ],
+    "music": [
+      {
+        "key": "search_track",
+        "name": "search_track",
+        "description": "search the catalogue for a track"
+      },
+      {
+        "key": "create_playlist",
+        "name": "create_playlist",
+        "description": "create a playlist"
+      },
+      {
+        "key": "add_to_playlist",
+        "name": "add_to_playlist",
+        "description": "add a track to a playlist"
+      },
+      {
+        "key": "read_now_playing",
+        "name": "read_now_playing",
+        "description": "read what is currently playing"
+      },
+      {
+        "key": "skip_track",
+        "name": "skip_track",
+        "description": "skip to the next track"
+      }
+    ],
+    "media": [
+      {
+        "key": "transcribe_audio",
+        "name": "transcribe_audio",
+        "description": "transcribe speech in an audio file"
+      },
+      {
+        "key": "cut_video",
+        "name": "cut_video",
+        "description": "cut a video between two timestamps"
+      },
+      {
+        "key": "extract_frame",
+        "name": "extract_frame",
+        "description": "extract a single frame from a video"
+      },
+      {
+        "key": "mix_audio",
+        "name": "mix_audio",
+        "description": "mix two audio tracks together"
+      },
+      {
+        "key": "generate_subtitles",
+        "name": "generate_subtitles",
+        "description": "generate subtitles for a video"
+      },
+      {
+        "key": "read_waveform",
+        "name": "read_waveform",
+        "description": "read the waveform of an audio file"
+      }
+    ],
+    "docs_office": [
+      {
+        "key": "create_doc",
+        "name": "create_doc",
+        "description": "create a new word-processing document"
+      },
+      {
+        "key": "insert_heading",
+        "name": "insert_heading",
+        "description": "insert a heading into a document"
+      },
+      {
+        "key": "export_pdf",
+        "name": "export_pdf",
+        "description": "export a document as a PDF"
+      },
+      {
+        "key": "read_comments",
+        "name": "read_comments",
+        "description": "read the review comments on a document"
+      },
+      {
+        "key": "accept_changes",
+        "name": "accept_changes",
+        "description": "accept the tracked changes in a document"
+      },
+      {
+        "key": "create_slide",
+        "name": "create_slide",
+        "description": "create a slide in a presentation"
+      },
+      {
+        "key": "apply_template",
+        "name": "apply_template",
+        "description": "apply a template to a presentation"
+      }
+    ],
+    "design": [
+      {
+        "key": "read_frame",
+        "name": "read_frame",
+        "description": "read a frame from a design file"
+      },
+      {
+        "key": "export_asset",
+        "name": "export_asset",
+        "description": "export an asset from a design file"
+      },
+      {
+        "key": "list_components",
+        "name": "list_components",
+        "description": "list the components in a design library"
+      },
+      {
+        "key": "create_variant",
+        "name": "create_variant",
+        "description": "create a variant of a component"
+      },
+      {
+        "key": "read_tokens",
+        "name": "read_tokens",
+        "description": "read the design tokens of a library"
+      }
+    ],
+    "iot": [
+      {
+        "key": "read_sensor",
+        "name": "read_sensor",
+        "description": "read the current value of a sensor"
+      },
+      {
+        "key": "set_thermostat",
+        "name": "set_thermostat",
+        "description": "set the target temperature of a thermostat"
+      },
+      {
+        "key": "toggle_light",
+        "name": "toggle_light",
+        "description": "turn a light on or off"
+      },
+      {
+        "key": "lock_door",
+        "name": "lock_door",
+        "description": "lock or unlock a smart lock"
+      },
+      {
+        "key": "read_energy_use",
+        "name": "read_energy_use",
+        "description": "read the energy used by a device"
+      }
+    ],
+    "legal": [
+      {
+        "key": "draft_clause",
+        "name": "draft_clause",
+        "description": "draft a contract clause from a template"
+      },
+      {
+        "key": "compare_contract",
+        "name": "compare_contract",
+        "description": "compare two contract versions"
+      },
+      {
+        "key": "request_signature",
+        "name": "request_signature",
+        "description": "send a document for electronic signature"
+      },
+      {
+        "key": "read_signature_status",
+        "name": "read_signature_status",
+        "description": "read whether a document has been signed"
+      },
+      {
+        "key": "archive_contract",
+        "name": "archive_contract",
+        "description": "archive an executed contract"
+      }
+    ],
+    "finance": [
+      {
+        "key": "read_ledger",
+        "name": "read_ledger",
+        "description": "read entries from the general ledger"
+      },
+      {
+        "key": "post_journal",
+        "name": "post_journal",
+        "description": "post a journal entry"
+      },
+      {
+        "key": "read_budget",
+        "name": "read_budget",
+        "description": "read the budget for a cost centre"
+      },
+      {
+        "key": "reconcile_account",
+        "name": "reconcile_account",
+        "description": "reconcile a bank account"
+      },
+      {
+        "key": "read_fx_rate",
+        "name": "read_fx_rate",
+        "description": "read a foreign exchange rate"
+      },
+      {
+        "key": "close_period",
+        "name": "close_period",
+        "description": "close an accounting period"
+      }
+    ],
+    "support": [
+      {
+        "key": "create_case",
+        "name": "create_case",
+        "description": "create a customer support case"
+      },
+      {
+        "key": "read_case",
+        "name": "read_case",
+        "description": "read a customer support case"
+      },
+      {
+        "key": "escalate_case",
+        "name": "escalate_case",
+        "description": "escalate a case to the next tier"
+      },
+      {
+        "key": "read_csat",
+        "name": "read_csat",
+        "description": "read the satisfaction score for a case"
+      },
+      {
+        "key": "send_macro",
+        "name": "send_macro",
+        "description": "send a canned reply to a customer"
+      }
+    ],
+    "science": [
+      {
+        "key": "search_papers",
+        "name": "search_papers",
+        "description": "search a bibliographic database for papers"
+      },
+      {
+        "key": "read_citation",
+        "name": "read_citation",
+        "description": "read the citation record of a paper"
+      },
+      {
+        "key": "plot_series",
+        "name": "plot_series",
+        "description": "plot a numeric series as a chart"
+      },
+      {
+        "key": "fit_curve",
+        "name": "fit_curve",
+        "description": "fit a curve to a set of points"
+      },
+      {
+        "key": "convert_units",
+        "name": "convert_units",
+        "description": "convert a quantity between units"
+      }
+    ],
+    "near_miss": [
+      {
+        "key": "read_access_log",
+        "name": "read_access_log",
+        "description": "read the web access log of a marketing site"
+      },
+      {
+        "key": "read_audit_log",
+        "name": "read_audit_log",
+        "description": "read the account audit log of the billing system"
+      },
+      {
+        "key": "diff_translations",
+        "name": "diff_translations",
+        "description": "show the differences between two translation files"
+      },
+      {
+        "key": "diff_schedules",
+        "name": "diff_schedules",
+        "description": "show the differences between two published schedules"
+      },
+      {
+        "key": "run_migrations",
+        "name": "run_migrations",
+        "description": "run the pending database migrations"
+      },
+      {
+        "key": "run_backup",
+        "name": "run_backup",
+        "description": "run a backup of the customer database"
+      },
+      {
+        "key": "build_catalogue",
+        "name": "build_catalogue",
+        "description": "rebuild the product catalogue index"
+      },
+      {
+        "key": "test_webhook",
+        "name": "test_webhook",
+        "description": "send a test payload to a configured webhook"
+      },
+      {
+        "key": "lint_content",
+        "name": "lint_content",
+        "description": "check marketing copy against the style guide"
+      },
+      {
+        "key": "update_profile",
+        "name": "update_profile",
+        "description": "update the contact details on an account profile"
+      },
+      {
+        "key": "blame_translation",
+        "name": "blame_translation",
+        "description": "show who last edited each translated string"
+      },
+      {
+        "key": "read_delivery_metrics",
+        "name": "read_delivery_metrics",
+        "description": "read open and click rates for a mail campaign"
+      },
+      {
+        "key": "read_campaign_logs",
+        "name": "read_campaign_logs",
+        "description": "read the send log of an email campaign"
+      },
+      {
+        "key": "restart_printer",
+        "name": "restart_printer",
+        "description": "restart an office printer queue"
+      },
+      {
+        "key": "rollback_price",
+        "name": "rollback_price",
+        "description": "revert a product price to its previous value"
+      },
+      {
+        "key": "deploy_landing_page",
+        "name": "deploy_landing_page",
+        "description": "publish a marketing landing page"
+      },
+      {
+        "key": "resize_window",
+        "name": "resize_window",
+        "description": "resize an application window on screen"
+      },
+      {
+        "key": "optimize_route",
+        "name": "optimize_route",
+        "description": "optimise a delivery route for a driver"
+      },
+      {
+        "key": "compress_archive",
+        "name": "compress_archive",
+        "description": "compress a folder into a zip archive"
+      },
+      {
+        "key": "read_image_licence",
+        "name": "read_image_licence",
+        "description": "read the licence attached to a stock image"
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "test-failure",
+      "phase": "verify",
+      "query": "テストが失敗した原因を調べたい",
+      "useful": [
+        "run_tests",
+        "read_file",
+        "grep",
+        "git_log",
+        "git_diff",
+        "git_blame"
+      ],
+      "note": "手段として役に立つものを含む。単体で依頼を達成するものだけではない"
+    },
+    {
+      "id": "dependency-update",
+      "phase": "implement",
+      "query": "依存を更新して壊れていないか確かめたい",
+      "useful": [
+        "update_deps",
+        "run_tests",
+        "build_project",
+        "audit_deps",
+        "git_diff"
+      ]
+    },
+    {
+      "id": "production-incident",
+      "phase": "verify",
+      "query": "本番で応答が遅い。原因を特定したい",
+      "useful": [
+        "read_metrics",
+        "read_logs",
+        "git_log",
+        "rollback"
+      ],
+      "note": "設計時点で最も曖昧な課題。中間帯が広がることが分かっている"
+    },
+    {
+      "id": "image-size",
+      "phase": "implement",
+      "query": "画像のファイルサイズを小さくしたい",
+      "useful": [
+        "resize_assets"
+      ],
+      "note": "字句一致では引けない。依頼と説明の語彙が重ならないため、この課題が字句段の限界を測る"
+    },
+    {
+      "id": "write-up",
+      "phase": "deliver",
+      "query": "変更内容をチームへ知らせたい",
+      "useful": [
+        "slack_post",
+        "create_ticket",
+        "git_diff"
+      ]
+    }
+  ]
+}

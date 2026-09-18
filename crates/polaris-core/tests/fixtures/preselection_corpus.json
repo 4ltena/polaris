@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "note": "事前選定の比較に使う固定コーパス。合成であり、実カタログではない。正解ラベルは設計時の判断であって、実作業で有用性を確認した結果ではない。これを書き換えると過去の測定値と比較できなくなるので、変えるときは版を上げて別ファイルにする。",
+  "servers": {
+    "files": [
+      { "key": "read_file", "name": "read_file", "description": "read a file from the workspace" },
+      { "key": "write_file", "name": "write_file", "description": "write a file in the workspace" },
+      { "key": "grep", "name": "grep", "description": "search file contents by pattern" },
+      { "key": "list_dir", "name": "list_dir", "description": "list the entries of a directory" },
+      { "key": "resize_assets", "name": "resize_assets", "description": "resize and optimize raster assets" },
+      { "key": "read_exif", "name": "read_exif", "description": "read image metadata without modifying the file" }
+    ],
+    "vcs": [
+      { "key": "git_log", "name": "git_log", "description": "show the commit history of a path" },
+      { "key": "git_blame", "name": "git_blame", "description": "show who last changed each line" },
+      { "key": "git_diff", "name": "git_diff", "description": "show the working tree changes" },
+      { "key": "open_pr", "name": "open_pr", "description": "open a pull request on the remote" }
+    ],
+    "build": [
+      { "key": "run_tests", "name": "run_tests", "description": "run the project's test suite" },
+      { "key": "build_project", "name": "build_project", "description": "compile the project" },
+      { "key": "lint", "name": "lint", "description": "run the linter over the project" },
+      { "key": "update_deps", "name": "update_deps", "description": "update dependency versions and the lockfile" },
+      { "key": "audit_deps", "name": "audit_deps", "description": "check dependencies for known advisories" }
+    ],
+    "ops": [
+      { "key": "deploy", "name": "deploy", "description": "deploy the current build to production" },
+      { "key": "rollback", "name": "rollback", "description": "roll the production deployment back" },
+      { "key": "read_logs", "name": "read_logs", "description": "read recent production logs" },
+      { "key": "read_metrics", "name": "read_metrics", "description": "read production latency and error rates" },
+      { "key": "restart_service", "name": "restart_service", "description": "restart a production service" }
+    ],
+    "comms": [
+      { "key": "slack_post", "name": "slack_post", "description": "post a message to a channel" },
+      { "key": "send_email", "name": "send_email", "description": "send an email to a mailing list" },
+      { "key": "create_ticket", "name": "create_ticket", "description": "create an issue in the tracker" },
+      { "key": "search_docs", "name": "search_docs", "description": "search the team's written documents" }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "test-failure",
+      "phase": "verify",
+      "query": "テストが失敗した原因を調べたい",
+      "useful": ["run_tests", "read_file", "grep", "git_log", "git_diff", "git_blame"],
+      "note": "手段として役に立つものを含む。単体で依頼を達成するものだけではない"
+    },
+    {
+      "id": "dependency-update",
+      "phase": "implement",
+      "query": "依存を更新して壊れていないか確かめたい",
+      "useful": ["update_deps", "run_tests", "build_project", "audit_deps", "git_diff"]
+    },
+    {
+      "id": "production-incident",
+      "phase": "verify",
+      "query": "本番で応答が遅い。原因を特定したい",
+      "useful": ["read_metrics", "read_logs", "git_log", "rollback"],
+      "note": "設計時点で最も曖昧な課題。中間帯が広がることが分かっている"
+    },
+    {
+      "id": "image-size",
+      "phase": "implement",
+      "query": "画像のファイルサイズを小さくしたい",
+      "useful": ["resize_assets"],
+      "note": "字句一致では引けない。依頼と説明の語彙が重ならないため、この課題が字句段の限界を測る"
+    },
+    {
+      "id": "write-up",
+      "phase": "deliver",
+      "query": "変更内容をチームへ知らせたい",
+      "useful": ["slack_post", "create_ticket", "git_diff"]
+    }
+  ]
+}

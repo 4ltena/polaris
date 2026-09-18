@@ -1,8 +1,12 @@
 //! Owned desktop worker completion, cancellation, and trusted input boundary tests.
 use super::*;
+use polaris_desktop_protocol::ids::RunId;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+mod history;
+mod mcp_entry;
+use crate::mcp::runtime::test_fixture as mcp_server;
 
 #[derive(Clone, Copy)]
 enum Behavior {
@@ -100,13 +104,17 @@ fn fixture(
     });
     let mut session = Session::new();
     session.push_user("fixture input");
+    let (_store_root, writer, target) = history::writer_for(run_id.clone(), "fixture input", None);
     let input = DesktopRunInput {
-        run_id,
+        target: target.clone(),
         prepared,
         execution,
         provider: provider.clone(),
         provider_pool: provider,
         session,
+        request_context: DesktopRequestContext::Prepared(
+            writer.project_request_history(&target).unwrap(),
+        ),
         always_on: crate::prompt::assemble_always_on("", "", &[]),
         skills: vec![],
         agent_types: vec![],
@@ -315,11 +323,14 @@ fn tool_retention_shortens_requests_but_completion_returns_original_raw_history(
             request: polaris_provider::CompletionRequest,
         ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError> {
             assert!(
-                request.messages[1]
+                request.messages[2]
                     .content
                     .starts_with("[Stored tool result ")
             );
-            assert!(request.messages[1].content.len() < 1000);
+            // Well under the 5,100-byte body below. The bound is the excerpt
+            // budget plus the retrieval instructions, not the 128 characters
+            // a preview used to be.
+            assert!(request.messages[2].content.len() < 2000);
             Ok(polaris_provider::CompletionResponse {
                 text: "done".into(),
                 ..Default::default()
@@ -328,7 +339,7 @@ fn tool_retention_shortens_requests_but_completion_returns_original_raw_history(
     }
     let (_temp, mut input, _requests, _) = fixture(Behavior::Complete);
     let evidence = "original evidence\n".repeat(300);
-    input.session.messages = vec![
+    let old_messages = vec![
         polaris_provider::Message::assistant_with_tool_calls(
             "",
             vec![polaris_provider::ToolCall {
@@ -338,8 +349,8 @@ fn tool_retention_shortens_requests_but_completion_returns_original_raw_history(
             }],
         ),
         polaris_provider::Message::tool_result("old-call", &evidence),
-        polaris_provider::Message::user("continue"),
     ];
+    history::continue_after(&mut input, "continue", old_messages);
     input.session.tool_memory = Some(crate::tool_memory::ToolMemory {
         backend: Arc::new(Memory),
         mode: crate::tool_memory::RetentionMode::Retrieval,
@@ -349,7 +360,7 @@ fn tool_retention_shortens_requests_but_completion_returns_original_raw_history(
     let (mut worker, _events) = DesktopRun::start(input).unwrap();
     let completion = joined(&mut worker);
     assert!(completion.result.is_ok());
-    assert_eq!(completion.session.messages[1].content, evidence);
+    assert_eq!(completion.session.messages[2].content, evidence);
     assert_eq!(completion.session.messages.last().unwrap().content, "done");
 }
 
@@ -532,8 +543,8 @@ fn wrong_run_missing_grant_and_other_prepared_policy_make_no_provider_calls() {
         let (_temp, mut input, _requests, calls) = fixture(Behavior::Complete);
         let (_other_temp, other, _other_requests, _) = fixture(Behavior::Complete);
         match mismatch {
-            0 => input.run_id = RunId::new("wrong-run").unwrap(),
-            1 => input.execution = ExecutionPort::channel(input.run_id.clone()).0,
+            0 => input.target.run_id = RunId::new("wrong-run").unwrap(),
+            1 => input.execution = ExecutionPort::channel(input.target.run_id.clone()).0,
             _ => input.execution = other.execution,
         }
         assert!(matches!(

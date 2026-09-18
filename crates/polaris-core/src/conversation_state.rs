@@ -5,7 +5,7 @@
 //! SQLite tombstones are owned by the memory layer: its transaction must enclose
 //! `publish` when publishing indexed summaries. This module does not authorize reads.
 
-use crate::workflow::{WORKFLOW_SCHEMA_VERSION, WorkflowGatesV1, WorkflowStateV1};
+use crate::workflow::{WORKFLOW_SCHEMA_VERSION, WorkflowConfig, WorkflowGatesV1, WorkflowStateV1};
 use polaris_provider::{Message, Role};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +18,9 @@ use std::{
 
 pub const SCHEMA_VERSION: u32 = 2;
 pub const REAL_TURN_WINDOW: usize = 10;
+pub const SAVED_WORKFLOW_CONFIG_SCHEMA_VERSION: u32 = 1;
+
+pub(crate) mod structured_attempt;
 
 pub use polaris_desktop_protocol::snapshot::HistoryMode;
 
@@ -28,6 +31,47 @@ pub struct AncestorRange {
     pub epoch: u64,
     pub generation: u64,
     pub visible_summary_ids: Vec<String>,
+    /// Exact v3 publication IDs granted at fork time. Missing legacy markers
+    /// grant no structured-memory rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_structured_publication_ids: Vec<String>,
+}
+
+/// Extracted source prefix committed with a v3 publication. It is marker state,
+/// not a source of raw text and is intentionally absent until M3-2 publishes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredCoverage {
+    pub epoch: u64,
+    pub last_source_sequence: u64,
+    pub raw_offset: u64,
+    pub prefix_hash: String,
+}
+
+/// The whole workflow configuration is durable session state.  The wrapper
+/// version lets a newer writer reject unknown configurations rather than
+/// silently dropping fields while publishing a later state marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedWorkflowConfigV1 {
+    pub schema_version: u32,
+    pub config: WorkflowConfig,
+}
+
+impl SavedWorkflowConfigV1 {
+    pub fn capture(config: &WorkflowConfig) -> Self {
+        Self {
+            schema_version: SAVED_WORKFLOW_CONFIG_SCHEMA_VERSION,
+            config: config.clone(),
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.schema_version != SAVED_WORKFLOW_CONFIG_SCHEMA_VERSION {
+            return Err(invalid("未対応のworkflow設定保存形式です"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +88,14 @@ pub struct ConversationStateV2 {
     pub history_mode: HistoryMode,
     pub recent_turn_ids: Vec<u64>,
     pub visible_summary_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_structured_publication_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_coverage: Option<StructuredCoverage>,
+    /// Missing only in sessions written before workflow configuration became
+    /// durable. Those are initialized explicitly by `restore_workflow`.
+    #[serde(default)]
+    pub workflow_config: Option<SavedWorkflowConfigV1>,
     pub workflow: WorkflowStateV1,
     pub gates: WorkflowGatesV1,
     pub ancestors: Vec<AncestorRange>,
@@ -62,6 +114,9 @@ impl ConversationStateV2 {
             history_mode: HistoryMode::Legacy,
             recent_turn_ids: Vec::new(),
             visible_summary_ids: Vec::new(),
+            visible_structured_publication_ids: Vec::new(),
+            structured_coverage: None,
+            workflow_config: None,
             workflow: WorkflowStateV1::default(),
             gates: WorkflowGatesV1::default(),
             ancestors: Vec::new(),
@@ -73,6 +128,10 @@ impl ConversationStateV2 {
         if self.schema_version != SCHEMA_VERSION
             || self.workflow.schema_version != WORKFLOW_SCHEMA_VERSION
             || self.gates.schema_version != WORKFLOW_SCHEMA_VERSION
+            || self
+                .workflow_config
+                .as_ref()
+                .is_some_and(|config| config.validate().is_err())
         {
             return Err(invalid("未対応のセッション保存形式です"));
         }
@@ -88,8 +147,41 @@ impl ConversationStateV2 {
                 .collect::<BTreeSet<_>>()
                 .len()
                 != self.visible_summary_ids.len()
+            || self
+                .visible_structured_publication_ids
+                .iter()
+                .any(|id| id.is_empty())
+            || self
+                .visible_structured_publication_ids
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.visible_structured_publication_ids.len()
+            || self.structured_coverage.as_ref().is_some_and(|coverage| {
+                coverage.epoch != self.epoch
+                    || coverage.last_source_sequence == 0
+                    || !valid_hash(&coverage.prefix_hash)
+            })
+            || (self.history_mode != HistoryMode::Structured10
+                && (!self.visible_structured_publication_ids.is_empty()
+                    || self.structured_coverage.is_some()
+                    || self
+                        .ancestors
+                        .iter()
+                        .any(|ancestor| !ancestor.visible_structured_publication_ids.is_empty())))
             || self.ancestors.iter().any(|ancestor| {
-                !valid_session_id(&ancestor.session_id) || ancestor.session_id == self.session_id
+                !valid_session_id(&ancestor.session_id)
+                    || ancestor.session_id == self.session_id
+                    || ancestor
+                        .visible_structured_publication_ids
+                        .iter()
+                        .any(|id| id.is_empty())
+                    || ancestor
+                        .visible_structured_publication_ids
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        != ancestor.visible_structured_publication_ids.len()
             })
         {
             return Err(invalid("セッション状態の識別子・範囲が不正です"));
@@ -145,47 +237,50 @@ impl ConversationSnapshot {
     }
     /// Expired turns must not split a function call/result group.
     pub fn validate_complete_turn(&self, turn_id: u64) -> io::Result<()> {
-        let events: Vec<_> = self
-            .events
-            .iter()
-            .filter(|event| event.epoch == self.state.epoch && event.turn_id == turn_id)
-            .collect();
-        if !events.first().is_some_and(|event| event.starts_turn) {
-            return Err(invalid("原文ターンがありません"));
-        }
-        let mut pending = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        for event in events {
-            let msg = &event.message;
-            if !pending.is_empty() && msg.role != Role::Tool {
-                return Err(invalid("tool結果が未完了です"));
-            }
-            for call in &msg.tool_calls {
-                if msg.role != Role::Assistant
-                    || call.id.is_empty()
-                    || !seen.insert(call.id.clone())
-                {
-                    return Err(invalid("tool呼出しIDが不正です"));
-                }
-                pending.insert(call.id.clone());
-            }
-            if msg.role == Role::Tool {
-                if !msg
-                    .tool_call_id
-                    .as_ref()
-                    .is_some_and(|id| pending.remove(id))
-                {
-                    return Err(invalid("対応しないtool結果です"));
-                }
-            } else if msg.tool_call_id.is_some() {
-                return Err(invalid("tool以外に結果IDがあります"));
-            }
-        }
-        if !pending.is_empty() {
+        validate_complete_turn_events(
+            self.events
+                .iter()
+                .filter(|event| event.epoch == self.state.epoch && event.turn_id == turn_id),
+        )
+    }
+}
+
+pub(crate) fn validate_complete_turn_events<'a>(
+    events: impl Iterator<Item = &'a RawEventV2>,
+) -> io::Result<()> {
+    let mut events = events.peekable();
+    if !events.peek().is_some_and(|event| event.starts_turn) {
+        return Err(invalid("原文ターンがありません"));
+    }
+    let mut pending = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    for event in events {
+        let msg = &event.message;
+        if !pending.is_empty() && msg.role != Role::Tool {
             return Err(invalid("tool結果が未完了です"));
         }
-        Ok(())
+        for call in &msg.tool_calls {
+            if msg.role != Role::Assistant || call.id.is_empty() || !seen.insert(call.id.clone()) {
+                return Err(invalid("tool呼出しIDが不正です"));
+            }
+            pending.insert(call.id.clone());
+        }
+        if msg.role == Role::Tool {
+            if !msg
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| pending.remove(id))
+            {
+                return Err(invalid("対応しないtool結果です"));
+            }
+        } else if msg.tool_call_id.is_some() {
+            return Err(invalid("tool以外に結果IDがあります"));
+        }
     }
+    if !pending.is_empty() {
+        return Err(invalid("tool結果が未完了です"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +298,8 @@ impl ConversationStore {
             || state.raw_commit_hash != content_hash(&[])
             || !state.recent_turn_ids.is_empty()
             || !state.visible_summary_ids.is_empty()
+            || !state.visible_structured_publication_ids.is_empty()
+            || state.structured_coverage.is_some()
         {
             return Err(invalid("新規セッションの状態が不正です"));
         }
@@ -286,6 +383,14 @@ impl ConversationStore {
                 return Err(invalid("原文snapshotのepochが不正です"));
             }
         }
+        if let Some(coverage) = &snapshot.state.structured_coverage {
+            validate_coverage_boundary(
+                &raw,
+                &snapshot,
+                snapshot.state.raw_commit_offset,
+                coverage,
+            )?;
+        }
         Ok(snapshot)
     }
     /// The v2 root inferred from this session's fixed directory layout.
@@ -338,6 +443,7 @@ impl LockedConversation<'_> {
         }
         let mut next = ConversationStateV2::new(snapshot.state.project_id.clone(), new_id.into())?;
         next.history_mode = snapshot.state.history_mode;
+        next.workflow_config = snapshot.state.workflow_config.clone();
         next.workflow = snapshot.state.workflow.clone();
         next.gates = snapshot.state.gates.for_fork(artifact_hash);
         next.ancestors = snapshot.state.ancestors.clone();
@@ -346,6 +452,10 @@ impl LockedConversation<'_> {
             epoch: snapshot.state.epoch,
             generation: snapshot.state.generation,
             visible_summary_ids: snapshot.state.visible_summary_ids.clone(),
+            visible_structured_publication_ids: snapshot
+                .state
+                .visible_structured_publication_ids
+                .clone(),
         });
         let child = ConversationStore::create(data_root, next)?;
         let mut lock = child.lock()?;
@@ -397,12 +507,21 @@ impl LockedConversation<'_> {
             }
             events.push(event);
         }
-        Ok(ConversationSnapshot {
+        let snapshot = ConversationSnapshot {
             state,
             raw_hash: content_hash(&bytes),
             raw_offset: bytes.len() as u64,
             events,
-        })
+        };
+        if let Some(coverage) = &snapshot.state.structured_coverage {
+            validate_coverage_boundary(
+                &bytes,
+                &snapshot,
+                snapshot.state.raw_commit_offset,
+                coverage,
+            )?;
+        }
+        Ok(snapshot)
     }
     pub fn append(
         &mut self,
@@ -498,6 +617,7 @@ impl LockedConversation<'_> {
             || next.session_id != expected.state.session_id
             || next.epoch != expected.state.epoch
             || next.generation != expected.state.generation
+            || next.history_mode != expected.state.history_mode
         {
             return Err(invalid("公開対象の世代・所属が一致しません"));
         }
@@ -510,6 +630,10 @@ impl LockedConversation<'_> {
         let turns = expected.active_turns();
         next.recent_turn_ids = turns.into_iter().rev().take(REAL_TURN_WINDOW).collect();
         next.recent_turn_ids.reverse();
+        if let Some(coverage) = &next.structured_coverage {
+            let bytes = fs::read(self.store.directory.join("raw.jsonl"))?;
+            validate_coverage_boundary(&bytes, expected, expected.raw_offset, coverage)?;
+        }
         next.validate()?;
         fail_point("marker")?;
         atomic_write(
@@ -533,6 +657,8 @@ impl LockedConversation<'_> {
         next.raw_commit_offset = snapshot.raw_offset;
         next.recent_turn_ids.clear();
         next.visible_summary_ids.clear();
+        next.visible_structured_publication_ids.clear();
+        next.structured_coverage = None;
         next.ancestors.clear();
         atomic_write(
             &self.store.directory.join("state.json"),
@@ -541,7 +667,45 @@ impl LockedConversation<'_> {
     }
 }
 
-fn validate_event(event: &RawEventV2, previous: Option<&RawEventV2>) -> io::Result<()> {
+pub(crate) fn validate_coverage_boundary(
+    bytes: &[u8],
+    expected: &ConversationSnapshot,
+    committed_offset: u64,
+    coverage: &StructuredCoverage,
+) -> io::Result<()> {
+    if coverage.epoch != expected.state.epoch
+        || committed_offset > expected.raw_offset
+        || coverage.raw_offset > committed_offset
+    {
+        return Err(invalid(
+            "構造化記憶のcoverageが保存済み原文境界と一致しません",
+        ));
+    }
+    if bytes.len() as u64 != expected.raw_offset || content_hash(bytes) != expected.raw_hash {
+        return Err(invalid("構造化記憶のcoverage原文が一致しません"));
+    }
+    let covered = usize::try_from(coverage.raw_offset)
+        .map_err(|_| invalid("構造化記憶のcoverage範囲が不正です"))?;
+    if content_hash(&bytes[..covered]) != coverage.prefix_hash {
+        return Err(invalid("構造化記憶のcoverage hashが一致しません"));
+    }
+    let mut offset = 0usize;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        offset = offset
+            .checked_add(line.len())
+            .ok_or_else(|| invalid("原文offsetが上限です"))?;
+        let event: RawEventV2 = serde_json::from_slice(line)?;
+        if event.epoch == coverage.epoch
+            && event.sequence == coverage.last_source_sequence
+            && offset as u64 == coverage.raw_offset
+        {
+            return Ok(());
+        }
+    }
+    Err(invalid("構造化記憶のcoverage sourceが一致しません"))
+}
+
+pub(crate) fn validate_event(event: &RawEventV2, previous: Option<&RawEventV2>) -> io::Result<()> {
     if event.schema_version != SCHEMA_VERSION
         || event.sequence != previous.map_or(1, |event| event.sequence.saturating_add(1))
         || event.turn_id == 0
@@ -580,7 +744,7 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 #[cfg(test)]
-thread_local! { static FAIL_POINT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
+thread_local! { pub(crate) static FAIL_POINT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 fn fail_point(_point: &str) -> io::Result<()> {
     #[cfg(test)]
     if FAIL_POINT.with(|point| point.get() == Some(_point)) {
@@ -625,8 +789,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = private_file(&temporary, true)?;
     // On failure leave the private temporary file for recovery, never remove raw.
     file.write_all(bytes)?;
+    fail_point("atomic_file_sync")?;
     file.sync_all()?;
+    fail_point("atomic_rename")?;
     fs::rename(&temporary, path)?;
+    fail_point("atomic_directory_sync")?;
     File::open(parent)?.sync_all()
 }
 
@@ -635,11 +802,12 @@ mod tests {
     use super::*;
     const ID: &str = "00000000-0000-4000-8000-000000000001";
     fn store(root: &Path) -> ConversationStore {
-        ConversationStore::create(
-            root,
-            ConversationStateV2::new("project".into(), ID.into()).unwrap(),
-        )
-        .unwrap()
+        store_with_mode(root, HistoryMode::Legacy)
+    }
+    fn store_with_mode(root: &Path, history_mode: HistoryMode) -> ConversationStore {
+        let mut state = ConversationStateV2::new("project".into(), ID.into()).unwrap();
+        state.history_mode = history_mode;
+        ConversationStore::create(root, state).unwrap()
     }
     #[test]
     fn roundtrip_publishes_gates_and_detects_stale_snapshot() {
@@ -669,6 +837,181 @@ mod tests {
         );
         assert!(lock.publish(&old, old.state.clone()).is_err());
         assert!(!dir.path().join("sessions").exists());
+    }
+    #[test]
+    fn structured_marker_is_opt_in_and_fork_freezes_exact_v3_publication_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_mode(dir.path(), HistoryMode::Structured10);
+        let mut lock = store.lock().unwrap();
+        let snapshot = lock.append(Message::user("question"), true).unwrap();
+        let mut next = snapshot.state.clone();
+        next.visible_structured_publication_ids = vec!["publication-v3".into()];
+        next.structured_coverage = Some(StructuredCoverage {
+            epoch: 0,
+            last_source_sequence: 1,
+            raw_offset: snapshot.raw_offset,
+            prefix_hash: snapshot.raw_hash.clone(),
+        });
+        lock.publish(&snapshot, next).unwrap();
+        let child = lock
+            .fork(
+                dir.path(),
+                "00000000-0000-4000-8000-000000000002",
+                "artifact",
+            )
+            .unwrap();
+        let child_state = child.lock().unwrap().snapshot().unwrap().state;
+        assert!(child_state.visible_structured_publication_ids.is_empty());
+        assert_eq!(
+            child_state
+                .ancestors
+                .last()
+                .unwrap()
+                .visible_structured_publication_ids,
+            ["publication-v3"]
+        );
+        assert!(child_state.structured_coverage.is_none());
+    }
+    #[test]
+    fn coverage_requires_a_committed_raw_boundary_and_mode_never_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_mode(dir.path(), HistoryMode::Structured10);
+        let raw_path = store.directory().join("raw.jsonl");
+        let mut lock = store.lock().unwrap();
+        let snapshot = lock.append(Message::user("first"), true).unwrap();
+        let mut next = snapshot.state.clone();
+        next.visible_structured_publication_ids = vec!["publication-v3".into()];
+        next.structured_coverage = Some(StructuredCoverage {
+            epoch: snapshot.state.epoch,
+            last_source_sequence: snapshot.events.last().unwrap().sequence,
+            raw_offset: snapshot.raw_offset,
+            prefix_hash: snapshot.raw_hash.clone(),
+        });
+        lock.publish(&snapshot, next).unwrap();
+        let expected = lock.append(Message::user("second"), true).unwrap();
+        let raw_before = fs::read(&raw_path).unwrap();
+        let state_before = expected.state.clone();
+        for change in [0, 1, 2, 3] {
+            let mut invalid = expected.state.clone();
+            invalid.visible_structured_publication_ids = vec!["publication-v3".into()];
+            invalid.structured_coverage = Some(StructuredCoverage {
+                epoch: expected.state.epoch,
+                last_source_sequence: expected.events.last().unwrap().sequence,
+                raw_offset: expected.raw_offset,
+                prefix_hash: expected.raw_hash.clone(),
+            });
+            match change {
+                0 => invalid.structured_coverage.as_mut().unwrap().raw_offset -= 1,
+                1 => {
+                    invalid.structured_coverage.as_mut().unwrap().prefix_hash =
+                        content_hash(b"forged")
+                }
+                2 => {
+                    invalid
+                        .structured_coverage
+                        .as_mut()
+                        .unwrap()
+                        .last_source_sequence += 1
+                }
+                3 => invalid.history_mode = HistoryMode::Strict10,
+                _ => unreachable!(),
+            }
+            assert!(lock.publish(&expected, invalid).is_err(), "tamper {change}");
+            assert_eq!(fs::read(&raw_path).unwrap(), raw_before);
+            assert_eq!(lock.snapshot().unwrap().state, state_before);
+        }
+        drop(lock);
+        let state_path = store.directory().join("state.json");
+        let mut persisted: ConversationStateV2 =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let coverage = persisted.structured_coverage.as_mut().unwrap();
+        coverage.last_source_sequence = expected.events.last().unwrap().sequence;
+        coverage.raw_offset = expected.raw_offset;
+        coverage.prefix_hash = expected.raw_hash.clone();
+        fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        assert!(store.lock().unwrap().snapshot().is_err());
+        assert_eq!(fs::read(&raw_path).unwrap(), raw_before);
+    }
+    #[test]
+    fn legacy_and_strict_markers_reject_structured_metadata() {
+        for mode in [HistoryMode::Legacy, HistoryMode::Strict10] {
+            let mut state = ConversationStateV2::new("project".into(), ID.into()).unwrap();
+            state.history_mode = mode;
+            assert!(state.validate().is_ok());
+            state
+                .visible_structured_publication_ids
+                .push("publication-v3".into());
+            assert!(state.validate().is_err());
+            state.visible_structured_publication_ids.clear();
+            state.ancestors.push(AncestorRange {
+                session_id: "00000000-0000-4000-8000-000000000002".into(),
+                epoch: 0,
+                generation: 0,
+                visible_summary_ids: vec![],
+                visible_structured_publication_ids: vec!["publication-v3".into()],
+            });
+            assert!(state.validate().is_err());
+        }
+    }
+    #[test]
+    fn new_structured_sessions_cannot_pregrant_publications_or_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut valid = ConversationStateV2::new("project".into(), ID.into()).unwrap();
+        valid.history_mode = HistoryMode::Structured10;
+        assert!(ConversationStore::create(dir.path(), valid).is_ok());
+        for prefilled in [true, false] {
+            let id = if prefilled {
+                "00000000-0000-4000-8000-000000000003"
+            } else {
+                "00000000-0000-4000-8000-000000000004"
+            };
+            let mut state = ConversationStateV2::new("project".into(), id.into()).unwrap();
+            state.history_mode = HistoryMode::Structured10;
+            if prefilled {
+                state
+                    .visible_structured_publication_ids
+                    .push("publication-v3".into());
+            } else {
+                state.structured_coverage = Some(StructuredCoverage {
+                    epoch: 0,
+                    last_source_sequence: 1,
+                    raw_offset: 0,
+                    prefix_hash: content_hash(&[]),
+                });
+            }
+            assert!(ConversationStore::create(dir.path(), state).is_err());
+            assert!(!dir.path().join("sessions-v2").join(id).exists());
+        }
+    }
+    #[test]
+    fn structured_clear_removes_v3_grants_and_coverage_but_retains_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_mode(dir.path(), HistoryMode::Structured10);
+        let mut lock = store.lock().unwrap();
+        let snapshot = lock.append(Message::user("retain raw"), true).unwrap();
+        let mut next = snapshot.state.clone();
+        next.visible_structured_publication_ids = vec!["current-publication".into()];
+        next.structured_coverage = Some(StructuredCoverage {
+            epoch: 0,
+            last_source_sequence: 1,
+            raw_offset: snapshot.raw_offset,
+            prefix_hash: snapshot.raw_hash.clone(),
+        });
+        next.ancestors.push(AncestorRange {
+            session_id: "00000000-0000-4000-8000-000000000002".into(),
+            epoch: 0,
+            generation: 1,
+            visible_summary_ids: vec![],
+            visible_structured_publication_ids: vec!["ancestor-publication".into()],
+        });
+        lock.publish(&snapshot, next).unwrap();
+        let raw = fs::read(store.directory().join("raw.jsonl")).unwrap();
+        lock.clear_epoch().unwrap();
+        let cleared = lock.snapshot().unwrap();
+        assert!(cleared.state.visible_structured_publication_ids.is_empty());
+        assert!(cleared.state.structured_coverage.is_none());
+        assert!(cleared.state.ancestors.is_empty());
+        assert_eq!(fs::read(store.directory().join("raw.jsonl")).unwrap(), raw);
     }
     #[test]
     fn ten_real_turns_exclude_examples_and_retain_raw() {
@@ -842,7 +1185,7 @@ mod tests {
     fn fork_copies_only_ten_turns_and_freezes_parent_generation_without_grants() {
         use crate::workflow::{ExternalGrant, VerificationEvidence};
         let dir = tempfile::tempdir().unwrap();
-        let parent = store(dir.path());
+        let parent = store_with_mode(dir.path(), HistoryMode::Strict10);
         let mut lock = parent.lock().unwrap();
         for turn in 1..=12 {
             lock.append(Message::user(format!("turn {turn}")), true)
@@ -850,7 +1193,6 @@ mod tests {
         }
         let snapshot = lock.snapshot().unwrap();
         let mut next = snapshot.state.clone();
-        next.history_mode = HistoryMode::Strict10;
         next.gates.verification = Some(VerificationEvidence {
             artifact_hash: "old".into(),
             passed: true,

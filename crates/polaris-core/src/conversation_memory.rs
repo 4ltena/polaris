@@ -9,13 +9,21 @@ use polaris_memory::{
 };
 use std::{io, path::Path};
 
+pub mod observation;
+pub(crate) mod related;
 mod strict_history;
+pub mod structured;
+mod structured_owner;
 pub use strict_history::{
     EmbeddingModel, LocalStdioEmbedder, PreparedHistory, ResolvedConversationSource,
     StrictEmbedder, StrictHistory, StrictRecovery, StrictSummaryProvider, SummaryRequest,
     read_source, resolve_conversation_uri,
 };
 pub(crate) use strict_history::{parse_uri, source_page, summary_evidence, validate_summary};
+pub(crate) use structured_owner::reject_unpublished_structured_attempt;
+pub use structured_owner::{
+    StructuredSummaryWork, begin_structured_summary, save_structured_summary_response,
+};
 
 fn number(value: u64) -> io::Result<i64> {
     value
@@ -67,6 +75,11 @@ fn publish_summary_snapshot(
     expected: &ConversationSnapshot,
     pending: &PendingSummary,
 ) -> io::Result<ConversationSnapshot> {
+    if expected.state.history_mode == crate::conversation_state::HistoryMode::Structured10 {
+        return structured_owner::publish_structured_summary_snapshot(
+            store, database, expected, pending,
+        );
+    }
     let mut lock = store.lock()?;
     lock.check_snapshot(expected)?;
     let generation = expected

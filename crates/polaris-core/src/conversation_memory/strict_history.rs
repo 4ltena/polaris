@@ -33,6 +33,11 @@ const MAX_SOURCE_TOKENS: usize = 1024;
 const MAX_HELPER_OUTPUT_BYTES: u64 = 256 * 1024;
 const MAX_HELPER_ERROR_BYTES: u64 = 16 * 1024;
 
+mod related_history;
+mod structured_history;
+#[cfg(test)]
+mod structured_tests;
+
 pub type StrictFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +54,9 @@ pub struct SummaryRequest {
     pub model: &'static str,
     pub effort: &'static str,
     pub prompt_version: &'static str,
+    /// Present only for structured10.  The provider returns the fixed outer
+    /// envelope in the same completion as the ordinary summary.
+    pub structured_sources: Option<super::structured::StructuredSummaryInput>,
 }
 
 /// A separately configured provider. The caller supplies this from its dedicated
@@ -70,6 +78,7 @@ pub struct PreparedHistory {
     pub snapshot: ConversationSnapshot,
     pub messages: Vec<Message>,
     pub retrieval: Vec<ConversationHit>,
+    pub structured: Option<super::structured::packing::StructuredContext>,
     pub published_generation: u64,
     pub published_raw_hash: String,
 }
@@ -84,11 +93,27 @@ pub struct StrictRecovery {
 pub struct StrictHistory {
     summary: Arc<dyn StrictSummaryProvider>,
     embedder: Arc<dyn StrictEmbedder>,
+    /// Optional, like every other use of the judge. It reorders the related
+    /// candidates and nothing else; without it retrieval behaves exactly as
+    /// it did before.
+    judge: Option<Arc<dyn polaris_provider::decision::Decider>>,
 }
 
 impl StrictHistory {
     pub fn new(summary: Arc<dyn StrictSummaryProvider>, embedder: Arc<dyn StrictEmbedder>) -> Self {
-        Self { summary, embedder }
+        Self {
+            summary,
+            embedder,
+            judge: None,
+        }
+    }
+
+    pub fn judged_by(
+        mut self,
+        judge: Option<Arc<dyn polaris_provider::decision::Decider>>,
+    ) -> Self {
+        self.judge = judge;
+        self
     }
 
     /// Assumes the current user message was durably appended by Session first.
@@ -110,6 +135,24 @@ impl StrictHistory {
         query: &str,
         published: &(dyn Fn(&ConversationSnapshot) -> io::Result<()> + Send + Sync),
     ) -> io::Result<PreparedHistory> {
+        let prepared = self
+            .prepare_for_session_observed(store, database, query, published)
+            .await?;
+        if let Some(context) = &prepared.structured {
+            super::observation::prepare_structured(context)?.require_dispatch()?;
+        }
+        Ok(prepared)
+    }
+
+    /// Session accepts this exact snapshot before exposing even a classified
+    /// refusal. Public preparation keeps its existing io::Result contract.
+    pub(crate) async fn prepare_for_session_observed(
+        &self,
+        store: &ConversationStore,
+        database: &Path,
+        query: &str,
+        published: &(dyn Fn(&ConversationSnapshot) -> io::Result<()> + Send + Sync),
+    ) -> io::Result<PreparedHistory> {
         if query.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -120,7 +163,18 @@ impl StrictHistory {
             .await?;
         let snapshot = store.lock()?.snapshot()?;
         let view = published_view(&snapshot.state)?;
-        let retrieval = self.retrieve(&view, database, query).await?;
+        let structured = if snapshot.state.history_mode
+            == crate::conversation_state::HistoryMode::Structured10
+        {
+            Some(self.prepare_structured_context(store, database, &snapshot, query)?)
+        } else {
+            None
+        };
+        let retrieval = if structured.is_some() {
+            Vec::new()
+        } else {
+            self.retrieve(&view, database, query).await?
+        };
         let final_snapshot = store.lock()?.snapshot()?;
         if !same_snapshot(&snapshot, &final_snapshot) {
             return Err(io::Error::other(
@@ -135,6 +189,7 @@ impl StrictHistory {
             messages: final_snapshot.recent_messages(),
             snapshot: final_snapshot,
             retrieval,
+            structured,
             published_generation: snapshot.state.generation,
             published_raw_hash: snapshot.raw_hash,
         })
@@ -182,6 +237,10 @@ impl StrictHistory {
         snapshot: ConversationSnapshot,
         turn: u64,
     ) -> io::Result<ConversationSnapshot> {
+        if snapshot.state.history_mode == crate::conversation_state::HistoryMode::Structured10 {
+            let work = super::begin_structured_summary(store, database, &snapshot, turn)?;
+            return self.publish_structured_work(store, database, work).await;
+        }
         snapshot.validate_complete_turn(turn)?;
         let generation = snapshot
             .state
@@ -219,6 +278,42 @@ impl StrictHistory {
     /// Shared processing only: callers own durable intent, publication and cancellation.
     pub(crate) fn embedding_metadata(&self) -> &EmbeddingModel {
         self.embedder.metadata()
+    }
+
+    pub(crate) async fn embed_related_query(
+        &self,
+        query: &str,
+    ) -> io::Result<super::related::EmbeddedRelatedQuery> {
+        if query.trim().is_empty()
+            || query.len() > 64 * 1024
+            || query
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 128
+        {
+            return Err(io::Error::other("関連検索の入力が上限外です"));
+        }
+        let metadata = self.embedder.metadata().clone();
+        if !(1..=4096).contains(&metadata.dimension) {
+            return Err(io::Error::other("関連検索の埋め込み次元が上限外です"));
+        }
+        let vectors = self.embedder.embed_query(query).await?;
+        if vectors.is_empty() || vectors.len() > 32 || &metadata != self.embedder.metadata() {
+            return Err(io::Error::other("関連検索の埋め込み応答が不正です"));
+        }
+        let mut parts = Vec::with_capacity(vectors.len());
+        for values in vectors {
+            validate_vector(&values, &metadata)?;
+            parts.push(QueryEmbedding {
+                model: metadata.model.clone(),
+                revision: metadata.revision.clone(),
+                dimension: metadata.dimension,
+                values,
+            });
+        }
+        Ok(super::related::EmbeddedRelatedQuery::new(query, parts))
     }
 
     pub(crate) async fn retrieve(
@@ -298,10 +393,58 @@ impl StrictHistory {
                 model: SUMMARY_MODEL,
                 effort: SUMMARY_EFFORT,
                 prompt_version: SUMMARY_PROMPT_VERSION,
+                structured_sources: None,
             })
             .await?;
         summary_evidence(snapshot, turn, &summary)?;
         Ok(summary)
+    }
+
+    pub(crate) async fn summarize_structured_turn(
+        &self,
+        snapshot: &ConversationSnapshot,
+        turn: u64,
+        intent: &super::structured::StructuredIntent,
+        database: &Path,
+        view: &polaris_memory::structured::StructuredPublicationView,
+    ) -> io::Result<super::structured::ValidatedStructuredResponse> {
+        let mut input = super::structured::summary_input(snapshot, turn, intent)?;
+        input.related_entities = {
+            let memory = MemoryStore::open(database).map_err(io::Error::other)?;
+            memory
+                .structured_entity_hints(
+                    view,
+                    &intent
+                        .sources
+                        .iter()
+                        .map(|s| s.content.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(io::Error::other)?
+        };
+        super::structured::hint_budget(&input.related_entities)?;
+        let response = self
+            .summary
+            .summarize(SummaryRequest {
+                source_turn_id: turn,
+                messages: vec![],
+                model: SUMMARY_MODEL,
+                effort: SUMMARY_EFFORT,
+                prompt_version: super::structured::STRUCTURED_PROMPT_VERSION,
+                structured_sources: Some(input),
+            })
+            .await?;
+        let memory = MemoryStore::open(database).map_err(io::Error::other)?;
+        super::structured::validate_response_with_resolver(
+            snapshot,
+            turn,
+            intent,
+            &response,
+            &super::structured::PublishedResolver {
+                memory: &memory,
+                view,
+            },
+        )
     }
 
     pub(crate) async fn embed_summary(
@@ -398,7 +541,10 @@ fn unsummarized_expired_turn(snapshot: &ConversationSnapshot) -> io::Result<Opti
     Ok(None)
 }
 
-fn turn_messages(snapshot: &ConversationSnapshot, turn: u64) -> io::Result<Vec<Message>> {
+pub(super) fn turn_messages(
+    snapshot: &ConversationSnapshot,
+    turn: u64,
+) -> io::Result<Vec<Message>> {
     snapshot.validate_complete_turn(turn)?;
     Ok(snapshot
         .events
@@ -488,18 +634,46 @@ pub fn resolve_conversation_uri(
     database: &Path,
     uri: &str,
 ) -> io::Result<ResolvedConversationSource> {
+    if uri.starts_with("conversation://structured/") {
+        return super::structured::sources::resolve_uri(store, database, uri);
+    }
     let (source_id, requested, offset) = parse_uri(uri)?;
-    let current = store.lock()?.snapshot()?;
-    let view = published_view(&current.state)?;
+    let lock = store.lock()?;
+    let current = lock.snapshot()?;
     let memory = MemoryStore::open(database).map_err(io::Error::other)?;
+    let read = || {
+        resolve_legacy_source_from_snapshot(store, &current, &memory, &source_id, requested, offset)
+    };
+    if current.state.history_mode == crate::conversation_state::HistoryMode::Structured10 {
+        super::structured_owner::with_verified_receipts(store, &current, &memory, |_| read())
+    } else {
+        read()
+    }
+}
+
+fn resolve_legacy_source_from_snapshot(
+    store: &ConversationStore,
+    current: &ConversationSnapshot,
+    memory: &MemoryStore,
+    source_id: &str,
+    requested: Option<(i64, i64)>,
+    offset: usize,
+) -> io::Result<ResolvedConversationSource> {
+    let view = published_view(&current.state)?;
     memory
-        .with_conversation_source(&view, &source_id, |reference| {
-            let source_store = ConversationStore::open(
-                store.data_root().map_err(polaris_memory::Error::Io)?,
-                &reference.scope.project_id,
-                &reference.scope.session_id,
-            )
-            .map_err(polaris_memory::Error::Io)?;
+        .with_conversation_source(&view, source_id, |reference| {
+            let parent;
+            let source_store = if reference.scope.session_id == current.state.session_id {
+                store
+            } else {
+                parent = ConversationStore::open(
+                    store.data_root().map_err(polaris_memory::Error::Io)?,
+                    &reference.scope.project_id,
+                    &reference.scope.session_id,
+                )
+                .map_err(polaris_memory::Error::Io)?;
+                &parent
+            };
             let generation: u64 =
                 reference.scope.generation.try_into().map_err(|_| {
                     polaris_memory::Error::InvalidInput("source generation is invalid")
@@ -513,6 +687,10 @@ pub fn resolve_conversation_uri(
             let snapshot = source_store
                 .load_snapshot(snapshot_generation, &reference.source.raw_hash)
                 .map_err(polaris_memory::Error::Io)?;
+            if current.state.history_mode == crate::conversation_state::HistoryMode::Structured10 {
+                verify_structured_summary_source(current, source_store, &snapshot, &reference)
+                    .map_err(polaris_memory::Error::Io)?;
+            }
             let (start, end) =
                 requested.unwrap_or((reference.source.start_turn, reference.source.end_turn));
             if start < reference.source.start_turn || end > reference.source.end_turn || start > end
@@ -547,6 +725,49 @@ pub fn resolve_conversation_uri(
             })
         })
         .map_err(io::Error::other)
+}
+
+/// Legacy summary URIs are still valid historical evidence in Structured10,
+/// but their v2 index metadata must match the paired saved extraction result.
+fn verify_structured_summary_source(
+    current: &ConversationSnapshot,
+    source_store: &ConversationStore,
+    source: &ConversationSnapshot,
+    reference: &polaris_memory::conversation::SourceReference,
+) -> io::Result<String> {
+    let invalid = || io::Error::other("過去の原文参照が構造化保存記録と一致しません");
+    let turn = u64::try_from(reference.source.start_turn).map_err(|_| invalid())?;
+    let response = source_store
+        .bound_structured_attempt(source, turn)?
+        .and_then(|receipt| receipt.response)
+        .ok_or_else(invalid)?;
+    let evidence = summary_evidence(source, turn, &response.summary)?;
+    let publication = response.delta.publication;
+    let granted = if publication.scope.session_id == current.state.session_id {
+        source.state.epoch == current.state.epoch
+            && current.state.generation > source.state.generation
+            && current
+                .state
+                .visible_structured_publication_ids
+                .contains(&publication.publication_id)
+    } else {
+        current.state.ancestors.iter().any(|ancestor| {
+            ancestor.session_id == publication.scope.session_id
+                && ancestor.epoch == source.state.epoch
+                && ancestor.generation > source.state.generation
+                && ancestor
+                    .visible_structured_publication_ids
+                    .contains(&publication.publication_id)
+        })
+    };
+    if !granted
+        || reference.summary_id != evidence.id
+        || reference.scope != evidence.scope
+        || reference.source != evidence.source
+    {
+        return Err(invalid());
+    }
+    Ok(response.summary)
 }
 
 type ParsedSourceUri = (String, Option<(i64, i64)>, usize);
@@ -592,6 +813,26 @@ pub(crate) fn source_page(
     offset: usize,
     payload: &str,
 ) -> io::Result<String> {
+    evidence_page(payload, offset, |stop| {
+        let next = if stop < payload.len() {
+            format!("conversation://{source}?start={start}&end={end}&offset={stop}")
+        } else {
+            "none".into()
+        };
+        format!(
+            "historical evidence source_id={source} turns={start}-{end} bytes={offset}-{stop}/{} next={next}",
+            payload.len()
+        )
+    })
+}
+
+/// Shared bounded UTF-8 paging. Callers supply only their immutable source
+/// metadata and continuation URI; the size/token policy is identical.
+pub(crate) fn evidence_page(
+    payload: &str,
+    offset: usize,
+    header: impl Fn(usize) -> String,
+) -> io::Result<String> {
     if offset >= payload.len() || !payload.is_char_boundary(offset) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -602,35 +843,28 @@ pub(crate) fn source_page(
     while !payload.is_char_boundary(stop) {
         stop -= 1;
     }
-    loop {
-        let next = if stop < payload.len() {
-            format!("conversation://{source}?start={start}&end={end}&offset={stop}")
-        } else {
-            "none".into()
-        };
-        let page = format!(
-            "historical evidence source_id={source} turns={start}-{end} bytes={offset}-{stop}/{} next={next}\n{}",
-            payload.len(),
-            &payload[offset..stop]
-        );
-        if page.len() <= MAX_SOURCE_BYTES
-            && tiktoken_rs::o200k_base_singleton()
-                .encode_with_special_tokens(&page)
-                .len()
-                <= MAX_SOURCE_TOKENS
+    while stop > offset {
+        let page = format!("{}\n{}", header(stop), &payload[offset..stop]);
+        if page.len() <= MAX_SOURCE_BYTES && crate::budget::count_tokens(&page) <= MAX_SOURCE_TOKENS
         {
             return Ok(page);
         }
-        if stop == offset {
-            return Err(io::Error::other("source metadata exceeds recovery budget"));
-        }
-        // Remove a bounded chunk, always at a UTF-8 boundary. Continuation uses
-        // immutable payload byte offsets, so pages never skip or duplicate data.
-        stop = offset + (stop - offset).saturating_sub(64);
-        while !payload.is_char_boundary(stop) {
-            stop -= 1;
+        if stop - offset > 64 {
+            stop -= 64;
+            while !payload.is_char_boundary(stop) {
+                stop -= 1;
+            }
+        } else {
+            // A whole final chunk may not fit while one scalar still does.
+            stop = offset
+                + payload[offset..stop]
+                    .char_indices()
+                    .next_back()
+                    .expect("nonempty UTF-8 prefix")
+                    .0;
         }
     }
+    Err(io::Error::other("source metadata exceeds recovery budget"))
 }
 
 /// Fixed-argv, offline stdio configuration. The runtime is intentionally not
@@ -938,7 +1172,8 @@ mod tests {
         std::fs::create_dir(&temporary).unwrap();
         let helper = root.path().join("fixture.py");
         // Deterministic process fixture: no model, packages, network or subprocesses.
-        std::fs::write(&helper, "import os, sys, time\nfrom pathlib import Path\nroot = Path(sys.argv[sys.argv.index('--model-path') + 1])\n(root / 'pid').write_text(str(os.getpid()))\nwhile True: time.sleep(0.01)\n").unwrap();
+        // Publish readiness atomically, after the PID contents are complete.
+        std::fs::write(&helper, "import os, sys, time\nfrom pathlib import Path\nroot = Path(sys.argv[sys.argv.index('--model-path') + 1])\n(root / 'pid.tmp').write_text(str(os.getpid()))\nos.replace(root / 'pid.tmp', root / 'pid')\nwhile True: time.sleep(0.01)\n").unwrap();
         let ledger = AttemptLedger::default();
         let mut embedder = LocalStdioEmbedder::new(
             "/usr/bin/python3".into(),
@@ -1125,6 +1360,19 @@ mod tests {
         assert_eq!(payload, recovered);
         assert!(parse_uri("conversation://source-1?offset=1&offset=2").is_err());
         assert!(source_page("source-1", 1, 1, 1, &payload).is_err());
+    }
+
+    #[test]
+    fn source_paging_refuses_metadata_that_leaves_no_forward_progress() {
+        assert!(evidence_page("a", 0, |_| "x".repeat(MAX_SOURCE_BYTES - 1)).is_err());
+        let one = evidence_page("aa", 0, |_| " ".repeat(MAX_SOURCE_BYTES - 2)).unwrap();
+        assert_eq!(one.split_once('\n').unwrap().1, "a");
+        let scalar = evidence_page("あa", 0, |_| " ".repeat(MAX_SOURCE_BYTES - 4)).unwrap();
+        assert_eq!(scalar.split_once('\n').unwrap().1, "あ");
+        assert_eq!(
+            evidence_page("a", 0, |_| "evidence".into()).unwrap(),
+            "evidence\na"
+        );
     }
 
     #[tokio::test]

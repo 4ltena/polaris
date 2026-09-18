@@ -167,6 +167,19 @@ fn start_at(
 ) -> Result<StartedOwner, StartupError> {
     let root =
         DesktopRoot::open_owned(&args.store.store_root).map_err(|_| StartupError::Generic)?;
+    // M6-5: record new private copies here, and remove the ones a killed
+    // process left behind. A sweep failure never stops the owner.
+    polaris_core::scratch_registry::install(&args.store.store_root);
+    let _ = polaris_core::scratch_registry::sweep(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs()),
+        polaris_core::scratch_registry::RETENTION_SECONDS,
+        |pid| {
+            // SAFETY: signal 0 only tests for the process; it delivers nothing.
+            unsafe { libc::kill(pid as i32, 0) == 0 }
+        },
+    );
     if root.identity().map_err(|_| StartupError::Generic)?
         != (
             args.store_identity.device.get(),
@@ -200,6 +213,16 @@ fn start_at(
     // Reject unsupported/missing memory resources before local model discovery
     // or any credential-backed client construction. Configuration-save services
     // never enter this production-only startup path.
+    let mcp_store = polaris_mcp::store::Store::open(home).map_err(|_| StartupError::Generic)?;
+    // A source that cannot be registered is not a regular file and is never read.
+    let _ = polaris_core::mcp::setup::protect_sources(home);
+    let mcp_snapshot = mcp_store
+        .load_snapshot()
+        .map_err(|_| StartupError::Generic)?;
+    let mcp_active = (
+        mcp_snapshot.registry.as_ref().map_or(0, |r| r.revision),
+        mcp_snapshot.secrets.as_ref().map_or(0, |s| s.revision()),
+    );
     let history = crate::memory_resources::prepare(
         saved.state.configuration.history_mode,
         doc.provider,
@@ -211,12 +234,27 @@ fn start_at(
     // These existing loaders register the actual credential inode before any
     // model-visible catalog or workspace read. Never inspect their values in logs.
     let backend = match doc.provider {
-        BootstrapProvider::Codex => TrustedBackend::Codex {
-            tokens: Arc::new(
-                DesktopAuthTokens::from_trusted_store(home.join(".polaris/auth.json"))
-                    .map_err(|_| StartupError::Generic)?,
-            ),
-        },
+        // Multiple accounts take over completely: the legacy single
+        // authentication is neither read nor used to fill a gap.
+        BootstrapProvider::Codex => {
+            match polaris_auth::accounts::owner::AccountOwner::open_if_registered(
+                polaris_auth::ISSUER,
+            )
+            .map_err(|_| StartupError::Generic)?
+            {
+                Some(owner) => TrustedBackend::Codex {
+                    tokens: Arc::new(crate::auth_tokens::UnboundAccountTokens),
+                    accounts: Some(owner),
+                },
+                None => TrustedBackend::Codex {
+                    tokens: Arc::new(
+                        DesktopAuthTokens::from_trusted_store(home.join(".polaris/auth.json"))
+                            .map_err(|_| StartupError::Generic)?,
+                    ),
+                    accounts: None,
+                },
+            }
+        }
         BootstrapProvider::Openai => TrustedBackend::Openai {
             api_key: polaris_auth::api_key::load_from(&home.join(".polaris/api_key.json"))
                 .map_err(|_| StartupError::Generic)?
@@ -255,6 +293,24 @@ fn start_at(
         }
     };
     let helper = read_package_manifest(executable).map_err(|_| StartupError::Generic)?;
+    let runtime_roots = ["/bin", "/usr/bin", "/usr/lib", "/System/Library"]
+        .map(PathBuf::from)
+        .to_vec();
+    let mcp_runtime_roots = runtime_roots.clone();
+    let mcp_excluded_source = args.confirmed_source_path.clone();
+    let mcp_excluded_store = args.store.store_root.clone();
+    let mcp = polaris_core::mcp::runtime::RuntimeConfig::prepare_registered(
+        mcp_snapshot,
+        args.store.project_id.as_str().into(),
+        home,
+        &runtime_roots,
+        &[
+            args.confirmed_source_path.clone(),
+            args.store.store_root.clone(),
+        ],
+        workspace_limits(),
+    )
+    .map_err(|_| StartupError::Generic)?;
     let resources_root = executable
         .parent()
         .and_then(Path::parent)
@@ -291,6 +347,36 @@ fn start_at(
             .iter()
             .any(|a| !a.output_schema.is_file())
     {
+        return Err(StartupError::Generic);
+    }
+    // Saved workflow configuration is authoritative on reconnect. Only a new
+    // owner reads workflow fields from the pinned global/project config paths.
+    let runtime_workflow = match &saved.state.workflow {
+        Some(workflow) => workflow.restore(None).map_err(|_| StartupError::Generic)?,
+        None => polaris_core::workflow::SessionWorkflow::new(
+            polaris_core::config::try_load_workflow_from(
+                Some(&home.join(".polaris/config.toml")),
+                Some(&args.confirmed_source_path.join(".polaris/config.toml")),
+            )
+            .map_err(|_| StartupError::Generic)?,
+        ),
+    };
+    let workflow = runtime_workflow.config.clone();
+    // The same `[decision]` table the terminal reads, from the same two
+    // pinned paths. The key stays in the environment: a configuration file
+    // is shared, a credential is not.
+    // A configuration this owner cannot read leaves it without a judge,
+    // not without a session. Every path that would ask the judge something
+    // works without an answer, so refusing to start over an optional
+    // optimization would cost more than it protects — and the owner
+    // already starts on a saved workflow when this same file is malformed.
+    let decision = polaris_core::config::try_load_decision_from(
+        Some(&home.join(".polaris/config.toml")),
+        Some(&args.confirmed_source_path.join(".polaris/config.toml")),
+    )
+    .unwrap_or_default();
+    let decider = polaris_core::decision_bands::from_configuration(&decision);
+    if workflow.enabled && runtime_workflow.begin_turn(&skills.skills).is_err() {
         return Err(StartupError::Generic);
     }
     let always_on = assemble_always_on("", "macOS desktop; isolated workspace", &skills.skills)
@@ -372,22 +458,32 @@ fn start_at(
         spawn_write_concurrency: 1,
         tool_memory: None,
         history,
+        mcp,
+        workflow,
+        decider,
     };
     let limits = OwnerLaunchLimits {
         workspace: workspace_limits(),
         source: workspace_limits(),
-        runtime_roots: ["/bin", "/usr/bin", "/usr/lib", "/System/Library"]
-            .map(PathBuf::from)
-            .to_vec(),
+        runtime_roots,
         toolchains,
         copy_mutations: source.write_allowed,
         clock: Arc::new(Clock::new()?),
         approval_ttl_ms: 300_000,
     };
-    let service = compose_existing(
+    let mut service = compose_existing(
         args, root, writer, helper, backend, resources, recovery, limits,
     )
     .map_err(|_| StartupError::Generic)?;
+    service.attach_mcp_settings(crate::engine::McpSettings {
+        store: mcp_store,
+        home: home.to_owned(),
+        active_registry_revision: mcp_active.0,
+        active_secrets_revision: mcp_active.1,
+        runtime_roots: mcp_runtime_roots,
+        excluded_roots: vec![mcp_excluded_source, mcp_excluded_store],
+        limits: workspace_limits(),
+    });
     skill_copies.append(&mut agent_copies);
     Ok(StartedOwner {
         service,

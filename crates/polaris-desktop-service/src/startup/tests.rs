@@ -16,6 +16,54 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[tokio::test]
+async fn configured_mcp_corruption_stops_startup_but_unsafe_stdio_is_only_quarantined() {
+    for corrupt in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (args, home, exe) = fixture(&base);
+        let mcp = polaris_mcp::store::Store::open(&home).unwrap();
+        let cwd = base.join("registered-server");
+        fs::create_dir(&cwd).unwrap();
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(cwd.join(".env"), "synthetic-only").unwrap();
+        let registry = polaris_mcp::registration::Registry {
+            schema_version: 1,
+            revision: 1,
+            servers: vec![polaris_mcp::registration::Server {
+                server_id: "configured".into(),
+                enabled_projects: ["project".into()].into(),
+                transport: polaris_mcp::registration::Destination::Stdio {
+                    command: Path::new("/bin/sh").canonicalize().unwrap(),
+                    args: vec!["-c".into(), "touch started".into()],
+                    cwd: cwd.clone(),
+                    sandbox_profile: "workspace-write".into(),
+                    secret_env: Default::default(),
+                    readable_roots: vec![],
+                    executable_sha256: None,
+                    script: None,
+                    script_sha256: None,
+                },
+                protocol_profile: Default::default(),
+                capabilities: polaris_mcp::registration::Capabilities {
+                    catalog_metadata: true,
+                    ..Default::default()
+                },
+                timeouts: Default::default(),
+            }],
+        };
+        mcp.save_registry(0, &registry).unwrap();
+        if corrupt {
+            fs::write(home.join(".polaris/mcp/servers.json"), b"{").unwrap();
+        }
+        let result = tokio::task::spawn_blocking(move || start_at(args, &home, &exe))
+            .await
+            .unwrap();
+        assert_eq!(matches!(result, Err(StartupError::Generic)), corrupt);
+        assert!(!cwd.join("started").exists());
+    }
+}
+
 #[test]
 fn launchservices_fixed_alias_resolves_to_verified_package() {
     let base = tempfile::tempdir_in("/private/tmp").unwrap();
@@ -172,6 +220,126 @@ fn fixture_with_history(
 }
 
 #[tokio::test]
+async fn mcp_settings_report_startup_revisions_until_the_next_owner_start() {
+    use polaris_desktop_protocol::mcp_settings::{McpRegistrySave, McpRegistryState};
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let (args, home, exe) = fixture(&base);
+    let project = args.store.project_id.clone();
+    let session = args.store.session_id.clone();
+    let server = serde_json::json!({"server_id":"remote","enabled_projects":[project.as_str()],
+        "transport":{"kind":"streamable_http","url":"https://example.com/mcp","secret_headers":{}},
+        "protocol_profile":"discover_2026",
+        "capabilities":{"catalog_metadata":true,"resource_read":false,"prompt_selection":false,"tool_call":false},
+        "timeouts":{"catalog_ttl_seconds":300,"connect_seconds":10,"catalog_seconds":30,"operation_seconds":120,"connect_retries":2}});
+    let registry = |revision| polaris_mcp::registration::Registry {
+        schema_version: 1,
+        revision,
+        servers: vec![serde_json::from_value(server.clone()).unwrap()],
+    };
+    polaris_mcp::store::Store::open(&home)
+        .unwrap()
+        .save_registry(0, &registry(1))
+        .unwrap();
+    async fn exchange(
+        client: &mut tokio::io::DuplexStream,
+        id: &str,
+        body: RequestBody,
+    ) -> SuccessResult {
+        let request = Request {
+            protocol_version: Default::default(),
+            client_id: ClientId::new("client").unwrap(),
+            request_id: RequestId::new(id).unwrap(),
+            body,
+        };
+        client
+            .write_all(&codec::encode(&request).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let n = client.read_u32().await.unwrap();
+            let mut body = vec![0; n as usize];
+            client.read_exact(&mut body).await.unwrap();
+            codec::from_json::<Response>(&body)
+                .unwrap()
+                .outcome
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+    for (round, expected_active) in [1, 2].into_iter().enumerate() {
+        let (args, home, exe) = (
+            OwnerLaunchArguments {
+                store: args.store.clone(),
+                bootstrap_name: args.bootstrap_name.clone(),
+                bootstrap_file: ExpectedBootstrapFile {
+                    identity: args.bootstrap_file.identity,
+                    sha256: args.bootstrap_file.sha256,
+                },
+                confirmed_source_path: args.confirmed_source_path.clone(),
+                ..args
+            },
+            home.clone(),
+            exe.clone(),
+        );
+        let mut owner = tokio::task::spawn_blocking(move || start_at(args, &home, &exe))
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut client, server_end) = tokio::io::duplex(65536);
+        let (reader, writer) = tokio::io::split(server_end);
+        let task = tokio::spawn(async move { owner.service.serve(reader, writer).await.unwrap() });
+        let SuccessResult::Hello(hello) = exchange(&mut client, "hello", RequestBody::Hello).await
+        else {
+            panic!("hello");
+        };
+        assert!(
+            hello
+                .capabilities
+                .contains(&polaris_desktop_protocol::response::Capability::McpSettings)
+        );
+        let SuccessResult::McpRegistryRead(McpRegistryState {
+            registry_revision,
+            active_registry_revision,
+            ..
+        }) = exchange(
+            &mut client,
+            "read",
+            RequestBody::McpRegistryRead(session.clone()),
+        )
+        .await
+        else {
+            panic!("read");
+        };
+        assert_eq!(active_registry_revision.get(), expected_active, "{round}");
+        assert_eq!(registry_revision.get(), expected_active);
+        let SuccessResult::McpRegistrySave(saved) = exchange(
+            &mut client,
+            "save",
+            RequestBody::McpRegistrySave(
+                session.clone(),
+                McpRegistrySave {
+                    expected_revision: registry_revision,
+                    servers: vec![server.as_object().unwrap().clone()],
+                },
+            ),
+        )
+        .await
+        else {
+            panic!("save");
+        };
+        assert_eq!(saved.registry_revision.get(), expected_active + 1);
+        assert_eq!(saved.active_registry_revision.get(), expected_active);
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn packaged_owner_advertises_real_runs_and_releases_store_after_eof() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
@@ -234,7 +402,7 @@ async fn legacy_owner_ignores_invalid_memory_config_without_creating_memory_reso
     let (args, home, exe) = fixture(&base);
     put(
         &home.join(".polaris/config.toml"),
-        b"invalid memory TOML [",
+        b"history_mode = 'invalid-memory-mode'\n[embedding]\nruntime = false\n[workflow]\nmode = 'adaptive'\n",
         0o600,
     );
     let store = args.store.store_root.clone();
@@ -245,6 +413,78 @@ async fn legacy_owner_ignores_invalid_memory_config_without_creating_memory_reso
     assert!(!store.join("embedding-helper").exists());
     assert!(!store.join("conversation-memory.sqlite3").exists());
     drop(owner);
+    let root = DesktopRoot::open_owned(&store).unwrap();
+    let saved = root
+        .open(
+            &ProjectId::new("project").unwrap(),
+            &SessionId::new("session").unwrap(),
+        )
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert_eq!(
+        saved.state.workflow.unwrap().config.mode,
+        polaris_core::workflow::WorkflowMode::Adaptive
+    );
+}
+
+#[tokio::test]
+async fn legacy_new_owner_rejects_malformed_workflow_source_before_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let (args, home, exe) = fixture(&base);
+    put(&home.join(".polaris/config.toml"), b"invalid TOML [", 0o600);
+    let store = args.store.store_root.clone();
+    let result = tokio::task::spawn_blocking(move || start_at(args, &home, &exe))
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(StartupError::Generic)));
+    assert!(!store.join("embedding-helper").exists());
+    assert!(!store.join("conversation-memory.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn owner_reconnect_uses_saved_workflow_even_when_global_config_becomes_invalid() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let (args, home, exe) = fixture(&base);
+    let store = args.store.store_root.clone();
+    let root = DesktopRoot::open_owned(&store).unwrap();
+    let mut writer = root
+        .open(&args.store.project_id, &args.store.session_id)
+        .unwrap();
+    let mut config = polaris_core::config::Config::default().workflow;
+    config.initial_phase = polaris_core::workflow::Phase::Implement;
+    config.phase_skills.insert(
+        polaris_core::workflow::Phase::Implement,
+        vec!["builtin:missing-old-phase".into()],
+    );
+    let workflow = polaris_core::workflow::SessionWorkflow::new(config);
+    workflow
+        .request_phase(polaris_core::workflow::Phase::Verify)
+        .unwrap();
+    // Manual mode needs the saved current phase, not an unused initial phase.
+    drop(workflow.begin_turn(&[]).unwrap());
+    let saved_workflow = polaris_core::desktop_store::SavedWorkflow::capture(&workflow);
+    writer
+        .configure_workflow(
+            writer.snapshot().unwrap().marker.session_revision,
+            Some(saved_workflow.clone()),
+        )
+        .unwrap();
+    drop(writer);
+    drop(root);
+    put(&home.join(".polaris/config.toml"), b"invalid TOML [", 0o600);
+    let project = args.store.project_id.clone();
+    let session = args.store.session_id.clone();
+    let owner = tokio::task::spawn_blocking(move || start_at(args, &home, &exe))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(owner);
+    let root = DesktopRoot::open_owned(&store).unwrap();
+    let saved = root.open(&project, &session).unwrap().snapshot().unwrap();
+    assert_eq!(saved.state.workflow, Some(saved_workflow));
 }
 
 #[tokio::test]

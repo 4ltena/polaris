@@ -9,6 +9,7 @@ license.workspace = true
 polaris-auth = { path = "../polaris-auth" }
 polaris-tools = { path = "../polaris-tools" }
 polaris-sandbox = { path = "../polaris-sandbox" }
+polaris-mcp = { path = "../polaris-mcp" }
 async-trait.workspace = true
 polaris-skills = { path = "../polaris-skills" }
 polaris-core = { path = "../polaris-core" }

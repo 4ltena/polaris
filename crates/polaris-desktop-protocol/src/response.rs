@@ -49,6 +49,7 @@ pub enum Capability {
     HistoryRead,
     DraftUpdate,
     SessionConfigure,
+    WorkflowConfigure,
     RunStart,
     RunCancel,
     ApprovalResolve,
@@ -56,6 +57,10 @@ pub enum Capability {
     SourceApplyResolve,
     RequestStatus,
     Shutdown,
+    McpSettings,
+    RunDetailsRead,
+    /// Only the read-only home helper offers this, never an owner.
+    HomeBrowse,
 }
 
 crate::object_wire! {
@@ -147,10 +152,40 @@ pub struct Configured {
 }
 }
 
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowConfigured {
+    pub session_revision: DecimalU64,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub workflow: Option<WorkflowStatus>,
+}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Queued {
     Queued,
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalUpdated {
+    pub session_revision: DecimalU64,
+    pub goal_revision: DecimalU64,
+}
+}
+
+crate::object_wire! {
+/// Durable on receipt only. The run owner records separately when a run
+/// actually applied it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstructionReceived {
+    pub session_revision: DecimalU64,
+    pub instruction_id: String,
+}
 }
 
 crate::object_wire! {
@@ -263,6 +298,12 @@ pub enum SuccessResult {
     DraftUpdate(DraftUpdated),
     #[serde(rename = "session.configure")]
     SessionConfigure(Configured),
+    #[serde(rename = "workflow.configure")]
+    WorkflowConfigure(WorkflowConfigured),
+    #[serde(rename = "goal.update")]
+    GoalUpdate(GoalUpdated),
+    #[serde(rename = "instruction.send")]
+    InstructionSend(InstructionReceived),
     #[serde(rename = "run.start")]
     RunStart(RunAccepted),
     #[serde(rename = "run.cancel")]
@@ -279,6 +320,28 @@ pub enum SuccessResult {
     RequestStatus(RequestStatusResult),
     #[serde(rename = "shutdown.request")]
     ShutdownRequest(ShutdownResult),
+    #[serde(rename = "mcp.registry.read")]
+    McpRegistryRead(crate::mcp_settings::McpRegistryState),
+    #[serde(rename = "mcp.registry.save")]
+    McpRegistrySave(crate::mcp_settings::McpRegistryState),
+    #[serde(rename = "mcp.secret.set")]
+    McpSecretSet(crate::mcp_settings::McpRegistryState),
+    #[serde(rename = "mcp.secret.delete")]
+    McpSecretDelete(crate::mcp_settings::McpRegistryState),
+    #[serde(rename = "mcp.catalog.check")]
+    McpCatalogCheck(crate::mcp_settings::McpCatalogChecked),
+    #[serde(rename = "mcp.catalog.cancel")]
+    McpCatalogCancel(crate::mcp_settings::McpCatalogCancelled),
+    #[serde(rename = "mcp.setup.detect")]
+    McpSetupDetect(crate::mcp_settings::McpSetupCandidates),
+    #[serde(rename = "mcp.setup.register")]
+    McpSetupRegister(crate::mcp_settings::McpRegistryState),
+    #[serde(rename = "run.details")]
+    RunDetails(crate::run_details::RunDetailsPage),
+    #[serde(rename = "browse.list")]
+    BrowseList(crate::browse::BrowseListPage),
+    #[serde(rename = "browse.read")]
+    BrowseRead(crate::browse::BrowseReadResult),
 }
 }
 
@@ -296,6 +359,9 @@ impl SuccessResult {
             Self::HistoryPage(_) => Method::HistoryPage,
             Self::DraftUpdate(_) => Method::DraftUpdate,
             Self::SessionConfigure(_) => Method::SessionConfigure,
+            Self::WorkflowConfigure(_) => Method::WorkflowConfigure,
+            Self::GoalUpdate(_) => Method::GoalUpdate,
+            Self::InstructionSend(_) => Method::InstructionSend,
             Self::RunStart(_) => Method::RunStart,
             Self::RunCancel(_) => Method::RunCancel,
             Self::ApprovalResolve(_) => Method::ApprovalResolve,
@@ -304,6 +370,17 @@ impl SuccessResult {
             Self::SourceApplyResolve(_) => Method::SourceApplyResolve,
             Self::RequestStatus(_) => Method::RequestStatus,
             Self::ShutdownRequest(_) => Method::ShutdownRequest,
+            Self::McpRegistryRead(_) => Method::McpRegistryRead,
+            Self::McpRegistrySave(_) => Method::McpRegistrySave,
+            Self::McpSecretSet(_) => Method::McpSecretSet,
+            Self::McpSecretDelete(_) => Method::McpSecretDelete,
+            Self::McpCatalogCheck(_) => Method::McpCatalogCheck,
+            Self::McpCatalogCancel(_) => Method::McpCatalogCancel,
+            Self::McpSetupDetect(_) => Method::McpSetupDetect,
+            Self::McpSetupRegister(_) => Method::McpSetupRegister,
+            Self::RunDetails(_) => Method::RunDetails,
+            Self::BrowseList(_) => Method::BrowseList,
+            Self::BrowseRead(_) => Method::BrowseRead,
         }
     }
 }
@@ -342,6 +419,65 @@ impl Response {
             crate::request::RequestBody::LocalModels(_, params),
         ) = (&self.outcome, &request.body)
             && (result.provider != params.provider || result.endpoint != params.endpoint)
+        {
+            return Err(CorrelationError::Method);
+        }
+        if let (
+            Ok(SuccessResult::BrowseList(page)),
+            crate::request::RequestBody::BrowseList(params),
+        ) = (&self.outcome, &request.body)
+            && (page.directory != params.path
+                || page.entries.iter().any(|entry| {
+                    entry.name.is_empty()
+                        || entry.name.contains('/')
+                        || entry.path
+                            != if page.directory.is_empty() {
+                                entry.name.clone()
+                            } else {
+                                format!("{}/{}", page.directory, entry.name)
+                            }
+                }))
+        {
+            return Err(CorrelationError::Method);
+        }
+        if let (
+            Ok(SuccessResult::BrowseRead(result)),
+            crate::request::RequestBody::BrowseRead(params),
+        ) = (&self.outcome, &request.body)
+            && (result.path != params.path
+                || result.device != params.device
+                || result.inode != params.inode)
+        {
+            return Err(CorrelationError::Method);
+        }
+        if let (
+            Ok(SuccessResult::RunDetails(page)),
+            crate::request::RequestBody::RunDetails(_, params),
+        ) = (&self.outcome, &request.body)
+            && (page.run_id != params.run_id
+                || page.attempt_id != params.attempt_id
+                || params
+                    .snapshot_id
+                    .as_ref()
+                    .is_some_and(|id| id != &page.snapshot_id))
+        {
+            return Err(CorrelationError::Method);
+        }
+        if let (
+            Ok(
+                SuccessResult::McpCatalogCheck(crate::mcp_settings::McpCatalogChecked {
+                    server_id,
+                    ..
+                })
+                | SuccessResult::McpCatalogCancel(crate::mcp_settings::McpCatalogCancelled {
+                    server_id,
+                    ..
+                }),
+            ),
+            crate::request::RequestBody::McpCatalogCheck(_, params)
+            | crate::request::RequestBody::McpCatalogCancel(_, params),
+        ) = (&self.outcome, &request.body)
+            && server_id != &params.server_id
         {
             return Err(CorrelationError::Method);
         }

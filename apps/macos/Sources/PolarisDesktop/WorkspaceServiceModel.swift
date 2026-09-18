@@ -119,6 +119,19 @@ final class WorkspaceServiceModel: ObservableObject {
   @Published private(set) var ownerStartupFailure: OwnerStartupFailure?
   @Published private(set) var isRecovering = false
   @Published private(set) var runs: [WorkspaceRun] = []
+  /// One expanded run at a time; details reads never take `isBusy`.
+  @Published private(set) var expandedRunKey: Data?
+  @Published private(set) var runDetails: WorkspaceRunDetails?
+  @Published private(set) var runDetailsNotice: String?
+  private var runDetailsToken = UUID()
+  var workflowStatus: (enabled: Bool, mode: String, phase: String, revision: UInt64)? {
+    guard let value = snapshot?["workflow"],
+          let enabled = value["enabled"]?.bool,
+          let mode = value["mode"]?.string,
+          let phase = value["phase"]?.string,
+          let revision = value["revision"]?.decimal else { return nil }
+    return (enabled, mode, phase, revision)
+  }
   @Published private(set) var approvals: [WorkspaceApproval] = []
   @Published private(set) var sourceApplyCandidates: [SourceApplyCandidate] = []
   @Published private(set) var sourceApplyPages: [Data: SourceApplyPage] = [:]
@@ -1056,6 +1069,26 @@ final class WorkspaceServiceModel: ObservableObject {
 }
 
 extension WorkspaceServiceModel {
+  /// The snapshot remains authoritative. This sends no skill/profile text and
+  /// does not update local selection until the durable snapshot is reloaded.
+  func configureWorkflow(enabled: Bool, mode: String, initialPhase: String) async {
+    guard phase == .ready, !isBusy, !runs.contains(where: { !$0.isTerminal }),
+          supports("workflow_configure"), let connection = transport,
+          let revision = snapshot?["session_revision"]?.decimal else { return }
+    let token = generation
+    isBusy = true; failure = nil
+    do {
+      let id = UUID().uuidString
+      let reply = try await connection.send(requestID: id,
+        request: .workflowConfigure(session: store.sessionID, revision: revision,
+                                    enabled: enabled, mode: mode, initialPhase: initialPhase))
+      try requireCurrent(token)
+      _ = try checked(reply, id: id, method: "workflow.configure")
+      isBusy = false
+      await refresh()
+    } catch { failed(error, token: token) }
+  }
+
   /// One explicit submission; the saved revision identifies the immutable text.
   func startRun() async {
     guard canSend, let connection = transport,
@@ -1448,5 +1481,79 @@ extension WorkspaceServiceModel {
       }
       eventSequence += 1; eventRevision = revision
     }
+  }
+}
+
+extension WorkspaceServiceModel {
+  var canReadRunDetails: Bool { phase == .ready && supports("run_details_read") }
+
+  /// Opening another run or reloading discards the old snapshot and cursor.
+  func openRunDetails(_ run: WorkspaceRun) async {
+    let token = UUID()
+    runDetailsToken = token; expandedRunKey = run.key; runDetails = nil; runDetailsNotice = nil
+    guard canReadRunDetails, let connection = transport else {
+      runDetailsNotice = "このserviceでは実行内容を表示できません。"
+      return
+    }
+    do {
+      let payload = try await send(.runDetails(session: store.sessionID, run: run.id, attempt: run.attemptID,
+                                               snapshot: nil, cursor: nil), connection: connection, token: generation)
+      let details = try WorkspaceRunDetails(run: run, first: ServiceRunDetailsPage(payload))
+      guard runDetailsToken == token else { return }
+      runDetails = details
+    } catch {
+      guard runDetailsToken == token else { return }
+      runDetailsNotice = Self.runDetailsNotice(error)
+    }
+  }
+
+  func closeRunDetails() {
+    runDetailsToken = UUID(); expandedRunKey = nil; runDetails = nil; runDetailsNotice = nil
+  }
+
+  func continueRunDetails() async {
+    guard let details = runDetails, let cursor = details.nextCursor, let connection = transport else { return }
+    let token = UUID()
+    runDetailsToken = token; runDetailsNotice = nil
+    do {
+      let payload = try await send(.runDetails(session: store.sessionID, run: String(decoding: details.runKey, as: UTF8.self),
+                                               attempt: details.attemptID, snapshot: details.snapshotID, cursor: cursor),
+                                   connection: connection, token: generation)
+      let page = try ServiceRunDetailsPage(payload)
+      guard runDetailsToken == token, var current = runDetails, current == details else { return }
+      try current.append(page)
+      runDetails = current
+    } catch {
+      guard runDetailsToken == token else { return }
+      runDetailsNotice = Self.runDetailsNotice(error)
+    }
+  }
+
+  /// The saved run changed after the snapshot; reload to see the newer prefix.
+  func runDetailsOutdated(_ run: WorkspaceRun) -> Bool {
+    guard let details = runDetails, details.runKey == run.key else { return false }
+    return !details.runState.utf8.elementsEqual(run.state.utf8)
+  }
+
+  private static func runDetailsNotice(_ error: Error) -> String {
+    switch error {
+    case Failure.rejected("revision_conflict"): "表示内容の有効期限が切れました。読み込み直してください。"
+    case Failure.rejected("not_found"): "この実行の保存内容が見つかりません。"
+    case Failure.rejected("capability_unavailable"): "この実行の内容は表示できません。"
+    case ServiceError.correlation, ServiceError.schema:
+      "受け取った内容の対応を確認できないため表示しません。読み込み直してください。"
+    default: "実行内容を読み込めません。読み込み直してください。"
+    }
+  }
+}
+
+extension WorkspaceServiceModel {
+  var canManageMcp: Bool { phase == .ready && supports("mcp_settings") }
+  /// Explicit settings operations only; the owner revalidates every document.
+  /// A catalog job may take minutes, so these never take `isBusy`: run cancel,
+  /// approvals and event polling stay live, and the owner refuses a run start.
+  func mcpSettings(_ request: ServiceRequest) async throws -> ServiceValue {
+    guard request.capability == "mcp_settings", canManageMcp, let transport else { throw ServiceError.notReady }
+    return try await send(request, connection: transport, token: generation)
   }
 }

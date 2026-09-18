@@ -33,6 +33,12 @@ pub enum Method {
     DraftUpdate,
     #[serde(rename = "session.configure")]
     SessionConfigure,
+    #[serde(rename = "workflow.configure")]
+    WorkflowConfigure,
+    #[serde(rename = "goal.update")]
+    GoalUpdate,
+    #[serde(rename = "instruction.send")]
+    InstructionSend,
     #[serde(rename = "run.start")]
     RunStart,
     #[serde(rename = "run.cancel")]
@@ -49,6 +55,28 @@ pub enum Method {
     RequestStatus,
     #[serde(rename = "shutdown.request")]
     ShutdownRequest,
+    #[serde(rename = "mcp.registry.read")]
+    McpRegistryRead,
+    #[serde(rename = "mcp.registry.save")]
+    McpRegistrySave,
+    #[serde(rename = "mcp.secret.set")]
+    McpSecretSet,
+    #[serde(rename = "mcp.secret.delete")]
+    McpSecretDelete,
+    #[serde(rename = "mcp.catalog.check")]
+    McpCatalogCheck,
+    #[serde(rename = "mcp.catalog.cancel")]
+    McpCatalogCancel,
+    #[serde(rename = "mcp.setup.detect")]
+    McpSetupDetect,
+    #[serde(rename = "mcp.setup.register")]
+    McpSetupRegister,
+    #[serde(rename = "run.details")]
+    RunDetails,
+    #[serde(rename = "browse.list")]
+    BrowseList,
+    #[serde(rename = "browse.read")]
+    BrowseRead,
 }
 
 crate::object_wire! {
@@ -99,6 +127,39 @@ pub struct HistoryPage {
 }
 }
 
+/// M6-3: what to do with the session's goal. A goal is only a reason to
+/// consider another run; it never authorizes one and never occupies the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GoalOperation {
+    Set {
+        text: String,
+    },
+    Clear,
+    /// Suppresses automatic re-runs until an explicit resume.
+    Stop,
+    Resume,
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalUpdate {
+    #[serde(flatten)]
+    pub operation: GoalOperation,
+}
+}
+
+crate::object_wire! {
+/// An instruction that arrived while a run was already going. Receiving it is
+/// durable; applying it is a separate step the run owner records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstructionSend {
+    pub text: String,
+}
+}
+
 crate::object_wire! {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,6 +184,36 @@ pub struct SessionConfigure {
 }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMode {
+    Manual,
+    Adaptive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPhase {
+    General,
+    Brainstorm,
+    Specify,
+    Implement,
+    Review,
+    Verify,
+    Deliver,
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowConfigure {
+    pub expected_session_revision: DecimalU64,
+    pub enabled: bool,
+    pub mode: WorkflowMode,
+    pub initial_phase: WorkflowPhase,
+}
+}
+
 crate::object_wire! {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,6 +221,19 @@ pub struct RunStart {
     pub expected_draft_revision: DecimalU64,
     pub expected_configuration_revision: DecimalU64,
     pub expected_policy_revision: DecimalU64,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub mcp_prompt: Option<McpPromptChoice>,
+}
+}
+
+crate::object_wire! {
+/// A host-selected next-run input, never a model tool or execution grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpPromptChoice {
+    pub server: String,
+    pub prompt: String,
+    pub arguments: serde_json::Map<String, serde_json::Value>,
 }
 }
 
@@ -232,6 +336,9 @@ pub enum RequestBody {
     HistoryPage(SessionId, HistoryPage),
     DraftUpdate(SessionId, DraftUpdate),
     SessionConfigure(SessionId, SessionConfigure),
+    WorkflowConfigure(SessionId, WorkflowConfigure),
+    GoalUpdate(SessionId, GoalUpdate),
+    InstructionSend(SessionId, InstructionSend),
     RunStart(SessionId, RunStart),
     RunCancel(SessionId, RunTarget),
     ApprovalResolve(SessionId, ApprovalResolve),
@@ -240,6 +347,17 @@ pub enum RequestBody {
     SourceApplyResolve(SessionId, SourceApplyResolve),
     RequestStatus(SessionId, RequestStatus),
     ShutdownRequest(ShutdownRequest),
+    McpRegistryRead(SessionId),
+    McpRegistrySave(SessionId, crate::mcp_settings::McpRegistrySave),
+    McpSecretSet(SessionId, crate::mcp_settings::McpSecretSet),
+    McpSecretDelete(SessionId, crate::mcp_settings::McpSecretDelete),
+    McpCatalogCheck(SessionId, crate::mcp_settings::McpCatalogTarget),
+    McpCatalogCancel(SessionId, crate::mcp_settings::McpCatalogTarget),
+    McpSetupDetect(SessionId),
+    McpSetupRegister(SessionId, crate::mcp_settings::McpSetupTarget),
+    RunDetails(SessionId, crate::run_details::RunDetailsRequest),
+    BrowseList(crate::browse::BrowseList),
+    BrowseRead(crate::browse::BrowseRead),
 }
 
 impl RequestBody {
@@ -256,6 +374,9 @@ impl RequestBody {
             Self::HistoryPage(..) => Method::HistoryPage,
             Self::DraftUpdate(..) => Method::DraftUpdate,
             Self::SessionConfigure(..) => Method::SessionConfigure,
+            Self::WorkflowConfigure(..) => Method::WorkflowConfigure,
+            Self::GoalUpdate(..) => Method::GoalUpdate,
+            Self::InstructionSend(..) => Method::InstructionSend,
             Self::RunStart(..) => Method::RunStart,
             Self::RunCancel(..) => Method::RunCancel,
             Self::ApprovalResolve(..) => Method::ApprovalResolve,
@@ -264,11 +385,25 @@ impl RequestBody {
             Self::SourceApplyResolve(..) => Method::SourceApplyResolve,
             Self::RequestStatus(..) => Method::RequestStatus,
             Self::ShutdownRequest(..) => Method::ShutdownRequest,
+            Self::McpRegistryRead(..) => Method::McpRegistryRead,
+            Self::McpRegistrySave(..) => Method::McpRegistrySave,
+            Self::McpSecretSet(..) => Method::McpSecretSet,
+            Self::McpSecretDelete(..) => Method::McpSecretDelete,
+            Self::McpCatalogCheck(..) => Method::McpCatalogCheck,
+            Self::McpCatalogCancel(..) => Method::McpCatalogCancel,
+            Self::McpSetupDetect(..) => Method::McpSetupDetect,
+            Self::McpSetupRegister(..) => Method::McpSetupRegister,
+            Self::RunDetails(..) => Method::RunDetails,
+            Self::BrowseList(..) => Method::BrowseList,
+            Self::BrowseRead(..) => Method::BrowseRead,
         }
     }
     pub fn session_id(&self) -> Option<&SessionId> {
         match self {
-            Self::Hello | Self::ShutdownRequest(..) => None,
+            Self::Hello
+            | Self::ShutdownRequest(..)
+            | Self::BrowseList(..)
+            | Self::BrowseRead(..) => None,
             Self::WorkspaceRead(s, _)
             | Self::AttachmentRead(s, _)
             | Self::LocalModels(s, _)
@@ -279,13 +414,25 @@ impl RequestBody {
             | Self::HistoryPage(s, _)
             | Self::DraftUpdate(s, _)
             | Self::SessionConfigure(s, _)
+            | Self::WorkflowConfigure(s, _)
+            | Self::GoalUpdate(s, _)
+            | Self::InstructionSend(s, _)
             | Self::RunStart(s, _)
             | Self::RunCancel(s, _)
             | Self::ApprovalResolve(s, _)
             | Self::SourceApplyList(s, _)
             | Self::SourceApplyPage(s, _)
             | Self::SourceApplyResolve(s, _)
-            | Self::RequestStatus(s, _) => Some(s),
+            | Self::RequestStatus(s, _)
+            | Self::McpRegistryRead(s)
+            | Self::McpRegistrySave(s, _)
+            | Self::McpSecretSet(s, _)
+            | Self::McpSecretDelete(s, _)
+            | Self::McpCatalogCheck(s, _)
+            | Self::McpCatalogCancel(s, _)
+            | Self::McpSetupDetect(s)
+            | Self::McpSetupRegister(s, _)
+            | Self::RunDetails(s, _) => Some(s),
         }
     }
 }
@@ -329,7 +476,10 @@ impl<'de> Deserialize<'de> for Request {
         let wire: Wire =
             serde_json::from_value(StrictValue::deserialize(d)?.0).map_err(de::Error::custom)?;
         let session = wire.session_id;
-        let needs_session = !matches!(wire.method, Method::Hello | Method::ShutdownRequest);
+        let needs_session = !matches!(
+            wire.method,
+            Method::Hello | Method::ShutdownRequest | Method::BrowseList | Method::BrowseRead
+        );
         if needs_session != session.is_some() {
             return Err(de::Error::custom("method/session target mismatch"));
         }
@@ -356,6 +506,8 @@ impl<'de> Deserialize<'de> for Request {
                 RequestBody::SessionOpen(session.unwrap())
             }
             Method::SessionRolesConfigure => scoped!(SessionRolesConfigure),
+            Method::GoalUpdate => scoped!(GoalUpdate),
+            Method::InstructionSend => scoped!(InstructionSend),
             Method::SessionSnapshot => {
                 let _: Empty = params!();
                 RequestBody::SessionSnapshot(session.unwrap())
@@ -364,6 +516,7 @@ impl<'de> Deserialize<'de> for Request {
             Method::HistoryPage => scoped!(HistoryPage),
             Method::DraftUpdate => scoped!(DraftUpdate),
             Method::SessionConfigure => scoped!(SessionConfigure),
+            Method::WorkflowConfigure => scoped!(WorkflowConfigure),
             Method::LocalModels => scoped!(LocalModels),
             Method::WorkspaceRead => scoped!(WorkspaceRead),
             Method::AttachmentRead => scoped!(AttachmentRead),
@@ -375,6 +528,33 @@ impl<'de> Deserialize<'de> for Request {
             Method::SourceApplyResolve => scoped!(SourceApplyResolve),
             Method::RequestStatus => scoped!(RequestStatus),
             Method::ShutdownRequest => RequestBody::ShutdownRequest(params!()),
+            Method::BrowseList => RequestBody::BrowseList(params!()),
+            Method::BrowseRead => RequestBody::BrowseRead(params!()),
+            Method::McpRegistryRead => {
+                let _: Empty = params!();
+                RequestBody::McpRegistryRead(session.unwrap())
+            }
+            Method::McpRegistrySave => scoped!(McpRegistrySave),
+            Method::McpSecretSet => scoped!(McpSecretSet),
+            Method::McpSecretDelete => scoped!(McpSecretDelete),
+            Method::McpCatalogCheck => scoped!(McpCatalogCheck),
+            Method::McpCatalogCancel => scoped!(McpCatalogCancel),
+            Method::McpSetupDetect => {
+                let _: Empty = params!();
+                RequestBody::McpSetupDetect(session.unwrap())
+            }
+            Method::McpSetupRegister => scoped!(McpSetupRegister),
+            Method::RunDetails => {
+                let params: crate::run_details::RunDetailsRequest = params!();
+                // A later page names both its snapshot and cursor.
+                if params.snapshot_id.is_some() != params.cursor.is_some() {
+                    return Err(de::Error::custom("run details continuation"));
+                }
+                RequestBody::RunDetails(
+                    session.ok_or_else(|| de::Error::custom("missing session"))?,
+                    params,
+                )
+            }
         };
         Ok(Self {
             protocol_version: wire.protocol_version,
@@ -405,17 +585,22 @@ impl Serialize for Request {
             wire.serialize_field("session_id", session)?;
         }
         match &self.body {
-            RequestBody::Hello | RequestBody::SessionOpen(_) | RequestBody::SessionSnapshot(_) => {
-                wire.serialize_field("params", &Empty {})?
-            }
+            RequestBody::Hello
+            | RequestBody::SessionOpen(_)
+            | RequestBody::SessionSnapshot(_)
+            | RequestBody::McpRegistryRead(_)
+            | RequestBody::McpSetupDetect(_) => wire.serialize_field("params", &Empty {})?,
             RequestBody::SessionSubscribe(_, p) => wire.serialize_field("params", p)?,
             RequestBody::HistoryPage(_, p) => wire.serialize_field("params", p)?,
             RequestBody::DraftUpdate(_, p) => wire.serialize_field("params", p)?,
             RequestBody::SessionConfigure(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::WorkflowConfigure(_, p) => wire.serialize_field("params", p)?,
             RequestBody::SessionRolesConfigure(_, p) => wire.serialize_field("params", p)?,
             RequestBody::LocalModels(_, p) => wire.serialize_field("params", p)?,
             RequestBody::WorkspaceRead(_, p) => wire.serialize_field("params", p)?,
             RequestBody::AttachmentRead(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::GoalUpdate(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::InstructionSend(_, p) => wire.serialize_field("params", p)?,
             RequestBody::RunStart(_, p) => wire.serialize_field("params", p)?,
             RequestBody::RunCancel(_, p) => wire.serialize_field("params", p)?,
             RequestBody::ApprovalResolve(_, p) => wire.serialize_field("params", p)?,
@@ -424,6 +609,15 @@ impl Serialize for Request {
             RequestBody::SourceApplyResolve(_, p) => wire.serialize_field("params", p)?,
             RequestBody::RequestStatus(_, p) => wire.serialize_field("params", p)?,
             RequestBody::ShutdownRequest(p) => wire.serialize_field("params", p)?,
+            RequestBody::McpRegistrySave(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::McpSecretSet(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::McpSecretDelete(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::McpCatalogCheck(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::McpCatalogCancel(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::McpSetupRegister(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::RunDetails(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::BrowseList(p) => wire.serialize_field("params", p)?,
+            RequestBody::BrowseRead(p) => wire.serialize_field("params", p)?,
         }
         wire.end()
     }

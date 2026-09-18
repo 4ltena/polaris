@@ -32,12 +32,15 @@ macro_rules! object_wire {
 }
 pub(crate) use object_wire;
 
+pub mod browse;
 pub mod codec;
 pub mod event;
 pub mod ids;
+pub mod mcp_settings;
 pub mod request;
 pub mod response;
 pub mod role_bindings;
+pub mod run_details;
 pub mod run_state;
 pub mod snapshot;
 pub mod source_apply;

@@ -9,6 +9,7 @@ private actor RunTransport: WorkspaceServiceTransport {
   var draftRevision: UInt64 = 4
   var text = "合成入力"
   var runState: String?
+  var workflow: (enabled: Bool, mode: String, phase: String, revision: UInt64)? = (true, "manual", "general", 4)
   var events: [ServiceValue] = []
   var history: [ServiceValue] = []
   var eventWaiter: CheckedContinuation<Void, Never>?
@@ -39,9 +40,13 @@ private actor RunTransport: WorkspaceServiceTransport {
   func release() { hold = nil; waiter?.resume(); waiter = nil }
   func loseRunACK() { failRun = true }
   func setStatus(_ value: ServiceValue) { status = value }
+  var detailsPages: [ServiceValue] = []
+  var mcpReplies: [ServiceValue] = []
+  func setMcp(_ replies: [ServiceValue]) { mcpReplies = replies }
+  func setDetails(_ pages: [ServiceValue]) { detailsPages = pages }
   func start() throws -> ServiceHello {
-    let caps = ["session_read", "history_read", "draft_update", "request_status", "shutdown"]
-      + (enabled ? ["run_start", "run_cancel", "approval_resolve"] : [])
+    let caps = ["session_read", "history_read", "draft_update", "request_status", "shutdown", "workflow_configure"]
+      + (enabled ? ["run_start", "run_cancel", "approval_resolve", "run_details_read", "mcp_settings"] : [])
     return try ServiceHello(.object([
       "protocol_version": .number("1"), "engine_epoch": .string("e"),
       "capabilities": .array(caps.map(ServiceValue.string)),
@@ -49,14 +54,19 @@ private actor RunTransport: WorkspaceServiceTransport {
         "subscription_bytes": .string("4194304"), "text_batch_bytes": .string("32768"), "text_batch_ms": .string("50")])]))
   }
   func snapshot() -> ServiceValue {
-    .object(["snapshot_id": .string("snap"), "session_id": .string("s"), "summary": .string(""),
+    var fields: [String: ServiceValue] = ["snapshot_id": .string("snap"), "session_id": .string("s"), "summary": .string(""),
       "session_revision": .string(String(revision)), "content_revision": .string("0"), "plan_revision": .string("0"),
       "policy_revision": .string("2"), "history_start_cursor": .string("first"),
       "position": .object(["engine_epoch": .string("e"), "subscription_id": .string("sub"), "event_seq": .string("0")]),
       "draft": .object(["draft_revision": .string(String(draftRevision)), "text": .string(text), "attachment_ids": .array([])]),
       "configuration": .object(["configuration_revision": .string("3"), "provider": .string("synthetic"), "model": .string("test"), "effort": .string("medium")]),
       "runs": .array(runState.map { [run($0)] } ?? []), "children": .array([]), "child_attempt_count": .string("0"), "role_bindings": .array([]), "role_catalog": .array([]),
-      "tasks": .array([]), "unresolved_approvals": .array(pendingApprovals)])
+      "tasks": .array([]), "unresolved_approvals": .array(pendingApprovals)]
+    if let workflow {
+      fields["workflow"] = .object(["enabled": .bool(workflow.enabled), "mode": .string(workflow.mode),
+        "phase": .string(workflow.phase), "revision": .string(String(workflow.revision))])
+    }
+    return .object(fields)
   }
   func run(_ state: String) -> ServiceValue {
     .object(["run_id": .string("r"), "attempt_id": .string("a"), "state": .string(state), "task_ids": .array([])])
@@ -71,8 +81,22 @@ private actor RunTransport: WorkspaceServiceTransport {
     }
     let payload: ServiceValue
     switch request {
-    case .workspaceRead, .attachmentRead, .localModels, .configureRoles, .sourceApplyList, .sourceApplyPage, .sourceApplyResolve: throw ServiceError.notReady
+    case .workspaceRead, .attachmentRead, .localModels, .configureRoles, .sourceApplyList, .sourceApplyPage, .sourceApplyResolve, .browseList, .browseRead: throw ServiceError.notReady
+    case .mcpRegistryRead, .mcpRegistrySave, .mcpCatalogCheck, .mcpCatalogCancel, .mcpSetupDetect, .mcpSetupRegister:
+      guard !mcpReplies.isEmpty else { throw ServiceError.io }
+      payload = mcpReplies.removeFirst()
+    case .runDetails:
+      guard !detailsPages.isEmpty else { throw ServiceError.io }
+      payload = detailsPages.removeFirst()
     case .configure: throw ServiceError.notReady
+    case .workflowConfigure(_, let expected, let enabled, let mode, let initialPhase):
+      guard expected == revision else { throw ServiceError.correlation }
+      revision += 1
+      let current = workflow?.revision ?? 0
+      workflow = (enabled, mode, initialPhase, current + 1)
+      payload = .object(["session_revision": .string(String(revision)), "workflow": .object([
+        "enabled": .bool(enabled), "mode": .string(mode), "phase": .string(initialPhase),
+        "revision": .string(String(current + 1))])])
     case .snapshot, .subscribe:
       if staleAfterRun, runState != nil {
         // Simulate a structurally valid pre-ACK snapshot, including the old draft.
@@ -157,6 +181,25 @@ extension WorkspaceRunTests {
       "state": .string("pending"), "display": .object(["title": .string("合成承認"), "description": .string("合成操作のみ"),
         "choices": .array([.string("allow"), .string("deny")])])])
   }
+  func testWorkflowConfigureWaitsForSavedSnapshotBeforePublishingSelection() async throws {
+    let t = RunTransport(), m = try model(t)
+    await m.start()
+    XCTAssertEqual(m.workflowStatus?.mode, "manual")
+    await t.suspend("workflow.configure")
+    let save = Task { await m.configureWorkflow(enabled: false, mode: "adaptive", initialPhase: "review") }
+    try await wait(t)
+    XCTAssertEqual(m.workflowStatus?.enabled, true)
+    XCTAssertEqual(m.workflowStatus?.mode, "manual")
+    await t.release(); await save.value
+    XCTAssertEqual(m.workflowStatus?.enabled, false)
+    XCTAssertEqual(m.workflowStatus?.mode, "adaptive")
+    XCTAssertEqual(m.workflowStatus?.phase, "review")
+    let calls = await t.calls
+    XCTAssertEqual(calls.filter { $0.1.method == "workflow.configure" }.count, 1)
+    XCTAssertTrue(calls.contains { $0.1.method == "session.subscribe" })
+    _ = await m.close()
+  }
+
   func testSaveBeforeRunPinsRevisionsAndRetainsLateEdit() async throws {
     let t = RunTransport(), m = try model(t)
     await m.start(); m.editDraft("送る本文")
@@ -499,6 +542,123 @@ extension WorkspaceRunTests {
     XCTAssertEqual(m.retainedHistory.count, 2)
     XCTAssertEqual(Set(m.retainedHistory.map(\.key)).count, 2)
     XCTAssertEqual(m.retainedHistory.map(\.text), ["一つ目", "二つ目"])
+    _ = await m.close()
+  }
+}
+
+extension WorkspaceRunTests {
+  private func detailsPage(_ snapshot: String, _ fragments: [(String, String, Int, Int, String)], next: String?) -> ServiceValue {
+    var fields: [String: ServiceValue] = [
+      "snapshot_id": .string(snapshot), "run_id": .string("r"), "attempt_id": .string("a"),
+      "session_revision": .string("11"), "accepted_revision": .string("11"), "run_state": .string("succeeded"),
+      "history_gap": .bool(false),
+      "fragments": .array(fragments.map { id, kind, offset, total, text in
+        .object(["entry_id": .string(id), "kind": .string(kind), "offset": .string(String(offset)),
+                 "total_bytes": .string(String(total)), "text": .string(text)])
+      }),
+    ]
+    if let next { fields["next_cursor"] = .string(next) }
+    return .object(fields)
+  }
+
+  func testRunDetailsJoinPagesInOrderAndRefuseGapsWithoutTakingBusy() async throws {
+    let t = RunTransport(), m = try model(t)
+    await t.setRun("succeeded")
+    await t.setDetails([
+      detailsPage("d1", [("1-0", "user_input", 0, 6, "指示"), ("2-0", "tool_result", 0, 8, "abcd")], next: "d1:1:4"),
+      detailsPage("d1", [("2-0", "tool_result", 4, 8, "efgh"), ("3-0", "assistant", 0, 6, "完了")], next: nil),
+    ])
+    await m.start()
+    let run = try XCTUnwrap(m.runs.first)
+    XCTAssertTrue(m.canReadRunDetails)
+    await m.openRunDetails(run)
+    XCTAssertEqual(m.runDetails?.entries.map(\.text), ["指示", "abcd"])
+    XCTAssertFalse(m.isBusy)
+    await m.continueRunDetails()
+    XCTAssertEqual(m.runDetails?.entries.map(\.text), ["指示", "abcdefgh", "完了"])
+    XCTAssertEqual(m.runDetails?.entries.map(\.isPrimary), [true, false, true])
+    XCTAssertNil(m.runDetails?.nextCursor)
+
+    await t.setDetails([
+      detailsPage("d2", [("1-0", "user_input", 0, 6, "指示")], next: "d2:1:0"),
+      detailsPage("d2", [("2-0", "tool_result", 2, 8, "xx")], next: nil),
+    ])
+    await m.openRunDetails(run)
+    await m.continueRunDetails()
+    XCTAssertEqual(m.runDetails?.entries.map(\.text), ["指示"])
+    XCTAssertNotNil(m.runDetailsNotice)
+
+    await t.reject("revision_conflict")
+    await m.openRunDetails(run)
+    XCTAssertNil(m.runDetails)
+    XCTAssertEqual(m.runDetailsNotice, "表示内容の有効期限が切れました。読み込み直してください。")
+    XCTAssertEqual(m.phase, .ready)
+    m.closeRunDetails()
+    XCTAssertNil(m.expandedRunKey)
+    _ = await m.close()
+  }
+}
+
+extension WorkspaceRunTests {
+  private func mcpState(revision: String, active: String, enabled: [String]) -> ServiceValue {
+    .object([
+      "registry_revision": .string(revision), "secrets_revision": .string("1"),
+      "active_registry_revision": .string(active), "active_secrets_revision": .string("1"),
+      "secret_references": .array([.string("blender-abcd")]), "unchecked_servers": .array([.string("blender")]),
+      "servers": .array([.object([
+        "server_id": .string("blender"), "enabled_projects": .array(enabled.map(ServiceValue.string)),
+        "transport": .object(["kind": .string("stdio"), "command": .string("/opt/blender-mcp")]),
+        "capabilities": .object(["catalog_metadata": .bool(true), "resource_read": .bool(false),
+                                 "prompt_selection": .bool(false), "tool_call": .bool(true)]),
+        "timeouts": .object(["connect_seconds": .number("10")]),
+      ])]),
+    ])
+  }
+
+  func testMcpSettingsEditOnlySavedDocumentsAndShowDetectedReasons() async throws {
+    let t = RunTransport(), m = try model(t)
+    await m.start()
+    await t.setMcp([
+      mcpState(revision: "1", active: "1", enabled: []),
+      mcpState(revision: "2", active: "1", enabled: ["p"]),
+      .object(["server_id": .string("blender"), "outcome": .string("checked"), "tools": .string("26")]),
+      .object(["candidates": .array([
+        .object(["candidate_id": .string("c1"), "name": .string("resolve"), "transport": .string("stdio"),
+                 "status": .object(["kind": .string("importable"), "description": .string("名前: resolve")])]),
+        .object(["candidate_id": .string("c2"), "name": .string("npx-tool"), "transport": .string("stdio"),
+                 "status": .object(["kind": .string("unavailable"), "reason": .string("launcher_not_supported")])]),
+      ])]),
+    ])
+    let settings = McpSettingsModel(service: m)
+    await settings.load()
+    XCTAssertEqual(settings.servers.count, 1)
+    XCTAssertFalse(settings.isEnabled(settings.servers[0]))
+    XCTAssertEqual(settings.destination(settings.servers[0]), "/opt/blender-mcp")
+    XCTAssertFalse(settings.pendingRestart)
+    settings.setEnabled("blender", true)
+    settings.setCapability("blender", "tool_call", false)
+    await settings.save()
+    let calls = await t.calls
+    guard case .mcpRegistrySave(_, 1, let documents) = calls.last?.1 else { return XCTFail("save") }
+    XCTAssertEqual(documents.first?["enabled_projects"], .array([.string("p")]))
+    XCTAssertEqual(documents.first?["capabilities"]?["tool_call"], .bool(false))
+    XCTAssertEqual(documents.first?["timeouts"]?["connect_seconds"], .number("10"))
+    XCTAssertTrue(settings.pendingRestart)
+    await t.suspend("mcp.catalog.check")
+    let check = Task { await settings.check("blender") }
+    try await wait(t)
+    // A long catalog job leaves run controls and polling available.
+    XCTAssertFalse(m.isBusy)
+    XCTAssertEqual(settings.checking, "blender")
+    await t.release()
+    await check.value
+    XCTAssertNil(settings.checking)
+    XCTAssertEqual(settings.checks["blender"], "ツール26件を確認しました。")
+    XCTAssertFalse(settings.unchecked.contains("blender"))
+    await settings.detect()
+    XCTAssertEqual(settings.candidates.map(\.description), ["名前: resolve", nil])
+    XCTAssertEqual(settings.candidates.last?.reason, "起動のたびにパッケージを取得する形式のため取り込めません")
+    XCTAssertFalse(m.isBusy)
     _ = await m.close()
   }
 }

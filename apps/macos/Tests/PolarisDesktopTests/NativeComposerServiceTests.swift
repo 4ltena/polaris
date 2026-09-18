@@ -52,7 +52,7 @@ private actor NativeComposerTransport: WorkspaceServiceTransport {
     func send(requestID: String, request: ServiceRequest) async throws -> ServiceReply {
         let payload: ServiceValue
         switch request {
-        case .workspaceRead, .attachmentRead, .localModels, .configureRoles, .sourceApplyList, .sourceApplyPage, .sourceApplyResolve: throw ServiceError.notReady
+        case .workspaceRead, .attachmentRead, .localModels, .configureRoles, .workflowConfigure, .sourceApplyList, .sourceApplyPage, .sourceApplyResolve, .runDetails, .browseList, .browseRead, .mcpRegistryRead, .mcpRegistrySave, .mcpCatalogCheck, .mcpCatalogCancel, .mcpSetupDetect, .mcpSetupRegister: throw ServiceError.notReady
         case .snapshot, .subscribe:
             payload = snapshot()
         case .draft(_, let expectedRevision, let text):

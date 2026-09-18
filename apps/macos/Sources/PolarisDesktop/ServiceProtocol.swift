@@ -8,6 +8,7 @@ enum ServiceRequest: Sendable {
   case snapshot(session: String)
   case subscribe(session: String)
   case configure(session: String, revision: UInt64, selection: ExecutionBinding, historyMode: HistoryMode)
+  case workflowConfigure(session: String, revision: UInt64, enabled: Bool, mode: String, initialPhase: String)
   case localModels(session: String, provider: ExecutionBinding.Provider, endpoint: String)
   case configureRoles(session: String, revision: UInt64, bindings: [LocalRoleBinding])
   case draft(session: String, revision: UInt64, text: String)
@@ -19,6 +20,25 @@ enum ServiceRequest: Sendable {
   case sourceApplyResolve(session: String, run: String, attempt: String, approval: String, hash: String,
                           revision: UInt64, policy: UInt64, decision: ServiceApprovalDecision)
   case shutdown(epoch: String)
+  /// A later page names both the snapshot and cursor of the previous page.
+  case runDetails(session: String, run: String, attempt: String, snapshot: String?, cursor: String?)
+  /// Home-relative paths on the read-only helper only; "" is home itself.
+  case browseList(path: String, cursor: String?)
+  case browseRead(path: String, device: UInt64, inode: UInt64)
+  /// Owner MCP settings; saved changes apply from the next owner start.
+  case mcpRegistryRead(session: String)
+  case mcpRegistrySave(session: String, expected: UInt64, servers: [ServiceValue])
+  case mcpCatalogCheck(session: String, server: String)
+  case mcpCatalogCancel(session: String, server: String)
+  case mcpSetupDetect(session: String)
+  case mcpSetupRegister(session: String, candidate: String)
+
+  static func validHomePath(_ path: String, allowHome: Bool) -> Bool {
+    if path.isEmpty { return allowHome }
+    return path.utf8.count <= 4096 && !path.hasPrefix("/")
+      && !path.unicodeScalars.contains { $0.properties.generalCategory == .control }
+      && path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+  }
 
   var method: String {
     switch self {
@@ -27,6 +47,7 @@ enum ServiceRequest: Sendable {
     case .snapshot: "session.snapshot"
     case .subscribe: "session.subscribe"
     case .configure: "session.configure"
+    case .workflowConfigure: "workflow.configure"
     case .localModels: "local.models"
     case .configureRoles: "session.roles.configure"
     case .draft: "draft.update"
@@ -37,6 +58,15 @@ enum ServiceRequest: Sendable {
     case .sourceApplyPage: "source_apply.page"
     case .sourceApplyResolve: "source_apply.resolve"
     case .shutdown: "shutdown.request"
+    case .runDetails: "run.details"
+    case .browseList: "browse.list"
+    case .browseRead: "browse.read"
+    case .mcpRegistryRead: "mcp.registry.read"
+    case .mcpRegistrySave: "mcp.registry.save"
+    case .mcpCatalogCheck: "mcp.catalog.check"
+    case .mcpCatalogCancel: "mcp.catalog.cancel"
+    case .mcpSetupDetect: "mcp.setup.detect"
+    case .mcpSetupRegister: "mcp.setup.register"
     }
   }
   var capability: String {
@@ -45,6 +75,7 @@ enum ServiceRequest: Sendable {
     case .attachmentRead: "attachment_read"
     case .snapshot, .subscribe: "session_read"
     case .configure: "session_configure"
+    case .workflowConfigure: "workflow_configure"
     case .localModels: "local_models"
     case .configureRoles: "role_configure"
     case .draft: "draft_update"
@@ -54,6 +85,10 @@ enum ServiceRequest: Sendable {
     case .sourceApplyList, .sourceApplyPage: "source_apply_read"
     case .sourceApplyResolve: "source_apply_resolve"
     case .shutdown: "shutdown"
+    case .runDetails: "run_details_read"
+    case .browseList, .browseRead: "home_browse"
+    case .mcpRegistryRead, .mcpRegistrySave, .mcpCatalogCheck, .mcpCatalogCancel, .mcpSetupDetect, .mcpSetupRegister:
+      "mcp_settings"
     }
   }
   func wire(clientID: String, requestID: String) throws -> ServiceValue {
@@ -73,6 +108,14 @@ enum ServiceRequest: Sendable {
       params = ["expected_configuration_revision": .string(String(revision)), "provider": .string(selection.provider.rawValue),
                 "model": .string(selection.model), "effort": .string(selection.storedEffort)]
       if historyMode != .legacy { params["history_mode"] = .string(historyMode.rawValue) }
+    case .workflowConfigure(let s, let revision, let enabled, let mode, let initialPhase):
+      guard ["manual", "adaptive"].contains(mode),
+            ["general", "brainstorm", "specify", "implement", "review", "verify", "deliver"].contains(initialPhase) else {
+        throw ServiceError.schema
+      }
+      session = s
+      params = ["expected_session_revision": .string(String(revision)), "enabled": .bool(enabled),
+                "mode": .string(mode), "initial_phase": .string(initialPhase)]
     case .localModels(let s, let provider, let endpoint):
       guard provider == .ollama || provider == .lmstudio else { throw ServiceError.schema }
       session = s
@@ -132,6 +175,32 @@ enum ServiceRequest: Sendable {
     case .shutdown(let epoch):
       try ServiceSchema.id.check(.string(epoch))
       params = ["engine_epoch": .string(epoch)]
+    case .runDetails(let s, let run, let attempt, let snapshot, let cursor):
+      guard (snapshot == nil) == (cursor == nil) else { throw ServiceError.schema }
+      for value in [run, attempt] + [snapshot, cursor].compactMap({ $0 }) {
+        try ServiceSchema.id.check(.string(value))
+      }
+      session = s
+      params = ["run_id": .string(run), "attempt_id": .string(attempt)]
+      if let snapshot, let cursor { params["snapshot_id"] = .string(snapshot); params["cursor"] = .string(cursor) }
+    case .browseList(let path, let cursor):
+      guard Self.validHomePath(path, allowHome: true) else { throw ServiceError.schema }
+      params = ["path": .string(path)]
+      if let cursor { try ServiceSchema.id.check(.string(cursor)); params["cursor"] = .string(cursor) }
+    case .browseRead(let path, let device, let inode):
+      guard Self.validHomePath(path, allowHome: false) else { throw ServiceError.schema }
+      params = ["path": .string(path), "device": .string(String(device)), "inode": .string(String(inode))]
+    case .mcpRegistryRead(let s), .mcpSetupDetect(let s): session = s
+    case .mcpRegistrySave(let s, let expected, let servers):
+      guard servers.count <= 32 else { throw ServiceError.capacity }
+      session = s
+      params = ["expected_revision": .string(String(expected)), "servers": .array(servers)]
+    case .mcpCatalogCheck(let s, let server), .mcpCatalogCancel(let s, let server):
+      try ServiceSchema.id.check(.string(server))
+      session = s; params = ["server_id": .string(server)]
+    case .mcpSetupRegister(let s, let candidate):
+      try ServiceSchema.id.check(.string(candidate))
+      session = s; params = ["candidate_id": .string(candidate)]
     }
     var fields = try Self.envelope(
       clientID: clientID, requestID: requestID, method: method, params: params)
@@ -196,6 +265,8 @@ indirect enum ServiceSchema: Sendable {
   case object([String: ServiceSchema])
   case optionalFields([String: ServiceSchema], [String: ServiceSchema])
   case alternatives([ServiceSchema])
+  /// A server registration document, validated again by the owner on save.
+  case anyObject
 
   func check(_ value: ServiceValue) throws {
     switch (self, value) {
@@ -205,6 +276,7 @@ indirect enum ServiceSchema: Sendable {
     case (.uint32Number, .number(let number)) where Self.isCanonicalUInt(number, maximum: UInt64(UInt32.max)): break
     case (.version, .number("1")): break
     case (.bool, .bool): break
+    case (.anyObject, .object): break
     case (.oneOf(let choices), .string(let s)) where choices.contains(s): break
     case (.array(let schema), .array(let items)): for item in items { try schema.check(item) }
     case (.object(let fields), .object(let object)) where Set(fields.keys) == Set(object.keys):
@@ -227,8 +299,9 @@ indirect enum ServiceSchema: Sendable {
     return parsed <= maximum
   }
   static let capabilities: Set<String> = [
-    "workspace_read", "attachment_read", "session_read", "history_read", "draft_update", "session_configure", "role_configure", "run_start", "run_cancel", "local_models",
-    "approval_resolve", "request_status", "shutdown", "source_apply_read", "source_apply_resolve",
+    "workspace_read", "attachment_read", "session_read", "history_read", "draft_update", "session_configure", "workflow_configure", "role_configure", "run_start", "run_cancel", "local_models",
+    "approval_resolve", "request_status", "shutdown", "source_apply_read", "source_apply_resolve", "mcp_settings",
+    "run_details_read", "home_browse",
   ]
   static let hello: Self = .object([
     "protocol_version": .version, "engine_epoch": .id, "capabilities": .array(.oneOf(capabilities)),
@@ -246,6 +319,11 @@ indirect enum ServiceSchema: Sendable {
   static let configuration: Self = .optionalFields([
     "configuration_revision": .decimal, "provider": .text, "model": .text, "effort": .text,
   ], ["history_mode": .oneOf(["legacy", "strict10"])])
+  static let workflow: Self = .object([
+    "enabled": .bool, "mode": .oneOf(["manual", "adaptive"]),
+    "phase": .oneOf(["general", "brainstorm", "specify", "implement", "review", "verify", "deliver"]),
+    "revision": .decimal,
+  ])
   static let memoryUsage: Self = .object([
     "input_tokens": .decimal, "output_tokens": .decimal, "cached_tokens": .decimal,
     "reported_responses": .decimal, "missing_responses": .decimal, "failed_requests": .decimal,
@@ -256,7 +334,9 @@ indirect enum ServiceSchema: Sendable {
   static let memory: Self = .optionalFields([
     "run_id": .id, "phase": .oneOf(["preparing", "ready", "failed", "outcome_unknown"]), "detail": .text,
     "recent_raw_turns": .decimal, "retrieval_sources": .array(.text), "reference_tokens": .decimal,
-  ], ["summary_usage": memoryUsage, "main_usage": memoryUsage, "embedding_usage": embeddingUsage, "total_usage": memoryUsage])
+  ], ["summary_usage": memoryUsage, "main_usage": memoryUsage, "embedding_usage": embeddingUsage, "total_usage": memoryUsage,
+      "retrieval_status": .oneOf(["found", "not_found", "ambiguous_entity", "pending_reconfirmation", "extraction_incomplete", "evidence_budget_exceeded"]),
+      "related_omission": .oneOf(["query_terms", "grants", "serialized_rows", "matching_work", "vector_work", "raw_proof_work"])])
   static let roleBinding: Self = .object([
     "role": .text, "provider": .oneOf(["ollama", "lmstudio"]), "endpoint": .text,
     "model": .text, "observed_tool_support": .oneOf(["supported", "unsupported", "unknown"]),
@@ -341,7 +421,7 @@ indirect enum ServiceSchema: Sendable {
     "runs": .array(run),
     "children": .array(child), "child_attempt_count": .decimal,
     "unresolved_approvals": .array(approval),
-  ], ["memory": memory])
+  ], ["memory": memory, "workflow": workflow])
   static func result(_ type: String) throws -> Self {
     switch type {
     case "workspace.read": .object([
@@ -358,8 +438,46 @@ indirect enum ServiceSchema: Sendable {
     case "hello": hello
     case "session.snapshot", "session.subscribe": snapshot
     case "history.page": ServiceHistoryPage.schema
+    case "run.details": ServiceRunDetailsPage.schema
+    case "mcp.registry.read", "mcp.registry.save", "mcp.setup.register": .object([
+      "registry_revision": .decimal, "servers": .array(.anyObject), "secrets_revision": .decimal,
+      "secret_references": .array(.id), "active_registry_revision": .decimal, "active_secrets_revision": .decimal,
+      "unchecked_servers": .array(.id),
+    ])
+    case "mcp.catalog.check": .optionalFields([
+      "server_id": .id, "outcome": .oneOf(["checked", "partial", "cancelled", "failed"]), "tools": .decimal,
+    ], ["failure": .oneOf(["unavailable", "auth", "transport", "protection", "limit", "stop_unconfirmed", "storage"])])
+    case "mcp.catalog.cancel": .object(["server_id": .id, "state": .oneOf(["cancelling", "not_running"])])
+    case "mcp.setup.detect": .object(["candidates": .array(.object([
+      "candidate_id": .id, "name": .text, "transport": .oneOf(["stdio", "streamable_http", "unsupported"]),
+      "status": .alternatives([
+        .object(["kind": .oneOf(["importable"]), "description": .text]),
+        .object(["kind": .oneOf(["unavailable"]), "reason": .oneOf([
+          "launcher_not_supported", "environment_reference", "credential_in_arguments", "unsupported_transport",
+          "unsupported_auth", "command_not_found", "unsupported_install_location", "already_registered", "invalid",
+        ])]),
+      ]),
+    ]))])
+    case "browse.list": .optionalFields([
+      "browse_epoch": .id, "snapshot_id": .id, "directory": .text, "omitted": .decimal, "capacity": .bool,
+      "entries": .array(.object([
+        "name": .text, "path": .text, "kind": .oneOf(["directory", "file", "symlink", "unsupported"]),
+        "device": .decimal, "inode": .decimal,
+      ])),
+    ], ["next_cursor": .id])
+    case "browse.read": .object([
+      "browse_epoch": .id, "path": .text, "device": .decimal, "inode": .decimal,
+      "content": .alternatives([
+        .object(["state": .oneOf(["ready"]), "text": .text]),
+        .object(["state": .oneOf(["unavailable"]), "reason": .oneOf([
+          "deleted", "replaced", "revision_conflict", "too_large", "binary", "permission_denied", "protected",
+          "not_regular_file",
+        ])]),
+      ]),
+    ])
     case "request.status": ServiceRequestStatus.schema
     case "session.configure": .object(["session_revision": .decimal, "configuration": configuration])
+    case "workflow.configure": .optionalFields(["session_revision": .decimal], ["workflow": workflow])
     case "local.models": localModels
     case "session.roles.configure": .object([
       "configuration_revision": .decimal, "bindings": .array(roleBinding),

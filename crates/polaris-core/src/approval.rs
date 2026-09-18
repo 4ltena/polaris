@@ -12,6 +12,8 @@ use std::pin::Pin;
 use polaris_sandbox::SandboxPolicy;
 use polaris_tools::predicate::{Verdict, predict};
 
+use crate::mcp::operation::{ExternalCeiling, McpApprovalDisplay, McpOperation};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPolicy {
     /// Never ask. Anything out of scope is refused outright.
@@ -41,9 +43,43 @@ pub trait Approver {
     }
 }
 
+/// A typed judge the gate may consult in the moment before it troubles the
+/// person, and the request it judges against.
+///
+/// **Denial only.** It can turn a question into a refusal. It can never turn
+/// a refusal into a grant, satisfy an `ExternalCeiling`, shorten the question
+/// that is actually asked, or reopen something `ApprovalPolicy::Never`
+/// already refused — that refusal happens in `approval_request`, before this
+/// is consulted. A probability is not permission.
+///
+/// The question and the edge belong to [`crate::decision_bands`] and are not
+/// restated here: the same "役に立つか" wording tool preselection uses, and a
+/// refusal only in the **exclusion** band. A differently worded question, or
+/// a new threshold to read the answer against, would be a second calibration
+/// with nothing measured behind it.
+pub struct Advisor {
+    decider: std::sync::Arc<dyn polaris_provider::decision::Decider>,
+    /// What the run was asked to do. Without it "is this useful" has no
+    /// subject, so an advisor cannot be built from the operation alone.
+    task: String,
+}
+
+impl Advisor {
+    pub fn new(
+        decider: std::sync::Arc<dyn polaris_provider::decision::Decider>,
+        task: impl Into<String>,
+    ) -> Self {
+        Self {
+            decider,
+            task: task.into(),
+        }
+    }
+}
+
 pub struct Gate {
     policy: ApprovalPolicy,
     approval_available: bool,
+    advisor: Option<Advisor>,
 }
 
 impl Gate {
@@ -51,7 +87,14 @@ impl Gate {
         Self {
             policy,
             approval_available: true,
+            advisor: None,
         }
+    }
+
+    /// Registering one is optional, like every other use of the judge.
+    /// Without it the gate behaves exactly as it did before.
+    pub fn advise(&mut self, advisor: Advisor) {
+        self.advisor = Some(advisor);
     }
 
     /// Preserve the parent's policy without granting unattended approval.
@@ -59,6 +102,9 @@ impl Gate {
         Self {
             policy: self.policy,
             approval_available: false,
+            // A subagent cannot reach an approver at all, so there is no
+            // question here for an advisor to pre-empt.
+            advisor: None,
         }
     }
 
@@ -138,6 +184,9 @@ impl Gate {
         Self {
             policy: self.policy,
             approval_available: true,
+            // A preview builds the request without asking anyone, so there
+            // is no question for an advisor to pre-empt.
+            advisor: None,
         }
         .write_request(sandbox, target)
         .map(|_| ())
@@ -151,9 +200,117 @@ impl Gate {
         Self {
             policy: self.policy,
             approval_available: true,
+            // A preview builds the request without asking anyone, so there
+            // is no question for an advisor to pre-empt.
+            advisor: None,
         }
         .command_request(sandbox, command)
         .map(|_| ())
+    }
+
+    /// Generic MCP tool calls are external and unknown-impact.  An explicit
+    /// host ceiling is required before the normal Gate policy may ask once.
+    /// Server annotations and the local sandbox are deliberately absent from
+    /// this decision: neither can establish remote/app permission.
+    pub fn check_mcp_operation(
+        &mut self,
+        ceiling: ExternalCeiling,
+        operation: &McpOperation,
+        approver: &mut dyn Approver,
+    ) -> Result<(), String> {
+        let Some(reason) = self.mcp_operation_request(ceiling, operation)? else {
+            return Ok(());
+        };
+        Self::finish(&reason, approver.ask(&reason))
+    }
+
+    /// Nonblocking counterpart for hosts whose approver implements async UI.
+    ///
+    /// A registered [`Advisor`] is consulted here and nowhere else. The order
+    /// is the point: the ceiling and the policy decide first, so a judge is
+    /// never asked about something already refused, and is never what lets
+    /// something through. It runs only once a question was going to be asked,
+    /// so a run that approves nothing pays nothing for it.
+    pub async fn check_mcp_operation_async(
+        &mut self,
+        ceiling: ExternalCeiling,
+        operation: &McpOperation,
+        approver: &mut dyn Approver,
+    ) -> Result<(), String> {
+        let Some(reason) = self.mcp_operation_request(ceiling, operation)? else {
+            return Ok(());
+        };
+        if let Some(refusal) = self.plainly_useless(operation).await {
+            return Err(refusal);
+        }
+        Self::finish(&reason, approver.ask_async(&reason).await)
+    }
+
+    /// `Some` only when a judge answered, and answered in the exclusion band.
+    ///
+    /// Everything else — no advisor, a judge that could not answer, an answer
+    /// anywhere above the exclusion edge — leaves the person to decide, which
+    /// is what happens today. Its only effect is an early `Err`: it is
+    /// consulted after the ceiling and the policy, so nothing it returns can
+    /// grant anything.
+    async fn plainly_useless(&self, operation: &McpOperation) -> Option<String> {
+        let advisor = self.advisor.as_ref()?;
+        let display = operation.approval_display();
+        let bands = crate::decision_bands::judge(
+            advisor.decider.as_ref(),
+            &serde_json::json!({ "task": advisor.task }),
+            &advisor.task,
+            "操作",
+            &[(display.metadata.item.as_str(), display.description.as_str())],
+            std::future::pending(),
+        )
+        .await
+        .ok()?;
+        // One candidate was asked about, so exactly one band holds it. Only
+        // the exclusion band is acted on; the other two keep the question.
+        (bands.excluded == 1).then(|| {
+            format!(
+                "判定器が依頼に対して役に立たないと判断したため実行しなかった: {}",
+                display.description
+            )
+        })
+    }
+
+    /// Registration from a CLI or TUI run: the explicit external permission
+    /// first, then one question unless the policy forbids asking.
+    pub async fn check_mcp_registration_async(
+        &mut self,
+        ceiling: ExternalCeiling,
+        description: &str,
+        approver: &mut dyn Approver,
+    ) -> Result<(), String> {
+        if !ceiling.permits_external() {
+            return Err("mcp_external_ceiling_absent".into());
+        }
+        let Some(reason) = self.approval_request(format!("MCPサーバの登録\n{description}"))?
+        else {
+            return Ok(());
+        };
+        Self::finish(&reason, approver.ask_async(&reason).await)
+    }
+
+    /// Desktop's existing owner calls this before it persists an intent and
+    /// owns the actual approval.  No local question or grant is created here.
+    /// `Some` tells that owner to use the returned, secret-safe display.
+    pub fn owned_mcp_approval(
+        &self,
+        ceiling: ExternalCeiling,
+        operation: &McpOperation,
+    ) -> Result<Option<McpApprovalDisplay>, String> {
+        Self {
+            policy: self.policy,
+            approval_available: true,
+            // A preview builds the request without asking anyone, so there
+            // is no question for an advisor to pre-empt.
+            advisor: None,
+        }
+        .mcp_operation_request(ceiling, operation)
+        .map(|request| request.map(|_| operation.approval_display()))
     }
 
     fn command_request(
@@ -189,6 +346,24 @@ impl Gate {
         self.approval_request(reason)
     }
 
+    fn mcp_operation_request(
+        &self,
+        ceiling: ExternalCeiling,
+        operation: &McpOperation,
+    ) -> Result<Option<String>, String> {
+        if operation.is_resource_read() {
+            return Err("mcp_operation_not_tool".into());
+        }
+        if !ceiling.permits_external() {
+            return Err("mcp_external_ceiling_absent".into());
+        }
+        let display = operation.approval_display();
+        self.approval_request(format!(
+            "{}; ペイロード {}",
+            display.description, display.metadata.payload_hash
+        ))
+    }
+
     /// Shared preflight for both sync and async calls, before invoking an approver.
     fn approval_request(&self, reason: String) -> Result<Option<String>, String> {
         if self.policy == ApprovalPolicy::Never {
@@ -213,6 +388,11 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::operation::HostOperationIdentity;
+    use polaris_mcp::{
+        OperationBinding,
+        catalog::{ItemId, Kind},
+    };
     use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
     struct Scripted {
@@ -228,6 +408,166 @@ mod tests {
 
     fn workspace(root: &std::path::Path) -> SandboxPolicy {
         SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.to_path_buf()]).expect("policy")
+    }
+
+    fn mcp_operation() -> McpOperation {
+        McpOperation::from_binding(
+            HostOperationIdentity {
+                run_id: "run-1".into(),
+                attempt_id: "attempt-1".into(),
+                model_call_id: "call-1".into(),
+                operation_id: "operation-1".into(),
+                policy_revision: 3,
+                expires_at_ms: 1234,
+            },
+            "fixture project",
+            OperationBinding {
+                item: ItemId {
+                    server_id: "fixture-server".into(),
+                    kind: Kind::Tool,
+                    key: "modify-project".into(),
+                },
+                registry_revision: 2,
+                destination_hash: "destination".into(),
+                connection_generation: "connection".into(),
+                catalog_generation: "catalog".into(),
+                schema_hash: Some("schema".into()),
+                arguments_hash: "arguments".into(),
+                selection_id: None,
+                resource_uri: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Answers every question with the same probability, and counts how
+    /// many times it was asked. `None` makes it fail instead.
+    struct Judge {
+        yes: Option<f64>,
+        asked: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl polaris_provider::decision::Decider for Judge {
+        async fn decide(
+            &self,
+            _state: &serde_json::Value,
+            questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+        ) -> Result<polaris_provider::decision::Decision, polaris_provider::decision::DecisionError>
+        {
+            *self.asked.lock().unwrap() += 1;
+            let Some(yes) = self.yes else {
+                return Err(polaris_provider::decision::DecisionError::Unavailable);
+            };
+            Ok(polaris_provider::decision::Decision {
+                answers: questions
+                    .keys()
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            polaris_provider::decision::Answer {
+                                noul: Some(yes),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    fn advised(yes: Option<f64>) -> (Gate, std::sync::Arc<Judge>) {
+        let judge = std::sync::Arc::new(Judge {
+            yes,
+            asked: std::sync::Mutex::new(0),
+        });
+        let mut gate = Gate::new(ApprovalPolicy::OnRequest);
+        gate.advise(Advisor::new(judge.clone(), "画像を小さくしたい"));
+        (gate, judge)
+    }
+
+    /// The exclusion edge is the only answer that acts. Below it the person
+    /// is not troubled at all; at it and above, the question is asked exactly
+    /// as it would have been without a judge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_advisor_refuses_only_in_the_exclusion_band() {
+        for (yes, asks) in [
+            (crate::decision_bands::EXCLUDE - 0.1, false),
+            (crate::decision_bands::EXCLUDE, false),
+            (crate::decision_bands::EXCLUDE + 0.1, true),
+            (crate::decision_bands::ADOPT, true),
+        ] {
+            let (mut gate, judge) = advised(Some(yes));
+            let mut approver = Scripted {
+                answers: vec![Decision::Allow],
+                asked: vec![],
+            };
+            let held = gate
+                .check_mcp_operation_async(
+                    ExternalCeiling::Allowed,
+                    &mcp_operation(),
+                    &mut approver,
+                )
+                .await;
+            assert_eq!(*judge.asked.lock().unwrap(), 1, "{yes}");
+            assert_eq!(approver.asked.is_empty(), !asks, "{yes}");
+            assert_eq!(held.is_ok(), asks, "{yes}");
+            if !asks {
+                assert!(held.unwrap_err().contains("役に立たない"), "{yes}");
+            }
+        }
+    }
+
+    /// A judge that could not answer is not a judge that said no.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_judge_that_cannot_answer_leaves_the_person_to_decide() {
+        let (mut gate, judge) = advised(None);
+        let mut approver = Scripted {
+            answers: vec![Decision::Allow],
+            asked: vec![],
+        };
+        assert!(
+            gate.check_mcp_operation_async(
+                ExternalCeiling::Allowed,
+                &mcp_operation(),
+                &mut approver
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(*judge.asked.lock().unwrap(), 1);
+        assert_eq!(approver.asked.len(), 1);
+    }
+
+    /// The ceiling and the policy decide first, so the judge is never asked
+    /// about something already refused — and can never be what reopens it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_advisor_is_not_consulted_about_what_was_already_refused() {
+        for (ceiling, policy) in [
+            (ExternalCeiling::Denied, ApprovalPolicy::OnRequest),
+            (ExternalCeiling::Allowed, ApprovalPolicy::Never),
+        ] {
+            let judge = std::sync::Arc::new(Judge {
+                // Would adopt, if it were ever asked.
+                yes: Some(1.0),
+                asked: std::sync::Mutex::new(0),
+            });
+            let mut gate = Gate::new(policy);
+            gate.advise(Advisor::new(judge.clone(), "画像を小さくしたい"));
+            let mut approver = Scripted {
+                answers: vec![Decision::Allow],
+                asked: vec![],
+            };
+            assert!(
+                gate.check_mcp_operation_async(ceiling, &mcp_operation(), &mut approver)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(*judge.asked.lock().unwrap(), 0);
+            assert!(approver.asked.is_empty());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -539,5 +879,144 @@ mod tests {
             reason.contains(&sandbox.writable_roots()[0].display().to_string()),
             "reason is missing the root: {reason}"
         );
+    }
+
+    #[test]
+    fn generic_mcp_tool_requires_one_question_and_denial_stops_it() {
+        for policy in [ApprovalPolicy::OnRequest, ApprovalPolicy::Always] {
+            for decision in [Decision::Allow, Decision::Deny] {
+                let mut gate = Gate::new(policy);
+                let mut approver = Scripted {
+                    answers: vec![decision],
+                    asked: vec![],
+                };
+                let result = gate.check_mcp_operation(
+                    ExternalCeiling::Allowed,
+                    &mcp_operation(),
+                    &mut approver,
+                );
+                assert_eq!(approver.asked.len(), 1, "{policy:?} must ask once");
+                assert!(approver.asked[0].contains("影響: 未判定"));
+                assert_eq!(result.is_ok(), decision == Decision::Allow);
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_tool_denies_for_never_missing_ceiling_or_subagent_without_relay() {
+        for policy in [
+            ApprovalPolicy::Never,
+            ApprovalPolicy::OnRequest,
+            ApprovalPolicy::Always,
+        ] {
+            let mut gate = Gate::new(policy);
+            let mut approver = Scripted {
+                answers: vec![Decision::Allow],
+                asked: vec![],
+            };
+            let missing = gate
+                .check_mcp_operation(ExternalCeiling::Denied, &mcp_operation(), &mut approver)
+                .unwrap_err();
+            assert_eq!(missing, "mcp_external_ceiling_absent");
+            assert!(approver.asked.is_empty());
+        }
+
+        let mut never = Gate::new(ApprovalPolicy::Never);
+        let mut approver = Scripted {
+            answers: vec![Decision::Allow],
+            asked: vec![],
+        };
+        assert!(
+            never
+                .check_mcp_operation(ExternalCeiling::Allowed, &mcp_operation(), &mut approver)
+                .is_err()
+        );
+        assert!(approver.asked.is_empty());
+
+        let mut child = Gate::new(ApprovalPolicy::OnRequest).for_subagent();
+        let error = child
+            .check_mcp_operation(ExternalCeiling::Allowed, &mcp_operation(), &mut approver)
+            .unwrap_err();
+        assert!(error.contains("approval relay is unavailable"));
+        assert!(approver.asked.is_empty());
+    }
+
+    #[test]
+    fn desktop_owner_receives_display_without_local_question_or_grant() {
+        let gate = Gate::new(ApprovalPolicy::OnRequest);
+        let display = gate
+            .owned_mcp_approval(ExternalCeiling::Allowed, &mcp_operation())
+            .unwrap()
+            .expect("owner must approve unknown tool");
+        assert_eq!(display.title, "MCP ツール実行");
+        assert_eq!(
+            display.metadata.impact,
+            crate::mcp::operation::McpImpact::Unknown
+        );
+        assert!(display.description.contains("fixture-server"));
+
+        assert!(
+            Gate::new(ApprovalPolicy::Never)
+                .owned_mcp_approval(ExternalCeiling::Allowed, &mcp_operation())
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_async_approval_uses_the_nonblocking_ui_boundary_once() {
+        struct AsyncOnly {
+            asked: usize,
+            decision: Decision,
+        }
+        impl Approver for AsyncOnly {
+            fn ask(&mut self, _: &str) -> Decision {
+                panic!("synchronous UI must not run")
+            }
+            fn ask_async<'a>(
+                &'a mut self,
+                _: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Decision> + 'a>> {
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    self.asked += 1;
+                    self.decision
+                })
+            }
+        }
+        for decision in [Decision::Allow, Decision::Deny] {
+            let mut approver = AsyncOnly { asked: 0, decision };
+            let result = Gate::new(ApprovalPolicy::OnRequest)
+                .check_mcp_operation_async(
+                    ExternalCeiling::Allowed,
+                    &mcp_operation(),
+                    &mut approver,
+                )
+                .await;
+            assert_eq!(result.is_ok(), decision == Decision::Allow);
+            assert_eq!(approver.asked, 1);
+        }
+    }
+
+    #[test]
+    fn server_annotations_cannot_relax_generic_mcp_tool_approval() {
+        // Catalog annotations are intentionally not an input to McpOperation
+        // or Gate.  Even a server's claimed read-only annotation cannot turn
+        // a generic tool into an allowed impact class.
+        let _claimed_annotation = "readOnly=true; destructive=false";
+        let operation = mcp_operation();
+        assert_eq!(
+            operation.impact(),
+            crate::mcp::operation::McpImpact::Unknown
+        );
+        let mut gate = Gate::new(ApprovalPolicy::OnRequest);
+        let mut approver = Scripted {
+            answers: vec![Decision::Deny],
+            asked: vec![],
+        };
+        assert!(
+            gate.check_mcp_operation(ExternalCeiling::Allowed, &operation, &mut approver)
+                .is_err()
+        );
+        assert_eq!(approver.asked.len(), 1);
     }
 }

@@ -12,6 +12,7 @@ pub mod constitution;
 pub mod conversation_memory;
 pub mod conversation_state;
 pub mod decision_bands;
+pub mod decisions;
 pub mod desktop_approval;
 pub mod desktop_events;
 pub mod desktop_execution;
@@ -25,9 +26,11 @@ mod dir_watch;
 mod error_region;
 mod events;
 pub mod execution_owner;
+pub mod filemap;
 mod files_md;
 mod gitignore;
 pub mod measurement;
+pub mod preselect;
 pub mod preselection_corpus;
 pub mod project;
 /// Unix only: the call binds to an open directory FD and spawns a child.
@@ -56,6 +59,7 @@ pub mod handoff;
 pub mod isolated_run;
 #[cfg(unix)]
 pub mod isolated_workspace;
+pub mod llama_server;
 pub mod local_execution;
 pub mod mcp;
 #[cfg(target_os = "macos")]

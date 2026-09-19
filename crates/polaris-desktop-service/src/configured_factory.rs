@@ -668,6 +668,7 @@ impl ConfiguredRunFactory {
                 let runtime = match binding.runtime {
                     polaris_core::desktop_store::SavedRuntime::Ollama => Runtime::Ollama,
                     polaris_core::desktop_store::SavedRuntime::LmStudio => Runtime::LmStudio,
+                    polaris_core::desktop_store::SavedRuntime::LlamaCpp => Runtime::LlamaCpp,
                     // An account-backed role answers on the registration
                     // the run already holds. There is no endpoint to bind
                     // and no inventory to consult: the model name is what

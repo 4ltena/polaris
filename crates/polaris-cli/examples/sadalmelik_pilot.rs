@@ -473,7 +473,7 @@ mod tests {
                 .unwrap();
             let requests = capture.0.lock().unwrap();
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].contains("Workflow focus: implement."), expected);
+            assert_eq!(requests[0].contains("phase=implement"), expected);
             assert_eq!(requests[0].contains(implement.body.trim()), expected);
         }
     }

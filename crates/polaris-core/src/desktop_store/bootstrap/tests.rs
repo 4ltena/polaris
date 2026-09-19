@@ -281,8 +281,16 @@ fn bootstrap_local_effort_is_storage_only_and_explicit_effort_is_rejected() {
 #[test]
 fn owner_configuration_shared_validator_preserves_cloud_and_local_semantics() {
     for provider in ["codex", "openai"] {
-        for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
             validate_owner_configuration(provider, "model", effort).unwrap();
+        }
+        // Not an effort the API has. Accepting it here just moved the
+        // refusal to the first request, out of the settings screen's reach.
+        for effort in ["ultra", "extra high", ""] {
+            assert!(
+                validate_owner_configuration(provider, "model", effort).is_err(),
+                "{effort}"
+            );
         }
     }
     for provider in ["ollama", "lmstudio"] {

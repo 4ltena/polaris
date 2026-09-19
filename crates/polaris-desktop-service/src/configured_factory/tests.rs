@@ -954,9 +954,13 @@ fn account_backed_roles_and_weights_are_built_on_the_registration_the_run_holds(
     let inputs = factory.prepare(&target, &saved).unwrap();
     assert!(inputs.provider.resolve_role("child").unwrap().is_some());
     assert!(inputs.provider.resolve_role("missing").is_err());
-    assert!(inputs.provider.resolve_tier("low").unwrap().is_some());
+    assert!(inputs.provider.resolve_tier("dwarf").unwrap().is_some());
     assert!(
-        inputs.provider.resolve_tier("ultra").unwrap().is_none(),
+        inputs
+            .provider
+            .resolve_tier("supergiant")
+            .unwrap()
+            .is_none(),
         "an unpriced weight names nothing and the caller falls back"
     );
     // Building the providers must not have sent anything: a model name is
@@ -994,7 +998,13 @@ fn a_weight_priced_without_any_role_still_routes() {
     let factory = f.factory();
     factory.stage_workspace(f.workspace()).unwrap();
     let inputs = factory.prepare(&target, &saved).unwrap();
-    assert!(inputs.provider.resolve_tier("ultra").unwrap().is_some());
+    assert!(
+        inputs
+            .provider
+            .resolve_tier("supergiant")
+            .unwrap()
+            .is_some()
+    );
     // Pricing a weight is not binding a role, so an unbound role is still
     // refused exactly as it was before.
     assert!(inputs.provider.resolve_role("child").is_err());

@@ -18,19 +18,31 @@ pub const MAX_MODEL_BYTES: usize = 512;
 pub enum SavedRuntime {
     Ollama,
     LmStudio,
+    /// `llama-server` started by polaris itself from a pinned build.
+    LlamaCpp,
     Account,
 }
 
 impl SavedRuntime {
+    /// Whether a saved binding must name where to send.
+    ///
+    /// `Account` has no origin to record. `LlamaCpp` has one, but polaris
+    /// allocates it at startup — the port is not the same twice — so a
+    /// saved endpoint would be a stale address that looks authoritative.
+    /// Both leave it absent and are resolved at bind time.
     fn wants_endpoint(self) -> bool {
-        !matches!(self, Self::Account)
+        !matches!(self, Self::Account | Self::LlamaCpp)
     }
 }
 
 /// The reasoning efforts the wire accepts. Stored as a closed set rather
 /// than free text: an effort the backend does not know is refused at the
 /// first request, and the settings screen is where that should be caught.
-pub const EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+///
+/// `max` belongs here even though it is Responses-API only, because
+/// `/responses` is the endpoint polaris sends to. `ultra` does not belong
+/// here and never did: the API has no such effort.
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// An observation only: Supported is neither a current capability nor a grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +77,7 @@ impl SavedRoleBinding {
             runtime: match selection.runtime() {
                 Runtime::Ollama => SavedRuntime::Ollama,
                 Runtime::LmStudio => SavedRuntime::LmStudio,
+                Runtime::LlamaCpp => SavedRuntime::LlamaCpp,
             },
             endpoint: Some(selection.endpoint().as_str().to_owned()),
             model: selection.model().id().to_owned(),

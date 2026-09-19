@@ -51,12 +51,17 @@ impl Tier {
     /// The spelling the frontmatter uses, which is also the routing key a
     /// provider is registered under. Keeping one spelling for both means a
     /// type's declaration and its configuration cannot drift apart.
-    pub const ALL: [Self; 4] = [
-        Self::Dwarf,
-        Self::Subgiant,
-        Self::Giant,
-        Self::Supergiant,
-    ];
+    /// The weight a task runs at when nothing routed it.
+    ///
+    /// Named here rather than at the call site because it is a property of
+    /// the ladder, not of the caller: M16 defines `subgiant` as the
+    /// ordinary rung for "複数fileの通常の変更", and a type's
+    /// `polaris-tier` is the ceiling above it, not a replacement for it.
+    /// A type whose ceiling sits below this still gets its ceiling — the
+    /// caller clamps with `min`.
+    pub const DEFAULT: Self = Self::Subgiant;
+
+    pub const ALL: [Self; 4] = [Self::Dwarf, Self::Subgiant, Self::Giant, Self::Supergiant];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -386,13 +391,29 @@ pub fn discover_agent_types_in(dirs: &[PathBuf]) -> DiscoveredAgentTypes {
 
 /// `<project_root>/agents` と `<HOME>/.polaris/agents` に加えて設定由来の
 /// 追加パスを、この順で歩く。`.polaris/skills` と対になる規約。
+///
+/// 歩き終えたあとに同梱の型（`crate::builtin`）を**最後へ**足す。順序が
+/// 意味を持つ——先に見つかった名前が勝つので、projectや利用者が同じ名前で
+/// 書いた型はそのまま優先される。足さない場合、このリポジトリ以外の全ての
+/// projectで型が0件になり、毎要求108トークンを払って広告している `spawn`
+/// が失敗しか返さない。
 pub fn discover_agent_types(project_root: &Path, extra_paths: &[PathBuf]) -> DiscoveredAgentTypes {
     let mut dirs = vec![project_root.join("agents")];
     if let Some(home) = std::env::var_os("HOME") {
         dirs.push(Path::new(&home).join(".polaris").join("agents"));
     }
     dirs.extend_from_slice(extra_paths);
-    discover_agent_types_in(&dirs)
+    let mut discovered = discover_agent_types_in(&dirs);
+    for builtin in crate::builtin::agent_types() {
+        if !discovered
+            .agent_types
+            .iter()
+            .any(|a| a.name == builtin.name)
+        {
+            discovered.agent_types.push(builtin);
+        }
+    }
+    discovered
 }
 
 #[cfg(test)]
@@ -400,7 +421,85 @@ mod tests {
     use super::*;
 
     fn valid_text() -> &'static str {
-        "---\nname: file-inspector\ndescription: 単一ファイルを読み取り専用で棚卸しし、責務、入出力、対応するテストを返す。\nallowed-tools: read\nmetadata:\n  polaris-access: read\n  polaris-tier: low\n  polaris-wall-seconds: \"360\"\n  polaris-max-turns: \"12\"\n  polaris-continuation: \"denied\"\n  polaris-output: references/result.schema.json\n---\n本文がそのまま subagent のシステムプロンプトとなる。\n"
+        "---\nname: file-inspector\ndescription: 単一ファイルを読み取り専用で棚卸しし、責務、入出力、対応するテストを返す。\nallowed-tools: read\nmetadata:\n  polaris-access: read\n  polaris-tier: dwarf\n  polaris-wall-seconds: \"360\"\n  polaris-max-turns: \"12\"\n  polaris-continuation: \"denied\"\n  polaris-output: references/result.schema.json\n---\n本文がそのまま subagent のシステムプロンプトとなる。\n"
+    }
+
+    /// The shipped types have to be there when nothing is on disk, and
+    /// have to lose to anything that is. A project that writes its own
+    /// `implementer` gets its own, not the one in the binary.
+    #[test]
+    fn the_shipped_types_fill_an_empty_catalogue_and_yield_to_a_project_of_the_same_name() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let project = tempfile::tempdir().expect("temp dir");
+        // `discover_agent_types` reads HOME. Point it at an empty one so
+        // the machine's real `~/.polaris/agents` cannot decide this test.
+        let _guard = HomeGuard::set(home.path());
+
+        let bare = discover_agent_types(project.path(), &[]);
+        let shipped: Vec<String> = crate::builtin::agent_types()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert!(!shipped.is_empty(), "nothing ships");
+        for name in &shipped {
+            assert!(
+                bare.agent_types.iter().any(|a| &a.name == name),
+                "{name} is not offered in an empty project"
+            );
+        }
+
+        // Now the project writes its own under one of those names.
+        let taken = shipped[0].as_str();
+        let dir = project.path().join("agents").join(taken);
+        std::fs::create_dir_all(dir.join("references")).expect("mkdir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            valid_text().replace("name: file-inspector", &format!("name: {taken}")),
+        )
+        .expect("write");
+
+        let with_own = discover_agent_types(project.path(), &[]);
+        let held: Vec<_> = with_own
+            .agent_types
+            .iter()
+            .filter(|a| a.name == taken)
+            .collect();
+        assert_eq!(held.len(), 1, "the name is offered twice: {held:?}");
+        assert_eq!(
+            held[0].path, dir,
+            "the shipped type won over the project's own"
+        );
+    }
+
+    /// `HOME` is process-wide and cargo runs these concurrently.
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl HomeGuard {
+        fn set(home: &Path) -> Self {
+            let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("HOME");
+            // SAFETY: only rewritten while holding HOME_LOCK, and restored
+            // on drop including on panic.
+            unsafe { std::env::set_var("HOME", home) };
+            Self { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                match self.prev.take() {
+                    Some(prev) => std::env::set_var("HOME", prev),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -431,7 +530,7 @@ mod tests {
     #[test]
     fn a_missing_metadata_key_is_rejected() {
         let text =
-            "---\nname: bad\ndescription: 説明。\nmetadata:\n  polaris-tier: low\n---\n本文。\n";
+            "---\nname: bad\ndescription: 説明。\nmetadata:\n  polaris-tier: dwarf\n---\n本文。\n";
         let err = parse(text, "bad", Path::new("agents/bad")).unwrap_err();
         assert!(matches!(
             err,
@@ -444,7 +543,7 @@ mod tests {
 
     #[test]
     fn an_invalid_access_value_is_rejected() {
-        let text = "---\nname: bad\ndescription: 説明。\nmetadata:\n  polaris-access: sudo\n  polaris-tier: low\n  polaris-wall-seconds: \"1\"\n  polaris-max-turns: \"1\"\n  polaris-continuation: \"denied\"\n  polaris-output: r.json\n---\n本文。\n";
+        let text = "---\nname: bad\ndescription: 説明。\nmetadata:\n  polaris-access: sudo\n  polaris-tier: dwarf\n  polaris-wall-seconds: \"1\"\n  polaris-max-turns: \"1\"\n  polaris-continuation: \"denied\"\n  polaris-output: r.json\n---\n本文。\n";
         let err = parse(text, "bad", Path::new("agents/bad")).unwrap_err();
         assert!(matches!(
             err,
@@ -464,7 +563,7 @@ mod tests {
             ("supergiant", Tier::Supergiant),
         ] {
             let text =
-                valid_text().replace("polaris-tier: low", &format!("polaris-tier: {declared}"));
+                valid_text().replace("polaris-tier: dwarf", &format!("polaris-tier: {declared}"));
             let held = parse(&text, "file-inspector", Path::new("agents/file-inspector"))
                 .expect("a valid weight");
             assert_eq!(held.tier, expected);
@@ -473,9 +572,17 @@ mod tests {
         // then match no configured weight at all — the type would quietly
         // run on the parent's model instead of the one its author asked
         // for. A misspelling has to be a load failure, not a silent one.
-        for refused in ["heavy", "Low", "lo", ""] {
+        // The three spellings that were valid before the rename are
+        // refused here, unlike `SavedTier`/`BoundTier`, which keep them as
+        // serde aliases. The asymmetry is deliberate: a saved role binding
+        // is invisible state a person cannot see go wrong, so it is read
+        // leniently; frontmatter is a file its author can open, and a type
+        // that fails to load is reported as skipped. Adding an alias here
+        // would be a change of that decision, and this list is what says
+        // so.
+        for refused in ["heavy", "Low", "lo", "", "low", "medium", "ultra"] {
             let text =
-                valid_text().replace("polaris-tier: low", &format!("polaris-tier: {refused}"));
+                valid_text().replace("polaris-tier: dwarf", &format!("polaris-tier: {refused}"));
             let error = parse(&text, "file-inspector", Path::new("agents/file-inspector"))
                 .expect_err(&format!("{refused:?} is not a weight"));
             assert!(

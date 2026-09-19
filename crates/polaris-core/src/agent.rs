@@ -268,6 +268,112 @@ const MAX_REGENERATION_TARGETS_PER_CALL: usize = 32;
 const MAX_EXAMPLES: usize = 20;
 const MAX_EXAMPLE_TOKENS: usize = 768;
 
+/// Asks the judge which documented files this request is about, and
+/// returns the section naming them.
+///
+/// Returns `None` whenever the route cannot be taken — no judge, no map,
+/// an unreadable map, or a judge that would not answer. None of those is a
+/// failure of the run: without a section the model falls back to reading
+/// the map itself, which is exactly what it did before this existed. The
+/// reason goes to the audit log so a run that quietly stopped routing can
+/// be told apart from one where nothing matched.
+///
+/// The map is read through `symlink_metadata` first, on the same footing
+/// as `constitution::environment_block`: a `docs/filemap.md` that is a link
+/// is not followed, so a repository cannot point this at a file outside
+/// itself and have its contents summarised into the prompt.
+async fn filemap_route(
+    session: &Session,
+    root: Option<&std::path::Path>,
+    query: &str,
+    audit: &Arc<Mutex<AuditLog>>,
+    caller: &str,
+) -> Result<Option<String>, AgentError> {
+    let Some(decider) = session.decider.clone() else {
+        return Ok(None);
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let path = root.join("docs/filemap.md");
+    let readable = matches!(std::fs::symlink_metadata(&path), Ok(meta) if meta.is_file());
+    if !readable {
+        return Ok(None);
+    }
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let entries = crate::filemap::parse(&body);
+    let phase = session
+        .workflow
+        .as_ref()
+        .map(|workflow| workflow.state().phase.as_str())
+        .unwrap_or("");
+    let (section, result) =
+        match crate::filemap::route(decider.as_ref(), &entries, query, phase).await {
+            Ok(picked) if picked.is_empty() => (None, "no_match".to_owned()),
+            Ok(picked) => {
+                let count = picked.len().min(crate::filemap::MAX_PICKS);
+                (crate::filemap::section(&picked), format!("picked={count}"))
+            }
+            Err(refused) => (None, format!("{refused:?}")),
+        };
+    audit.lock().await.record(&Record {
+        tool: "filemap-route",
+        detail: &format!("entries={}", entries.len()),
+        sandbox: None,
+        target: None,
+        result: &result,
+        caller,
+    })?;
+    Ok(section)
+}
+
+/// Asks the judge which settled questions this request repeats.
+///
+/// Sits beside the filemap route and costs the same shape of call. The
+/// section it produces is advice: it names what looks already decided and
+/// leaves the model to judge, because a false match here would stop work
+/// that should happen while a false miss only leaves things as they are.
+async fn decided_route(
+    session: &Session,
+    root: Option<&std::path::Path>,
+    query: &str,
+    audit: &Arc<Mutex<AuditLog>>,
+    caller: &str,
+) -> Result<Option<String>, AgentError> {
+    let Some(decider) = session.decider.clone() else {
+        return Ok(None);
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let entries = crate::decisions::load(root);
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let (section, result) = match crate::decisions::route(decider.as_ref(), &entries, query).await {
+        Ok(matched) if matched.is_empty() => (None, "no_match".to_owned()),
+        Ok(matched) => {
+            let count = matched.len().min(crate::decisions::MAX_SHOWN);
+            (
+                crate::decisions::section(&matched),
+                format!("matched={count}"),
+            )
+        }
+        Err(refused) => (None, format!("{refused:?}")),
+    };
+    audit.lock().await.record(&Record {
+        tool: "decided-route",
+        detail: &format!("entries={}", entries.len()),
+        sandbox: None,
+        target: None,
+        result: &result,
+        caller,
+    })?;
+    Ok(section)
+}
+
 /// Trims `changes` so that at most `cap` directories can be regenerated
 /// from it, and reports how many entries were dropped.
 ///
@@ -571,6 +677,16 @@ pub(crate) async fn run_loop(
     }
     let base_system = system;
     let mut request_tools = tools.to_vec();
+    // Never advertise `spawn` into an empty catalogue. It costs tokens on
+    // every request, and with no type to resolve against, each of the
+    // three dispatch branches ends before a provider call — two of them
+    // reach `Stopped` after three tries, so the tool does not merely fail,
+    // it ends the run. Shipped types (`polaris_skills::builtin`) mean the
+    // CLI never gets here; a desktop whose bundle lost `Resources/agents`
+    // still can.
+    if agent_types.is_empty() {
+        request_tools.retain(|tool| tool.name != "spawn");
+    }
     let mcp_setup = session.mcp_setup.clone().filter(|_| caller == "root");
     if mcp_setup.is_some() {
         request_tools.push(polaris_tools::mcp_setup_spec());
@@ -667,7 +783,16 @@ pub(crate) async fn run_loop(
     // may only refuse.
     if let Some(decider) = session.decider.clone() {
         ctx.gate
-            .advise(crate::approval::Advisor::new(decider, skill_query));
+            .advise(crate::approval::Advisor::new(decider.clone(), skill_query));
+        // And, separately, the severity classifier (M18). It needs two
+        // things to do anything at all: a judge here, and a level the
+        // person wrote down. Registering it with `AutoApproval::Off` — the
+        // default — leaves every question exactly where it was, so the
+        // registration itself grants nothing.
+        ctx.gate.classify(crate::approval::Classifier::new(
+            decider,
+            session.approval_auto,
+        ));
     }
     if let Some(runtime) = mcp.as_deref_mut() {
         let phase = session
@@ -689,6 +814,28 @@ pub(crate) async fn run_loop(
             })?;
         }
     }
+    // Route the request to a handful of files, once, before the first
+    // request goes out.
+    //
+    // Sits here rather than behind a tool because a tool call costs a full
+    // round trip of the main model — the whole history re-sent — to ask a
+    // question the judge answers for a fraction of a cent. Computed once
+    // and held constant for the run, so it joins the prompt at the same
+    // place the workflow profile and the skill catalogue do without moving
+    // the prefix between iterations.
+    //
+    // Root only. A subagent is given its task directly and has no map to
+    // search, and paying for a second route on every spawned child would
+    // cost more than the read it replaces.
+    let (filemap_section, decided_section) = if caller == "root" {
+        let root = ctx.sandbox.writable_roots().first().cloned();
+        (
+            filemap_route(session, root.as_deref(), skill_query, &audit, caller).await?,
+            decided_route(session, root.as_deref(), skill_query, &audit, caller).await?,
+        )
+    } else {
+        (None, None)
+    };
     // Every invocation owns its context. Child agents invoke run_loop
     // independently and cannot inherit transport state from their parent.
     let turn_context = polaris_provider::turn_affinity::TurnContext::new();
@@ -728,6 +875,20 @@ pub(crate) async fn run_loop(
             }
         } else {
             request_system
+        };
+        // The routed files come last, so the sections that answer to their
+        // own ceilings keep the order they had before this existed.
+        let request_system = match &filemap_section {
+            Some(section) => {
+                format!("{request_system}\n{}\n{section}", crate::filemap::HEADING)
+            }
+            None => request_system,
+        };
+        let request_system = match &decided_section {
+            Some(section) => {
+                format!("{request_system}\n{}\n{section}", crate::decisions::HEADING)
+            }
+            None => request_system,
         };
         // M6-3c: instructions that arrived during the run join the
         // conversation at this boundary, in arrival order, before the next
@@ -823,6 +984,22 @@ pub(crate) async fn run_loop(
                 {
                     refreshed.push('\n');
                     refreshed.push_str(&catalog.text);
+                }
+                // This branch rebuilds the prompt from scratch, so every
+                // section added above has to be added here too. Anything
+                // left out is silently dropped for root runs only — the
+                // one configuration where it was meant to apply.
+                if let Some(section) = &filemap_section {
+                    refreshed.push('\n');
+                    refreshed.push_str(crate::filemap::HEADING);
+                    refreshed.push('\n');
+                    refreshed.push_str(section);
+                }
+                if let Some(section) = &decided_section {
+                    refreshed.push('\n');
+                    refreshed.push_str(crate::decisions::HEADING);
+                    refreshed.push('\n');
+                    refreshed.push_str(section);
                 }
                 refreshed
             }
@@ -1822,9 +1999,8 @@ async fn dispatch(
                 // A name the catalogue does have is taken as given: the
                 // orchestrator that bothered to name a real one has said
                 // something the judge should not overrule.
-                let recognised = named.filter(|name| {
-                    agent_types.iter().any(|held| &held.name == name)
-                });
+                let recognised =
+                    named.filter(|name| agent_types.iter().any(|held| &held.name == name));
                 let agent_type = match (recognised, decider) {
                     (Some(name), _) => name.to_string(),
                     // Either nothing was named, or what was named is not
@@ -1856,9 +2032,12 @@ async fn dispatch(
                                 // No name, and the judge could not choose.
                                 // Inventing one here would run something
                                 // nobody asked for.
-                                None => break 'spawn Err(
-                                    "tasks[].type がなく、判定器も型を選べませんでした".to_string(),
-                                ),
+                                None => {
+                                    break 'spawn Err(
+                                        "tasks[].type がなく、判定器も型を選べませんでした"
+                                            .to_string(),
+                                    );
+                                }
                             },
                         }
                     }
@@ -2551,7 +2730,7 @@ mod tests {
                     Phase::Deliver,
                 ][index];
                 assert_eq!(state.workflow.phase, phase);
-                assert!(req.system.contains(&format!("Workflow focus: {phase}")));
+                assert!(req.system.contains(&format!("phase={phase}")));
                 assert_eq!(
                     req.system.matches("Required workflow instructions").count(),
                     1
@@ -3162,6 +3341,205 @@ mod tests {
         }));
     }
 
+    /// Builds a project whose map documents three files, and a judge that
+    /// adopts only the one named in `wanted`.
+    fn filemap_fixture(wanted: &'static str) -> (tempfile::TempDir, FilemapJudge) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("docs")).expect("docs");
+        std::fs::write(
+            dir.path().join("docs/filemap.md"),
+            "# File map\n\n## `crates/polaris-core/src`\n\n\
+             - `agent.rs` — The loop that runs one turn.\n\
+             - `budget.rs` — Token ceilings for the always-on context.\n\
+             - `session.rs` — Request history.\n",
+        )
+        .expect("map");
+        (dir, FilemapJudge { wanted })
+    }
+
+    struct FilemapJudge {
+        wanted: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl polaris_provider::decision::Decider for FilemapJudge {
+        async fn decide(
+            &self,
+            _state: &serde_json::Value,
+            questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+        ) -> Result<polaris_provider::decision::Decision, polaris_provider::decision::DecisionError>
+        {
+            let answers = questions
+                .iter()
+                .map(|(key, question)| {
+                    let asked = match question {
+                        polaris_provider::decision::Question::Noul { instructions } => {
+                            instructions.clone()
+                        }
+                        _ => String::new(),
+                    };
+                    (
+                        key.clone(),
+                        polaris_provider::decision::Answer {
+                            noul: Some(if asked.contains(self.wanted) {
+                                1.0
+                            } else {
+                                0.0
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            Ok(polaris_provider::decision::Decision {
+                answers,
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    /// The system prompt of every request the run sent. `CompletionRequest`
+    /// is not `Clone`, and the only part these tests judge is the prompt.
+    async fn filemap_run_system(
+        root: &std::path::Path,
+        judge: Option<FilemapJudge>,
+    ) -> Vec<String> {
+        struct Capture {
+            requests: Mutex<Vec<CompletionRequest>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        let provider = Capture {
+            requests: Mutex::new(Vec::new()),
+        };
+        let mut session = Session::new();
+        session.push_user("常時コンテキストの上限はどこで決まるか");
+        session.decider = judge.map(|judge| {
+            std::sync::Arc::new(judge) as std::sync::Arc<dyn polaris_provider::decision::Decider>
+        });
+        let audit_dir = tempfile::tempdir().unwrap();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        // The route takes the project root from the writable roots, and
+        // full-access refuses to name one.
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            std::slice::from_ref(&root.to_path_buf()),
+        )
+        .expect("policy");
+        let (_, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run(
+            &provider,
+            &mut session,
+            dummy_audit(&audit_dir),
+            &mut StopTracker::new(3),
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        requests
+            .iter()
+            .map(|request| request.system.clone())
+            .collect()
+    }
+
+    /// The point of the route: the model is handed the file, not the map.
+    /// The section must name what the judge adopted and nothing it dropped
+    /// — a section that listed every entry would cost more than the read it
+    /// replaces.
+    #[tokio::test]
+    async fn the_routed_files_reach_the_request_and_the_dropped_ones_do_not() {
+        let (dir, judge) = filemap_fixture("budget.rs");
+        let systems = filemap_run_system(dir.path(), Some(judge)).await;
+        let system = &systems[0];
+        assert!(
+            system.contains(crate::filemap::HEADING),
+            "the section is missing: {system}"
+        );
+        assert!(system.contains("crates/polaris-core/src/budget.rs"));
+        assert!(
+            !system.contains("crates/polaris-core/src/session.rs"),
+            "an entry the judge dropped was sent anyway"
+        );
+        // The whole map must not be what was sent.
+        assert!(!system.contains("The loop that runs one turn."));
+    }
+
+    /// Without a judge there is no route, and the run must look exactly as
+    /// it did before this existed. A section built from some fallback
+    /// ordering would put unjudged paths in front of the model on every
+    /// default run, where the judge is off.
+    #[tokio::test]
+    async fn no_judge_means_no_section_at_all() {
+        let (dir, _) = filemap_fixture("budget.rs");
+        let systems = filemap_run_system(dir.path(), None).await;
+        assert!(
+            !systems[0].contains(crate::filemap::HEADING),
+            "a section was injected without a judge: {}",
+            systems[0]
+        );
+    }
+
+    /// A judge that adopts nothing is not a judge that failed. An empty
+    /// heading spends tokens on every iteration to say nothing.
+    #[tokio::test]
+    async fn nothing_adopted_leaves_no_empty_heading() {
+        let (dir, judge) = filemap_fixture("a-file-the-map-does-not-have");
+        let systems = filemap_run_system(dir.path(), Some(judge)).await;
+        assert!(!systems[0].contains(crate::filemap::HEADING));
+    }
+
+    /// The map is read the way `environment_block` reads it: a link is not
+    /// followed. Otherwise a repository could point `docs/filemap.md` at a
+    /// file outside itself and have its contents summarised into the
+    /// prompt.
+    #[tokio::test]
+    async fn a_map_that_is_a_symlink_is_not_followed() {
+        // The judge adopts what the *target* documents. Were it looking for
+        // something only the real map holds, this would pass whether or not
+        // the link was followed.
+        let (dir, judge) = filemap_fixture("key.pem");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("filemap.md");
+        std::fs::write(
+            &target,
+            "## `secrets`\n\n- `key.pem` — the private key nobody asked for\n",
+        )
+        .expect("target");
+        let map = dir.path().join("docs/filemap.md");
+        std::fs::remove_file(&map).expect("remove");
+        std::os::unix::fs::symlink(&target, &map).expect("symlink");
+
+        let systems = filemap_run_system(dir.path(), Some(judge)).await;
+        assert!(!systems[0].contains(crate::filemap::HEADING));
+        assert!(!systems[0].contains("key.pem"));
+    }
+
     #[tokio::test]
     async fn root_mcp_setup_lists_candidates_without_values_outside_mcp_dispatch() {
         struct Capture {
@@ -3643,6 +4021,79 @@ mod tests {
         assert!(request.system.contains("## Optional skill catalog"));
         assert!(request.system.contains("deploy-guide"));
         assert!(!request.system.contains("not automatic"));
+    }
+
+    /// `spawn` is paid for on every request. With no type to resolve
+    /// against, every call it invites ends before a provider call and two
+    /// of the three branches stop the run outright, so advertising it into
+    /// an empty catalogue buys nothing and can only cost.
+    #[tokio::test]
+    async fn spawn_is_not_offered_when_there_is_no_agent_type_to_run() {
+        struct Capture(Mutex<Option<CompletionRequest>>);
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                *self.0.lock().unwrap() = Some(request);
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        async fn offered_tools(agent_types: &[polaris_skills::AgentType]) -> Vec<String> {
+            let provider = Capture(Mutex::new(None));
+            let mut session = Session::new();
+            session.push_user("do the thing");
+            let dir = tempfile::tempdir().unwrap();
+            let always_on = crate::prompt::assemble_always_on("", "", &[]);
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            run(
+                &provider,
+                &mut session,
+                dummy_audit(&dir),
+                &mut StopTracker::new(2),
+                &always_on,
+                &[],
+                agent_types,
+                unused_provider_pool(),
+                1,
+                1,
+                None,
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+            let request = provider.0.lock().unwrap().take().unwrap();
+            request.tools.iter().map(|t| t.name.clone()).collect()
+        }
+
+        let without = offered_tools(&[]).await;
+        assert!(
+            !without.iter().any(|n| n == "spawn"),
+            "spawn was advertised into an empty catalogue: {without:?}"
+        );
+        // The rest of the baseline is untouched — this withdraws one tool,
+        // it does not shrink the tool list generally.
+        assert!(without.iter().any(|n| n == "read"), "{without:?}");
+
+        let shipped = polaris_skills::builtin::agent_types();
+        assert!(!shipped.is_empty(), "nothing ships with the binary");
+        let with = offered_tools(&shipped).await;
+        assert!(
+            with.iter().any(|n| n == "spawn"),
+            "spawn vanished even with types available: {with:?}"
+        );
+        assert_eq!(with.len(), without.len() + 1, "{with:?} vs {without:?}");
     }
 
     #[tokio::test]

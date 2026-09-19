@@ -12,7 +12,16 @@ pub struct Config {
     pub embedding: EmbeddingConfig,
     /// Built-in workflow skills are enabled unless configuration explicitly opts out.
     pub workflow: crate::workflow::WorkflowConfig,
-    /// Whether root tool mutations automatically regenerate affected `files.md` maps.
+    /// Whether root tool mutations automatically regenerate affected
+    /// `files.md` maps.
+    ///
+    /// Off unless asked for. It was on, and a 2026-09-19 audit found the
+    /// output has no reader: nothing loads a `files.md` into a request, the
+    /// writer gitignores what it produces (`files_md.rs`), and
+    /// `docs/filemap.md` — which the system prompt does point at — is built
+    /// from `git ls-files --exclude-standard`, so the two are mutually
+    /// invisible. What remained was a subagent run per changed directory,
+    /// up to 32 per call, producing files nobody read.
     pub files_md_auto_regenerate: bool,
     /// Additional places to look for skills. Not included in the 2 default locations.
     pub skills_paths: Vec<PathBuf>,
@@ -46,6 +55,20 @@ pub struct Config {
     pub build_cache: crate::build_cache::Cap,
     /// Which directory the cap applies to. `None` means `<project>/target`.
     pub build_cache_path: Option<PathBuf>,
+    /// How much of `--approval always`'s band the person has agreed in
+    /// advance to stop being asked about. TOML key: `[approval] auto`.
+    ///
+    /// **`off` unless written down.** This is the only setting here that
+    /// widens what runs without a person answering, so it does not acquire
+    /// a value from a judge becoming reachable, from a default that seemed
+    /// convenient, or from any other configuration key.
+    pub approval_auto: crate::approval::AutoApproval,
+    /// The bundled `llama-server`, when a project pinned one. TOML table:
+    /// `[llama_cpp]` with `server`, `models_dir` and `build`.
+    ///
+    /// `None` starts nothing. There is no default path and no search:
+    /// which binary to execute is the one thing this must never guess.
+    pub llama_cpp: Option<crate::llama_server::LlamaCppConfig>,
 }
 
 /// The API key is deliberately not here. A project's configuration file is
@@ -110,7 +133,7 @@ impl Default for Config {
                     .collect(),
                 ..Default::default()
             },
-            files_md_auto_regenerate: true,
+            files_md_auto_regenerate: false,
             skills_paths: Vec::new(),
             agents_paths: Vec::new(),
             spawn_concurrency: crate::spawn::DEFAULT_CONCURRENCY,
@@ -119,6 +142,8 @@ impl Default for Config {
             decision: DecisionConfig::default(),
             build_cache: crate::build_cache::Cap::default(),
             build_cache_path: None,
+            approval_auto: crate::approval::AutoApproval::default(),
+            llama_cpp: None,
         }
     }
 }
@@ -144,6 +169,47 @@ struct RawConfig {
     decision: RawDecision,
     #[serde(default)]
     build_cache: RawBuildCache,
+    #[serde(default)]
+    approval: RawApproval,
+    #[serde(default)]
+    llama_cpp: RawLlamaCpp,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlamaCpp {
+    #[serde(default)]
+    server: Option<PathBuf>,
+    #[serde(default)]
+    models_dir: Option<PathBuf>,
+    #[serde(default)]
+    build: Option<String>,
+}
+
+impl RawLlamaCpp {
+    /// All three or none. Two of three is not a partial configuration to
+    /// fill in with a default — it is a pin somebody stopped writing, and
+    /// completing it here would execute a binary nobody named.
+    fn resolve(self) -> Result<Option<crate::llama_server::LlamaCppConfig>, ConfigError> {
+        match (self.server, self.models_dir, self.build) {
+            (None, None, None) => Ok(None),
+            (Some(server), Some(models_dir), Some(build)) => {
+                Ok(Some(crate::llama_server::LlamaCppConfig {
+                    server,
+                    models_dir,
+                    build,
+                }))
+            }
+            _ => Err(ConfigError::IncompleteLlamaCpp),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApproval {
+    #[serde(default)]
+    auto: Option<crate::approval::AutoApproval>,
 }
 
 /// Explicit, local-only embedding runtime. No downloads occur during a turn.
@@ -153,6 +219,16 @@ pub struct EmbeddingConfig {
     pub runtime: Option<PathBuf>,
     pub model_path: Option<PathBuf>,
     pub revision: Option<String>,
+    /// The e5-base snapshot the preselection ranking stage uses (M10 L2).
+    ///
+    /// Separate from `model_path` because they are different models and
+    /// both may be present: strict10 pins e5-small and the ranking stage
+    /// pins e5-base. One field would force a project to choose, and
+    /// whichever it chose the other subsystem would silently compare
+    /// vectors from the wrong space. `runtime` is shared — it is the same
+    /// interpreter running the same helper.
+    pub preselect_model_path: Option<PathBuf>,
+    pub preselect_revision: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -392,6 +468,8 @@ pub enum ConfigError {
     BuildCacheSize,
     #[error("[build_cache] のmax_percentは1から100までです")]
     BuildCacheShare,
+    #[error("[llama_cpp] には server・models_dir・build の3つすべてが要ります")]
+    IncompleteLlamaCpp,
 }
 
 fn read_one<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, ConfigError> {
@@ -433,6 +511,12 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
             if raw.embedding.model_path.is_some() {
                 merged.embedding.model_path = raw.embedding.model_path;
             }
+            if raw.embedding.preselect_model_path.is_some() {
+                merged.embedding.preselect_model_path = raw.embedding.preselect_model_path;
+            }
+            if raw.embedding.preselect_revision.is_some() {
+                merged.embedding.preselect_revision = raw.embedding.preselect_revision;
+            }
             if raw.embedding.revision.is_some() {
                 merged.embedding.revision = raw.embedding.revision;
             }
@@ -465,6 +549,12 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
             raw.build_cache.apply_to(&mut merged.build_cache)?;
             if path.is_some() {
                 merged.build_cache_path = path;
+            }
+            if let Some(auto) = raw.approval.auto {
+                merged.approval_auto = auto;
+            }
+            if let Some(llama_cpp) = raw.llama_cpp.resolve()? {
+                merged.llama_cpp = Some(llama_cpp);
             }
             raw.decision.apply_to(&mut merged.decision)?;
         }
@@ -525,6 +615,128 @@ pub fn load(project_root: &Path) -> Result<Config, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `is_empty` is what the CLI keys its "the ladder is inert" warning
+    /// off, so it has to mean exactly "no weight buys anything different".
+    /// A weight naming only an effort still counts: the same model told to
+    /// think harder is a real rung.
+    #[test]
+    fn a_ladder_where_no_weight_names_anything_is_reported_as_empty() {
+        use crate::config::TierSettings;
+        assert!(
+            TierConfig::default().is_empty(),
+            "a bare default is not reported as empty"
+        );
+
+        let effort_only = TierConfig {
+            subgiant: TierSettings {
+                model: None,
+                effort: Some("medium".into()),
+            },
+            ..TierConfig::default()
+        };
+        assert!(
+            !effort_only.is_empty(),
+            "an effort-only rung was treated as nothing"
+        );
+
+        let model_only = TierConfig {
+            supergiant: TierSettings {
+                model: Some("sol".into()),
+                effort: None,
+            },
+            ..TierConfig::default()
+        };
+        assert!(!model_only.is_empty());
+
+        // The default really does leave every weight on the parent, which
+        // is the condition the warning exists for.
+        for tier in polaris_skills::Tier::ALL {
+            let settings = TierConfig::default().for_tier(tier).clone();
+            assert_eq!(settings, TierSettings::default(), "{tier}");
+        }
+    }
+
+    /// The only setting that widens what runs without a person answering.
+    /// It has to be written down, and a value nobody defined has to be
+    /// rejected rather than rounded to the nearest one.
+    #[test]
+    fn automatic_approval_is_off_unless_the_project_wrote_a_level_down() {
+        use crate::approval::AutoApproval;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let load = |body: &str| {
+            std::fs::write(&path, body).expect("write");
+            try_load_from(None, Some(&path))
+        };
+
+        assert_eq!(
+            try_load_from(None, None).unwrap().approval_auto,
+            AutoApproval::Off
+        );
+        assert_eq!(load("").unwrap().approval_auto, AutoApproval::Off);
+        assert_eq!(
+            load("[approval]\n").unwrap().approval_auto,
+            AutoApproval::Off
+        );
+        for (body, expected) in [
+            ("[approval]\nauto = \"off\"\n", AutoApproval::Off),
+            ("[approval]\nauto = \"low\"\n", AutoApproval::Low),
+            ("[approval]\nauto = \"medium\"\n", AutoApproval::Medium),
+        ] {
+            assert_eq!(load(body).unwrap().approval_auto, expected, "{body}");
+        }
+        // `high` would mean "stop asking about anything", which is not a
+        // level anyone may set here; the other spellings are typos that
+        // must not silently become `off`.
+        for refused in [
+            "[approval]\nauto = \"high\"\n",
+            "[approval]\nauto = \"Low\"\n",
+            "[approval]\nauto = \"all\"\n",
+            "[approval]\nauto = true\n",
+            "[approval]\nautomatic = \"low\"\n",
+        ] {
+            assert!(load(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// Nothing starts unless all three are written down. A default path
+    /// or a partial fill-in here would execute a binary nobody named.
+    #[test]
+    fn the_bundled_runtime_is_absent_unless_all_three_fields_are_pinned() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let load = |body: &str| {
+            std::fs::write(&path, body).expect("write");
+            try_load_from(None, Some(&path))
+        };
+
+        assert!(try_load_from(None, None).unwrap().llama_cpp.is_none());
+        assert!(load("").unwrap().llama_cpp.is_none());
+        assert!(load("[llama_cpp]\n").unwrap().llama_cpp.is_none());
+
+        let full = load(
+            "[llama_cpp]\nserver = \"/r/llama-server\"\nmodels_dir = \"/r/models\"\nbuild = \"b11026-x\"\n",
+        )
+        .unwrap()
+        .llama_cpp
+        .expect("a complete pin");
+        assert_eq!(full.server, std::path::PathBuf::from("/r/llama-server"));
+        assert_eq!(full.models_dir, std::path::PathBuf::from("/r/models"));
+        assert_eq!(full.build, "b11026-x");
+
+        for partial in [
+            "[llama_cpp]\nserver = \"/r/llama-server\"\n",
+            "[llama_cpp]\nserver = \"/r/llama-server\"\nmodels_dir = \"/r/models\"\n",
+            "[llama_cpp]\nmodels_dir = \"/r/models\"\nbuild = \"b11026-x\"\n",
+        ] {
+            assert!(
+                matches!(load(partial), Err(ConfigError::IncompleteLlamaCpp)),
+                "{partial}"
+            );
+        }
+        assert!(load("[llama_cpp]\nbinary = \"/r/llama-server\"\n").is_err());
+    }
 
     #[test]
     fn workflow_defaults_resolve_builtin_skills_for_every_phase() {
@@ -640,21 +852,37 @@ mod tests {
         }
     }
 
+    /// The default is off: the maps it writes have no reader, so the only
+    /// thing left on by default was a subagent run per changed directory.
+    /// Asking for it still works, and a project still overrides the global
+    /// file in both directions.
     #[test]
-    fn files_md_auto_regenerate_defaults_true_and_project_overrides_global() {
+    fn files_md_auto_regenerate_defaults_false_and_project_overrides_global() {
         let global = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let global_path = write(global.path(), "[files_md]\nauto_regenerate = false\n");
+        assert!(!Config::default().files_md_auto_regenerate);
+
+        // Silence anywhere in the chain leaves it off.
+        let global_path = write(global.path(), "# nothing about files_md\n");
         let project_path = write(project.path(), "# inherit files_md\n");
-        assert!(Config::default().files_md_auto_regenerate);
         assert!(
             !try_load_from(Some(&global_path), Some(&project_path))
                 .unwrap()
                 .files_md_auto_regenerate
         );
-        let project_path = write(project.path(), "[files_md]\nauto_regenerate = true\n");
+
+        // Asked for globally, inherited by a project that says nothing.
+        let global_path = write(global.path(), "[files_md]\nauto_regenerate = true\n");
         assert!(
             try_load_from(Some(&global_path), Some(&project_path))
+                .unwrap()
+                .files_md_auto_regenerate
+        );
+
+        // And a project turns it back off.
+        let project_path = write(project.path(), "[files_md]\nauto_regenerate = false\n");
+        assert!(
+            !try_load_from(Some(&global_path), Some(&project_path))
                 .unwrap()
                 .files_md_auto_regenerate
         );
@@ -700,8 +928,10 @@ mod tests {
     fn a_blank_model_or_effort_is_refused_rather_than_carried() {
         let dir = tempfile::tempdir().unwrap();
         for body in [
-            "[tier.low]\nmodel = \"\"\n",
-            "[tier.medium]\neffort = \"   \"\n",
+            "[tier.dwarf]\nmodel = \"\"\n",
+            "[tier.subgiant]\neffort = \"   \"\n",
+            "[tier.giant]\nmodel = \"\"\n",
+            "[tier.supergiant]\neffort = \"\"\n",
         ] {
             let path = write(dir.path(), body);
             assert!(
@@ -717,7 +947,7 @@ mod tests {
         // dropped in silence.
         for body in [
             "[tier.heavy]\nmodel = \"gpt-6-astra\"\n",
-            "[tier.low]\nmodle = \"gpt-6-astra\"\n",
+            "[tier.dwarf]\nmodle = \"gpt-6-astra\"\n",
         ] {
             let path = write(dir.path(), body);
             assert!(

@@ -1,6 +1,7 @@
 //! Loading of skills that conform to the Agent Skills specification. Adds no frontmatter fields of its own.
 
 pub mod agent_type;
+pub mod builtin;
 pub mod discovery;
 pub mod frontmatter;
 pub mod workflow_profile;

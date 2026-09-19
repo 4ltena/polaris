@@ -9,7 +9,7 @@ pub mod input;
 mod memory;
 pub mod onboarding;
 pub mod persist;
-pub use memory::{configure_memory, lock_memory};
+pub use memory::{configure_archive, configure_memory, lock_memory};
 pub mod render;
 mod selection;
 pub mod sessions;
@@ -57,7 +57,9 @@ pub struct RunArgs<'a> {
     pub mcp_selection_provider: Option<Arc<dyn Provider>>,
     pub provider_name: String,
     pub model_name: String,
-    /// Seeds the footer with the caller's selected effort; otherwise use
+    /// Seeds the footer with the caller's selected effort, as a wire token
+    /// (`--effort`'s own spelling); it is translated to the matching
+    /// catalog row by `render::effort_display_name`. Absent means
     /// `render::DEFAULT_EFFORT`.
     pub initial_effort_name: Option<String>,
     pub cwd: PathBuf,
@@ -90,6 +92,9 @@ pub struct RunArgs<'a> {
     pub spawn_write_concurrency: usize,
     /// Root-only automatic files.md regeneration, inherited by every TUI session reset.
     pub files_md_auto_regenerate: bool,
+    /// How much of `--approval always`'s band the person agreed in advance
+    /// to stop being asked about, from `[approval] auto` (M18).
+    pub approval_auto: polaris_core::approval::AutoApproval,
     /// Disabled configurations preserve legacy sessions by leaving workflow
     /// state absent.
     pub workflow_config: polaris_core::workflow::WorkflowConfig,
@@ -132,6 +137,7 @@ struct WorkflowSessionArgs<'a> {
     summary_usage: Option<polaris_provider::UsageMeter>,
     history_backend_factory: Option<&'a HistoryBackendFactory>,
     files_md_auto_regenerate: bool,
+    approval_auto: polaris_core::approval::AutoApproval,
     continuation: Option<PreparedContinuation>,
     workflow_mode_overridden: bool,
     skills: &'a [Skill],
@@ -228,12 +234,14 @@ async fn new_workflow_session(
         summary_usage,
         history_backend_factory,
         files_md_auto_regenerate,
+        approval_auto,
         continuation,
         workflow_mode_overridden,
         skills,
     } = args;
     let mut session = polaris_core::session::Session::new();
     session.disable_files_md_auto_regenerate = !files_md_auto_regenerate;
+    session.approval_auto = approval_auto;
     session.strict_history = strict_history;
     session.summary_usage = summary_usage;
     let has_continuation = continuation.is_some();
@@ -265,7 +273,12 @@ async fn new_workflow_session(
         let data_root = sessions_dir
             .parent()
             .ok_or("sessions directory has no data root")?;
-        let project_id = persist::project_identity(cwd).map_err(|error| error.to_string())?;
+        // The identity is the project's, not the launch directory's — the
+        // same convention `memory.rs` and `tool_memory.rs` already follow.
+        // Without the resolve, starting from a subdirectory files the
+        // session under a second identity the CLI never looks in.
+        let project_id = persist::project_identity(&polaris_core::project::resolve_root(cwd))
+            .map_err(|error| error.to_string())?;
         let persistence = polaris_core::session_store::PersistedSession::create(
             data_root,
             &state_dir.join("memory.sqlite3"),
@@ -628,6 +641,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         summary_usage: args.summary_usage.clone(),
         history_backend_factory: args.history_backend_factory.as_ref(),
         files_md_auto_regenerate: args.files_md_auto_regenerate,
+        approval_auto: args.approval_auto,
         continuation: args.continuation.clone(),
         workflow_mode_overridden: args.workflow_mode_overridden,
         skills: args.skills,
@@ -787,11 +801,16 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // that actually changes what gets sent; this is only the display copy
     // shown in the header/footer/notices.
     let mut model_name = args.model_name.clone();
-    // Use the caller's selection or the same default marked in the picker.
+    // Use the caller's selection or the same default marked in the
+    // picker. The caller passes a wire token (`--effort`'s own spelling);
+    // from here on everything is display names, so `xhigh` becomes the row
+    // it belongs to instead of a label no catalog row matches.
     let mut effort_name = args
         .initial_effort_name
-        .clone()
-        .unwrap_or_else(|| render::DEFAULT_EFFORT.to_string());
+        .as_deref()
+        .map(render::effort_display_name)
+        .unwrap_or(render::DEFAULT_EFFORT)
+        .to_string();
     let mut status = Status::Idle;
     let mut key_reader = CrosstermKeyReader;
     // Each turn gets its own MCP runtime; connections and grants never carry over.
@@ -847,15 +866,25 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         }
         let mut cumulative_usage = usage_meter.snapshot().usage;
         session.compaction_threshold = args.compact_at;
-        if args.remember
-            && let Err(error) = memory::configure_saved_memory(
+        if args.remember {
+            if let Err(error) = memory::configure_saved_memory(
                 &mut session,
                 &args.cwd,
                 &args.state_dir,
                 &session_path,
-            )
+            ) {
+                fatal_message = Some(format!("履歴保存を準備できません: {error}"));
+                break 'outer ExitCode::FAILURE;
+            }
+        } else if session.persistence.is_none()
+            && session.before_compact.is_none()
+            && let Some(id) = session_path.file_stem().and_then(|s| s.to_str())
+            && let Err(error) =
+                memory::configure_archive(&mut session, &args.cwd, &args.state_dir, id)
         {
-            fatal_message = Some(format!("履歴保存を準備できません: {error}"));
+            // Without this the legacy log is rewritten over the summary and
+            // the compacted prefix is gone from memory and disk at once.
+            fatal_message = Some(format!("圧縮前の履歴を退避できません: {error}"));
             break 'outer ExitCode::FAILURE;
         }
         // Recomputed every draw from the live buffer, so the popup tracks
@@ -2244,7 +2273,10 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
         *status = Status::Notice("v2セッションの保存先が不正です".into());
         return;
     };
-    let project_id = persist::project_identity(std::path::Path::new(cwd_display)).ok();
+    let project_id = persist::project_identity(&polaris_core::project::resolve_root(
+        std::path::Path::new(cwd_display),
+    ))
+    .ok();
     if let Some(project_id) = &project_id {
         summaries.extend(sessions::list_v2_sessions(
             data_root,
@@ -2798,21 +2830,34 @@ async fn handle_compact(
         Ok(None) => {
             *status = Status::Notice("nothing old enough to compact yet".to_string());
         }
-        Ok(Some(report)) => match persist::rewrite(session_path, &session.messages) {
-            Ok(()) => {
-                *status = Status::Notice(format!(
-                    "compacted {} messages → {} ({} tok → {} tok)",
-                    report.messages_before,
-                    report.messages_after,
-                    report.tokens_before,
-                    report.tokens_after
-                ));
+        Ok(Some(report)) => {
+            let summary = format!(
+                "compacted {} messages → {} ({} tok → {} tok)",
+                report.messages_before,
+                report.messages_after,
+                report.tokens_before,
+                report.tokens_after
+            );
+            // Only a legacy file log needs rewriting. A v2 session already
+            // holds every message in its own append-only `raw.jsonl`, and
+            // writing the summarised list to `session_path` as well
+            // manufactures a second, lossy session that `/resume` then
+            // offers beside the intact one. The automatic path has always
+            // been guarded this way (the `TurnOutcome::Done(Ok(_))` arm);
+            // this one was not.
+            if session.persistence.is_some() {
+                *status = Status::Notice(summary);
+            } else {
+                match persist::rewrite(session_path, &session.messages) {
+                    Ok(()) => *status = Status::Notice(summary),
+                    Err(e) => {
+                        *status = Status::Notice(format!(
+                            "compacted in memory, but couldn't persist it: {e}"
+                        ));
+                    }
+                }
             }
-            Err(e) => {
-                *status =
-                    Status::Notice(format!("compacted in memory, but couldn't persist it: {e}"));
-            }
-        },
+        }
         Err(e) => {
             *status = Status::Notice(format!("compaction failed: {e}"));
         }
@@ -2867,11 +2912,30 @@ enum SlashOutcome {
     Fatal(String),
 }
 
-const AGENTS_MD_TEMPLATE: &str = "# AGENTS.md\n\n\
-Project-specific instructions for polaris. Everything up to the first\n\
-`## ` heading (or the top of the file, if there is none) is sent to the\n\
-model on every turn, so keep this part short — put anything long-form\n\
-under its own `## ` section instead.\n";
+/// The file `/init` writes.
+///
+/// It carries the `## Always on` heading because that heading is the only
+/// thing `constitution::extract_always_on` looks for (the alternative is
+/// the `<!-- polaris:always-on -->` marker pair). Until 2026-09-19 the
+/// template had neither, and its own prose said that everything above the
+/// first `## ` heading was sent — so a user who followed it to the letter
+/// wrote rules that reached the model zero times, and nothing said so.
+fn agents_md_template() -> String {
+    let limit = polaris_core::constitution::CONSTITUTION_LIMIT;
+    format!(
+        "# AGENTS.md\n\n\
+         Project-specific instructions for polaris. **Only the `## Always on`\n\
+         section below is sent to the model**, and only up to {limit} o200k_base\n\
+         tokens of it — lines past that are dropped from the end. A\n\
+         `~/.polaris/AGENTS.md` with its own always-on section halves this\n\
+         project's share. `polaris doctor` prints which lines reach the model\n\
+         and which were dropped.\n\n\
+         Everything else in this file is for people. Put long-form material\n\
+         under its own `## ` heading; the model can `read` it when it needs it.\n\n\
+         ## Always on\n\n\
+         - Replace this line with a rule that must hold on every single turn.\n"
+    )
+}
 
 const REVIEW_INSTRUCTION: &str =
     "Review the current uncommitted changes (`git diff`) and point out any issues you find.";
@@ -3167,11 +3231,14 @@ fn apply_slash_action(
             SlashOutcome::Continue
         }
         slash::Action::Init => {
-            let path = cwd.join("AGENTS.md");
+            // At the project root, because that is the only `AGENTS.md`
+            // that is ever read. Writing it beside a subdirectory the run
+            // happened to start in produces a file nothing loads.
+            let path = polaris_core::project::resolve_root(cwd).join("AGENTS.md");
             if path.exists() {
                 *status = Status::Notice(format!("{} already exists", path.display()));
             } else {
-                match std::fs::write(&path, AGENTS_MD_TEMPLATE) {
+                match std::fs::write(&path, agents_md_template()) {
                     Ok(()) => *status = Status::Notice(format!("created {}", path.display())),
                     Err(e) => {
                         return SlashOutcome::Fatal(format!(
@@ -3441,6 +3508,56 @@ mod tests {
             "the persisted file must reflect the compacted session, not the pre-compaction one"
         );
         assert_eq!(loaded.messages[0].content, session.messages[0].content);
+    }
+
+    /// A v2 session already holds every message in its own append-only
+    /// log, and nothing appends to the legacy path for it. Writing the
+    /// summarised list there anyway leaves a second `.jsonl` that
+    /// `/resume` lists beside the intact session — same conversation,
+    /// prefix replaced by a summary, no way to tell which is which.
+    #[tokio::test]
+    async fn manual_compaction_does_not_write_a_legacy_log_for_a_v2_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_root = tempfile::tempdir().expect("temp dir");
+        let session_path = dir.path().join("s.jsonl");
+
+        let big_reply = "x".repeat(polaris_core::compaction::MIN_TOKENS_TO_SUMMARIZE * 10);
+        let mut session = Session::default();
+        let persistence = polaris_core::session_store::PersistedSession::create(
+            data_root.path(),
+            &data_root.path().join("memory.sqlite3"),
+            "p",
+            polaris_core::conversation_state::HistoryMode::Legacy,
+            None,
+        )
+        .expect("v2 session");
+        session.attach(persistence).expect("attach");
+        session.push_user("turn 1");
+        session.push_assistant(&big_reply, vec![]);
+        session.push_user("turn 2");
+        session.push_assistant("reply 2", vec![]);
+        session.push_user("turn 3");
+        session.push_assistant("reply 3", vec![]);
+
+        let mut status = Status::Idle;
+        handle_compact(
+            &Summarizer,
+            &mut session,
+            &session_path,
+            &mut status,
+            &mut polaris_provider::Usage::default(),
+        )
+        .await;
+
+        assert!(
+            matches!(&status, Status::Notice(s) if s.contains("compacted")),
+            "compaction did not run, so this proves nothing"
+        );
+        assert_eq!(session.messages.len(), 5, "1 summary + kept tail of 4");
+        assert!(
+            !session_path.exists(),
+            "a summarised legacy log was written beside an intact v2 session"
+        );
     }
 
     #[tokio::test]
@@ -4228,6 +4345,39 @@ mod tests {
         }
     }
 
+    /// The template has to survive the reader it was written for. Asserting
+    /// only that the file exists passed for the whole of the template's
+    /// previous life, during which it delivered nothing: it had no
+    /// `## Always on` heading, so `extract_always_on` returned an empty
+    /// string and the run carried zero project rules.
+    #[test]
+    fn what_init_writes_actually_reaches_the_model_and_fits_the_ceiling() {
+        use polaris_core::constitution::{CONSTITUTION_LIMIT, extract_always_on};
+        let template = agents_md_template();
+
+        let block = extract_always_on(&template);
+        assert!(
+            !block.is_empty(),
+            "the template delivers nothing:\n{template}"
+        );
+        assert!(
+            block.lines().any(|l| l.trim_start().starts_with('-')),
+            "the delivered block has no rule line: {block:?}"
+        );
+        // Every line of it has to fit, or `/init` ships a file whose own
+        // example rule is silently dropped.
+        let cost = polaris_core::budget::count_tokens(&block);
+        assert!(
+            cost <= CONSTITUTION_LIMIT,
+            "the template's own block costs {cost}, over the {CONSTITUTION_LIMIT}-token ceiling: {block:?}"
+        );
+        // The prose must not promise the behaviour the code does not have.
+        assert!(
+            !template.contains("Everything up to the first"),
+            "the template still describes a rule `extract_always_on` does not implement"
+        );
+    }
+
     #[test]
     fn init_does_not_overwrite_an_existing_agents_md() {
         let mut session = Session::default();
@@ -4380,6 +4530,7 @@ mod tests {
             let session = new_workflow_session(WorkflowSessionArgs {
                 config: &config.workflow,
                 initial_phase: None,
+                approval_auto: config.approval_auto,
                 history_mode: config.history_mode,
                 cwd: dir.path(),
                 state_dir: dir.path(),
@@ -4445,6 +4596,7 @@ mod tests {
         let session = new_workflow_session(WorkflowSessionArgs {
             config: &current_config,
             initial_phase: None,
+            approval_auto: polaris_core::approval::AutoApproval::default(),
             history_mode: polaris_core::conversation_state::HistoryMode::Legacy,
             cwd: dir.path(),
             state_dir: dir.path(),
@@ -4774,9 +4926,11 @@ mod tests {
         let backend = TestBackend::new(70, 14);
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
         // Down from gpt-5.4 moves to gpt-5.4-mini,
-        // Enter advances to the effort step. "high" is index 2 in
-        // EFFORT_CATALOG; Down once from the default "medium"
-        // reaches it, then Enter confirms the whole wizard.
+        // Enter advances to the effort step. "max" is index 4 in
+        // EFFORT_CATALOG; Down once from the default "extra high"
+        // reaches it, then Enter confirms the whole wizard. `max` also
+        // has to arrive at the provider as itself — it is a real effort
+        // on `/responses` and used to be rewritten to `xhigh` on the way.
         let mut reader = ScriptedReader(VecDeque::from([
             KeyCode::Down,
             KeyCode::Enter,
@@ -4798,7 +4952,7 @@ mod tests {
         );
 
         assert_eq!(model_name, "gpt-5.4-mini");
-        assert_eq!(effort_name, "high");
+        assert_eq!(effort_name, "max");
         assert_eq!(
             *provider.model.lock().expect("lock"),
             Some("gpt-5.4-mini".to_string()),
@@ -4806,12 +4960,12 @@ mod tests {
         );
         assert_eq!(
             *provider.effort.lock().expect("lock"),
-            Some("high".to_string())
+            Some("max".to_string())
         );
         match status {
             Status::Notice(n) => {
                 assert!(n.contains("gpt-5.4-mini"));
-                assert!(n.contains("high"));
+                assert!(n.contains("max"));
             }
             _ => panic!("expected a Notice"),
         }
@@ -4828,16 +4982,17 @@ mod tests {
         // human-readable display name.
         let backend = TestBackend::new(70, 14);
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
-        // "extra high" is two rows after the default "medium".
+        // Starting from "low", "extra high" is three rows down.
         let mut reader = ScriptedReader(VecDeque::from([
             KeyCode::Enter,
+            KeyCode::Down,
             KeyCode::Down,
             KeyCode::Down,
             KeyCode::Enter,
         ]));
         let provider = RecordingProvider::new();
         let mut model_name = "gpt-5.6-sol".to_string();
-        let mut effort_name = render::DEFAULT_EFFORT.to_string();
+        let mut effort_name = "low".to_string();
         let mut status = Status::Idle;
 
         handle_model(

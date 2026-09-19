@@ -21,6 +21,7 @@ use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
 mod account;
 mod compare;
+mod decided;
 mod handoff;
 mod mcp;
 mod memory;
@@ -38,7 +39,7 @@ Environment variables:
   POLARIS_PROVIDER  openai (default) or codex. codex uses the credentials from `polaris login`.
   POLARIS_API_KEY   Required when provider=openai. API key for an OpenAI-compatible endpoint.
   POLARIS_BASE_URL  Used when provider=openai; defaults to https://api.openai.com/v1
-  POLARIS_MODEL     Defaults to gpt-6-astra; reasoning effort defaults to medium (--effort)
+  POLARIS_MODEL     Defaults to gpt-6-astra; reasoning effort defaults to xhigh (--effort)
 "
 )]
 struct Args {
@@ -68,8 +69,13 @@ struct Args {
     #[arg(long)]
     account: Option<String>,
 
-    /// 推論強度。既定はmedium。明示した値が優先する。
-    #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
+    /// 推論強度。既定はxhigh。明示した値が優先する。
+    ///
+    /// この既定はorchestrator——rootの実行自身——の強度である。委譲先の
+    /// 強度は`[tier.*]`が決め、そこで強度を書かなかった段だけがこの値を
+    /// 引き継ぐ。`max`はResponses API限定だが、polarisの主経路は
+    /// `/responses`なので送れる。`ultra`はAPIに無いので受け付けない。
+    #[arg(long, default_value = "xhigh", value_parser = ["low", "medium", "high", "xhigh", "max"])]
     effort: Option<String>,
 
     /// 圧縮前の履歴をローカル保存し、プロジェクト別の検索索引を作る。
@@ -283,6 +289,9 @@ enum Command {
     Handoff(handoff::Args),
     /// 余剰枠で頼まれていない整理を行ってよいかを判定する。
     Spare(spare::Args),
+    /// このプロジェクトで決めたことを1文で残す。次の実行の前に、同じ
+    /// 問いを蒸し返していないかの判定に使われる。
+    Decided(decided::Args),
     /// Authenticate with a ChatGPT subscription. Opens a browser.
     Login,
     /// Delete the stored credentials. Does not touch `~/.codex/`.
@@ -942,6 +951,15 @@ async fn main() -> ExitCode {
         Some(Command::Sync(options)) => return sync::run(options).await,
         Some(Command::Memory(options)) => return memory::run(options).await,
         Some(Command::Mcp(options)) => return mcp::run(options).await,
+        Some(Command::Decided(options)) => {
+            return match decided::run(options) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(reason) => {
+                    eprintln!("{reason}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Some(Command::Setting(options)) => return setting::run(options),
         Some(Command::Compare(options)) => return compare::run(options),
         Some(Command::Handoff(options)) => return handoff::run(options),
@@ -1057,6 +1075,14 @@ async fn main() -> ExitCode {
     // Resolve a requested target before onboarding, helper staging, or any
     // strict-history setup can mutate local state.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Everything below that takes "the project" takes this, not `cwd`.
+    // `.polaris/config.toml`, `AGENTS.md`, `.polaris/skills`, `agents/`
+    // and the build cache all live at the root; resolving them against the
+    // working directory means a run started from `crates/polaris-cli/`
+    // silently gets no configuration, no rules, no skills and no agent
+    // types, while the state directory (which resolves internally) stays
+    // the same. Half the run followed the project and half did not.
+    let project_root = polaris_core::project::resolve_root(&cwd);
     let (_, preflight_sessions_dir) = match preflight_storage_paths(&cwd) {
         Ok(paths) => paths,
         Err(error) => {
@@ -1064,7 +1090,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut config = match polaris_core::config::load(&cwd) {
+    let mut config = match polaris_core::config::load(&project_root) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("設定を読み込めません: {error}");
@@ -1078,14 +1104,13 @@ async fn main() -> ExitCode {
         .history_mode
         .map(polaris_core::conversation_state::HistoryMode::from)
         .unwrap_or(config.history_mode);
-    let project_id =
-        match polaris_tui::persist::project_identity(&polaris_core::project::resolve_root(&cwd)) {
-            Ok(id) => id,
-            Err(error) => {
-                eprintln!("プロジェクト識別子を取得できません: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let project_id = match polaris_tui::persist::project_identity(&project_root) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("プロジェクト識別子を取得できません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let Some(preflight_data_root) = preflight_sessions_dir.parent() else {
         eprintln!("v2セッションの保存先を特定できません");
         return ExitCode::FAILURE;
@@ -1156,6 +1181,11 @@ async fn main() -> ExitCode {
         },
     );
 
+    // Set by the `llamacpp` arm. Never read again on purpose: holding it
+    // is the whole job. `LlamaServer` kills the child when it drops, so
+    // the binding has to outlive every path that uses the provider — and
+    // it drops at the end of `main`, including on the early returns.
+    let mut _llama_server: Option<polaris_core::llama_server::LlamaServer> = None;
     let (provider, mcp_selection_provider, tier_weights): (Shared, Option<Shared>, TierWeights) = loop {
         match provider_name.as_str() {
             "openai" => {
@@ -1324,8 +1354,74 @@ async fn main() -> ExitCode {
                     }
                 }
             }
+            // The bundled `llama-server`, started by this process. The
+            // other two local runtimes (Ollama, LM Studio) are reachable
+            // only from the desktop's role bindings; this arm exists so
+            // the CLI — which is what the measurement harnesses drive —
+            // can run a local model at all.
+            "llamacpp" => {
+                let Some(llama) = config.llama_cpp.clone() else {
+                    eprintln!(
+                        "POLARIS_PROVIDER=llamacpp には `[llama_cpp]` の server・models_dir・build が要ります。"
+                    );
+                    return ExitCode::FAILURE;
+                };
+                let state = match polaris_core::project::state_dir(&project_root) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        eprintln!("状態ディレクトリを特定できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let started = async {
+                    let server =
+                        polaris_core::llama_server::LlamaServer::start(&llama, &state).await?;
+                    let adapter = polaris_core::llama_server::adapter(&server)
+                        .map_err(|_| std::io::Error::other("問い合わせ口を作成できません"))?;
+                    let inventory = adapter
+                        .inventory_with_load_state()
+                        .await
+                        .map_err(|error| std::io::Error::other(format!("{error}")))?;
+                    let observed = inventory
+                        .iter()
+                        .find(|held| held.id() == model)
+                        .ok_or_else(|| {
+                            let names: Vec<&str> = inventory.iter().map(|held| held.id()).collect();
+                            std::io::Error::other(format!(
+                                "{model} が {} にありません。あるのは {names:?}",
+                                llama.models_dir.display()
+                            ))
+                        })?;
+                    let selection = adapter
+                        .select(observed)
+                        .await
+                        .map_err(|error| std::io::Error::other(format!("{error}")))?;
+                    let provider =
+                        polaris_provider::local_inference::LocalInferenceProvider::with_token(
+                            selection,
+                            server.token(),
+                        )
+                        .map_err(|error| std::io::Error::other(format!("{error}")))?;
+                    Ok::<_, std::io::Error>((server, provider))
+                }
+                .await;
+                let (server, provider) = match started {
+                    Ok(started) => started,
+                    Err(error) => {
+                        eprintln!("llama-serverを起動できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                // Held for the life of the process: dropping it kills the
+                // child, and an orphan would hold the port and the model.
+                _llama_server = Some(server);
+                model_name = model.clone();
+                break (std::sync::Arc::new(provider), None, TierWeights::new());
+            }
             other => {
-                eprintln!("POLARIS_PROVIDER is an unknown value {other}. Specify openai or codex");
+                eprintln!(
+                    "POLARIS_PROVIDER is an unknown value {other}. Specify openai, codex or llamacpp"
+                );
                 return ExitCode::FAILURE;
             }
         }
@@ -1349,6 +1445,20 @@ async fn main() -> ExitCode {
             std::sync::Arc::new(polaris_core::tier::typed::TypedTierDecider::new(decider))
                 as std::sync::Arc<dyn polaris_core::tier::TierDecider>
         });
+
+    // A judge that routes delegations by weight, over four weights that
+    // all resolve to the same provider, changes nothing and says nothing.
+    // `build_tier_providers` skips a weight that names neither a model nor
+    // an effort, so an installation with no `[tier.*]` gets one provider
+    // wearing four names — and the ladder's whole point is that they
+    // differ. Say it once; do not invent model names as defaults, because
+    // which model each weight buys is the project's decision and a wrong
+    // guess here spends its money.
+    if tier_decider.is_some() && config.tiers.is_empty() {
+        eprintln!(
+            "警告: 判定器は委譲を4段へ振り分けますが、`[tier.*]` に model も effort も書かれていないため、4段すべてが同じproviderへ解決されます。段ごとの設定を書くまで、振り分けは費用にも能力にも効きません。"
+        );
+    }
 
     // Priced weights route delegations; roles stay unrouted, because the
     // CLI has no role bindings and a delegation to an unrouted role has to
@@ -1413,9 +1523,28 @@ async fn main() -> ExitCode {
 
     let approval_policy: ApprovalPolicy = args.approval.into();
 
+    // The ceiling cuts lines from the end and says nothing. Worse, a
+    // `~/.polaris/AGENTS.md` with an always-on section of its own takes
+    // half the ceiling, so a project file that fitted yesterday can stop
+    // fitting because of a file in another directory that the project's
+    // own tooling never looks at. Say it once here; `polaris doctor`
+    // prints the whole accounting.
+    for reach in constitution::reach(&project_root) {
+        if reach.dropped > 0 {
+            eprintln!(
+                "警告: {} のalways-on節は{}行のうち{}行しかモデルへ届きません（{}行は上限で切り捨て、届く分は{}トークン）。内訳は `polaris doctor` にあります。",
+                reach.path.display(),
+                reach.delivered + reach.dropped,
+                reach.delivered,
+                reach.dropped,
+                reach.tokens,
+            );
+        }
+    }
+
     // Resolve the same two sources once; reads happen before each root request.
     #[cfg(unix)]
-    let agents_refresh = match constitution::AgentsRefresh::from_home(&cwd) {
+    let agents_refresh = match constitution::AgentsRefresh::from_home(&project_root) {
         Ok(source) => source,
         Err(error) => {
             eprintln!("AGENTS.mdの読取元を準備できません: {error}");
@@ -1423,8 +1552,8 @@ async fn main() -> ExitCode {
         }
     };
     #[cfg(not(unix))]
-    let constitution = constitution::load(&cwd);
-    let environment = constitution::environment_block(&cwd, None);
+    let constitution = constitution::load(&project_root);
+    let environment = constitution::environment_block(&cwd, &project_root, None);
 
     let history_backend_factory: polaris_tui::HistoryBackendFactory = {
         let embedding = config.embedding.clone();
@@ -1482,12 +1611,13 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let discovered = polaris_skills::discover(&cwd, &config.skills_paths);
+    let discovered = polaris_skills::discover(&project_root, &config.skills_paths);
     for line in format_skipped_skills(&discovered.skipped) {
         eprintln!("{line}");
     }
 
-    let discovered_agents = polaris_skills::discover_agent_types(&cwd, &config.agents_paths);
+    let discovered_agents =
+        polaris_skills::discover_agent_types(&project_root, &config.agents_paths);
     for s in &discovered_agents.skipped {
         eprintln!("agent type skipped: {s}");
     }
@@ -1518,6 +1648,7 @@ async fn main() -> ExitCode {
             });
             let mut session = Session::new();
             session.disable_files_md_auto_regenerate = !config.files_md_auto_regenerate;
+            session.approval_auto = config.approval_auto;
             session.tier_decider = tier_decider.clone();
             session.decider = decider.clone();
             // The same independently constructed selector the MCP catalogue
@@ -1543,9 +1674,7 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            let project_id = match polaris_tui::persist::project_identity(
-                &polaris_core::project::resolve_root(&cwd),
-            ) {
+            let project_id = match polaris_tui::persist::project_identity(&project_root) {
                 Ok(id) => id,
                 Err(error) => {
                     eprintln!("プロジェクト識別子を取得できません: {error}");
@@ -1644,13 +1773,32 @@ async fn main() -> ExitCode {
                     .as_nanos()
             );
             if args.remember {
-                match polaris_tui::configure_memory(&mut session, &cwd, &state_dir, &session_id) {
+                match polaris_tui::configure_memory(
+                    &mut session,
+                    &project_root,
+                    &state_dir,
+                    &session_id,
+                ) {
                     Ok(()) => {}
                     Err(error) => {
                         eprintln!("履歴保存を準備できません: {error}");
                         return ExitCode::FAILURE;
                     }
                 }
+            } else if session.persistence.is_none()
+                && let Err(error) = polaris_tui::configure_archive(
+                    &mut session,
+                    &project_root,
+                    &state_dir,
+                    &session_id,
+                )
+            {
+                // A v2 session keeps every message in its own append-only
+                // log. Without one, compaction is the only writer of the
+                // record, and it replaces a prefix with a summary — so the
+                // originals have to be put somewhere first.
+                eprintln!("圧縮前の履歴を退避できません: {error}");
+                return ExitCode::FAILURE;
             }
             if let Some(mode) = args.tool_memory.retention()
                 && let Err(error) = polaris_tui::tool_memory::configure_tool_memory(
@@ -1810,7 +1958,7 @@ async fn main() -> ExitCode {
                         outcome.usage.total_tokens,
                         session.messages.len(),
                     );
-                    sweep_build_cache(&cwd, &config);
+                    sweep_build_cache(&project_root, &config);
                     // Per model, because the weights a run routes between
                     // differ in price by a factor of fifty. A total alone
                     // cannot be converted to money.
@@ -1922,6 +2070,7 @@ async fn main() -> ExitCode {
                 spawn_concurrency: config.spawn_concurrency,
                 spawn_write_concurrency: config.spawn_write_concurrency,
                 files_md_auto_regenerate: config.files_md_auto_regenerate,
+                approval_auto: config.approval_auto,
                 workflow_config: config.workflow,
                 initial_phase: args.phase.map(Phase::from),
                 history_mode,
@@ -2103,6 +2252,42 @@ async fn run_doctor() -> ExitCode {
     match polaris_core::project::state_dir(&cwd) {
         Ok(d) => println!("  state directory: {}", d.display()),
         Err(e) => println!("  Can't determine the state directory: {e}"),
+    }
+
+    // Which project rules actually reach the model. The ceiling truncates
+    // from the end in silence, and a global AGENTS.md halves the project's
+    // share, so "I wrote the rule down" and "the model was told" are two
+    // different facts. This prints the second one.
+    println!("\nAGENTS.md (always-on):");
+    let project_root = polaris_core::project::resolve_root(&cwd);
+    let reached = polaris_core::constitution::reach(&project_root);
+    if reached.is_empty() {
+        println!("  no always-on section anywhere. polaris reads only a `## Always on`");
+        println!("  heading or a <!-- polaris:always-on --> ... <!-- /polaris:always-on -->");
+        println!("  pair; text outside those is never sent. `/init` writes a starting point.");
+    }
+    for reach in &reached {
+        let verdict = if reach.dropped == 0 {
+            "all lines reach the model".to_string()
+        } else {
+            format!("{} line(s) DROPPED, never sent", reach.dropped)
+        };
+        println!(
+            "  {}: {} line(s) / {} tokens reach the model \u{2014} {verdict}",
+            reach.path.display(),
+            reach.delivered,
+            reach.tokens,
+        );
+    }
+    if reached.len() == 2 {
+        println!(
+            "  both files have a section, so the global one is capped at {} tokens",
+            polaris_core::constitution::CONSTITUTION_LIMIT / 2
+        );
+        println!(
+            "  and the project gets whatever is left of {}.",
+            polaris_core::constitution::CONSTITUTION_LIMIT
+        );
     }
 
     ExitCode::SUCCESS
@@ -2790,7 +2975,17 @@ mod tests {
     fn defaults_and_explicit_model_effort_have_the_documented_precedence() {
         let args = Args::try_parse_from(["polaris", "-p", "hello"]).expect("args");
         assert_eq!(selected_model(args.model, None), "gpt-6-astra");
-        assert_eq!(args.effort.as_deref(), Some("medium"));
+        // The orchestrator — the root run itself — is astra at xhigh.
+        // Delegations are priced by `[tier.*]`, which is where the cheaper
+        // models live; the root run is the one party whose own reasoning
+        // nothing downstream can make up for.
+        assert_eq!(args.effort.as_deref(), Some("xhigh"));
+        // The TUI marks a row "(default)" by display name, so the row it
+        // marks has to be the one this default actually selects.
+        assert_eq!(
+            polaris_tui::render::effort_wire_value(polaris_tui::render::DEFAULT_EFFORT),
+            "xhigh"
+        );
         assert_eq!(selected_model(None, Some("env-model".into())), "env-model");
         assert_eq!(
             selected_model(Some("flag-model".into()), Some("env-model".into())),
@@ -2798,6 +2993,16 @@ mod tests {
         );
         let args = Args::try_parse_from(["polaris", "--effort", "high"]).expect("args");
         assert_eq!(args.effort.as_deref(), Some("high"));
+        // `max` is real on `/responses`; `ultra` is not an effort the API
+        // has, and offering it only meant sending something else instead.
+        assert_eq!(
+            Args::try_parse_from(["polaris", "--effort", "max"])
+                .expect("args")
+                .effort
+                .as_deref(),
+            Some("max")
+        );
+        assert!(Args::try_parse_from(["polaris", "--effort", "ultra"]).is_err());
     }
 
     #[test]
@@ -3026,6 +3231,44 @@ mod tests {
             "different projects are sharing the same state directory: {}",
             from_root.display()
         );
+    }
+
+    /// The arm exists and names itself in the error a person will see.
+    /// Until 2026-09-19 the CLI had no local provider at all — local
+    /// models were reachable only from the desktop's role bindings — so
+    /// the measurement harnesses, which drive the CLI, could not run one.
+    #[test]
+    fn the_unknown_provider_message_lists_every_arm_that_exists() {
+        // Read out of the source rather than written here twice: a new
+        // arm that the message does not mention is a provider nobody can
+        // find, and that is exactly how `llamacpp` would have shipped.
+        let source = include_str!("main.rs");
+        let arms: std::collections::BTreeSet<&str> = source
+            .lines()
+            .filter_map(|line| line.trim().strip_suffix(" => {"))
+            .filter_map(|name| name.strip_prefix('"'))
+            .filter_map(|name| name.strip_suffix('"'))
+            .filter(|name| ["openai", "codex", "llamacpp"].contains(name))
+            .collect();
+        assert_eq!(
+            arms,
+            ["codex", "llamacpp", "openai"].into_iter().collect(),
+            "an arm was added or removed without this test noticing"
+        );
+        let message = source
+            .lines()
+            .find(|line| line.contains("POLARIS_PROVIDER is an unknown value"))
+            .expect("the unknown-provider message is gone");
+        for arm in &arms {
+            assert!(
+                source
+                    .lines()
+                    .skip_while(|line| !line.contains("POLARIS_PROVIDER is an unknown value"))
+                    .take(3)
+                    .any(|line| line.contains(arm)),
+                "{arm} is not named in the unknown-provider message: {message}"
+            );
+        }
     }
 
     #[test]

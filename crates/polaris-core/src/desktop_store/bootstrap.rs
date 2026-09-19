@@ -127,6 +127,11 @@ fn bounded_text(value: &str, max: usize) -> bool {
 }
 /// Validate saved owner configuration metadata only; no runtime or capability
 /// claim. Local `medium` is the legacy storage value, never effective effort.
+///
+/// The cloud set is the efforts the API accepts, `max` included because
+/// polaris sends to `/responses`. `ultra` used to be accepted here: it is
+/// not an effort the API has, so saving it only deferred the refusal to the
+/// first request, where the settings screen can no longer say so.
 pub fn validate_owner_configuration(
     provider: &str,
     model: &str,
@@ -138,11 +143,7 @@ pub fn validate_owner_configuration(
         _ => return Err(refused()),
     };
     if !bounded_text(model, 512)
-        || (cloud
-            && !matches!(
-                stored_effort,
-                "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-            ))
+        || (cloud && !matches!(stored_effort, "low" | "medium" | "high" | "xhigh" | "max"))
         || (!cloud && stored_effort != "medium")
     {
         return Err(refused());

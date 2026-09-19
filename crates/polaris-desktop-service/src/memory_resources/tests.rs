@@ -185,7 +185,9 @@ fn physical_paths_and_non_project_runtime_are_required() {
             EmbeddingConfig {
                 runtime: Some(f.runtime.clone()),
                 model_path: Some(f.model.clone()),
-                revision: Some("fixed".into())
+                revision: Some("fixed".into()),
+                preselect_model_path: None,
+                preselect_revision: None
             },
             f.runtime.parent().unwrap()
         ),

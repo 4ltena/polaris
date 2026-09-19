@@ -290,7 +290,11 @@ async fn check(host: &LocalHost, server: &str) -> Result<String, String> {
     let stopped = runtime.shutdown().await;
     let entry = entry.map_err(|error| match error {
         polaris_core::mcp::runtime::Error::Transport(error) => message(error).to_owned(),
-        _ => "カタログを確認できません。".to_owned(),
+        // The other two variants carry their own text. Dropping it left a
+        // person who had already answered the approval with "cannot be
+        // confirmed" and nowhere to look — the worst shape a failure can
+        // take, because the permission was already spent.
+        other => format!("カタログを確認できません（{other}）。"),
     })?;
     let (tools, partial) = store.save_catalog_entry(server, entry).map_err(fail)?;
     stopped.map_err(fail)?;

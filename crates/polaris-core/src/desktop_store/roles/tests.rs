@@ -225,6 +225,10 @@ fn an_account_model_has_no_endpoint_and_a_local_one_must_have_one() {
 
 #[test]
 fn an_effort_nobody_accepts_is_refused_where_it_is_typed() {
+    // Pinned as a literal, not read back out of `EFFORTS`: the loop below
+    // would pass just as happily against a set that had lost `max` or
+    // regained `ultra`.
+    assert_eq!(EFFORTS, ["low", "medium", "high", "xhigh", "max"]);
     let mut held = binding("a");
     for effort in EFFORTS {
         held.effort = Some(effort.into());
@@ -274,18 +278,37 @@ fn weights_are_stored_once_each_and_in_order() {
 }
 
 #[test]
-fn the_stored_weight_and_the_declared_one_are_the_same_three() {
+fn the_stored_weight_and_the_declared_one_are_the_same_four() {
     for tier in polaris_skills::Tier::ALL {
         assert_eq!(polaris_skills::Tier::from(SavedTier::from(tier)), tier);
     }
     // The stored spelling is what the configuration keys off, so it has to
     // match the frontmatter's.
     for (tier, name) in [
-        (SavedTier::Dwarf, "low"),
-        (SavedTier::Subgiant, "medium"),
-        (SavedTier::Supergiant, "ultra"),
+        (SavedTier::Dwarf, "dwarf"),
+        (SavedTier::Subgiant, "subgiant"),
+        (SavedTier::Giant, "giant"),
+        (SavedTier::Supergiant, "supergiant"),
     ] {
         assert_eq!(json!(tier), json!(name));
         assert_eq!(polaris_skills::Tier::from(tier).name(), name);
+    }
+}
+
+/// A profile saved before the weights were renamed still loads. The three
+/// old spellings were written to disk by shipped builds, so dropping them
+/// would silently reset a stored role to a default weight rather than
+/// failing where someone could see it.
+#[test]
+fn the_spellings_written_before_the_rename_still_load() {
+    for (stored, tier) in [
+        ("low", SavedTier::Dwarf),
+        ("medium", SavedTier::Subgiant),
+        ("ultra", SavedTier::Supergiant),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<SavedTier>(json!(stored)).expect(stored),
+            tier
+        );
     }
 }

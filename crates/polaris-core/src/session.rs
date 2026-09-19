@@ -53,6 +53,11 @@ pub struct Session {
     /// The light model that settles what the judge left undecided. The
     /// same independently constructed selector the MCP catalogue uses.
     pub light_model: Option<std::sync::Arc<dyn polaris_provider::Provider>>,
+    /// How much of `--approval always`'s band the person agreed in advance
+    /// to stop being asked about (M18). `Off` unless the project's
+    /// `[approval] auto` says otherwise, and it takes a judge as well —
+    /// neither alone changes anything.
+    pub approval_auto: crate::approval::AutoApproval,
     /// Root-only bundled setting commands. The model passes an operation
     /// name, never a command; a real install stays the person's to confirm.
     pub setting: Option<std::sync::Arc<crate::recipe::tool::SettingTool>>,

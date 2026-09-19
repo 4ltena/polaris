@@ -439,12 +439,19 @@ async fn run_one_inner(
 }
 
 fn validate_output(agent: &AgentType, text: &str) -> Result<(), String> {
-    let schema_text = std::fs::read_to_string(&agent.output_schema).map_err(|e| {
-        format!(
-            "cannot read output schema {}: {e}",
-            agent.output_schema.display()
-        )
-    })?;
+    // A type that ships inside the binary has no schema file to read; it
+    // carries the text instead. Everything else is read from disk exactly
+    // as before, and the lookup matches on the whole path, so a project's
+    // own type can never pick up a shipped schema by accident.
+    let schema_text = match polaris_skills::builtin::output_schema_text(&agent.output_schema) {
+        Some(embedded) => embedded.to_string(),
+        None => std::fs::read_to_string(&agent.output_schema).map_err(|e| {
+            format!(
+                "cannot read output schema {}: {e}",
+                agent.output_schema.display()
+            )
+        })?,
+    };
     let schema: serde_json::Value = serde_json::from_str(&schema_text)
         .map_err(|e| format!("output schema is not valid JSON: {e}"))?;
     let instance: serde_json::Value = serde_json::from_str(text)
@@ -1143,7 +1150,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let types = [file_inspector()];
-        // agents/file-inspector declares `low`.
+        // agents/file-inspector declares `dwarf`.
         assert_eq!(types[0].tier, polaris_skills::Tier::Dwarf);
         let task = SpawnTask {
             agent_type: "file-inspector".into(),
@@ -1155,7 +1162,7 @@ mod tests {
         let light = named("light");
         let weighted: Arc<dyn Provider> = Arc::new(RoleProvider::tiers_only(
             parent.clone(),
-            HashMap::from([("low".into(), light.clone() as Arc<dyn Provider>)]),
+            HashMap::from([("dwarf".into(), light.clone() as Arc<dyn Provider>)]),
         ));
         let _ = run_one(
             &task,
@@ -1183,7 +1190,7 @@ mod tests {
                 HashMap::from([("file-inspector".into(), bound.clone() as Arc<dyn Provider>)]),
             )
             .with_tiers(HashMap::from([(
-                "low".into(),
+                "dwarf".into(),
                 lighter.clone() as Arc<dyn Provider>,
             )])),
         );
@@ -2842,7 +2849,7 @@ mod resolved_type_tests {
         let resolved = resolved_type(
             &held,
             &catalogue(),
-            "file-reader",
+            Some("file-reader"),
             "ファイルを読んで要約する",
         )
         .await;
@@ -2856,19 +2863,19 @@ mod resolved_type_tests {
         // A name nobody offered is the one answer that cannot be read.
         let invented = judge(Some("not-in-the-catalogue"));
         assert_eq!(
-            resolved_type(&invented, &catalogue(), "x", "依頼").await,
+            resolved_type(&invented, &catalogue(), Some("x"), "依頼").await,
             None
         );
         // A judge that could not answer.
         let failing = judge(None);
         assert_eq!(
-            resolved_type(&failing, &catalogue(), "x", "依頼").await,
+            resolved_type(&failing, &catalogue(), Some("x"), "依頼").await,
             None
         );
         assert_eq!(*failing.asked.lock().unwrap(), 1);
         // Nothing to choose between.
         let unasked = judge(Some("ro-fixture"));
-        assert_eq!(resolved_type(&unasked, &[], "x", "依頼").await, None);
+        assert_eq!(resolved_type(&unasked, &[], Some("x"), "依頼").await, None);
         assert_eq!(*unasked.asked.lock().unwrap(), 0);
     }
 
@@ -2893,7 +2900,7 @@ mod resolved_type_tests {
             }
         }
         let capture = Capture(std::sync::Mutex::new(Vec::new()));
-        let _ = resolved_type(&capture, &catalogue(), "x", "依頼").await;
+        let _ = resolved_type(&capture, &catalogue(), Some("x"), "依頼").await;
         assert_eq!(
             *capture.0.lock().unwrap(),
             ["ro-fixture".to_owned(), "second-fixture".to_owned()]

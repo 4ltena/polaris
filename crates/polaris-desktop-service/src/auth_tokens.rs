@@ -20,6 +20,67 @@ impl DesktopAuthTokens {
     }
 }
 
+/// A run-bound source. Every send for one run resolves through the single
+/// registration fixed at acceptance; a logout or a new generation fails it
+/// closed instead of reaching another account.
+pub struct AccountTokens {
+    bound: polaris_auth::accounts::observation::BoundTokenSource,
+    /// The revision last handed out, so a 401 asks for a newer one.
+    used: std::sync::Mutex<Option<u64>>,
+}
+
+impl AccountTokens {
+    pub fn new(bound: polaris_auth::accounts::observation::BoundTokenSource) -> Self {
+        Self {
+            bound,
+            used: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn keep(&self, token: polaris_auth::accounts::owner::AccessToken) -> Token {
+        *self.used.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.token_revision);
+        Token {
+            access_token: token.secret().to_owned(),
+            account_id: token.account_id.clone(),
+            effort: None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenSource for AccountTokens {
+    async fn token(&self) -> Result<Token, ProviderError> {
+        self.bound
+            .token()
+            .await
+            .map(|token| self.keep(token))
+            .map_err(refresh_error)
+    }
+
+    async fn refreshed(&self) -> Result<Token, ProviderError> {
+        let used = *self.used.lock().unwrap_or_else(|e| e.into_inner());
+        let token = match used {
+            Some(revision) => self.bound.refresh_after_unauthorized(revision).await,
+            None => self.bound.token().await,
+        };
+        token.map(|token| self.keep(token)).map_err(refresh_error)
+    }
+}
+
+/// The accounts registry exists, so a run without a binding must not send.
+pub struct UnboundAccountTokens;
+
+#[async_trait::async_trait]
+impl TokenSource for UnboundAccountTokens {
+    async fn token(&self) -> Result<Token, ProviderError> {
+        Err(ProviderError::Auth("authentication_account_unbound".into()))
+    }
+
+    async fn refreshed(&self) -> Result<Token, ProviderError> {
+        self.token().await
+    }
+}
+
 fn auth_error() -> ProviderError {
     ProviderError::Auth(
         "Polarisの認証情報を確認できません。設定から接続を確認してください。".into(),
@@ -32,7 +93,11 @@ fn refresh_error(error: polaris_auth::AuthError) -> ProviderError {
     // and credentials. These labels are recognized by desktop_run's audit.
     let category = match error {
         AuthError::Protection => "authentication_protection",
+        AuthError::Busy => "authentication_store_busy",
+        AuthError::RecoveryRequired => "authentication_recovery_required",
         AuthError::Io(_) | AuthError::NotLoggedIn => "authentication_store",
+        AuthError::AlreadyRegistered => "authentication_already_registered",
+        AuthError::AccountLimit => "authentication_account_limit",
         AuthError::Http(message) => match message
             .split_whitespace()
             .take(2)
@@ -88,6 +153,11 @@ mod tests {
     fn refresh_errors_discard_private_upstream_details() {
         let private = "synthetic credential and upstream response";
         for (error, expected) in [
+            (polaris_auth::AuthError::Busy, "authentication_store_busy"),
+            (
+                polaris_auth::AuthError::RecoveryRequired,
+                "authentication_recovery_required",
+            ),
             (
                 polaris_auth::AuthError::Http(format!("status 400 Bad Request: {private}")),
                 "authentication_http_400",

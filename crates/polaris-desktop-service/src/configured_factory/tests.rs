@@ -35,9 +35,16 @@ struct Fixture {
     helper: PathBuf,
     writer: Writer,
     tokens: Arc<Tokens>,
+    /// What the fixture's one agent type declares it needs. Empty by
+    /// default, because most tests do not care; a test that does sets it
+    /// before building the resources.
+    child_tools: Vec<String>,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_mode(Default::default())
+    }
+    fn with_mode(mode: polaris_desktop_protocol::snapshot::HistoryMode) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let source = base.join("source");
@@ -61,7 +68,7 @@ impl Fixture {
                         attachment_ids: vec![],
                     },
                     configuration: Configuration {
-                        history_mode: Default::default(),
+                        history_mode: mode,
                         configuration_revision: DecimalU64::new(0),
                         provider: "codex".into(),
                         model: "gpt-6-astra".into(),
@@ -78,6 +85,7 @@ impl Fixture {
             helper,
             writer,
             tokens: Arc::new(Tokens(AtomicUsize::new(0))),
+            child_tools: Vec::new(),
         }
     }
     fn grant(&self) -> ConfirmedSourceGrant {
@@ -97,6 +105,9 @@ impl Fixture {
         }
     }
     fn bootstrap(&self) -> ValidatedOwnerBootstrap {
+        self.bootstrap_with_tier(BootstrapTier::ReadCreate)
+    }
+    fn bootstrap_with_tier(&self, tier: BootstrapTier) -> ValidatedOwnerBootstrap {
         let identity = |p: &std::path::Path| {
             let m = fs::metadata(p).unwrap();
             BootstrapIdentity {
@@ -107,14 +118,14 @@ impl Fixture {
         let root = self.base.join("store");
         let saved = self.writer.snapshot().unwrap();
         let doc = OwnerBootstrapDocument {
-            history_mode: Default::default(),
+            history_mode: saved.state.configuration.history_mode,
             schema_version: 1,
             project_id: saved.marker.project_id.clone(),
             session_id: saved.marker.session_id.clone(),
             store_identity: identity(&root),
             source_path: self.source.to_str().unwrap().into(),
             source_identity: identity(&self.source),
-            tier: BootstrapTier::ReadCreate,
+            tier,
             policy_revision: DecimalU64::new(7),
             configuration_revision: saved.state.configuration.configuration_revision,
             provider: BootstrapProvider::Codex,
@@ -157,9 +168,9 @@ impl Fixture {
                 description: "fixture".into(),
                 body: "fixture".into(),
                 path: self.base.clone(),
-                allowed_tools: vec![],
+                allowed_tools: self.child_tools.clone(),
                 access: polaris_skills::AgentAccess::Read,
-                tier: "medium".into(),
+                tier: polaris_skills::Tier::Subgiant,
                 wall_seconds: 5,
                 max_turns: 2,
                 workflow_phase: None,
@@ -171,6 +182,12 @@ impl Fixture {
             spawn_write_concurrency: 1,
             tool_memory: None,
             history: None,
+            mcp: None,
+            workflow: polaris_core::workflow::WorkflowConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            decider: None,
         }
     }
     fn factory(&self) -> ConfiguredRunFactory {
@@ -178,6 +195,7 @@ impl Fixture {
             self.bootstrap(),
             self.grant(),
             TrustedBackend::Codex {
+                accounts: None,
                 tokens: self.tokens.clone(),
             },
             self.resources(),
@@ -203,6 +221,15 @@ impl Fixture {
     fn accept(&mut self) -> RunTarget {
         self.accept_named("")
     }
+    /// An acceptance that fixed the run to one registration.
+    fn accept_bound(&mut self, registration_id: &str) -> (RunTarget, Published) {
+        let target = self.accept_named("");
+        let mut saved = self.writer.snapshot().unwrap();
+        saved.state.runs[0].account = Some(
+            polaris_core::desktop_store::SavedAccount::new(registration_id.into(), 1).unwrap(),
+        );
+        (target, saved)
+    }
     fn accept_named(&mut self, suffix: &str) -> RunTarget {
         let target = RunTarget {
             run_id: RunId::new(format!("r{suffix}")).unwrap(),
@@ -217,6 +244,7 @@ impl Fixture {
                     body: RequestBody::RunStart(
                         SessionId::new("s").unwrap(),
                         RunStart {
+                            mcp_prompt: None,
                             expected_draft_revision: self
                                 .writer
                                 .snapshot()
@@ -245,6 +273,100 @@ impl Fixture {
     }
 }
 #[test]
+fn mcp_configuration_preserves_project_and_external_ceiling_before_capability_collapse() {
+    use polaris_core::mcp::{operation::ExternalCeiling, runtime::RuntimeConfig};
+    for (tier, ceiling) in [
+        (BootstrapTier::ReadCreate, ExternalCeiling::Denied),
+        (BootstrapTier::ReadCreateBuild, ExternalCeiling::Denied),
+        (
+            BootstrapTier::ReadCreateBuildExternal,
+            ExternalCeiling::Allowed,
+        ),
+    ] {
+        let mut f = Fixture::new();
+        let mut grant = f.grant();
+        grant.tier = tier;
+        let mut resources = f.resources();
+        resources.mcp = Some(
+            RuntimeConfig::new(
+                polaris_mcp::registration::Registry {
+                    schema_version: 1,
+                    revision: 1,
+                    servers: vec![],
+                },
+                "p".into(),
+                Arc::new(polaris_mcp::store::Secrets::new(1, Default::default()).unwrap()),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let factory = ConfiguredRunFactory::new(
+            f.bootstrap_with_tier(tier),
+            grant,
+            TrustedBackend::Codex {
+                accounts: None,
+                tokens: f.tokens.clone(),
+            },
+            resources,
+        )
+        .unwrap();
+        let target = f.accept();
+        factory.stage_workspace(f.workspace()).unwrap();
+        let input = factory
+            .prepare(&target, &f.writer.snapshot().unwrap())
+            .unwrap();
+        assert_eq!(input.external_ceiling, ceiling);
+        let mcp = input.mcp.unwrap();
+        assert_eq!(mcp.config.project_id(), "p");
+        assert!(
+            mcp.selection_provider.is_some(),
+            "Codex runs get the fixed light selector"
+        );
+        if tier != BootstrapTier::ReadCreate {
+            assert!(matches!(
+                input.execution_capability,
+                Some(
+                    polaris_core::desktop_execution::ConfirmedExecutionCapability::ConfinedCode { .. }
+                )
+            ));
+        }
+        assert_eq!(f.tokens.0.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn mcp_configuration_for_another_project_is_rejected_before_authentication() {
+    let f = Fixture::new();
+    let mut resources = f.resources();
+    resources.mcp = Some(
+        polaris_core::mcp::runtime::RuntimeConfig::new(
+            polaris_mcp::registration::Registry {
+                schema_version: 1,
+                revision: 1,
+                servers: vec![],
+            },
+            "other-project".into(),
+            Arc::new(polaris_mcp::store::Secrets::new(1, Default::default()).unwrap()),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        ConfiguredRunFactory::new(
+            f.bootstrap(),
+            f.grant(),
+            TrustedBackend::Codex {
+                accounts: None,
+                tokens: f.tokens.clone()
+            },
+            resources,
+        ),
+        Err(FactoryError::Binding)
+    ));
+    assert_eq!(f.tokens.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn role_revision_requires_refreshed_owner_bootstrap_before_next_run() {
     let mut f = Fixture::new();
     let old = f.factory();
@@ -253,6 +375,7 @@ fn role_revision_requires_refreshed_owner_bootstrap_before_next_run() {
         .configure_role_bindings(
             DecimalU64::new(0),
             Some(polaris_core::desktop_store::SavedRoleBindings::new(vec![]).unwrap()),
+            None,
             &catalog,
         )
         .unwrap();
@@ -311,13 +434,15 @@ fn frozen_local_role_is_revalidated_and_bound_without_primary_fallback() {
                     polaris_core::desktop_store::SavedRoleBinding {
                         role: "child".into(),
                         runtime: polaris_core::desktop_store::SavedRuntime::Ollama,
-                        endpoint,
+                        endpoint: Some(endpoint),
+                        effort: None,
                         model: "qwen:small".into(),
                         observed_tool_support: polaris_core::desktop_store::ToolSupport::Unknown,
                     },
                 ])
                 .unwrap(),
             ),
+            None,
             &catalog,
         )
         .unwrap();
@@ -362,6 +487,7 @@ fn configured_factory_rejects_grant_backend_and_catalog_mismatch() {
             f.bootstrap(),
             grant,
             TrustedBackend::Codex {
+                accounts: None,
                 tokens: f.tokens.clone()
             },
             f.resources()
@@ -386,6 +512,7 @@ fn configured_factory_rejects_grant_backend_and_catalog_mismatch() {
             f.bootstrap(),
             f.grant(),
             TrustedBackend::Codex {
+                accounts: None,
                 tokens: f.tokens.clone()
             },
             resources
@@ -470,6 +597,7 @@ fn recipe_factory(f: &Fixture, recipe: WorkspacePreparationRecipe) -> Configured
         f.bootstrap(),
         f.grant(),
         TrustedBackend::Codex {
+            accounts: None,
             tokens: f.tokens.clone(),
         },
         f.resources(),
@@ -694,4 +822,227 @@ fn configured_recipe_registered_moved_inode_refuses_before_digest() {
     // Registry retains historical identities; retain this bounded dummy fixture
     // so concurrent tests cannot reuse its registered inodes.
     let _ = f._temp.keep();
+}
+
+#[test]
+fn configured_factory_structured_history_prepares_dedicated_summary_without_auth() {
+    let mut f = Fixture::with_mode(polaris_desktop_protocol::snapshot::HistoryMode::Structured10);
+    let mut resources = f.resources();
+    resources.history = Some(TrustedMemoryIndex {
+        embedder: polaris_core::conversation_memory::LocalStdioEmbedder::new(
+            f.base.join("unused-python"),
+            f.base.join("unused-helper"),
+            f.base.join("unused-model"),
+            f.base.join("unused-runtime"),
+            "fixture-revision".into(),
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap(),
+        database: f.base.join("unused-index.sqlite3"),
+        identity: polaris_core::desktop_store::MemoryResources {
+            embedding_model: "intfloat/multilingual-e5-small".into(),
+            embedding_revision: "fixture-revision".into(),
+            embedding_dimension: 384,
+            fingerprint: "a".repeat(64),
+        },
+    });
+    let factory = ConfiguredRunFactory::new(
+        f.bootstrap(),
+        f.grant(),
+        TrustedBackend::Codex {
+            accounts: None,
+            tokens: f.tokens.clone(),
+        },
+        resources,
+    )
+    .unwrap();
+    assert!(factory.summary_provider.is_some());
+    factory.stage_workspace(f.workspace()).unwrap();
+    let target = f.accept();
+    let saved = f.writer.snapshot().unwrap();
+    let inputs = factory.prepare(&target, &saved).unwrap();
+    let history = inputs
+        .history
+        .as_ref()
+        .expect("structured history resources must not be discarded by zip");
+    assert!(!Arc::ptr_eq(&history.summary_provider, &inputs.provider));
+    assert_eq!(history.database, f.base.join("unused-index.sqlite3"));
+    assert_eq!(f.tokens.0.load(Ordering::SeqCst), 0);
+    assert!(!history.database.exists());
+}
+
+#[test]
+fn a_run_bound_to_a_registration_never_falls_back_to_the_single_authentication() {
+    let mut f = Fixture::new();
+    let factory = ConfiguredRunFactory::new(
+        f.bootstrap(),
+        f.grant(),
+        TrustedBackend::Codex {
+            accounts: None,
+            tokens: f.tokens.clone(),
+        },
+        f.resources(),
+    )
+    .unwrap();
+    factory.stage_workspace(f.workspace()).unwrap();
+    let (target, saved) = f.accept_bound("reg-a");
+    // No accounts owner can resolve the binding, so the run cannot send at all.
+    assert!(factory.prepare(&target, &saved).is_err());
+    assert_eq!(f.tokens.0.load(Ordering::SeqCst), 0);
+    let _ = f._temp.keep();
+}
+
+#[test]
+fn a_factory_without_accounts_binds_no_registration_at_acceptance() {
+    let f = Fixture::new();
+    let factory = ConfiguredRunFactory::new(
+        f.bootstrap(),
+        f.grant(),
+        TrustedBackend::Codex {
+            accounts: None,
+            tokens: f.tokens.clone(),
+        },
+        f.resources(),
+    )
+    .unwrap();
+    assert_eq!(factory.bind_account().unwrap(), None);
+    let _ = f._temp.keep();
+}
+
+#[test]
+fn account_backed_roles_and_weights_are_built_on_the_registration_the_run_holds() {
+    use polaris_core::desktop_store::{
+        SavedRoleBinding, SavedRoleBindings, SavedRuntime, SavedTier, SavedTierBinding,
+        SavedTierBindings, ToolSupport,
+    };
+    let mut f = Fixture::new();
+    let catalog = f.resources().agent_types;
+    f.writer
+        .configure_role_bindings(
+            DecimalU64::new(0),
+            Some(
+                SavedRoleBindings::new(vec![SavedRoleBinding {
+                    role: "child".into(),
+                    runtime: SavedRuntime::Account,
+                    // No endpoint: the account is reached through the
+                    // registration, not through an origin the user gave.
+                    endpoint: None,
+                    effort: Some("high".into()),
+                    model: "gpt-5.6-terra".into(),
+                    observed_tool_support: ToolSupport::Supported,
+                }])
+                .unwrap(),
+            ),
+            Some(
+                SavedTierBindings::new(vec![SavedTierBinding {
+                    tier: SavedTier::Dwarf,
+                    runtime: SavedRuntime::Account,
+                    endpoint: None,
+                    model: "gpt-5.4-mini".into(),
+                    effort: Some("low".into()),
+                }])
+                .unwrap(),
+            ),
+            &catalog,
+        )
+        .unwrap();
+    let target = f.accept_named("-account-role");
+    let saved = f.writer.snapshot().unwrap();
+    let factory = f.factory();
+    factory.stage_workspace(f.workspace()).unwrap();
+    let inputs = factory.prepare(&target, &saved).unwrap();
+    assert!(inputs.provider.resolve_role("child").unwrap().is_some());
+    assert!(inputs.provider.resolve_role("missing").is_err());
+    assert!(inputs.provider.resolve_tier("low").unwrap().is_some());
+    assert!(
+        inputs.provider.resolve_tier("ultra").unwrap().is_none(),
+        "an unpriced weight names nothing and the caller falls back"
+    );
+    // Building the providers must not have sent anything: a model name is
+    // what the account is asked to answer under, and whether it will is
+    // settled by the first real request.
+    assert_eq!(f.tokens.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_weight_priced_without_any_role_still_routes() {
+    use polaris_core::desktop_store::{
+        SavedRuntime, SavedTier, SavedTierBinding, SavedTierBindings,
+    };
+    let mut f = Fixture::new();
+    let catalog = f.resources().agent_types;
+    f.writer
+        .configure_role_bindings(
+            DecimalU64::new(0),
+            None,
+            Some(
+                SavedTierBindings::new(vec![SavedTierBinding {
+                    tier: SavedTier::Supergiant,
+                    runtime: SavedRuntime::Account,
+                    endpoint: None,
+                    model: "gpt-6-astra".into(),
+                    effort: None,
+                }])
+                .unwrap(),
+            ),
+            &catalog,
+        )
+        .unwrap();
+    let target = f.accept_named("-weight-only");
+    let saved = f.writer.snapshot().unwrap();
+    let factory = f.factory();
+    factory.stage_workspace(f.workspace()).unwrap();
+    let inputs = factory.prepare(&target, &saved).unwrap();
+    assert!(inputs.provider.resolve_tier("ultra").unwrap().is_some());
+    // Pricing a weight is not binding a role, so an unbound role is still
+    // refused exactly as it was before.
+    assert!(inputs.provider.resolve_role("child").is_err());
+}
+
+#[test]
+fn a_type_that_needs_tools_is_not_bound_to_a_model_nobody_saw_supporting_them() {
+    use polaris_core::desktop_store::{
+        SavedRoleBinding, SavedRoleBindings, SavedRuntime, ToolSupport,
+    };
+    // One run per case: a fixture accepts a single run, and what is being
+    // compared is what preparation does with each saved observation.
+    let prepared = |support| {
+        let mut f = Fixture::new();
+        f.child_tools = vec!["read".into()];
+        let catalog = f.resources().agent_types;
+        f.writer
+            .configure_role_bindings(
+                DecimalU64::new(0),
+                Some(
+                    SavedRoleBindings::new(vec![SavedRoleBinding {
+                        role: "child".into(),
+                        runtime: SavedRuntime::Account,
+                        endpoint: None,
+                        effort: None,
+                        model: "gpt-5.6-terra".into(),
+                        observed_tool_support: support,
+                    }])
+                    .unwrap(),
+                ),
+                None,
+                &catalog,
+            )
+            .unwrap();
+        let target = f.accept_named("-tools");
+        let saved = f.writer.snapshot().unwrap();
+        let factory = f.factory();
+        factory.stage_workspace(f.workspace()).unwrap();
+        factory.prepare(&target, &saved).map(|_| ())
+    };
+    // Unknown is not the same as supported. The observation is the
+    // settings screen's, recorded when the binding was saved, and a run
+    // must not assume what nobody looked at.
+    for refused in [ToolSupport::Unknown, ToolSupport::Unsupported] {
+        assert!(
+            prepared(refused).is_err(),
+            "{refused:?} must not bind a type that needs tools"
+        );
+    }
+    assert!(prepared(ToolSupport::Supported).is_ok());
 }

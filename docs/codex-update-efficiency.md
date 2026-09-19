@@ -16,14 +16,14 @@
 
 スキルカタログには[独立したtoken予算 #38978](https://github.com/openai/codex/pull/38978)もある。Polarisはカタログ全体を常時送らないため、その上限値を導入しても現在の固定入力は減らない。また、Codexの[要約なしのcontext切替](https://github.com/openai/codex/blob/rust-v0.153.0/codex-rs/core/src/compact_token_budget.rs)は、原文と決定を保持するstrict10とは契約が異なる。要約要求を省くために過去の情報を失わせる変更は採用していない。
 
-開発版では、`~/.polaris/config.toml`または`<project-root>/.polaris/config.toml`に次を指定するとfiles.mdの自動更新だけを停止できる。
+`~/.polaris/config.toml`または`<project-root>/.polaris/config.toml`に次を指定するとfiles.mdの自動更新を有効にできる。
 
 ```toml
 [files_md]
-auto_regenerate = false
+auto_regenerate = true
 ```
 
-既定はtrueで、従来の更新動作を維持する。falseではファイル変更を契機とするfiles-md-writerの追加モデル要求を起動しない。通常の応答や手動spawnは使えるが、files.mdを最新に保つには明示的な更新が必要になる。履歴の要約・保存、必須skill、サンドボックス、承認規則はこの設定の対象外である。
+**既定はfalseである。** 導入時はtrueだったが、生成した`files.md`を要求へ載せる経路が無いことを2026-09-19に確認し、既定を反転した。falseではファイル変更を契機とするfiles-md-writerの追加モデル要求を起動しない。通常の応答や手動spawnは使えるが、files.mdを最新に保つには明示的な更新が必要になる。履歴の要約・保存、必須skill、サンドボックス、承認規則はこの設定の対象外である。
 
 これは自動recap停止の設計を参考にした独自実装であり、Codexのコードを複製したものではない。追加要求が発生する作業では削減候補となるが、トークン数・費用・利用枠の削減率は未測定である。files-md-writerを導入していない環境では、この設定によるモデル要求の削減はない。
 

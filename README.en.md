@@ -41,7 +41,7 @@ target/release/polaris login
 POLARIS_PROVIDER=codex target/release/polaris -p "How many lines are in Cargo.toml?"
 ```
 
-Omit `-p` to start the interactive TUI. During development, use `cargo run -p polaris-cli -- -p "..."`. The default model is `gpt-6-astra`, with `medium` reasoning effort.
+Omit `-p` to start the interactive TUI. During development, use `cargo run -p polaris-cli -- -p "..."`. The default model is `gpt-6-astra`, with `xhigh` reasoning effort.
 
 Use `--phase` to choose the starting phase:
 

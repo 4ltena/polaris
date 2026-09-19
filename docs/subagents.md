@@ -60,7 +60,7 @@ description: 単一ファイルを読み取り専用で棚卸しし、責務、�
 allowed-tools: read
 metadata:
   polaris-access: read
-  polaris-tier: low
+  polaris-tier: dwarf
   polaris-wall-seconds: "360"
   polaris-max-turns: "12"
   polaris-continuation: "denied"
@@ -73,7 +73,7 @@ frontmatter直後の本文が型のシステムプロンプトになる。`allow
 | キー | 値 | 意味 |
 | --- | --- | --- |
 | `polaris-access` | `read` / `read-write` | `read`は読み取り専用。`read-write`は`write_root`の指定を必要とし、親の書き込み可能ルート外を拒否する。 |
-| `polaris-tier` | `low` / `medium` / `ultra` | 型の重さ。設定がこれをモデルと推論強度へ対応させる。3つ以外の値を書いた型は、理由付きで読み飛ばす。 |
+| `polaris-tier` | `dwarf` / `subgiant` / `giant` / `supergiant` | 型の重さ。光度階級を借りた4段で、設定がこれをモデルと推論強度へ対応させる。4つ以外の値を書いた型は、理由付きで読み飛ばす。旧綴りの`low`・`medium`・`ultra`はここでは**受け付けない**（推論強度の値と衝突するため改名した。保存済みのrole束縛だけは`serde(alias)`で読める）。 |
 | `polaris-wall-seconds` | 秒数 | 1タスクの壁時計上限。超過したタスクだけを失敗として返す。 |
 | `polaris-max-turns` | ターン数 | 1タスクのターン上限。スキーマ不一致の再試行も同じ予算を使う。 |
 | `polaris-continuation` | `denied` / `allowed` | 波をまたぐ継続の可否を表す。 |

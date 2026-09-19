@@ -41,7 +41,7 @@ target/release/polaris login
 POLARIS_PROVIDER=codex target/release/polaris -p "Cargo.toml は何行か"
 ```
 
-`-p`を省略すると対話TUIを起動する。開発中は`cargo run -p polaris-cli -- -p "..."`でも実行できる。既定モデルは`gpt-6-astra`、推論強度は`medium`である。
+`-p`を省略すると対話TUIを起動する。開発中は`cargo run -p polaris-cli -- -p "..."`でも実行できる。既定モデルは`gpt-6-astra`、推論強度は`xhigh`である。
 
 段階を指定して始める場合は、`--phase`を使う。
 

@@ -21,7 +21,7 @@ cargo build --release
 
 `--web-search`は`disabled`、`cached`、`live`を受け付けるが、現在のChatGPT認証先はResponses形式の上限契約を確認していない。既定の`disabled`だけが利用でき、`cached`と`live`は明示しても開始前に拒否される。`cached`もローカルのオフライン検索を意味しない。動作するlive用コマンドはまだ案内しない。
 
-推論強度の既定は`medium`。APIにはモデル名を`gpt-6-astra`、推論強度を`medium`として別々に渡す。`--effort`で明示した値が優先され、アカウントのプランによって既定値は変わらない。
+推論強度の既定は`xhigh`。APIにはモデル名を`gpt-6-astra`、推論強度を`xhigh`として別々に渡す。`--effort`で明示した値が優先され、アカウントのプランによって既定値は変わらない。受け付ける値は`low`・`medium`・`high`・`xhigh`・`max`の5つである。`max`はResponses API限定だが、主経路が`/responses`なので使える。この既定はroot実行自身の強度であり、委譲先の強度は`[tier.*]`が決める。
 
 現行の`openai`プロバイダは`/chat/completions`を使う。公式仕様ではAstraのtool callingにResponses APIが必要なため、この経路でのAstraのツール実行は非対応である。`codex`プロバイダは別のResponses形式の実装であり、APIキー用のResponses対応とは区別する。[Astra移行ガイド](https://developers.openai.com/api/docs/guides/latest-model)
 
@@ -87,7 +87,7 @@ SwiftUIの作業画面は、選択したプロジェクトと会話を専用の�
 
 失敗ターンの使用量は累計表示へ反映されない。プロバイダがusageを返さないときは`0`と表示する。履歴ペインはスクロールバックを持たず、最新メッセージだけを表示する。
 
-`/model`はモデル、続けてreasoning effortを選ぶ2段階のピッカーを表示する。表示上の`extra high`はAPIへ送るとき`xhigh`へ変換し、`max`と`ultra`も現在の実装では`xhigh`として送る。明示した選択は既定の`gpt-6-astra`・`medium`を上書きし、次のターンから反映する。`/permissions`と`/skills`も同じ形式のピッカーを使う。`/skills`は閲覧専用である。
+`/model`はモデル、続けてreasoning effortを選ぶ2段階のピッカーを表示する。並ぶのは`low`・`medium`・`high`・`extra high`・`max`の5行で、APIが受け付ける値と1対1である。表示上の`extra high`だけは送るとき`xhigh`へ変換し、`max`はそのまま送る。明示した選択は既定の`gpt-6-astra`・`extra high`を上書きし、次のターンから反映する。`/permissions`と`/skills`も同じ形式のピッカーを使う。`/skills`は閲覧専用である。
 
 `/resume`の一覧は、現在の作業ディレクトリを最初に置き、ほかのディレクトリは最後の会話日時の新しい順に並べる。各行には相対時刻、メッセージ数、最初のユーザーメッセージの60文字プレビューを表示する。30日を超えた会話は絶対日時で表示する。legacyでは壊れた行より前までを読むが、v2の破損・世代不一致は原文を切り捨てず拒否する。
 
@@ -120,11 +120,11 @@ macOSのCLIとTUIでは、グローバルの`~/.polaris/AGENTS.md`と起動時�
 
 ### files.mdの自動更新
 
-files-md-writer型を導入している場合、rootのツール変更後に対象ディレクトリの`files.md`を自動更新する。設定の既定は有効であり、不要なプロジェクトでは、グローバルまたはプロジェクト設定で止められる。
+files-md-writer型を導入している場合、rootのツール変更後に対象ディレクトリの`files.md`を自動更新する。**既定は無効である。** 生成した`files.md`を要求へ載せる経路は無く、ディレクトリが増えるたびにsubagentを起動する分だけが残るため、2026-09-19に既定をfalseへ変えた。必要なプロジェクトでは、グローバルまたはプロジェクト設定で有効にする。
 
 ```toml
 [files_md]
-auto_regenerate = false
+auto_regenerate = true
 ```
 
 この設定はroot起点の自動更新だけを止める。`spawn`による明示的なsubagent実行は維持される。

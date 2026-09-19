@@ -111,13 +111,24 @@ pub fn discover_in(dirs: &[PathBuf]) -> Discovered {
 
 /// Walks the two default locations plus any places added by configuration,
 /// in this order.
+/// The shipped skills (`crate::builtin::skills`) are appended **last**, on
+/// the same first-one-wins rule as the directories: a project or a person
+/// who writes a skill under one of those names keeps their own. Without
+/// this, an optional skill could only be shipped by copying it into
+/// `~/.polaris/skills` on every machine by hand.
 pub fn discover(project_root: &Path, extra_paths: &[PathBuf]) -> Discovered {
     let mut dirs = vec![project_root.join(".polaris").join("skills")];
     if let Some(home) = std::env::var_os("HOME") {
         dirs.push(Path::new(&home).join(".polaris").join("skills"));
     }
     dirs.extend_from_slice(extra_paths);
-    discover_in(&dirs)
+    let mut discovered = discover_in(&dirs);
+    for skill in crate::builtin::skills() {
+        if !discovered.skills.iter().any(|held| held.name == skill.name) {
+            discovered.skills.push(skill);
+        }
+    }
+    discovered
 }
 
 #[cfg(test)]
@@ -203,12 +214,18 @@ mod tests {
         let found = discover(project.path(), &[]);
 
         assert_eq!(
-            found.skills.len(),
-            1,
+            from_disk(&found),
+            vec!["dup"],
             "a shared name should resolve to 1 entry"
         );
         assert_eq!(
-            found.skills[0].body.trim(),
+            found
+                .skills
+                .iter()
+                .find(|skill| skill.name == "dup")
+                .expect("dup")
+                .body
+                .trim(),
             "PROJECT",
             "search order differs from the specification: the project's skill lost to ~/.polaris/skills"
         );
@@ -257,6 +274,22 @@ mod tests {
         );
     }
 
+    /// The names `discover` found **on disk**, with the shipped skills
+    /// removed. They ride along on every call now, and the tests below are
+    /// about which directories were searched, not about what ships.
+    fn from_disk(found: &Discovered) -> Vec<&str> {
+        let shipped: Vec<String> = crate::builtin::skills()
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        found
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .filter(|name| !shipped.iter().any(|held| held == name))
+            .collect()
+    }
+
     #[test]
     fn home_skills_are_found_when_the_project_has_none() {
         // The two tests above only look at who wins a collision, so even if
@@ -275,12 +308,13 @@ mod tests {
         let _guard = set_home(Some(home.path()));
         let found = discover(project.path(), &[]);
 
-        let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
-            names,
+            from_disk(&found),
             vec!["personal"],
             "~/.polaris/skills was not searched"
         );
+        // And the shipped ones came along, after it.
+        assert!(found.skills.iter().any(|s| s.name == "smallest-change"));
     }
 
     #[test]
@@ -298,8 +332,7 @@ mod tests {
         let _guard = set_home(None);
         let found = discover(project.path(), &[]);
 
-        let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha"]);
+        assert_eq!(from_disk(&found), vec!["alpha"]);
         assert!(found.skipped.is_empty());
     }
 

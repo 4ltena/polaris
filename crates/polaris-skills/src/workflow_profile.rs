@@ -239,7 +239,7 @@ fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-fn count_tokens(text: &str) -> usize {
+pub(crate) fn count_tokens(text: &str) -> usize {
     tiktoken_rs::o200k_base_singleton()
         .encode_with_special_tokens(text)
         .len()

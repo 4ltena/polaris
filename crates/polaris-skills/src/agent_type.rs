@@ -13,6 +13,67 @@ pub enum AgentAccess {
     ReadWrite,
 }
 
+/// How much a type's work is expected to need. The configuration maps each
+/// one to a model and a reasoning effort, so a misspelling here would
+/// silently route a type to the parent's model instead of the one its
+/// author asked for. Checked at load, like `AgentAccess`.
+///
+/// **Named for luminosity class, not for size of effort.** The previous
+/// spellings — `low`, `medium`, `ultra` — collided with the reasoning-effort
+/// values a rung also carries, and one of them collided with a value the API
+/// does not have: `ultra` is not an effort OpenAI accepts, and polaris was
+/// quietly rewriting it to `xhigh`. A rung and the effort it asks for are two
+/// different things and now read as two different things.
+///
+/// Four rungs rather than three because the gap that matters is the model,
+/// not the effort: measured on 2026-09-18, moving a task from `gpt-6-astra`
+/// to `gpt-5.6-terra` takes the bill to about a fifth, while dropping the
+/// effort the whole way only reaches the 45.7% of it that output accounts
+/// for. Three rungs bound to one model spend the weaker lever.
+///
+/// The order is the order of the rungs. `PartialOrd` derives from it, and
+/// [`crate::Tier`] is clamped downward against a type's declaration, so a
+/// reordering here silently changes which weights a type can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// Mechanical, self-contained work: one file, a rename, a template.
+    Dwarf,
+    /// The default. An ordinary change across a few files, with tests.
+    Subgiant,
+    /// The hard instance of the same job, and where a failed `Subgiant`
+    /// task is retried — a retry is a more reliable signal than a forecast.
+    Giant,
+    /// Only where the rung below actually fails.
+    Supergiant,
+}
+
+impl Tier {
+    /// The spelling the frontmatter uses, which is also the routing key a
+    /// provider is registered under. Keeping one spelling for both means a
+    /// type's declaration and its configuration cannot drift apart.
+    pub const ALL: [Self; 4] = [
+        Self::Dwarf,
+        Self::Subgiant,
+        Self::Giant,
+        Self::Supergiant,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dwarf => "dwarf",
+            Self::Subgiant => "subgiant",
+            Self::Giant => "giant",
+            Self::Supergiant => "supergiant",
+        }
+    }
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentType {
     pub name: String,
@@ -21,7 +82,7 @@ pub struct AgentType {
     pub path: PathBuf,
     pub allowed_tools: Vec<String>,
     pub access: AgentAccess,
-    pub tier: String,
+    pub tier: Tier,
     pub wall_seconds: u32,
     pub max_turns: u32,
     /// Explicit role focus from the local type definition, never task prose.
@@ -167,7 +228,19 @@ pub fn parse(text: &str, dir_name: &str, dir_path: &Path) -> Result<AgentType, A
             });
         }
     };
-    let tier = required_metadata(&metadata, dir_name, "polaris-tier")?.to_string();
+    let tier = match required_metadata(&metadata, dir_name, "polaris-tier")? {
+        "dwarf" => Tier::Dwarf,
+        "subgiant" => Tier::Subgiant,
+        "giant" => Tier::Giant,
+        "supergiant" => Tier::Supergiant,
+        other => {
+            return Err(AgentTypeError::InvalidMetadataValue {
+                agent: dir_name.to_string(),
+                key: "polaris-tier",
+                value: other.to_string(),
+            });
+        }
+    };
     let wall_seconds = required_metadata(&metadata, dir_name, "polaris-wall-seconds")?
         .parse::<u32>()
         .map_err(|_| AgentTypeError::InvalidMetadataValue {
@@ -341,7 +414,7 @@ mod tests {
         assert_eq!(a.name, "file-inspector");
         assert_eq!(a.allowed_tools, vec!["read".to_string()]);
         assert_eq!(a.access, AgentAccess::Read);
-        assert_eq!(a.tier, "low");
+        assert_eq!(a.tier, Tier::Dwarf);
         assert_eq!(a.wall_seconds, 360);
         assert_eq!(a.max_turns, 12);
         assert!(!a.continuation);
@@ -380,6 +453,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn every_declared_weight_is_read_and_nothing_else_is() {
+        for (declared, expected) in [
+            ("dwarf", Tier::Dwarf),
+            ("subgiant", Tier::Subgiant),
+            ("giant", Tier::Giant),
+            ("supergiant", Tier::Supergiant),
+        ] {
+            let text =
+                valid_text().replace("polaris-tier: low", &format!("polaris-tier: {declared}"));
+            let held = parse(&text, "file-inspector", Path::new("agents/file-inspector"))
+                .expect("a valid weight");
+            assert_eq!(held.tier, expected);
+        }
+        // Until now any string passed, so `lo` or `heavy` would load and
+        // then match no configured weight at all — the type would quietly
+        // run on the parent's model instead of the one its author asked
+        // for. A misspelling has to be a load failure, not a silent one.
+        for refused in ["heavy", "Low", "lo", ""] {
+            let text =
+                valid_text().replace("polaris-tier: low", &format!("polaris-tier: {refused}"));
+            let error = parse(&text, "file-inspector", Path::new("agents/file-inspector"))
+                .expect_err(&format!("{refused:?} is not a weight"));
+            assert!(
+                matches!(
+                    &error,
+                    AgentTypeError::InvalidMetadataValue {
+                        key: "polaris-tier",
+                        ..
+                    } | AgentTypeError::MissingMetadataKey {
+                        key: "polaris-tier",
+                        ..
+                    }
+                ),
+                "{refused:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn weights_order_from_light_to_heavy() {
+        // The declared weight is a ceiling a decision may lower but never
+        // raise, which is `min` — and `min` is only the right operation if
+        // the order runs this way round.
+        assert!(Tier::Dwarf < Tier::Subgiant);
+        assert!(Tier::Subgiant < Tier::Giant);
+        assert!(Tier::Giant < Tier::Supergiant);
+        assert_eq!(Tier::Supergiant.min(Tier::Dwarf), Tier::Dwarf);
     }
 
     /// The same valid frontmatter, with `polaris-output` swapped for

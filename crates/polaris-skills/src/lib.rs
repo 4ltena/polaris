@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 pub use agent_type::{
     AgentAccess, AgentType, AgentTypeError, DiscoveredAgentTypes, SkipCauseAgentType,
-    SkippedAgentType, discover_agent_types, discover_agent_types_in,
+    SkippedAgentType, Tier, discover_agent_types, discover_agent_types_in,
 };
 pub use discovery::{Discovered, SkipCause, Skipped, discover, discover_in};
 pub use frontmatter::SkillError;

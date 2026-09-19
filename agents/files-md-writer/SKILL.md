@@ -4,7 +4,7 @@ description: 単一ディレクトリ直下の各エントリ(ファイル・サ
 allowed-tools: read write
 metadata:
   polaris-access: read-write
-  polaris-tier: low
+  polaris-tier: dwarf
   polaris-wall-seconds: "60"
   polaris-max-turns: "4"
   polaris-continuation: "denied"

@@ -4,7 +4,7 @@ description: 単一ファイルを読み取り専用で棚卸しし、責務、�
 allowed-tools: read
 metadata:
   polaris-access: read
-  polaris-tier: low
+  polaris-tier: dwarf
   polaris-wall-seconds: "360"
   polaris-max-turns: "12"
   polaris-continuation: "denied"

@@ -16,8 +16,16 @@ use crate::audit::{AuditLog, Record};
 use crate::session::Session;
 use crate::stop::{StopReason, StopTracker};
 
+mod mcp_dispatch;
+mod skill_catalog;
+mod workflow_control;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
+    #[error("MCP execution stopped: {0}")]
+    Mcp(#[from] crate::mcp::runtime::Error),
+    #[error("MCP操作の結果を確認できません。外部の状態を確認してください。自動では再実行しません")]
+    McpUnconfirmed,
     #[error("desktop event delivery stopped: {0}")]
     Desktop(crate::desktop_events::EventFailure),
     #[error("stopped: {0:?}")]
@@ -105,7 +113,45 @@ pub async fn run(
     events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<AgentOutcome, AgentError> {
+    run_with_mcp(
+        provider,
+        session,
+        audit,
+        stop,
+        always_on,
+        skills,
+        agent_types,
+        provider_pool,
+        spawn_concurrency,
+        spawn_write_concurrency,
+        events,
+        ctx,
+        None,
+    )
+    .await
+}
+
+/// [`run`] with a local MCP runtime from `McpPort::local`. The caller keeps the
+/// runtime outside this future and shuts it down on the same Tokio runtime.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_mcp(
+    provider: &dyn Provider,
+    session: &mut Session,
+    audit: Arc<Mutex<AuditLog>>,
+    stop: &mut StopTracker,
+    always_on: &crate::prompt::AlwaysOn,
+    skills: &[polaris_skills::Skill],
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>>,
+    ctx: &mut ToolContext<'_>,
+    mcp: Option<&mut crate::mcp::runtime::RunRuntime>,
+) -> Result<AgentOutcome, AgentError> {
+    session.memory_observation = None;
     session.check_persistence()?;
+    let skill_query = real_user_query(session);
     session.request_prompt = Some(always_on.clone());
     run_loop(
         provider,
@@ -120,8 +166,11 @@ pub async fn run(
         spawn_concurrency,
         spawn_write_concurrency,
         "root",
+        &skill_query,
+        false,
         events.map(Into::into),
         ctx,
+        mcp,
     )
     .await
 }
@@ -133,6 +182,7 @@ pub async fn run(
 pub async fn run_desktop(
     provider: &dyn Provider,
     session: &mut Session,
+    skill_query: &str,
     audit: Arc<Mutex<AuditLog>>,
     stop: &mut StopTracker,
     always_on: &crate::prompt::AlwaysOn,
@@ -143,7 +193,9 @@ pub async fn run_desktop(
     spawn_write_concurrency: usize,
     events: crate::desktop_events::DesktopEventSink,
     ctx: &mut ToolContext<'_>,
+    mcp: Option<&mut crate::mcp::runtime::RunRuntime>,
 ) -> Result<AgentOutcome, AgentError> {
+    session.memory_observation = None;
     let control = events.control();
     session.request_prompt = Some(always_on.clone());
     if let Some(reason) = control.failure() {
@@ -162,8 +214,11 @@ pub async fn run_desktop(
         spawn_concurrency,
         spawn_write_concurrency,
         "root",
+        skill_query,
+        true,
         Some(crate::desktop_events::EventSink::Bounded(events)),
         ctx,
+        mcp,
     );
     tokio::select! {
         biased;
@@ -185,6 +240,16 @@ pub(crate) fn check_event_delivery(
     Ok(())
 }
 
+fn real_user_query(session: &Session) -> String {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == polaris_provider::Role::User)
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
 /// The most directories one tool call may set `files.md` regeneration
 /// going for. Each target is a full serial subagent run — a provider round
 /// trip the model's tool result waits on — so an unbounded count is not a
@@ -194,6 +259,14 @@ pub(crate) fn check_event_delivery(
 /// while still bounding the pathological case; what exceeds it is dropped
 /// and said so in the audit log (see the call site).
 const MAX_REGENERATION_TARGETS_PER_CALL: usize = 32;
+
+/// Both halves of the `examples` ceiling. The token figure matches what a
+/// retrieved memory is allowed to weigh, since the two sit side by side in
+/// every request. The count is the half tokens cannot express: the
+/// evaluation path adds user/assistant pairs, and a large number of short
+/// pairs is as much a drift in what the request teaches as one long one.
+const MAX_EXAMPLES: usize = 20;
+const MAX_EXAMPLE_TOKENS: usize = 768;
 
 /// Trims `changes` so that at most `cap` directories can be regenerated
 /// from it, and reports how many entries were dropped.
@@ -394,18 +467,44 @@ pub(crate) async fn run_loop(
     spawn_concurrency: usize,
     spawn_write_concurrency: usize,
     caller: &str,
+    skill_query: &str,
+    skills_are_frozen: bool,
     events: Option<crate::desktop_events::EventSink>,
     ctx: &mut ToolContext<'_>,
+    mut mcp: Option<&mut crate::mcp::runtime::RunRuntime>,
 ) -> Result<AgentOutcome, AgentError> {
+    // A desktop runtime needs the owner's transcript and event control; a local
+    // runtime approves through `ctx` and records results in the session.
+    let mcp_control = match (mcp.as_deref(), &events) {
+        (None, _) => None,
+        (Some(runtime), _)
+            if runtime.is_local() && caller == "root" && session.desktop_transcript.is_none() =>
+        {
+            None
+        }
+        (Some(runtime), Some(crate::desktop_events::EventSink::Bounded(events)))
+            if !runtime.is_local() && caller == "root" && session.desktop_transcript.is_some() =>
+        {
+            Some(events.control())
+        }
+        _ => {
+            return Err(crate::mcp::runtime::Error::Owner(
+                crate::execution_owner::McpCallError::Invalid,
+            )
+            .into());
+        }
+    };
     // Resolve once at the real user boundary; tool continuations retain this
     // exact snapshot. The guard releases the turn on errors and cancellation.
     session.check_persistence()?;
-    let workflow_turn = session
+    let mut workflow_turn = session
         .workflow
         .as_ref()
         .filter(|workflow| workflow.config.enabled)
         .map(|workflow| {
-            if matches!(&events, Some(crate::desktop_events::EventSink::Bounded(_))) {
+            if skills_are_frozen
+                || matches!(&events, Some(crate::desktop_events::EventSink::Bounded(_)))
+            {
                 // The desktop owner supplies a frozen, validated skill snapshot.
                 // Never reopen host paths while running an isolated root or child.
                 workflow.begin_turn(skills)
@@ -415,11 +514,90 @@ pub(crate) async fn run_loop(
         })
         .transpose()
         .map_err(std::io::Error::other)?;
+    if let Some(turn) = &mut workflow_turn {
+        workflow_control::pending(session, turn).await?;
+        if !workflow_control::adaptive(session) {
+            turn.refresh_manual_profile(&session.workflow.as_ref().expect("workflow").gates)
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    let is_adaptive = workflow_control::adaptive(session);
+    let lookup_skills = workflow_turn
+        .as_ref()
+        .map(|turn| turn.skill_corpus())
+        .unwrap_or(skills);
+    let mut optional_skills = tools
+        .iter()
+        .any(|tool| tool.name == "skill")
+        .then(|| {
+            workflow_turn
+                .as_ref()
+                .map(|turn| turn.catalog_entries())
+                .unwrap_or_else(|| crate::workflow::skill_catalog_entries(skills))
+        })
+        .map(|entries| skill_catalog::Catalog::new(entries, skill_query.into()));
+    // Once per run, before the first request: the query does not change
+    // within a run, so asking the judge again each iteration would buy the
+    // same answer at the same cost.
+    if let (Some(catalog), Some(decider)) = (optional_skills.as_mut(), &session.decider) {
+        catalog
+            .narrow(
+                decider.as_ref(),
+                session.light_model.as_deref(),
+                std::future::pending(),
+            )
+            .await;
+    }
+    // `examples` rides on every request in the run and is the one part of
+    // it with no ceiling of its own: `Session.examples` is a public `Vec`
+    // with no configuration path, so a caller can assign anything. Refuse
+    // here, before a single request is assembled, rather than truncating —
+    // a half-sent set of examples teaches the model the wrong thing more
+    // quietly than a failure does. Nothing in the loop writes `examples`,
+    // so checking once covers the run.
+    if session.examples.len() > MAX_EXAMPLES {
+        return Err(std::io::Error::other(format!(
+            "examplesが{MAX_EXAMPLES}件を超えました（{}件）",
+            session.examples.len()
+        ))
+        .into());
+    }
+    let example_tokens = crate::compaction::session_tokens(&session.examples);
+    if example_tokens > MAX_EXAMPLE_TOKENS {
+        return Err(std::io::Error::other(format!(
+            "examplesが{MAX_EXAMPLE_TOKENS}tokensを超えました（{example_tokens}tokens）"
+        ))
+        .into());
+    }
+    let base_system = system;
+    let mut request_tools = tools.to_vec();
+    let mcp_setup = session.mcp_setup.clone().filter(|_| caller == "root");
+    if mcp_setup.is_some() {
+        request_tools.push(polaris_tools::mcp_setup_spec());
+    }
+    // The bundled setting commands, on the same root-only footing: a child
+    // run never gets to change the project's configuration.
+    let setting = session.setting.clone().filter(|_| caller == "root");
+    if setting.is_some() {
+        request_tools.push(polaris_tools::setting_spec());
+    }
+    // The state window is offered to any run with an owner port, so reading
+    // the current state does not depend on the workflow being enabled.
+    let state_tool = is_adaptive || session.desktop_workflow.is_some();
+    if state_tool {
+        request_tools.push(polaris_tools::state_spec());
+        crate::budget::validate_state_schema()?;
+    }
     let workflow_system = workflow_turn
         .as_ref()
         .map(|turn| format!("{system}\n{}", turn.body));
     let system = workflow_system.as_deref().unwrap_or(system);
     session.checkpoint()?;
+    if session.desktop_workflow.is_some()
+        && let Some(turn) = &workflow_turn
+    {
+        session.publish_workflow(&turn.state, None).await?;
+    }
     if let Some(turn) = &workflow_turn {
         audit.lock().await.record(&Record {
             tool: "workflow",
@@ -448,7 +626,23 @@ pub(crate) async fn run_loop(
         .as_ref()
         .map(|meter| meter.snapshot())
         .unwrap_or_default();
-    let historical_evidence = session.prepare_history().await?;
+    let historical_evidence = session.prepare_history().await;
+    if let Some(observation) = &session.memory_observation {
+        audit.lock().await.record(&Record {
+            tool: "conversation-memory",
+            detail: "preparation",
+            sandbox: None,
+            target: None,
+            result: &observation.audit_detail(),
+            caller,
+        })?;
+        if let Some(tx) = &events {
+            let _ = tx.send(crate::events::AgentEvent::MemoryPrepared(
+                observation.clone(),
+            ));
+        }
+    }
+    let historical_evidence = historical_evidence?;
     let strict_history = session.uses_strict_history()?;
     let child_workflow = session
         .workflow
@@ -465,11 +659,85 @@ pub(crate) async fn run_loop(
     let metered_provider = meter.wrap(provider);
     let provider: &dyn Provider = &metered_provider;
     let provider_pool: Arc<dyn Provider> = Arc::new(meter.wrap(provider_pool));
+    // The judge that chooses the tools also answers whether one of them is
+    // worth troubling the person about. One registration and one question
+    // shape for both: the gate asks the same "役に立つか" of a single
+    // operation that preselection asks of every candidate. It is consulted
+    // only where an approval question was already going to be asked, and it
+    // may only refuse.
+    if let Some(decider) = session.decider.clone() {
+        ctx.gate
+            .advise(crate::approval::Advisor::new(decider, skill_query));
+    }
+    if let Some(runtime) = mcp.as_deref_mut() {
+        let phase = session
+            .workflow
+            .as_ref()
+            .map(|workflow| workflow.state().phase.as_str())
+            .unwrap_or("");
+        if let Some(status) = runtime
+            .prepare_local_preselection(skill_query, phase, &meter)
+            .await
+        {
+            audit.lock().await.record(&Record {
+                tool: "mcp-preselection",
+                detail: status.as_str(),
+                sandbox: None,
+                target: None,
+                result: status.as_str(),
+                caller,
+            })?;
+        }
+    }
     // Every invocation owns its context. Child agents invoke run_loop
     // independently and cannot inherit transport state from their parent.
     let turn_context = polaris_provider::turn_affinity::TurnContext::new();
     loop {
         check_event_delivery(events.as_ref())?;
+        if is_adaptive && let Some(turn) = &workflow_turn {
+            workflow_control::pending(session, turn).await?;
+        }
+        let current_profile = if is_adaptive {
+            workflow_turn
+                .as_ref()
+                .map(|turn| turn.profile(&session.workflow.as_ref().expect("workflow").gates))
+                .transpose()
+                .map_err(std::io::Error::other)?
+        } else {
+            None
+        };
+        let request_system = if let Some(profile) = &current_profile {
+            format!("{base_system}\n{}", profile.body)
+        } else {
+            system.to_string()
+        };
+        let empty_injected = Vec::new();
+        let injected = current_profile
+            .as_ref()
+            .map(|profile| &profile.state.skills)
+            .or_else(|| workflow_turn.as_ref().map(|turn| &turn.state.skills))
+            .unwrap_or(&empty_injected);
+        let catalog = optional_skills
+            .as_mut()
+            .map(|catalog| catalog.project(injected));
+        let request_system = if let Some(catalog) = &catalog {
+            if catalog.text.is_empty() {
+                request_system
+            } else {
+                format!("{request_system}\n{}", catalog.text)
+            }
+        } else {
+            request_system
+        };
+        // M6-3c: instructions that arrived during the run join the
+        // conversation at this boundary, in arrival order, before the next
+        // request is built. The owner marks them as taken in the same save.
+        if let Some(owner) = session.desktop_workflow.clone() {
+            for text in owner.take_instructions().await.unwrap_or_default() {
+                session.push_user(&text);
+            }
+            session.check_persistence()?;
+        }
         // Call unconditionally every turn. If this were only called on
         // error, a call pattern that never triggers an error would never
         // trip MaxTurns, and the loop could run forever.
@@ -484,7 +752,13 @@ pub(crate) async fn run_loop(
         }
 
         if let Some(memory) = session.tool_memory.clone() {
-            let report = memory.retain(&mut session.messages).await;
+            let report = memory
+                .retain(
+                    &mut session.messages,
+                    session.decider.as_deref(),
+                    skill_query,
+                )
+                .await;
             if report.stored > 0 || report.failed > 0 {
                 audit.lock().await.record(&Record {
                     tool: "tool-memory",
@@ -500,7 +774,81 @@ pub(crate) async fn run_loop(
             }
         }
 
-        let total_tokens = crate::budget::always_on_tokens(system, tools)
+        // The request is finished here, before the decision that reads it,
+        // so that one value is both what gets counted and what gets sent.
+        // Counting a separate reconstruction is what let the two drift: the
+        // decision under-counted and an over-threshold request went out
+        // uncompacted.
+        //
+        // The root's system prompt is rebuilt from a fresh read of the
+        // project rules rather than reusing the one assembled before the
+        // turn, so the reread happens here too.
+        let refreshed_base = match &session.request_prompt {
+            Some(prompt) => Some(prompt.system_for_request()?),
+            None => None,
+        };
+        // The always-on floor is checked on its own, before the parts that
+        // carry their own budgets are added: the workflow profile, the
+        // skill catalogue and the selected MCP schemas each answer to their
+        // own ceiling, and folding them in here would report a breach of a
+        // budget none of them belongs to. What this catches is the bundled
+        // prompt and tool definitions growing past what they are allowed —
+        // a user's oversized rules are cut by `cap()` long before they
+        // reach this, so this is not the check for those.
+        // `system` has the workflow turn folded into it by this point, and
+        // `base_system` is the same string before that; the turn belongs to
+        // the workflow's budget, not this one.
+        let floor = crate::budget::always_on_tokens(
+            refreshed_base.as_deref().unwrap_or(base_system),
+            tools,
+        );
+        if floor > crate::budget::BUDGET_LIMIT {
+            return Err(std::io::Error::other(format!(
+                "常時contextが{}tokensを超えました（{floor}tokens）",
+                crate::budget::BUDGET_LIMIT
+            ))
+            .into());
+        }
+        let mut sending_system = match refreshed_base {
+            Some(mut refreshed) => {
+                if let Some(profile) = &current_profile {
+                    refreshed.push('\n');
+                    refreshed.push_str(&profile.body);
+                } else if let Some(turn) = &workflow_turn {
+                    refreshed.push('\n');
+                    refreshed.push_str(&turn.body);
+                }
+                if let Some(catalog) = &catalog
+                    && !catalog.text.is_empty()
+                {
+                    refreshed.push('\n');
+                    refreshed.push_str(&catalog.text);
+                }
+                refreshed
+            }
+            None => request_system,
+        };
+        // Resolving the preselection is what turns picks into schemas, so
+        // it happens before the decision rather than after it. `freeze`
+        // settles the selection for this iteration and must run once.
+        if let Some(runtime) = mcp.as_deref_mut() {
+            mcp_dispatch::refresh(runtime, mcp_control.as_ref()).await?;
+        }
+        let mcp_request = mcp.as_deref_mut().map(mcp_dispatch::prepare).transpose()?;
+        let mut sending_tools = request_tools.clone();
+        if let Some(prepared) = &mcp_request {
+            sending_tools.extend_from_slice(&prepared.tools);
+            if !prepared.metadata.is_empty() {
+                sending_system.push('\n');
+                sending_system.push_str(&prepared.metadata);
+            }
+        }
+        let total_tokens = crate::budget::always_on_tokens(&sending_system, &sending_tools)
+            + crate::compaction::session_tokens(&session.examples)
+            // The memory evidence is deliberately absent. It exists only
+            // under strict10/structured10, and compaction is disabled under
+            // exactly those modes, so whenever this decision runs the
+            // evidence is None. Counting it would be unreachable.
             + crate::compaction::session_tokens(&session.messages);
         if !strict_history
             && total_tokens
@@ -550,29 +898,55 @@ pub(crate) async fn run_loop(
             .transpose()
             .map_err(AgentError::Desktop)?
             .flatten();
+        // Built before the compaction decision and carried here unchanged.
+        // Anything appended past this point is weight the decision never
+        // saw.
         let request = CompletionRequest {
-            system: match &session.request_prompt {
-                Some(prompt) => {
-                    let mut refreshed = prompt.system_for_request()?;
-                    if let Some(turn) = &workflow_turn {
-                        refreshed.push('\n');
-                        refreshed.push_str(&turn.body);
-                    }
-                    refreshed
-                }
-                None => system.to_string(),
-            },
+            system: sending_system,
             messages: request_messages,
-            tools: tools.to_vec(),
+            tools: sending_tools,
         };
+        {
+            if let Some(catalog) = &catalog {
+                audit.lock().await.record(&Record {
+                    tool: "skill-catalog",
+                    detail: "automatic_optional",
+                    sandbox: None,
+                    target: None,
+                    result: &catalog.audit_result(),
+                    caller,
+                })?;
+            }
+            let counts = crate::budget::request_context_tokens(&request);
+            audit.lock().await.record(&Record {
+                tool: "workflow_context",
+                detail: "reference_tokens",
+                sandbox: None,
+                target: None,
+                result: &serde_json::to_string(&counts).map_err(std::io::Error::other)?,
+                caller,
+            })?;
+        }
+        if let Some(tx) = events.as_ref() {
+            let _ = tx.send(crate::events::AgentEvent::ModelRequestStarted {
+                turn: u64::from(stop.turns()),
+            });
+        }
         let res = match observer.as_ref() {
             Some(observer) => {
                 provider
                     .complete_in_turn_with_observer(request, &turn_context, Some(observer))
-                    .await?
+                    .await
             }
-            None => provider.complete_in_turn(request, &turn_context).await?,
+            None => provider.complete_in_turn(request, &turn_context).await,
         };
+        if let Some(tx) = events.as_ref() {
+            let _ = tx.send(crate::events::AgentEvent::ModelRequestFinished {
+                turn: u64::from(stop.turns()),
+                ok: res.is_ok(),
+            });
+        }
+        let res = res?;
 
         if res.tool_calls.is_empty() {
             let display_text = res.display_text();
@@ -614,7 +988,175 @@ pub(crate) async fn run_loop(
         session.check_persistence()?;
 
         let mut pending_changes = crate::dir_watch::DirChanges::default();
+        let transitions = res
+            .tool_calls
+            .iter()
+            .filter(|call| call.name == "state" && call.arguments["op"] == "transition")
+            .count();
+        let mut deferred_transition = None;
+        let mut siblings_ok = true;
         for call in &res.tool_calls {
+            if let Some(setup) = mcp_setup.as_ref()
+                && call.name == "mcp_setup"
+            {
+                check_event_delivery(events.as_ref())?;
+                mcp_dispatch::event(events.as_ref(), call, None);
+                let cancelled = async {
+                    match &events {
+                        Some(crate::desktop_events::EventSink::Bounded(events)) => {
+                            events.control().cancelled().await
+                        }
+                        _ => std::future::pending().await,
+                    }
+                };
+                let outcome = setup
+                    .call(&call.arguments, cancelled, ctx.gate, &mut *ctx.approver)
+                    .await;
+                let ok = outcome.is_ok();
+                let body = outcome.unwrap_or_else(|e| e);
+                session.push_tool_result(&call.id, &body);
+                session.check_persistence()?;
+                audit.lock().await.record(&Record {
+                    tool: &call.name,
+                    detail: &call.arguments.to_string(),
+                    sandbox: None,
+                    target: None,
+                    result: &body,
+                    caller,
+                })?;
+                mcp_dispatch::event(events.as_ref(), call, Some((&body, ok)));
+                siblings_ok &= ok;
+                if ok {
+                    stop.observe_success();
+                } else if let Some(reason) = stop.observe_error(&body) {
+                    return Err(AgentError::Stopped(reason));
+                }
+                continue;
+            }
+            if let Some(tool) = setting.as_ref()
+                && call.name == "setting"
+            {
+                check_event_delivery(events.as_ref())?;
+                mcp_dispatch::event(events.as_ref(), call, None);
+                let outcome = tool
+                    .call(&call.arguments, ctx.sandbox, ctx.gate, &mut *ctx.approver)
+                    .await;
+                let ok = outcome.is_ok();
+                let body = outcome.unwrap_or_else(|reason| reason);
+                session.push_tool_result(&call.id, &body);
+                session.check_persistence()?;
+                audit.lock().await.record(&Record {
+                    tool: &call.name,
+                    detail: &call.arguments.to_string(),
+                    sandbox: None,
+                    target: None,
+                    result: &body,
+                    caller,
+                })?;
+                mcp_dispatch::event(events.as_ref(), call, Some((&body, ok)));
+                siblings_ok &= ok;
+                if ok {
+                    stop.observe_success();
+                } else if let Some(reason) = stop.observe_error(&body) {
+                    return Err(AgentError::Stopped(reason));
+                }
+                continue;
+            }
+            if let Some(runtime) = mcp.as_deref_mut()
+                && call.name.starts_with("mcp_")
+            {
+                check_event_delivery(events.as_ref())?;
+                let generic_tool = call.name != "mcp_catalog";
+                if generic_tool
+                    && let Some(workflow) = &mut session.workflow
+                    && let Some(verification) = &mut workflow.gates.verification
+                {
+                    verification.stale = true;
+                }
+                mcp_dispatch::event(events.as_ref(), call, None);
+                check_event_delivery(events.as_ref())?;
+                let reply = mcp_dispatch::dispatch(
+                    runtime,
+                    mcp_request.as_ref().expect("MCP request"),
+                    call,
+                    session,
+                    mcp_control.as_ref(),
+                    ctx,
+                )
+                .await?;
+                let successful = reply.successful;
+                let continue_run = reply.continue_run;
+                let body = reply.message.content.clone();
+                // This is the Writer's exact canonical message for remote
+                // operations. It must enter both request view and full suffix.
+                session.push_message(reply.message, false);
+                session.check_persistence()?;
+                audit.lock().await.record(&Record {
+                    tool: &call.name,
+                    detail: &call.arguments.to_string(),
+                    sandbox: None,
+                    target: None,
+                    result: &body,
+                    caller,
+                })?;
+                mcp_dispatch::event(events.as_ref(), call, Some((&body, successful)));
+                siblings_ok &= successful;
+                if !continue_run {
+                    return Err(AgentError::McpUnconfirmed);
+                }
+                if successful {
+                    stop.observe_success();
+                } else if let Some(reason) = stop.observe_error(&body) {
+                    return Err(AgentError::Stopped(reason));
+                }
+                continue;
+            }
+            if state_tool && call.name == "state" {
+                workflow_control::event(events.as_ref(), call, None);
+                let outcome = match workflow_control::parse(call) {
+                    Ok(
+                        workflow_control::StateOperation::Get
+                        | workflow_control::StateOperation::Transition { .. },
+                    ) if !is_adaptive => Err(workflow_control::error(
+                        "unavailable",
+                        "この実行では段階操作を使えません",
+                    )),
+                    Ok(workflow_control::StateOperation::Get) => Ok(workflow_control::get(session)),
+                    Ok(workflow_control::StateOperation::Window { since }) => {
+                        workflow_control::window(session, since)
+                            .await
+                            .map_err(|e| workflow_control::error("unavailable", &e))
+                    }
+                    Ok(workflow_control::StateOperation::Transition {
+                        phase,
+                        expected_revision,
+                    }) if transitions == 1 => {
+                        deferred_transition = Some((call, phase, expected_revision));
+                        continue;
+                    }
+                    Ok(workflow_control::StateOperation::Transition { .. }) => {
+                        Err(workflow_control::error(
+                            "not_applied",
+                            "同一応答に複数の段階変更があります",
+                        ))
+                    }
+                    Err(e) => Err(workflow_control::error("invalid_arguments", &e)),
+                };
+                let ok = outcome.is_ok();
+                let result = outcome.unwrap_or_else(|e| e);
+                workflow_control::event(events.as_ref(), call, Some((&result, ok)));
+                session.push_tool_result(&call.id, &result);
+                session.check_persistence()?;
+                if ok {
+                    stop.observe_success();
+                } else {
+                    siblings_ok = false;
+                    if let Some(reason) = stop.observe_error(&result) {
+                        return Err(AgentError::Stopped(reason));
+                    }
+                }
+                continue;
+            }
             check_event_delivery(events.as_ref())?;
             // Read/bash (and spawn/skill) may consume the generated map.
             // Explicit map edits must also see the preceding regeneration.
@@ -656,6 +1198,7 @@ pub(crate) async fn run_loop(
                 dispatch_conversation_read(
                     session.persistence.as_ref(),
                     session.desktop_memory.as_deref(),
+                    session.strict_history.as_deref(),
                     call,
                     path,
                     events.as_ref(),
@@ -667,7 +1210,7 @@ pub(crate) async fn run_loop(
             } else {
                 dispatch(
                     call,
-                    skills,
+                    lookup_skills,
                     agent_types,
                     provider_pool.clone(),
                     audit.clone(),
@@ -675,10 +1218,14 @@ pub(crate) async fn run_loop(
                     spawn_write_concurrency,
                     events.clone(),
                     child_workflow.clone(),
+                    session.tier_decider.as_deref(),
+                    session.decider.as_deref(),
                     ctx,
                 )
                 .await
             };
+
+            siblings_ok &= outcome.is_ok();
 
             // `result` is exactly the body actually returned to the model
             // (on success) or the error text (on failure).
@@ -804,6 +1351,44 @@ pub(crate) async fn run_loop(
             ctx,
         )
         .await;
+        if let Some((call, phase, revision)) = deferred_transition {
+            check_event_delivery(events.as_ref())?;
+            let outcome = if siblings_ok {
+                workflow_control::apply(
+                    session,
+                    workflow_turn.as_ref().expect("adaptive turn"),
+                    phase,
+                    revision,
+                    call,
+                )
+                .await?
+            } else {
+                Err(workflow_control::error(
+                    "not_applied",
+                    "同じ応答のtoolが失敗したため段階を変更しません",
+                ))
+            };
+            let ok = outcome.is_ok();
+            let result = outcome.unwrap_or_else(|e| e);
+            if !ok {
+                session.push_tool_result(&call.id, &result);
+            }
+            session.check_persistence()?;
+            workflow_control::event(events.as_ref(), call, Some((&result, ok)));
+            audit.lock().await.record(&Record {
+                tool: "state",
+                detail: &call.arguments.to_string(),
+                sandbox: None,
+                target: None,
+                result: &result,
+                caller,
+            })?;
+            if ok {
+                stop.observe_success();
+            } else if let Some(reason) = stop.observe_error(&result) {
+                return Err(AgentError::Stopped(reason));
+            }
+        }
     }
 }
 
@@ -846,9 +1431,10 @@ fn include_summary_usage(
     main
 }
 
-async fn dispatch_conversation_read(
+pub(crate) async fn dispatch_conversation_read(
     saved: Option<&crate::session_store::PersistedSession>,
     desktop: Option<&crate::desktop_memory::DesktopMemory>,
+    history: Option<&crate::conversation_memory::StrictHistory>,
     call: &polaris_provider::ToolCall,
     path: &str,
     events: Option<&crate::desktop_events::EventSink>,
@@ -860,8 +1446,36 @@ async fn dispatch_conversation_read(
         });
     }
     check_event_delivery(events).map_err(|error| error.to_string())?;
-    let result = if let Some(desktop) = desktop {
+    let search = crate::conversation_memory::related::is_search_path(path);
+    let result = if search
+        && (path != crate::conversation_memory::related::SEARCH_URI
+            || call
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                != Some(path)
+            || call
+                .arguments
+                .as_object()
+                .is_none_or(|args| args.keys().any(|key| key != "path")))
+    {
+        Err("関連検索には予約URIだけを指定してください".into())
+    } else if let Some(desktop) = desktop {
         desktop.read(path).await.map_err(|error| error.to_string())
+    } else if search {
+        async {
+            let (Some(saved), Some(history)) = (saved, history) else {
+                return Err("この実行経路では関連検索が利用できません".into());
+            };
+            saved.snapshot().map_err(|error| error.to_string())?;
+            let result = history
+                .search_related(&saved.store, &saved.database)
+                .await
+                .map_err(|error| error.to_string())?;
+            saved.snapshot().map_err(|error| error.to_string())?;
+            Ok(result)
+        }
+        .await
     } else {
         saved
             .ok_or_else(|| "会話原文の永続保存が有効ではありません".to_string())
@@ -958,6 +1572,11 @@ async fn dispatch(
     spawn_write_concurrency: usize,
     events: Option<crate::desktop_events::EventSink>,
     workflow: Option<crate::spawn::ChildWorkflow>,
+    tier_decider: Option<&dyn crate::tier::TierDecider>,
+    // The run's judge, for the one thing the weight decider cannot answer:
+    // which subagent type the model meant when it named one that does not
+    // exist.
+    decider: Option<&dyn polaris_provider::decision::Decider>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<String, String> {
     if let Some(tx) = &events {
@@ -1176,7 +1795,7 @@ async fn dispatch(
                 Some(q) => q,
                 None => break 'skill Err("q is missing".to_string()),
             };
-            Ok(polaris_tools::skill::lookup(skills, q))
+            Ok(lookup_skill(skills, q))
         }
         "spawn" => 'spawn: {
             let tasks_json = match call.arguments["tasks"].as_array() {
@@ -1185,15 +1804,78 @@ async fn dispatch(
             };
             let mut tasks = Vec::with_capacity(tasks_json.len());
             for t in tasks_json {
-                let agent_type = match t["type"].as_str() {
-                    Some(a) => a.to_string(),
-                    None => break 'spawn Err("tasks[].type is missing".to_string()),
-                };
+                // **The type is optional.** Naming one costs the
+                // orchestrator a decision it is the most expensive party in
+                // the run to make: it has no catalogue in its context, so it
+                // either guesses a name or spends a round trip looking one
+                // up, and both the input and the output of that round trip
+                // are billed at the orchestrator's rate. The judge holds the
+                // catalogue for a rate that does not register — measured on
+                // 2026-09-18 at 0.04% of a run. So the ordinary path is to
+                // describe the work and let the judge match it to a type.
+                let named = t["type"].as_str();
                 let task = match t["task"].as_str() {
                     Some(task) => task.to_string(),
                     None => break 'spawn Err("tasks[].task is missing".to_string()),
                 };
                 let write_root = t["write_root"].as_str().map(str::to_string);
+                // A name the catalogue does have is taken as given: the
+                // orchestrator that bothered to name a real one has said
+                // something the judge should not overrule.
+                let recognised = named.filter(|name| {
+                    agent_types.iter().any(|held| &held.name == name)
+                });
+                let agent_type = match (recognised, decider) {
+                    (Some(name), _) => name.to_string(),
+                    // Either nothing was named, or what was named is not
+                    // real. Both are the same question: which of the types
+                    // this run actually offers does the work described?
+                    (None, Some(decider)) => {
+                        match crate::spawn::resolved_type(decider, agent_types, named, &task).await
+                        {
+                            Some(resolved) => {
+                                // Choosing silently would let the person
+                                // believe a type they never read is the one
+                                // that ran — and when a name *was* given,
+                                // that the one they read is the one that ran.
+                                let recorded = audit.lock().await.record(&Record {
+                                    tool: "spawn-type",
+                                    detail: named.unwrap_or("(型の指定なし)"),
+                                    sandbox: None,
+                                    target: None,
+                                    result: &resolved,
+                                    caller: "root",
+                                });
+                                if let Err(error) = recorded {
+                                    break 'spawn Err(error.to_string());
+                                }
+                                resolved
+                            }
+                            None => match named {
+                                Some(name) => name.to_string(),
+                                // No name, and the judge could not choose.
+                                // Inventing one here would run something
+                                // nobody asked for.
+                                None => break 'spawn Err(
+                                    "tasks[].type がなく、判定器も型を選べませんでした".to_string(),
+                                ),
+                            },
+                        }
+                    }
+                    // No judge. A name that is not in the catalogue is
+                    // passed through unchanged so the failure is reported
+                    // where it already is, by name; no name at all cannot be
+                    // resolved by anyone here.
+                    (None, None) => match named {
+                        Some(name) => name.to_string(),
+                        None => {
+                            break 'spawn Err(
+                                "tasks[].type がありません（判定器が無い場合は型名が要ります）"
+                                    .to_string(),
+                            );
+                        }
+                    },
+                };
                 tasks.push(crate::spawn::SpawnTask {
                     agent_type,
                     task,
@@ -1217,6 +1899,7 @@ async fn dispatch(
                 events.clone(),
                 workflow,
                 ctx.gate,
+                tier_decider,
             ))
             .await)
         }
@@ -1240,6 +1923,14 @@ async fn dispatch(
     }
 
     outcome
+}
+
+fn lookup_skill(skills: &[polaris_skills::Skill], query: &str) -> String {
+    let query = query.trim();
+    if skills.iter().filter(|skill| skill.name == query).count() > 1 {
+        return "同名のskillが複数あるため、本文を開示できません。".into();
+    }
+    polaris_tools::skill::lookup(skills, query)
 }
 
 /// CLIの隔離helper入口だけが呼ぶ。親のdispatchからは呼ばない。
@@ -1333,6 +2024,45 @@ async fn owned_mutation(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn related_search_dispatch_rejects_options_and_unsupported_owner_without_fallback() {
+        use crate::conversation_memory::related::SEARCH_URI;
+        let call = |arguments| polaris_provider::ToolCall {
+            id: "related-read".into(),
+            name: "read".into(),
+            arguments,
+        };
+        for arguments in [
+            serde_json::json!({"path": SEARCH_URI, "offset": 0}),
+            serde_json::json!({"path": SEARCH_URI, "limit": 1}),
+            serde_json::json!({"path": SEARCH_URI, "query": "different text"}),
+            serde_json::json!({"path": format!("{SEARCH_URI}?offset=1")}),
+        ] {
+            let path = arguments["path"].as_str().unwrap().to_owned();
+            let result =
+                super::dispatch_conversation_read(None, None, None, &call(arguments), &path, None)
+                    .await;
+            assert_eq!(
+                result.unwrap_err(),
+                "関連検索には予約URIだけを指定してください"
+            );
+        }
+        assert_eq!(
+            super::dispatch_conversation_read(
+                None,
+                None,
+                None,
+                &call(serde_json::json!({"path": SEARCH_URI})),
+                SEARCH_URI,
+                None
+            )
+            .await
+            .unwrap_err(),
+            "この実行経路では関連検索が利用できません"
+        );
+        assert!(crate::conversation_memory::parse_uri(SEARCH_URI).is_err());
+    }
+
     use super::*;
     use polaris_provider::{CompletionResponse, ToolCall};
     use std::sync::Mutex;
@@ -1449,6 +2179,8 @@ mod tests {
                 dummy_audit(&dir),
                 1,
                 1,
+                None,
+                None,
                 None,
                 None,
                 &mut ctx,
@@ -1795,6 +2527,356 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn adaptive_workflow_replaces_phase_context_and_preserves_durable_results() {
+        use crate::workflow::{Phase, SessionWorkflow, WorkflowMode};
+        struct Adaptive {
+            requests: Mutex<Vec<CompletionRequest>>,
+            storage: crate::session_store::PersistedSession,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Adaptive {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                let mut requests = self.requests.lock().unwrap();
+                let index = requests.len();
+                let state = self.storage.snapshot().unwrap().state;
+                assert_eq!(state.workflow.revision, index as u64);
+                let phase = [
+                    Phase::General,
+                    Phase::Implement,
+                    Phase::Verify,
+                    Phase::Deliver,
+                ][index];
+                assert_eq!(state.workflow.phase, phase);
+                assert!(req.system.contains(&format!("Workflow focus: {phase}")));
+                assert_eq!(
+                    req.system.matches("Required workflow instructions").count(),
+                    1
+                );
+                for other in Phase::ALL {
+                    let heading = format!("### builtin:{other}\n");
+                    assert_eq!(
+                        req.system.contains(&heading),
+                        other == phase && phase != Phase::General
+                    );
+                }
+                assert_eq!(req.tools.iter().filter(|s| s.name == "state").count(), 1);
+                if index > 0 {
+                    let last = req.messages.last().unwrap();
+                    assert_eq!(last.tool_call_id, Some(format!("transition-{index}")));
+                    let value: serde_json::Value = serde_json::from_str(&last.content).unwrap();
+                    assert_eq!(value["revision"], index);
+                    assert_eq!(value["status"], "applied");
+                }
+                let baseline = crate::prompt::assemble_always_on("", "", &[]);
+                let workflow_tokens = crate::budget::count_tokens(
+                    req.system.strip_prefix(baseline.system()).unwrap().trim(),
+                );
+                assert!(workflow_tokens <= crate::workflow::WORKFLOW_TOKEN_LIMIT);
+                for (transport, body, base_wire, control_wire) in [
+                    (
+                        "openai",
+                        polaris_provider::openai::build_body("fixture", &req, Some("medium")),
+                        polaris_provider::openai::tool_wire_shape(baseline.tools()),
+                        polaris_provider::openai::tool_wire_shape(&[polaris_tools::state_spec()]),
+                    ),
+                    (
+                        "codex",
+                        polaris_provider::codex::build_body("fixture", &req, Some("medium")),
+                        polaris_provider::codex::tool_wire_shape(baseline.tools()),
+                        polaris_provider::codex::tool_wire_shape(&[polaris_tools::state_spec()]),
+                    ),
+                ] {
+                    let baseline_tokens = crate::budget::count_tokens(baseline.system())
+                        + crate::budget::count_tokens(&serde_json::to_string(&base_wire).unwrap());
+                    let state_tokens =
+                        crate::budget::count_tokens(&serde_json::to_string(&control_wire).unwrap());
+                    assert!(baseline_tokens <= 990 && state_tokens <= 256);
+                    assert!(baseline_tokens + workflow_tokens + state_tokens <= 1630);
+                    let wire_tokens = crate::budget::count_tokens(&body.to_string());
+                    println!(
+                        "workflow_budget transport={transport} phase={phase} baseline={baseline_tokens} workflow={workflow_tokens} state={state_tokens} full_fixture_wire={wire_tokens}"
+                    );
+                    if let Some(previous) = requests.last() {
+                        assert_ne!(
+                            polaris_provider::cache_key("fixture", Some("medium"), previous),
+                            body["prompt_cache_key"].as_str().unwrap()
+                        );
+                    }
+                }
+                requests.push(req);
+                if index == 3 {
+                    return Ok(CompletionResponse {
+                        text: "done".into(),
+                        ..Default::default()
+                    });
+                }
+                Ok(CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: format!("transition-{}", index + 1),
+                        name: "state".into(),
+                        arguments: serde_json::json!({"op":"transition","phase":(["implement","verify","deliver"][index]),"expected_revision":index}),
+                    }],
+                    ..Default::default()
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default().workflow;
+        config.mode = WorkflowMode::Adaptive;
+        let mut session = Session::new();
+        session.workflow = Some(SessionWorkflow::new(config));
+        let storage = crate::session_store::PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite"),
+            "project",
+            crate::conversation_state::HistoryMode::Legacy,
+            session.workflow.as_ref(),
+        )
+        .unwrap();
+        session.persistence = Some(storage.clone());
+        session.push_user("complete the task");
+        let provider = Adaptive {
+            requests: Mutex::new(Vec::new()),
+            storage,
+        };
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let result = run(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(5),
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "done");
+        assert_eq!(provider.requests.lock().unwrap().len(), 4);
+        assert_eq!(
+            session.workflow.as_ref().unwrap().state().phase,
+            Phase::Deliver
+        );
+        assert_eq!(session.messages.len(), 8);
+        crate::budget::validate_state_schema().unwrap();
+    }
+
+    #[tokio::test]
+    async fn adaptive_workflow_rejects_stale_duplicate_and_failed_sibling_transitions() {
+        use crate::workflow::{Phase, SessionWorkflow, WorkflowMode};
+        let change = |id: &str, revision: u64| ToolCall {
+            id: id.into(),
+            name: "state".into(),
+            arguments: serde_json::json!({"op":"transition","phase":"verify","expected_revision":revision}),
+        };
+        let cases = vec![
+            vec![change("stale", 99)],
+            vec![change("first", 0), change("second", 0)],
+            vec![
+                change("change", 0),
+                ToolCall {
+                    id: "bad".into(),
+                    name: "unknown".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            vec![ToolCall {
+                id: "invalid-phase".into(),
+                name: "state".into(),
+                arguments: serde_json::json!({"op":"transition","phase":"unknown","expected_revision":0}),
+            }],
+            vec![ToolCall {
+                id: "grant".into(),
+                name: "state".into(),
+                arguments: serde_json::json!({"op":"transition","phase":"deliver","expected_revision":0,"spec_approval":true}),
+            }],
+        ];
+        for calls in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = crate::config::Config::default().workflow;
+            config.mode = WorkflowMode::Adaptive;
+            let mut session = Session::new();
+            session.workflow = Some(SessionWorkflow::new(config));
+            session.push_user("test");
+            let provider = Scripted {
+                replies: Mutex::new(vec![
+                    CompletionResponse {
+                        tool_calls: calls,
+                        ..Default::default()
+                    },
+                    CompletionResponse {
+                        text: "done".into(),
+                        ..Default::default()
+                    },
+                ]),
+            };
+            let always_on = crate::prompt::assemble_always_on("", "", &[]);
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            run(
+                &provider,
+                &mut session,
+                dummy_audit(&dir),
+                &mut StopTracker::new(4),
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                1,
+                1,
+                None,
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                session.workflow.as_ref().unwrap().state().phase,
+                Phase::General
+            );
+            assert_eq!(session.workflow.as_ref().unwrap().state().revision, 0);
+            let results: Vec<_> = session
+                .messages
+                .iter()
+                .filter(|m| m.role == polaris_provider::Role::Tool)
+                .collect();
+            assert!(!results.is_empty());
+            assert!(
+                results
+                    .iter()
+                    .all(|m| !m.content.contains("\"status\":\"applied\""))
+            );
+            crate::session::desktop_request_history(&session.messages).unwrap();
+        }
+    }
+
+    /// M6-1: the window is offered to a desktop run even with the workflow
+    /// off, and the phase operations stay unavailable there.
+    #[tokio::test]
+    async fn the_state_window_is_available_without_the_workflow_but_phase_operations_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        // The owner is dropped: a run whose owner is gone proceeds without
+        // instructions instead of waiting for an answer that cannot come.
+        let (port, _) = crate::desktop_workflow::DesktopWorkflow::pair(
+            polaris_desktop_protocol::request::RunTarget {
+                run_id: polaris_desktop_protocol::ids::RunId::new("r").unwrap(),
+                attempt_id: polaris_desktop_protocol::ids::AttemptId::new("a").unwrap(),
+            },
+        );
+        session.desktop_workflow = Some(port);
+        session.push_user("test");
+        let provider = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "focus".into(),
+                        name: "state".into(),
+                        arguments: serde_json::json!({"op":"get"}),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(4),
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        let result = session
+            .messages
+            .iter()
+            .find(|m| m.role == polaris_provider::Role::Tool)
+            .expect("the state tool was offered and dispatched");
+        assert!(result.content.contains("unavailable"), "{}", result.content);
+    }
+
+    /// The next event that is not a model request boundary.
+    fn next_event_now(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::events::AgentEvent>,
+    ) -> Option<crate::events::AgentEvent> {
+        loop {
+            match rx.try_recv().ok()? {
+                crate::events::AgentEvent::ModelRequestStarted { .. }
+                | crate::events::AgentEvent::ModelRequestFinished { .. } => continue,
+                other => return Some(other),
+            }
+        }
+    }
+
+    /// Nothing but the model request events arrived.
+    fn only_model_events(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::events::AgentEvent>,
+    ) -> bool {
+        loop {
+            match rx.try_recv() {
+                Ok(
+                    crate::events::AgentEvent::ModelRequestStarted { .. }
+                    | crate::events::AgentEvent::ModelRequestFinished { .. },
+                ) => continue,
+                Ok(_) => return false,
+                Err(_) => return true,
+            }
+        }
+    }
+
+    /// Model request start/end events surround every turn; a test that is
+    /// about tools skips them instead of asserting on their position.
+    async fn next_event(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::events::AgentEvent>,
+    ) -> Option<crate::events::AgentEvent> {
+        loop {
+            match rx.recv().await? {
+                crate::events::AgentEvent::ModelRequestStarted { .. }
+                | crate::events::AgentEvent::ModelRequestFinished { .. } => continue,
+                other => return Some(other),
+            }
+        }
+    }
+
     /// A provider that calls a tool the 1st time and returns body text the 2nd time.
     struct Scripted {
         replies: Mutex<Vec<CompletionResponse>>,
@@ -1843,7 +2925,10 @@ mod tests {
                 }
                 assert_eq!(
                     requests.last().unwrap().messages.last().unwrap().content,
-                    polaris_tools::skill::lookup::<polaris_skills::Skill>(&[], "")
+                    polaris_tools::skill::lookup(
+                        &polaris_skills::workflow_profile::recommended_bindings(),
+                        "",
+                    )
                 );
                 Ok(CompletionResponse {
                     text: "done".into(),
@@ -1979,6 +3064,743 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn automatic_skill_catalog_is_metadata_only_and_stable_across_tool_continuation() {
+        struct Capture {
+            requests: Mutex<Vec<CompletionRequest>>,
+            replies: Mutex<Vec<CompletionResponse>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(self.replies.lock().unwrap().remove(0))
+            }
+        }
+
+        let provider = Capture {
+            requests: Mutex::new(Vec::new()),
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "read-catalog-entry".into(),
+                        name: "skill".into(),
+                        arguments: serde_json::json!({"q":"deploy-guide"}),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let skill = polaris_skills::Skill {
+            name: "deploy-guide".into(),
+            description: "Deploys the service safely.".into(),
+            body: "BODY MUST ONLY ARRIVE THROUGH THE SKILL TOOL".into(),
+            path: "/fixture/deploy-guide/SKILL.md".into(),
+        };
+        let mut session = Session::new();
+        session.push_user("deploy the service");
+        session.workflow = Some(crate::workflow::SessionWorkflow::new(
+            crate::workflow::WorkflowConfig {
+                enabled: true,
+                always: vec!["builtin:workflow-core".into()],
+                ..Default::default()
+            },
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(3),
+            &always_on,
+            &[skill],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request.system.contains("## Optional skill catalog"));
+            assert!(request.system.contains("deploy-guide"));
+            assert!(request.system.contains("Deploys the service safely."));
+            assert!(
+                !request
+                    .system
+                    .contains("BODY MUST ONLY ARRIVE THROUGH THE SKILL TOOL")
+            );
+            assert_eq!(
+                request.system.matches("## Optional skill catalog").count(),
+                1
+            );
+        }
+        assert!(requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .contains("BODY MUST ONLY ARRIVE THROUGH THE SKILL TOOL")
+        }));
+    }
+
+    #[tokio::test]
+    async fn root_mcp_setup_lists_candidates_without_values_outside_mcp_dispatch() {
+        struct Capture {
+            requests: Mutex<Vec<CompletionRequest>>,
+            replies: Mutex<Vec<CompletionResponse>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(self.replies.lock().unwrap().remove(0))
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "[mcp_servers.docs]\nurl = \"https://docs.example.com/mcp\"\nhttp_headers = { authorization = \"Bearer synthetic-token\" }\n",
+        )
+        .unwrap();
+        let target = polaris_desktop_protocol::request::RunTarget {
+            run_id: polaris_desktop_protocol::ids::RunId::new("setup-run").unwrap(),
+            attempt_id: polaris_desktop_protocol::ids::AttemptId::new("attempt").unwrap(),
+        };
+        let mut owner = crate::execution_owner::RunExecution::new(
+            &target,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let port = owner
+            .configure_registration(&target, crate::mcp::operation::ExternalCeiling::Denied)
+            .unwrap();
+        let provider = Capture {
+            requests: Mutex::new(Vec::new()),
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "setup".into(),
+                        name: "mcp_setup".into(),
+                        arguments: serde_json::json!({"op":"detect"}),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut session = Session::new();
+        session.push_user("use my docs server");
+        session.mcp_setup = Some(Arc::new(crate::mcp::setup::SetupTool::new(
+            home.clone(),
+            vec![],
+            vec![],
+            crate::isolated_workspace::Limits {
+                max_entries: 8,
+                max_files: 4,
+                max_file_bytes: 1024,
+                max_total_bytes: 4096,
+                max_depth: 2,
+            },
+            "project".into(),
+            crate::mcp::setup::Authorization::Owner(port),
+        )));
+        let dir = tempfile::tempdir().unwrap();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(3),
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp_setup")
+        );
+        let result = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("setup"))
+            .unwrap();
+        assert!(result.content.contains(r#""name":"docs""#));
+        assert!(!result.content.contains("synthetic-token"));
+        assert!(!result.content.contains("docs.example.com"));
+    }
+
+    #[tokio::test]
+    async fn the_setting_tool_is_offered_to_the_root_and_answers_without_a_shell() {
+        struct Capture {
+            requests: Mutex<Vec<CompletionRequest>>,
+            replies: Mutex<Vec<CompletionResponse>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(self.replies.lock().unwrap().remove(0))
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"demo"}"#).unwrap();
+        let provider = Capture {
+            requests: Mutex::new(Vec::new()),
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "setting".into(),
+                        name: "setting".into(),
+                        arguments: serde_json::json!({"op":"plan"}),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut session = Session::new();
+        session.push_user("set this project up");
+        session.setting = Some(Arc::new(crate::recipe::tool::SettingTool::new(
+            root.clone(),
+        )));
+        let dir = tempfile::tempdir().unwrap();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(3),
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        let offered = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "setting")
+            .expect("the root is offered the setting tool");
+        // The model names an operation. There is nowhere to put a command,
+        // a path or a package name.
+        let properties = &offered.parameters["properties"];
+        assert_eq!(
+            properties
+                .as_object()
+                .expect("properties")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["op"]
+        );
+        assert_eq!(offered.parameters["additionalProperties"], false);
+
+        let result = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("setting"))
+            .expect("the answer");
+        let answer: serde_json::Value =
+            serde_json::from_str(&result.content).expect("the tool answers with JSON");
+        assert_eq!(answer["nextjs"]["applicable"], true);
+        assert_eq!(answer["nextjs"]["install_requires_person"], true);
+        // Planning changed nothing in the project.
+        assert!(!root.join("node_modules").exists());
+        assert!(!root.join("next.config.mjs").exists());
+    }
+
+    #[tokio::test]
+    async fn a_child_run_is_never_offered_the_setting_tool() {
+        struct Once(Mutex<Vec<CompletionRequest>>);
+        #[async_trait::async_trait]
+        impl Provider for Once {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.0.lock().unwrap().push(request);
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let provider = Once(Mutex::new(Vec::new()));
+        let mut session = Session::new();
+        session.push_user("do something");
+        session.setting = Some(Arc::new(crate::recipe::tool::SettingTool::new(root)));
+        let dir = tempfile::tempdir().unwrap();
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run_loop(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(3),
+            "BASE_SYSTEM",
+            &polaris_tools::all_specs(),
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            "child",
+            "",
+            false,
+            None,
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !provider.0.lock().unwrap()[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "setting"),
+            "a child run must not be able to change the project's configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_mcp_calls_are_approved_in_the_loop_and_answered_with_the_canonical_result() {
+        use polaris_mcp::catalog::{ItemId, Kind};
+        struct Capture {
+            requests: Mutex<Vec<CompletionRequest>>,
+            replies: Mutex<Vec<CompletionResponse>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(self.replies.lock().unwrap().remove(0))
+            }
+        }
+        let (server, methods, fixture) =
+            crate::mcp::runtime::test_fixture::server_fixture("").await;
+        let config = crate::mcp::runtime::RuntimeConfig::new(
+            polaris_mcp::registration::Registry {
+                schema_version: 1,
+                revision: 1,
+                servers: vec![server],
+            },
+            "project".into(),
+            Arc::new(polaris_mcp::store::Secrets::new(1, Default::default()).unwrap()),
+            Default::default(),
+        )
+        .unwrap();
+        let mut runtime = crate::mcp::runtime::RunRuntime::new(
+            config,
+            crate::execution_owner::McpPort::local(
+                "local-session",
+                "run-1",
+                "1",
+                crate::mcp::operation::ExternalCeiling::Allowed,
+            ),
+        )
+        .unwrap();
+        runtime
+            .ensure_catalog("fixture", std::future::pending())
+            .await
+            .unwrap();
+        let item = ItemId {
+            server_id: "fixture".into(),
+            kind: Kind::Tool,
+            key: "fixture".into(),
+        };
+        let found = runtime
+            .candidates("fixture", Some("fixture"), "implement")
+            .unwrap();
+        runtime.select(&item, &found[0].generation).unwrap();
+        let alias = polaris_mcp::catalog::tool_alias(&item).unwrap();
+        let provider = Capture {
+            requests: Mutex::new(Vec::new()),
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "mcp-call".into(),
+                        name: alias.clone(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut session = Session::new();
+        session.push_user("use the fixture tool");
+        let dir = tempfile::tempdir().unwrap();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, _, mut approver) = dummy_tool_parts();
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run_with_mcp(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(3),
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+            Some(&mut runtime),
+        )
+        .await
+        .unwrap();
+        {
+            let requests = provider.requests.lock().unwrap();
+            assert!(requests[0].tools.iter().any(|tool| tool.name == alias));
+            let result = requests[1]
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("mcp-call"))
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+            assert_eq!(envelope["disposition"], "completed");
+            assert_eq!(
+                methods
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| *m == "tools/call")
+                    .count(),
+                1
+            );
+        }
+        let repeated = ToolCall {
+            id: "repeated".into(),
+            name: alias.clone(),
+            arguments: serde_json::json!({}),
+        };
+        *provider.replies.lock().unwrap() = vec![CompletionResponse {
+            tool_calls: vec![repeated.clone(), repeated],
+            ..Default::default()
+        }];
+        let mut session = Session::new();
+        session.push_user("call it twice");
+        let result = run_with_mcp(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(3),
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+            Some(&mut runtime),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AgentError::Mcp(crate::mcp::runtime::Error::Owner(
+                crate::execution_owner::McpCallError::Invalid
+            )))
+        ));
+        assert_eq!(approver.asked, 1, "a repeated call id stops before asking");
+        runtime.shutdown().await.unwrap();
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn automatic_skill_catalog_does_not_require_workflow() {
+        struct Capture(Mutex<Option<CompletionRequest>>);
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                *self.0.lock().unwrap() = Some(request);
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        let provider = Capture(Mutex::new(None));
+        let skill = polaris_skills::Skill {
+            name: "deploy-guide".into(),
+            description: "Deploys the service safely.".into(),
+            body: "not automatic".into(),
+            path: "/fixture/deploy-guide/SKILL.md".into(),
+        };
+        let mut session = Session::new();
+        session.push_user("deploy the service");
+        let dir = tempfile::tempdir().unwrap();
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(2),
+            &always_on,
+            &[skill],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        let request = provider.0.lock().unwrap().take().unwrap();
+        assert!(request.system.contains("## Optional skill catalog"));
+        assert!(request.system.contains("deploy-guide"));
+        assert!(!request.system.contains("not automatic"));
+    }
+
+    #[tokio::test]
+    async fn empty_catalog_keeps_the_base_system_and_is_audited() {
+        struct Capture(Mutex<Option<CompletionRequest>>);
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                *self.0.lock().unwrap() = Some(request);
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        let provider = Capture(Mutex::new(None));
+        let skill = polaris_skills::Skill {
+            name: "deploy-guide".into(),
+            description: "Deploys the service safely.".into(),
+            body: "not automatic".into(),
+            path: "/fixture/deploy-guide/SKILL.md".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let audit = shared_audit(&audit_path);
+        let mut session = Session::new();
+        session.push_user("unrelated request");
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run_loop(
+            &provider,
+            &mut session,
+            audit,
+            &mut StopTracker::new(2),
+            "BASE_SYSTEM",
+            &polaris_tools::all_specs(),
+            &[skill],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            "root",
+            "unrelated request",
+            false,
+            None,
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider.0.lock().unwrap().as_ref().unwrap().system,
+            "BASE_SYSTEM"
+        );
+        let audit = std::fs::read_to_string(audit_path).unwrap();
+        assert!(audit.contains("\"tool\":\"skill-catalog\""));
+        assert!(audit.contains("count=0"));
+        assert!(audit.contains("revision="));
+        assert!(audit.contains("tokens=0"));
+    }
+
+    #[tokio::test]
+    async fn all_injected_catalog_is_audited_without_prompt_metadata() {
+        struct Capture;
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                assert!(!request.system.contains("## Optional skill catalog"));
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        let skill = polaris_skills::Skill {
+            name: "deploy-guide".into(),
+            description: "Deploys the service safely.".into(),
+            body: "required body".into(),
+            path: "/fixture/deploy-guide/SKILL.md".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let mut session = Session::new();
+        session.push_user("deploy the service");
+        session.workflow = Some(crate::workflow::SessionWorkflow::new(
+            crate::workflow::WorkflowConfig {
+                enabled: true,
+                always: vec!["user:deploy-guide".into()],
+                ..Default::default()
+            },
+        ));
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        run_loop(
+            &Capture,
+            &mut session,
+            shared_audit(&audit_path),
+            &mut StopTracker::new(2),
+            "BASE_SYSTEM",
+            &polaris_tools::all_specs(),
+            &[skill],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            "root",
+            "deploy the service",
+            true,
+            None,
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap();
+        let audit = std::fs::read_to_string(audit_path).unwrap();
+        assert!(audit.contains("\"tool\":\"skill-catalog\""));
+        assert!(audit.contains("count=0"));
+        assert!(audit.contains("excluded=1"));
+    }
+
+    #[test]
+    fn explicit_lookup_rejects_a_visible_name_with_multiple_frozen_bodies() {
+        let skills = vec![
+            polaris_skills::Skill {
+                name: "workflow-core".into(),
+                description: "Builtin.".into(),
+                body: "builtin body".into(),
+                path: "builtin:workflow-core".into(),
+            },
+            polaris_skills::Skill {
+                name: "workflow-core".into(),
+                description: "User.".into(),
+                body: "user body".into(),
+                path: "/fixture/workflow-core/SKILL.md".into(),
+            },
+        ];
+        let result = lookup_skill(&skills, "workflow-core");
+        assert!(result.contains("複数"));
+        assert!(!result.contains("builtin body"));
+        assert!(!result.contains("user body"));
+    }
+
     struct TurnOnlyProvider {
         turn_calls: std::sync::atomic::AtomicUsize,
     }
@@ -2041,9 +3863,11 @@ mod tests {
             gate: &mut gate,
             approver: &mut approver,
         };
+        let desktop_query = real_user_query(&session);
         let result = run_desktop(
             &Streaming,
             &mut session,
+            &desktop_query,
             dummy_audit(&dir),
             &mut stop,
             &always_on,
@@ -2054,6 +3878,7 @@ mod tests {
             1,
             sink,
             &mut ctx,
+            None,
         )
         .await
         .unwrap();
@@ -2062,9 +3887,18 @@ mod tests {
         assert_eq!(result.usage_report.reported_responses, 1);
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[1].content, "authoritative");
-        assert!(matches!(receiver.try_recv().unwrap().event,
-            crate::events::AgentEvent::TextDelta { request_id: 1, text, .. } if text == "provisional"));
-        assert!(receiver.try_recv().is_err());
+        let mut envelopes = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|envelope| envelope.event)
+            .filter(|event| {
+                !matches!(
+                    event,
+                    crate::events::AgentEvent::ModelRequestStarted { .. }
+                        | crate::events::AgentEvent::ModelRequestFinished { .. }
+                )
+            });
+        assert!(matches!(envelopes.next(),
+            Some(crate::events::AgentEvent::TextDelta { request_id: 1, text, .. }) if text == "provisional"));
+        assert!(envelopes.next().is_none());
     }
 
     #[tokio::test]
@@ -2109,9 +3943,11 @@ mod tests {
             gate: &mut gate,
             approver: &mut approver,
         };
+        let desktop_query = real_user_query(&session);
         let outcome = run_desktop(
             &provider,
             &mut session,
+            &desktop_query,
             dummy_audit(&dir),
             &mut stop,
             &always_on,
@@ -2122,6 +3958,7 @@ mod tests {
             1,
             sink,
             &mut ctx,
+            None,
         )
         .await
         .unwrap();
@@ -2163,6 +4000,8 @@ mod tests {
             1,
             1,
             Some(sink.into()),
+            None,
+            None,
             None,
             &mut ctx,
         );
@@ -2254,6 +4093,8 @@ mod tests {
                 1,
                 1,
                 Some(sink.with_execution(port).unwrap().into()),
+                None,
+                None,
                 None,
                 &mut ctx,
             );
@@ -2363,6 +4204,8 @@ mod tests {
                 1,
                 Some(sink.with_execution(port).unwrap().into()),
                 None,
+                None,
+                None,
                 &mut ctx,
             );
             let owner = async {
@@ -2427,6 +4270,8 @@ mod tests {
             1,
             Some(sink),
             None,
+            None,
+            None,
             &mut ctx,
         );
         let controller = async {
@@ -2485,6 +4330,8 @@ mod tests {
             1,
             Some(sink),
             None,
+            None,
+            None,
             &mut ToolContext {
                 sandbox: &sandbox,
                 helper: Path::new("/bin/false"),
@@ -2527,9 +4374,11 @@ mod tests {
         let (sink, receiver, _) = crate::desktop_events::DesktopEventSink::channel(
             polaris_desktop_protocol::ids::RunId::new("cancel-provider").unwrap(),
         );
+        let desktop_query = real_user_query(&session);
         let run = run_desktop(
             &provider,
             &mut session,
+            &desktop_query,
             dummy_audit(&dir),
             &mut stop,
             &always_on,
@@ -2540,6 +4389,7 @@ mod tests {
             1,
             sink,
             &mut ctx,
+            None,
         );
         let disconnect = async {
             provider.0.notified().await;
@@ -2587,9 +4437,11 @@ mod tests {
             polaris_desktop_protocol::ids::RunId::new("pre-cancel").unwrap(),
         );
         control.cancel();
+        let desktop_query = real_user_query(&session);
         let result = run_desktop(
             &provider,
             &mut session,
+            &desktop_query,
             dummy_audit(&dir),
             &mut stop,
             &always_on,
@@ -2600,6 +4452,7 @@ mod tests {
             1,
             sink,
             &mut ctx,
+            None,
         )
         .await;
         assert!(matches!(
@@ -2612,9 +4465,11 @@ mod tests {
         let (sink, _receiver, _) = crate::desktop_events::DesktopEventSink::channel(
             polaris_desktop_protocol::ids::RunId::new("normal").unwrap(),
         );
+        let desktop_query = real_user_query(&session);
         let result = run_desktop(
             &provider,
             &mut session,
+            &desktop_query,
             dummy_audit(&dir),
             &mut stop,
             &always_on,
@@ -2625,6 +4480,7 @@ mod tests {
             1,
             sink,
             &mut ctx,
+            None,
         )
         .await
         .unwrap();
@@ -2800,6 +4656,7 @@ mod tests {
                 &self,
                 request: CompletionRequest,
             ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                assert!(request.tools.iter().all(|tool| tool.name != "state"));
                 self.0.lock().unwrap().push(request.system);
                 Ok(CompletionResponse {
                     hosted_web_search: Vec::new(),
@@ -2812,16 +4669,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let always_on = crate::prompt::assemble_always_on("", "", &[]);
         let provider = Capture(Mutex::new(Vec::new()));
-        for (enabled, reference, expected_ok) in [
-            (false, "user:missing", true),
-            (true, "builtin:workflow-core", true),
-            (true, "user:missing", false),
+        for (enabled, mode, reference, expected_ok) in [
+            (
+                false,
+                crate::workflow::WorkflowMode::Adaptive,
+                "user:missing",
+                true,
+            ),
+            (
+                true,
+                crate::workflow::WorkflowMode::Manual,
+                "builtin:workflow-core",
+                true,
+            ),
+            (
+                true,
+                crate::workflow::WorkflowMode::Manual,
+                "user:missing",
+                false,
+            ),
         ] {
             let mut session = Session::new();
             session.workflow = Some(
                 SessionWorkflow::restore(
                     WorkflowConfig {
                         enabled,
+                        mode,
                         always: vec![reference.into()],
                         ..Default::default()
                     },
@@ -3009,6 +4882,8 @@ mod tests {
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             None,
             None,
+            None,
+            None,
             &mut ctx,
         )
         .await
@@ -3050,6 +4925,8 @@ mod tests {
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             None,
             None,
+            None,
+            None,
             &mut ctx,
         )
         .await
@@ -3088,6 +4965,8 @@ mod tests {
             dummy_audit(&dir),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
+            None,
             None,
             None,
             &mut ctx,
@@ -4115,6 +5994,8 @@ print("wrote")
                     1,
                     Some(tx.into()),
                     None,
+                    None,
+                    None,
                     &mut ToolContext {
                         sandbox: &sandbox,
                         helper: Path::new("/bin/true"),
@@ -4238,7 +6119,7 @@ print("wrote")
                     path: root.clone(),
                     allowed_tools: vec!["bash".into()],
                     access: polaris_skills::AgentAccess::ReadWrite,
-                    tier: "low".into(),
+                    tier: polaris_skills::Tier::Dwarf,
                     wall_seconds: 30,
                     max_turns: 10,
                     workflow_phase: None,
@@ -4288,6 +6169,8 @@ print("wrote")
                     dummy_audit(&dir),
                     1,
                     1,
+                    None,
+                    None,
                     None,
                     None,
                     &mut ToolContext {
@@ -4818,15 +6701,277 @@ print("wrote")
                     serde_json::to_value(&session.messages[..4]).unwrap(),
                     original
                 );
-                assert!(rx.try_recv().is_err());
+                assert!(only_model_events(&mut rx));
             } else {
                 assert_eq!(session.messages.len(), 4);
                 assert!(matches!(
-                    rx.try_recv().unwrap(),
-                    crate::events::AgentEvent::HistoryCompacted { .. }
+                    next_event_now(&mut rx),
+                    Some(crate::events::AgentEvent::HistoryCompacted { .. })
                 ));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_compaction_decision_counts_what_the_request_will_actually_carry() {
+        // `examples` rides on every request but used to sit outside the
+        // tally, so a session could cross the threshold on them and still
+        // send uncompacted. The error only ever went one way: the decision
+        // under-counted what it was about to send.
+        //
+        // Compaction can only shrink `session.messages`, so the history
+        // here is large enough to be worth summarizing while staying under
+        // the threshold on its own. The examples are what carry it over.
+        struct Capture {
+            requests: Mutex<Vec<CompletionRequest>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(CompletionResponse {
+                    text: "reply".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        let dir = tempfile::tempdir().expect("temp directory");
+        let body = "x".repeat(crate::compaction::MIN_TOKENS_TO_SUMMARIZE * 40);
+        let history = |session: &mut Session| {
+            session.push_user("turn 1");
+            session.push_assistant(&body, vec![]);
+            session.push_user("turn 2");
+            session.push_assistant("reply 2", vec![]);
+            session.push_user("turn 3");
+            // Well inside the ceiling W-2 puts on `examples`, so what this
+            // test proves stays reachable in production.
+            session.examples = vec![polaris_provider::Message::user("y".repeat(2_400))];
+        };
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+
+        // First run: measure what the request actually carries, rather than
+        // rebuilding the tally here and calibrating against a guess.
+        let mut measured = Session::new();
+        history(&mut measured);
+        measured.compaction_threshold = Some(usize::MAX);
+        let probe = Capture {
+            requests: Mutex::new(Vec::new()),
+        };
+        {
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            run(
+                &probe,
+                &mut measured,
+                shared_audit(&dir.path().join("probe.jsonl")),
+                &mut StopTracker::new(10),
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                None,
+                &mut ctx,
+            )
+            .await
+            .expect("the probe run succeeds");
+        }
+        let sent = probe.requests.lock().unwrap().remove(0);
+
+        let mut session = Session::new();
+        history(&mut session);
+        let examples = crate::compaction::session_tokens(&session.examples);
+        let without_examples = crate::budget::always_on_tokens(&sent.system, &sent.tools)
+            + crate::compaction::session_tokens(&session.messages);
+        assert!(
+            examples > 0 && examples <= MAX_EXAMPLE_TOKENS,
+            "the examples must weigh something, within the ceiling"
+        );
+        // Reached only once the examples are counted, and not before.
+        session.compaction_threshold = Some(without_examples + examples);
+
+        let p = Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    text: "summary".into(),
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: "final reply".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let audit = shared_audit(&dir.path().join("audit.jsonl"));
+        let mut stop = StopTracker::new(10);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let outcome = run(
+            &p,
+            &mut session,
+            audit.clone(),
+            &mut stop,
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            Some(events_tx),
+            &mut ctx,
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(
+            outcome.text, "final reply",
+            "the first scripted reply is the summary, so the turn compacted"
+        );
+        assert!(
+            events_rx.try_recv().is_ok_and(|held| matches!(
+                held,
+                crate::events::AgentEvent::HistoryCompacted { .. }
+            )),
+            "counting the examples is what brings the total over the threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn examples_past_either_half_of_the_ceiling_stop_before_a_request_is_built() {
+        struct Never;
+        #[async_trait::async_trait]
+        impl Provider for Never {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                panic!("the run must refuse before it reaches the provider");
+            }
+        }
+        let dir = tempfile::tempdir().expect("temp directory");
+        let always_on = crate::prompt::assemble_always_on("", "", &[]);
+        // Short enough that the pairs stay well inside the token half, so
+        // the count is what refuses them; and one long message that stays
+        // inside the count, so the tokens are what refuses that.
+        for (examples, reason) in [
+            (
+                vec![polaris_provider::Message::user("ex"); MAX_EXAMPLES + 1],
+                "件",
+            ),
+            (
+                vec![polaris_provider::Message::user("y".repeat(4_000))],
+                "tokens",
+            ),
+        ] {
+            let mut session = Session::new();
+            session.push_user("何かする");
+            session.examples = examples;
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            let failure = run(
+                &Never,
+                &mut session,
+                shared_audit(&dir.path().join("audit.jsonl")),
+                &mut StopTracker::new(10),
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                None,
+                &mut ctx,
+            )
+            .await
+            .expect_err("oversized examples are refused");
+            assert!(
+                matches!(&failure, AgentError::Io(error) if error.to_string().contains(reason)),
+                "{failure}"
+            );
+            assert_eq!(
+                session.messages.len(),
+                1,
+                "refusing leaves the session as it was, with nothing truncated"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_always_on_floor_past_its_budget_stops_before_sending() {
+        struct Never;
+        #[async_trait::async_trait]
+        impl Provider for Never {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                panic!("the run must refuse before it reaches the provider");
+            }
+        }
+        let dir = tempfile::tempdir().expect("temp directory");
+        // A tool definition that grew past what the always-on set is
+        // allowed. This is the breach D-03 is for: bundled definitions,
+        // not a user's rules, which `cap()` cuts long before here.
+        let bloated = vec![polaris_tools::ToolSpec {
+            name: "bloated".into(),
+            description: "d".repeat(crate::budget::BUDGET_LIMIT * 8),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let mut session = Session::new();
+        session.push_user("何かする");
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let failure = run_loop(
+            &Never,
+            &mut session,
+            shared_audit(&dir.path().join("audit.jsonl")),
+            &mut StopTracker::new(10),
+            "system prompt",
+            &bloated,
+            &[],
+            &[],
+            unused_provider_pool(),
+            crate::spawn::DEFAULT_CONCURRENCY,
+            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            "root",
+            "",
+            false,
+            None,
+            &mut ctx,
+            None,
+        )
+        .await
+        .expect_err("an always-on set past its budget is refused");
+        assert!(
+            matches!(&failure, AgentError::Io(error)
+                if error.to_string().contains(&crate::budget::BUDGET_LIMIT.to_string())),
+            "{failure}"
+        );
     }
 
     #[tokio::test]
@@ -4980,7 +7125,7 @@ print("wrote")
         assert_eq!(session.messages[0].content, "turn 1");
 
         assert!(
-            events_rx.try_recv().is_err(),
+            only_model_events(&mut events_rx),
             "no HistoryCompacted event should have been sent for a failed compaction"
         );
     }
@@ -5025,8 +7170,11 @@ print("wrote")
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             "root",
+            "hi",
+            false,
             None,
             &mut ctx,
+            None,
         )
         .await
         .unwrap();
@@ -5207,9 +7355,8 @@ print("wrote")
     /// The scripted turns of one `files-md-writer` run: a `read` of
     /// `reads`, then output matching its schema. The `read` is what makes
     /// the run observable — a subagent that returns text and touches
-    /// nothing writes no audit line of its own, and the audit log is the
-    /// only place this harness-driven mechanism is visible from outside
-    /// `run_loop`.
+    /// nothing writes no tool audit line of its own. Request metrics are
+    /// separate from the tool record used to count regeneration runs.
     fn files_md_writer_turns(
         reads: &std::path::Path,
         dir: &std::path::Path,
@@ -5710,7 +7857,7 @@ print("wrote")
         let regenerations: Vec<_> = entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry["caller"] == "files-md-writer")
+            .filter(|(_, entry)| entry["caller"] == "files-md-writer" && entry["tool"] == "read")
             .collect();
         assert_eq!(
             regenerations.len(),
@@ -5792,8 +7939,11 @@ print("wrote")
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             // The only difference from the test above.
             "some-subagent",
+            "make a newdir",
+            false,
             None,
             &mut ctx,
+            None,
         )
         .await
         .expect("the subagent loop failed")
@@ -6158,12 +8308,12 @@ print("wrote")
         .await
         .expect("should succeed");
 
-        let first = rx.recv().await.expect("no first event");
+        let first = next_event(&mut rx).await.expect("no first event");
         assert!(
             matches!(first, crate::events::AgentEvent::ToolStarted { ref name, .. } if name == "read"),
             "first event was not ToolStarted(read): {first:?}"
         );
-        let second = rx.recv().await.expect("no second event");
+        let second = next_event(&mut rx).await.expect("no second event");
         assert!(
             matches!(
                 second,
@@ -6234,8 +8384,8 @@ print("wrote")
         .await
         .expect("should succeed");
 
-        let _started = rx.recv().await.expect("no ToolStarted");
-        let finished = rx.recv().await.expect("no ToolFinished");
+        let _started = next_event(&mut rx).await.expect("no ToolStarted");
+        let finished = next_event(&mut rx).await.expect("no ToolFinished");
         let crate::events::AgentEvent::ToolFinished { result, .. } = finished else {
             panic!("expected ToolFinished, got {finished:?}");
         };
@@ -6303,8 +8453,8 @@ print("wrote")
         .await
         .expect("should succeed");
 
-        let _started = rx.recv().await.expect("no ToolStarted");
-        let finished = rx.recv().await.expect("no ToolFinished");
+        let _started = next_event(&mut rx).await.expect("no ToolStarted");
+        let finished = next_event(&mut rx).await.expect("no ToolFinished");
         let crate::events::AgentEvent::ToolFinished { ok, result, .. } = finished else {
             panic!("expected ToolFinished, got {finished:?}");
         };
@@ -6389,8 +8539,8 @@ print("wrote")
         .await
         .expect("should succeed");
 
-        let _started = rx.recv().await.expect("no ToolStarted");
-        let finished = rx.recv().await.expect("no ToolFinished");
+        let _started = next_event(&mut rx).await.expect("no ToolStarted");
+        let finished = next_event(&mut rx).await.expect("no ToolFinished");
         let crate::events::AgentEvent::ToolFinished {
             ok, diff, result, ..
         } = finished
@@ -6502,8 +8652,8 @@ print("wrote")
         .await
         .expect("should succeed");
 
-        let _started = rx.recv().await.expect("no ToolStarted");
-        let finished = rx.recv().await.expect("no ToolFinished");
+        let _started = next_event(&mut rx).await.expect("no ToolStarted");
+        let finished = next_event(&mut rx).await.expect("no ToolFinished");
         let crate::events::AgentEvent::ToolFinished { diff, .. } = finished else {
             panic!("expected ToolFinished, got {finished:?}");
         };
@@ -6585,8 +8735,8 @@ print("wrote")
         .await
         .expect("should succeed");
 
-        let _started = rx.recv().await.expect("no ToolStarted");
-        let finished = rx.recv().await.expect("no ToolFinished");
+        let _started = next_event(&mut rx).await.expect("no ToolStarted");
+        let finished = next_event(&mut rx).await.expect("no ToolFinished");
         let crate::events::AgentEvent::ToolFinished { diff, .. } = finished else {
             panic!("expected ToolFinished, got {finished:?}");
         };
@@ -6669,8 +8819,8 @@ print("wrote")
         .await
         .expect("should succeed");
 
-        let _started = rx.recv().await.expect("no ToolStarted");
-        let finished = rx.recv().await.expect("no ToolFinished");
+        let _started = next_event(&mut rx).await.expect("no ToolStarted");
+        let finished = next_event(&mut rx).await.expect("no ToolFinished");
         let crate::events::AgentEvent::ToolFinished { diff, .. } = finished else {
             panic!("expected ToolFinished, got {finished:?}");
         };
@@ -6770,8 +8920,8 @@ print("wrote")
         .await
         .expect("the loop failed");
 
-        let _started = rx.recv().await.expect("no ToolStarted");
-        let finished = rx.recv().await.expect("no ToolFinished");
+        let _started = next_event(&mut rx).await.expect("no ToolStarted");
+        let finished = next_event(&mut rx).await.expect("no ToolFinished");
         let crate::events::AgentEvent::ToolFinished { ok, diff, .. } = finished else {
             panic!("expected ToolFinished, got {finished:?}");
         };
@@ -6864,12 +9014,12 @@ print("wrote")
         .await
         .expect("the denial failed the whole loop");
 
-        let started = rx.recv().await.expect("no ToolStarted");
+        let started = next_event(&mut rx).await.expect("no ToolStarted");
         assert!(
             matches!(started, crate::events::AgentEvent::ToolStarted { ref name, .. } if name == "write"),
             "first event was not ToolStarted(write): {started:?}"
         );
-        let finished = rx.recv().await.expect(
+        let finished = next_event(&mut rx).await.expect(
             "no ToolFinished — a gate denial must not skip the event that follows ToolStarted",
         );
         let crate::events::AgentEvent::ToolFinished { ok, .. } = finished else {
@@ -6938,12 +9088,12 @@ print("wrote")
         .await
         .expect("a missing argument should come back as a tool result, not a loop failure");
 
-        let started = rx.recv().await.expect("no ToolStarted");
+        let started = next_event(&mut rx).await.expect("no ToolStarted");
         assert!(
             matches!(started, crate::events::AgentEvent::ToolStarted { ref name, .. } if name == "read"),
             "first event was not ToolStarted(read): {started:?}"
         );
-        let finished = rx.recv().await.expect(
+        let finished = next_event(&mut rx).await.expect(
             "no ToolFinished — a missing-argument error must not skip the event that follows ToolStarted",
         );
         let crate::events::AgentEvent::ToolFinished { ok, .. } = finished else {

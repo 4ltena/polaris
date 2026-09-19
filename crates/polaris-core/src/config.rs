@@ -29,6 +29,70 @@ pub struct Config {
     /// `[spawn] write_concurrency`. Defaults to
     /// `polaris_spawn::DEFAULT_WRITE_CONCURRENCY` (4).
     pub spawn_write_concurrency: usize,
+    /// Which model and reasoning effort each declared weight is worth. TOML
+    /// keys: `[tier.dwarf]`, `[tier.subgiant]`, `[tier.giant]`,
+    /// `[tier.supergiant]`. Everything
+    /// unset inherits the parent run's own model, which is what happens
+    /// when the table is absent entirely.
+    pub tiers: TierConfig,
+    /// The typed judge, used both to preselect tools and to weigh delegated
+    /// tasks. One setting for both, because both ask the same service the
+    /// same kind of question and a run that trusts it for one has no reason
+    /// to withhold the other.
+    pub decision: DecisionConfig,
+    /// How large this project's build output may grow before the oldest of
+    /// it is removed. TOML keys: `[build_cache] max_bytes`,
+    /// `[build_cache] max_percent`. Unset means nothing is ever removed.
+    pub build_cache: crate::build_cache::Cap,
+    /// Which directory the cap applies to. `None` means `<project>/target`.
+    pub build_cache_path: Option<PathBuf>,
+}
+
+/// The API key is deliberately not here. A project's configuration file is
+/// committed and shared; a credential read from the environment is not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionConfig {
+    /// Off unless asked for. Every path that consults the judge works
+    /// without one, so enabling it is a choice to spend a round trip.
+    pub enabled: bool,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+}
+
+/// One entry per weight `polaris_skills::Tier` declares, so a new weight
+/// cannot be added to the enum without a place here to say what it costs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierConfig {
+    pub dwarf: TierSettings,
+    pub subgiant: TierSettings,
+    pub giant: TierSettings,
+    pub supergiant: TierSettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierSettings {
+    /// `None` keeps the parent run's model rather than naming one.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl TierConfig {
+    pub fn for_tier(&self, tier: polaris_skills::Tier) -> &TierSettings {
+        match tier {
+            polaris_skills::Tier::Dwarf => &self.dwarf,
+            polaris_skills::Tier::Subgiant => &self.subgiant,
+            polaris_skills::Tier::Giant => &self.giant,
+            polaris_skills::Tier::Supergiant => &self.supergiant,
+        }
+    }
+
+    /// Whether any weight names anything at all. A run with none of them
+    /// set has nothing to route and can skip building per-weight providers.
+    pub fn is_empty(&self) -> bool {
+        [&self.dwarf, &self.subgiant, &self.giant, &self.supergiant]
+            .into_iter()
+            .all(|held| held.model.is_none() && held.effort.is_none())
+    }
 }
 
 impl Default for Config {
@@ -51,6 +115,10 @@ impl Default for Config {
             agents_paths: Vec::new(),
             spawn_concurrency: crate::spawn::DEFAULT_CONCURRENCY,
             spawn_write_concurrency: crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            tiers: TierConfig::default(),
+            decision: DecisionConfig::default(),
+            build_cache: crate::build_cache::Cap::default(),
+            build_cache_path: None,
         }
     }
 }
@@ -70,6 +138,12 @@ struct RawConfig {
     agents: RawAgents,
     #[serde(default)]
     spawn: RawSpawn,
+    #[serde(default)]
+    tier: RawTier,
+    #[serde(default)]
+    decision: RawDecision,
+    #[serde(default)]
+    build_cache: RawBuildCache,
 }
 
 /// Explicit, local-only embedding runtime. No downloads occur during a turn.
@@ -85,9 +159,36 @@ pub struct EmbeddingConfig {
 #[serde(deny_unknown_fields)]
 struct RawWorkflow {
     enabled: Option<bool>,
+    mode: Option<crate::workflow::WorkflowMode>,
     initial_phase: Option<crate::workflow::Phase>,
     always: Option<Vec<String>>,
     phase_skills: Option<std::collections::BTreeMap<crate::workflow::Phase, Vec<String>>>,
+}
+
+impl RawWorkflow {
+    fn apply_to(self, merged: &mut crate::workflow::WorkflowConfig) {
+        if let Some(enabled) = self.enabled {
+            merged.enabled = enabled;
+        }
+        if let Some(mode) = self.mode {
+            merged.mode = mode;
+        }
+        if let Some(phase) = self.initial_phase {
+            merged.initial_phase = phase;
+        }
+        if let Some(always) = self.always {
+            merged.always = always;
+        }
+        if let Some(phases) = self.phase_skills {
+            // An explicit empty map clears all inherited stage bindings.
+            // Nonempty maps override their named phases only, including [].
+            if phases.is_empty() {
+                merged.phase_skills.clear();
+            } else {
+                merged.phase_skills.extend(phases);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -115,6 +216,150 @@ struct RawAgents {
     paths: Option<Vec<PathBuf>>,
 }
 
+/// What each declared weight is worth in models. Absent tables and absent
+/// keys both mean "inherit", so a project file can set `[tier.dwarf] model`
+/// without restating the global file's `effort`.
+/// `max_bytes` is written the way a person says it: `"80GiB"`, `"500MB"`,
+/// or a bare number of bytes. A unit nobody uses for disk is refused rather
+/// than guessed — being wrong about the unit here deletes the wrong amount.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBuildCache {
+    #[serde(default)]
+    max_bytes: Option<String>,
+    #[serde(default)]
+    max_percent: Option<u8>,
+    /// Which directory holds this project's build output. Relative paths are
+    /// read against the project root. Unset means `target`.
+    #[serde(default)]
+    path: Option<PathBuf>,
+}
+
+impl RawBuildCache {
+    fn apply_to(self, merged: &mut crate::build_cache::Cap) -> Result<(), ConfigError> {
+        if let Some(written) = self.max_bytes {
+            merged.bytes = Some(parse_size(&written).ok_or(ConfigError::BuildCacheSize)?);
+        }
+        if let Some(percent) = self.max_percent {
+            if !(1..=100).contains(&percent) {
+                return Err(ConfigError::BuildCacheShare);
+            }
+            merged.percent = Some(percent);
+        }
+        Ok(())
+    }
+}
+
+/// `"80GiB"` and the rest. Binary units only where they are written as such;
+/// `GB` is the decimal one, because that is what the person who wrote it
+/// meant and silently treating it as 2^30 overstates the cap by 7%.
+fn parse_size(written: &str) -> Option<u64> {
+    let trimmed = written.trim();
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    let scale: u64 = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "KIB" => 1 << 10,
+        "MIB" => 1 << 20,
+        "GIB" => 1 << 30,
+        "TIB" => 1u64 << 40,
+        _ => return None,
+    };
+    let bytes = number * scale as f64;
+    (bytes.is_finite() && bytes >= 0.0 && bytes <= u64::MAX as f64).then_some(bytes as u64)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDecision {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+impl RawDecision {
+    fn apply_to(self, merged: &mut DecisionConfig) -> Result<(), ConfigError> {
+        if let Some(enabled) = self.enabled {
+            merged.enabled = enabled;
+        }
+        for (value, held) in [
+            (self.base_url, &mut merged.base_url),
+            (self.model, &mut merged.model),
+        ] {
+            let Some(value) = value else { continue };
+            if value.trim().is_empty() {
+                return Err(ConfigError::EmptyDecisionValue);
+            }
+            *held = Some(value);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTier {
+    #[serde(default)]
+    dwarf: Option<RawTierSettings>,
+    #[serde(default)]
+    subgiant: Option<RawTierSettings>,
+    #[serde(default)]
+    giant: Option<RawTierSettings>,
+    #[serde(default)]
+    supergiant: Option<RawTierSettings>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTierSettings {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+impl RawTier {
+    fn apply_to(self, merged: &mut TierConfig) -> Result<(), ConfigError> {
+        for (raw, settings) in [
+            (self.dwarf, &mut merged.dwarf),
+            (self.subgiant, &mut merged.subgiant),
+            (self.giant, &mut merged.giant),
+            (self.supergiant, &mut merged.supergiant),
+        ] {
+            let Some(raw) = raw else { continue };
+            for (value, held) in [
+                (raw.model, &mut settings.model),
+                (raw.effort, &mut settings.effort),
+            ] {
+                let Some(value) = value else { continue };
+                // A blank is a typo, not a choice: it would be carried all
+                // the way to the provider and refused there, or worse,
+                // accepted as a model named "". Whether the name is one
+                // the backend knows is settled when the provider is built,
+                // where the backend is known; here only emptiness is.
+                if value.trim().is_empty() {
+                    return Err(ConfigError::EmptyTierValue);
+                }
+                *held = Some(value);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawSpawn {
     /// `None` here means "inherit the prior stage's value" — unlike
@@ -139,9 +384,17 @@ pub enum ConfigError {
         path: String,
         source: toml::de::Error,
     },
+    #[error("[tier] のmodelとeffortに空の値は書けません")]
+    EmptyTierValue,
+    #[error("[decision] のbase_urlとmodelに空の値は書けません")]
+    EmptyDecisionValue,
+    #[error("[build_cache] のmax_bytesを読めません。80GiB・500MB・バイト数のいずれかで書きます")]
+    BuildCacheSize,
+    #[error("[build_cache] のmax_percentは1から100までです")]
+    BuildCacheShare,
 }
 
-fn read_one(path: &Path) -> Result<Option<RawConfig>, ConfigError> {
+fn read_one<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, ConfigError> {
     let body = match std::fs::read_to_string(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -170,7 +423,7 @@ fn read_one(path: &Path) -> Result<Option<RawConfig>, ConfigError> {
 pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Config, ConfigError> {
     let mut merged = Config::default();
     for path in [global, project].into_iter().flatten() {
-        if let Some(raw) = read_one(path)? {
+        if let Some(raw) = read_one::<RawConfig>(path)? {
             if let Some(mode) = raw.history_mode {
                 merged.history_mode = mode;
             }
@@ -183,24 +436,7 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
             if raw.embedding.revision.is_some() {
                 merged.embedding.revision = raw.embedding.revision;
             }
-            if let Some(enabled) = raw.workflow.enabled {
-                merged.workflow.enabled = enabled;
-            }
-            if let Some(phase) = raw.workflow.initial_phase {
-                merged.workflow.initial_phase = phase;
-            }
-            if let Some(always) = raw.workflow.always {
-                merged.workflow.always = always;
-            }
-            if let Some(phases) = raw.workflow.phase_skills {
-                // An explicit empty map clears all inherited stage bindings.
-                // Nonempty maps override their named phases only, including [].
-                if phases.is_empty() {
-                    merged.workflow.phase_skills.clear();
-                } else {
-                    merged.workflow.phase_skills.extend(phases);
-                }
-            }
+            raw.workflow.apply_to(&mut merged.workflow);
             if let Some(auto_regenerate) = raw.files_md.auto_regenerate {
                 merged.files_md_auto_regenerate = auto_regenerate;
             }
@@ -224,6 +460,55 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
             if let Some(n) = raw.spawn.write_concurrency {
                 merged.spawn_write_concurrency = n.max(1);
             }
+            raw.tier.apply_to(&mut merged.tiers)?;
+            let path = raw.build_cache.path.clone();
+            raw.build_cache.apply_to(&mut merged.build_cache)?;
+            if path.is_some() {
+                merged.build_cache_path = path;
+            }
+            raw.decision.apply_to(&mut merged.decision)?;
+        }
+    }
+    Ok(merged)
+}
+
+/// Reads only workflow configuration. Other feature settings belong to their
+/// own loaders, so disabled memory cannot prevent a legacy owner from starting.
+/// Malformed TOML and invalid workflow fields still fail closed.
+pub fn try_load_workflow_from(
+    global: Option<&Path>,
+    project: Option<&Path>,
+) -> Result<crate::workflow::WorkflowConfig, ConfigError> {
+    #[derive(Deserialize)]
+    struct WorkflowOnly {
+        #[serde(default)]
+        workflow: RawWorkflow,
+    }
+    let mut merged = Config::default().workflow;
+    for path in [global, project].into_iter().flatten() {
+        if let Some(raw) = read_one::<WorkflowOnly>(path)? {
+            raw.workflow.apply_to(&mut merged);
+        }
+    }
+    Ok(merged)
+}
+
+/// Reads only the judge's configuration, so an owner that cannot start
+/// feature X does not lose the judge with it — the same reason
+/// `try_load_workflow_from` exists.
+pub fn try_load_decision_from(
+    global: Option<&Path>,
+    project: Option<&Path>,
+) -> Result<DecisionConfig, ConfigError> {
+    #[derive(Deserialize)]
+    struct DecisionOnly {
+        #[serde(default)]
+        decision: RawDecision,
+    }
+    let mut merged = Config::default().decision;
+    for path in [global, project].into_iter().flatten() {
+        if let Some(raw) = read_one::<DecisionOnly>(path)? {
+            raw.decision.apply_to(&mut merged)?;
         }
     }
     Ok(merged)
@@ -297,6 +582,23 @@ mod tests {
     }
 
     #[test]
+    fn workflow_mode_defaults_to_manual_and_inherits_independently() {
+        use crate::workflow::WorkflowMode;
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let gp = write(global.path(), "[workflow]\nmode = 'adaptive'\n");
+        let pp = write(project.path(), "[workflow]\ninitial_phase = 'review'\n");
+        let inherited = try_load_from(Some(&gp), Some(&pp)).unwrap();
+        assert_eq!(inherited.workflow.mode, WorkflowMode::Adaptive);
+        let pp = write(project.path(), "[workflow]\nmode = 'manual'\n");
+        assert_eq!(
+            try_load_from(Some(&gp), Some(&pp)).unwrap().workflow.mode,
+            WorkflowMode::Manual
+        );
+        assert_eq!(Config::default().workflow.mode, WorkflowMode::Manual);
+    }
+
+    #[test]
     fn workflow_inherits_missing_keys_and_clears_explicit_empty_values() {
         use crate::workflow::Phase;
         let global = tempfile::tempdir().unwrap();
@@ -356,6 +658,140 @@ mod tests {
                 .unwrap()
                 .files_md_auto_regenerate
         );
+    }
+
+    #[test]
+    fn a_weight_the_project_leaves_alone_keeps_what_the_global_file_gave_it() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let global_path = write(
+            global.path(),
+            "[tier.dwarf]\nmodel = \"gpt-5.4-mini\"\neffort = \"low\"\n\n[tier.supergiant]\nmodel = \"gpt-6-astra\"\n",
+        );
+        // Only `low`'s model is restated, so `low`'s effort and the whole
+        // of `ultra` have to survive. Restating one key must not blank the
+        // rest of the weight.
+        let project_path = write(project.path(), "[tier.dwarf]\nmodel = \"gpt-5.6-luna\"\n");
+        let held = try_load_from(Some(&global_path), Some(&project_path)).unwrap();
+        assert_eq!(held.tiers.dwarf.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(held.tiers.dwarf.effort.as_deref(), Some("low"));
+        assert_eq!(held.tiers.supergiant.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(held.tiers.subgiant, TierSettings::default());
+        assert_eq!(
+            held.tiers
+                .for_tier(polaris_skills::Tier::Dwarf)
+                .model
+                .as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        assert!(!held.tiers.is_empty());
+    }
+
+    #[test]
+    fn no_tier_table_leaves_every_weight_on_the_parent_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "# nothing about weights\n");
+        let held = try_load_from(None, Some(&path)).unwrap();
+        assert!(held.tiers.is_empty());
+        assert_eq!(held.tiers, Config::default().tiers);
+    }
+
+    #[test]
+    fn a_blank_model_or_effort_is_refused_rather_than_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        for body in [
+            "[tier.low]\nmodel = \"\"\n",
+            "[tier.medium]\neffort = \"   \"\n",
+        ] {
+            let path = write(dir.path(), body);
+            assert!(
+                matches!(
+                    try_load_from(None, Some(&path)),
+                    Err(ConfigError::EmptyTierValue)
+                ),
+                "{body}"
+            );
+        }
+        // A weight nobody has heard of, or a key nobody has heard of, is a
+        // typo in the same way — and unlike a blank it would otherwise be
+        // dropped in silence.
+        for body in [
+            "[tier.heavy]\nmodel = \"gpt-6-astra\"\n",
+            "[tier.low]\nmodle = \"gpt-6-astra\"\n",
+        ] {
+            let path = write(dir.path(), body);
+            assert!(
+                matches!(
+                    try_load_from(None, Some(&path)),
+                    Err(ConfigError::Parse { .. })
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_judge_is_off_unless_asked_for_and_never_reads_a_key_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!Config::default().decision.enabled);
+        let path = write(dir.path(), "# nothing about the judge\n");
+        assert!(!try_load_from(None, Some(&path)).unwrap().decision.enabled);
+
+        let path = write(
+            dir.path(),
+            "[decision]\nenabled = true\nmodel = \"jev-latest\"\n",
+        );
+        let held = try_load_from(None, Some(&path)).unwrap();
+        assert!(held.decision.enabled);
+        assert_eq!(held.decision.model.as_deref(), Some("jev-latest"));
+        assert_eq!(held.decision.base_url, None, "unset falls back in the host");
+
+        // A credential does not belong in a file that is committed and
+        // shared, so the key has no name here at all.
+        let path = write(
+            dir.path(),
+            "[decision]\nenabled = true\napi_key = \"secret\"\n",
+        );
+        assert!(matches!(
+            try_load_from(None, Some(&path)),
+            Err(ConfigError::Parse { .. })
+        ));
+
+        let path = write(dir.path(), "[decision]\nmodel = \"\"\n");
+        assert!(matches!(
+            try_load_from(None, Some(&path)),
+            Err(ConfigError::EmptyDecisionValue)
+        ));
+    }
+
+    #[test]
+    fn a_judge_only_read_ignores_everything_it_is_not_asked_about() {
+        // Read on its own so an owner that cannot start one feature does
+        // not lose the judge with it — the same reason the workflow-only
+        // read exists. Fields belonging to other tables are not this
+        // reader's to reject.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[workflow]\nenabled = false\n\n[decision]\nenabled = true\n",
+        );
+        let held = try_load_decision_from(None, Some(&path)).expect("a read");
+        assert!(held.enabled);
+
+        // The project file overrides the global one field by field, the
+        // same way the whole configuration does.
+        let global = write(dir.path(), "[decision]\nenabled = true\nmodel = \"a\"\n");
+        let project = tempfile::tempdir().unwrap();
+        let project = write(project.path(), "[decision]\nmodel = \"b\"\n");
+        let held = try_load_decision_from(Some(&global), Some(&project)).expect("a read");
+        assert!(held.enabled, "what the project does not restate survives");
+        assert_eq!(held.model.as_deref(), Some("b"));
+
+        // Malformed still fails here; whether that stops the caller is the
+        // caller's decision, and the desktop owner chooses to continue
+        // without a judge rather than without a session.
+        let broken = write(dir.path(), "invalid TOML [");
+        assert!(try_load_decision_from(None, Some(&broken)).is_err());
     }
 
     fn write(dir: &std::path::Path, body: &str) -> std::path::PathBuf {

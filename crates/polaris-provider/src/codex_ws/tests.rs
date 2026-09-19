@@ -7,7 +7,10 @@ use serde_json::json;
 /// turn — correct output, silently paid for twice.
 #[test]
 fn the_delta_is_measured_against_what_the_server_already_holds() {
-    let baseline = vec![json!({"role": "user", "text": "one"}), json!({"type": "output"})];
+    let baseline = vec![
+        json!({"role": "user", "text": "one"}),
+        json!({"type": "output"}),
+    ];
     let input = vec![
         json!({"role": "user", "text": "one"}),
         json!({"type": "output"}),
@@ -62,7 +65,11 @@ fn a_different_request_shape_is_a_different_conversation() {
     ] {
         let mut other = body.clone();
         other[field] = value;
-        assert_ne!(held, Shape::of(&other), "{field} must break the continuation");
+        assert_ne!(
+            held,
+            Shape::of(&other),
+            "{field} must break the continuation"
+        );
     }
 
     // `input` grows on every request and is compared as a prefix instead.
@@ -94,7 +101,10 @@ fn the_fields_only_the_server_carries_do_not_refuse_the_continuation() {
         "arguments": "{\"path\":\"a\"}",
     });
     assert_eq!(
-        delta(&[from_server.clone()], &[from_polaris.clone(), json!({"next": 1})]),
+        delta(
+            std::slice::from_ref(&from_server),
+            &[from_polaris.clone(), json!({"next": 1})]
+        ),
         Some(vec![json!({"next": 1})])
     );
 
@@ -102,7 +112,10 @@ fn the_fields_only_the_server_carries_do_not_refuse_the_continuation() {
     // into "close enough".
     let mut other_call = from_polaris.clone();
     other_call["call_id"] = json!("call_xyz");
-    assert_eq!(delta(&[from_server.clone()], &[other_call]), None);
+    assert_eq!(
+        delta(std::slice::from_ref(&from_server), &[other_call]),
+        None
+    );
     let mut other_args = from_polaris;
     other_args["arguments"] = json!("{\"path\":\"b\"}");
     assert_eq!(delta(&[from_server], &[other_args]), None);

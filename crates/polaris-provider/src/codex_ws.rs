@@ -37,9 +37,8 @@ pub(crate) fn enabled() -> bool {
     std::env::var_os("POLARIS_WS").as_deref() == Some(std::ffi::OsStr::new("on"))
 }
 
-type Stream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Stream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// One open socket, and what the next request on it may continue from.
 pub(crate) struct Session {
@@ -154,29 +153,27 @@ impl Session {
 
     /// The continuation this socket can offer for `shape`, if any.
     pub(crate) fn continuation_for(&self, shape: &Shape) -> Option<&Continuation> {
-        self.continuation.as_ref().filter(|held| &held.shape == shape)
+        self.continuation
+            .as_ref()
+            .filter(|held| &held.shape == shape)
     }
 
     /// Why this socket cannot continue, in the terms the reader needs. For
     /// diagnostics while the transport is behind a flag.
-    pub(crate) fn why_no_continuation(
-        &self,
-        shape: &Shape,
-        input: &[serde_json::Value],
-    ) -> String {
+    pub(crate) fn why_no_continuation(&self, shape: &Shape, input: &[serde_json::Value]) -> String {
         match &self.continuation {
             None => "前の応答がない".to_owned(),
             Some(held) if &held.shape != shape => "要求の形が変わった".to_owned(),
             Some(held) => {
-                let at = held
-                    .baseline
-                    .iter()
-                    .zip(input)
-                    .position(|(a, b)| a != b);
+                let at = held.baseline.iter().zip(input).position(|(a, b)| a != b);
                 match at {
                     Some(at) => format!(
                         "{at}件目が違う\n      保持: {}\n      今回: {}",
-                        &held.baseline[at].to_string().chars().take(220).collect::<String>(),
+                        &held.baseline[at]
+                            .to_string()
+                            .chars()
+                            .take(220)
+                            .collect::<String>(),
                         &input[at].to_string().chars().take(220).collect::<String>(),
                     ),
                     None => format!(

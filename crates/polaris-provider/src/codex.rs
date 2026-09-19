@@ -692,6 +692,7 @@ impl CodexProvider {
         body: &serde_json::Value,
         token: &crate::Token,
         observer: Option<&dyn crate::ResponseObserver>,
+        prefix: cache_prefix::CachePrefixDiagnostics,
     ) -> Option<Result<CompletionResponse, ProviderError>> {
         // A transport that silently falls back is a transport nobody can
         // tell is working. Every decision it makes is said out loud while it
@@ -727,12 +728,19 @@ impl CodexProvider {
         if frame.get("reasoning").is_none() {
             frame["reasoning"] = serde_json::Value::Null;
         }
-        match session
-            .continuation_for(&shape)
-            .and_then(|held| crate::codex_ws::delta(&held.baseline, &input).map(|d| (held.response_id.clone(), d)))
-        {
+        let mut continued = false;
+        let mut sent = input.len();
+        match session.continuation_for(&shape).and_then(|held| {
+            crate::codex_ws::delta(&held.baseline, &input).map(|d| (held.response_id.clone(), d))
+        }) {
             Some((previous, delta)) => {
-                note(&format!("継続あり。送る項目 {}件（全体 {}件）", delta.len(), input.len()));
+                note(&format!(
+                    "継続あり。送る項目 {}件（全体 {}件）",
+                    delta.len(),
+                    input.len()
+                ));
+                continued = true;
+                sent = delta.len();
                 frame["previous_response_id"] = serde_json::Value::String(previous);
                 frame["input"] = serde_json::Value::Array(delta);
             }
@@ -745,7 +753,28 @@ impl CodexProvider {
                 frame.as_object_mut()?.remove("previous_response_id");
             }
         }
-        match session.round_trip(frame, input, observer).await {
+        // Built from the frame actually put on the wire, not from the HTTP
+        // body: what this arm has to answer for is the delta it sent and
+        // the usage the server billed against the conversation it holds.
+        let mut metric = match metrics::RequestMetric::from_env(&frame, prefix) {
+            Ok(metric) => metric,
+            // A metrics path that cannot be opened is a measurement
+            // failure, not a transport failure. The HTTP path reports it by
+            // failing the request; do the same rather than quietly
+            // producing an unmeasured run that looks like a measured one.
+            Err(error) => return Some(Err(error)),
+        };
+        if let Some(metric) = metric.as_mut() {
+            metric.socket(continued, sent, input.len());
+        }
+        let answer = session.round_trip(frame, input, observer).await;
+        if let Some(metric) = metric.as_mut() {
+            if let Ok((_, usage)) = &answer {
+                metric.usage = *usage;
+            }
+            metric.finish(&answer);
+        }
+        match answer {
             Ok((completed, usage)) => {
                 note(&format!("応答 {usage:?}"));
                 Some(Ok(completed))
@@ -804,12 +833,14 @@ impl CodexProvider {
         // continuation the server no longer holds — falls through to the
         // path below rather than failing the run. The transport is an
         // optimisation; the run is not.
+        let prefix_diagnostics = self.cache_prefix.diagnostics(&model, req);
         if crate::codex_ws::enabled()
-            && let Some(answer) = self.over_socket(&body, token, observer).await
+            && let Some(answer) = self
+                .over_socket(&body, token, observer, prefix_diagnostics)
+                .await
         {
             return answer;
         }
-        let prefix_diagnostics = self.cache_prefix.diagnostics(&model, req);
         let mut metric = metrics::RequestMetric::from_env(&body, prefix_diagnostics)?;
         let identity = TurnIdentity {
             origin: self.base.clone(),

@@ -31,9 +31,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::cache_prefix::CachePrefixDiagnostics;
+use crate::ProviderError;
 use crate::cache_pacing::Mode as PacingMode;
 use crate::turn_affinity::TurnAffinityMode;
-use crate::{CompletionResponse, ProviderError};
 
 fn fingerprint(value: &Value) -> Value {
     let bytes = value.to_string();
@@ -373,7 +373,12 @@ impl RequestMetric {
         self.dispatched = true;
     }
 
-    pub(super) fn finish(&mut self, result: &Result<CompletionResponse, ProviderError>) {
+    /// Generic over the success type because it never reads it: only the
+    /// error is inspected, to name the outcome. The socket arm carries the
+    /// usage alongside the response, and a signature pinned to
+    /// `CompletionResponse` would have forced that caller to clone an error
+    /// that is not `Clone`.
+    pub(super) fn finish<T>(&mut self, result: &Result<T, ProviderError>) {
         let result = result.as_ref().map_err(|mut error| {
             while let ProviderError::ReceivedUsage { source, .. } = error {
                 error = source.as_ref();
@@ -405,6 +410,24 @@ impl RequestMetric {
             "context_present": context_present,
             "sent": sent,
             "received": received,
+        });
+    }
+
+    /// Marks the row as the websocket arm and records what the continuation
+    /// let this request leave out.
+    ///
+    /// Without it the two transports are indistinguishable in the log: the
+    /// socket path sends a different body — a `previous_response_id` and a
+    /// delta rather than the whole input — so a row that does not say which
+    /// arm produced it cannot be compared with anything. `sent`/`held` is
+    /// the evidence for the input multiplier, which is the number that
+    /// decides whether the transport is worth having.
+    pub(super) fn socket(&mut self, continued: bool, sent: usize, held: usize) {
+        self.record["transport"] = json!("websocket");
+        self.record["continuation"] = json!({
+            "used": continued,
+            "items_sent": sent,
+            "items_held": held,
         });
     }
 
@@ -448,7 +471,7 @@ impl Drop for RequestMetric {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
-    use crate::{CompletionRequest, Message};
+    use crate::{CompletionRequest, CompletionResponse, Message};
     use std::os::unix::fs::PermissionsExt;
 
     struct LogPath(std::path::PathBuf);
@@ -499,7 +522,7 @@ mod tests {
         let path = LogPath::new();
         let mut metric = RequestMetric::new(&path.0, &body()).unwrap();
         metric.usage = TokenUsage::parse(&serde_json::json!({"input_tokens":3,"output_tokens":4}));
-        metric.finish(&Err(ProviderError::Observation {
+        metric.finish::<CompletionResponse>(&Err(ProviderError::Observation {
             reason: crate::ObserverError::Full,
             completed: None,
         }));
@@ -538,7 +561,7 @@ mod tests {
             dispatch.wait,
             dispatch.offset,
         );
-        metric.finish(&Err(ProviderError::Auth("expired".into())));
+        metric.finish::<CompletionResponse>(&Err(ProviderError::Auth("expired".into())));
         drop(metric);
         let rows = path.records();
         assert_eq!(rows.len(), 1);
@@ -655,6 +678,45 @@ mod tests {
         assert_eq!(rows[2]["cache_mode"], "explicit");
     }
 
+    /// The socket arm has to be tellable apart from the HTTP arm in the
+    /// log, and has to say what the continuation let it leave out.
+    ///
+    /// Until 2026-09-19 it wrote no row at all: `over_socket` returned
+    /// before `RequestMetric::from_env` ran, so `POLARIS_WS=on` produced a
+    /// silently unmeasured run. A row that does not name its transport is
+    /// the same failure one step later — the two arms average together and
+    /// the comparison reads as noise.
+    #[test]
+    fn the_socket_arm_is_named_in_the_row_with_what_it_did_not_resend() {
+        let path = LogPath::new();
+        let mut continued = RequestMetric::new(&path.0, &body()).unwrap();
+        continued.socket(true, 2, 11);
+        drop(continued);
+        let mut whole = RequestMetric::new(&path.0, &body()).unwrap();
+        whole.socket(false, 11, 11);
+        drop(whole);
+        // A row from the HTTP arm never calls it, and must stay unmarked.
+        drop(RequestMetric::new(&path.0, &body()).unwrap());
+
+        let rows = path.records();
+        assert_eq!(rows[0]["transport"], "websocket");
+        assert_eq!(rows[0]["continuation"]["used"], true);
+        assert_eq!(rows[0]["continuation"]["items_sent"], 2);
+        assert_eq!(rows[0]["continuation"]["items_held"], 11);
+        assert_eq!(rows[1]["transport"], "websocket");
+        assert_eq!(rows[1]["continuation"]["used"], false);
+        assert_eq!(
+            rows[1]["continuation"]["items_sent"], rows[1]["continuation"]["items_held"],
+            "without a continuation the whole input goes out"
+        );
+        assert_eq!(
+            rows[2]["transport"],
+            Value::Null,
+            "the HTTP arm must not be labelled websocket: {}",
+            rows[2]
+        );
+    }
+
     #[test]
     fn cache_prefix_diagnostics_record_identifiers_not_the_guide() {
         let path = LogPath::new();
@@ -761,7 +823,9 @@ mod tests {
             let mut guard = RequestMetric::new(&path.0, &request).unwrap();
             guard.http_status = Some(status);
             if status == 401 {
-                guard.finish(&Err(ProviderError::Auth("SECRET_AUTH_RESPONSE".into())));
+                guard.finish::<CompletionResponse>(&Err(ProviderError::Auth(
+                    "SECRET_AUTH_RESPONSE".into(),
+                )));
             } else {
                 guard.usage = TokenUsage::parse(&json!({"input_tokens": 12, "output_tokens": 3}));
                 guard.finish(&Ok(CompletionResponse {

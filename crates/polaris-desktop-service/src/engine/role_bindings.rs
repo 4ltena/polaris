@@ -38,6 +38,7 @@ fn to_wire_runtime(runtime: SavedRuntime) -> BoundRuntime {
     match runtime {
         SavedRuntime::Ollama => BoundRuntime::Ollama,
         SavedRuntime::LmStudio => BoundRuntime::LmStudio,
+        SavedRuntime::LlamaCpp => BoundRuntime::LlamaCpp,
         SavedRuntime::Account => BoundRuntime::Account,
     }
 }
@@ -46,6 +47,7 @@ fn from_wire_runtime(runtime: BoundRuntime) -> SavedRuntime {
     match runtime {
         BoundRuntime::Ollama => SavedRuntime::Ollama,
         BoundRuntime::LmStudio => SavedRuntime::LmStudio,
+        BoundRuntime::LlamaCpp => SavedRuntime::LlamaCpp,
         BoundRuntime::Account => SavedRuntime::Account,
     }
 }

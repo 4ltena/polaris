@@ -16,6 +16,10 @@ const MAX_ENDPOINT_BYTES: usize = 256;
 pub enum BoundRuntime {
     Ollama,
     LmStudio,
+    /// `llama-server` started by polaris itself. Unlike the other two it
+    /// has no separate installation for the person to point at, so the
+    /// settings screen shows it without an endpoint field.
+    LlamaCpp,
     Account,
 }
 
@@ -185,12 +189,25 @@ mod tests {
                 "endpoint": "http://127.0.0.1:11434/", "model": "qwen:small",
                 "observed_tool_support": "supported"
             }], "tier_bindings": [{
-                "tier": "low", "runtime": "account",
+                "tier": "dwarf", "runtime": "account",
                 "model": "gpt-5.4-mini", "effort": "low"
             }]}
         });
         let request: Request = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(&request).unwrap(), value);
+        // A binding saved by a build that predates the rename still reads.
+        // Dropping the aliases would lose a desktop's roles in silence, and
+        // the canonical spelling above cannot catch that.
+        for (stored, tier) in [
+            ("low", BoundTier::Dwarf),
+            ("medium", BoundTier::Subgiant),
+            ("ultra", BoundTier::Supergiant),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<BoundTier>(serde_json::json!(stored)).expect(stored),
+                tier
+            );
+        }
         let binding = RoleBinding {
             role: "reviewer".into(),
             runtime: BoundRuntime::Ollama,

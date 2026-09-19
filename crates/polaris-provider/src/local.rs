@@ -17,6 +17,45 @@ const LOAD_STATE_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum Runtime {
     Ollama,
     LmStudio,
+    /// `llama-server` in router mode (`--models-dir`), which polaris starts
+    /// itself from a pinned build. The other two are servers somebody else
+    /// installed and runs; this one has an owner inside the process, which
+    /// is why it is the only one that carries a token.
+    LlamaCpp,
+}
+
+/// A bearer token minted for a runtime polaris started itself.
+///
+/// `--api-key` turns the loopback port from "anything on this machine may
+/// drive the model" into "only the process holding this may". Loopback
+/// alone is not an access control; every other local program shares it.
+///
+/// `Debug` redacts, because this value is carried next to metadata that is
+/// printed in diagnostics and written into audit records.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiToken(String);
+
+impl ApiToken {
+    /// 32 bytes of hex from the system source. Not derived from anything
+    /// the run already holds, so it cannot outlive or identify the run.
+    pub fn generate() -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut bytes = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        Ok(Self(
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ApiToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiToken(<redacted>)")
+    }
 }
 
 /// Validated IP-literal loopback origin, without a path or embedded credentials.
@@ -193,10 +232,21 @@ pub struct LocalAdapter {
     runtime: Runtime,
     endpoint: Endpoint,
     client: Client,
+    token: Option<ApiToken>,
 }
 
 impl LocalAdapter {
     pub fn new(runtime: Runtime, endpoint: Endpoint) -> Result<Self, LocalError> {
+        Self::with_token(runtime, endpoint, None)
+    }
+
+    /// The same adapter against a runtime that requires a bearer token.
+    /// Only a runtime polaris started itself has one.
+    pub fn with_token(
+        runtime: Runtime,
+        endpoint: Endpoint,
+        token: Option<ApiToken>,
+    ) -> Result<Self, LocalError> {
         // Do not use the shared builder: it may read SSL_CERT_FILE. This adapter
         // discovers no credentials, CA files or proxy settings from the environment.
         let client = Client::builder()
@@ -210,6 +260,7 @@ impl LocalAdapter {
             runtime,
             endpoint,
             client,
+            token,
         })
     }
 
@@ -233,10 +284,16 @@ impl LocalAdapter {
         let route = match self.runtime {
             Runtime::Ollama => "/api/tags",
             Runtime::LmStudio => "/api/v1/models",
+            Runtime::LlamaCpp => "/v1/models",
         };
         let value = self.request(route, None).await?;
+        // llama-server answers in the OpenAI shape, so its array is `data`.
+        let container = match self.runtime {
+            Runtime::Ollama | Runtime::LmStudio => "models",
+            Runtime::LlamaCpp => "data",
+        };
         let models = value
-            .get("models")
+            .get(container)
             .and_then(Value::as_array)
             .ok_or(LocalError::InvalidMetadata)?;
         if models.len() > MAX_MODELS {
@@ -250,6 +307,7 @@ impl LocalAdapter {
                 let key = match self.runtime {
                     Runtime::Ollama => "name",
                     Runtime::LmStudio => "key",
+                    Runtime::LlamaCpp => "id",
                 };
                 let id = text(obj, key)?.ok_or(LocalError::InvalidMetadata)?;
                 if !seen.insert(id.clone()) {
@@ -301,7 +359,9 @@ impl LocalAdapter {
                     };
                 }
             }
-            Runtime::LmStudio => {}
+            // Both report residency in the inventory itself, so there is
+            // no second request to make.
+            Runtime::LmStudio | Runtime::LlamaCpp => {}
         }
     }
 
@@ -312,6 +372,8 @@ impl LocalAdapter {
             return Err(LocalError::SelectionMismatch);
         }
         let mut model = observed.clone();
+        // LM Studio and llama-server already put everything in the
+        // inventory; only Ollama needs a second, narrower observation.
         if self.runtime == Runtime::Ollama {
             // show(name) may observe different content from the earlier inventory.
             // It supplies no digest; even bracketing it with tags cannot bind the
@@ -349,12 +411,30 @@ impl LocalAdapter {
         Ok(ModelSelection { model })
     }
 
+    /// `GET /health`, for a runtime polaris started and is waiting on.
+    ///
+    /// Exposed rather than reimplemented in the supervisor so the same
+    /// bounded client, deadline, size cap and token cover it. A separate
+    /// HTTP client there would be a second set of limits to keep in step.
+    pub async fn health(&self) -> Result<Value, LocalError> {
+        self.request("/health", None).await
+    }
+
+    /// `GET /props`. Carries the build identity the supervisor pins.
+    pub async fn props(&self) -> Result<Value, LocalError> {
+        self.request("/props", None).await
+    }
+
     async fn request(&self, route: &str, body: Option<Value>) -> Result<Value, LocalError> {
         let mut url = self.endpoint.0.clone();
         url.set_path(route);
         let request = match body {
             Some(body) => self.client.post(url).json(&body),
             None => self.client.get(url),
+        };
+        let request = match &self.token {
+            Some(token) => request.bearer_auth(token.as_str()),
+            None => request,
         };
         // Outer deadline includes body consumption; trickling bytes cannot extend it.
         tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -424,6 +504,18 @@ fn location(obj: &Map<String, Value>) -> Result<ExecutionLocation, LocalError> {
 
 fn load_state(runtime: Runtime, obj: &Map<String, Value>) -> Result<LoadState, LocalError> {
     match runtime {
+        // The router reports residency per model as `status.value`. An
+        // unrecognised word stays Unknown rather than becoming "unloaded":
+        // a wrong "unloaded" reads as a fact about memory, and the caller
+        // would present it as one.
+        Runtime::LlamaCpp => match obj.get("status") {
+            None | Some(Value::Null) => Ok(LoadState::Unknown),
+            Some(status) => match text(object(status)?, "value")?.as_deref() {
+                Some("loaded") => Ok(LoadState::Loaded),
+                Some("unloaded") => Ok(LoadState::Unloaded),
+                _ => Ok(LoadState::Unknown),
+            },
+        },
         // `/api/tags` does not carry memory residency. `/api/ps` is queried
         // after the bounded inventory succeeds.
         Runtime::Ollama => Ok(LoadState::Unknown),
@@ -540,6 +632,41 @@ fn apply_metadata(
                             Some(model.max_context_length.map_or(n, |old| old.min(n)));
                     }
                 }
+            }
+        }
+        Runtime::LlamaCpp => {
+            // The router lists modalities, not capabilities. Text out is
+            // the only thing it actually states, so it is the only thing
+            // read as `Supported`.
+            //
+            // **Tool support stays `Unknown`.** Whether a GGUF's chat
+            // template emits tool calls cannot be seen without loading the
+            // model, and inventing an answer here would create a second,
+            // unmeasured claim beside the one the settings screen already
+            // records (`ToolSupport`). `configured_factory` refuses a
+            // tool-needing agent bound to a model nobody observed, which is
+            // the behaviour that belongs here.
+            if let Some(value) = obj.get("architecture").filter(|v| !v.is_null()) {
+                let architecture = object(value)?;
+                let has = |key: &str, what: &str| -> Result<bool, LocalError> {
+                    match architecture.get(key) {
+                        None | Some(Value::Null) => Ok(false),
+                        Some(Value::Array(list)) if list.len() <= 64 => {
+                            Ok(list.iter().any(|v| v.as_str() == Some(what)))
+                        }
+                        _ => Err(LocalError::InvalidMetadata),
+                    }
+                };
+                model.capabilities.completion = if has("output_modalities", "text")? {
+                    Capability::Supported
+                } else {
+                    Capability::Unknown
+                };
+                model.capabilities.vision = if has("input_modalities", "image")? {
+                    Capability::Supported
+                } else {
+                    Capability::Unsupported
+                };
             }
         }
         Runtime::LmStudio => {

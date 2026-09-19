@@ -106,8 +106,15 @@ impl OpenAiProvider {
 
     /// Internal transport for a fixed local selection. Never discovers credentials
     /// or CA files through the shared cloud client builder.
-    pub(crate) fn for_local(
+    /// The same transport against a runtime that requires a bearer token.
+    ///
+    /// Only a runtime polaris started itself has one. Ollama and LM Studio
+    /// are servers somebody else runs and neither asks for a key; a
+    /// `llama-server` polaris launched is started with `--api-key-file`,
+    /// so without the token every request it receives is a 401.
+    pub(crate) fn for_local_with_token(
         selection: &crate::local::ModelSelection,
+        token: Option<&crate::local::ApiToken>,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -119,7 +126,7 @@ impl OpenAiProvider {
             .map_err(|_| ProviderError::Http("could not build local client".into()))?;
         Ok(Self {
             base_url: format!("{}v1", selection.endpoint().as_str()),
-            api_key: None,
+            api_key: token.map(|token| token.as_str().to_owned()),
             model: std::sync::RwLock::new(selection.model().id().to_owned()),
             effort: std::sync::RwLock::new(None),
             client,

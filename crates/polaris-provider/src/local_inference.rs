@@ -5,7 +5,7 @@
 //! Slot ownership, revalidation and runtime stop acknowledgement belong to the
 //! caller; dropping a request future does not prove server-side generation stopped.
 
-use crate::local::{Capability, ModelSelection};
+use crate::local::{ApiToken, Capability, ModelSelection};
 use crate::openai::OpenAiProvider;
 use crate::web_search::{WebSearchConfig, WebSearchPolicy};
 use crate::{CompletionRequest, CompletionResponse, Provider, ProviderError};
@@ -23,9 +23,23 @@ impl LocalInferenceProvider {
         Self::with_web_search(selection, WebSearchConfig::disabled())
     }
 
+    /// For a runtime polaris started itself, which answers 401 without the
+    /// token it was launched with.
+    pub fn with_token(selection: ModelSelection, token: &ApiToken) -> Result<Self, ProviderError> {
+        Self::build(selection, WebSearchConfig::disabled(), Some(token))
+    }
+
     pub fn with_web_search(
         selection: ModelSelection,
         web_search: WebSearchConfig,
+    ) -> Result<Self, ProviderError> {
+        Self::build(selection, web_search, None)
+    }
+
+    fn build(
+        selection: ModelSelection,
+        web_search: WebSearchConfig,
+        token: Option<&ApiToken>,
     ) -> Result<Self, ProviderError> {
         if web_search.policy != WebSearchPolicy::Disabled {
             return Err(ProviderError::Unsupported("local hosted web search".into()));
@@ -33,7 +47,7 @@ impl LocalInferenceProvider {
         if selection.model().capabilities().completion == Capability::Unsupported {
             return Err(ProviderError::Unsupported("local completion".into()));
         }
-        let transport = OpenAiProvider::for_local(&selection)?;
+        let transport = OpenAiProvider::for_local_with_token(&selection, token)?;
         Ok(Self {
             selection,
             transport,

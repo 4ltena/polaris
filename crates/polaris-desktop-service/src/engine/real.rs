@@ -5,7 +5,7 @@ use polaris_core::{
     agent::AgentError,
     audit::AuditLog,
     desktop_events::{DesktopEventReceiver, EVENT_CAPACITY, EventEnvelope, EventFailure},
-    desktop_run::{DesktopRun, DesktopRunError, DesktopRunInput},
+    desktop_run::{DesktopRequestContext, DesktopRun, DesktopRunError, DesktopRunInput},
     desktop_store::{HistoryGap, SavedWorkflow},
     isolated_run::PreparedWorkspace,
     session::Session,
@@ -20,9 +20,33 @@ use polaris_provider::{Message, Provider, Role};
 /// Skills and agent types are immutable trusted snapshots; no host disk reload.
 /// Legacy history hooks remain unavailable.
 pub trait TrustedRunFactory: Send + Sync {
+    /// A startup-owner validated workflow profile. Wire input never supplies
+    /// skill IDs, paths, or bodies.
+    fn workflow_config(&self) -> Option<&polaris_core::workflow::WorkflowConfig> {
+        None
+    }
+
+    /// The typed judge this owner was started with, if any. Default `None`
+    /// so a factory that has no opinion keeps the behaviour every run had
+    /// before the judge existed.
+    fn decider(&self) -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
+        None
+    }
+
+    fn workflow_skills(&self) -> &[polaris_skills::Skill] {
+        &[]
+    }
     /// Immutable trusted catalog used to validate next-run role choices.
     fn role_catalog(&self) -> &[polaris_skills::AgentType] {
         &[]
+    }
+
+    /// The registration an accepted run is fixed to, decided once, just before
+    /// the acceptance that saves it. `None` keeps the single authentication.
+    fn bind_account(
+        &self,
+    ) -> Result<Option<polaris_core::desktop_store::SavedAccount>, ServiceError> {
+        Ok(None)
     }
 
     fn prepare(
@@ -115,6 +139,18 @@ pub struct TrustedRunInputs {
     /// Preopened trusted backend only; never resolved from a model-supplied path.
     pub tool_memory: Option<polaris_core::tool_memory::ToolMemory>,
     pub history: Option<TrustedHistoryResources>,
+    pub mcp: Option<TrustedMcpResources>,
+    /// Fixed from the confirmed tier; bounds MCP calls and registration.
+    pub external_ceiling: polaris_core::mcp::operation::ExternalCeiling,
+}
+
+/// Fixed host configuration and external ceiling, never model-supplied. The
+/// trusted resource owner retains any dedicated stdio directories through cleanup.
+#[derive(Clone)]
+pub struct TrustedMcpResources {
+    pub config: polaris_core::mcp::runtime::RuntimeConfig,
+    /// Fixed light model for tool preselection; `None` for local backends.
+    pub selection_provider: Option<Arc<dyn Provider>>,
 }
 
 /// Verified before provider admission; a dedicated summary client and per-run meter.
@@ -135,15 +171,35 @@ impl DesktopService {
     /// Consume the already validated Writer without reopening or recovering it.
     /// Constructor failure leaves durable artifacts in their existing store.
     pub fn from_trusted_store(
-        store: Writer,
+        mut store: Writer,
         runs: Arc<dyn TrustedRunFactory>,
         source: SourceApplyRuntime,
     ) -> Result<Self, ServiceError> {
-        let saved = store.snapshot()?;
+        let mut saved = store.snapshot()?;
         if store.coordinates() != (&saved.marker.project_id, &saved.marker.session_id) {
             return Err(ServiceError::Options);
         }
         let owner = source_owner::SourceOwner::new(source)?;
+        // A configured owner must publish its validated profile before the
+        // initial Snapshot, so a new GUI can select workflow behavior. The
+        // validator resolves the trusted skill catalog before any run exists.
+        // Legacy `None` is also protected by the RunStart preflight.
+        if saved.state.workflow.is_none()
+            && let Some(config) = runs.workflow_config()
+        {
+            let workflow = super::validated_workflow(
+                config.clone(),
+                polaris_core::workflow::WorkflowGatesV1::default(),
+                polaris_core::workflow::WorkflowStateV1 {
+                    phase: config.initial_phase,
+                    ..Default::default()
+                },
+                runs.workflow_skills(),
+            )
+            .map_err(|_| ServiceError::Options)?;
+            store.configure_workflow(saved.marker.session_revision, Some(workflow))?;
+            saved = store.snapshot()?;
+        }
         let mut service = Self::from_production_store(store, saved.marker.session_id)?;
         let engine = service.engine.as_mut().ok_or(ServiceError::Worker)?;
         engine.trusted_runs = Some(TrustedRuns {
@@ -273,6 +329,7 @@ pub(super) struct RealRun {
     worker: Option<DesktopRun>,
     events: Option<DesktopEventReceiver>,
     memory: Option<polaris_core::desktop_memory::DesktopMemoryOwner>,
+    workflow_owner: Option<polaris_core::desktop_workflow::DesktopWorkflowOwner>,
     summary_usage: Option<polaris_provider::UsageMeter>,
     main_usage: polaris_provider::UsageMeter,
     embedding_usage: Option<polaris_provider::attempts::AttemptLedger>,
@@ -287,6 +344,10 @@ pub(super) struct RealRun {
     memory_evidence_over_budget: bool,
     joined: bool,
     sequence: u64,
+    /// M6-2: the work in flight and when it started, from the run's own
+    /// events. Silence changes nothing here.
+    work: Option<(polaris_core::activity::Work, std::time::Instant)>,
+    activity: Option<polaris_core::activity::Activity>,
 }
 impl RealRun {
     pub(super) fn queued() -> Self {
@@ -298,6 +359,7 @@ impl RealRun {
             worker: None,
             events: None,
             memory: None,
+            workflow_owner: None,
             summary_usage: None,
             main_usage: Default::default(),
             embedding_usage: None,
@@ -311,7 +373,46 @@ impl RealRun {
             memory_evidence_over_budget: false,
             joined: false,
             sequence: 0,
+            work: None,
+            activity: None,
         }
+    }
+
+    /// Only a start and its matching end move this; a quiet period does not.
+    fn observe_activity(&mut self, event: &AgentEvent) {
+        use polaris_core::activity::Work;
+        self.work = match event {
+            AgentEvent::ModelRequestStarted { .. } => {
+                Some((Work::ModelRequest, std::time::Instant::now()))
+            }
+            AgentEvent::ToolStarted { .. } => Some((Work::Tool, std::time::Instant::now())),
+            AgentEvent::SpawnStarted { .. } => Some((Work::Child, std::time::Instant::now())),
+            AgentEvent::ModelRequestFinished { .. }
+            | AgentEvent::ToolFinished { .. }
+            | AgentEvent::SpawnFinished { .. } => None,
+            _ => return,
+        };
+    }
+
+    fn refresh_activity(&mut self, awaiting_approval: bool) {
+        use polaris_core::activity::{Deadlines, Observed, assess};
+        let observed = Observed {
+            finished: self
+                .joined
+                .then_some(!matches!(self.outcome, Some(Observation::Failed))),
+            awaiting_approval,
+            awaiting_input: false,
+            awaiting_dependency: false,
+            work: match (&self.preparation, self.work) {
+                (Preparation::Running(_), _) => Some((
+                    polaris_core::activity::Work::Preparation,
+                    std::time::Duration::ZERO,
+                )),
+                (_, Some((work, since))) => Some((work, since.elapsed())),
+                _ => None,
+            },
+        };
+        self.activity = Some(assess(&observed, &Deadlines::default()));
     }
     pub(super) fn cancel(&mut self) {
         self.cancelled = true;
@@ -328,6 +429,9 @@ impl RealRun {
     ) -> Result<Vec<EventBody>, ServiceError> {
         if let Some(memory) = &mut self.memory {
             memory.poll(store.as_deref_mut(), self.cancelled);
+        }
+        if let Some(workflow) = &mut self.workflow_owner {
+            workflow.poll(store.as_deref_mut(), self.cancelled, self.activity);
         }
         if let Preparation::Running(job) = &mut self.preparation
             && let Some(outcome) = job.poll()
@@ -361,6 +465,7 @@ impl RealRun {
                 return Err(ServiceError::Worker);
             }
             self.sequence = event.sequence;
+            self.observe_activity(&event.event);
             if let Some(store) = store.as_deref_mut() {
                 match persist_child_event(store, target, event) {
                     Ok(Some(update)) => updates.push(update),
@@ -404,12 +509,7 @@ impl RealRun {
                     .workflow
                     .as_ref()
                     .map(SavedWorkflow::capture);
-                self.suffix = completion
-                    .session
-                    .messages
-                    .into_iter()
-                    .skip(self.prefix.len())
-                    .collect();
+                self.suffix = completion.turn_suffix;
                 self.outcome = Some(match completion.result {
                     Ok(_) if !self.output_rejected => Observation::Succeeded,
                     Ok(_) => Observation::Failed,
@@ -431,6 +531,7 @@ impl RealRun {
         target: &RunTarget,
         store: &mut Writer,
         total: &polaris_provider::UsageMeter,
+        judge: Option<Arc<dyn polaris_provider::decision::Decider>>,
     ) -> Result<Option<Arc<polaris_core::desktop_memory::DesktopMemory>>, ServiceError> {
         let expected = store
             .snapshot()?
@@ -441,31 +542,35 @@ impl RealRun {
             .ok_or(StoreError::NotFound)?
             .configuration
             .history_mode;
-        if history.is_some()
-            != (expected == polaris_desktop_protocol::snapshot::HistoryMode::Strict10)
-        {
+        if history.is_some() == expected.is_legacy() {
             return Err(ServiceError::Options);
         }
         let Some(history) = history else {
             return Ok(None);
         };
-        store.bind_memory(target, history.identity.clone())?;
         let summary = Arc::new(polaris_core::strict_provider::ProviderSummary::new(
             Arc::new(total.wrap(history.summary_provider)),
         ));
-        self.summary_usage = Some(summary.usage.clone());
-        self.embedding_usage = Some(history.embedding_usage);
-        let strict = Arc::new(polaris_core::conversation_memory::StrictHistory::new(
-            summary,
-            history.embedder,
-        ));
+        let summary_usage = summary.usage.clone();
+        // The same judge the run's preselection uses. Here it only reorders
+        // the related candidates; it never drops one.
+        let strict = Arc::new(
+            polaris_core::conversation_memory::StrictHistory::new(summary, history.embedder)
+                .judged_by(judge),
+        );
         let (memory, owner) = polaris_core::desktop_memory::DesktopMemory::pair(
             target.clone(),
             strict,
-            history.database,
-            history.identity,
+            history.database.clone(),
+            history.identity.clone(),
         )
         .map_err(|_| ServiceError::Options)?;
+        if expected.is_structured() {
+            store.prepare_structured_memory_index(target, &history.database, &history.identity)?;
+        }
+        store.bind_memory(target, history.identity)?;
+        self.summary_usage = Some(summary_usage);
+        self.embedding_usage = Some(history.embedding_usage);
         self.memory = Some(owner);
         Ok(Some(memory))
     }
@@ -698,6 +803,14 @@ impl Engine {
             return Err(StoreError::RecoveryRequired.into());
         }
         let published = self.store.snapshot()?;
+        // Taken before `active` is borrowed, because the request context
+        // below is built inside that borrow. Leaving it `None` there is what
+        // kept the desktop on the judge-free path: the owner was started with
+        // a judge and then never handed it to preselection.
+        let judge = self
+            .trusted_runs
+            .as_ref()
+            .and_then(|trusted| trusted.factory.decider());
         let Some(active) = &mut self.active else {
             return Ok(());
         };
@@ -766,7 +879,10 @@ impl Engine {
             }
         }
         let active = self.active.as_mut().ok_or(ServiceError::Worker)?;
+        let awaiting_approval = active.execution.awaiting_approval();
         let real = active.real.as_mut().ok_or(ServiceError::Worker)?;
+        // The window reports what the run is doing; it is read, not acted on.
+        real.refresh_activity(awaiting_approval);
         // Approval waits must never suppress this poll or cancellation delivery.
         let child_events = match real.poll(&active.target, Some(&mut self.store)) {
             Ok(events) => events,
@@ -837,47 +953,129 @@ impl Engine {
                             &active.target,
                             &mut self.store,
                             &active.usage,
+                            judge.clone(),
                         );
                         if desktop_memory.is_err() {
                             real.outcome = Some(Observation::Failed);
                         }
-                        let input = DesktopRunInput {
-                            run_id: active.target.run_id.clone(),
-                            prepared: inputs.prepared,
-                            execution: active.execution.port.clone(),
-                            provider: Arc::new(
+                        let desktop_workflow = workflow.as_ref().map(|_| {
+                            let (workflow, owner) =
+                                polaris_core::desktop_workflow::DesktopWorkflow::pair(
+                                    active.target.clone(),
+                                );
+                            real.workflow_owner = Some(owner);
+                            workflow
+                        });
+                        let request_context = if let Some(mcp) = inputs.mcp.take() {
+                            if mcp.config.project_id() != current.marker.project_id.as_str() {
+                                Err(StoreError::TargetMismatch)
+                            } else {
                                 active
-                                    .usage
-                                    .wrap(Arc::new(real.main_usage.wrap(inputs.provider))),
-                            ),
-                            provider_pool: Arc::new(
-                                active
-                                    .usage
-                                    .wrap(Arc::new(real.main_usage.wrap(inputs.provider_pool))),
-                            ),
-                            session: Session {
-                                messages: real.prefix.clone(),
-                                tool_memory: inputs.tool_memory,
-                                workflow,
-                                desktop_memory: desktop_memory.unwrap_or(None),
-                                ..Session::new()
-                            },
-                            always_on: inputs.always_on,
-                            audit: inputs.audit,
-                            max_turns: inputs.max_turns,
-                            skills: inputs.skills,
-                            agent_types: inputs.agent_types,
-                            spawn_concurrency: inputs.spawn_concurrency,
-                            spawn_write_concurrency: inputs.spawn_write_concurrency,
-                        };
-                        if real.outcome.is_none() {
-                            match DesktopRun::start(input) {
-                                Ok((worker, events)) => {
-                                    real.worker = Some(worker);
-                                    real.events = Some(events);
-                                }
-                                Err(_) => real.outcome = Some(Observation::Failed),
+                                    .execution
+                                    .configure_mcp(
+                                        &active.target,
+                                        current.marker.session_id.clone(),
+                                        inputs.external_ceiling,
+                                        polaris_core::approval::ApprovalPolicy::Always,
+                                    )
+                                    .map(|port| {
+                                        // Read at root run start; a busy or damaged
+                                        // cache only disables preselection.
+                                        let index = self.mcp_settings.as_ref().map_or(
+                                            Ok(None),
+                                            |settings| {
+                                                settings
+                                                    .store
+                                                    .load_catalog_index()
+                                                    .map(|index| {
+                                                        index.map(|index| {
+                                                            index.verified(mcp.config.registry())
+                                                        })
+                                                    })
+                                                    .map_err(polaris_core::mcp::preselection::index_status)
+                                            },
+                                        );
+                                        let selector = mcp.selection_provider.map(|provider| {
+                                            Arc::new(active.usage.wrap(provider))
+                                                as Arc<dyn Provider>
+                                        });
+                                        DesktopRequestContext::Mcp {
+                                            config: Box::new(mcp.config),
+                                            port,
+                                            prompt: target.mcp_prompt.clone(),
+                                            preselection:
+                                                polaris_core::desktop_run::McpPreselection {
+                                                    index,
+                                                    selector,
+                                                    decider: judge.clone(),
+                                                },
+                                        }
+                                    })
                             }
+                        } else {
+                            self.store
+                                .project_request_history(&active.target)
+                                .map(DesktopRequestContext::Prepared)
+                        };
+                        // Detection and approved registration only; a store
+                        // failure leaves the run without the tool.
+                        let mcp_setup = self.mcp_settings.as_ref().and_then(|settings| {
+                            let port = active
+                                .execution
+                                .configure_registration(&active.target, inputs.external_ceiling)
+                                .ok()?;
+                            Some(Arc::new(polaris_core::mcp::setup::SetupTool::new(
+                                settings.home.clone(),
+                                settings.runtime_roots.clone(),
+                                settings.excluded_roots.clone(),
+                                settings.limits,
+                                current.marker.project_id.as_str().into(),
+                                polaris_core::mcp::setup::Authorization::Owner(port),
+                            )))
+                        });
+                        if let Ok(request_context) = request_context {
+                            let input =
+                                DesktopRunInput {
+                                    target: active.target.clone(),
+                                    prepared: inputs.prepared,
+                                    execution: active.execution.port.clone(),
+                                    provider: Arc::new(
+                                        active
+                                            .usage
+                                            .wrap(Arc::new(real.main_usage.wrap(inputs.provider))),
+                                    ),
+                                    provider_pool: Arc::new(active.usage.wrap(Arc::new(
+                                        real.main_usage.wrap(inputs.provider_pool),
+                                    ))),
+                                    session: Session {
+                                        messages: real.prefix.clone(),
+                                        tool_memory: inputs.tool_memory,
+                                        workflow,
+                                        desktop_memory: desktop_memory.unwrap_or(None),
+                                        desktop_workflow,
+                                        mcp_setup,
+                                        ..Session::new()
+                                    },
+                                    request_context,
+                                    always_on: inputs.always_on,
+                                    audit: inputs.audit,
+                                    max_turns: inputs.max_turns,
+                                    skills: inputs.skills,
+                                    agent_types: inputs.agent_types,
+                                    spawn_concurrency: inputs.spawn_concurrency,
+                                    spawn_write_concurrency: inputs.spawn_write_concurrency,
+                                };
+                            if real.outcome.is_none() {
+                                match DesktopRun::start(input) {
+                                    Ok((worker, events)) => {
+                                        real.worker = Some(worker);
+                                        real.events = Some(events);
+                                    }
+                                    Err(_) => real.outcome = Some(Observation::Failed),
+                                }
+                            }
+                        } else {
+                            real.outcome = Some(Observation::Failed);
                         }
                     }
                 } else {
@@ -886,6 +1084,9 @@ impl Engine {
             }
         }
         if real.outcome.is_some() {
+            active
+                .execution
+                .record_finished_registrations(&mut self.store, &active.target)?;
             // An unresolved summary may have consumed a provider request. Preserve
             // its durable intent and refuse automatic replay after restart.
             if self
@@ -944,6 +1145,13 @@ impl Engine {
             .map(|c| c.child.run_id)
             .collect();
         if active.started {
+            // MCP may have published its canonical result after the caller
+            // future was dropped. Reconcile only after owner cleanup completes.
+            let suffix = self.store.reconcile_mcp_turn_suffix(
+                &active.target,
+                real.suffix.clone(),
+                real.workflow.as_ref(),
+            )?;
             if real.output_rejected {
                 self.store
                     .record_history_gap(&active.target, HistoryGap::OutputRejected)
@@ -954,7 +1162,7 @@ impl Engine {
                 &active.operation,
                 outcome,
                 result,
-                real.suffix.clone(),
+                suffix,
                 real.workflow.clone(),
             )?;
         } else if !state.run.state.is_terminal() {
@@ -962,6 +1170,9 @@ impl Engine {
                 .finish(&active.target, Observation::Cancelled, result)?;
         }
         active.execution.saved = true;
+        // A cancelled run can still be saved as failed (its last checkpoint is
+        // refused), so the continuation is told about the cancel directly.
+        let stopped_by_person = cancel || active.real.as_ref().is_some_and(|real| real.cancelled);
         let active = self.active.take().ok_or(ServiceError::Worker)?;
         let saved = self.store.snapshot()?;
         if let Some(prepared) = active
@@ -1053,6 +1264,158 @@ impl Engine {
                 .ok_or(StoreError::NotFound)?
                 .run;
             self.emit(EventBody::RunState(run), out)?;
+        }
+        self.continue_goal(out, stopped_by_person)
+    }
+
+    /// M6-4: whether the goal is done, after a run that finished the way it
+    /// was asked to.
+    ///
+    /// One typed question, run on its own current-thread runtime because
+    /// the settle path is synchronous. That is affordable here and would
+    /// not be on the main model: this is a separate service, billed on its
+    /// own, answering one question — the send path and the usage
+    /// accounting that deferred this work are not involved.
+    ///
+    /// `None` whenever there is no judge, no answer, or an answer that is
+    /// not confident. The caller leaves the run alone on `None`.
+    fn judge_goal(&self, goal: &str) -> Option<bool> {
+        let factory = self.trusted_runs.as_ref()?.factory.clone();
+        let decider = factory.decider()?;
+        // The tasks and what each one was accepted on. This is the state
+        // the owner already keeps as the record of what was done, so the
+        // question is asked against the same evidence a person would read
+        // — not against the transcript, which is long and mostly working.
+        let saved = self.store.snapshot().ok()?;
+        let evidence = saved
+            .state
+            .tasks
+            .iter()
+            .map(|task| {
+                let met = task
+                    .acceptance
+                    .iter()
+                    .filter(|held| {
+                        held.state == polaris_desktop_protocol::snapshot::AcceptanceState::Passed
+                    })
+                    .count();
+                format!(
+                    "- {} [{:?}] 受入 {}/{}",
+                    task.title,
+                    task.state,
+                    met,
+                    task.acceptance.len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?
+            .block_on(polaris_core::resume::achieved::judge(
+                decider.as_ref(),
+                goal,
+                &evidence,
+                std::future::pending(),
+            ))
+    }
+
+    /// M6-2b: one automatic continuation, only while a goal is unfinished and
+    /// nothing is unresolved. The budget is spent before the run is accepted,
+    /// so a crash in between refuses instead of repeating.
+    fn continue_goal(
+        &mut self,
+        out: Option<&Outbox>,
+        stopped_by_person: bool,
+    ) -> Result<(), ServiceError> {
+        use polaris_core::resume::{Decision, Observed, decide};
+        let saved = self.store.snapshot()?;
+        let (Some(goal), Some(client)) = (saved.state.goal.clone(), self.client.clone()) else {
+            return Ok(());
+        };
+        // The person's own text is never replaced by the goal, and their stop
+        // is never re-read from a state that lost it.
+        if stopped_by_person
+            || !saved.state.draft.text.is_empty()
+            || !saved.state.draft.attachment_ids.is_empty()
+        {
+            return Ok(());
+        }
+        let mut observed = Observed {
+            goal_active: goal.active,
+            goal_stopped: goal.stopped,
+            previous: saved.state.runs.last().map(|record| record.run.state),
+            awaiting_approval: !saved.state.unresolved_approvals.is_empty(),
+            automatic_used: goal.automatic_used.get(),
+            // Asked for below, and only when it could change the outcome.
+            goal_achieved: None,
+        };
+        if decide(&observed) != Decision::Continue {
+            // M6-4: a run can finish exactly as asked and still be one step
+            // of the goal. That is the only case worth a question, so the
+            // judge is asked here and nowhere else — after everything that
+            // refuses for another reason has already refused.
+            let judged = matches!(
+                decide(&observed),
+                Decision::Refuse {
+                    reason: polaris_core::resume::Refusal::Completed
+                }
+            )
+            .then(|| self.judge_goal(&goal.text))
+            .flatten();
+            if judged != Some(false) {
+                return Ok(());
+            }
+            observed.goal_achieved = judged;
+            if decide(&observed) != Decision::Continue {
+                return Ok(());
+            }
+        }
+        self.store.record_automatic_resume()?;
+        let draft_revision = saved.state.draft.draft_revision;
+        let request = |engine: &mut Self, body| Request {
+            protocol_version: Default::default(),
+            client_id: client.clone(),
+            request_id: RequestId::new(engine.id("auto")).expect("bounded identifier"),
+            body,
+        };
+        let draft = request(
+            self,
+            RequestBody::DraftUpdate(
+                self.session.clone(),
+                polaris_desktop_protocol::request::DraftUpdate {
+                    expected_draft_revision: draft_revision,
+                    text: goal.text.clone(),
+                    attachment_ids: Vec::new(),
+                },
+            ),
+        );
+        let start = request(
+            self,
+            RequestBody::RunStart(
+                self.session.clone(),
+                polaris_desktop_protocol::request::RunStart {
+                    mcp_prompt: None,
+                    expected_draft_revision: DecimalU64::new(draft_revision.get() + 1),
+                    expected_configuration_revision: saved
+                        .state
+                        .configuration
+                        .configuration_revision,
+                    expected_policy_revision: saved.state.policy_revision,
+                },
+            ),
+        );
+        let mut events = Vec::new();
+        for automatic in [draft, start] {
+            if self.handle(&automatic, &mut events).is_err() {
+                // A refused continuation stays refused; the spent budget is
+                // not returned, so it cannot be retried in a loop.
+                break;
+            }
+        }
+        if let Some(out) = out {
+            self.emit_all(events, out)?;
         }
         Ok(())
     }

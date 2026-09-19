@@ -15,6 +15,10 @@ indirect enum ServiceValue: Sendable, Equatable {
     if case .string(let value) = self { return value }
     return nil
   }
+  var bool: Bool? {
+    if case .bool(let value) = self { return value }
+    return nil
+  }
   // Rust's opaque IDs compare bytes, unlike Swift's canonical-equivalent String equality.
   func matchesID(_ id: String) -> Bool { string?.utf8.elementsEqual(id.utf8) == true }
   var decimal: UInt64? {

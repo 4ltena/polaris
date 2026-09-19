@@ -2,8 +2,20 @@
 
 mod local_models;
 #[cfg(target_os = "macos")]
+mod mcp_catalog;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../polaris-core/src/mcp/runtime/tests/fixture.rs"]
+mod mcp_fixture;
+#[cfg(target_os = "macos")]
+mod mcp_settings;
+#[cfg(target_os = "macos")]
+mod mcp_setup;
+#[cfg(target_os = "macos")]
+pub(crate) use mcp_settings::McpSettings;
+#[cfg(target_os = "macos")]
 mod real;
 mod role_bindings;
+mod run_details;
 #[cfg(target_os = "macos")]
 mod source_owner;
 #[cfg(target_os = "macos")]
@@ -11,7 +23,8 @@ mod source_recovery;
 mod source_view;
 #[cfg(target_os = "macos")]
 pub use real::{
-    TrustedHistoryResources, TrustedRunCompletion, TrustedRunFactory, TrustedRunInputs,
+    TrustedHistoryResources, TrustedMcpResources, TrustedRunCompletion, TrustedRunFactory,
+    TrustedRunInputs,
 };
 #[cfg(target_os = "macos")]
 pub use source_owner::{SourceApplyRuntime, TrustedSourceFactory};
@@ -30,7 +43,7 @@ use polaris_desktop_protocol::{
     request::{Request, RequestBody, RunTarget},
     response::*,
     run_state::{Observation, RunState},
-    snapshot::{Configuration, Draft, Position, Snapshot},
+    snapshot::{Configuration, Draft, Position, Snapshot, WorkflowStatus},
     validate::{ConnectionState, validate_request},
 };
 use std::{
@@ -53,6 +66,67 @@ const REQUEST_RECORDS: usize = 128;
 const RUNS: usize = 32;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 static EPOCH_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+fn workflow_phase(
+    phase: polaris_desktop_protocol::request::WorkflowPhase,
+) -> polaris_core::workflow::Phase {
+    use polaris_desktop_protocol::request::WorkflowPhase as Wire;
+    match phase {
+        Wire::General => polaris_core::workflow::Phase::General,
+        Wire::Brainstorm => polaris_core::workflow::Phase::Brainstorm,
+        Wire::Specify => polaris_core::workflow::Phase::Specify,
+        Wire::Implement => polaris_core::workflow::Phase::Implement,
+        Wire::Review => polaris_core::workflow::Phase::Review,
+        Wire::Verify => polaris_core::workflow::Phase::Verify,
+        Wire::Deliver => polaris_core::workflow::Phase::Deliver,
+    }
+}
+
+fn workflow_status(saved: &polaris_core::desktop_store::SavedWorkflow) -> WorkflowStatus {
+    use polaris_desktop_protocol::request::{WorkflowMode as WireMode, WorkflowPhase as WirePhase};
+    let mode = match saved.config.mode {
+        polaris_core::workflow::WorkflowMode::Manual => WireMode::Manual,
+        polaris_core::workflow::WorkflowMode::Adaptive => WireMode::Adaptive,
+    };
+    let phase = match saved.state.phase {
+        polaris_core::workflow::Phase::General => WirePhase::General,
+        polaris_core::workflow::Phase::Brainstorm => WirePhase::Brainstorm,
+        polaris_core::workflow::Phase::Specify => WirePhase::Specify,
+        polaris_core::workflow::Phase::Implement => WirePhase::Implement,
+        polaris_core::workflow::Phase::Review => WirePhase::Review,
+        polaris_core::workflow::Phase::Verify => WirePhase::Verify,
+        polaris_core::workflow::Phase::Deliver => WirePhase::Deliver,
+    };
+    WorkflowStatus {
+        enabled: saved.config.enabled,
+        mode,
+        phase,
+        revision: DecimalU64::new(saved.state.revision),
+    }
+}
+
+pub(super) fn validated_workflow(
+    config: polaris_core::workflow::WorkflowConfig,
+    gates: polaris_core::workflow::WorkflowGatesV1,
+    state: polaris_core::workflow::WorkflowStateV1,
+    skills: &[polaris_skills::Skill],
+) -> Result<polaris_core::desktop_store::SavedWorkflow, ProtocolError> {
+    let workflow =
+        polaris_core::workflow::SessionWorkflow::restore(config.clone(), gates.clone(), state)
+            .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
+    if !config.enabled {
+        return Ok(polaris_core::desktop_store::SavedWorkflow::capture(
+            &workflow,
+        ));
+    }
+    let turn = workflow
+        .begin_turn(skills)
+        .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
+    Ok(polaris_core::desktop_store::SavedWorkflow::capture(
+        &polaris_core::workflow::SessionWorkflow::restore(config, gates, turn.state.clone())
+            .map_err(|_| error(ErrorCode::CapabilityUnavailable))?,
+    ))
+}
 
 pub fn project_id() -> ProjectId {
     ProjectId::new("fake-project").unwrap()
@@ -275,6 +349,34 @@ where
                             .and_then(|response| out.send(&response)),
                     }
                 }
+                Command::Request(request)
+                    if matches!(
+                        request.body,
+                        RequestBody::McpCatalogCheck(..)
+                            | RequestBody::McpSetupDetect(..)
+                            | RequestBody::McpSetupRegister(..)
+                    ) =>
+                {
+                    #[cfg(target_os = "macos")]
+                    let outcome = if matches!(request.body, RequestBody::McpCatalogCheck(..)) {
+                        engine
+                            .start_mcp_catalog(&request)
+                            .map(|result| result.map(SuccessResult::McpCatalogCheck))
+                    } else {
+                        engine.start_mcp_setup(&request).map(|()| None)
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let outcome = Err(error(ErrorCode::CapabilityUnavailable));
+                    match outcome {
+                        Ok(None) => Ok(()),
+                        Ok(Some(result)) => Response::for_request(&request, Ok(result))
+                            .map_err(|_| ServiceError::Worker)
+                            .and_then(|response| out.send(&response)),
+                        Err(error) => Response::for_request(&request, Err(error))
+                            .map_err(|_| ServiceError::Worker)
+                            .and_then(|response| out.send(&response)),
+                    }
+                }
                 Command::Request(request) => {
                     let mut events = Vec::new();
                     let outcome = engine.handle(&request, &mut events);
@@ -346,7 +448,8 @@ where
                 && engine.active.is_none()
                 && engine.cleanups.is_empty()
                 && !engine.source_unsettled()
-                && engine.local_models.is_none();
+                && engine.local_models.is_none()
+                && engine.mcp_catalog_idle();
             if engine.ready
                 || failed_without_owned_work
                 || (!engine.production
@@ -532,6 +635,7 @@ struct Engine {
     client: Option<ClientId>,
     subscription: Option<Position>,
     history: Option<History>,
+    details: Option<run_details::Details>,
     serial: u64,
     active: Option<Active>,
     draining: bool,
@@ -540,6 +644,12 @@ struct Engine {
     served: bool,
     disconnected: Arc<AtomicBool>,
     cleanups: crate::execution::CleanupOwner,
+    #[cfg(target_os = "macos")]
+    mcp_settings: Option<mcp_settings::McpSettings>,
+    #[cfg(target_os = "macos")]
+    mcp_catalog: Option<mcp_catalog::CatalogJob>,
+    #[cfg(target_os = "macos")]
+    mcp_setup: mcp_setup::McpSetupState,
     #[cfg(all(test, unix))]
     pause: Option<tests::Pause>,
 }
@@ -604,6 +714,7 @@ impl Engine {
             client: None,
             subscription: None,
             history: None,
+            details: None,
             serial: 0,
             active: None,
             draining: false,
@@ -611,6 +722,12 @@ impl Engine {
             failed: false,
             served: false,
             cleanups: Default::default(),
+            #[cfg(target_os = "macos")]
+            mcp_settings: None,
+            #[cfg(target_os = "macos")]
+            mcp_catalog: None,
+            #[cfg(target_os = "macos")]
+            mcp_setup: Default::default(),
             #[cfg(all(test, unix))]
             pause: None,
         }
@@ -718,6 +835,7 @@ impl Engine {
                         Capability::LocalModels,
                         Capability::RequestStatus,
                         Capability::Shutdown,
+                        Capability::RunDetailsRead,
                     ]
                 } else {
                     let mut capabilities = vec![
@@ -731,6 +849,7 @@ impl Engine {
                         Capability::ApprovalResolve,
                         Capability::RequestStatus,
                         Capability::Shutdown,
+                        Capability::RunDetailsRead,
                     ];
                     #[cfg(target_os = "macos")]
                     if self.workspace_reader.is_some() {
@@ -741,11 +860,16 @@ impl Engine {
                         capabilities.push(Capability::SourceApplyResolve);
                     }
                     if self.real_enabled() {
+                        capabilities.push(Capability::WorkflowConfigure);
                         capabilities.push(Capability::LocalModels);
                         capabilities.push(Capability::RoleConfigure);
                     }
                     if self.production {
                         capabilities.retain(|c| *c != Capability::SessionConfigure);
+                    }
+                    #[cfg(target_os = "macos")]
+                    if self.mcp_settings.is_some() {
+                        capabilities.push(Capability::McpSettings);
                     }
                     capabilities
                 },
@@ -764,6 +888,10 @@ impl Engine {
         {
             return Err(error(ErrorCode::CapabilityUnavailable));
         }
+        #[cfg(target_os = "macos")]
+        if self.mcp_catalog.is_some() && matches!(request.body, RequestBody::RunStart(..)) {
+            return Err(error(ErrorCode::SessionBusy));
+        }
         if matches!(request.body, RequestBody::SourceApplyResolve(..)) && !self.source_enabled() {
             return Err(error(ErrorCode::CapabilityUnavailable));
         }
@@ -776,6 +904,9 @@ impl Engine {
                 RequestBody::RunStart(..)
                     | RequestBody::DraftUpdate(..)
                     | RequestBody::SessionConfigure(..)
+                    | RequestBody::WorkflowConfigure(..)
+                    | RequestBody::GoalUpdate(..)
+                    | RequestBody::InstructionSend(..)
             )
         {
             return Err(error(ErrorCode::SessionBusy));
@@ -852,6 +983,7 @@ impl Engine {
             RequestBody::HistoryPage(_, params) => {
                 Ok(SuccessResult::HistoryPage(self.history_page(params)?))
             }
+            RequestBody::WorkflowConfigure(_, params) => self.configure_workflow(params),
             RequestBody::SourceApplyList(_, params) => self.source_list(params),
             RequestBody::SourceApplyPage(_, params) => self.source_page(params),
             RequestBody::ApprovalResolve(..) => self.resolve_approval(request, events),
@@ -872,7 +1004,8 @@ impl Engine {
                 self.ready &= self.active.is_none()
                     && self.cleanups.is_empty()
                     && !self.source_unsettled()
-                    && self.local_models.is_none();
+                    && self.local_models.is_none()
+                    && self.mcp_catalog_idle();
                 if let Some(active) = &mut self.active {
                     active.cancel();
                 }
@@ -884,6 +1017,44 @@ impl Engine {
                         ShutdownState::Draining
                     },
                 }))
+            }
+            RequestBody::McpCatalogCheck(..)
+            | RequestBody::McpSetupDetect(..)
+            | RequestBody::McpSetupRegister(..) => Err(error(ErrorCode::InvalidRequest)),
+            RequestBody::RunDetails(_, params) => {
+                Ok(SuccessResult::RunDetails(self.run_details(params)?))
+            }
+            RequestBody::BrowseList(..) | RequestBody::BrowseRead(..) => {
+                Err(error(ErrorCode::CapabilityUnavailable))
+            }
+            RequestBody::McpCatalogCancel(_, target) => {
+                #[cfg(target_os = "macos")]
+                {
+                    if self.mcp_settings.is_none() {
+                        return Err(error(ErrorCode::CapabilityUnavailable));
+                    }
+                    Ok(SuccessResult::McpCatalogCancel(
+                        self.cancel_mcp_catalog(target),
+                    ))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = target;
+                    Err(error(ErrorCode::CapabilityUnavailable))
+                }
+            }
+            RequestBody::McpRegistryRead(_)
+            | RequestBody::McpRegistrySave(..)
+            | RequestBody::McpSecretSet(..)
+            | RequestBody::McpSecretDelete(..) => {
+                #[cfg(target_os = "macos")]
+                {
+                    self.mcp_settings_request(request)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Err(error(ErrorCode::CapabilityUnavailable))
+                }
             }
             _ => self.mutate(request, events),
         }
@@ -944,12 +1115,116 @@ impl Engine {
         Ok(SuccessResult::ApprovalResolve(response))
     }
 
+    /// GUI configuration has only three selections. The profile text, skill
+    /// IDs and paths remain the startup owner's validated catalog.
+    fn configure_workflow(
+        &mut self,
+        params: &polaris_desktop_protocol::request::WorkflowConfigure,
+    ) -> Result<SuccessResult, ProtocolError> {
+        if self.active.is_some()
+            || !self.cleanups.is_empty()
+            || self.source_unsettled()
+            || self
+                .store
+                .snapshot()
+                .map_err(store_error)?
+                .state
+                .runs
+                .iter()
+                .any(|run| !run.run.state.is_terminal())
+        {
+            return Err(error(ErrorCode::SessionBusy));
+        }
+        let factory = self
+            .trusted_runs
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .factory
+            .clone();
+        let saved = self.store.snapshot().map_err(store_error)?;
+        let (mut config, gates, state) = match saved.state.workflow {
+            Some(saved) => (saved.config, saved.gates, saved.state),
+            None => {
+                let config = factory
+                    .workflow_config()
+                    .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                    .clone();
+                (
+                    config.clone(),
+                    polaris_core::workflow::WorkflowGatesV1::default(),
+                    polaris_core::workflow::WorkflowStateV1 {
+                        phase: config.initial_phase,
+                        ..Default::default()
+                    },
+                )
+            }
+        };
+        config.enabled = params.enabled;
+        config.mode = match params.mode {
+            polaris_desktop_protocol::request::WorkflowMode::Manual => {
+                polaris_core::workflow::WorkflowMode::Manual
+            }
+            polaris_desktop_protocol::request::WorkflowMode::Adaptive => {
+                polaris_core::workflow::WorkflowMode::Adaptive
+            }
+        };
+        let phase = workflow_phase(params.initial_phase);
+        config.initial_phase = phase;
+        let workflow = {
+            let candidate = polaris_core::workflow::SessionWorkflow::restore(
+                config.clone(),
+                gates.clone(),
+                state,
+            )
+            .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
+            candidate
+                .request_phase(phase)
+                .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
+            validated_workflow(config, gates, candidate.state(), factory.workflow_skills())?
+        };
+        self.store
+            .configure_workflow(params.expected_session_revision, Some(workflow))
+            .map_err(store_error)?;
+        let saved = self.store.snapshot().map_err(store_error)?;
+        Ok(SuccessResult::WorkflowConfigure(WorkflowConfigured {
+            session_revision: saved.marker.session_revision,
+            workflow: saved.state.workflow.as_ref().map(workflow_status),
+        }))
+    }
+
+    /// New/legacy desktop sessions must have a durable configuration before a
+    /// RunStart is admitted. Failure leaves the request unaccepted.
+    fn initialize_workflow(&mut self, expected: DecimalU64) -> Result<(), ProtocolError> {
+        let factory = self
+            .trusted_runs
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .factory
+            .clone();
+        let config = factory
+            .workflow_config()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .clone();
+        let workflow = validated_workflow(
+            config.clone(),
+            polaris_core::workflow::WorkflowGatesV1::default(),
+            polaris_core::workflow::WorkflowStateV1 {
+                phase: config.initial_phase,
+                ..Default::default()
+            },
+            factory.workflow_skills(),
+        )?;
+        self.store
+            .configure_workflow(expected, Some(workflow))
+            .map_err(store_error)
+    }
+
     fn mutate(
         &mut self,
         request: &Request,
         events: &mut Vec<EventBody>,
     ) -> Result<SuccessResult, ProtocolError> {
-        let before = self.store.snapshot().map_err(store_error)?;
+        let mut before = self.store.snapshot().map_err(store_error)?;
         let existing = self
             .store
             .request_status(&self.session, &request.client_id, &request.request_id)
@@ -964,6 +1239,12 @@ impl Engine {
                 return Err(error(ErrorCode::CapabilityUnavailable));
             }
             match &request.body {
+                RequestBody::RunStart(..)
+                    if self.real_enabled() && before.state.workflow.is_none() =>
+                {
+                    self.initialize_workflow(before.marker.session_revision)?;
+                    before = self.store.snapshot().map_err(store_error)?;
+                }
                 RequestBody::DraftUpdate(_, p)
                     if p.text.len() > TEXT_BYTES || !p.attachment_ids.is_empty() =>
                 {
@@ -1039,7 +1320,24 @@ impl Engine {
         {
             source.reserve(target.clone())?;
         }
-        let accepted = match self.store.apply(request, target.clone()) {
+        // The binding is decided before the acceptance writes it, so a run is
+        // never saved without the registration its sends must use. A re-sent
+        // request keeps the binding its acceptance already saved.
+        let account = match (&target, existing.is_none(), self.trusted_runs.as_ref()) {
+            (Some(_), true, Some(runs)) => match runs.factory.bind_account() {
+                Ok(account) => account,
+                Err(_) => {
+                    // Nothing was accepted, so the placeholder goes back too.
+                    #[cfg(target_os = "macos")]
+                    if let (Some(source), Some(target)) = (&mut self.source, &target) {
+                        source.release_unused(target);
+                    }
+                    return Err(error(ErrorCode::CapabilityUnavailable));
+                }
+            },
+            _ => None,
+        };
+        let accepted = match self.store.apply_bound(request, target.clone(), account) {
             Ok(accepted) => accepted,
             Err(e) => {
                 // A definitely rejected start releases its placeholder. Ambiguous
@@ -1079,6 +1377,20 @@ impl Engine {
                     session_revision: revision,
                     configuration,
                 }))
+            }
+            RequestResult::GoalUpdated { goal_revision } => Ok(SuccessResult::GoalUpdate(
+                polaris_desktop_protocol::response::GoalUpdated {
+                    session_revision: revision,
+                    goal_revision,
+                },
+            )),
+            RequestResult::InstructionReceived { instruction_id } => {
+                Ok(SuccessResult::InstructionSend(
+                    polaris_desktop_protocol::response::InstructionReceived {
+                        session_revision: revision,
+                        instruction_id,
+                    },
+                ))
             }
             RequestResult::RunAccepted { run_id, attempt_id } => {
                 if fresh {
@@ -1169,6 +1481,7 @@ impl Engine {
             position: position.clone(),
             draft: state.draft.clone(),
             configuration: state.configuration.clone(),
+            workflow: state.workflow.as_ref().map(workflow_status),
             memory: state.runs.last().and_then(|r| r.memory.clone()),
             role_bindings: role_bindings::to_wire(state.role_bindings.as_ref()),
             role_catalog: self.role_catalog_wire(),
@@ -1272,8 +1585,22 @@ impl Engine {
             }
         }
     }
+    fn mcp_catalog_idle(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.mcp_catalog.is_none() && self.mcp_setup.job.is_none()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
+    }
     fn step(&mut self, out: &Outbox) -> Result<(), ServiceError> {
         self.poll_local_models(Some(out), false)?;
+        #[cfg(target_os = "macos")]
+        self.poll_mcp_catalog(Some(out), false)?;
+        #[cfg(target_os = "macos")]
+        self.poll_mcp_setup(Some(out), false)?;
         self.poll_source(false)?;
         self.cleanups.step();
         self.checkpoint_usage()?;
@@ -1450,6 +1777,10 @@ impl Engine {
     fn settle(&mut self, out: &Outbox) -> Result<(), ServiceError> {
         self.ready = false;
         self.poll_local_models(Some(out), true)?;
+        #[cfg(target_os = "macos")]
+        self.poll_mcp_catalog(Some(out), true)?;
+        #[cfg(target_os = "macos")]
+        self.poll_mcp_setup(Some(out), true)?;
         let source_result = self.poll_source(true);
         self.cleanups.step();
         self.cancel_and_poll_core();
@@ -1462,12 +1793,17 @@ impl Engine {
         self.ready = self.active.is_none()
             && self.cleanups.is_empty()
             && !self.source_unsettled()
-            && self.local_models.is_none();
+            && self.local_models.is_none()
+            && self.mcp_catalog_idle();
         Ok(())
     }
     fn settle_without_output(&mut self) -> Result<(), ServiceError> {
         self.ready = false;
         self.poll_local_models(None, true)?;
+        #[cfg(target_os = "macos")]
+        self.poll_mcp_catalog(None, true)?;
+        #[cfg(target_os = "macos")]
+        self.poll_mcp_setup(None, true)?;
         let source_result = self.poll_source(true);
         self.cleanups.step();
         self.cancel_and_poll_core();
@@ -1480,7 +1816,8 @@ impl Engine {
         self.ready = self.active.is_none()
             && self.cleanups.is_empty()
             && !self.source_unsettled()
-            && self.local_models.is_none();
+            && self.local_models.is_none()
+            && self.mcp_catalog_idle();
         Ok(())
     }
 }

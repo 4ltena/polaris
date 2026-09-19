@@ -152,6 +152,12 @@ impl Fixture {
             spawn_write_concurrency: 1,
             tool_memory: None,
             history: None,
+            mcp: None,
+            workflow: polaris_core::workflow::WorkflowConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            decider: None,
         };
         let directory = File::open(&recovery).unwrap();
         directory.sync_all().unwrap();
@@ -181,6 +187,7 @@ impl Fixture {
             self.writer,
             self.helper,
             TrustedBackend::Codex {
+                accounts: None,
                 tokens: self.tokens,
             },
             self.resources,

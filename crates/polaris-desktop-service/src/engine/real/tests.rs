@@ -1,6 +1,8 @@
 //! Offline real-engine ownership, durable transcript, and cancellation fixtures.
 use super::*;
-use polaris_desktop_protocol::request::{DraftUpdate, RunStart};
+use polaris_desktop_protocol::request::{
+    DraftUpdate, RunStart, WorkflowConfigure, WorkflowMode, WorkflowPhase,
+};
 use polaris_provider::{CompletionRequest, CompletionResponse, ProviderError, ToolCall, Usage};
 use std::{future::Future, io, os::unix::fs::PermissionsExt, pin::Pin, sync::atomic::AtomicUsize};
 
@@ -124,8 +126,12 @@ struct Factory {
     agent_types: Vec<polaris_skills::AgentType>,
     completions: Arc<std::sync::Mutex<Vec<TrustedRunCompletion>>>,
     history: Option<HistoryFixture>,
+    workflow: polaris_core::workflow::WorkflowConfig,
 }
 impl TrustedRunFactory for Factory {
+    fn workflow_config(&self) -> Option<&polaris_core::workflow::WorkflowConfig> {
+        Some(&self.workflow)
+    }
     fn completed(&self, completion: TrustedRunCompletion) {
         self.completions.lock().unwrap().push(completion);
     }
@@ -167,12 +173,15 @@ impl TrustedRunFactory for Factory {
             spawn_write_concurrency: 1,
             tool_memory: None,
             history: self.history.as_ref().map(HistoryFixture::resources),
+            mcp: None,
+            external_ceiling: polaris_core::mcp::operation::ExternalCeiling::Denied,
         })
     }
 }
 
 #[derive(Clone)]
 struct HistoryFixture {
+    mode: polaris_desktop_protocol::snapshot::HistoryMode,
     summary_provider: Arc<dyn Provider>,
     database: std::path::PathBuf,
     identity: polaris_core::desktop_store::MemoryResources,
@@ -221,6 +230,10 @@ impl FixtureEmbedder {
         if matches!(self.behavior, EmbedderBehavior::HoldPassage) && passage
             || matches!(self.behavior, EmbedderBehavior::HoldQuery) && !passage
         {
+            // Lets a parent process kill this one while the embedding is held.
+            if let Some(marker) = std::env::var_os("POLARIS_FIXTURE_HOLD_MARKER") {
+                std::fs::write(marker, b"held")?;
+            }
             return std::future::pending().await;
         }
         let ok = matches!(self.behavior, EmbedderBehavior::Valid)
@@ -323,14 +336,47 @@ struct Fixture {
     config: ServiceConfig,
     completions: Arc<std::sync::Mutex<Vec<TrustedRunCompletion>>>,
 }
-fn fixture(behavior: Behavior, invalid_limits: bool) -> Fixture {
-    fixture_with_history(behavior, invalid_limits, None, None)
+fn default_workflow() -> polaris_core::workflow::WorkflowConfig {
+    polaris_core::workflow::WorkflowConfig {
+        enabled: false,
+        always: vec![],
+        phase_skills: Default::default(),
+        ..Default::default()
+    }
 }
+
+fn fixture(behavior: Behavior, invalid_limits: bool) -> Fixture {
+    fixture_with_history_and_workflow(behavior, invalid_limits, None, None, default_workflow())
+}
+
+fn fixture_with_workflow(
+    behavior: Behavior,
+    workflow: polaris_core::workflow::WorkflowConfig,
+) -> Fixture {
+    fixture_with_history_and_workflow(behavior, false, None, None, workflow)
+}
+
 fn fixture_with_history(
     behavior: Behavior,
     invalid_limits: bool,
     history: Option<HistoryFixture>,
     provider_override: Option<Arc<dyn Provider>>,
+) -> Fixture {
+    fixture_with_history_and_workflow(
+        behavior,
+        invalid_limits,
+        history,
+        provider_override,
+        default_workflow(),
+    )
+}
+
+fn fixture_with_history_and_workflow(
+    behavior: Behavior,
+    invalid_limits: bool,
+    history: Option<HistoryFixture>,
+    provider_override: Option<Arc<dyn Provider>>,
+    workflow: polaris_core::workflow::WorkflowConfig,
 ) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
@@ -387,7 +433,7 @@ fn fixture_with_history(
             path: base.clone(),
             allowed_tools: vec![],
             access: polaris_skills::agent_type::AgentAccess::Read,
-            tier: "medium".into(),
+            tier: polaris_skills::Tier::Subgiant,
             wall_seconds: 5,
             max_turns: 2,
             workflow_phase: None,
@@ -395,6 +441,7 @@ fn fixture_with_history(
             output_schema: schema,
         }],
         history: history.clone(),
+        workflow,
     });
     std::fs::create_dir(base.join("store")).unwrap();
     std::fs::set_permissions(base.join("store"), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -406,11 +453,7 @@ fn fixture_with_history(
     let service = DesktopService::open_with_trusted_runs(
         config.clone(),
         Configuration {
-            history_mode: if history.is_some() {
-                polaris_desktop_protocol::snapshot::HistoryMode::Strict10
-            } else {
-                Default::default()
-            },
+            history_mode: history.as_ref().map(|h| h.mode).unwrap_or_default(),
             configuration_revision: DecimalU64::new(0),
             provider: "fixture".into(),
             model: "offline".into(),
@@ -431,6 +474,9 @@ fn fixture_with_history(
     }
 }
 
+mod mcp_tests;
+mod structured_tests;
+
 type RecordedRequests = Arc<std::sync::Mutex<Vec<CompletionRequest>>>;
 
 fn strict_fixture(
@@ -449,6 +495,7 @@ fn strict_fixture_with(
     let summary_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let memory_temp = tempfile::tempdir().unwrap();
     let history = HistoryFixture {
+        mode: polaris_desktop_protocol::snapshot::HistoryMode::Strict10,
         summary_provider: Arc::new(RecordingProvider {
             calls: summary_calls.clone(),
             summary: true,
@@ -489,6 +536,13 @@ fn request(id: &str, body: RequestBody) -> Request {
     }
 }
 fn start(engine: &mut Engine) -> Request {
+    start_with_prompt(engine, None)
+}
+
+fn start_with_prompt(
+    engine: &mut Engine,
+    prompt: Option<polaris_desktop_protocol::request::McpPromptChoice>,
+) -> Request {
     engine
         .handle(&request("hello", RequestBody::Hello), &mut vec![])
         .unwrap();
@@ -513,6 +567,7 @@ fn start(engine: &mut Engine) -> Request {
         RequestBody::RunStart(
             session_id(),
             RunStart {
+                mcp_prompt: prompt,
                 expected_draft_revision: DecimalU64::new(1),
                 expected_configuration_revision: DecimalU64::new(0),
                 expected_policy_revision: DecimalU64::new(0),
@@ -521,6 +576,175 @@ fn start(engine: &mut Engine) -> Request {
     );
     engine.handle(&start, &mut vec![]).unwrap();
     start
+}
+
+#[test]
+fn run_start_checkpoints_legacy_none_workflow_before_acceptance() {
+    let mut f = fixture(Behavior::Held, false);
+    let engine = f.service.engine.as_mut().unwrap();
+    assert!(engine.store.snapshot().unwrap().state.workflow.is_none());
+    start(engine);
+    let saved = engine.store.snapshot().unwrap();
+    assert!(saved.state.workflow.is_some());
+    assert!(saved.state.runs.last().unwrap().workflow.is_some());
+    assert_eq!(f.preparations.load(Ordering::SeqCst), 0);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn trusted_owner_rejects_invalid_workflow_catalog_before_provider_admission() {
+    let mut config = default_workflow();
+    config.enabled = true;
+    config.always = vec!["missing-skill".into()];
+    let mut f = fixture_with_workflow(Behavior::Held, config);
+    let engine = f.service.engine.take().unwrap();
+    let factory = engine.trusted_runs.as_ref().unwrap().factory.clone();
+    let result = DesktopService::from_trusted_store(
+        engine.store,
+        factory,
+        constructor_source_runtime(f._temp.path().into(), Arc::new(AtomicUsize::new(0)), 100),
+    );
+    assert!(matches!(result, Err(ServiceError::Options)));
+    assert_eq!(f.preparations.load(Ordering::SeqCst), 0);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn trusted_owner_persists_disabled_workflow_without_resolving_broken_profile() {
+    let mut config = default_workflow();
+    config.always = vec!["missing-skill".into()];
+    let mut f = fixture_with_workflow(Behavior::Held, config);
+    let engine = f.service.engine.take().unwrap();
+    let factory = engine.trusted_runs.as_ref().unwrap().factory.clone();
+    let mut service = DesktopService::from_trusted_store(
+        engine.store,
+        factory,
+        constructor_source_runtime(f._temp.path().into(), Arc::new(AtomicUsize::new(0)), 100),
+    )
+    .unwrap();
+    let workflow = service
+        .engine
+        .as_mut()
+        .unwrap()
+        .store
+        .snapshot()
+        .unwrap()
+        .state
+        .workflow
+        .unwrap();
+    assert!(!workflow.config.enabled);
+    assert_eq!(workflow.config.always, ["missing-skill"]);
+    assert_eq!(f.preparations.load(Ordering::SeqCst), 0);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn workflow_configure_uses_cas_preserves_disabled_and_snapshot_phase() {
+    let mut f = fixture(Behavior::Held, false);
+    let engine = f.service.engine.as_mut().unwrap();
+    engine
+        .handle(&request("hello", RequestBody::Hello), &mut vec![])
+        .unwrap();
+    let configured = engine
+        .handle(
+            &request(
+                "workflow",
+                RequestBody::WorkflowConfigure(
+                    session_id(),
+                    WorkflowConfigure {
+                        expected_session_revision: DecimalU64::new(0),
+                        enabled: false,
+                        mode: WorkflowMode::Adaptive,
+                        initial_phase: WorkflowPhase::Review,
+                    },
+                ),
+            ),
+            &mut vec![],
+        )
+        .unwrap();
+    let SuccessResult::WorkflowConfigure(status) = configured else {
+        panic!("workflow result")
+    };
+    let status = status.workflow.unwrap();
+    assert!(!status.enabled);
+    assert_eq!(status.mode, WorkflowMode::Adaptive);
+    assert_eq!(status.phase, WorkflowPhase::Review);
+    let saved = engine.store.snapshot().unwrap();
+    let workflow = saved.state.workflow.as_ref().unwrap();
+    assert!(!workflow.config.enabled);
+    assert_eq!(workflow.state.phase, polaris_core::workflow::Phase::Review);
+    assert!(matches!(
+        engine.handle(
+            &request(
+                "workflow-stale",
+                RequestBody::WorkflowConfigure(
+                    session_id(),
+                    WorkflowConfigure {
+                        expected_session_revision: DecimalU64::new(0),
+                        enabled: true,
+                        mode: WorkflowMode::Manual,
+                        initial_phase: WorkflowPhase::General,
+                    },
+                ),
+            ),
+            &mut vec![],
+        ),
+        Err(error) if error.code == ErrorCode::RevisionConflict
+    ));
+    let snapshot = engine.snapshot(false).unwrap();
+    assert_eq!(snapshot.workflow.unwrap().phase, WorkflowPhase::Review);
+    engine
+        .handle(
+            &request(
+                "workflow-draft",
+                RequestBody::DraftUpdate(
+                    session_id(),
+                    DraftUpdate {
+                        expected_draft_revision: DecimalU64::new(0),
+                        text: "fixture input".into(),
+                        attachment_ids: vec![],
+                    },
+                ),
+            ),
+            &mut vec![],
+        )
+        .unwrap();
+    engine
+        .handle(
+            &request(
+                "workflow-start",
+                RequestBody::RunStart(
+                    session_id(),
+                    RunStart {
+                        mcp_prompt: None,
+                        expected_draft_revision: DecimalU64::new(1),
+                        expected_configuration_revision: DecimalU64::new(0),
+                        expected_policy_revision: DecimalU64::new(0),
+                    },
+                ),
+            ),
+            &mut vec![],
+        )
+        .unwrap();
+    let revision = engine.store.snapshot().unwrap().marker.session_revision;
+    assert!(matches!(
+        engine.handle(
+            &request(
+                "workflow-busy",
+                RequestBody::WorkflowConfigure(
+                    session_id(),
+                    WorkflowConfigure {
+                        expected_session_revision: revision,
+                        enabled: true,
+                        mode: WorkflowMode::Manual,
+                        initial_phase: WorkflowPhase::General,
+                    },
+                ),
+            ),
+            &mut vec![],
+        ),
+        Err(error) if error.code == ErrorCode::SessionBusy
+    ));
 }
 fn until(engine: &mut Engine, predicate: impl Fn(&Engine) -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -564,6 +788,7 @@ fn queue_text(engine: &mut Engine, ordinal: u64) {
                 RequestBody::RunStart(
                     session_id(),
                     RunStart {
+                        mcp_prompt: None,
                         expected_draft_revision: saved.state.draft.draft_revision,
                         expected_configuration_revision: saved
                             .state
@@ -778,6 +1003,7 @@ fn real_engine_strict10_oversized_provenance_stops_before_embedding_and_main_wit
     assert!(polaris_core::budget::count_tokens(&text) <= 256);
     let database = tempfile::tempdir().unwrap();
     let history = HistoryFixture {
+        mode: polaris_desktop_protocol::snapshot::HistoryMode::Strict10,
         summary_provider: Arc::new(OverBudgetSummary {
             calls: summaries.clone(),
             text,
@@ -1502,6 +1728,7 @@ fn real_engine_approval_wait_does_not_starve_core_join() {
                 RequestBody::RunStart(
                     session_id(),
                     RunStart {
+                        mcp_prompt: None,
                         expected_draft_revision: next.state.draft.draft_revision,
                         expected_configuration_revision: next
                             .state
@@ -1551,6 +1778,31 @@ fn real_engine_start_failure_and_provider_failure_never_succeed() {
         assert_eq!(f.calls.load(Ordering::SeqCst), usize::from(!invalid));
         assert_eq!(saved.raw.len(), 1);
     }
+}
+
+#[test]
+fn real_engine_selected_prompt_without_mcp_resources_stops_before_provider_and_does_not_replay() {
+    let mut f = fixture(Behavior::Complete, false);
+    let engine = f.service.engine.as_mut().unwrap();
+    let choice = polaris_desktop_protocol::request::McpPromptChoice {
+        server: "unconfigured".into(),
+        prompt: "prompt".into(),
+        arguments: Default::default(),
+    };
+    let request = start_with_prompt(engine, Some(choice.clone()));
+    until(engine, |e| e.active.is_none());
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.state.runs[0].run.state, RunState::Failed);
+    assert_eq!(saved.state.runs[0].mcp_prompt, Some(choice));
+    assert_eq!(saved.raw.len(), 1);
+    assert_eq!(f.preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    engine.handle(&request, &mut vec![]).unwrap();
+    engine.step_real(None, false).unwrap();
+    assert!(engine.active.is_none());
+    assert_eq!(engine.store.snapshot().unwrap().marker, saved.marker);
+    assert_eq!(f.preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1658,6 +1910,7 @@ fn storage_only_open_never_advertises_or_accepts_real_execution() {
                 RequestBody::RunStart(
                     session_id(),
                     RunStart {
+                        mcp_prompt: None,
                         expected_draft_revision: DecimalU64::new(0),
                         expected_configuration_revision: DecimalU64::new(0),
                         expected_policy_revision: DecimalU64::new(0),
@@ -2282,6 +2535,7 @@ fn source_engine_reserves_receipts_before_start_and_fresh_answers_obey_request_b
         RequestBody::RunStart(
             session_id(),
             RunStart {
+                mcp_prompt: None,
                 expected_draft_revision: saved.state.draft.draft_revision,
                 expected_configuration_revision: saved.state.configuration.configuration_revision,
                 expected_policy_revision: saved.state.policy_revision,
@@ -2375,6 +2629,12 @@ struct PausedPrepare {
     panic: bool,
 }
 impl TrustedRunFactory for PausedPrepare {
+    fn workflow_config(&self) -> Option<&polaris_core::workflow::WorkflowConfig> {
+        self.inner.workflow_config()
+    }
+    fn workflow_skills(&self) -> &[polaris_skills::Skill] {
+        self.inner.workflow_skills()
+    }
     fn prepare(
         &self,
         target: &RunTarget,
@@ -2455,7 +2715,7 @@ fn real_prepare_cancel_disconnect_policy_and_configuration_prevent_provider_star
             "configuration" => {
                 engine
                     .store
-                    .configure_role_bindings(DecimalU64::new(0), None, &[])
+                    .configure_role_bindings(DecimalU64::new(0), None, None, &[])
                     .unwrap();
             }
             _ => unreachable!(),
@@ -2538,6 +2798,12 @@ fn real_execution_capability_is_forwarded_and_invalid_scope_prevents_provider() 
         invalid: bool,
     }
     impl TrustedRunFactory for CapabilityFactory {
+        fn workflow_config(&self) -> Option<&polaris_core::workflow::WorkflowConfig> {
+            self.inner.workflow_config()
+        }
+        fn workflow_skills(&self) -> &[polaris_skills::Skill] {
+            self.inner.workflow_skills()
+        }
         fn prepare(
             &self,
             target: &RunTarget,
@@ -2657,8 +2923,17 @@ fn trusted_store_constructor_preserves_existing_writer_and_production_capabiliti
     assert_eq!(engine.session, session);
     assert_eq!(engine.store.coordinates(), (&project, &session));
     let after = engine.store.snapshot().unwrap();
-    assert_eq!(before.marker, after.marker);
-    assert_eq!(before.state, after.state);
+    assert_eq!(
+        after.marker.session_revision.get(),
+        before.marker.session_revision.get() + 1
+    );
+    assert_eq!(after.state.draft, before.state.draft);
+    assert_eq!(after.state.configuration, before.state.configuration);
+    assert_eq!(
+        after.state.workflow.as_ref().unwrap().config,
+        default_workflow()
+    );
+    assert!(!after.state.workflow.as_ref().unwrap().config.enabled);
     assert_eq!(
         engine.trusted_runs.as_ref().unwrap().configuration,
         before.state.configuration
@@ -2856,6 +3131,7 @@ fn storage_provisioning_refuses_invalid_busy_and_configured_owner() {
                 RequestBody::RunStart(
                     session_id(),
                     RunStart {
+                        mcp_prompt: None,
                         expected_draft_revision: DecimalU64::new(1),
                         expected_configuration_revision: DecimalU64::new(0),
                         expected_policy_revision: DecimalU64::new(0),
@@ -2878,4 +3154,351 @@ fn storage_provisioning_refuses_invalid_busy_and_configured_owner() {
         ErrorCode::SessionBusy
     );
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+/// A refused binding must leave nothing reserved: the session stays usable and
+/// the next start can still be accepted once an account is available.
+#[test]
+fn a_refused_account_binding_releases_the_run_placeholder() {
+    struct Refusing {
+        inner: Arc<dyn TrustedRunFactory>,
+        refuse: Arc<AtomicUsize>,
+    }
+    impl TrustedRunFactory for Refusing {
+        fn workflow_config(&self) -> Option<&polaris_core::workflow::WorkflowConfig> {
+            self.inner.workflow_config()
+        }
+        fn workflow_skills(&self) -> &[polaris_skills::Skill] {
+            self.inner.workflow_skills()
+        }
+        fn bind_account(
+            &self,
+        ) -> Result<Option<polaris_core::desktop_store::SavedAccount>, ServiceError> {
+            if self.refuse.load(Ordering::SeqCst) > 0 {
+                self.refuse.fetch_sub(1, Ordering::SeqCst);
+                return Err(ServiceError::Options);
+            }
+            polaris_core::desktop_store::SavedAccount::new("reg-a".into(), 1)
+                .map(Some)
+                .map_err(|_| ServiceError::Options)
+        }
+        fn prepare(
+            &self,
+            target: &RunTarget,
+            saved: &Published,
+        ) -> Result<TrustedRunInputs, ServiceError> {
+            self.inner.prepare(target, saved)
+        }
+    }
+    let mut f = fixture(Behavior::Held, false);
+    let engine = f.service.engine.take().unwrap();
+    let refuse = Arc::new(AtomicUsize::new(1));
+    let factory: Arc<dyn TrustedRunFactory> = Arc::new(Refusing {
+        inner: engine.trusted_runs.as_ref().unwrap().factory.clone(),
+        refuse: refuse.clone(),
+    });
+    // The source owner is what holds a run placeholder across the acceptance.
+    let mut service = DesktopService::from_trusted_store(
+        engine.store,
+        factory,
+        constructor_source_runtime(f._temp.path().into(), Arc::new(AtomicUsize::new(0)), 100),
+    )
+    .unwrap();
+    service.attach_source_recovery().unwrap();
+    let engine = service.engine.as_mut().unwrap();
+    engine
+        .handle(&request("hello", RequestBody::Hello), &mut vec![])
+        .unwrap();
+    engine
+        .handle(
+            &request(
+                "draft",
+                RequestBody::DraftUpdate(
+                    session_id(),
+                    DraftUpdate {
+                        expected_draft_revision: DecimalU64::new(0),
+                        text: "fixture input".into(),
+                        attachment_ids: vec![],
+                    },
+                ),
+            ),
+            &mut vec![],
+        )
+        .unwrap();
+    let start = |suffix: &str| {
+        request(
+            &format!("start{suffix}"),
+            RequestBody::RunStart(
+                session_id(),
+                RunStart {
+                    mcp_prompt: None,
+                    expected_draft_revision: DecimalU64::new(1),
+                    expected_configuration_revision: DecimalU64::new(0),
+                    expected_policy_revision: DecimalU64::new(0),
+                },
+            ),
+        )
+    };
+    let refused = engine.handle(&start("-refused"), &mut vec![]).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::CapabilityUnavailable);
+    assert!(engine.store.snapshot().unwrap().state.runs.is_empty());
+    assert_eq!(refuse.load(Ordering::SeqCst), 0);
+    assert!(!engine.source.as_ref().unwrap().unsettled());
+
+    // The refusal consumed no placeholder, so the session still accepts a run.
+    engine.handle(&start("-accepted"), &mut vec![]).unwrap();
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.state.runs.len(), 1);
+    assert_eq!(
+        saved.state.runs[0]
+            .account
+            .as_ref()
+            .map(|account| account.registration_id.as_str()),
+        Some("reg-a")
+    );
+}
+
+/// M6-2: the owner learns what the run is doing from its start and end
+/// events. A quiet period between them is work, never a stop.
+#[test]
+fn the_activity_follows_events_and_a_person_outranks_work_in_flight() {
+    use polaris_core::activity::{Activity, WaitReason, Work};
+    let mut real = RealRun::queued();
+    real.refresh_activity(false);
+    assert_eq!(real.activity, Some(Activity::Idle));
+
+    real.observe_activity(&AgentEvent::ModelRequestStarted { turn: 1 });
+    real.refresh_activity(false);
+    assert_eq!(
+        real.activity,
+        Some(Activity::Running {
+            work: Work::ModelRequest
+        })
+    );
+    // Nothing arrived, and the run is still running.
+    real.refresh_activity(false);
+    assert_eq!(
+        real.activity,
+        Some(Activity::Running {
+            work: Work::ModelRequest
+        })
+    );
+    real.refresh_activity(true);
+    assert_eq!(
+        real.activity,
+        Some(Activity::Waiting {
+            reason: WaitReason::Approval
+        })
+    );
+
+    real.observe_activity(&AgentEvent::ModelRequestFinished { turn: 1, ok: true });
+    real.refresh_activity(false);
+    assert_eq!(real.activity, Some(Activity::Idle));
+}
+
+/// M6-3: a goal does not occupy the conversation. While a run is going, a new
+/// run is refused but an instruction is still received and kept durable.
+#[test]
+fn an_instruction_is_received_while_a_run_is_going_and_a_second_run_is_not() {
+    use polaris_desktop_protocol::request::{GoalOperation, GoalUpdate, InstructionSend};
+    let mut f = fixture(Behavior::Held, false);
+    let engine = f.service.engine.as_mut().unwrap();
+    start(engine);
+    engine
+        .handle(
+            &request(
+                "goal",
+                RequestBody::GoalUpdate(
+                    session_id(),
+                    GoalUpdate {
+                        operation: GoalOperation::Set {
+                            text: "検査まで通す".into(),
+                        },
+                    },
+                ),
+            ),
+            &mut vec![],
+        )
+        .unwrap();
+
+    let instruction = request(
+        "note",
+        RequestBody::InstructionSend(
+            session_id(),
+            InstructionSend {
+                text: "先にtestを直す".into(),
+            },
+        ),
+    );
+    engine.handle(&instruction, &mut vec![]).unwrap();
+    // The same instruction resent is the same instruction, not a second one.
+    engine.handle(&instruction, &mut vec![]).unwrap();
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.state.instructions.len(), 1);
+    assert!(saved.state.instructions[0].applied_to.is_none());
+    assert_eq!(saved.state.goal.as_ref().unwrap().text, "検査まで通す");
+
+    // A second run is still refused while the first one holds the session.
+    assert!(matches!(
+        engine.handle(
+            &request(
+                "second",
+                RequestBody::RunStart(
+                    session_id(),
+                    RunStart {
+                        mcp_prompt: None,
+                        expected_draft_revision: DecimalU64::new(1),
+                        expected_configuration_revision: DecimalU64::new(0),
+                        expected_policy_revision: DecimalU64::new(0),
+                    },
+                ),
+            ),
+            &mut vec![],
+        ),
+        Err(error) if error.code == ErrorCode::SessionBusy
+    ));
+}
+
+/// M6-2b: a failed run with an unfinished goal continues once by itself, and
+/// the second failure stops there.
+#[test]
+fn an_unfinished_goal_continues_once_automatically_and_then_stops() {
+    use polaris_desktop_protocol::request::{GoalOperation, GoalUpdate};
+    let mut f = fixture(Behavior::Error, false);
+    let engine = f.service.engine.as_mut().unwrap();
+    start(engine);
+    engine
+        .handle(
+            &request(
+                "goal",
+                RequestBody::GoalUpdate(
+                    session_id(),
+                    GoalUpdate {
+                        operation: GoalOperation::Set {
+                            text: "検査まで通す".into(),
+                        },
+                    },
+                ),
+            ),
+            &mut vec![],
+        )
+        .unwrap();
+    until(engine, |e| e.active.is_none());
+
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.state.runs.len(), 2, "one automatic continuation");
+    assert_eq!(saved.state.runs[0].run.state, RunState::Failed);
+    assert_eq!(saved.state.goal.as_ref().unwrap().automatic_used.get(), 1);
+    // Its input is the goal, and the budget is spent before the run is saved.
+    assert_eq!(saved.state.runs[1].input.text, "検査まで通す");
+
+    until(engine, |e| e.active.is_none());
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.state.runs.len(), 2, "the budget is spent");
+    assert_eq!(saved.state.goal.as_ref().unwrap().automatic_used.get(), 1);
+}
+
+/// M6-2b: a stop is a stop even when the run is saved as failed, and the
+/// person's unsent text is never replaced by the goal.
+#[test]
+fn a_cancelled_run_or_a_waiting_draft_stops_the_automatic_continuation() {
+    use polaris_desktop_protocol::request::{GoalOperation, GoalUpdate};
+    let goal = |suffix: &str| {
+        request(
+            &format!("goal{suffix}"),
+            RequestBody::GoalUpdate(
+                session_id(),
+                GoalUpdate {
+                    operation: GoalOperation::Set {
+                        text: "検査まで通す".into(),
+                    },
+                },
+            ),
+        )
+    };
+
+    // A cancelled run does not continue, whatever terminal state it was saved as.
+    let mut f = fixture(Behavior::Held, false);
+    let engine = f.service.engine.as_mut().unwrap();
+    start(engine);
+    engine.handle(&goal(""), &mut vec![]).unwrap();
+    let target = engine.active.as_ref().unwrap().target.clone();
+    engine
+        .handle(
+            &request("cancel", RequestBody::RunCancel(session_id(), target)),
+            &mut vec![],
+        )
+        .unwrap();
+    until(engine, |e| e.active.is_none());
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.state.runs.len(), 1, "a stop is not continued");
+    assert_eq!(saved.state.goal.as_ref().unwrap().automatic_used.get(), 0);
+
+    // Text the person has not sent yet keeps the continuation from starting.
+    let mut f = fixture(Behavior::Error, false);
+    let engine = f.service.engine.as_mut().unwrap();
+    start(engine);
+    engine.handle(&goal("-draft"), &mut vec![]).unwrap();
+    engine
+        .handle(
+            &request(
+                "typing",
+                RequestBody::DraftUpdate(
+                    session_id(),
+                    DraftUpdate {
+                        expected_draft_revision: DecimalU64::new(2),
+                        text: "あとで送る文章".into(),
+                        attachment_ids: vec![],
+                    },
+                ),
+            ),
+            &mut vec![],
+        )
+        .unwrap();
+    until(engine, |e| e.active.is_none());
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.state.runs.len(), 1);
+    assert_eq!(saved.state.draft.text, "あとで送る文章");
+    assert_eq!(saved.state.goal.as_ref().unwrap().automatic_used.get(), 0);
+}
+
+/// M6-4: a run that succeeded is left alone unless the judge says the goal
+/// itself is still outstanding. With no judge registered — the ordinary
+/// state — nothing changes from before the judge existed.
+#[test]
+fn a_successful_run_is_left_alone_when_no_judge_says_otherwise() {
+    use polaris_desktop_protocol::request::{GoalOperation, GoalUpdate};
+    let mut f = fixture(Behavior::Complete, false);
+    let engine = f.service.engine.as_mut().unwrap();
+    start(engine);
+    engine
+        .handle(
+            &request(
+                "goal",
+                RequestBody::GoalUpdate(
+                    session_id(),
+                    GoalUpdate {
+                        operation: GoalOperation::Set {
+                            text: "検査まで通す".into(),
+                        },
+                    },
+                ),
+            ),
+            &mut vec![],
+        )
+        .unwrap();
+    until(engine, |e| e.active.is_none());
+
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.state.runs[0].run.state, RunState::Succeeded);
+    assert_eq!(
+        saved.state.runs.len(),
+        1,
+        "a finished run is not continued on a guess"
+    );
+    assert_eq!(
+        saved.state.goal.as_ref().unwrap().automatic_used.get(),
+        0,
+        "and the budget is not spent on one"
+    );
 }

@@ -10,10 +10,14 @@ pub enum HistoryMode {
     #[default]
     Legacy,
     Strict10,
+    Structured10,
 }
 impl HistoryMode {
     pub fn is_legacy(&self) -> bool {
         *self == Self::Legacy
+    }
+    pub fn is_structured(&self) -> bool {
+        *self == Self::Structured10
     }
 }
 
@@ -24,6 +28,30 @@ pub enum MemoryPhase {
     Ready,
     Failed,
     OutcomeUnknown,
+}
+
+/// 検索の分類。実行権限や現在値の採用許可を表すものではない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRetrievalStatus {
+    Found,
+    NotFound,
+    AmbiguousEntity,
+    PendingReconfirmation,
+    ExtractionIncomplete,
+    EvidenceBudgetExceeded,
+}
+
+/// 補足検索だけを省略した処理上限。必須記憶の取得分類とは独立する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRelatedOmission {
+    QueryTerms,
+    Grants,
+    SerializedRows,
+    MatchingWork,
+    VectorWork,
+    RawProofWork,
 }
 
 crate::object_wire! {
@@ -62,6 +90,10 @@ pub struct MemoryStatus {
     pub recent_raw_turns: DecimalU64,
     pub retrieval_sources: Vec<String>,
     pub reference_tokens: DecimalU64,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub retrieval_status: Option<MemoryRetrievalStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub related_omission: Option<MemoryRelatedOmission>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
     pub main_usage: Option<MemoryUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
@@ -248,6 +280,8 @@ pub struct Snapshot {
     pub draft: Draft,
     pub configuration: Configuration,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub workflow: Option<WorkflowStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
     pub memory: Option<MemoryStatus>,
     pub role_bindings: Vec<crate::role_bindings::RoleBinding>,
     pub role_catalog: Vec<crate::role_bindings::RoleDescriptor>,
@@ -256,5 +290,16 @@ pub struct Snapshot {
     pub children: Vec<Child>,
     pub child_attempt_count: DecimalU64,
     pub unresolved_approvals: Vec<PendingApproval>,
+}
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStatus {
+    pub enabled: bool,
+    pub mode: crate::request::WorkflowMode,
+    pub phase: crate::request::WorkflowPhase,
+    pub revision: DecimalU64,
 }
 }

@@ -338,6 +338,71 @@ mod tests {
         );
     }
 
+    /// Pins the exact always-on total, not just that it is under the limit.
+    ///
+    /// Every other budget test here asserts `<= BUDGET_LIMIT`. That catches
+    /// the moment the ceiling breaks and nothing before it, so the context
+    /// can drift from 632 to 989 one forgotten property description at a
+    /// time without a single test going red — and the last commit before
+    /// the break gets blamed for all of it. Pinning the number makes every
+    /// change to the always-on context show up as a deliberate edit to this
+    /// line, with the new value measured rather than assumed.
+    ///
+    /// Raising it is allowed. Raising it silently is not.
+    #[test]
+    fn the_always_on_total_is_pinned() {
+        const PINNED: usize = 602;
+        let n = crate::prompt::assemble_always_on("", "", &[]).tokens();
+        assert_eq!(
+            n, PINNED,
+            "the always-on context moved from {PINNED} to {n} tokens. \
+             If that was intended, update PINNED to {n} and say why in the commit."
+        );
+    }
+
+    /// Pins what a root turn actually sends, which is not what
+    /// `BUDGET_LIMIT` measures.
+    ///
+    /// `always_on_tokens` counts the six-tool baseline. A root turn appends
+    /// `mcp_setup`, `setting` and `state` to `request_tools`
+    /// (`agent::run_loop`), and none of those three has ever been counted
+    /// against a limit — the 990 check looks at a list they are not in. So
+    /// the number the repository quotes for its own always-on context is
+    /// smaller than the number it sends, by the size of three schemas, and
+    /// nothing fails when they grow.
+    ///
+    /// This does not assert a ceiling, because there is no agreed one for
+    /// the root turn. It asserts the value, so that growth is visible and
+    /// deliberate rather than invisible and free.
+    #[test]
+    fn the_root_turn_total_is_pinned() {
+        const PINNED: usize = 950;
+        let mut tools = polaris_tools::all_specs();
+        tools.push(polaris_tools::mcp_setup_spec());
+        tools.push(polaris_tools::setting_spec());
+        tools.push(polaris_tools::state_spec());
+
+        let baseline = crate::prompt::assemble_always_on("", "", &[]);
+        let n = always_on_tokens(baseline.system(), &tools);
+
+        // Guards against a vacuous pass: the three root-only tools must
+        // really be in the list being measured.
+        assert_eq!(
+            tools.len(),
+            MAX_TOOLS + 3,
+            "the root-only tools are missing"
+        );
+        assert!(
+            n > baseline.tokens(),
+            "the root turn must cost more than the baseline, not the same"
+        );
+        assert_eq!(
+            n, PINNED,
+            "the root turn moved from {PINNED} to {n} tokens. \
+             If that was intended, update PINNED to {n} and say why in the commit."
+        );
+    }
+
     #[test]
     fn tool_count_stays_within_limit() {
         let n = polaris_tools::all_specs().len();
@@ -408,6 +473,7 @@ mod tests {
         );
 
         let env = crate::constitution::environment_block(
+            std::path::Path::new("/w/polaris"),
             std::path::Path::new("/w/polaris"),
             Some("feat/m1-headless-loop"),
         );

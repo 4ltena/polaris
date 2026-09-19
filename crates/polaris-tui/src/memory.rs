@@ -21,12 +21,19 @@ pub fn lock_memory(state_dir: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-pub fn configure_memory(
-    session: &mut Session,
-    project: &Path,
-    state_dir: &Path,
-    session_id: &str,
-) -> io::Result<()> {
+/// Where pre-compaction snapshots go, created private.
+fn archive_base(state_dir: &Path, session_id: &str) -> io::Result<std::path::PathBuf> {
+    let directory = state_dir.join("memory-archives");
+    std::fs::create_dir_all(&directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(directory.join(format!("{session_id}.jsonl")))
+}
+
+fn valid_session_id(session_id: &str) -> io::Result<()> {
     if session_id.is_empty()
         || !session_id
             .chars()
@@ -37,16 +44,51 @@ pub fn configure_memory(
             "invalid memory session id",
         ));
     }
+    Ok(())
+}
+
+/// Keeps the pre-compaction history without building a search index.
+///
+/// The destructive path is `persist::rewrite`: on a legacy file log,
+/// a successful compaction replaces the whole file with the summarised
+/// list, so the original prefix then exists nowhere. A v2 session needs
+/// none of this — its `raw.jsonl` is append-only and already holds every
+/// message — so the caller installs this only when `persistence` is absent.
+///
+/// Until 2026-09-19 the snapshot and the searchable memory index were one
+/// switch (`--remember`), which meant **not wanting a search index meant
+/// losing the conversation.** Those are different decisions: one is about
+/// recall, the other about not destroying what was said.
+pub fn configure_archive(
+    session: &mut Session,
+    project: &Path,
+    state_dir: &Path,
+    session_id: &str,
+) -> io::Result<()> {
+    valid_session_id(session_id)?;
+    let project = polaris_core::project::resolve_root(project);
+    let base = archive_base(state_dir, session_id)?;
+    let state_dir = state_dir.to_path_buf();
+    session.before_compact = Some(Arc::new(move |messages| {
+        // The same lock the indexing hook takes, so two processes cannot
+        // write one session's snapshot at once.
+        let _lock = lock_memory(&state_dir)?;
+        super::persist::archive_snapshot(&base, &project, messages)?;
+        Ok(())
+    }));
+    Ok(())
+}
+
+pub fn configure_memory(
+    session: &mut Session,
+    project: &Path,
+    state_dir: &Path,
+    session_id: &str,
+) -> io::Result<()> {
+    valid_session_id(session_id)?;
     let project = polaris_core::project::resolve_root(project);
     let project_id = super::persist::project_identity(&project)?;
-    let directory = state_dir.join("memory-archives");
-    std::fs::create_dir_all(&directory)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let archive_base = directory.join(format!("{session_id}.jsonl"));
+    let archive_base = archive_base(state_dir, session_id)?;
     let database = state_dir.join("memory.sqlite3");
     let session_id = session_id.to_owned();
     let state_dir = state_dir.to_path_buf();
@@ -166,6 +208,44 @@ pub fn configure_saved_memory(
 mod tests {
     use super::*;
     use polaris_provider::Message;
+
+    /// Archival without a search index. The compacted prefix has to
+    /// survive for someone who never asked for recall — those are two
+    /// decisions, and until 2026-09-19 one switch made both.
+    #[test]
+    fn the_archive_only_hook_keeps_the_originals_and_builds_no_index() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = Session::default();
+        configure_archive(&mut session, root.path(), state.path(), "plain-session").unwrap();
+
+        let messages = vec![
+            Message::user("これは圧縮で消えるはずだった発言"),
+            Message::user("こちらも"),
+        ];
+        session.before_compact.as_ref().unwrap()(&messages).unwrap();
+
+        let archive = state.path().join("memory-archives/plain-session.archive");
+        let saved: Vec<_> = std::fs::read_dir(&archive)
+            .expect("no archive directory")
+            .flatten()
+            .collect();
+        assert_eq!(saved.len(), 1, "expected one snapshot: {saved:?}");
+        let body = std::fs::read_to_string(saved[0].path()).unwrap();
+        for message in &messages {
+            assert!(
+                body.contains(&message.content),
+                "the snapshot lost {:?}",
+                message.content
+            );
+        }
+        // No index was asked for, so none was built. A sqlite file here
+        // would mean the two decisions are still one.
+        assert!(
+            !state.path().join("memory.sqlite3").exists(),
+            "an archive-only session built a search index"
+        );
+    }
 
     #[test]
     fn archives_and_indexes_original_but_forget_prevents_recreation() {

@@ -399,7 +399,17 @@ def parse_metrics(path, stderr):
                 and coverage == {'reported': len(traces), 'missing': 0, 'failed': 0}
                 and embedding['missing'] == 0 and embedding['failed'] == 0
                 and '診断ログの保存に失敗' not in stderr)
-    return totals, traces, model_match, coverage, embedding, complete
+    # reasoningはoutput_tokensの内数で、CLIの`tokens:`行にも`fields`にも
+    # 出ない。`fields`へ足すとtotals側にキーが無く突合が落ちるため、別に
+    # 数える。未報告はnullであり0ではないので欠測件数を併記する。
+    reasoning = [(row.get('usage') or {}).get('reasoning_tokens') for row in traces]
+    reasoning_usage = {'tokens': sum(value for value in reasoning if value is not None),
+                       'missing': sum(value is None for value in reasoning),
+                       'share_of_output': None}
+    if reasoning_usage['missing'] == 0 and trace_totals.get('output'):
+        reasoning_usage['share_of_output'] = round(
+            reasoning_usage['tokens'] / trace_totals['output'], 4)
+    return totals, traces, model_match, coverage, embedding, complete, reasoning_usage
 
 
 def exercise(audit):
@@ -495,13 +505,14 @@ def main():
             scope_ok = (set(changed).issubset(permitted.get(task, set()))
                         and all(after.get(path, ('missing', ''))[0] == 'file' for path in changed)
                         and not any(value[0] == 'link' for value in after.values()))
-            totals, traces, model_match, coverage, embedding, complete = parse_metrics(metrics, stderr)
+            totals, traces, model_match, coverage, embedding, complete, reasoning_usage = parse_metrics(metrics, stderr)
             quality_state, quality_reason = quality_result(task, stdout, fixture) if scope_ok else ('incorrect', 'scope_violation')
             row = {'task': task, 'repeat': repeat, 'exit_code': code,
                    'elapsed_seconds': round(time.monotonic() - start, 3),
                    'quality_pass': code == 0 and quality_state == 'pass',
                    'quality_assessment': quality_state, 'quality_unassessed_reason': quality_reason if quality_state == 'unassessed' else None,
                    'scope_pass': scope_ok, 'changed_paths': changed, 'usage': totals,
+                   'reasoning_usage': reasoning_usage,
                    'embedding_usage': embedding,
                    'combined_known_tokens': (totals['total'] + embedding['known_input_tokens']) if totals else None,
                    'embedding_measurement_complete': embedding['missing'] == 0 and embedding['failed'] == 0,

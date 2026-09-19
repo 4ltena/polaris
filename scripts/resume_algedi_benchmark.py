@@ -89,7 +89,9 @@ def validate_saved_row(directory, row, baseline, candidate, condition, expected_
 
     stdout = (directory / f'{task}-{repeat}.out').read_text()
     stderr = (directory / f'{task}-{repeat}.err').read_text()
-    totals, traces, model_match, coverage, embedding, complete = benchmark.parse_metrics(
+    # reasoning_usage は保存済み行との照合に使わない。既存の行はこの欄を
+    # 持たないので、比較へ入れると再開が全件不一致になる。
+    totals, traces, model_match, coverage, embedding, complete, _ = benchmark.parse_metrics(
         directory / f'{task}-{repeat}.metrics.jsonl', stderr)
     assessment, reason = benchmark.quality_result(task, stdout, fixture)
     if assessment != 'pass' or reason is not None:

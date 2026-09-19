@@ -229,6 +229,16 @@ def main():
             fields = {'input': 'input_tokens', 'output': 'output_tokens', 'cache': 'cache_read_tokens'}
             trace_totals = {k: sum((r.get('usage') or {}).get(v) or 0 for r in traces) for k, v in fields.items()}
             reconciled = totals is not None and all(totals[k] == trace_totals[k] for k in fields)
+            # reasoningはoutput_tokensの内数で、CLIの`tokens:`行には出ない。
+            # `fields`へ足すと突合がtotals側のキー欠落で落ちるため別に数える。
+            # 未報告はnullであり0ではないので、合計とは別に欠測件数を持つ。
+            reasoning = [(r.get('usage') or {}).get('reasoning_tokens') for r in traces]
+            reasoning_usage = {'tokens': sum(v for v in reasoning if v is not None),
+                               'missing': sum(v is None for v in reasoning),
+                               'share_of_output': None}
+            if reasoning_usage['missing'] == 0 and trace_totals['output']:
+                reasoning_usage['share_of_output'] = round(
+                    reasoning_usage['tokens'] / trace_totals['output'], 4)
             cache_complete = bool(traces) and all((r.get('usage') or {}).get('cache_read_tokens') is not None for r in traces)
             cache_write_complete = bool(traces) and all((r.get('usage') or {}).get('cache_write_tokens') is not None for r in traces)
             coverage_match = re.search(r'使用量の計測: 応答あり (\d+) / 欠測 (\d+) / 失敗 (\d+)', stderr)
@@ -244,6 +254,7 @@ def main():
                    'quality_pass': code == 0 and scope_ok and quality(task, stdout, fixture),
                    'scope_pass': scope_ok, 'changed_paths': changed,
                    'usage': totals, 'trace_totals_match': reconciled,
+                   'reasoning_usage': reasoning_usage,
                    'embedding_usage': embedding,
                    'embedding_measurement_complete': embedding_complete,
                    'combined_known_tokens': (totals['total'] + embedding['known_input_tokens']) if totals else None,

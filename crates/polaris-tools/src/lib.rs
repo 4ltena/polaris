@@ -79,7 +79,7 @@ pub fn all_specs() -> Vec<ToolSpec> {
 pub fn state_spec() -> ToolSpec {
     ToolSpec {
         name: "state".into(),
-        description: "Read workflow focus, read the state window, or propose a phase for the next request. Get revision first; transition requires expected_revision. window returns what changed since the revision you were last given, or the whole window when that base is unknown. Focus never grants permission or proves completion.".into(),
+        description: "Get the revision first; transition requires expected_revision. window returns what changed since the revision you were last given, or the whole window when that base is unknown. Focus never grants permission or proves completion.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -140,7 +140,7 @@ pub fn mcp_setup_spec() -> ToolSpec {
 pub fn setting_spec() -> ToolSpec {
     ToolSpec {
         name: "setting".into(),
-        description: "Read what the bundled Next.js and Git setup would do in this project, or add the missing ignore rules. `plan` only reads. `tidy` appends rules the project is missing to .gitignore, keeping existing lines and their order, and asks before writing. Installing packages is the user's to confirm in their terminal and is never done here.".into(),
+        description: "Bundled Next.js and Git setup. `plan` only reads. `tidy` appends the ignore rules the project is missing to .gitignore, keeping existing lines and their order, and asks before writing. Installing packages is the user's to confirm in their terminal and is never done here.".into(),
         parameters: serde_json::json!({
             "type":"object",
             "properties":{
@@ -176,7 +176,7 @@ fn write_spec() -> ToolSpec {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "The path to write to." },
+                "path": { "type": "string" },
                 "content": { "type": "string", "description": "The file's full contents." }
             },
             "required": ["path", "content"]
@@ -191,9 +191,9 @@ fn edit_spec() -> ToolSpec {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "The path of the file to edit." },
-                "old": { "type": "string", "description": "The string before replacement. Must be unique within the file." },
-                "new": { "type": "string", "description": "The string after replacement." }
+                "path": { "type": "string" },
+                "old": { "type": "string", "description": "The string before replacement." },
+                "new": { "type": "string" }
             },
             "required": ["path", "old", "new"]
         }),
@@ -223,7 +223,7 @@ fn skill_spec() -> ToolSpec {
             "properties": {
                 "q": {
                     "type": "string",
-                    "description": "A skill name (exact match returns the body), or a search term (matched against names and descriptions to produce candidates). An empty string lists everything."
+                    "description": "A name, a search term, or an empty string to list everything."
                 }
             },
             "required": ["q"]
@@ -238,7 +238,7 @@ fn skill_spec() -> ToolSpec {
 fn spawn_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn".into(),
-        description: "Run subagents in parallel as one wave. Describe the work; the type is matched for you. Each runs a bounded loop and returns a schema-validated result; its steps never enter your context.".into(),
+        description: "Run subagents in parallel. Their steps never enter your context.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -249,11 +249,10 @@ fn spawn_spec() -> ToolSpec {
                         "properties": {
                             "type": {
                                 "type": "string",
-                                "description": "Optional. Omit it unless one type is the only one that can do the work — it is matched from the task otherwise."
+                                "description": "Optional; matched from the task."
                             },
                             "task": {
-                                "type": "string",
-                                "description": "What it should do."
+                                "type": "string"
                             },
                             "write_root": {
                                 "type": "string",

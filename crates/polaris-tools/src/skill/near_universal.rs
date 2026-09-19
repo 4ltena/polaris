@@ -1,7 +1,7 @@
 //! 「ほぼ常に関連する」skill の選定。BM25 のスコアリングを一切知らず、
 //! description の書き方の慣習（trigger 形式・量化語・固有名詞の有無）だ
 //! けを見る。基準の根拠は
-//! `docs/superpowers/specs/2026-08-20-polaris-skill-bm25-router-design.md`
+//! `.polaris/notes/specs/2026-08-20-polaris-skill-bm25-router-design.md`
 //! を参照。
 
 use std::collections::HashSet;

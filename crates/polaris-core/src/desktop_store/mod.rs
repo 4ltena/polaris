@@ -3,9 +3,12 @@
 //! PrototypeRootは新規TempDir、DesktopRootは明示した私用領域を所有する。認可、provider実行、
 //! 実会話移行は呼び出さない。呼出側は要求・台帳照会の前に対象を認可すること。
 
+mod account;
 mod bootstrap;
 mod children;
 mod disk;
+mod goal;
+pub mod hub;
 mod memory;
 mod model;
 mod roles;
@@ -13,18 +16,29 @@ mod source_apply;
 mod workflow;
 mod writer;
 
+pub use account::SavedAccount;
 pub use bootstrap::{
     BootstrapIdentity, BootstrapProvider, BootstrapTier, ExpectedBootstrapFile,
     ExpectedBootstrapStore, MAX_OWNER_BOOTSTRAP_BYTES, OwnerBootstrapDocument,
     ValidatedOwnerBootstrap, read_owner_bootstrap, validate_owner_configuration,
 };
 pub use children::SavedChild;
-pub use memory::{MemoryResources, MemorySnapshot, SavedMemory, SummaryWork};
+pub use goal::{AppliedInstruction, MAX_INSTRUCTIONS, SavedGoal, SavedInstruction};
+pub use hub::{
+    ApprovalSummary, Changes, Delta, GoalSummary, HubView, InstructionSummary, ListChange,
+    RunSummary, TaskSummary, Verification,
+};
+pub use memory::{
+    MemoryResources, MemorySnapshot, SavedMemory, SavedStructuredResponse, SummaryWork,
+};
 pub use model::{
     Acceptance, HistoryGap, InitialState, IntentReceipt, Marker, Operation, Published,
     RequestRecord, RequestResult, RunRecord, Sidecar, StoreError, StoreResult,
 };
-pub use roles::{SavedRoleBinding, SavedRoleBindings, SavedRuntime, ToolSupport};
+pub use roles::{
+    EFFORTS, SavedRoleBinding, SavedRoleBindings, SavedRuntime, SavedTier, SavedTierBinding,
+    SavedTierBindings, ToolSupport,
+};
 pub use source_apply::{
     MAX_SOURCE_APPLY_BYTES, MAX_SOURCE_APPLY_ENTRIES, MAX_SOURCE_APPLY_LEDGER_BYTES,
     MAX_SOURCE_APPLY_RECORDS, SavedSourceApply, SourceApplyCandidate, SourceApplyEntry,
@@ -32,11 +46,24 @@ pub use source_apply::{
     SourceApplyResult, SourceApplyVersion,
 };
 pub use workflow::SavedWorkflow;
+pub use writer::mcp::{
+    MCP_TOOL_OPERATION, McpDisposition, McpPublishedResult, McpTerminalInput,
+    McpTerminalPublication, SavedMcpOperation,
+};
+pub(crate) use writer::mcp::{local_mcp_terminal, mcp_reply_budget};
+pub use writer::prompt::{McpPromptIntent, McpPromptPublication, McpPromptResult, SavedMcpPrompt};
+pub use writer::recipe::{
+    Current as RecipeCurrent, SCHEMA_VERSION as RECIPE_SCHEMA_VERSION, SavedRecipeIntent,
+    SavedRecipeStep, SavedRecipeTerminal, StepOutcome, reusable_steps,
+};
 pub(crate) use writer::validate_turn_suffix;
 pub use writer::{DesktopRoot, PrototypeRoot, Writer};
+pub use writer::{OwnerRequestHistory, RunDetailEntry, RunDetails};
 
 #[cfg(all(test, unix))]
 mod tests;
+#[cfg(all(test, unix))]
+pub(crate) use tests::inject as inject_test_failure;
 
 #[cfg(all(test, not(unix)))]
 mod unsupported_tests {

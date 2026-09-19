@@ -44,6 +44,14 @@ fn prepared_policy_matches(workspace: &PreparedWorkspace, policy: &SandboxPolicy
             .is_ok()
 }
 
+mod mcp;
+mod registration;
+pub use mcp::{McpCall, McpCallError, McpPort};
+pub use registration::{
+    MCP_REGISTRATION_OPERATION, RegistrationApproval, RegistrationError, RegistrationGrant,
+    RegistrationPort,
+};
+
 const QUANTUM: usize = 4;
 const APPROVAL_TTL_MS: u64 = 60_000;
 const OPERATION_KIND: &str = "process.execute";
@@ -170,6 +178,8 @@ impl Cleanup {
     }
 }
 pub struct RunExecution {
+    mcp: Option<mcp::McpRelay>,
+    registration: Option<registration::RegistrationRelay>,
     #[cfg(target_os = "macos")]
     workspace: Option<Arc<PreparedWorkspace>>,
     pub port: ExecutionPort,
@@ -191,6 +201,8 @@ impl RunExecution {
     pub fn new(target: &RunTarget, disconnected: Arc<AtomicBool>) -> Self {
         let (port, incoming) = ExecutionPort::channel(target.run_id.clone());
         Self {
+            mcp: None,
+            registration: None,
             #[cfg(target_os = "macos")]
             workspace: None,
             port,
@@ -284,6 +296,42 @@ impl RunExecution {
         owner.workspace = Some(workspace);
         Ok(owner)
     }
+    /// Trusted run setup only. Registration and the external ceiling are not
+    /// grants; every generic tool still requires a concrete durable approval.
+    pub fn configure_mcp(
+        &mut self,
+        target: &RunTarget,
+        session: polaris_desktop_protocol::ids::SessionId,
+        ceiling: crate::mcp::operation::ExternalCeiling,
+        policy: crate::approval::ApprovalPolicy,
+    ) -> Result<McpPort, StoreError> {
+        if self.port.run_id() != &target.run_id
+            || self.mcp.is_some()
+            || self.closed
+            || self.next_operation != 0
+        {
+            return Err(StoreError::RunConflict);
+        }
+        let (relay, port) =
+            mcp::McpRelay::new(target, session, ceiling, policy, self.disconnected.clone());
+        self.mcp = Some(relay);
+        Ok(port)
+    }
+
+    /// Trusted root run setup only; the ceiling is the fixed external tier.
+    pub fn configure_registration(
+        &mut self,
+        target: &RunTarget,
+        ceiling: crate::mcp::operation::ExternalCeiling,
+    ) -> Result<RegistrationPort, StoreError> {
+        if self.port.run_id() != &target.run_id || self.registration.is_some() || self.closed {
+            return Err(StoreError::RunConflict);
+        }
+        let (relay, port) = registration::RegistrationRelay::new(ceiling);
+        self.registration = Some(relay);
+        Ok(port)
+    }
+
     fn policy_matches(&self, policy: &SandboxPolicy) -> bool {
         #[cfg(target_os = "macos")]
         if let Some(workspace) = &self.workspace {
@@ -293,6 +341,12 @@ impl RunExecution {
         true // Existing fake constructor has no prepared-workspace contract.
     }
     pub fn cancel(&mut self) {
+        if let Some(mcp) = &mut self.mcp {
+            mcp.cancel();
+        }
+        if let Some(registration) = &mut self.registration {
+            registration.cancel();
+        }
         self.closed = true;
         self.incoming.close();
         for slot in &self.slots {
@@ -314,6 +368,23 @@ impl RunExecution {
                 && run.policy_revision == policy_revision
                 && !run.run.state.is_terminal()
         });
+        if let Some(mcp) = &mut self.mcp {
+            let result = mcp.step(store, target, &published, &mut self.approval_events);
+            if result.is_err() || mcp.terminal_stop() {
+                self.cancel();
+            }
+            result?;
+        }
+        if let Some(registration) = &mut self.registration {
+            let stopped = self.closed || self.disconnected.load(Ordering::Acquire);
+            registration.step(
+                store,
+                target,
+                &published,
+                &mut self.approval_events,
+                stopped,
+            )?;
+        }
         let mut cursor = 0;
         while cursor < self.awaiting.len() {
             let waiting = &self.awaiting[cursor];
@@ -650,6 +721,12 @@ impl RunExecution {
         }
     }
     pub fn approval_resolved(&mut self, id: &ApprovalId, decision: ApprovalDecision) {
+        if let Some(mcp) = &mut self.mcp {
+            mcp.approval_resolved(id, decision);
+        }
+        if let Some(registration) = &mut self.registration {
+            registration.approval_resolved(id, decision);
+        }
         if let Some(waiting) = self
             .awaiting
             .iter_mut()
@@ -658,14 +735,38 @@ impl RunExecution {
             waiting.decision = Some(decision);
         }
     }
+    /// Records finished host-local registrations without advancing any lane.
+    pub fn record_finished_registrations(
+        &mut self,
+        store: &mut Writer,
+        target: &RunTarget,
+    ) -> Result<(), StoreError> {
+        match &mut self.registration {
+            Some(registration) => registration.record_finished(store, target),
+            None => Ok(()),
+        }
+    }
     pub fn take_approval_events(&mut self) -> Vec<EventBody> {
         std::mem::take(&mut self.approval_events)
     }
     pub fn awaiting_approval(&self) -> bool {
         !self.awaiting.is_empty()
+            || self
+                .mcp
+                .as_ref()
+                .is_some_and(mcp::McpRelay::awaiting_approval)
+            || self
+                .registration
+                .as_ref()
+                .is_some_and(registration::RegistrationRelay::awaiting_approval)
     }
     pub fn quiescent(&self) -> bool {
-        self.incoming.is_empty()
+        self.mcp.as_ref().is_none_or(mcp::McpRelay::quiescent)
+            && self
+                .registration
+                .as_ref()
+                .is_none_or(registration::RegistrationRelay::quiescent)
+            && self.incoming.is_empty()
             && self.awaiting.is_empty()
             && self.slots.iter().all(|owned| {
                 let s = owned.lock().unwrap_or_else(|e| e.into_inner());
@@ -673,6 +774,10 @@ impl RunExecution {
             })
     }
     pub fn observation(&self, requested: Observation) -> Observation {
+        let requested = self
+            .mcp
+            .as_ref()
+            .map_or(requested, |mcp| mcp.observation(requested));
         if requested != Observation::Succeeded {
             return requested;
         }
@@ -892,6 +997,18 @@ pub struct CleanupOwner {
     _private: (),
 }
 impl CleanupOwner {
+    /// Synthetic parked cleanup for owner lifetime tests; not a native stop failure.
+    #[cfg(any(test, feature = "execution-test-support"))]
+    pub fn inject_pending_cleanup_for_test(&self) -> Arc<AtomicBool> {
+        let confirmed = Arc::new(AtomicBool::new(false));
+        RECOVERY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .push(Cleanup::Deferred(confirmed.clone()));
+        confirmed
+    }
+
     pub fn step(&mut self) {
         RECOVERY.lock().unwrap_or_else(|e| e.into_inner()).step();
     }
@@ -943,6 +1060,18 @@ mod tests {
         RunExecution,
         tempfile::TempDir,
     ) {
+        read_owner_with_prompt(target, None)
+    }
+    pub(super) fn read_owner_with_prompt(
+        target: RunTarget,
+        mcp_prompt: Option<polaris_desktop_protocol::request::McpPromptChoice>,
+    ) -> (
+        crate::desktop_store::PrototypeRoot,
+        Writer,
+        RunTarget,
+        RunExecution,
+        tempfile::TempDir,
+    ) {
         use crate::desktop_store::{InitialState, PrototypeRoot};
         use polaris_desktop_protocol::{
             ids::*,
@@ -982,6 +1111,7 @@ mod tests {
                     body: RequestBody::RunStart(
                         session,
                         RunStart {
+                            mcp_prompt,
                             expected_draft_revision: DecimalU64::new(0),
                             expected_configuration_revision: DecimalU64::new(0),
                             expected_policy_revision: DecimalU64::new(0),

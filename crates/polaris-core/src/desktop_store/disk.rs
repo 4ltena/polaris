@@ -331,18 +331,27 @@ pub(super) fn load(
         let state: Sidecar = serde_json::from_slice(line)?;
         super::children::validate(&state)?;
         super::source_apply::validate(&state)?;
+        super::writer::mcp::validate_state(&state)?;
+        super::writer::prompt::validate_state(&state)?;
         if let Some(prior) = &latest {
+            super::memory::validate_transition(prior, &state)?;
             super::source_apply::validate_transition(prior, &state)?;
+            super::writer::mcp::validate_transition(prior, &state)?;
+            super::writer::prompt::validate_transition(prior, &state)?;
         }
         if let Some(roles) = &state.role_bindings {
             roles.validate()?;
         }
+        super::goal::validate(state.goal.as_ref(), &state.instructions)?;
         if let Some(workflow) = &state.workflow {
             workflow.validate()?;
         }
         for run in &state.runs {
             if let Some(roles) = &run.role_bindings {
                 roles.validate()?;
+            }
+            if let Some(account) = &run.account {
+                account.validate()?;
             }
             if let Some(workflow) = &run.workflow {
                 workflow.validate()?;

@@ -16,6 +16,14 @@ use std::{
 };
 use tempfile::TempDir;
 
+pub(super) mod details;
+mod history;
+pub(super) mod mcp;
+pub(super) mod prompt;
+pub(super) mod recipe;
+pub use details::{RunDetailEntry, RunDetails};
+pub use history::OwnerRequestHistory;
+
 /// 任意pathや既存TempDirを受け取る入口を持たない、試作領域の所有者。
 #[derive(Debug, Clone)]
 pub struct PrototypeRoot {
@@ -118,19 +126,16 @@ impl StoreRoot {
         session: SessionId,
         initial: InitialState,
     ) -> StoreResult<Writer> {
-        self.directory.verify()?;
-        let directory = Arc::new(
-            self.directory
-                .child(&content_hash(session.as_str().as_bytes()), true)?,
-        );
-        let guard = directory.open("writer.lock", true, true)?;
-        acquire(&guard)?;
         let state = Sidecar {
+            inherited_turn_count: DecimalU64::new(0),
             conversation_memory: None,
             session_revision: DecimalU64::new(0),
             draft: initial.draft,
             configuration: initial.configuration,
             role_bindings: None,
+            tier_bindings: None,
+            goal: None,
+            instructions: Vec::new(),
             policy_revision: initial.policy_revision,
             tasks: Vec::new(),
             children: Vec::new(),
@@ -141,11 +146,22 @@ impl StoreRoot {
             approval_records: Vec::new(),
             workflow: None,
         };
+        self.create_seeded(project, session, state, Vec::new())
+    }
+
+    fn create_seeded(
+        &self,
+        project: ProjectId,
+        session: SessionId,
+        state: Sidecar,
+        raw: Vec<RawEventV2>,
+    ) -> StoreResult<Writer> {
+        let raw_bytes = raw
+            .iter()
+            .map(disk::line)
+            .collect::<StoreResult<Vec<_>>>()?
+            .concat();
         let side = disk::line(&state)?;
-        directory.open(disk::RAW, true, true)?.sync_all()?;
-        let mut file = directory.open(disk::SIDECAR, true, true)?;
-        file.write_all(&side)?;
-        file.sync_all()?;
         let marker = Marker {
             schema_version: 3,
             session_id: session,
@@ -153,23 +169,34 @@ impl StoreRoot {
             epoch: DecimalU64::new(1),
             session_revision: DecimalU64::new(0),
             content_revision: DecimalU64::new(0),
-            raw_offset: DecimalU64::new(0),
-            raw_hash: content_hash(&[]),
+            raw_offset: DecimalU64::new(raw_bytes.len() as u64),
+            raw_hash: content_hash(&raw_bytes),
             sidecar_offset: DecimalU64::new(side.len() as u64),
             sidecar_hash: content_hash(&side),
             deleted: false,
         };
-        disk::publish_marker(&directory, &marker)?;
+        let published = Published { marker, state, raw };
+        validate_ledger(&published)?;
+        self.directory.verify()?;
+        let directory = Arc::new(self.directory.child(
+            &content_hash(published.marker.session_id.as_str().as_bytes()),
+            true,
+        )?);
+        let guard = directory.open("writer.lock", true, true)?;
+        acquire(&guard)?;
+        let mut file = directory.open(disk::RAW, true, true)?;
+        file.write_all(&raw_bytes)?;
+        file.sync_all()?;
+        let mut file = directory.open(disk::SIDECAR, true, true)?;
+        file.write_all(&side)?;
+        file.sync_all()?;
+        disk::publish_marker(&directory, &published.marker)?;
         self.directory.sync()?;
         Ok(Writer {
             root: self.clone(),
             directory,
             guard,
-            published: Published {
-                marker,
-                state,
-                raw: Vec::new(),
-            },
+            published,
             recovery_required: false,
         })
     }
@@ -201,7 +228,7 @@ impl StoreRoot {
         changed |= super::source_apply::invalidate_unconsumed(&mut next.state);
         for record in &mut next.state.runs {
             if !record.run.state.is_terminal() {
-                let unresolved = record.operations.iter().any(|op| op.result_id.is_none());
+                let unresolved = record.operations.iter().any(mcp::unresolved);
                 record.run.state = if unresolved {
                     RunState::OutcomeUnknown
                 } else {
@@ -251,7 +278,19 @@ fn reconcile(
 }
 
 fn validate_ledger(p: &Published) -> StoreResult<()> {
+    if p.state.inherited_turn_count.get() > 10
+        || p.raw.iter().filter(|event| event.starts_turn).count() as u64
+            != p.state
+                .inherited_turn_count
+                .get()
+                .checked_add(p.state.runs.len() as u64)
+                .ok_or(StoreError::Overflow)?
+    {
+        return Err(StoreError::Corrupt("原文turnと実行台帳の対応"));
+    }
     super::memory::validate(p)?;
+    prompt::validate(p)?;
+    mcp::validate(p)?;
     super::children::validate(&p.state)?;
     super::source_apply::validate(&p.state)?;
     use std::collections::BTreeSet;
@@ -366,6 +405,47 @@ pub struct Writer {
     recovery_required: bool,
 }
 
+/// Retains the current writer/root and, for an ancestor, a read-only shared lock.
+pub(super) struct MemoryDirectory<'a> {
+    pub(super) directory: Arc<disk::Directory>,
+    read_guard: Option<File>,
+    root: StoreRoot,
+    owner: Option<&'a Writer>,
+}
+impl MemoryDirectory<'_> {
+    pub(super) fn verify(&self) -> StoreResult<()> {
+        if let Some(owner) = self.owner {
+            owner.ready()?;
+        }
+        self.root.directory.verify()?;
+        self.directory.verify()?;
+        if let Some(guard) = &self.read_guard {
+            disk::same(guard, &self.directory.open("writer.lock", false, false)?)?;
+        }
+        Ok(())
+    }
+
+    /// Move a parent's shared guard across the child's mutable marker commit.
+    /// A current-session reader must keep borrowing its exclusive Writer.
+    pub(super) fn into_parent(mut self) -> StoreResult<MemoryDirectory<'static>> {
+        self.verify()?;
+        let guard = self.read_guard.take().ok_or(StoreError::RunConflict)?;
+        Ok(MemoryDirectory {
+            directory: Arc::clone(&self.directory),
+            read_guard: Some(guard),
+            root: self.root.clone(),
+            owner: None,
+        })
+    }
+}
+impl Drop for MemoryDirectory<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = &self.read_guard {
+            let _ = guard.unlock();
+        }
+    }
+}
+
 impl Drop for Writer {
     fn drop(&mut self) {
         let _ = self.guard.unlock();
@@ -373,6 +453,47 @@ impl Drop for Writer {
 }
 
 impl Writer {
+    pub(super) fn memory_directory(&self, session: &SessionId) -> StoreResult<MemoryDirectory<'_>> {
+        self.ready()?;
+        let (directory, read_guard) = if session == &self.published.marker.session_id {
+            (Arc::clone(&self.directory), None)
+        } else {
+            let directory = Arc::new(
+                self.root
+                    .directory
+                    .child(&content_hash(session.as_str().as_bytes()), false)?,
+            );
+            let guard = directory.open("writer.lock", false, false)?;
+            match guard.try_lock_shared() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => return Err(StoreError::Busy),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+            (directory, Some(guard))
+        };
+        let owner = MemoryDirectory {
+            directory,
+            read_guard,
+            root: self.root.clone(),
+            owner: Some(self),
+        };
+        owner.verify()?;
+        Ok(owner)
+    }
+
+    /// 新規子へ完全な直近原文と固定記憶参照だけを渡す。モデル・RPCは呼ばない。
+    pub fn fork_memory(&self, session: SessionId, artifact_hash: &str) -> StoreResult<Writer> {
+        self.ready()?;
+        let parent = disk::load(&self.directory, self.coordinates().0, self.coordinates().1)?;
+        validate_ledger(&parent)?;
+        if parent.marker != self.published.marker {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let (state, raw) = super::memory::fork_seed(&parent, &session, artifact_hash)?;
+        self.root
+            .create_seeded(parent.marker.project_id.clone(), session, state, raw)
+    }
+
     /// Identity of the retained store root, not merely the session coordinates.
     /// Trusted launch uses this to reject a Writer from another directory.
     pub fn root_identity(&self) -> StoreResult<(u64, u64)> {
@@ -446,6 +567,7 @@ impl Writer {
         &mut self,
         expected_configuration_revision: DecimalU64,
         role_bindings: Option<super::SavedRoleBindings>,
+        tier_bindings: Option<super::SavedTierBindings>,
         catalog: &[polaris_skills::AgentType],
     ) -> StoreResult<()> {
         self.ready()?;
@@ -457,6 +579,9 @@ impl Writer {
         if let Some(saved) = &role_bindings {
             saved.validate_catalog(catalog)?;
         }
+        if let Some(saved) = &tier_bindings {
+            saved.validate()?;
+        }
         let mut next = self.published.clone();
         next.state.configuration.configuration_revision = next
             .state
@@ -464,6 +589,7 @@ impl Writer {
             .configuration_revision
             .checked_add(1)?;
         next.state.role_bindings = role_bindings;
+        next.state.tier_bindings = tier_bindings;
         self.commit(next, false)
     }
 
@@ -498,6 +624,9 @@ impl Writer {
 
     pub(super) fn commit(&mut self, mut next: Published, content_changed: bool) -> StoreResult<()> {
         self.ready()?;
+        super::memory::validate_transition(&self.published.state, &next.state)?;
+        mcp::validate_transition(&self.published.state, &next.state)?;
+        prompt::validate_transition(&self.published.state, &next.state)?;
         next.marker.session_revision = self.published.marker.session_revision.checked_add(1)?;
         next.state.session_revision = next.marker.session_revision;
         if content_changed {
@@ -567,6 +696,20 @@ impl Writer {
         request: &Request,
         target: Option<RunTarget>,
     ) -> StoreResult<Acceptance> {
+        self.apply_bound(request, target, None)
+    }
+
+    /// The same acceptance, with the registration the run is bound to. The
+    /// binding is written by the acceptance itself, never by a later save.
+    pub fn apply_bound(
+        &mut self,
+        request: &Request,
+        target: Option<RunTarget>,
+        account: Option<super::SavedAccount>,
+    ) -> StoreResult<Acceptance> {
+        if let Some(account) = &account {
+            account.validate()?;
+        }
         self.ready()?;
         if request.body.session_id() != Some(&self.published.marker.session_id) {
             return Err(StoreError::TargetMismatch);
@@ -575,6 +718,8 @@ impl Writer {
             request.body,
             RequestBody::DraftUpdate(..)
                 | RequestBody::SessionConfigure(..)
+                | RequestBody::GoalUpdate(..)
+                | RequestBody::InstructionSend(..)
                 | RequestBody::RunStart(..)
                 | RequestBody::RunCancel(..)
         ) {
@@ -634,7 +779,88 @@ impl Writer {
                         configuration: state.configuration.clone(),
                     }
                 }
+                RequestBody::GoalUpdate(_, params) => {
+                    if target.is_some() {
+                        return Err(StoreError::RunConflict);
+                    }
+                    use polaris_desktop_protocol::request::GoalOperation;
+                    let previous = state.goal.clone();
+                    let goal = match (&params.operation, previous) {
+                        (GoalOperation::Set { text }, previous) => {
+                            if text.trim().is_empty() || text.len() > super::goal::MAX_GOAL_BYTES {
+                                return Err(StoreError::Corrupt("goal"));
+                            }
+                            super::SavedGoal {
+                                text: text.clone(),
+                                revision: DecimalU64::new(
+                                    previous
+                                        .as_ref()
+                                        .map_or(0, |goal| goal.revision.get())
+                                        .checked_add(1)
+                                        .ok_or(StoreError::Overflow)?,
+                                ),
+                                active: true,
+                                // A new goal never clears an explicit stop.
+                                stopped: previous.is_some_and(|goal| goal.stopped),
+                                automatic_used: DecimalU64::new(0),
+                            }
+                        }
+                        (_, None) => return Err(StoreError::NotFound),
+                        (operation, Some(previous)) => super::SavedGoal {
+                            revision: previous.revision.checked_add(1)?,
+                            active: !matches!(operation, GoalOperation::Clear) && previous.active,
+                            stopped: match operation {
+                                GoalOperation::Stop => true,
+                                GoalOperation::Resume => false,
+                                _ => previous.stopped,
+                            },
+                            ..previous
+                        },
+                    };
+                    goal.validate()?;
+                    let goal_revision = goal.revision;
+                    state.goal = Some(goal);
+                    RequestResult::GoalUpdated { goal_revision }
+                }
+                RequestBody::InstructionSend(_, params) => {
+                    if target.is_some() {
+                        return Err(StoreError::RunConflict);
+                    }
+                    if state.instructions.len() >= super::goal::MAX_INSTRUCTIONS {
+                        // Applied instructions are already in a run's history,
+                        // so the oldest of them makes room. A queue of
+                        // instructions nobody took is refused instead.
+                        let applied = state
+                            .instructions
+                            .iter()
+                            .position(|held| held.applied_to.is_some())
+                            .ok_or(StoreError::Overflow)?;
+                        state.instructions.remove(applied);
+                    }
+                    // The request identity is the instruction identity, so a
+                    // resend can never become a second instruction.
+                    let instruction = super::SavedInstruction {
+                        instruction_id: format!("i-{}", request.request_id.as_str()),
+                        text: params.text.clone(),
+                        received_revision: state.session_revision.checked_add(1)?,
+                        applied_to: None,
+                    };
+                    instruction.validate()?;
+                    if state
+                        .instructions
+                        .iter()
+                        .any(|held| held.instruction_id == instruction.instruction_id)
+                    {
+                        return Err(StoreError::RequestConflict);
+                    }
+                    let instruction_id = instruction.instruction_id.clone();
+                    state.instructions.push(instruction);
+                    RequestResult::InstructionReceived { instruction_id }
+                }
                 RequestBody::RunStart(_, params) => {
+                    if let Some(choice) = &params.mcp_prompt {
+                        prompt::validate_choice(choice)?;
+                    }
                     if state.runs.iter().any(|r| !r.run.state.is_terminal()) {
                         return Err(StoreError::Busy);
                     }
@@ -681,8 +907,11 @@ impl Writer {
                         },
                         configuration: state.configuration.clone(),
                         role_bindings: state.role_bindings.clone(),
+                        tier_bindings: state.tier_bindings.clone(),
+                        account,
                         policy_revision: state.policy_revision,
                         input: state.draft.clone(),
+                        mcp_prompt: params.mcp_prompt.clone(),
                         operations: Vec::new(),
                         result_id: None,
                         usage: None,
@@ -749,6 +978,18 @@ impl Writer {
         target: &RunTarget,
         operation: OperationId,
     ) -> StoreResult<IntentReceipt> {
+        let (next, receipt) = self.prepare_unapproved_intent(target, operation)?;
+        if receipt == IntentReceipt::NewlyPublished {
+            self.commit(next, false)?;
+        }
+        Ok(receipt)
+    }
+
+    fn prepare_unapproved_intent(
+        &self,
+        target: &RunTarget,
+        operation: OperationId,
+    ) -> StoreResult<(Published, IntentReceipt)> {
         self.ready()?;
         if self
             .published
@@ -766,7 +1007,7 @@ impl Writer {
             .iter()
             .any(|o| o.operation_id == operation)
         {
-            return Ok(IntentReceipt::AlreadyRecorded);
+            return Ok((self.published.clone(), IntentReceipt::AlreadyRecorded));
         }
         if !record.run.state.permits_start()
             || self
@@ -791,9 +1032,11 @@ impl Writer {
         record.operations.push(Operation {
             operation_id: operation,
             result_id: None,
+            mcp: None,
+            prompt: None,
+            recipe: None,
         });
-        self.commit(next, false)?;
-        Ok(IntentReceipt::NewlyPublished)
+        Ok((next, IntentReceipt::NewlyPublished))
     }
 
     pub fn record_operation_result(
@@ -856,6 +1099,127 @@ impl Writer {
 
     /// Publish a bounded diagnostic before terminal publication. If this fails,
     /// the owner must retain recovery-required state and cannot announce ready.
+    /// Sets or replaces the goal. A stop stays until an explicit resume, so a
+    /// new goal does not silently restart anything.
+    pub fn set_goal(&mut self, text: String) -> StoreResult<u64> {
+        self.ready()?;
+        if text.trim().is_empty() || text.len() > super::goal::MAX_GOAL_BYTES {
+            return Err(StoreError::Corrupt("goal"));
+        }
+        let mut next = self.published.clone();
+        let revision = next
+            .state
+            .goal
+            .as_ref()
+            .map_or(0, |goal| goal.revision.get());
+        let goal = super::SavedGoal {
+            text,
+            revision: DecimalU64::new(revision.checked_add(1).ok_or(StoreError::Overflow)?),
+            active: true,
+            stopped: next.state.goal.as_ref().is_some_and(|goal| goal.stopped),
+            automatic_used: DecimalU64::new(0),
+        };
+        goal.validate()?;
+        let revision = goal.revision.get();
+        next.state.goal = Some(goal);
+        self.commit(next, false)?;
+        Ok(revision)
+    }
+
+    /// Clears, stops or resumes the goal. Clearing keeps the revision so an
+    /// older run cannot be treated as still pursuing it.
+    pub fn update_goal(&mut self, active: bool, stopped: bool) -> StoreResult<u64> {
+        self.ready()?;
+        let mut next = self.published.clone();
+        let goal = next.state.goal.as_mut().ok_or(StoreError::NotFound)?;
+        goal.revision = goal.revision.checked_add(1)?;
+        goal.active = active && !goal.text.trim().is_empty();
+        goal.stopped = stopped;
+        let revision = goal.revision.get();
+        let goal = goal.clone();
+        goal.validate()?;
+        self.commit(next, false)?;
+        Ok(revision)
+    }
+
+    /// Spends one automatic continuation. Refused once the budget is gone,
+    /// so a restart cannot hand out a second one.
+    pub fn record_automatic_resume(&mut self) -> StoreResult<u64> {
+        self.ready()?;
+        let mut next = self.published.clone();
+        let goal = next.state.goal.as_mut().ok_or(StoreError::NotFound)?;
+        if goal.automatic_used.get() >= crate::resume::MAX_AUTOMATIC {
+            return Err(StoreError::RunConflict);
+        }
+        goal.automatic_used = goal.automatic_used.checked_add(1)?;
+        let used = goal.automatic_used.get();
+        self.commit(next, false)?;
+        Ok(used)
+    }
+
+    /// Durable on receipt. Applying it is a separate, later transition.
+    pub fn receive_instruction(&mut self, id: String, text: String) -> StoreResult<()> {
+        self.ready()?;
+        let mut next = self.published.clone();
+        if next.state.instructions.len() >= super::goal::MAX_INSTRUCTIONS {
+            let applied = next
+                .state
+                .instructions
+                .iter()
+                .position(|held| held.applied_to.is_some())
+                .ok_or(StoreError::Overflow)?;
+            next.state.instructions.remove(applied);
+        }
+        if next
+            .state
+            .instructions
+            .iter()
+            .any(|instruction| instruction.instruction_id == id)
+        {
+            // The same instruction is never stored twice, so a resend cannot
+            // be applied twice either.
+            return Ok(());
+        }
+        let instruction = super::SavedInstruction {
+            instruction_id: id,
+            text,
+            received_revision: next.state.session_revision.checked_add(1)?,
+            applied_to: None,
+        };
+        instruction.validate()?;
+        next.state.instructions.push(instruction);
+        self.commit(next, false)
+    }
+
+    /// Marks exactly the instructions a run took in, at its apply boundary.
+    pub fn apply_instructions(&mut self, target: &RunTarget, ids: &[String]) -> StoreResult<()> {
+        self.ready()?;
+        self.run_index(target)?;
+        let mut next = self.published.clone();
+        for id in ids {
+            let instruction = next
+                .state
+                .instructions
+                .iter_mut()
+                .find(|instruction| &instruction.instruction_id == id)
+                .ok_or(StoreError::NotFound)?;
+            // The same attempt never applies one twice; a later attempt may
+            // take over one an abandoned attempt had taken.
+            if instruction
+                .applied_to
+                .as_ref()
+                .is_some_and(|applied| applied.attempt_id == target.attempt_id)
+            {
+                return Err(StoreError::RunConflict);
+            }
+            instruction.applied_to = Some(super::AppliedInstruction {
+                run_id: target.run_id.clone(),
+                attempt_id: target.attempt_id.clone(),
+            });
+        }
+        self.commit(next, false)
+    }
+
     pub fn record_history_gap(&mut self, target: &RunTarget, gap: HistoryGap) -> StoreResult<()> {
         self.ready()?;
         let index = self.run_index(target)?;
@@ -1039,6 +1403,99 @@ impl Writer {
         )
     }
 
+    /// Atomically acknowledge one workflow transition and its complete raw
+    /// suffix. The worker always supplies the complete suffix; this owner
+    /// appends only the tail beyond its durable cursor.
+    pub fn checkpoint_workflow(
+        &mut self,
+        target: &RunTarget,
+        full_turn_suffix: Vec<Message>,
+        previous: super::SavedWorkflow,
+        candidate: super::SavedWorkflow,
+        tool_call_id: Option<&str>,
+    ) -> StoreResult<()> {
+        self.ready()?;
+        previous.validate()?;
+        candidate.validate()?;
+        validate_turn_suffix(&full_turn_suffix, Observation::Cancelled)?;
+        if let Some(id) = tool_call_id
+            && !full_turn_suffix
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some(id))
+        {
+            return Err(StoreError::RunConflict);
+        }
+        if previous.config != candidate.config
+            || !same_or_staled_gates(&previous.gates, &candidate.gates)
+            || (candidate.state.revision == previous.state.revision
+                && candidate.state != previous.state)
+            || (candidate.state.revision != previous.state.revision
+                && candidate.state.revision
+                    != previous
+                        .state
+                        .revision
+                        .checked_add(1)
+                        .ok_or(StoreError::Overflow)?)
+        {
+            return Err(StoreError::RunConflict);
+        }
+        let index = self.run_index(target)?;
+        let record = &self.published.state.runs[index];
+        if record.run.state.is_terminal() {
+            return if record.workflow.as_ref() == Some(&candidate)
+                && same_messages(
+                    &saved_turn_suffix(&self.published, self.published.raw_run_index(index)?)?,
+                    &full_turn_suffix,
+                )? {
+                Ok(())
+            } else {
+                Err(StoreError::RunConflict)
+            };
+        }
+        if record.workflow.as_ref() == Some(&candidate)
+            && same_messages(
+                &saved_turn_suffix(&self.published, self.published.raw_run_index(index)?)?,
+                &full_turn_suffix,
+            )?
+        {
+            return Ok(());
+        }
+        let saved = record.workflow.as_ref().ok_or(StoreError::RunConflict)?;
+        if !checkpoint_base_matches(saved, &previous) {
+            return Err(StoreError::RunConflict);
+        }
+        let mut next = self.published.clone();
+        let tail = turn_suffix_tail(&next, next.raw_run_index(index)?, &full_turn_suffix)?;
+        let raw_index = next.raw_run_index(index)?;
+        append_turn_suffix(&mut next.raw, raw_index, tail)?;
+        next.state.runs[index].workflow = Some(candidate.clone());
+        next.state.workflow = Some(candidate);
+        self.commit(next, true)
+    }
+
+    /// Reconcile the durable marker after an uncertain ACK, without dispatching
+    /// or appending anything. The owner handle binds project/session/epoch;
+    /// target plus the exact saved workflow and full suffix bind the checkpoint.
+    pub fn confirm_workflow_checkpoint(
+        &mut self,
+        target: &RunTarget,
+        full_turn_suffix: &[Message],
+        candidate: &super::SavedWorkflow,
+    ) -> StoreResult<()> {
+        self.recover()?;
+        let index = self.run_index(target)?;
+        if self.published.state.runs[index].workflow.as_ref() == Some(candidate)
+            && same_messages(
+                &saved_turn_suffix(&self.published, self.published.raw_run_index(index)?)?,
+                full_turn_suffix,
+            )?
+        {
+            Ok(())
+        } else {
+            Err(StoreError::RunConflict)
+        }
+    }
+
     /// Publish raw output and workflow evidence under the same durable marker.
     /// Replay compares the checkpoint belonging to this run, not a newer turn.
     pub fn finish_with_messages_and_workflow(
@@ -1068,21 +1525,10 @@ impl Writer {
             {
                 return Err(StoreError::RunConflict);
             }
-            let input = self
-                .published
-                .raw
-                .iter()
-                .filter(|r| r.starts_turn)
-                .nth(index)
-                .ok_or(StoreError::RunConflict)?;
-            let saved: Vec<_> = self
-                .published
-                .raw
-                .iter()
-                .filter(|r| r.turn_id == input.turn_id && !r.starts_turn)
-                .map(|r| &r.message)
-                .collect();
-            let same_body = serde_json::to_vec(&saved)? == serde_json::to_vec(&messages)?;
+            let same_body = same_messages(
+                &saved_turn_suffix(&self.published, self.published.raw_run_index(index)?)?,
+                &messages,
+            )?;
             return if record.run.state == outcome.state()
                 && record.result_id.as_ref() == Some(&result)
                 && same_body
@@ -1119,24 +1565,9 @@ impl Writer {
             .state();
         let mut next = self.published.clone();
         super::children::seal(&mut next.state, target, outcome)?;
-        let prior = next.raw.last().ok_or(StoreError::RunConflict)?;
-        // Only the current accepted turn may acquire a new suffix.
-        if !prior.starts_turn || next.raw.iter().filter(|r| r.starts_turn).count() != index + 1 {
-            return Err(StoreError::RunConflict);
-        }
-        let turn_id = prior.turn_id;
-        let mut sequence = prior.sequence;
-        for message in messages {
-            sequence = sequence.checked_add(1).ok_or(StoreError::Overflow)?;
-            next.raw.push(RawEventV2 {
-                schema_version: 2,
-                sequence,
-                epoch: next.marker.epoch.get(),
-                turn_id,
-                starts_turn: false,
-                message,
-            });
-        }
+        let tail = turn_suffix_tail(&next, next.raw_run_index(index)?, &messages)?;
+        let raw_index = next.raw_run_index(index)?;
+        append_turn_suffix(&mut next.raw, raw_index, tail)?;
         let record = &mut next.state.runs[index];
         record.operations[op].result_id = Some(result.clone());
         record.run.state = state;
@@ -1293,6 +1724,33 @@ impl Writer {
         payload_hash: &str,
         now_ms: u64,
     ) -> StoreResult<IntentReceipt> {
+        let (next, receipt) = self.prepare_approval_intent(
+            target,
+            approval,
+            operation,
+            operation_kind,
+            scope,
+            payload_hash,
+            now_ms,
+        )?;
+        if receipt == IntentReceipt::NewlyPublished {
+            self.commit(next, false)?;
+        }
+        Ok(receipt)
+    }
+
+    /// 許可消費とintentを同じmarkerで公開する。slot登録・draining照合は所有者が直列化する。
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_approval_intent(
+        &self,
+        target: &RunTarget,
+        approval: &ApprovalId,
+        operation: &OperationId,
+        operation_kind: &str,
+        scope: &str,
+        payload_hash: &str,
+        now_ms: u64,
+    ) -> StoreResult<(Published, IntentReceipt)> {
         self.ready()?;
         let index = self
             .published
@@ -1314,7 +1772,7 @@ impl Writer {
             return Err(StoreError::RunConflict);
         }
         if ledger.consumed {
-            return Ok(IntentReceipt::AlreadyRecorded);
+            return Ok((self.published.clone(), IntentReceipt::AlreadyRecorded));
         }
         if self
             .published
@@ -1340,9 +1798,11 @@ impl Writer {
         run.operations.push(Operation {
             operation_id: operation.clone(),
             result_id: None,
+            mcp: None,
+            prompt: None,
+            recipe: None,
         });
-        self.commit(next, false)?;
-        Ok(IntentReceipt::NewlyPublished)
+        Ok((next, IntentReceipt::NewlyPublished))
     }
 
     pub fn invalidate_approval(&mut self, approval: &ApprovalId) -> StoreResult<()> {
@@ -1712,6 +2172,129 @@ fn valid_hash(hash: &str) -> bool {
         && hash
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn same_message(left: &Message, right: &Message) -> StoreResult<bool> {
+    Ok(serde_json::to_vec(left)? == serde_json::to_vec(right)?)
+}
+
+fn same_messages(left: &[Message], right: &[Message]) -> StoreResult<bool> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    left.iter()
+        .zip(right)
+        .try_fold(true, |same, (left, right)| {
+            Ok(same && same_message(left, right)?)
+        })
+}
+
+fn saved_turn_suffix(p: &Published, index: usize) -> StoreResult<Vec<Message>> {
+    let run_index = index
+        .checked_sub(
+            usize::try_from(p.state.inherited_turn_count.get())
+                .map_err(|_| StoreError::Overflow)?,
+        )
+        .ok_or(StoreError::RunConflict)?;
+    let supplemental = prompt::attachment(p, run_index)?.map(|event| event.sequence);
+    let input = p
+        .raw
+        .iter()
+        .filter(|event| event.starts_turn)
+        .nth(index)
+        .ok_or(StoreError::RunConflict)?;
+    Ok(p.raw
+        .iter()
+        .filter(|event| {
+            event.turn_id == input.turn_id
+                && !event.starts_turn
+                && Some(event.sequence) != supplemental
+        })
+        .map(|event| event.message.clone())
+        .collect())
+}
+
+fn turn_suffix_tail(p: &Published, index: usize, full: &[Message]) -> StoreResult<Vec<Message>> {
+    let saved = saved_turn_suffix(p, index)?;
+    if saved.len() > full.len()
+        || !saved
+            .iter()
+            .zip(full)
+            .try_fold(true, |same, (saved, full)| {
+                Ok::<bool, StoreError>(same && same_message(saved, full)?)
+            })?
+    {
+        return Err(StoreError::RunConflict);
+    }
+    Ok(full[saved.len()..].to_vec())
+}
+
+fn append_turn_suffix(
+    raw: &mut Vec<RawEventV2>,
+    index: usize,
+    tail: Vec<Message>,
+) -> StoreResult<()> {
+    if tail.is_empty() {
+        return Ok(());
+    }
+    // Only the current accepted turn may acquire a new suffix.
+    if raw.iter().filter(|event| event.starts_turn).count() != index + 1 {
+        return Err(StoreError::RunConflict);
+    }
+    let input = raw
+        .iter()
+        .filter(|event| event.starts_turn)
+        .nth(index)
+        .ok_or(StoreError::RunConflict)?;
+    let turn_id = input.turn_id;
+    let mut sequence = raw.last().ok_or(StoreError::RunConflict)?.sequence;
+    let epoch = raw.last().ok_or(StoreError::RunConflict)?.epoch;
+    for message in tail {
+        sequence = sequence.checked_add(1).ok_or(StoreError::Overflow)?;
+        raw.push(RawEventV2 {
+            schema_version: 2,
+            sequence,
+            epoch,
+            turn_id,
+            starts_turn: false,
+            message,
+        });
+    }
+    Ok(())
+}
+
+fn same_or_staled_gates(
+    previous: &crate::workflow::WorkflowGatesV1,
+    candidate: &crate::workflow::WorkflowGatesV1,
+) -> bool {
+    if previous.schema_version != candidate.schema_version
+        || previous.approved_spec_hash != candidate.approved_spec_hash
+        || previous.external_grants != candidate.external_grants
+    {
+        return false;
+    }
+    match (&previous.verification, &candidate.verification) {
+        (None, None) => true,
+        (Some(previous), Some(candidate)) => {
+            previous.artifact_hash == candidate.artifact_hash
+                && previous.passed == candidate.passed
+                && (!previous.stale || candidate.stale)
+        }
+        _ => false,
+    }
+}
+
+fn checkpoint_base_matches(saved: &super::SavedWorkflow, previous: &super::SavedWorkflow) -> bool {
+    saved.config == previous.config
+        && saved.state.phase == previous.state.phase
+        && saved.state.revision == previous.state.revision
+        && same_or_staled_gates(&saved.gates, &previous.gates)
+        && (saved.state == previous.state
+            // `begin_turn` fixes the first request's manifest before provider
+            // admission. A legacy durable snapshot has no manifest yet.
+            || (saved.state.skill_manifest_hash.is_empty()
+                && saved.state.skills.is_empty()
+                && !previous.state.skill_manifest_hash.is_empty()))
 }
 
 pub(crate) fn validate_turn_suffix(messages: &[Message], outcome: Observation) -> StoreResult<()> {

@@ -5,6 +5,10 @@ use super::*;
 use polaris_desktop_protocol::{ids::*, request::*, run_state::*, snapshot::*};
 use std::{fs, io::Write};
 
+mod details_tests;
+mod mcp_tests;
+mod prompt_tests;
+
 fn session() -> SessionId {
     SessionId::new("../../prototype-session").unwrap()
 }
@@ -75,6 +79,7 @@ fn start(id: &str, revision: u64) -> Request {
         RequestBody::RunStart(
             session(),
             RunStart {
+                mcp_prompt: None,
                 expected_draft_revision: DecimalU64::new(revision),
                 expected_configuration_revision: DecimalU64::new(0),
                 expected_policy_revision: DecimalU64::new(7),
@@ -98,7 +103,7 @@ fn dir(writer: &Writer) -> std::path::PathBuf {
     // 試験のみ: 非公開内部のpathは外部APIへ漏らさない。
     writer.test_directory()
 }
-fn inject(point: Option<&'static str>) {
+pub(crate) fn inject(point: Option<&'static str>) {
     disk::FAIL.with(|f| f.set(point));
 }
 fn unchanged(before: &Published, after: &Published) {
@@ -1506,6 +1511,130 @@ fn workflow_checkpoint_reopens_and_old_run_replays_after_configuration_changes()
 }
 
 #[test]
+fn workflow_checkpoint_publishes_suffix_once_and_terminal_reuses_its_cursor() {
+    let (_, mut writer) = setup();
+    let previous = workflow_fixture();
+    writer
+        .configure_workflow(DecimalU64::new(0), Some(previous.clone()))
+        .unwrap();
+    writer
+        .apply(&start("workflow-checkpoint", 0), Some(target()))
+        .unwrap();
+    let mut candidate = previous.clone();
+    candidate.state.phase = crate::workflow::Phase::Review;
+    candidate.state.revision = 1;
+    let suffix = desktop_tool_turn();
+    writer
+        .checkpoint_workflow(
+            &target(),
+            suffix.clone(),
+            previous.clone(),
+            candidate.clone(),
+            Some("call-1"),
+        )
+        .unwrap();
+    let checkpointed = writer.snapshot().unwrap();
+    assert_eq!(checkpointed.raw.len(), 4);
+    assert_eq!(checkpointed.state.runs[0].workflow, Some(candidate.clone()));
+    assert_eq!(checkpointed.state.workflow, Some(candidate.clone()));
+    assert!(
+        writer
+            .checkpoint_workflow(
+                &target(),
+                desktop_tool_turn(),
+                candidate.clone(),
+                candidate.clone(),
+                Some("different-call"),
+            )
+            .is_err()
+    );
+    unchanged(&checkpointed, &writer.snapshot().unwrap());
+    // An uncertain acknowledgement is checked against the same candidate and
+    // full suffix; it cannot append the tool result a second time.
+    writer
+        .checkpoint_workflow(
+            &target(),
+            suffix.clone(),
+            previous,
+            candidate.clone(),
+            Some("call-1"),
+        )
+        .unwrap();
+    unchanged(&checkpointed, &writer.snapshot().unwrap());
+    writer.record_intent(&target(), op()).unwrap();
+    writer
+        .finish_with_messages_and_workflow(
+            &target(),
+            &op(),
+            Observation::Succeeded,
+            result(),
+            suffix,
+            Some(candidate),
+        )
+        .unwrap();
+    let terminal = writer.snapshot().unwrap();
+    assert_eq!(
+        terminal.raw.len(),
+        4,
+        "terminal must reuse checkpoint cursor"
+    );
+    assert_eq!(terminal.state.runs[0].run.state, RunState::Succeeded);
+}
+
+#[tokio::test]
+async fn workflow_lost_ack_confirms_marker_without_repeating_checkpoint() {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let (_, mut writer) = setup();
+    let previous = workflow_fixture();
+    writer
+        .configure_workflow(DecimalU64::new(0), Some(previous.clone()))
+        .unwrap();
+    writer
+        .apply(&start("lost-workflow-ack", 0), Some(target()))
+        .unwrap();
+    let mut candidate = previous.clone();
+    candidate.state.phase = crate::workflow::Phase::Review;
+    candidate.state.revision = 1;
+    let suffix = desktop_tool_turn();
+    let (port, mut owner) = crate::desktop_workflow::DesktopWorkflow::pair(target());
+    owner.discard_next_ack();
+    let mut checkpoint = Box::pin(port.checkpoint(
+        suffix.clone(),
+        previous,
+        candidate.clone(),
+        Some("call-1".into()),
+    ));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        checkpoint.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    owner.poll(Some(&mut writer), false, None);
+    let committed = writer.snapshot().unwrap();
+    assert_eq!(committed.state.workflow, Some(candidate.clone()));
+    assert!(matches!(
+        checkpoint.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    owner.poll(Some(&mut writer), true, None); // Cancellation permits only confirmation.
+    assert!(matches!(
+        checkpoint.as_mut().poll(&mut context),
+        Poll::Ready(Ok(()))
+    ));
+    unchanged(&committed, &writer.snapshot().unwrap());
+    candidate.state.revision = 2;
+    assert!(
+        writer
+            .confirm_workflow_checkpoint(&target(), &suffix, &candidate)
+            .is_err()
+    );
+    unchanged(&committed, &writer.snapshot().unwrap());
+}
+
+#[test]
 fn workflow_invalid_schema_is_rejected_before_publishing_terminal() {
     let (_, mut writer) = setup();
     writer
@@ -2216,7 +2345,7 @@ fn role_catalog() -> Vec<polaris_skills::AgentType> {
         path: "/never-read".into(),
         allowed_tools: vec![],
         access: polaris_skills::AgentAccess::Read,
-        tier: String::new(),
+        tier: polaris_skills::Tier::Dwarf,
         wall_seconds: 1,
         max_turns: 1,
         workflow_phase: None,
@@ -2228,7 +2357,8 @@ fn saved_roles_fixture() -> SavedRoleBindings {
     SavedRoleBindings::new(vec![SavedRoleBinding {
         role: "reviewer".into(),
         runtime: SavedRuntime::Ollama,
-        endpoint: "http://127.0.0.1:11434".into(),
+        endpoint: Some("http://127.0.0.1:11434".into()),
+        effort: None,
         model: "fixture".into(),
         observed_tool_support: ToolSupport::Unknown,
     }])
@@ -2249,12 +2379,17 @@ fn saved_roles_configuration_cas_validation_and_content_preservation() {
     let roles = saved_roles_fixture();
     assert!(
         writer
-            .configure_role_bindings(DecimalU64::new(0), Some(roles.clone()), &[])
+            .configure_role_bindings(DecimalU64::new(0), Some(roles.clone()), None, &[])
             .is_err()
     );
     unchanged(&before, &writer.snapshot().unwrap());
     writer
-        .configure_role_bindings(DecimalU64::new(0), Some(roles.clone()), &role_catalog())
+        .configure_role_bindings(
+            DecimalU64::new(0),
+            Some(roles.clone()),
+            None,
+            &role_catalog(),
+        )
         .unwrap();
     let saved = writer.snapshot().unwrap();
     assert_eq!(saved.state.role_bindings, Some(roles));
@@ -2270,7 +2405,7 @@ fn saved_roles_configuration_cas_validation_and_content_preservation() {
     assert_eq!(saved.marker.raw_hash, before.marker.raw_hash);
     assert_eq!(saved.state.draft, before.state.draft);
     assert!(matches!(
-        writer.configure_role_bindings(DecimalU64::new(0), None, &[]),
+        writer.configure_role_bindings(DecimalU64::new(0), None, None, &[]),
         Err(StoreError::CasConflict("configuration"))
     ));
     assert!(matches!(
@@ -2282,7 +2417,7 @@ fn saved_roles_configuration_cas_validation_and_content_preservation() {
     invalid.schema_version = 2;
     assert!(
         writer
-            .configure_role_bindings(DecimalU64::new(1), Some(invalid), &role_catalog())
+            .configure_role_bindings(DecimalU64::new(1), Some(invalid), None, &role_catalog())
             .is_err()
     );
     unchanged(&saved, &writer.snapshot().unwrap());
@@ -2293,14 +2428,19 @@ fn saved_roles_active_update_freezes_run_and_terminal_reopen_preserves_both() {
     let (root, mut writer) = setup();
     let roles = saved_roles_fixture();
     writer
-        .configure_role_bindings(DecimalU64::new(0), Some(roles.clone()), &role_catalog())
+        .configure_role_bindings(
+            DecimalU64::new(0),
+            Some(roles.clone()),
+            None,
+            &role_catalog(),
+        )
         .unwrap();
     let accepted = start_with_configuration("role-run", 1);
     writer.apply(&accepted, Some(target())).unwrap();
     writer.record_intent(&target(), op()).unwrap();
     let empty = SavedRoleBindings::new(vec![]).unwrap();
     writer
-        .configure_role_bindings(DecimalU64::new(1), Some(empty.clone()), &[])
+        .configure_role_bindings(DecimalU64::new(1), Some(empty.clone()), None, &[])
         .unwrap();
     let active = writer.snapshot().unwrap();
     assert_eq!(active.state.configuration.configuration_revision.get(), 2);
@@ -2341,7 +2481,7 @@ fn saved_roles_active_update_freezes_run_and_terminal_reopen_preserves_both() {
     assert_eq!(saved.state.role_bindings, Some(empty));
     assert_eq!(saved.state.runs[0].role_bindings, Some(roles.clone()));
     reopened
-        .configure_role_bindings(DecimalU64::new(2), None, &[])
+        .configure_role_bindings(DecimalU64::new(2), None, None, &[])
         .unwrap();
     reopened
         .finish_with_messages_and_workflow(
@@ -2365,7 +2505,7 @@ fn saved_roles_none_and_explicit_empty_round_trip_and_legacy_missing_fields() {
     for roles in [None, Some(SavedRoleBindings::new(vec![]).unwrap())] {
         let (root, mut writer) = setup();
         writer
-            .configure_role_bindings(DecimalU64::new(0), roles.clone(), &[])
+            .configure_role_bindings(DecimalU64::new(0), roles.clone(), None, &[])
             .unwrap();
         writer
             .apply(
@@ -2404,6 +2544,7 @@ fn saved_roles_disk_rejects_invalid_current_and_historical_sidecar_and_run_metad
                 .configure_role_bindings(
                     DecimalU64::new(0),
                     Some(saved_roles_fixture()),
+                    None,
                     &role_catalog(),
                 )
                 .unwrap();
@@ -2414,7 +2555,7 @@ fn saved_roles_disk_rejects_invalid_current_and_historical_sidecar_and_run_metad
                 )
                 .unwrap();
             writer
-                .configure_role_bindings(DecimalU64::new(1), None, &[])
+                .configure_role_bindings(DecimalU64::new(1), None, None, &[])
                 .unwrap();
             let path = dir(&writer);
             let mut marker = writer.snapshot().unwrap().marker;
@@ -3556,4 +3697,218 @@ fn source_answer_publication_fault_never_saves_answer_without_receipt() {
         );
         assert!(saved.state.source_applies[0].intent_revision.is_none());
     }
+}
+
+#[test]
+fn the_acceptance_that_saves_a_run_saves_the_registration_it_is_bound_to() {
+    let (_root, mut writer) = setup();
+    let account = SavedAccount::new("reg-a".into(), 3).unwrap();
+    writer
+        .apply_bound(&start("start", 0), Some(target()), Some(account.clone()))
+        .unwrap();
+    let saved = writer.snapshot().unwrap();
+    assert_eq!(saved.state.runs[0].account, Some(account));
+    // Reloading keeps the binding and rejects a record that lost its generation.
+    let reloaded: Sidecar =
+        serde_json::from_str(&serde_json::to_string(&saved.state).unwrap()).unwrap();
+    assert_eq!(
+        reloaded.runs[0].account.as_ref().unwrap().registration_id,
+        "reg-a"
+    );
+    assert!(SavedAccount::new("reg-a".into(), 0).is_err());
+    assert!(SavedAccount::new("reg a".into(), 1).is_err());
+}
+
+#[test]
+fn a_run_accepted_without_a_binding_stays_on_the_single_authentication() {
+    let (_root, mut writer) = setup();
+    writer.apply(&start("start", 0), Some(target())).unwrap();
+    assert_eq!(writer.snapshot().unwrap().state.runs[0].account, None);
+    // An invalid binding is refused before anything is written.
+    let mut writer = setup().1;
+    let invalid = SavedAccount {
+        registration_id: String::new(),
+        generation: DecimalU64::new(1),
+    };
+    assert!(
+        writer
+            .apply_bound(&start("start", 0), Some(target()), Some(invalid))
+            .is_err()
+    );
+    assert!(writer.snapshot().unwrap().state.runs.is_empty());
+}
+
+#[test]
+fn the_state_window_answers_from_the_published_state_and_follows_with_differences() {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let (_root, mut writer) = setup();
+    let (port, mut owner) = crate::desktop_workflow::DesktopWorkflow::pair(target());
+    let mut context = Context::from_waker(Waker::noop());
+    let mut first = Box::pin(port.window(None));
+    assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+    owner.poll(Some(&mut writer), false, None);
+    let Poll::Ready(Ok(crate::desktop_store::hub::Delta::Resync(view))) =
+        first.as_mut().poll(&mut context)
+    else {
+        panic!("an unknown base resynchronizes");
+    };
+    assert!(view.runs.is_empty());
+
+    writer.apply(&start("window", 0), Some(target())).unwrap();
+    let mut second = Box::pin(port.window(Some(view.revision)));
+    assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+    owner.poll(Some(&mut writer), false, None);
+    let Poll::Ready(Ok(crate::desktop_store::hub::Delta::Changes(changes))) =
+        second.as_mut().poll(&mut context)
+    else {
+        panic!("a matching base produces the difference only");
+    };
+    assert_eq!(changes.base, view.revision);
+    assert_eq!(changes.runs.changed.len(), 1);
+    assert!(changes.tasks.is_empty());
+
+    // Reading is not writing: a cancelled run still sees where things stand.
+    let mut third = Box::pin(port.window(Some(changes.revision)));
+    assert!(matches!(third.as_mut().poll(&mut context), Poll::Pending));
+    owner.poll(Some(&mut writer), true, None);
+    let Poll::Ready(Ok(crate::desktop_store::hub::Delta::Changes(changes))) =
+        third.as_mut().poll(&mut context)
+    else {
+        panic!("cancellation does not refuse a read");
+    };
+    assert!(changes.is_empty());
+}
+
+#[test]
+fn a_goal_survives_a_stop_and_an_instruction_is_durable_before_it_is_applied() {
+    let (_root, mut writer) = setup();
+    assert_eq!(writer.set_goal("v1.0.0まで進める".into()).unwrap(), 1);
+    assert!(writer.set_goal("   ".into()).is_err());
+    let goal = writer.snapshot().unwrap().state.goal.unwrap();
+    assert!(goal.active && !goal.stopped);
+
+    // An explicit stop stays through a later goal change.
+    assert_eq!(writer.update_goal(true, true).unwrap(), 2);
+    assert_eq!(writer.set_goal("別の目標".into()).unwrap(), 3);
+    let goal = writer.snapshot().unwrap().state.goal.unwrap();
+    assert!(goal.stopped, "a new goal must not silently resume");
+    assert_eq!(writer.update_goal(true, false).unwrap(), 4);
+    assert!(!writer.snapshot().unwrap().state.goal.unwrap().stopped);
+
+    writer
+        .receive_instruction("i1".into(), "先にtestを直す".into())
+        .unwrap();
+    // The same instruction never lands twice, so a resend cannot double-apply.
+    writer
+        .receive_instruction("i1".into(), "先にtestを直す".into())
+        .unwrap();
+    let saved = writer.snapshot().unwrap();
+    assert_eq!(saved.state.instructions.len(), 1);
+    assert!(saved.state.instructions[0].applied_to.is_none());
+
+    // The window shows a received instruction until a run takes it in.
+    let pending = crate::desktop_store::hub::view(&writer.snapshot().unwrap().state, 1, None);
+    assert_eq!(pending.instructions.len(), 1);
+    assert_eq!(pending.goal.as_ref().map(|goal| goal.revision), Some(4));
+
+    writer.apply(&start("goal-run", 0), Some(target())).unwrap();
+    writer
+        .apply_instructions(&target(), &["i1".into()])
+        .unwrap();
+    let after = crate::desktop_store::hub::view(&writer.snapshot().unwrap().state, 2, None);
+    assert!(after.instructions.is_empty());
+    let applied = writer.snapshot().unwrap().state.instructions[0]
+        .applied_to
+        .clone()
+        .expect("applied");
+    assert_eq!(applied.run_id, target().run_id);
+    // Applying the same instruction again is a conflict, not a silent repeat.
+    assert!(
+        writer
+            .apply_instructions(&target(), &["i1".into()])
+            .is_err()
+    );
+    assert!(
+        writer
+            .apply_instructions(&target(), &["i2".into()])
+            .is_err()
+    );
+}
+
+#[test]
+fn instructions_are_handed_to_the_run_once_and_stay_recorded_against_it() {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let (_root, mut writer) = setup();
+    writer.apply(&start("first", 0), Some(target())).unwrap();
+    writer
+        .receive_instruction("i1".into(), "先にtestを直す".into())
+        .unwrap();
+    let (port, mut owner) = crate::desktop_workflow::DesktopWorkflow::pair(target());
+    let mut context = Context::from_waker(Waker::noop());
+
+    let mut take = Box::pin(port.take_instructions());
+    assert!(matches!(take.as_mut().poll(&mut context), Poll::Pending));
+    owner.poll(Some(&mut writer), false, None);
+    let Poll::Ready(Ok(taken)) = take.as_mut().poll(&mut context) else {
+        panic!("the instruction is handed over");
+    };
+    assert_eq!(taken, vec!["先にtestを直す".to_string()]);
+
+    // The same attempt never receives it twice.
+    let mut again = Box::pin(port.take_instructions());
+    assert!(matches!(again.as_mut().poll(&mut context), Poll::Pending));
+    owner.poll(Some(&mut writer), false, None);
+    assert!(matches!(
+        again.as_mut().poll(&mut context),
+        Poll::Ready(Ok(taken)) if taken.is_empty()
+    ));
+
+    // It stays recorded against the run that took it, with its text.
+    let saved = writer.snapshot().unwrap();
+    assert_eq!(
+        saved.state.instructions[0]
+            .applied_to
+            .as_ref()
+            .map(|applied| applied.attempt_id.as_str()),
+        Some(target().attempt_id.as_str())
+    );
+    assert!(
+        crate::desktop_store::hub::view(&saved.state, 1, None)
+            .instructions
+            .is_empty()
+    );
+}
+
+#[test]
+fn an_applied_instruction_makes_room_so_a_long_session_keeps_accepting_them() {
+    use crate::desktop_store::MAX_INSTRUCTIONS;
+    let (_root, mut writer) = setup();
+    writer.apply(&start("run", 0), Some(target())).unwrap();
+    for n in 0..MAX_INSTRUCTIONS {
+        writer
+            .receive_instruction(format!("i{n}"), format!("指示{n}"))
+            .unwrap();
+    }
+    // Every instruction is still waiting, so the bound refuses one more.
+    assert!(
+        writer
+            .receive_instruction("over".into(), "あふれる".into())
+            .is_err()
+    );
+    writer
+        .apply_instructions(&target(), &["i0".into()])
+        .unwrap();
+    writer
+        .receive_instruction("after".into(), "続きの指示".into())
+        .unwrap();
+    let held = writer.snapshot().unwrap().state.instructions;
+    assert_eq!(held.len(), MAX_INSTRUCTIONS);
+    assert!(held.iter().all(|held| held.instruction_id != "i0"));
+    assert_eq!(held.last().unwrap().instruction_id, "after");
 }

@@ -18,15 +18,36 @@ impl TierDecider for Fixed {
     }
 }
 
+/// Nothing routed the task, so it runs at the ordinary rung — not at the
+/// ceiling its type happens to allow.
+///
+/// This test used to assert the opposite, and that assertion was the
+/// defect. `polaris-tier` is a ceiling: `implementer` declares
+/// `supergiant` so the judge can reach all four rungs, not because every
+/// implementation is worth `sol`. Running the ceiling unrouted put the
+/// ordinary case on 33.7 against `subgiant`'s 10.0, in exactly the
+/// configuration that has no judge to notice it.
 #[tokio::test]
-async fn no_decider_uses_what_each_type_declared() {
+async fn nothing_routed_it_means_the_ordinary_rung_not_the_ceiling() {
     let light = typed("light", "dwarf");
     let heavy = typed("heavy", "supergiant");
-    let tasks = [(&light, "a"), (&heavy, "b")];
+    let middle = typed("middle", "giant");
+    let tasks = [(&light, "a"), (&heavy, "b"), (&middle, "c")];
     assert_eq!(
         decide_all(None, &tasks).await,
-        vec![Tier::Dwarf, Tier::Supergiant],
-        "having no decider is the ordinary case, not a degraded one"
+        // `dwarf` keeps its own: the ceiling still binds downward, so a
+        // type that allows less than the default is not handed more.
+        vec![Tier::Dwarf, Tier::DEFAULT, Tier::DEFAULT],
+        "unrouted work runs at the documented default, capped by the ceiling"
+    );
+    assert_eq!(
+        Tier::DEFAULT,
+        Tier::Subgiant,
+        "M16 names subgiant the default"
+    );
+    assert!(
+        Tier::DEFAULT < Tier::Supergiant,
+        "a default at or above the top rung would make this rule a no-op"
     );
 }
 
@@ -55,7 +76,10 @@ async fn answers_that_do_not_line_up_with_the_tasks_are_discarded_whole() {
     let decider = Fixed(vec![Tier::Dwarf]);
     assert_eq!(
         decide_all(Some(&decider), &tasks).await,
-        vec![Tier::Dwarf, Tier::Supergiant]
+        // A reply that cannot be lined up routed nothing, so this lands on
+        // the same unrouted default as having no decider at all — not on
+        // the ceiling, and not on the one answer that did arrive.
+        vec![Tier::Dwarf, Tier::DEFAULT]
     );
 }
 

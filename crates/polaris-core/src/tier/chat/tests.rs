@@ -95,7 +95,10 @@ async fn nothing_but_a_weight_per_line_counts_as_an_answer() {
 async fn a_model_that_cannot_answer_costs_no_delegation() {
     let heavy = typed_agent("heavy", "supergiant");
     let decider = ChatTierDecider::new(scripted(None));
-    assert_eq!(decider.decide(&[(&heavy, "a")]).await, vec![Tier::Supergiant]);
+    assert_eq!(
+        decider.decide(&[(&heavy, "a")]).await,
+        vec![Tier::Supergiant]
+    );
 }
 
 #[tokio::test]

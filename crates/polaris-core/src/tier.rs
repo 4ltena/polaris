@@ -38,20 +38,30 @@ pub async fn decide_all(
     decider: Option<&dyn TierDecider>,
     tasks: &[(&AgentType, &str)],
 ) -> Vec<Tier> {
-    let declared = || {
+    // Without a routing answer the weight falls to the documented default,
+    // held down by the type's ceiling — never to the ceiling itself.
+    //
+    // `polaris-tier` is a ceiling: `implementer` declares `supergiant` so
+    // that the judge can reach all four rungs, not because every
+    // implementation is worth `sol`. Running the ceiling when nobody
+    // routed meant the ordinary case paid 33.7 against `subgiant`'s 10.0,
+    // in exactly the configuration that has no judge to notice. The
+    // ceiling still binds: a type that declares `dwarf` keeps `dwarf`,
+    // because `min` cannot hand it something heavier than it allows.
+    let unrouted = || {
         tasks
             .iter()
-            .map(|(agent, _)| agent.tier)
+            .map(|(agent, _)| Tier::DEFAULT.min(agent.tier))
             .collect::<Vec<_>>()
     };
     let Some(decider) = decider else {
-        return declared();
+        return unrouted();
     };
     let answered = decider.decide(tasks).await;
     // A decider that returns the wrong number of answers has told us
     // nothing we can line up with the tasks, so none of it is used.
     if answered.len() != tasks.len() {
-        return declared();
+        return unrouted();
     }
     tasks
         .iter()

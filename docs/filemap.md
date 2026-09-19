@@ -25,6 +25,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `SKILL.md` — files.md
 
+## `agents/implementer`
+
+- `SKILL.md` — 実装する
+
 ## `apps/macos`
 
 - `README.md` — macOSデスクトップ
@@ -94,6 +98,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `account.rs` — 複数アカウントの登録操作と、1つのrunを1つの登録へ固定する束縛。
 - `compare.rs` — フォルダ同士がどれだけ似ているかを示す。名前とサイズだけを読み、
+- `decided.rs` — `polaris decided` — the ledger of questions this project has settled.
 - `handoff.rs` — 実装が終わったことを、実機で試せる人へ渡す文面にする。
 - `main.rs` — Entry point for the `polaris` binary. Decides the endpoint from environment
 - `mcp.rs` — MCP registrations, secrets, catalog checks and setup from the terminal.
@@ -131,6 +136,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `conversation_memory.rs` — Publication boundary between the raw session marker and conversation indexes.
 - `conversation_state.rs` — Versioned session storage, separate from the legacy Message-only JSONL reader.
 - `decision_bands.rs` — The band rule, in one place.
+- `decisions.rs` — What this project has already settled, so it is not settled twice.
 - `desktop_approval.rs` — Bounded approval mailbox. The controller owns the pending request and
 - `desktop_events.rs` — Desktopキューだけを有界にする。provider/tool内のbufferは対象外。
 - `desktop_execution.rs` — Desktopの待機窓口。worker・結果・回収handleの所有はserviceに置く。
@@ -142,15 +148,18 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `error_region.rs` — Which part of a long tool result is worth quoting back.
 - `events.rs` — ターン実行中にツール呼び出し・subagent活動をTUIへリアルタイム通知する
 - `execution_owner.rs` — 共通のrun専用有界実行所有者。保存スレッドではcommandを実行しない。
+- `filemap.rs` — Routing a request to a handful of files, instead of sending the whole map.
 - `files_md.rs` — `dir_watch` が検出した変更を、実際に `files.md` を書く subagent の
 - `gitignore.rs` — `files.md`(ハーネスが自動生成する、コミット対象外のファイル)を
 - `handoff.rs` — M7a-1: the prompt that hands a finished implementation to someone who can
 - `isolated_run.rs` — macOS prepare-only composition. Paths and executable identity are supplied by
 - `isolated_workspace.rs` — Bounded, sanitized source snapshots. No apply-back or execution policy lives here.
 - `lib.rs` — Entry point for polaris-core. Ties together the budget, constitution, and prompt modules.
+- `llama_server.rs` — Supervising the bundled `llama-server`.
 - `local_execution.rs` — Fixed local selections with endpoint-wide physical inference admission.
 - `mcp.rs` — Run-owned MCP connections, request context and local result retention.
 - `measurement.rs` — M8: what one comparison measurement leaves behind. Nothing here sends
+- `preselect.rs` — Ranking candidates by embedding similarity — M10's second route.
 - `preselection_corpus.rs` — The fixed corpus every preselection comparison is measured against, and
 - `project.rs` — Resolves the project root.
 - `project_git.rs` — A read-only git call against the user's own repository.
@@ -233,6 +242,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/decision_bands`
 
 - `tests.rs` — A local stub stands in for the service. No real endpoint is contacted.
+
+## `crates/polaris-core/src/decisions`
+
+- `tests.rs` — What the ledger must not lose, and what the route must not claim.
 
 ## `crates/polaris-core/src/desktop_run`
 
@@ -374,6 +387,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `tests.rs` — Real owner/Writer; the grant is the only authority to save.
 
+## `crates/polaris-core/src/filemap`
+
+- `tests.rs` — The rules that decide which files the model is pointed at, and what the
+
 ## `crates/polaris-core/src/handoff`
 
 - `tests.rs` — Fixed inputs only; nothing is sent anywhere.
@@ -391,6 +408,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `registered.rs` — Admission of a host-registered directory without copying or modifying it.
 - `tests.rs` — Sanitized snapshots, excluded secrets, source conflicts, and copy limits.
+
+## `crates/polaris-core/src/llama_server`
+
+- `tests.rs` — The supervisor, against a stand-in server.
 
 ## `crates/polaris-core/src/local_execution`
 
@@ -475,6 +496,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/measurement/price`
 
 - `tests.rs` — The embedded table and exact money arithmetic; nothing is sent.
+
+## `crates/polaris-core/src/preselect`
+
+- `tests.rs` — The ranking stage, against a deterministic embedder.
 
 ## `crates/polaris-core/src/preselection_corpus`
 
@@ -839,6 +864,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `cache_prefix.rs` — Fixed, opt-in instructions for the cache-prefix cost experiment.
 - `codex.rs` — A provider that speaks the Responses API using ChatGPT subscription
 - `codex_metrics.rs` — Opt-in, content-free diagnostics for each actual Codex HTTP attempt.
+- `codex_ws.rs` — The websocket transport for the Responses endpoint.
 - `decision.rs` — A model that answers typed questions instead of writing text. It takes a
 - `lib.rs` — Provider abstraction. Transport-dependent parts live in each
 - `local.rs` — Bounded, metadata-only discovery of explicitly configured local runtimes.
@@ -848,6 +874,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `sse.rs` — Incrementally decodes SSE (text/event-stream). Pushing a byte chunk
 - `turn_affinity.rs` — Opaque transport continuity scoped to one logical user turn.
 - `web_search.rs` — Hosted web-search request policy and Responses-style output parsing.
+
+## `crates/polaris-provider/src/codex_ws`
+
+- `tests.rs` — The two decisions that decide whether a continuation is safe to use.
 
 ## `crates/polaris-provider/src/decision`
 
@@ -905,6 +935,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `Cargo.toml` — manifest for the polaris-skills crate
 
+## `crates/polaris-skills/resources/skills/document-writing`
+
+- `SKILL.md` — 文書を書く
+
+## `crates/polaris-skills/resources/skills/smallest-change`
+
+- `SKILL.md` — 最小の変更を選ぶ
+
 ## `crates/polaris-skills/resources/workflow/brainstorm`
 
 - `SKILL.md` — SKILL.md
@@ -936,6 +974,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-skills/src`
 
 - `agent_type.rs` — subagent 型の定義（`agents/<type>/SKILL.md`）の解析と discovery。
+- `builtin.rs` — The agent types that ship inside the binary.
 - `discovery.rs` — Skill discovery. A single corrupt skill must not take down the whole
 - `frontmatter.rs` — SKILL.md frontmatter parsing. Validates only the constraints the specification lays down; adds no constraints of its own.
 - `lib.rs` — Loading of skills that conform to the Agent Skills specification. Adds no frontmatter fields of its own.
@@ -1005,45 +1044,6 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `testing.md` — テスト
 - `tool-preselection.md` — ツールの事前選定
 - `usage.md` — 利用ガイド
-
-## `docs/superpowers`
-
-- `CURRENT.md` — Polaris 現在の状態
-
-## `docs/superpowers/plans`
-
-- `2026-08-16-polaris-m1-headless-loop.md` — polaris M1 ヘッドレス最小ループ Implementation Plan
-- `2026-08-17-polaris-m2-write-and-sandbox.md` — polaris M2 実装計画 — write / edit / bash とサンドボックス
-- `2026-08-17-polaris-m3a-skills.md` — polaris M3a Skills ローダと skill ツール Implementation Plan
-- `2026-08-18-polaris-m25-codex-provider.md` — polaris M2.5 Codex プロバイダ 実装計画
-- `2026-08-20-polaris-m3b-bm25-skill-router.md` — polaris M3b BM25 skill ルータ 実装計画
-- `2026-08-20-polaris-m4-core.md` — polaris M4 コア（`spawn` と単一波オーケストレーション）実装計画
-- `2026-08-21-polaris-tui-onboarding.md` — polaris TUI Onboarding Screen Implementation Plan
-- `2026-08-21-polaris-tui-v2.md` — polaris TUI v2 Implementation Plan
-- `2026-08-21-polaris-tui.md` — polaris TUI Implementation Plan
-- `2026-08-24-polaris-files-md-autogen.md` — polaris ディレクトリ別 files.md 自動生成 Implementation Plan
-- `2026-08-24-polaris-tui-live-tool-progress.md` — polaris TUI ライブツール進捗・diff表示 Implementation Plan
-- `2026-08-25-polaris-tui-fullscreen-scroll.md` — polaris TUI 自前スクロール管理・フッター固定化 Implementation Plan
-- `2026-08-26-polaris-codex-reasoning-continuity.md` — polaris Codexプロバイダ reasoning item保持 Implementation Plan
-- `2026-08-26-polaris-history-compaction.md` — polaris 会話履歴の自動圧縮(compaction) Implementation Plan
-- `2026-08-26-polaris-tui-mouse-drag-selection.md` — polaris TUI マウスドラッグ選択・自前クリップボードコピー Implementation Plan
-- `2026-08-27-polaris-codex-ws-transport.md` — polaris Codex WebSocket トランスポート(フェーズ1) Implementation Plan
-
-## `docs/superpowers/specs`
-
-- `2026-08-16-polaris-harness-design.md` — polaris 設計仕様
-- `2026-08-18-polaris-codex-provider-design.md` — polaris Codex プロバイダ 設計
-- `2026-08-20-polaris-skill-bm25-router-design.md` — polaris skill ルータ BM25 化 設計
-- `2026-08-21-polaris-tui-design.md` — polaris TUI 設計
-- `2026-08-21-polaris-tui-onboarding-design.md` — polaris TUI 初回起動オンボーディング画面 設計
-- `2026-08-21-polaris-tui-v2-design.md` — polaris TUI v2 設計
-- `2026-08-24-polaris-files-md-autogen-design.md` — polaris ディレクトリ別 `files.md` 自動生成 設計書
-- `2026-08-24-polaris-tui-live-tool-progress-design.md` — polaris TUI ライブツール進捗・diff表示 設計書
-- `2026-08-25-polaris-tui-fullscreen-scroll-design.md` — polaris TUI 自前スクロール管理・フッター固定化 設計書
-- `2026-08-26-polaris-codex-reasoning-continuity-design.md` — polaris Codexプロバイダ reasoning item保持 設計書
-- `2026-08-26-polaris-history-compaction-design.md` — polaris 会話履歴の自動圧縮(compaction) 設計書
-- `2026-08-26-polaris-tui-mouse-drag-selection-design.md` — polaris TUI マウスドラッグ選択・自前クリップボードコピー 設計書
-- `2026-08-27-polaris-codex-ws-transport-design.md` — polaris Codex WebSocket トランスポート(フェーズ1)設計書
 
 ## `skills/mutation-check`
 

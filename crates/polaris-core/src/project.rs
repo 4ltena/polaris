@@ -15,10 +15,41 @@ use std::{
 const MARKERS: &[&str] = &[".git", ".polaris"];
 
 pub fn resolve_root(start: &Path) -> PathBuf {
+    resolve_root_below(
+        start,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
+/// The walk, with the home directory passed in so a test can name one.
+///
+/// **The search never adopts the home directory from below.** Both markers
+/// exist there in ordinary setups: `polaris login` writes
+/// `$HOME/.polaris/auth.json`, and a dotfiles repository puts `.git`
+/// straight in `$HOME`. Without this stop, the first login silently turns
+/// every markerless directory under home into a project whose root is
+/// `$HOME` — so the default `workspace-write` sandbox would take the whole
+/// home directory as writable, and one state directory, audit log and
+/// memory store would serve every such directory at once. The same
+/// directory would behave differently before and after that first login.
+///
+/// Home is still honoured when it is where the run actually started: that
+/// is the caller naming it, not the search wandering into it.
+pub(crate) fn resolve_root_below(start: &Path, home: Option<&Path>) -> PathBuf {
     let canonical = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
 
     let mut cursor: &Path = &canonical;
     loop {
+        // Home ends the walk. Reaching it means either the run started
+        // there — and `canonical` is home, so returning it is the same
+        // answer — or the search climbed out of the project, which is the
+        // case this exists to stop. Nothing above home is a project root
+        // either: a marker in `/Users` would otherwise capture every
+        // account on the machine.
+        if home.as_deref() == Some(cursor) {
+            return canonical;
+        }
         if MARKERS.iter().any(|m| cursor.join(m).exists()) {
             return cursor.to_path_buf();
         }
@@ -213,6 +244,77 @@ mod tests {
         assert_eq!(
             resolve_root(&deep),
             deep.canonicalize().expect("canonicalize")
+        );
+    }
+
+    /// The search must not adopt home from below, for either marker.
+    ///
+    /// `polaris login` writes `$HOME/.polaris/auth.json`, and a dotfiles
+    /// repository puts `.git` in `$HOME`. Either one used to make every
+    /// markerless directory under home resolve to `$HOME`, which under the
+    /// default `workspace-write` hands the sandbox the whole home
+    /// directory. The same directory behaved differently before and after
+    /// the first login.
+    #[test]
+    fn the_search_never_adopts_the_home_directory_from_below() {
+        for marker in [".polaris", ".git"] {
+            let home = tempfile::tempdir().expect("home");
+            std::fs::create_dir_all(home.path().join(marker)).expect("marker");
+            let work = home.path().join("work").join("deep");
+            std::fs::create_dir_all(&work).expect("work");
+
+            let resolved = resolve_root_below(&work, Some(home.path()));
+            let expected = work.canonicalize().expect("canonical");
+            assert_eq!(
+                resolved, expected,
+                "{marker} in home must not become the root of a directory below it"
+            );
+            assert_ne!(
+                resolved,
+                home.path().canonicalize().expect("canonical home"),
+                "resolving to home would make the sandbox writable across it"
+            );
+        }
+    }
+
+    /// A run that started in home still gets home, and nothing above it.
+    ///
+    /// The stop returns the starting directory, which for this case *is*
+    /// home — so the run is not left rootless. And a marker above home
+    /// never wins: one in `/Users` would otherwise make every account on
+    /// the machine one project.
+    #[test]
+    fn a_run_started_in_home_gets_home_and_never_anything_above_it() {
+        let above = tempfile::tempdir().expect("above");
+        std::fs::create_dir_all(above.path().join(".git")).expect("marker above home");
+        let home = above.path().join("someone");
+        std::fs::create_dir_all(&home).expect("home");
+        let canonical = home.canonicalize().expect("canonical");
+
+        // Home itself carries no marker, so without the stop the walk
+        // would climb past it and adopt the directory holding every
+        // account.
+        assert_eq!(resolve_root_below(&home, Some(&home)), canonical);
+
+        // And with a marker of its own it is still home, not something above.
+        std::fs::create_dir_all(home.join(".polaris")).expect("marker");
+        assert_eq!(resolve_root_below(&home, Some(&home)), canonical);
+    }
+
+    /// The stop applies to home alone. A real project between the start and
+    /// home is still found, even though home lies above it.
+    #[test]
+    fn a_project_below_home_is_still_found() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".polaris")).expect("home marker");
+        let project = home.path().join("code").join("thing");
+        std::fs::create_dir_all(project.join(".git")).expect("project marker");
+        let deep = project.join("src").join("inner");
+        std::fs::create_dir_all(&deep).expect("deep");
+
+        assert_eq!(
+            resolve_root_below(&deep, Some(home.path())),
+            project.canonicalize().expect("canonical project")
         );
     }
 

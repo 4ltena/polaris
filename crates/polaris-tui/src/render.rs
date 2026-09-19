@@ -1363,10 +1363,16 @@ pub fn render_model_picker(frame: &mut Frame, current: &str, selected: usize) {
 /// the order codex's real "Select Reasoning Level" screen lists them —
 /// verified against two screenshots of it. codex splits this into two
 /// screens (`Low`..`Extra high` on the main list, then a `More
-/// reasoning...` row that opens a second "Advanced Reasoning" screen
-/// for `Max`/`Ultra`, each carrying a "consumes usage limits faster"
-/// warning); explicit instruction here was to list everything in one
-/// flat picker instead, so all six are just rows 1-6 of the same list.
+/// reasoning...` row that opens a second "Advanced Reasoning" screen,
+/// carrying a "consumes usage limits faster" warning); explicit
+/// instruction here was to list everything in one flat picker instead,
+/// so all five are just rows 1-5 of the same list.
+///
+/// One row per value the API actually accepts, and no more. `ultra` used
+/// to be a sixth row: it is not an effort the API has, so picking it was
+/// silently rewritten to `xhigh` and the user was shown a choice that did
+/// not exist. `max` is real — Responses-API only, which is the endpoint
+/// polaris talks to — so it is sent as itself.
 pub const EFFORT_CATALOG: &[(&str, &str)] = &[
     ("low", "fast responses with lighter reasoning"),
     (
@@ -1382,31 +1388,46 @@ pub const EFFORT_CATALOG: &[(&str, &str)] = &[
         "max",
         "for difficult problems when quality matters more than speed \u{b7} consumes usage limits faster",
     ),
-    (
-        "ultra",
-        "for the most demanding work \u{b7} consumes usage limits faster",
-    ),
 ];
 
-/// Match the CLI default; the current selection may override it.
-pub const DEFAULT_EFFORT: &str = "medium";
+/// The catalog row matching the CLI default; the current selection may
+/// override it. This is a *display* name, so it is the row whose
+/// [`effort_wire_value`] is what `--effort` defaults to (`xhigh`), not
+/// that token spelled out. `defaults_and_explicit_model_effort_have_the_documented_precedence`
+/// in `polaris-cli` pins the two to each other.
+pub const DEFAULT_EFFORT: &str = "extra high";
 
 /// Maps a picker-level effort name to the literal token actually sent
 /// over the wire. Real reasoning-effort APIs only accept a handful of
 /// space-free values — `polaris_auth::effort_for_plan_type` is
 /// first-party evidence for exactly which ones (`"low"`/`"xhigh"`, with
-/// `"medium"`/`"high"` filling the gap between). Sending `EFFORT_CATALOG`'s
-/// display name directly, `"extra high"` included, is what produced a
-/// real `400 Invalid value: 'extra high'` from the API — this exists so
-/// that bug can't recur for any entry. `"max"`/`"ultra"` are a
-/// ChatGPT-app-only upsell tier the API has no literal enum value for at
-/// all (there's no evidence anywhere in this codebase of a wire token
-/// beyond `xhigh`), so both fall back to the highest value that's
-/// actually valid rather than guessing a new string and hitting the same
-/// 400 `"extra high"` did.
+/// `"medium"`/`"high"` filling the gap between, and `"max"` above them on
+/// the Responses API). Sending `EFFORT_CATALOG`'s display name directly,
+/// `"extra high"` included, is what produced a real `400 Invalid value:
+/// 'extra high'` from the API — this exists so that bug can't recur for
+/// any entry.
+///
+/// `"extra high"` is the only row whose label differs from its token, and
+/// so the only rewrite left here. `"max"` used to be folded into `xhigh`
+/// alongside it; it is a real value on `/responses`, which is polaris's
+/// own endpoint, and collapsing it made the top two rows of the picker
+/// send the same thing.
 pub fn effort_wire_value(name: &str) -> &str {
     match name {
-        "extra high" | "max" | "ultra" => "xhigh",
+        "extra high" => "xhigh",
+        other => other,
+    }
+}
+
+/// The inverse of [`effort_wire_value`]: the catalog row a wire token
+/// belongs to. `--effort` is given in wire tokens, and the footer and the
+/// picker's highlight are keyed on display names, so the one token that
+/// is spelled differently has to be translated back before it reaches
+/// them — otherwise `--effort xhigh` shows `xhigh` in the footer and
+/// leaves the picker highlighting row 1.
+pub fn effort_display_name(wire: &str) -> &str {
+    match wire {
+        "xhigh" => "extra high",
         other => other,
     }
 }
@@ -2258,7 +2279,10 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert!(rows.iter().any(|r| r.contains("medium (default)")));
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(&format!("{DEFAULT_EFFORT} (default)")))
+        );
         assert!(rows.iter().any(|r| r.contains("high (current)")));
         // Neither row is both at once here, so the combined suffix must
         // not appear.
@@ -2270,7 +2294,7 @@ mod tests {
         let backend = TestBackend::new(100, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_effort_picker(f, "gpt-6-astra", "medium", 1))
+            .draw(|f| render_effort_picker(f, "gpt-6-astra", DEFAULT_EFFORT, 3))
             .expect("draw");
 
         let content = terminal
@@ -2280,7 +2304,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("medium (default, current)"));
+        assert!(content.contains(&format!("{DEFAULT_EFFORT} (default, current)")));
     }
 
     #[test]
@@ -2306,10 +2330,33 @@ mod tests {
     }
 
     #[test]
-    fn effort_wire_value_maps_extra_high_max_and_ultra_to_xhigh() {
+    fn effort_wire_value_renames_extra_high_and_sends_max_as_itself() {
         assert_eq!(effort_wire_value("extra high"), "xhigh");
-        assert_eq!(effort_wire_value("max"), "xhigh");
-        assert_eq!(effort_wire_value("ultra"), "xhigh");
+        // `max` is a real effort on `/responses`, which is the endpoint
+        // polaris sends to. Folding it into `xhigh` made the top two rows
+        // of the picker ask for the same thing.
+        assert_eq!(effort_wire_value("max"), "max");
+    }
+
+    #[test]
+    fn the_picker_offers_exactly_the_efforts_the_api_accepts() {
+        // The catalog is what a user can pick, so a row the API has no
+        // value for is a choice that cannot be honoured — `ultra` was
+        // one, and it was quietly answered with `xhigh` instead.
+        assert_eq!(
+            EFFORT_CATALOG
+                .iter()
+                .map(|(name, _)| effort_wire_value(name))
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn effort_display_name_is_the_inverse_of_effort_wire_value() {
+        for (name, _) in EFFORT_CATALOG {
+            assert_eq!(effort_display_name(effort_wire_value(name)), *name);
+        }
     }
 
     #[test]

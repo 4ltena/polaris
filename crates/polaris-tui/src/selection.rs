@@ -2,7 +2,7 @@
 //! in the coordinate space of `render::wrap_history_lines`'s output (the
 //! `wrapped` array `draw_frame` recomputes every frame) — never touches
 //! `HistoryLine`/`wrap_history_lines`/`render_history_into` themselves.
-//! See `docs/superpowers/specs/2026-08-26-polaris-tui-mouse-drag-selection-design.md`.
+//! See `.polaris/notes/specs/2026-08-26-polaris-tui-mouse-drag-selection-design.md`.
 
 /// A position in the `wrapped` array's coordinate space: `line` indexes
 /// into `wrapped`, `col` is a *character* index (not byte, not display

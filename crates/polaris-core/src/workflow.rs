@@ -787,8 +787,16 @@ fn build_profile(
         Some(evidence) if evidence.passed => "passed",
         Some(_) => "failed",
     };
+    // `key=value`, matching the environment block's own shape, and the
+    // caveat only where it has something to guard. Spelled out in prose on
+    // every iteration it cost 28 tokens, of which the parenthetical alone
+    // was 8 — and with no grants there is nothing for it to prevent being
+    // misread. With grants it is what stops the count reading as that many
+    // free passes.
+    let grants = gates.external_grants.len();
+    let caveat = if grants == 0 { "" } else { " (still gated)" };
     let body = format!(
-        "{}\nWorkflow focus: {}. Spec approval: {}. Verification: {verification}. External grants: {} (existing tool permission checks still apply).\n",
+        "{}\nphase={} spec={} verification={verification} grants={grants}{caveat}\n",
         frozen.body,
         state.phase,
         if gates.approved_spec_hash.is_some() {
@@ -796,7 +804,6 @@ fn build_profile(
         } else {
             "missing"
         },
-        gates.external_grants.len(),
     );
     let tokens = crate::budget::count_tokens(&body);
     if tokens > WORKFLOW_TOKEN_LIMIT {
@@ -936,7 +943,7 @@ mod tests {
             )
             .unwrap();
             let turn = runtime.begin_turn(&[]).unwrap();
-            assert!(turn.body.contains("Spec approval: missing"));
+            assert!(turn.body.contains("spec=missing"));
             assert!(turn.tokens <= WORKFLOW_TOKEN_LIMIT);
             runtime.request_phase(Phase::Review).unwrap();
             assert_eq!(runtime.state(), turn.state);
@@ -952,6 +959,49 @@ mod tests {
             assert_eq!(runtime.begin_turn(&[]).unwrap().state.phase, Phase::Review);
         }
     }
+    /// The count alone reads as that many free passes. The caveat is what
+    /// says a grant still goes through the ordinary permission checks, and
+    /// it is carried only where there is a grant to misread — a line that
+    /// says "still gated" beside `grants=0` spends tokens every iteration
+    /// guarding nothing.
+    #[test]
+    fn the_grant_caveat_rides_along_only_when_there_is_a_grant() {
+        let build = |grants: Vec<ExternalGrant>| {
+            let runtime = SessionWorkflow::restore(
+                WorkflowConfig {
+                    enabled: true,
+                    always: vec!["builtin:workflow-core".into()],
+                    ..Default::default()
+                },
+                WorkflowGatesV1 {
+                    external_grants: grants,
+                    ..WorkflowGatesV1::default()
+                },
+                WorkflowStateV1::default(),
+            )
+            .unwrap();
+            runtime.begin_turn(&[]).unwrap().body.clone()
+        };
+
+        let none = build(Vec::new());
+        assert!(none.contains("grants=0"), "{none}");
+        assert!(
+            !none.contains("still gated"),
+            "nothing to guard, so nothing is carried: {none}"
+        );
+
+        let one = build(vec![ExternalGrant {
+            operation: "fetch".into(),
+            target: "https://example.invalid/".into(),
+            artifact_hash: "0".repeat(64),
+        }]);
+        assert!(one.contains("grants=1"), "{one}");
+        assert!(
+            one.contains("still gated"),
+            "a grant must not read as a free pass: {one}"
+        );
+    }
+
     #[test]
     fn focus_is_explicit_and_never_grants_completion() {
         let gates = WorkflowGatesV1::default();

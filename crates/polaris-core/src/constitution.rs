@@ -2,7 +2,7 @@
 //! full text of AGENTS.md is never loaded. Because it's truncated at a
 //! ceiling, no matter how large AGENTS.md gets, the budget cannot be broken.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::budget::count_tokens;
 
@@ -198,11 +198,17 @@ pub fn load_from(global_agents: Option<&Path>, project_root: &Path) -> String {
     combine(&global, &project)
 }
 
-fn combine(global: &str, project: &str) -> String {
+/// The two capped halves, before they are joined.
+///
+/// `combine` joins them and `reach` counts them, so the diagnostic and the
+/// text actually sent come from one computation. Splitting them into two
+/// would leave the report free to say "3 lines reach" while the request
+/// carried 2, which is the exact failure this whole path exists to stop.
+fn capped_parts(global: &str, project: &str) -> (Option<String>, Option<String>) {
     match (global.is_empty(), project.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => cap(project, CONSTITUTION_LIMIT),
-        (false, true) => cap(global, CONSTITUTION_LIMIT),
+        (true, true) => (None, None),
+        (true, false) => (None, Some(cap(project, CONSTITUTION_LIMIT))),
+        (false, true) => (Some(cap(global, CONSTITUTION_LIMIT)), None),
         (false, false) => {
             let global_capped = cap(global, CONSTITUTION_LIMIT / 2);
             let global_tokens = count_tokens(&global_capped);
@@ -216,9 +222,79 @@ fn combine(global: &str, project: &str) -> String {
                 .saturating_sub(global_tokens)
                 .saturating_sub(separator_tokens);
             let project_capped = cap(project, project_limit);
-            format!("{global_capped}\n{project_capped}")
+            (Some(global_capped), Some(project_capped))
         }
     }
+}
+
+fn combine(global: &str, project: &str) -> String {
+    match capped_parts(global, project) {
+        (None, None) => String::new(),
+        (None, Some(project)) => project,
+        (Some(global), None) => global,
+        (Some(global), Some(project)) => format!("{global}\n{project}"),
+    }
+}
+
+/// What one `AGENTS.md` actually contributes to a request.
+///
+/// `dropped` counts whole lines the ceiling cut. It under-reports in one
+/// case: when the very first line alone is over the ceiling, `cap` keeps a
+/// character-boundary prefix of it, so that line counts as delivered even
+/// though only part of it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reach {
+    pub path: PathBuf,
+    pub delivered: usize,
+    pub dropped: usize,
+    pub tokens: usize,
+}
+
+fn reach_of(path: PathBuf, whole: &str, capped: Option<&str>) -> Reach {
+    let delivered = capped.map(|c| c.lines().count()).unwrap_or(0);
+    Reach {
+        path,
+        delivered,
+        dropped: whole.lines().count().saturating_sub(delivered),
+        tokens: capped.map(count_tokens).unwrap_or(0),
+    }
+}
+
+/// Per-source accounting for what `load_from` would send.
+///
+/// A source with no always-on section at all is left out; there is nothing
+/// to report about a file that was never going to contribute. A source that
+/// has one and loses lines to the ceiling is the case this exists for.
+///
+/// The halving is the part nobody sees coming: a `~/.polaris/AGENTS.md`
+/// with one always-on line takes half the ceiling off the project's share,
+/// so rules that reached the model yesterday stop reaching it today because
+/// of a file in a different directory, and nothing in either file changed.
+pub fn reach_from(global_agents: Option<&Path>, project_root: &Path) -> Vec<Reach> {
+    let global = global_agents.map(read_block).unwrap_or_default();
+    let project_path = project_root.join("AGENTS.md");
+    let project = read_block(&project_path);
+    let (global_capped, project_capped) = capped_parts(&global, &project);
+    let mut out = Vec::new();
+    if let Some(path) = global_agents
+        && !global.is_empty()
+    {
+        out.push(reach_of(
+            path.to_path_buf(),
+            &global,
+            global_capped.as_deref(),
+        ));
+    }
+    if !project.is_empty() {
+        out.push(reach_of(project_path, &project, project_capped.as_deref()));
+    }
+    out
+}
+
+/// `reach_from` against the same global path `load` uses.
+pub fn reach(project_root: &Path) -> Vec<Reach> {
+    let global = std::env::var_os("HOME").map(|h| Path::new(&h).join(".polaris").join("AGENTS.md"));
+    reach_from(global.as_deref(), project_root)
 }
 
 /// Resolves `~/.polaris/AGENTS.md` as the global rules and reads it.
@@ -228,15 +304,24 @@ pub fn load(project_root: &Path) -> String {
 }
 
 /// Environment info. Hands over up front the facts the model would otherwise spend a turn discovering.
-pub fn environment_block(cwd: &Path, branch: Option<&str>) -> String {
+///
+/// `cwd` and `project_root` are two different facts and both are needed.
+/// The model runs its commands in `cwd`, so that is what gets reported;
+/// the map is a property of the project, so it is looked for at
+/// `project_root`. Passing `cwd` for both — which the CLI did until
+/// 2026-09-19 — reports `filemap=absent` for any run started from a
+/// subdirectory of a repository that has one.
+pub fn environment_block(cwd: &Path, project_root: &Path, branch: Option<&str>) -> String {
     // Report the startup snapshot without reading contents or following a docs link.
-    let map_state = match std::fs::symlink_metadata(cwd.join("docs")) {
-        Ok(meta) if meta.is_dir() => match std::fs::symlink_metadata(cwd.join("docs/filemap.md")) {
-            Ok(meta) if meta.is_file() => "ready",
-            Ok(_) => "unavailable",
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent",
-            Err(_) => "unavailable",
-        },
+    let map_state = match std::fs::symlink_metadata(project_root.join("docs")) {
+        Ok(meta) if meta.is_dir() => {
+            match std::fs::symlink_metadata(project_root.join("docs/filemap.md")) {
+                Ok(meta) if meta.is_file() => "ready",
+                Ok(_) => "unavailable",
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent",
+                Err(_) => "unavailable",
+            }
+        }
         Ok(_) => "unavailable",
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent",
         Err(_) => "unavailable",
@@ -496,6 +581,114 @@ Long procedure. Not loaded.
         }
     }
 
+    /// Builds an `AGENTS.md` whose always-on section is `lines`.
+    fn agents_md(lines: &[&str]) -> String {
+        format!(
+            "# AGENTS\n\nPreamble.\n\n## Always on\n\n{}\n",
+            lines.join("\n")
+        )
+    }
+
+    /// The accounting and the text actually sent have to be one
+    /// computation. If they are two, the report is free to say three lines
+    /// reach while the request carries two — which is precisely the
+    /// failure the report exists to catch.
+    #[test]
+    fn what_reach_reports_as_delivered_is_what_load_actually_sends() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let global_path = home.path().join("AGENTS.md");
+
+        // Long enough that the ceiling has to bite on both sides.
+        let many: Vec<String> = (0..12)
+            .map(|i| format!("- rule {i}: a sentence long enough to cost real tokens here."))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        std::fs::write(project.path().join("AGENTS.md"), agents_md(&many)).unwrap();
+        std::fs::write(&global_path, agents_md(&many)).unwrap();
+
+        let sent = load_from(Some(&global_path), project.path());
+        let reported = reach_from(Some(&global_path), project.path());
+        assert_eq!(reported.len(), 2, "{reported:?}");
+        assert_eq!(
+            reported.iter().map(|r| r.delivered).sum::<usize>(),
+            sent.lines().count(),
+            "reported {reported:?} against sent {sent:?}"
+        );
+        // Both sides lost lines; neither is a full copy of the file.
+        for r in &reported {
+            assert!(r.dropped > 0, "nothing was reported dropped: {r:?}");
+        }
+    }
+
+    /// The halving. A file in another directory, which the project's own
+    /// tooling never reads, takes lines out of the project's rules.
+    #[test]
+    fn a_global_always_on_section_takes_lines_away_from_the_project() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let global_path = home.path().join("AGENTS.md");
+
+        let many: Vec<String> = (0..10)
+            .map(|i| format!("- project rule {i} with enough words to cost tokens."))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        std::fs::write(project.path().join("AGENTS.md"), agents_md(&many)).unwrap();
+
+        let alone = reach_from(None, project.path());
+        assert_eq!(alone.len(), 1);
+
+        std::fs::write(&global_path, agents_md(&["- one global rule."])).unwrap();
+        let shared = reach_from(Some(&global_path), project.path());
+        assert_eq!(shared.len(), 2);
+
+        let project_alone = alone[0].delivered;
+        let project_shared = shared[1].delivered;
+        assert!(
+            project_shared < project_alone,
+            "the global file cost the project nothing: {project_alone} vs {project_shared}"
+        );
+        assert_eq!(
+            shared[1].dropped,
+            many.len() - project_shared,
+            "dropped does not account for the whole file"
+        );
+    }
+
+    /// A file with no section at all contributes nothing and is not worth
+    /// reporting. Listing it would put a line saying "0 dropped" next to
+    /// every project that has no rules, and the real warnings would sit in
+    /// that noise.
+    #[test]
+    fn a_file_without_an_always_on_section_is_not_reported() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("AGENTS.md"),
+            "# AGENTS\n\nRules, but under no heading polaris reads.\n",
+        )
+        .unwrap();
+        assert!(reach_from(None, project.path()).is_empty());
+        assert!(reach_from(None, tempfile::tempdir().unwrap().path()).is_empty());
+    }
+
+    /// A section that fits has nothing dropped. Without this, a `reach`
+    /// that reported every file as truncated would still pass the tests
+    /// above.
+    #[test]
+    fn a_section_within_the_ceiling_reports_nothing_dropped() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("AGENTS.md"),
+            agents_md(&["- one short rule.", "- a second short rule."]),
+        )
+        .unwrap();
+        let reported = reach_from(None, project.path());
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].dropped, 0, "{reported:?}");
+        assert_eq!(reported[0].delivered, 2, "{reported:?}");
+        assert!(reported[0].tokens > 0 && reported[0].tokens <= CONSTITUTION_LIMIT);
+    }
+
     #[test]
     fn returns_empty_when_neither_file_exists() {
         let dir = tempfile::tempdir().expect("temp directory");
@@ -504,7 +697,11 @@ Long procedure. Not loaded.
 
     #[test]
     fn environment_block_carries_cwd_and_branch() {
-        let got = environment_block(Path::new("/w/polaris"), Some("feat/x"));
+        let got = environment_block(
+            Path::new("/w/polaris"),
+            Path::new("/w/polaris"),
+            Some("feat/x"),
+        );
         assert!(got.contains("/w/polaris"));
         assert!(got.contains("feat/x"));
     }
@@ -512,13 +709,35 @@ Long procedure. Not loaded.
     #[test]
     fn environment_reports_filemap_without_reading_contents() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(environment_block(dir.path(), None).starts_with("filemap=absent\n"));
+        assert!(environment_block(dir.path(), dir.path(), None).starts_with("filemap=absent\n"));
         std::fs::create_dir(dir.path().join("docs")).unwrap();
-        assert!(environment_block(dir.path(), None).starts_with("filemap=absent\n"));
+        assert!(environment_block(dir.path(), dir.path(), None).starts_with("filemap=absent\n"));
         std::fs::write(dir.path().join("docs/filemap.md"), "private marker").unwrap();
-        let environment = environment_block(dir.path(), None);
+        let environment = environment_block(dir.path(), dir.path(), None);
         assert!(environment.starts_with("filemap=ready\n"));
         assert!(!environment.contains("private marker"));
+    }
+
+    /// Launching from a subdirectory must not lose the map. The two paths
+    /// answer different questions — where the commands run, and where the
+    /// project is — and collapsing them into one reports `filemap=absent`
+    /// to every run started below the root.
+    #[test]
+    fn the_map_is_looked_for_at_the_root_while_the_reported_cwd_stays_where_the_run_started() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/filemap.md"), "map").unwrap();
+        let below = root.path().join("crates/inner");
+        std::fs::create_dir_all(&below).unwrap();
+
+        let environment = environment_block(&below, root.path(), None);
+        assert!(environment.starts_with("filemap=ready\n"), "{environment}");
+        assert!(
+            environment.contains(&format!("cwd: {}", below.display())),
+            "{environment}"
+        );
+        // The same run before the split: one path for both questions.
+        assert!(environment_block(&below, &below, None).starts_with("filemap=absent\n"));
     }
 
     #[cfg(unix)]
@@ -529,7 +748,9 @@ Long procedure. Not loaded.
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("filemap.md"), "outside").unwrap();
         symlink(outside.path(), root.path().join("docs")).unwrap();
-        assert!(environment_block(root.path(), None).starts_with("filemap=unavailable\n"));
+        assert!(
+            environment_block(root.path(), root.path(), None).starts_with("filemap=unavailable\n")
+        );
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("docs")).unwrap();
         symlink(
@@ -537,7 +758,9 @@ Long procedure. Not loaded.
             root.path().join("docs/filemap.md"),
         )
         .unwrap();
-        assert!(environment_block(root.path(), None).starts_with("filemap=unavailable\n"));
+        assert!(
+            environment_block(root.path(), root.path(), None).starts_with("filemap=unavailable\n")
+        );
     }
 
     /// A set of skills fed to the budget tests. Their name, description, and
@@ -562,7 +785,11 @@ Long procedure. Not loaded.
     fn full_always_on_context_stays_within_budget() {
         let constitution = "a".repeat(2000);
         let capped = cap(&constitution, CONSTITUTION_LIMIT);
-        let env = environment_block(Path::new("/w/polaris"), Some("feat/m1-headless-loop"));
+        let env = environment_block(
+            Path::new("/w/polaris"),
+            Path::new("/w/polaris"),
+            Some("feat/m1-headless-loop"),
+        );
         let always_on = crate::prompt::assemble_always_on(&capped, &env, &probe_skills(100));
 
         let n = always_on.tokens();
@@ -595,7 +822,11 @@ Long procedure. Not loaded.
         let huge_cwd: String = (0..600).map(|i| format!("/component{i}")).collect();
         let oversized_constitution = "a".repeat(2000);
         let capped_constitution = cap(&oversized_constitution, CONSTITUTION_LIMIT);
-        let env = environment_block(Path::new(&huge_cwd), Some("feat/m1-headless-loop"));
+        let env = environment_block(
+            Path::new(&huge_cwd),
+            Path::new(&huge_cwd),
+            Some("feat/m1-headless-loop"),
+        );
         let always_on =
             crate::prompt::assemble_always_on(&capped_constitution, &env, &probe_skills(100));
 

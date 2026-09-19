@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "required": ["changed", "checks", "blocked"],
+  "properties": {
+    "changed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "what"],
+        "properties": {
+          "path": { "type": "string" },
+          "what": { "type": "string" }
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command", "passed"],
+        "properties": {
+          "command": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "output": { "type": "string" }
+        }
+      }
+    },
+    "blocked": { "type": ["string", "null"] }
+  }
+}

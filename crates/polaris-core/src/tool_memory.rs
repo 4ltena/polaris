@@ -450,7 +450,10 @@ mod tests {
             &mut crate::stop::StopTracker::new(5),
             &crate::prompt::assemble_always_on("", "", &[]),
             &[],
-            &[],
+            // The shipped types, as every real run has. With an empty
+            // catalogue `spawn` is withdrawn and this would assert on a
+            // five-tool run without saying so.
+            &polaris_skills::builtin::agent_types(),
             model.clone(),
             1,
             1,

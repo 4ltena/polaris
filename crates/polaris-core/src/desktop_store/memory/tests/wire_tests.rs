@@ -141,7 +141,10 @@ async fn owner_wire_and_audit(omit_related: bool) {
             &mut crate::stop::StopTracker::new(3),
             &always_on,
             &[skill],
-            &[],
+            // The shipped types, as every real run has: `spawn` is
+            // withdrawn from a run with an empty catalogue, and an empty
+            // one here would quietly measure a five-tool wire.
+            &polaris_skills::builtin::agent_types(),
             Arc::new(NoAuxiliary),
             1,
             1,
@@ -233,7 +236,7 @@ async fn owner_wire_and_audit(omit_related: bool) {
                 .count(),
             1
         );
-        assert!(request.system.contains("Workflow focus: implement"));
+        assert!(request.system.contains("phase=implement"));
         for phase in crate::workflow::Phase::ALL {
             assert_eq!(
                 request

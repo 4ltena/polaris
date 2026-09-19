@@ -117,7 +117,10 @@ fn fixture(
         ),
         always_on: crate::prompt::assemble_always_on("", "", &[]),
         skills: vec![],
-        agent_types: vec![],
+        // The shipped types (`polaris_skills::builtin`), because every real
+        // run has them and `spawn` is withdrawn from a run that does not.
+        // An empty catalogue here would quietly test a five-tool run.
+        agent_types: polaris_skills::builtin::agent_types(),
         max_turns: 4,
         spawn_concurrency: 1,
         spawn_write_concurrency: 1,

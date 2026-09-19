@@ -160,6 +160,79 @@ async fn run_one_with_gate(
     outcome
 }
 
+/// Which of the catalogue's types the request means, when the name the model
+/// gave is not one of them.
+///
+/// An unknown name fails the whole delegation today, with a lexical candidate
+/// list in the message that nothing acts on. The name is the model's own
+/// invention; the catalogue is fixed and small. Matching the two by meaning is
+/// the same question preselection asks of tools, and it is **exclusive** — one
+/// type runs the task — so it is a `Choice` rather than a `Noul`. A `Noul` per
+/// type would let several clear a threshold and need a second rule to break
+/// the tie.
+///
+/// **It cannot widen anything.** Every option is a type this run already
+/// offers, so a substitution reaches nothing the model could not have named
+/// itself. A judge that is absent, that cannot answer, or that names something
+/// outside the catalogue leaves the delegation failing exactly as before: the
+/// fallback is the refusal, never a guess.
+pub(crate) async fn resolved_type(
+    decider: &dyn polaris_provider::decision::Decider,
+    agent_types: &[AgentType],
+    named: Option<&str>,
+    task: &str,
+) -> Option<String> {
+    use polaris_provider::decision::Question;
+    use std::collections::BTreeMap;
+
+    if agent_types.is_empty() {
+        return None;
+    }
+    let criteria: BTreeMap<String, String> = agent_types
+        .iter()
+        .map(|agent| (agent.name.clone(), agent.description.clone()))
+        .collect();
+    // Two callers, one question. Either the request named no type at all —
+    // the ordinary path, where choosing is this decider's job rather than
+    // the orchestrator's — or it named one the catalogue does not have, in
+    // which case saying so keeps the judge from picking that same wrong
+    // name back out of a description that happens to echo it.
+    let instructions = match named {
+        None => format!("この依頼を任せるのに合う型はどれか。\n依頼: {task}"),
+        Some(named) => format!(
+            "この依頼を任せるのに合う型はどれか。指定された型名 {named:?} はこの一覧に無い。\n依頼: {task}"
+        ),
+    };
+    let questions = BTreeMap::from([(
+        "type".to_owned(),
+        Question::Choice {
+            instructions,
+            criteria,
+        },
+    )]);
+    let state = serde_json::json!({
+        "purpose": "依頼に合う型を一覧から選ぶ",
+    });
+    let counted = crate::budget::count_tokens(&state.to_string())
+        + questions
+            .values()
+            .map(|question| {
+                crate::budget::count_tokens(&serde_json::to_string(question).unwrap_or_default())
+            })
+            .sum::<usize>();
+    if polaris_provider::decision::within_limits(counted, &questions).is_err() {
+        return None;
+    }
+    let decision = decider.decide(&state, &questions).await.ok()?;
+    let chosen = decision.answers.get("type")?.choice.as_deref()?;
+    // The reply names an option rather than pointing at a position, so a name
+    // nobody offered is the one thing that cannot be interpreted.
+    agent_types
+        .iter()
+        .find(|agent| agent.name == chosen)
+        .map(|agent| agent.name.clone())
+}
+
 /// The actual subagent execution, unwrapped from `run_one`'s
 /// `SpawnStarted`/`SpawnFinished` notifications so every early-return path
 /// below (unknown type, sandbox resolution failure, schema mismatch, ...)
@@ -194,6 +267,16 @@ async fn run_one_inner(
         Err(error) => return TaskOutcome::Failed(error.to_string()),
     };
 
+    // The weight the type declares, which the run may have priced. A role
+    // binding is more specific than a weight — it names this type in
+    // particular — so it is resolved first and kept if it matched. An
+    // unpriced weight is the ordinary case and simply changes nothing.
+    let provider = match provider.resolve_tier(agent.tier.name()) {
+        Ok(Some(priced)) => priced,
+        Ok(None) => provider,
+        Err(error) => return TaskOutcome::Failed(error.to_string()),
+    };
+
     // Depth 1: whatever `allowed-tools` says, `spawn` is excluded
     // unconditionally. This is the only thing that makes the empty
     // `agent_types` handed to `run_loop` below correct rather than merely
@@ -201,9 +284,9 @@ async fn run_one_inner(
     // arm to consult it.
     let mut tools: Vec<polaris_tools::ToolSpec> = polaris_tools::all_specs()
         .into_iter()
-        .filter(|t| t.name != "spawn" && agent.allowed_tools.iter().any(|a| a == t.name))
+        .filter(|t| t.name != "spawn" && agent.allowed_tools.iter().any(|a| a == &t.name))
         .collect();
-    tools.sort_by_key(|t| t.name);
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
 
     let sandbox = match resolve_subagent_sandbox(agent, task, base_sandbox) {
         Ok(s) => s,
@@ -224,7 +307,14 @@ async fn run_one_inner(
         };
         session.workflow = Some(crate::workflow::SessionWorkflow::new(config));
     }
-    let skills = workflow.map_or(&[][..], |context| context.skills.as_slice());
+    let frozen_skills = match workflow {
+        Some(context) => match context.workflow.refresh_required_skills(&context.skills) {
+            Ok(skills) => skills,
+            Err(error) => return TaskOutcome::Failed(error),
+        },
+        None => Vec::new(),
+    };
+    let skills = frozen_skills.as_slice();
     session.push_user(&task.task);
     let mut stop = StopTracker::with_wall_seconds(agent.max_turns, agent.wall_seconds);
     let mut gate = parent_gate.for_subagent();
@@ -256,8 +346,11 @@ async fn run_one_inner(
         DEFAULT_CONCURRENCY,
         DEFAULT_WRITE_CONCURRENCY,
         &agent.name,
+        &task.task,
+        true,
         events.clone(),
         &mut ctx,
+        None,
     )
     .await;
 
@@ -309,8 +402,11 @@ async fn run_one_inner(
                     DEFAULT_CONCURRENCY,
                     DEFAULT_WRITE_CONCURRENCY,
                     &agent.name,
+                    &task.task,
+                    true,
                     events.clone(),
                     &mut ctx2,
+                    None,
                 )
                 .await;
                 match retry {
@@ -499,6 +595,7 @@ pub async fn run_wave_scoped(
         events.map(Into::into),
         workflow,
         &Gate::new(ApprovalPolicy::Never),
+        None,
     )
     .await
 }
@@ -516,6 +613,7 @@ pub(crate) async fn run_wave_with_gate(
     events: Option<crate::desktop_events::EventSink>,
     workflow: Option<ChildWorkflow>,
     parent_gate: &Gate,
+    decider: Option<&dyn crate::tier::TierDecider>,
 ) -> String {
     if let Err(msg) = check_no_write_root_overlap(&tasks) {
         let entries: Vec<serde_json::Value> = tasks
@@ -534,7 +632,35 @@ pub(crate) async fn run_wave_with_gate(
     let total_permits = Semaphore::new(concurrency);
     let write_permits = Semaphore::new(write_concurrency);
 
-    let futures = tasks.iter().map(|task| {
+    // One decision for the whole wave, before any task starts. Asking per
+    // task would multiply a round trip that answers hundreds of questions
+    // as cheaply as one. Tasks whose type is not in the catalogue are left
+    // out here and fail for that reason inside `run_one_with_gate`, which
+    // is where that failure is already reported.
+    let known: Vec<(usize, &AgentType, &str)> = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, task)| {
+            agent_types
+                .iter()
+                .find(|agent| agent.name == task.agent_type)
+                .map(|agent| (index, agent, task.task.as_str()))
+        })
+        .collect();
+    let asked: Vec<(&AgentType, &str)> = known
+        .iter()
+        .map(|(_, agent, task)| (*agent, *task))
+        .collect();
+    let decided: std::collections::HashMap<usize, (polaris_skills::Tier, polaris_skills::Tier)> =
+        known
+            .iter()
+            .map(|(index, _, _)| *index)
+            .zip(crate::tier::decide_all(decider, &asked).await)
+            .zip(known.iter().map(|(_, agent, _)| agent.tier))
+            .map(|((index, chosen), declared)| (index, (declared, chosen)))
+            .collect();
+
+    let futures = tasks.iter().enumerate().map(|(index, task)| {
         let provider = provider.clone();
         let audit = audit.clone();
         let events = events.clone();
@@ -542,6 +668,7 @@ pub(crate) async fn run_wave_with_gate(
         let write_permits = &write_permits;
         let needs_write = task.write_root.is_some();
         let workflow = workflow.as_ref();
+        let weight = decided.get(&index).copied();
         async move {
             // Held across `run_one`'s whole `.await` — that is the point:
             // the permit bounds how many tasks are *running* at once, not
@@ -551,6 +678,12 @@ pub(crate) async fn run_wave_with_gate(
                 Some(write_permits.acquire().await.expect("semaphore closed"))
             } else {
                 None
+            };
+            let provider = match weight {
+                Some((declared, chosen)) => {
+                    crate::tier::PinnedTier::wrap(provider, declared, chosen)
+                }
+                None => provider,
             };
             let outcome = run_one_with_gate(
                 task,
@@ -977,6 +1110,97 @@ mod tests {
             .expect("agents/file-inspector does not parse")
     }
 
+    #[tokio::test]
+    async fn a_declared_weight_picks_its_own_provider_and_a_role_binding_still_wins() {
+        use polaris_provider::ProviderError;
+        use polaris_provider::role::RoleProvider;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Named {
+            name: &'static str,
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Named {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Whatever answers, answering at all ends the task; the
+                // point of the test is which provider was asked.
+                Ok(CompletionResponse {
+                    text: self.name.into(),
+                    ..Default::default()
+                })
+            }
+        }
+        fn named(name: &'static str) -> Arc<Named> {
+            Arc::new(Named {
+                name,
+                calls: AtomicUsize::new(0),
+            })
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let types = [file_inspector()];
+        // agents/file-inspector declares `low`.
+        assert_eq!(types[0].tier, polaris_skills::Tier::Dwarf);
+        let task = SpawnTask {
+            agent_type: "file-inspector".into(),
+            task: "inspect".into(),
+            write_root: None,
+        };
+
+        let parent = named("parent");
+        let light = named("light");
+        let weighted: Arc<dyn Provider> = Arc::new(RoleProvider::tiers_only(
+            parent.clone(),
+            HashMap::from([("low".into(), light.clone() as Arc<dyn Provider>)]),
+        ));
+        let _ = run_one(
+            &task,
+            &types,
+            weighted,
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            None,
+        )
+        .await;
+        // Two calls, not one: the reply is not the declared output schema,
+        // so the existing retry asks again. Both go to the same provider,
+        // which is what matters here.
+        assert_eq!(light.calls.load(Ordering::SeqCst), 2, "the weight routed");
+        assert_eq!(parent.calls.load(Ordering::SeqCst), 0);
+
+        // A role binding names this type in particular, so it is the more
+        // specific answer and the weight must not override it.
+        let bound = named("bound");
+        let lighter = named("lighter");
+        let both: Arc<dyn Provider> = Arc::new(
+            RoleProvider::new(
+                named("parent2"),
+                HashMap::from([("file-inspector".into(), bound.clone() as Arc<dyn Provider>)]),
+            )
+            .with_tiers(HashMap::from([(
+                "low".into(),
+                lighter.clone() as Arc<dyn Provider>,
+            )])),
+        );
+        let _ = run_one(
+            &task,
+            &types,
+            both,
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            None,
+        )
+        .await;
+        assert_eq!(bound.calls.load(Ordering::SeqCst), 2, "the role won");
+        assert_eq!(lighter.calls.load(Ordering::SeqCst), 0);
+    }
+
     fn audit_in(dir: &Path) -> Arc<Mutex<AuditLog>> {
         Arc::new(Mutex::new(
             AuditLog::open(&dir.join("audit.jsonl")).expect("cannot open"),
@@ -1263,6 +1487,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_retry_keeps_the_original_child_task_for_optional_skill_search() {
+        struct Capture {
+            requests: std::sync::Mutex<Vec<CompletionRequest>>,
+            replies: std::sync::Mutex<Vec<CompletionResponse>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(self.replies.lock().unwrap().remove(0))
+            }
+        }
+        let dir = tempfile::tempdir().expect("temp directory");
+        let provider = Arc::new(Capture {
+            requests: std::sync::Mutex::new(Vec::new()),
+            replies: std::sync::Mutex::new(vec![
+                text(r#"{"path":"a.rs"}"#),
+                text(r#"{"path":"a.rs","responsibility":"ok"}"#),
+            ]),
+        });
+        let child_workflow = ChildWorkflow {
+            workflow: crate::workflow::SessionWorkflow::new(crate::workflow::WorkflowConfig {
+                enabled: true,
+                always: vec!["builtin:workflow-core".into()],
+                ..Default::default()
+            }),
+            skills: vec![polaris_skills::Skill {
+                name: "inspect-guide".into(),
+                description: "Inspect deploy configuration safely.".into(),
+                body: "progressive disclosure only".into(),
+                path: "/fixture/inspect-guide/SKILL.md".into(),
+            }],
+        };
+        let task = SpawnTask {
+            agent_type: "file-inspector".into(),
+            task: "inspect deploy configuration".into(),
+            write_root: None,
+        };
+        let mut agent = file_inspector();
+        agent.allowed_tools.push("skill".into());
+        let outcome = run_one_scoped(
+            &task,
+            &[agent],
+            provider.clone(),
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            None,
+            Some(&child_workflow),
+        )
+        .await;
+        assert!(matches!(outcome, TaskOutcome::Ok(_)), "{outcome:?}");
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request.system.contains("## Optional skill catalog"));
+            assert!(request.system.contains("inspect-guide"));
+            assert!(!request.system.contains("progressive disclosure only"));
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_retry_reuses_the_first_child_skill_snapshot() {
+        struct Capture {
+            path: PathBuf,
+            requests: std::sync::Mutex<Vec<CompletionRequest>>,
+            replies: std::sync::Mutex<Vec<CompletionResponse>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request);
+                if requests.len() == 1 {
+                    std::fs::write(
+                        &self.path,
+                        "---\nname: mandatory-rule\ndescription: Mandatory rule.\n---\nNEW MANDATORY\n",
+                    )
+                    .unwrap();
+                }
+                Ok(self.replies.lock().unwrap().remove(0))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mandatory_path = dir.path().join("mandatory.SKILL.md");
+        std::fs::write(
+            &mandatory_path,
+            "---\nname: mandatory-rule\ndescription: Mandatory rule.\n---\nOLD MANDATORY\n",
+        )
+        .unwrap();
+        let provider = Arc::new(Capture {
+            path: mandatory_path.clone(),
+            requests: std::sync::Mutex::new(Vec::new()),
+            replies: std::sync::Mutex::new(vec![
+                CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "frozen-body".into(),
+                        name: "skill".into(),
+                        arguments: serde_json::json!({"q":"mandatory-rule"}),
+                    }],
+                    ..Default::default()
+                },
+                text(r#"{"path":"a.rs"}"#),
+                text(r#"{"path":"a.rs","responsibility":"ok"}"#),
+            ]),
+        });
+        let child_workflow = ChildWorkflow {
+            workflow: crate::workflow::SessionWorkflow::new(crate::workflow::WorkflowConfig {
+                enabled: true,
+                always: vec!["user:mandatory-rule".into()],
+                ..Default::default()
+            }),
+            skills: vec![
+                polaris_skills::Skill {
+                    name: "mandatory-rule".into(),
+                    description: "Mandatory rule.".into(),
+                    body: "stale before first snapshot".into(),
+                    path: mandatory_path,
+                },
+                polaris_skills::Skill {
+                    name: "deploy-guide".into(),
+                    description: "Inspect deploy configuration safely.".into(),
+                    body: "optional body".into(),
+                    path: "/fixture/deploy-guide/SKILL.md".into(),
+                },
+            ],
+        };
+        let task = SpawnTask {
+            agent_type: "file-inspector".into(),
+            task: "inspect deploy configuration".into(),
+            write_root: None,
+        };
+        let mut agent = file_inspector();
+        agent.allowed_tools.push("skill".into());
+        let outcome = run_one_scoped(
+            &task,
+            &[agent],
+            provider.clone(),
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            None,
+            Some(&child_workflow),
+        )
+        .await;
+        assert!(matches!(outcome, TaskOutcome::Ok(_)), "{outcome:?}");
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert!(request.system.contains("OLD MANDATORY"));
+            assert!(!request.system.contains("NEW MANDATORY"));
+            assert!(request.system.contains("## Optional skill catalog"));
+            assert!(request.system.contains("deploy-guide"));
+        }
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("OLD MANDATORY"))
+        );
+    }
+
+    #[tokio::test]
     async fn an_unknown_type_fails_with_the_same_candidate_list_the_router_produces() {
         let dir = tempfile::tempdir().expect("temp directory");
         let task = SpawnTask {
@@ -1424,6 +1817,7 @@ mod tests {
         // see the tool cannot call it, whatever its SKILL.md claims.
         struct CapturesTools {
             seen: std::sync::Mutex<Vec<Vec<String>>>,
+            systems: std::sync::Mutex<Vec<String>>,
         }
         #[async_trait::async_trait]
         impl polaris_provider::Provider for CapturesTools {
@@ -1435,6 +1829,7 @@ mod tests {
                     .lock()
                     .expect("lock")
                     .push(req.tools.iter().map(|t| t.name.to_string()).collect());
+                self.systems.lock().expect("lock").push(req.system);
                 Ok(CompletionResponse {
                     hosted_web_search: Vec::new(),
                     url_citations: Vec::new(),
@@ -1448,6 +1843,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp directory");
         let provider = Arc::new(CapturesTools {
             seen: std::sync::Mutex::new(vec![]),
+            systems: std::sync::Mutex::new(vec![]),
         });
         let mut agent = file_inspector();
         agent.allowed_tools = vec!["read".into(), "spawn".into()];
@@ -1457,7 +1853,20 @@ mod tests {
             task: "inspect a.rs".into(),
             write_root: None,
         };
-        let outcome = run_one(
+        let child_workflow = ChildWorkflow {
+            workflow: crate::workflow::SessionWorkflow::new(crate::workflow::WorkflowConfig {
+                enabled: true,
+                always: vec!["builtin:workflow-core".into()],
+                ..Default::default()
+            }),
+            skills: vec![polaris_skills::Skill {
+                name: "inspect-guide".into(),
+                description: "Inspect a.rs safely.".into(),
+                body: "not automatically disclosed".into(),
+                path: "/fixture/inspect-guide/SKILL.md".into(),
+            }],
+        };
+        let outcome = run_one_scoped(
             &task,
             &[agent],
             provider.clone(),
@@ -1465,6 +1874,7 @@ mod tests {
             &full_access(),
             Path::new("/bin/true"),
             None,
+            Some(&child_workflow),
         )
         .await;
         assert!(matches!(outcome, TaskOutcome::Ok(_)), "{outcome:?}");
@@ -1478,6 +1888,15 @@ mod tests {
         assert!(
             offered.iter().any(|n| n == "read"),
             "the rest of allowed-tools was dropped too: {offered:?}"
+        );
+        assert!(
+            !provider
+                .systems
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|system| system.contains("## Optional skill catalog")),
+            "a child without the skill capability received an optional catalog"
         );
     }
 
@@ -1639,7 +2058,7 @@ mod tests {
     /// whatever `name` the caller needs — e.g. a distinct name per task, so
     /// a test can prove result ordering by checking each entry's `"type"`
     /// rather than relying on identical entries being indistinguishable.
-    fn named_readonly_fixture(name: &str) -> AgentType {
+    pub(super) fn named_readonly_fixture(name: &str) -> AgentType {
         let mut a = file_inspector();
         a.name = name.to_string();
         a
@@ -2355,6 +2774,129 @@ mod tests {
         assert_eq!(
             count, 0,
             "the subagent's own `read` call must not have reached the parent's events channel"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolved_type_tests {
+    use super::*;
+    use polaris_provider::decision::{Answer, Decider, Decision, DecisionError, Question};
+    use std::collections::BTreeMap;
+
+    /// Answers with whatever name it was built with, and counts the asking.
+    /// `None` fails instead of answering.
+    struct Judge {
+        choice: Option<&'static str>,
+        asked: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Decider for Judge {
+        async fn decide(
+            &self,
+            _state: &serde_json::Value,
+            questions: &BTreeMap<String, Question>,
+        ) -> Result<Decision, DecisionError> {
+            *self.asked.lock().unwrap() += 1;
+            let Some(choice) = self.choice else {
+                return Err(DecisionError::Unavailable);
+            };
+            Ok(Decision {
+                answers: questions
+                    .keys()
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            Answer {
+                                choice: Some(choice.to_owned()),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    fn judge(choice: Option<&'static str>) -> Judge {
+        Judge {
+            choice,
+            asked: std::sync::Mutex::new(0),
+        }
+    }
+
+    fn catalogue() -> Vec<AgentType> {
+        vec![
+            super::tests::named_readonly_fixture("ro-fixture"),
+            super::tests::named_readonly_fixture("second-fixture"),
+        ]
+    }
+
+    /// The name the model invented is replaced by one the catalogue has.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_name_the_catalogue_lacks_is_answered_with_one_it_has() {
+        let held = judge(Some("second-fixture"));
+        let resolved = resolved_type(
+            &held,
+            &catalogue(),
+            "file-reader",
+            "ファイルを読んで要約する",
+        )
+        .await;
+        assert_eq!(resolved.as_deref(), Some("second-fixture"));
+        assert_eq!(*held.asked.lock().unwrap(), 1);
+    }
+
+    /// The fallback is the refusal the caller already had, never a guess.
+    #[tokio::test(flavor = "current_thread")]
+    async fn anything_unusable_leaves_the_delegation_refused() {
+        // A name nobody offered is the one answer that cannot be read.
+        let invented = judge(Some("not-in-the-catalogue"));
+        assert_eq!(
+            resolved_type(&invented, &catalogue(), "x", "依頼").await,
+            None
+        );
+        // A judge that could not answer.
+        let failing = judge(None);
+        assert_eq!(
+            resolved_type(&failing, &catalogue(), "x", "依頼").await,
+            None
+        );
+        assert_eq!(*failing.asked.lock().unwrap(), 1);
+        // Nothing to choose between.
+        let unasked = judge(Some("ro-fixture"));
+        assert_eq!(resolved_type(&unasked, &[], "x", "依頼").await, None);
+        assert_eq!(*unasked.asked.lock().unwrap(), 0);
+    }
+
+    /// Every option offered is a type this run already has, so a
+    /// substitution cannot reach anything the model could not have named.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_options_are_exactly_the_catalogue() {
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl Decider for Capture {
+            async fn decide(
+                &self,
+                _state: &serde_json::Value,
+                questions: &BTreeMap<String, Question>,
+            ) -> Result<Decision, DecisionError> {
+                for question in questions.values() {
+                    if let Question::Choice { criteria, .. } = question {
+                        *self.0.lock().unwrap() = criteria.keys().cloned().collect();
+                    }
+                }
+                Err(DecisionError::Unavailable)
+            }
+        }
+        let capture = Capture(std::sync::Mutex::new(Vec::new()));
+        let _ = resolved_type(&capture, &catalogue(), "x", "依頼").await;
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            ["ro-fixture".to_owned(), "second-fixture".to_owned()]
         );
     }
 }

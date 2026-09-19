@@ -881,7 +881,32 @@ pub struct LocalStdioEmbedder {
     pub attempt_ledger: Option<polaris_provider::attempts::AttemptLedger>,
 }
 
+/// The models the bundled helper will run, and the hidden size each has.
+///
+/// The same list lives in `scripts/local_embedding.py` as `MODELS`, and
+/// `the_two_sides_of_the_model_allowlist_agree` holds them equal. A model
+/// named on one side only is a helper invocation that dies at the argument
+/// check, which is loud, but the pair is cheap to keep honest.
+///
+/// strict10 pins the small one; the preselection ranking stage (M10 L2)
+/// pins the base one. Nothing chooses at runtime — the caller names which
+/// model it pinned, and a snapshot whose real hidden size disagrees is
+/// refused inside the helper.
+pub const EMBEDDING_MODELS: [(&str, i64); 2] = [
+    ("intfloat/multilingual-e5-small", 384),
+    ("intfloat/multilingual-e5-base", 768),
+];
+
+/// The model strict10 has always used. Named so the strict path cannot
+/// drift onto the other one by editing a list.
+pub const STRICT_EMBEDDING_MODEL: &str = "intfloat/multilingual-e5-small";
+
+/// The model the preselection ranking stage uses (M10 L2).
+pub const PRESELECT_EMBEDDING_MODEL: &str = "intfloat/multilingual-e5-base";
+
 impl LocalStdioEmbedder {
+    /// strict10's embedder. Pinned to [`STRICT_EMBEDDING_MODEL`] so that
+    /// path cannot acquire a second model by configuration.
     pub fn new(
         python: PathBuf,
         helper: PathBuf,
@@ -891,6 +916,40 @@ impl LocalStdioEmbedder {
         cpu_threads: usize,
         timeout: Duration,
     ) -> io::Result<Self> {
+        Self::with_model(
+            python,
+            helper,
+            model_path,
+            run_temp,
+            STRICT_EMBEDDING_MODEL,
+            revision,
+            cpu_threads,
+            timeout,
+        )
+    }
+
+    /// The same embedder against a named model from [`EMBEDDING_MODELS`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_model(
+        python: PathBuf,
+        helper: PathBuf,
+        model_path: PathBuf,
+        run_temp: PathBuf,
+        model: &str,
+        revision: String,
+        cpu_threads: usize,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        let Some((model, dimension)) = EMBEDDING_MODELS
+            .iter()
+            .find(|(name, _)| *name == model)
+            .map(|(name, dimension)| ((*name).to_string(), *dimension))
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "この埋め込みモデルは同梱helperの許可一覧にありません",
+            ));
+        };
         if !python.is_absolute()
             || !helper.is_absolute()
             || !model_path.is_absolute()
@@ -906,9 +965,9 @@ impl LocalStdioEmbedder {
         }
         Ok(Self {
             metadata: EmbeddingModel {
-                model: "intfloat/multilingual-e5-small".into(),
+                model,
                 revision,
-                dimension: 384,
+                dimension,
             },
             python,
             helper,
@@ -1028,10 +1087,12 @@ impl LocalStdioEmbedder {
             .arg(&self.helper)
             .arg("--model-path")
             .arg(&self.model_path)
+            .arg("--model-name")
+            .arg(&self.metadata.model)
             .arg("--revision")
             .arg(&self.metadata.revision)
             .arg("--dimension")
-            .arg("384")
+            .arg(self.metadata.dimension.to_string())
             .arg("--max-tokens")
             .arg("512")
             .kill_on_drop(true)
@@ -1160,6 +1221,85 @@ mod tests {
     use crate::conversation_state::ConversationStateV2;
 
     const ID: &str = "00000000-0000-4000-8000-000000000001";
+
+    /// The allowlist exists twice — here and in the helper — and both
+    /// copies decide whether a run happens. A model added to one side only
+    /// dies at the helper's argument check, which is at least loud, but a
+    /// *dimension* that disagrees is worse: the helper would refuse on the
+    /// real hidden size and nobody would know which side was wrong.
+    #[test]
+    fn the_two_sides_of_the_model_allowlist_agree() {
+        let helper = include_str!("../../../../scripts/local_embedding.py");
+        let block = helper
+            .split_once("MODELS = {")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(block, _)| block)
+            .expect("the helper no longer declares MODELS");
+        let declared: Vec<(String, i64)> = block
+            .lines()
+            .filter_map(|line| line.trim().strip_suffix(','))
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, size)| {
+                (
+                    name.trim().trim_matches('"').to_string(),
+                    size.trim().parse().expect("a model size is not a number"),
+                )
+            })
+            .collect();
+        let held: Vec<(String, i64)> = EMBEDDING_MODELS
+            .iter()
+            .map(|(name, size)| ((*name).to_string(), *size))
+            .collect();
+        assert_eq!(declared, held, "helper {declared:?} against Rust {held:?}");
+        assert!(held.iter().any(|(name, _)| name == STRICT_EMBEDDING_MODEL));
+        assert!(
+            held.iter()
+                .any(|(name, _)| name == PRESELECT_EMBEDDING_MODEL)
+        );
+        assert_ne!(STRICT_EMBEDDING_MODEL, PRESELECT_EMBEDDING_MODEL);
+    }
+
+    /// `new` is strict10's door and must stay on one model however the
+    /// allowlist grows. `with_model` refuses anything not on it.
+    #[test]
+    fn the_strict_constructor_is_pinned_and_an_unlisted_model_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let python = dir.path().join("python3");
+        let helper = dir.path().join("helper.py");
+        std::fs::write(&python, "").expect("write");
+        std::fs::write(&helper, "").expect("write");
+        let make = |model: Option<&str>| match model {
+            None => LocalStdioEmbedder::new(
+                python.clone(),
+                helper.clone(),
+                dir.path().to_path_buf(),
+                dir.path().to_path_buf(),
+                "rev".into(),
+                2,
+                Duration::from_secs(1),
+            ),
+            Some(model) => LocalStdioEmbedder::with_model(
+                python.clone(),
+                helper.clone(),
+                dir.path().to_path_buf(),
+                dir.path().to_path_buf(),
+                model,
+                "rev".into(),
+                2,
+                Duration::from_secs(1),
+            ),
+        };
+        let strict = make(None).expect("strict embedder");
+        assert_eq!(strict.metadata().model, STRICT_EMBEDDING_MODEL);
+        assert_eq!(strict.metadata().dimension, 384);
+
+        let preselect = make(Some(PRESELECT_EMBEDDING_MODEL)).expect("preselect embedder");
+        assert_eq!(preselect.metadata().dimension, 768);
+
+        for refused in ["intfloat/multilingual-e5-large", "", "e5-base"] {
+            assert!(make(Some(refused)).is_err(), "{refused}");
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]

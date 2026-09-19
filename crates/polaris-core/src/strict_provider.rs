@@ -94,10 +94,6 @@ pub fn local_embedder(
     config: &crate::config::EmbeddingConfig,
     private_root: &Path,
 ) -> io::Result<LocalStdioEmbedder> {
-    let python = config
-        .runtime
-        .clone()
-        .ok_or_else(|| io::Error::other("strict10にはembedding.runtimeが必要です"))?;
     let model = config
         .model_path
         .clone()
@@ -107,6 +103,61 @@ pub fn local_embedder(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| io::Error::other("strict10にはembedding.revisionが必要です"))?;
+    embedder_for(
+        config,
+        private_root,
+        crate::conversation_memory::STRICT_EMBEDDING_MODEL,
+        model,
+        revision,
+    )
+}
+
+/// The same helper against the preselection model (M10 L2).
+///
+/// A separate snapshot and revision, because it is a different model.
+/// Sharing `model_path` would make a project choose between strict10 and
+/// the ranking stage, and whichever lost would go on producing vectors
+/// that cannot be compared with the index they are scored against.
+///
+/// Returns `Ok(None)` when the project has not configured one: the ranking
+/// stage is optional and its absence is not a failure. An incomplete
+/// configuration *is* — half a pin is worse than none, because it looks
+/// deliberate.
+pub fn preselect_embedder(
+    config: &crate::config::EmbeddingConfig,
+    private_root: &Path,
+) -> io::Result<Option<LocalStdioEmbedder>> {
+    let revision = config
+        .preselect_revision
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    match (config.preselect_model_path.clone(), revision) {
+        (None, None) => Ok(None),
+        (Some(model), Some(revision)) => embedder_for(
+            config,
+            private_root,
+            crate::conversation_memory::PRESELECT_EMBEDDING_MODEL,
+            model,
+            revision,
+        )
+        .map(Some),
+        _ => Err(io::Error::other(
+            "embedding.preselect_model_pathとpreselect_revisionは両方必要です",
+        )),
+    }
+}
+
+fn embedder_for(
+    config: &crate::config::EmbeddingConfig,
+    private_root: &Path,
+    model_name: &str,
+    model: std::path::PathBuf,
+    revision: String,
+) -> io::Result<LocalStdioEmbedder> {
+    let python = config
+        .runtime
+        .clone()
+        .ok_or_else(|| io::Error::other("strict10にはembedding.runtimeが必要です"))?;
     if !python.is_absolute()
         || !python.is_file()
         || !model.is_absolute()
@@ -155,13 +206,104 @@ pub fn local_embedder(
         }
         Err(error) => return Err(error),
     }
-    LocalStdioEmbedder::new(
+    LocalStdioEmbedder::with_model(
         python,
         helper,
         model,
         dir,
+        model_name,
         revision,
         2,
         Duration::from_secs(60),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation_memory::StrictEmbedder;
+
+    fn usable(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let python = dir.join("python3");
+        let model = dir.join("model");
+        std::fs::write(&python, "").expect("write");
+        std::fs::create_dir_all(&model).expect("mkdir");
+        std::fs::write(model.join("config.json"), "{}").expect("write");
+        (python, model)
+    }
+
+    /// The two snapshots are two models. A project that configures only
+    /// strict10 must not silently get an e5-small index under the ranking
+    /// stage, and half a pin must fail loudly rather than look deliberate.
+    #[test]
+    fn the_ranking_model_is_configured_separately_and_a_half_pin_is_refused() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let private = temp.path().join("private");
+        std::fs::create_dir_all(&private).expect("mkdir");
+        let (python, model) = usable(temp.path());
+
+        let strict_only = crate::config::EmbeddingConfig {
+            runtime: Some(python.clone()),
+            model_path: Some(model.clone()),
+            revision: Some("rev-small".into()),
+            preselect_model_path: None,
+            preselect_revision: None,
+        };
+        assert_eq!(
+            local_embedder(&strict_only, &private)
+                .expect("strict embedder")
+                .metadata()
+                .model,
+            crate::conversation_memory::STRICT_EMBEDDING_MODEL
+        );
+        assert!(
+            preselect_embedder(&strict_only, &private)
+                .expect("absence is not a failure")
+                .is_none()
+        );
+
+        let both = crate::config::EmbeddingConfig {
+            preselect_model_path: Some(model.clone()),
+            preselect_revision: Some("rev-base".into()),
+            ..strict_only.clone()
+        };
+        let ranking = preselect_embedder(&both, &private)
+            .expect("preselect embedder")
+            .expect("configured");
+        assert_eq!(
+            ranking.metadata().model,
+            crate::conversation_memory::PRESELECT_EMBEDDING_MODEL
+        );
+        assert_eq!(ranking.metadata().dimension, 768);
+        assert_eq!(ranking.metadata().revision, "rev-base");
+        // The strict side keeps its own revision; one field would have
+        // made them share, and the shared one would be wrong for someone.
+        assert_eq!(
+            local_embedder(&both, &private)
+                .expect("strict embedder")
+                .metadata()
+                .revision,
+            "rev-small"
+        );
+
+        for half in [
+            crate::config::EmbeddingConfig {
+                preselect_model_path: Some(model.clone()),
+                preselect_revision: None,
+                ..strict_only.clone()
+            },
+            crate::config::EmbeddingConfig {
+                preselect_model_path: None,
+                preselect_revision: Some("rev-base".into()),
+                ..strict_only.clone()
+            },
+            crate::config::EmbeddingConfig {
+                preselect_model_path: Some(model),
+                preselect_revision: Some("   ".into()),
+                ..strict_only
+            },
+        ] {
+            assert!(preselect_embedder(&half, &private).is_err());
+        }
+    }
 }

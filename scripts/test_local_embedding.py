@@ -1,9 +1,12 @@
-"""Offline contract tests for the bundled strict10 embedding helper."""
+"""Offline contract tests for the bundled embedding helper."""
 
+import contextlib
 import importlib.util
 import hashlib
+import io
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
 
@@ -31,6 +34,45 @@ class LocalEmbeddingContractTest(unittest.TestCase):
     def test_passage_over_limit_is_rejected(self):
         with self.assertRaises(ValueError):
             HELPER.chunks(Tokenizer(), "a b c d", 4, "passage")
+
+    def test_only_the_two_pinned_models_are_accepted_and_the_size_must_match(self):
+        # The allowlist is the whole of the model policy. A caller that can
+        # name any model, or name a real one at the wrong size, can make the
+        # helper produce vectors that silently do not belong to the index
+        # they are compared against.
+        self.assertEqual(
+            HELPER.MODELS,
+            {
+                "intfloat/multilingual-e5-small": 384,
+                "intfloat/multilingual-e5-base": 768,
+            },
+        )
+
+        def parse(argv):
+            saved = sys.argv
+            sys.argv = ["local_embedding.py", *argv]
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    return HELPER.parse_args()
+            finally:
+                sys.argv = saved
+
+        base = ["--model-path", "/m", "--revision", "r", "--max-tokens", "512"]
+        for name, dimension in HELPER.MODELS.items():
+            args = parse([*base, "--model-name", name, "--dimension", str(dimension)])
+            self.assertEqual(args.dimension, dimension)
+        for name, dimension in [
+            ("intfloat/multilingual-e5-small", 768),   # real model, wrong size
+            ("intfloat/multilingual-e5-base", 384),    # the other way round
+            ("intfloat/multilingual-e5-large", 1024),  # not on the list
+            ("", 384),
+        ]:
+            with self.assertRaises(ValueError, msg=f"{name}/{dimension}"):
+                parse([*base, "--model-name", name, "--dimension", str(dimension)])
+        # max_tokens stays fixed; the chunking contract is written against it.
+        with self.assertRaises(ValueError):
+            parse(["--model-path", "/m", "--revision", "r", "--max-tokens", "256",
+                   "--model-name", "intfloat/multilingual-e5-small", "--dimension", "384"])
 
     def test_helper_declares_offline_safe_loaders(self):
         source = SOURCE.read_text(encoding="utf-8")

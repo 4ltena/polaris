@@ -15,8 +15,9 @@ mod strict_history;
 pub mod structured;
 mod structured_owner;
 pub use strict_history::{
-    EmbeddingModel, LocalStdioEmbedder, PreparedHistory, ResolvedConversationSource,
-    StrictEmbedder, StrictHistory, StrictRecovery, StrictSummaryProvider, SummaryRequest,
+    EMBEDDING_MODELS, EmbeddingModel, LocalStdioEmbedder, PRESELECT_EMBEDDING_MODEL,
+    PreparedHistory, ResolvedConversationSource, STRICT_EMBEDDING_MODEL, StrictEmbedder,
+    StrictFuture, StrictHistory, StrictRecovery, StrictSummaryProvider, SummaryRequest,
     read_source, resolve_conversation_uri,
 };
 pub(crate) use strict_history::{parse_uri, source_page, summary_evidence, validate_summary};

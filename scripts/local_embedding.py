@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Fixed offline JSONL embedding helper for strict10.
+"""Fixed offline JSONL embedding helper.
 
 The parent owns process placement and an OS sandbox. This helper performs no
 network access, subprocess creation, cache download, or dynamic code loading.
+
+Two models are allowed and no more. strict10 pins multilingual-e5-small; the
+preselection ranking stage (M10 L2) pins multilingual-e5-base. The caller says
+which one it pinned and the dimension it expects; this refuses anything that
+is not in `MODELS`, and refuses a snapshot whose real hidden size disagrees
+with the declared one. Widening the helper rather than copying it is
+deliberate: the prefixes, the pooling and the normalisation have to produce
+the same vector for the same model, and two copies are free to drift.
 """
 
 import argparse
@@ -14,16 +22,27 @@ import sys
 
 MAX_MANIFEST_FILE_BYTES = 8 * 1024 * 1024 * 1024
 
+# The only models this helper will run, and the hidden size each must have.
+MODELS = {
+    "intfloat/multilingual-e5-small": 384,
+    "intfloat/multilingual-e5-base": 768,
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--model-name", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--dimension", type=int, required=True)
     parser.add_argument("--max-tokens", type=int, required=True)
     parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
-    if args.dimension != 384 or args.max_tokens != 512 or not args.revision:
+    if (
+        MODELS.get(args.model_name) != args.dimension
+        or args.max_tokens != 512
+        or not args.revision
+    ):
         raise ValueError("fixed embedding helper arguments are invalid")
     return args
 
@@ -91,7 +110,7 @@ def chunks(tokenizer, text, maximum, kind):
             for offset in range(0, len(token_ids), available)] or [prefix]
 
 
-def embed(model, tokenizer, torch, values, maximum):
+def embed(model, tokenizer, torch, values, maximum, dimension):
     encoded = tokenizer(values, padding=True, truncation=False, return_tensors="pt")
     if encoded["input_ids"].shape[1] > maximum:
         raise ValueError("input exceeds 512 tokenizer tokens; truncation is forbidden")
@@ -99,7 +118,7 @@ def embed(model, tokenizer, torch, values, maximum):
         embeddings = mean_pool(model(**encoded).last_hidden_state, encoded["attention_mask"])
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
     result = embeddings.cpu().tolist()
-    if any(len(vector) != 384 or not all(math.isfinite(value) for value in vector) for vector in result):
+    if any(len(vector) != dimension or not all(math.isfinite(value) for value in vector) for vector in result):
         raise ValueError("model returned an invalid embedding")
     return result
 
@@ -117,11 +136,13 @@ def main():
         args.model_path, local_files_only=True, trust_remote_code=False, use_safetensors=True
     )
     model.eval()
+    # Checked on every path, not only under --preflight: an embedding call
+    # that never preflights would otherwise run a snapshot of the wrong size.
+    if model.config.hidden_size != args.dimension:
+        raise ValueError("fixed model dimension is invalid")
     if args.preflight:
         from importlib.metadata import version
-        if model.config.hidden_size != 384:
-            raise ValueError("fixed model dimension is invalid")
-        print(json.dumps({"model": "intfloat/multilingual-e5-small", "dimension": 384,
+        print(json.dumps({"model": args.model_name, "dimension": args.dimension,
                           "revision": args.revision,
                           "packages": {name: version(name) for name in
                                        ("torch", "transformers", "tokenizers", "safetensors")}},
@@ -137,7 +158,7 @@ def main():
         if len(texts) > 32:
             raise ValueError("query requires too many fixed-size chunks")
         tokens = sum(len(tokenizer.encode(text, add_special_tokens=True)) for text in texts)
-        print(json.dumps({"vectors": embed(model, tokenizer, torch, texts, args.max_tokens), "input_tokens": tokens}, separators=(",", ":")), flush=True)
+        print(json.dumps({"vectors": embed(model, tokenizer, torch, texts, args.max_tokens, args.dimension), "input_tokens": tokens}, separators=(",", ":")), flush=True)
 
 
 if __name__ == "__main__":

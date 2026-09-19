@@ -99,11 +99,42 @@ pub async fn judge(
     candidates: &[(&str, &str)],
     cancelled: impl Future<Output = ()>,
 ) -> Result<Bands, Refused> {
-    let questions: BTreeMap<String, Question> = candidates
-        .iter()
+    judge_with(
+        decider,
+        state,
+        candidates
+            .iter()
+            .map(|(name, description)| question(query, kind, name, description))
+            .collect(),
+        cancelled,
+    )
+    .await
+}
+
+/// The same banding, for a caller that writes its own question.
+///
+/// Split out because the wording above is fixed to 「役に立つか」 and its
+/// two edges were calibrated on exactly that phrasing. A caller asking
+/// something else needs the scoring, the completeness check and the
+/// ordering — not the sentence. Keeping one copy of the scoring is what
+/// stops a second set of edges appearing.
+///
+/// **A caller with its own wording does not inherit the calibration.** The
+/// edges still divide the answers, but what they mean for that question is
+/// unmeasured until it is measured. Read the adopted band as a suggestion
+/// there, not as a verdict.
+pub async fn judge_with(
+    decider: &dyn Decider,
+    state: &serde_json::Value,
+    asked: Vec<Question>,
+    cancelled: impl Future<Output = ()>,
+) -> Result<Bands, Refused> {
+    let questions: BTreeMap<String, Question> = asked
+        .into_iter()
         .enumerate()
-        .map(|(index, (name, description))| (key(index), question(query, kind, name, description)))
+        .map(|(index, question)| (key(index), question))
         .collect();
+    let count = questions.len();
 
     tokio::pin!(cancelled);
     let answered = tokio::select! {
@@ -117,7 +148,7 @@ pub async fn judge(
     // not a narrower answer, it is an answer to a different question set.
     let mut scored: Vec<(usize, f64)> = Vec::new();
     let mut excluded = 0;
-    for index in 0..candidates.len() {
+    for index in 0..count {
         let key = key(index);
         let (Some(answer), Some(question)) = (answered.answers.get(&key), questions.get(&key))
         else {

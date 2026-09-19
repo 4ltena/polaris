@@ -357,7 +357,7 @@ impl ToolSubset {
             0 => Vec::new(),
             3 => all
                 .iter()
-                .filter(|tool| matches!(tool.name, "read" | "bash" | "skill"))
+                .filter(|tool| matches!(tool.name.as_str(), "read" | "bash" | "skill"))
                 .map(|tool| tool.name.to_string())
                 .collect(),
             6 => all.iter().map(|tool| tool.name.to_string()).collect(),
@@ -395,7 +395,7 @@ impl ToolSubset {
         }
         request
             .tools
-            .retain(|tool| self.allowed.iter().any(|name| name == tool.name));
+            .retain(|tool| self.allowed.iter().any(|name| name == &tool.name));
         Ok(request)
     }
 

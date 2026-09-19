@@ -10,15 +10,15 @@ mod schema_validate;
 pub mod skill;
 pub mod write;
 
-pub use schema_validate::validate;
+pub use schema_validate::{McpSchema, McpSchemaError, validate};
 
 use serde::Serialize;
 
 /// Tool definition passed to the model. `parameters` is a JSON Schema.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub parameters: serde_json::Value,
 }
 
@@ -75,10 +75,86 @@ pub fn all_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// Request-local workflow control; never part of the six-tool baseline.
+pub fn state_spec() -> ToolSpec {
+    ToolSpec {
+        name: "state".into(),
+        description: "Read workflow focus, read the state window, or propose a phase for the next request. Get revision first; transition requires expected_revision. window returns what changed since the revision you were last given, or the whole window when that base is unknown. Focus never grants permission or proves completion.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {"type":"string", "enum":["get", "window", "transition"]},
+                "phase": {"type":"string", "enum":["general", "brainstorm", "specify", "implement", "review", "verify", "deliver"]},
+                "expected_revision": {"type":"integer", "minimum":0},
+                "since": {"type":"integer", "minimum":0}
+            },
+            "required":["op"],
+            "additionalProperties":false
+        }),
+    }
+}
+
+/// Root-only MCP entry point, separate from the six-tool baseline. Dispatch
+/// validates operation-specific fields; this schema cannot create host grants.
+pub fn mcp_catalog_spec() -> ToolSpec {
+    ToolSpec {
+        name: "mcp_catalog".into(),
+        description: "Search or select a registered MCP item, read a resource, or read a local result chunk. No registration, grants, or prompt selection.".into(),
+        parameters: serde_json::json!({
+            "type":"object",
+            "properties":{
+                "op":{"type":"string","enum":["search","select","read","chunk"]},
+                "q":{"type":"string"},
+                "server":{"type":"string"},
+                "kind":{"type":"string","enum":["tool","resource","resource_template","prompt"]},
+                "key":{"type":"string"},
+                "generation":{"type":"string"},
+                "arguments":{"type":"object"},
+                "handle":{"type":"string"},
+                "offset":{"type":"integer","minimum":0},
+                "limit":{"type":"integer","minimum":1,"maximum":32768}
+            },
+            "required":["op"],"additionalProperties":false
+        }),
+    }
+}
+
+/// Root-only host setup. Arguments carry candidate IDs, never paths or values.
+pub fn mcp_setup_spec() -> ToolSpec {
+    ToolSpec {
+        name: "mcp_setup".into(),
+        description: "Find MCP servers the user already configured for Codex or Claude on this computer, then register one after the user approves it. Results list candidate IDs, names, transports and reasons, never URLs, commands or credentials. A registration is usable from the next connection.".into(),
+        parameters: serde_json::json!({
+            "type":"object",
+            "properties":{
+                "op":{"type":"string","enum":["detect","register"]},
+                "candidate":{"type":"string"}
+            },
+            "required":["op"],"additionalProperties":false
+        }),
+    }
+}
+
+/// Root-only bundled setting commands. Arguments carry an operation name
+/// and nothing else: no path, no package, no command line.
+pub fn setting_spec() -> ToolSpec {
+    ToolSpec {
+        name: "setting".into(),
+        description: "Read what the bundled Next.js and Git setup would do in this project, or add the missing ignore rules. `plan` only reads. `tidy` appends rules the project is missing to .gitignore, keeping existing lines and their order, and asks before writing. Installing packages is the user's to confirm in their terminal and is never done here.".into(),
+        parameters: serde_json::json!({
+            "type":"object",
+            "properties":{
+                "op":{"type":"string","enum":["plan","tidy"]}
+            },
+            "required":["op"],"additionalProperties":false
+        }),
+    }
+}
+
 fn read_spec() -> ToolSpec {
     ToolSpec {
-        name: "read",
-        description: "Read a file. Returns it with line numbers. Omit limit unless you truly want less than 2000 lines - a guessed smaller value just forces a second read.",
+        name: "read".into(),
+        description: "Read a file. Returns it with line numbers. Omit limit unless you truly want less than 2000 lines - a guessed smaller value just forces a second read.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -93,8 +169,10 @@ fn read_spec() -> ToolSpec {
 
 fn write_spec() -> ToolSpec {
     ToolSpec {
-        name: "write",
-        description: "Create a new file. Overwrites an existing file. Creates intermediate directories.",
+        name: "write".into(),
+        description:
+            "Create a new file. Overwrites an existing file. Creates intermediate directories."
+                .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -108,8 +186,8 @@ fn write_spec() -> ToolSpec {
 
 fn edit_spec() -> ToolSpec {
     ToolSpec {
-        name: "edit",
-        description: "Replace part of an existing file. `old` must be a string that is uniquely determined within the file. Fails if there are multiple matches.",
+        name: "edit".into(),
+        description: "Replace part of an existing file. `old` must be a string that is uniquely determined within the file. Fails if there are multiple matches.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -124,8 +202,8 @@ fn edit_spec() -> ToolSpec {
 
 fn bash_spec() -> ToolSpec {
     ToolSpec {
-        name: "bash",
-        description: "Run a shell command. Use this for grep and find too. Writes outside the sandbox are denied.",
+        name: "bash".into(),
+        description: "Run a shell command. Use this for grep and find too. Writes outside the sandbox are denied.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -138,8 +216,8 @@ fn bash_spec() -> ToolSpec {
 
 fn skill_spec() -> ToolSpec {
     ToolSpec {
-        name: "skill",
-        description: "Look up a skill. Returns the body on an exact name match, otherwise returns candidate names and descriptions.",
+        name: "skill".into(),
+        description: "Look up a skill. Returns the body on an exact name match, otherwise returns candidate names and descriptions.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -159,8 +237,8 @@ fn skill_spec() -> ToolSpec {
 /// `"type": "object"`), so the array is wrapped under a `"tasks"` key.
 fn spawn_spec() -> ToolSpec {
     ToolSpec {
-        name: "spawn",
-        description: "Run subagents in parallel as one wave. Each runs a bounded loop and returns a schema-validated result; its steps never enter your context.",
+        name: "spawn".into(),
+        description: "Run subagents in parallel as one wave. Describe the work; the type is matched for you. Each runs a bounded loop and returns a schema-validated result; its steps never enter your context.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -171,7 +249,7 @@ fn spawn_spec() -> ToolSpec {
                         "properties": {
                             "type": {
                                 "type": "string",
-                                "description": "Type name, from agents/<type>/SKILL.md."
+                                "description": "Optional. Omit it unless one type is the only one that can do the work — it is matched from the task otherwise."
                             },
                             "task": {
                                 "type": "string",
@@ -182,7 +260,7 @@ fn spawn_spec() -> ToolSpec {
                                 "description": "Read-write types only: the one directory it may write."
                             }
                         },
-                        "required": ["type", "task"]
+                        "required": ["task"]
                     }
                 }
             },
@@ -273,21 +351,27 @@ mod tests {
         assert_eq!(json["parameters"]["required"][0], "tasks");
         assert_eq!(json["parameters"]["properties"]["tasks"]["type"], "array");
         let item_required = &json["parameters"]["properties"]["tasks"]["items"]["required"];
-        assert_eq!(item_required[0], "type");
-        assert_eq!(item_required[1], "task");
-        // `write_root` is deliberately not required — it only applies to a
-        // read-write type, and demanding it of every task would make the
-        // read-only case unrepresentable.
+        // Only the work is required. **`type` is deliberately optional**:
+        // the orchestrator is the most expensive party in the run, and it
+        // holds no catalogue, so demanding a type name buys either a guess
+        // or a round trip at its rate. The judge matches one from the task
+        // for a rate that does not register. A name is still honoured when
+        // one is given and is real.
+        assert_eq!(item_required[0], "task");
         assert!(
-            item_required[2].is_null(),
-            "write_root must not be required: {item_required}"
+            item_required[1].is_null(),
+            "only the task is required: {item_required}"
+        );
+        assert!(
+            json["parameters"]["properties"]["tasks"]["items"]["properties"]["type"].is_object(),
+            "type stays offered even though it is not required"
         );
     }
 
     #[test]
     fn all_specs_has_unique_names() {
         let specs = all_specs();
-        let mut names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+        let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         names.sort_unstable();
         let before = names.len();
         names.dedup();

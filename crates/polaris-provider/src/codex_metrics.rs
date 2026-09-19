@@ -195,12 +195,19 @@ fn source_cause(error: &(dyn std::error::Error + 'static)) -> &'static str {
     found
 }
 
-#[derive(Clone, Copy, Default, Serialize)]
-pub(super) struct TokenUsage {
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct TokenUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cache_read_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
+    /// The part of `output_tokens` the model spent thinking rather than
+    /// answering. Billed as output, and the only thing reasoning effort
+    /// actually moves — without it, "does raising effort cost more here?"
+    /// cannot be answered from a run's own record.
+    ///
+    /// `None` when the provider did not report it, which is not zero.
+    reasoning_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -218,6 +225,9 @@ impl TokenUsage {
                     v.pointer("/input_tokens_details/cache_write_tokens")
                         .and_then(Value::as_u64)
                 }),
+            reasoning_tokens: v
+                .pointer("/output_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64),
         }
     }
 }
@@ -907,5 +917,38 @@ mod tests {
             assert_eq!(folder.metrics_usage.input_tokens, None);
             assert_eq!(folder.cancelled, kind == "response.cancelled");
         }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tokens_tests {
+    use super::*;
+
+    /// Reasoning tokens are billed as output and are the only thing raising
+    /// the effort actually moves. Without them a run cannot answer "did the
+    /// extra effort cost anything here?" from its own record — the four-rung
+    /// ladder rests on a multiplier OpenAI does not publish, so it has to be
+    /// measured, and it cannot be measured from a figure that is not kept.
+    #[test]
+    fn the_thinking_part_of_the_output_is_kept_separately() {
+        let held = TokenUsage::parse(&serde_json::json!({
+            "input_tokens": 1200,
+            "output_tokens": 900,
+            "input_tokens_details": { "cached_tokens": 1024 },
+            "output_tokens_details": { "reasoning_tokens": 780 },
+        }));
+        assert_eq!(held.reasoning_tokens, Some(780));
+        assert_eq!(held.output_tokens, Some(900));
+        // The visible answer is what is left, and the record keeps both
+        // halves rather than the difference: a provider that stops reporting
+        // the split must read as unknown, not as "all of it was visible".
+        assert_eq!(held.cache_read_tokens, Some(1024));
+
+        // Not reported is not zero.
+        let silent = TokenUsage::parse(&serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 20,
+        }));
+        assert_eq!(silent.reasoning_tokens, None);
     }
 }

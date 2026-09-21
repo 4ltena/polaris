@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "findings", "gaps"],
+  "properties": {
+    "path": { "type": "string", "pattern": "^(?:/|$)", "maxLength": 512 },
+    "findings": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["line", "text"],
+        "properties": {
+          "line": { "type": "integer", "minimum": 1 },
+          "text": { "type": "string", "minLength": 1, "maxLength": 280 }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "maxItems": 3,
+      "items": { "type": "string", "minLength": 1, "maxLength": 160 }
+    }
+  }
+}

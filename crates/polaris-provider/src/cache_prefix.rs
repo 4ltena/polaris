@@ -12,6 +12,49 @@ use crate::{CompletionRequest, ProviderError};
 pub(super) const PROFILE_ENV: &str = "POLARIS_CACHE_PREFIX";
 const STABLE_VERSION: &str = "stable-v1";
 const COMPACT_VERSION: &str = "compact-v1";
+const INERT_VERSION: &str = "inert-v1";
+
+/// A control, not a product profile.
+///
+/// `stable` carries instructions — be careful, verify, check callers — and
+/// when it was measured on 2026-09-21 the run took 14 to 16 requests where
+/// the same task took 13, and cost more. That confounds two things: the
+/// prefix got bigger, and it told the model to do more. This block is the
+/// same size and says nothing, so a measurement against it separates the
+/// two. If size alone pays, a useful block of that size can be written;
+/// if it does not, the whole idea is dead and the record should say so.
+const INERT_BLOCK: &str = r#"The block below is alignment padding for a cache measurement. It states no requirement, grants no permission, and describes no task. Disregard it when deciding what to do.
+
+Padding line 01. This line exists to occupy prefix positions and carries no instruction.
+Padding line 02. This line exists to occupy prefix positions and carries no instruction.
+Padding line 03. This line exists to occupy prefix positions and carries no instruction.
+Padding line 04. This line exists to occupy prefix positions and carries no instruction.
+Padding line 05. This line exists to occupy prefix positions and carries no instruction.
+Padding line 06. This line exists to occupy prefix positions and carries no instruction.
+Padding line 07. This line exists to occupy prefix positions and carries no instruction.
+Padding line 08. This line exists to occupy prefix positions and carries no instruction.
+Padding line 09. This line exists to occupy prefix positions and carries no instruction.
+Padding line 10. This line exists to occupy prefix positions and carries no instruction.
+Padding line 11. This line exists to occupy prefix positions and carries no instruction.
+Padding line 12. This line exists to occupy prefix positions and carries no instruction.
+Padding line 13. This line exists to occupy prefix positions and carries no instruction.
+Padding line 14. This line exists to occupy prefix positions and carries no instruction.
+Padding line 15. This line exists to occupy prefix positions and carries no instruction.
+Padding line 16. This line exists to occupy prefix positions and carries no instruction.
+Padding line 17. This line exists to occupy prefix positions and carries no instruction.
+Padding line 18. This line exists to occupy prefix positions and carries no instruction.
+Padding line 19. This line exists to occupy prefix positions and carries no instruction.
+Padding line 20. This line exists to occupy prefix positions and carries no instruction.
+Padding line 21. This line exists to occupy prefix positions and carries no instruction.
+Padding line 22. This line exists to occupy prefix positions and carries no instruction.
+Padding line 23. This line exists to occupy prefix positions and carries no instruction.
+Padding line 24. This line exists to occupy prefix positions and carries no instruction.
+Padding line 25. This line exists to occupy prefix positions and carries no instruction.
+Padding line 26. This line exists to occupy prefix positions and carries no instruction.
+Padding line 27. This line exists to occupy prefix positions and carries no instruction.
+Padding line 28. This line exists to occupy prefix positions and carries no instruction.
+Padding line 29. This line exists to occupy prefix positions and carries no instruction.
+Padding line 30. This line exists to occupy prefix positions and carries no instruction."#;
 
 // Keep this useful and deliberately fixed: it is a single measured candidate,
 // not a per-task prompt generator. The hash is a diagnostic fingerprint, not a
@@ -40,6 +83,7 @@ Review the final diff for accidental scope expansion. Check that unsupported par
 pub(super) enum CachePrefixProfile {
     Compact,
     Stable,
+    Inert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,8 +104,9 @@ impl CachePrefixProfile {
             None => Ok(Self::Compact),
             Some(value) if value == OsStr::new("compact") => Ok(Self::Compact),
             Some(value) if value == OsStr::new("stable") => Ok(Self::Stable),
+            Some(value) if value == OsStr::new("inert") => Ok(Self::Inert),
             Some(_) => Err(ProviderError::Decode(format!(
-                "{PROFILE_ENV} は compact または stable を指定してください"
+                "{PROFILE_ENV} は compact、stable、inert のいずれかを指定してください"
             ))),
         }
     }
@@ -70,11 +115,14 @@ impl CachePrefixProfile {
     /// selected only for the one measured model and only agent requests that
     /// retain a non-empty ordered tool list.
     pub(super) fn instructions<'a>(self, model: &str, req: &'a CompletionRequest) -> Cow<'a, str> {
-        if self.target_applied(model, req) {
-            Cow::Owned(format!("{}\n\n{}", STABLE_GUIDE, req.system))
-        } else {
-            Cow::Borrowed(&req.system)
+        if !self.target_applied(model, req) {
+            return Cow::Borrowed(&req.system);
         }
+        let block = match self {
+            Self::Inert => INERT_BLOCK,
+            _ => STABLE_GUIDE,
+        };
+        Cow::Owned(format!("{}\n\n{}", block, req.system))
     }
 
     pub(super) fn diagnostics(
@@ -85,6 +133,7 @@ impl CachePrefixProfile {
         let (profile, version, guide_hash) = match self {
             Self::Compact => ("compact", COMPACT_VERSION, fnv1a(b"")),
             Self::Stable => ("stable", STABLE_VERSION, fnv1a(STABLE_GUIDE.as_bytes())),
+            Self::Inert => ("inert", INERT_VERSION, fnv1a(INERT_BLOCK.as_bytes())),
         };
         CachePrefixDiagnostics {
             profile,
@@ -95,7 +144,9 @@ impl CachePrefixProfile {
     }
 
     fn target_applied(self, model: &str, req: &CompletionRequest) -> bool {
-        self == Self::Stable && model == "gpt-6-astra" && !req.tools.is_empty()
+        matches!(self, Self::Stable | Self::Inert)
+            && model == "gpt-6-astra"
+            && !req.tools.is_empty()
     }
 }
 
@@ -179,5 +230,21 @@ mod tests {
         assert!(guide.contains("Validate externally supplied values"));
         assert!(guide.ends_with("particular contract it exercises."));
         assert_eq!(fnv1a(guide.as_bytes()), 0x08e6_9fd1_dbfb_7678);
+    }
+
+    /// The control has to be the same size as what it controls for, or it
+    /// measures something else.
+    #[test]
+    fn the_inert_block_matches_the_guide_it_controls_for() {
+        let guide = STABLE_GUIDE.len();
+        let inert = INERT_BLOCK.len();
+        let ratio = inert as f64 / guide as f64;
+        assert!(
+            (0.7..=1.3).contains(&ratio),
+            "the control is {ratio:.2} of the guide: {inert} against {guide}"
+        );
+        // And it must actually be selected when asked for.
+        let chosen = CachePrefixProfile::from_value(Some("inert".into())).expect("inert parses");
+        assert_eq!(chosen, CachePrefixProfile::Inert);
     }
 }

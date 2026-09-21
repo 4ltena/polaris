@@ -38,10 +38,12 @@ fn conversation_scoped_key() -> Option<&'static str> {
             .then(|| {
                 let mut bytes = [0u8; 8];
                 use std::io::Read;
-                let _ = std::fs::File::open("/dev/urandom")
-                    .and_then(|mut file| file.read_exact(&mut bytes));
-                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut file| file.read_exact(&mut bytes))
+                    .ok()
+                    .map(|()| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
             })
+            .flatten()
         })
         .as_deref()
 }
@@ -153,6 +155,20 @@ pub fn tool_wire_shape(tools: &[polaris_tools::ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
+/// How much prose the model is asked for, as `text.verbosity`.
+///
+/// Upstream sends this whenever the model supports it
+/// (`core/src/client.rs:873`); polaris has never sent a `text` field at
+/// all. It is the one output control that is part of the API rather than a
+/// sentence added to the prompt, and every prompt-side attempt to shorten
+/// the answer was measured on 2026-09-21 and cost more than it saved.
+/// Astra's output is 646 tokens a run, 24% of what the parity family
+/// costs, so this is worth a measurement rather than an assumption.
+fn verbosity() -> Option<String> {
+    let value = std::env::var("POLARIS_VERBOSITY").ok()?;
+    matches!(value.as_str(), "low" | "medium" | "high").then_some(value)
+}
+
 /// Assembles the request body.
 ///
 /// `effort` is sent as `reasoning.effort`. When it's `None`, the
@@ -200,6 +216,11 @@ fn build_body_with_instructions(
         // Do not request stored response state. Send the locally assembled
         // history explicitly; store:false does not itself guarantee a stable
         // prefix or reduce billed input tokens.
+        //
+        // It is not a choice either. Sending `true` on 2026-09-21 came back
+        // `400 invalid_request_error: "Store must be set to false"`, so this
+        // endpoint fixes the value and `store` cannot be why the backend
+        // never writes polaris a prefix cache entry.
         "store": false,
         "stream": true,
         // Added 2026-08-25 on the strength of a two-turn run that showed
@@ -223,6 +244,9 @@ fn build_body_with_instructions(
             None => crate::cache_key(model, effort, &effective_req),
         },
     });
+    if let Some(verbosity) = verbosity() {
+        body["text"] = serde_json::json!({ "verbosity": verbosity });
+    }
     let tools = tool_wire_shape(&req.tools);
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
@@ -724,7 +748,13 @@ impl CodexProvider {
         // server reads the frame by shape, and omitting a field it expects
         // is not the same as sending it empty.
         frame["tool_choice"] = serde_json::Value::String("auto".into());
-        frame["parallel_tool_calls"] = serde_json::Value::Bool(false);
+        // Several calls in one reply, because the loop already takes them
+        // that way — `dispatch` walks the list and `siblings_ok` decides
+        // what a failed one does to the rest. Holding it at `false` made
+        // the model spend a whole round trip per file it wanted to read,
+        // and a round trip re-bills the entire conversation. Upstream
+        // sends `true`; nothing here ever recorded a reason not to.
+        frame["parallel_tool_calls"] = serde_json::Value::Bool(true);
         if frame.get("reasoning").is_none() {
             frame["reasoning"] = serde_json::Value::Null;
         }

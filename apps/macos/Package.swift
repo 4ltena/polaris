@@ -9,7 +9,7 @@ let package = Package(
         .executable(name: "PolarisDesktop", targets: ["PolarisDesktop"])
     ],
     targets: [
-        .target(name: "PolarisSettings"),
+        .target(name: "PolarisSettings", linkerSettings: [.linkedFramework("Security")]),
         .executableTarget(name: "PolarisDesktop", dependencies: ["PolarisSettings"],
                           resources: [.process("Resources")]),
         .testTarget(name: "PolarisSettingsTests", dependencies: ["PolarisSettings", "PolarisDesktop"]),

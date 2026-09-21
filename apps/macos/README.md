@@ -1,12 +1,12 @@
 # macOSデスクトップ
 
-このディレクトリは、macOS 13以降で動作するSwiftUI版PolarisのSwift Packageである。v0.12.0の実装は完了した。生成する`.app`は未署名のローカル確認用で、RC化・配布・公開は行っていない。承認が必要な追加検証は利用者の指示により省略した。
+このディレクトリは、macOS 13以降で動作するSwiftUI版PolarisのSwift Packageである。Polaris本体と、初回設定・依存資源・本体配置を担当する独立インストーラを生成する。ローカル生成物は未署名で、署名・公証・公開は別工程である。
 
 アプリは選択したプロジェクトの外側に会話と設定を保存する。登録済みフォルダのidentityが変わった場合、保存済み会話を残して再接続を拒否する。同じsettings pathを二つのアプリから同時に使うこともできない。終了は下書きと復旧結果の保存を確認してから完了する。
 
 ## 組立て
 
-macOS 13以降、Swift 6、現在のcheckoutでビルドしたservice helperが必要である。モデル実行を確認する場合は、実行helperと移設可能なtoolchain packageも明示する。いずれも絶対パスで渡す。
+macOS 13以降、Swift 6、現在のcheckoutでビルドしたservice helperが必要である。モデル実行を確認する場合は、実行helperも明示する。いずれも絶対パスで渡す。
 
 ```sh
 cargo build -p polaris-desktop-service --bin polaris-desktop-service
@@ -15,11 +15,17 @@ cargo build -p polaris-cli --bin polaris
 python3 apps/macos/scripts/assemble-app.py \
   --service-helper "$PWD/target/debug/polaris-desktop-service" \
   --execution-helper "$PWD/target/debug/polaris" \
-  --toolchain-package /absolute/path/to/toolchain \
   --destination /absolute/path/PolarisDesktop.app
+
+python3 apps/macos/scripts/assemble-installer.py \
+  --service-helper "$PWD/target/debug/polaris-desktop-service" \
+  --execution-helper "$PWD/target/debug/polaris" \
+  --destination "/absolute/path/Polaris Installer.app"
 ```
 
-`--execution-helper`と`--toolchain-package`を省略すると、実行helperを同梱しないアプリになる。組立てスクリプトは既存の出力先を上書きせず、起動や署名も行わない。
+`--execution-helper`を省略すると、実行helperを同梱しないアプリになる。Rustツールチェーン、llama.cpp、e5用の隔離Python実行環境、strict10用multilingual-e5-small、事前選定用multilingual-e5-baseはアプリへ同梱しない。独立インストーラが、選択したフォルダへの`Polaris.app`配置と、固定manifestから`~/.polaris`配下への資源取得を行う。隔離Pythonにはtorch、transformers、tokenizers、safetensorsと、アーキテクチャに合うNumPyを固定して導入する。検証済みの絶対パスは`~/.polaris/managed-resources.toml`へ保存し、利用者が`config.toml`で明示した値を優先する。システムのRust・Python・PATHは変更しない。組立てスクリプトは既存の出力先を上書きせず、起動や署名も行わない。
+
+インストーラは6段階で、インストール先、GPT・Jev、Ollama・LM Studio・llama.cpp、任意のGGUF、作業フォルダ、権限の希望、テーマを保存する。既存の`Polaris.app`を置き換える場合は実行直前に確認し、一時退避から復旧できる形で更新する。Polaris本体に旧初回セットアップ画面はなく、完成済み設定がない場合はインストーラの実行を案内する。
 
 同梱するスキルはGit管理された`skills/`、子エージェント定義は`agents/`から取得する。ビルド元の`.polaris/skills`やホームの個人設定はアプリへコピーしない。これらのローカル設定を作らずに、新しく取得したソースから組み立てられる。実行時のプロジェクト・ホームからのスキル探索は従来どおりである。
 
@@ -34,7 +40,7 @@ open -n /absolute/path/PolarisDesktop.app --args \
 
 ## 作業画面
 
-初回設定でプロジェクト、希望する権限、クラウドまたはローカルの主モデルを選ぶ。選択内容を保存してから「保存した設定を確認して接続」を実行すると、保存済みの会話へ接続する。モデルまたは権限を変更すると、既存の所有者を終了して保存した設定へ接続し直す。
+インストーラでプロジェクト、希望する権限、クラウドまたはローカルの主モデルを選ぶ。Polaris本体は保存済み設定を読み、会話へ接続する。モデルまたは権限を変更すると、既存の所有者を終了して保存した設定へ接続し直す。
 
 会話欄は保存済みの会話、task、childと実行状態を表示する。ファイルとGitの欄は、プロジェクト内の保護された読取結果だけを表示する。秘密名、登録済み秘密、link、生成物、バイナリ、範囲外のパスは読取対象にしない。Gitの状態や履歴を取得できないときは、利用不可として表示する。
 
@@ -48,7 +54,7 @@ open -n /absolute/path/PolarisDesktop.app --args \
 
 `strict10`は全原文をv3保存先に残し、モデルへの直接投入を直近10実ユーザーターンに限る。それ以前は要約とローカル埋め込みから検索する。原文の表示履歴は削らない。検索は同じプロジェクト・会話に限定し、主回答・要約・ローカル埋め込みの使用量を実行詳細へ別々に表示する。欠測は「未取得」とする。
 
-主接続はCodexまたはOpenAIが必要で、同じ認証系の専用`gpt-6-astra/medium`で要約する。OSユーザーの`~/.polaris/config.toml`に固定埋め込み資源を設定する。形式と取得上限は[コンテキスト効率化](../../docs/context-efficiency.md#strict10とsessions-v2)を参照。資源が不足・不一致なら理由を表示し、主要求を開始しない。モデルの自動取得は行わず、ローカル主接続は従来方式で利用する。
+主接続はCodexまたはOpenAIが必要で、同じ認証系の専用`gpt-6-astra/medium`で要約する。Polarisインストーラは、固定した隔離Python実行環境とmultilingual-e5-smallを取得し、strict10へ自動接続する。必要なら、OSユーザーの`~/.polaris/config.toml`にある`[embedding]`で自動設定を上書きできる。形式と取得上限は[コンテキスト効率化](../../docs/context-efficiency.md#strict10とsessions-v2)を参照。資源が不足または不一致なら理由を表示し、主要求を開始しない。ローカル主接続は従来方式で利用する。
 
 実GUIから固定12入力を送り、11番目の原文参照と再起動時の履歴復元を確認した。12番目で出典情報込みの予算超過による検索不具合を検出し、上限を維持して修正した。修正後の自動回帰、アプリ接続、12ターンの復元は成功。追加実送信は省略したため、修正後の実モデル受入は未検証である。
 
@@ -65,6 +71,7 @@ Swiftの自動試験は次で実行する。
 ```sh
 swift test --package-path apps/macos
 python3 apps/macos/scripts/test_assemble_app.py
+python3 apps/macos/scripts/test_assemble_installer.py
 ```
 
 これらはSwift側のロジックとアプリ組立ての自動試験であり、実画面の操作、実モデル応答、実録音、署名、配布形式を検証するものではない。

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import PolarisSettings
@@ -43,6 +44,7 @@ struct WorkspaceComposerInput: View {
     @State private var inspectedAttachment: WorkspaceComposerAttachmentPreview?
     @State private var inputExpanded = false
     @State private var inputOverflows = false
+    @State private var modelMenuOpen = false
     private let compactInputHeight: CGFloat = 50
 
     init(text: Binding<String>, isComposing: Binding<Bool>, attachments: [WorkspaceAttachment],
@@ -128,14 +130,33 @@ struct WorkspaceComposerInput: View {
                     .accessibilityLabel("権限：\(selectedPermission?.title ?? "プロジェクト設定")")
                     .help(selectedPermission?.title ?? "プロジェクトの権限設定を使用")
                 Spacer(minLength: 0)
-                Menu {
-                    ForEach(models) { option in
-                        Button("\(option.title) · \(option.destination)\(option.unavailableReason.map { " · \($0)" } ?? "")") {
-                            onSelectModel(option)
-                        }.disabled(option.unavailableReason != nil)
-                    }
-                } label: { Text(selectedModel.title).lineLimit(1) }
-                    .menuStyle(.borderlessButton).help("次の要求：\(selectedModel.id) · \(selectedModel.destination) · \(selectedModel.effort)")
+                WorkspaceSelectionMenu(
+                    title: modelButtonTitle,
+                    heading: "Orchestratorモデル",
+                    selectedID: selectedModel.id,
+                    choices: cloudModels.map { option in
+                        WorkspaceSelectionChoice(id: option.id, title: modelDisplayName(option),
+                            detail: cloudModelDetail(option), symbol: modelSymbol(option),
+                            enabled: option.unavailableReason == nil)
+                    },
+                    secondaryTitle: "ローカルモデル",
+                    secondaryDetail: localModels.isEmpty ? "認識済みモデルはありません" : "認識済み \(localModels.count)件",
+                    secondarySymbol: "desktopcomputer",
+                    secondaryChoices: localModels.map { option in
+                        WorkspaceSelectionChoice(id: option.id, title: option.title,
+                            detail: option.destination, symbol: "cpu",
+                            enabled: option.unavailableReason == nil)
+                    },
+                    isOpen: $modelMenuOpen,
+                    opensAbove: true,
+                    width: 286,
+                    onSelect: { id in
+                        guard let option = models.first(where: { $0.id == id }) else { return }
+                        onSelectModel(option)
+                    })
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Orchestratorモデル：\(modelButtonTitle)")
+                .help("次の要求：\(selectedModel.id) · \(selectedModel.destination) · \(selectedModel.effort)")
                 Button { onVoice?(phase == .recording ? .stop : .start) } label: {
                     Image(systemName: phase == .recording ? "stop.circle" : "mic")
                 }
@@ -181,6 +202,55 @@ struct WorkspaceComposerInput: View {
         Text(text).font(.caption).foregroundStyle(.secondary)
     }
 
+    private var cloudModels: [WorkspaceModelConfiguration] {
+        models.filter { !isLocalModel($0) }
+    }
+
+    private var localModels: [WorkspaceModelConfiguration] {
+        models.filter { isLocalModel($0) && $0.id != "local|unavailable" }
+    }
+
+    private func cloudModelDetail(_ option: WorkspaceModelConfiguration) -> String {
+        if modelDisplayName(option) == "Astra" { return "\(option.title) · recommend" }
+        return [option.title, option.effort, option.unavailableReason]
+            .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    private var modelButtonTitle: String {
+        isLocalModel(selectedModel) ? selectedModel.title : modelDisplayName(selectedModel)
+    }
+
+    private func isLocalModel(_ option: WorkspaceModelConfiguration) -> Bool {
+        let value = (option.id + " " + option.destination).lowercased()
+        return value.contains("ollama|") || value.contains("lmstudio|") || value.contains("llamacpp|")
+            || value.contains("llama_cpp|")
+            || value.hasPrefix("local|") || value.contains(" ollama") || value.contains(" lmstudio")
+            || value.contains(" llamacpp")
+    }
+
+    private func modelDisplayName(_ option: WorkspaceModelConfiguration) -> String {
+        let value = (option.id + " " + option.title).lowercased()
+        if value.contains("gpt-6-astra") { return "Astra" }
+        if value.contains("gpt-5.6-sol") { return "Sol" }
+        if value.contains("gpt-5.6-terra") { return "Terra" }
+        if value.contains("gpt-5.6-luna") { return "Luna" }
+        if value.contains("ollama|") || value.contains("lmstudio|") || value.contains("llamacpp|") || value.contains("local") {
+            return "ローカルモデル"
+        }
+        return option.title
+    }
+
+    private func modelSymbol(_ option: WorkspaceModelConfiguration) -> String {
+        switch modelDisplayName(option) {
+        case "Astra": "sparkles"
+        case "Sol": "sun.max"
+        case "Terra": "globe.americas"
+        case "Luna": "moon"
+        case "ローカルモデル": "desktopcomputer"
+        default: "cpu"
+        }
+    }
+
     private func permissionSymbol(_ permission: PermissionPreference?) -> String {
         switch permission {
         case .readOnly: "eye"
@@ -194,5 +264,322 @@ struct WorkspaceComposerInput: View {
     private func sendIfAllowed() {
         guard canSend else { return }
         onSend()
+    }
+}
+
+struct WorkspaceSelectionChoice: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let detail: String
+    let symbol: String
+    var enabled = true
+}
+
+struct WorkspaceSelectionMenu: View {
+    let title: String
+    let heading: String
+    let selectedID: String
+    let choices: [WorkspaceSelectionChoice]
+    let secondaryTitle: String?
+    let secondaryDetail: String
+    let secondarySymbol: String
+    let secondaryChoices: [WorkspaceSelectionChoice]
+    @Binding var isOpen: Bool
+    let opensAbove: Bool
+    let width: CGFloat
+    let onSelect: (String) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var clickMonitor = WorkspaceSelectionMenuClickMonitor()
+    @State private var secondaryOpen = false
+
+    var body: some View {
+        Button { setOpen(!isOpen) } label: {
+            HStack(spacing: 5) {
+                Text(title).lineLimit(1)
+                Image(systemName: opensAbove ? "chevron.up" : "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityLabel("\(heading)：\(title)")
+        .accessibilityValue(isOpen ? "選択肢を表示中" : "閉じています")
+        .background(WorkspaceSelectionMenuHitRegion(id: "button", monitor: clickMonitor))
+        .overlay(alignment: opensAbove ? .bottomTrailing : .topTrailing) {
+            if isOpen {
+                panels
+                    .offset(y: opensAbove ? -34 : 34)
+                    .transition(.opacity)
+            }
+        }
+        .zIndex(isOpen ? 100 : 0)
+        .onExitCommand { setOpen(false) }
+        .onChange(of: isOpen) { open in
+            if open {
+                clickMonitor.start { setOpen(false) }
+            } else {
+                clickMonitor.stop()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            if isOpen { setOpen(false) }
+        }
+        .onDisappear { clickMonitor.stop() }
+    }
+
+    private var panels: some View {
+        primaryPanel
+            .overlay(alignment: opensAbove ? .bottomLeading : .topLeading) {
+                if secondaryOpen {
+                    secondaryPanel
+                        .offset(x: width + 8)
+                        .transition(.opacity)
+                }
+            }
+    }
+
+    private var primaryPanel: some View {
+        primaryPanelContent
+            .background(WorkspaceSelectionMenuHitRegion(id: "primary", monitor: clickMonitor))
+    }
+
+    private var primaryPanelContent: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(heading)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10).padding(.top, 7).padding(.bottom, 2)
+            ForEach(choices) { choice in
+                Button {
+                    onSelect(choice.id)
+                    setOpen(false)
+                } label: {
+                    HStack(alignment: .top, spacing: 9) {
+                        Image(systemName: choice.symbol)
+                            .frame(width: 17)
+                            .foregroundStyle(selectedID == choice.id ? Color.accentColor : .secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(choice.title).font(.callout.weight(.medium)).foregroundStyle(.primary)
+                            Text(choice.detail).font(.caption2).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        if selectedID == choice.id {
+                            Image(systemName: "checkmark")
+                                .font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor)
+                        }
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(WorkspaceSelectionRowStyle(selected: selectedID == choice.id))
+                .disabled(!choice.enabled)
+            }
+            if let secondaryTitle {
+                Button {
+                    if reduceMotion {
+                        secondaryOpen.toggle()
+                    } else {
+                        withAnimation(.easeOut(duration: 0.08)) { secondaryOpen.toggle() }
+                    }
+                } label: {
+                    HStack(alignment: .top, spacing: 9) {
+                        Image(systemName: secondarySymbol)
+                            .frame(width: 17)
+                            .foregroundStyle(secondarySelection ? Color.accentColor : .secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(secondaryTitle).font(.callout.weight(.medium)).foregroundStyle(.primary)
+                            Text(secondaryDetail).font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        Image(systemName: secondaryOpen ? "chevron.left" : "chevron.right")
+                            .font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(WorkspaceSelectionRowStyle(selected: secondarySelection))
+            }
+        }
+        .padding(.bottom, 5)
+        .frame(width: width)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(0.28), radius: 18, y: 7)
+    }
+
+    private var secondaryPanel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(secondaryTitle ?? "ローカルモデル")
+                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 10).padding(.top, 7).padding(.bottom, 2)
+            if secondaryChoices.isEmpty {
+                Text("認識済みモデルはありません")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 10).padding(.vertical, 9)
+            } else {
+                ForEach(secondaryChoices) { choice in
+                    Button {
+                        onSelect(choice.id)
+                        setOpen(false)
+                    } label: {
+                        HStack(alignment: .top, spacing: 9) {
+                            Image(systemName: choice.symbol)
+                                .frame(width: 17)
+                                .foregroundStyle(selectedID == choice.id ? Color.accentColor : .secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(choice.title).font(.callout.weight(.medium)).foregroundStyle(.primary)
+                                Text(choice.detail).font(.caption2).foregroundStyle(.secondary)
+                                    .lineLimit(2).truncationMode(.middle)
+                            }
+                            Spacer(minLength: 8)
+                            if selectedID == choice.id {
+                                Image(systemName: "checkmark")
+                                    .font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor)
+                            }
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 7)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(WorkspaceSelectionRowStyle(selected: selectedID == choice.id))
+                    .disabled(!choice.enabled)
+                }
+            }
+        }
+        .padding(.bottom, 5)
+        .frame(width: width)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(0.28), radius: 18, y: 7)
+        .background(WorkspaceSelectionMenuHitRegion(id: "secondary", monitor: clickMonitor))
+        .transition(.opacity)
+    }
+
+    private var secondarySelection: Bool {
+        secondaryChoices.contains { $0.id == selectedID }
+    }
+
+    private func setOpen(_ open: Bool) {
+        if reduceMotion {
+            isOpen = open
+        } else {
+            withAnimation(.easeOut(duration: 0.10)) { isOpen = open }
+        }
+        if !open { secondaryOpen = false }
+    }
+}
+
+@MainActor
+private final class WorkspaceSelectionMenuClickMonitor: ObservableObject {
+    private struct Region {
+        let windowNumber: Int
+        let frame: NSRect
+    }
+
+    private var regions: [String: Region] = [:]
+    private var eventMonitor: Any?
+    private var onOutsideClick: (() -> Void)?
+
+    func start(onOutsideClick: @escaping () -> Void) {
+        stop()
+        self.onOutsideClick = onOutsideClick
+        eventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            let inside = self.regions.values.contains { region in
+                region.windowNumber == event.windowNumber && region.frame.contains(event.locationInWindow)
+            }
+            if !inside {
+                let action = self.onOutsideClick
+                DispatchQueue.main.async { action?() }
+            }
+            return event
+        }
+    }
+
+    func stop() {
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+        eventMonitor = nil
+        onOutsideClick = nil
+    }
+
+    func update(id: String, windowNumber: Int, frame: NSRect) {
+        regions[id] = Region(windowNumber: windowNumber, frame: frame)
+    }
+
+    func remove(id: String) {
+        regions.removeValue(forKey: id)
+    }
+}
+
+private struct WorkspaceSelectionMenuHitRegion: NSViewRepresentable {
+    let id: String
+    let monitor: WorkspaceSelectionMenuClickMonitor
+
+    func makeNSView(context: Context) -> RegionView {
+        RegionView(id: id, monitor: monitor)
+    }
+
+    func updateNSView(_ nsView: RegionView, context: Context) {
+        nsView.publishFrame()
+    }
+
+    static func dismantleNSView(_ nsView: RegionView, coordinator: ()) {
+        nsView.monitor.remove(id: nsView.id)
+    }
+
+    final class RegionView: NSView {
+        let id: String
+        let monitor: WorkspaceSelectionMenuClickMonitor
+
+        init(id: String, monitor: WorkspaceSelectionMenuClickMonitor) {
+            self.id = id
+            self.monitor = monitor
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            publishFrame()
+        }
+
+        override func layout() {
+            super.layout()
+            publishFrame()
+        }
+
+        func publishFrame() {
+            guard let window else {
+                monitor.remove(id: id)
+                return
+            }
+            monitor.update(id: id, windowNumber: window.windowNumber, frame: convert(bounds, to: nil))
+        }
+    }
+}
+
+private struct WorkspaceSelectionRowStyle: ButtonStyle {
+    let selected: Bool
+    @State private var hovered = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(
+                selected || configuration.isPressed || hovered
+                    ? Color.primary.opacity(selected ? 0.075 : 0.055)
+                    : .clear,
+                in: RoundedRectangle(cornerRadius: 7)
+            )
+            .padding(.horizontal, 5)
+            .onHover { hovered = $0 }
     }
 }

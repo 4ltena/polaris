@@ -3,7 +3,7 @@ import Foundation
 
 /// Saved selection only. Neither credentials nor an execution grant.
 public struct ExecutionBinding: Codable, Equatable, Sendable {
-    public enum Provider: String, Codable, Sendable { case codex, openai, ollama, lmstudio }
+    public enum Provider: String, Codable, Sendable { case codex, openai, ollama, lmstudio, llamacpp }
     public let provider: Provider
     public let model: String
     public let effort: String?
@@ -27,19 +27,26 @@ public struct ExecutionBinding: Codable, Equatable, Sendable {
         case .codex, .openai:
             guard localEndpoint == nil, let effort, ["low", "medium", "high", "xhigh", "max", "ultra"].contains(effort) else { throw SettingsError.invalidDocument }
         case .ollama, .lmstudio:
-            guard effort == nil, let endpoint = localEndpoint, endpoint.utf8.count <= 256,
-                  !endpoint.contains(where: { $0.isWhitespace }),
-                  !endpoint.contains(where: { "@?#%\\".contains($0) }),
-                  let parts = URLComponents(string: endpoint), ["http", "https"].contains(parts.scheme),
-                  parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
-                  parts.path == "/", let host = parts.host,
-                  parts.port == nil || (1...65535).contains(parts.port!), parts.string == endpoint else { throw SettingsError.invalidDocument }
-            let bare = host.hasPrefix("[") && host.hasSuffix("]") ? String(host.dropFirst().dropLast()) : host
-            var v4 = in_addr(); var v6 = in6_addr()
-            let loopback4 = inet_pton(AF_INET, bare, &v4) == 1 && UInt32(bigEndian: v4.s_addr) >> 24 == 127
-            let loopback6 = inet_pton(AF_INET6, bare, &v6) == 1 && withUnsafeBytes(of: v6) { Array($0) == Array(repeating: UInt8(0), count: 15) + [1] }
-            guard loopback4 || loopback6 else { throw SettingsError.invalidDocument }
+            guard effort == nil, let localEndpoint else { throw SettingsError.invalidDocument }
+            try Self.validateLocalEndpoint(localEndpoint)
+        case .llamacpp:
+            guard effort == nil, localEndpoint == nil else { throw SettingsError.invalidDocument }
         }
+    }
+    public static func validateLocalEndpoint(_ endpoint: String) throws {
+        guard endpoint.utf8.count <= 256,
+              !endpoint.contains(where: { $0.isWhitespace }),
+              !endpoint.contains(where: { "@?#%\\".contains($0) }),
+              let parts = URLComponents(string: endpoint), ["http", "https"].contains(parts.scheme),
+              parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
+              parts.path == "/", let host = parts.host,
+              parts.port == nil || (1...65535).contains(parts.port!), parts.string == endpoint
+        else { throw SettingsError.invalidDocument }
+        let bare = host.hasPrefix("[") && host.hasSuffix("]") ? String(host.dropFirst().dropLast()) : host
+        var v4 = in_addr(); var v6 = in6_addr()
+        let loopback4 = inet_pton(AF_INET, bare, &v4) == 1 && UInt32(bigEndian: v4.s_addr) >> 24 == 127
+        let loopback6 = inet_pton(AF_INET6, bare, &v6) == 1 && withUnsafeBytes(of: v6) { Array($0) == Array(repeating: UInt8(0), count: 15) + [1] }
+        guard loopback4 || loopback6 else { throw SettingsError.invalidDocument }
     }
     public static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.provider == rhs.provider && Data(lhs.model.utf8) == Data(rhs.model.utf8)

@@ -20,5 +20,11 @@ final class LocalRoleBindingTests: XCTestCase {
     let cloud = try ExecutionBinding(provider: .codex, model: "gpt-6-astra", effort: "medium")
     XCTAssertThrowsError(try LocalRoleBinding(role: "reviewer", selection: cloud,
                                               observedToolSupport: .supported))
+    let llama = try ExecutionBinding(provider: .llamacpp, model: "local.gguf", effort: nil,
+                                     localEndpoint: nil)
+    XCTAssertNoThrow(try LocalRoleBinding(role: "reviewer", selection: llama,
+                                          observedToolSupport: .unknown))
+    XCTAssertThrowsError(try ExecutionBinding(provider: .llamacpp, model: "local.gguf",
+                                               effort: nil, localEndpoint: endpoint))
   }
 }

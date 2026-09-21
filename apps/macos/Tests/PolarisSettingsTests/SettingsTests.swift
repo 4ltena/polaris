@@ -11,9 +11,11 @@ final class SettingsTests: XCTestCase {
     }
 
     func testNavigationKeepsChoicesAndCancellationKeepsFolder() {
+        XCTAssertEqual(WelcomePage.allCases.count, 6)
         var state = WelcomeState()
         XCTAssertNil(state.preferences.permission)
         state.preferences.gpt = .apiKey
+        state.preferences.jevEnabled = true
         state.preferences.permission = .readCreateBuildExternal
         state.selectFolder(URL(fileURLWithPath: "/tmp/project"))
         state.go(to: .review); state.next()
@@ -24,7 +26,30 @@ final class SettingsTests: XCTestCase {
         state.selectFolder(nil)
         XCTAssertEqual(state.preferences.projectPath, "/tmp/project")
         XCTAssertEqual(state.preferences.gpt, .apiKey)
+        XCTAssertTrue(state.preferences.jevEnabled)
         XCTAssertEqual(state.preferences.permission, .readCreateBuildExternal)
+    }
+
+    func testLocalConnectionRoundTripsAndRejectsNonLoopbackEndpoints() throws {
+        var document = SettingsDocument()
+        document.draft.preferences.local = .linkInstalled
+        document.draft.preferences.localConnection = try LocalConnectionPreference(
+            runtime: .ollama, endpoint: "http://127.0.0.1:11434/", model: "qwen:small", verified: true)
+        let encoded = try JSONEncoder().encode(document)
+        XCTAssertEqual(try JSONDecoder().decode(SettingsDocument.self, from: encoded), document)
+        XCTAssertThrowsError(try LocalConnectionPreference(
+            runtime: .ollama, endpoint: "https://example.com/", model: nil, verified: false))
+        XCTAssertThrowsError(try LocalConnectionPreference(
+            runtime: .lmstudio, endpoint: "http://localhost:1234/", model: nil, verified: false))
+        XCTAssertThrowsError(try LocalConnectionPreference(
+            runtime: .llamacpp, endpoint: nil, model: nil, verified: true))
+        XCTAssertNoThrow(try LocalConnectionPreference(
+            runtime: .llamacpp, endpoint: nil, model: "model.gguf", verified: true))
+    }
+
+    func testLegacyPreferencesDecodeWithoutInventingLocalConnection() throws {
+        let data = Data(#"{"gpt":"later","local":"later","theme":"system"}"#.utf8)
+        XCTAssertNil(try JSONDecoder().decode(Preferences.self, from: data).localConnection)
     }
 
     func testDraftCompletionAndReopenRoundTrip() throws {
@@ -35,6 +60,7 @@ final class SettingsTests: XCTestCase {
             XCTAssertTrue(document.isEditing)
             document.draft.preferences.theme = .dark
             document.draft.preferences.gpt = .chatGPT
+            document.draft.preferences.jevEnabled = true
             document.draft.preferences.local = .linkInstalled
             document.draft.preferences.permission = .readCreate
             document.draft.selectFolder(URL(fileURLWithPath: "/tmp/project 日本語"))
@@ -51,6 +77,7 @@ final class SettingsTests: XCTestCase {
             let resumed = try store.load()
             XCTAssertTrue(resumed.isEditing)
             XCTAssertEqual(resumed.preferences?.theme, .dark)
+            XCTAssertEqual(resumed.preferences?.jevEnabled, true)
             XCTAssertEqual(resumed.draft.preferences.theme, .light)
             XCTAssertEqual(resumed, document)
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)

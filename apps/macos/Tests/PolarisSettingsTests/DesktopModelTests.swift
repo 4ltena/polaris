@@ -6,12 +6,122 @@ import PolarisSettings
 @testable import PolarisDesktop
 
 final class DesktopModelTests: XCTestCase {
+    private actor FakeDependencyInstaller: ManagedDependencyInstalling {
+        private var installed = Set<ManagedDependencyID>()
+        private var order: [ManagedDependencyID] = []
+
+        func statuses() -> [ManagedDependencyID: ManagedDependencyStatus] {
+            Dictionary(uniqueKeysWithValues: ManagedDependencyID.allCases.map {
+                ($0, installed.contains($0) ? .installed(version: "fixture") : .notInstalled)
+            })
+        }
+        func status(_ id: ManagedDependencyID) -> ManagedDependencyStatus {
+            installed.contains(id) ? .installed(version: "fixture") : .notInstalled
+        }
+        func install(_ id: ManagedDependencyID) -> String {
+            order.append(id)
+            installed.insert(id)
+            return "fixture"
+        }
+        func activatePreset() {}
+        func inspectGGUF(_ source: String) throws -> ManagedGGUFPlan {
+            throw ManagedDependencyError.manifest
+        }
+        func installedGGUFModels() -> [ManagedGGUFModel] { [] }
+        func installGGUF(_ plan: ManagedGGUFPlan) throws -> ManagedGGUFModel {
+            throw ManagedDependencyError.install
+        }
+        func installationOrder() -> [ManagedDependencyID] { order }
+    }
+
+    private final class StoredKey: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: String?
+        func load() -> String? { lock.lock(); defer { lock.unlock() }; return value }
+        func save(_ next: String) { lock.lock(); defer { lock.unlock() }; value = next }
+    }
     @MainActor
     private func waitForSplash(_ model: DesktopModel) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(3))
         while model.isStarting, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    @MainActor
+    private func installPreset(_ model: DesktopModel) async throws {
+        model.startPresetInstallation()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !model.presetInstallationReady, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(model.presetInstallationReady)
+    }
+
+    @MainActor
+    func testInstallerModeFiltersItsLaunchFlagAndCommitsWithoutStartingWorkspace() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("polaris-installer-model-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("settings.json")
+        let installer = FakeDependencyInstaller()
+        let model = DesktopModel(arguments: ["--installer-mode", "--settings-path", url.path],
+                                 dependencyInstaller: installer)
+
+        await model.start()
+        XCTAssertTrue(model.isInstallerMode)
+        XCTAssertFalse(model.isStarting)
+        XCTAssertTrue(model.document.isEditing)
+        try await installPreset(model)
+        model.change { $0.preferences.theme = .dark }
+        XCTAssertTrue(model.commitInstallerConfiguration())
+        XCTAssertFalse(model.document.isEditing)
+        XCTAssertEqual(model.document.preferences?.theme, .dark)
+        XCTAssertEqual(try JSONDecoder().decode(SettingsDocument.self, from: Data(contentsOf: url)), model.document)
+        model.releaseInstallerSettingsLock()
+        XCTAssertNoThrow(try SettingsStore(url: url))
+    }
+
+    @MainActor
+    func testPresetInstallationRunsEveryRequiredDependencyOnceInOrder() async throws {
+        let installer = FakeDependencyInstaller()
+        let model = DesktopModel(arguments: ["--invalid"], dependencyInstaller: installer)
+        model.startPresetInstallation()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !model.presetInstallationReady, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(model.presetInstallationReady)
+        let firstOrder = await installer.installationOrder()
+        XCTAssertEqual(firstOrder, ManagedDependencyID.preset)
+        model.startPresetInstallation()
+        await Task.yield()
+        let secondOrder = await installer.installationOrder()
+        XCTAssertEqual(secondOrder, ManagedDependencyID.preset)
+    }
+
+    @MainActor
+    func testJevChoiceKeepsSixPagesAndStoresCredentialOutsideSettings() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("polaris-jev-setup-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stored = StoredKey()
+        let credentials = JevCredentialAccess(load: { stored.load() }, save: { stored.save($0) })
+        let installer = FakeDependencyInstaller()
+        let model = DesktopModel(arguments: ["--settings-path", directory.appendingPathComponent("settings.json").path],
+                                 jevCredentials: credentials, dependencyInstaller: installer)
+        await model.start()
+        try await installPreset(model)
+        model.setJevEnabled(true)
+        model.jevAPIKey = "synthetic-jev-key"
+        model.finish()
+
+        XCTAssertEqual(WelcomePage.allCases.count, 6)
+        XCTAssertEqual(model.document.preferences?.jevEnabled, true)
+        XCTAssertEqual(stored.load(), "synthetic-jev-key")
+        XCTAssertTrue(model.jevAPIKey.isEmpty)
+        let encoded = try JSONEncoder().encode(model.document)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("synthetic-jev-key"))
     }
 
     @MainActor
@@ -269,7 +379,7 @@ final class DesktopModelTests: XCTestCase {
     }
 
     @MainActor
-    func testStartupHidesTitleBarThenRestoresFixedSetupWindow() async {
+    func testStartupHidesTitleBarThenRestoresFixedMainWindow() async {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 680),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -406,8 +516,11 @@ final class DesktopModelTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("settings.json")
-        let model = DesktopModel(arguments: ["--settings-path", url.path])
+        let installer = FakeDependencyInstaller()
+        let model = DesktopModel(arguments: ["--settings-path", url.path],
+                                 dependencyInstaller: installer)
         await model.start()
+        try await installPreset(model)
         XCTAssertNil(model.startupError)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
         model.change { $0.preferences.theme = .dark }

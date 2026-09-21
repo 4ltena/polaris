@@ -70,7 +70,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-helper", type=Path, required=True)
     parser.add_argument("--execution-helper", type=Path)
-    parser.add_argument("--toolchain-package", type=Path, action="append", default=[])
     parser.add_argument("--destination", type=Path)
     arguments = parser.parse_args()
     # Validate before spending the Swift build slot. No Cargo build or discovery.
@@ -131,12 +130,6 @@ def main():
             # 同梱資源はGit管理する正本から取得し、ビルド元の個人設定を混入させない。
             copy_runtime_tree(repository / "skills", contents / "Resources" / "skills")
             copy_runtime_tree(repository / "agents", contents / "Resources" / "agents")
-            if arguments.toolchain_package:
-                (contents / "Resources" / "toolchains").mkdir()
-            for index, source in enumerate(arguments.toolchain_package):
-                if not source.is_absolute() or not (source / "bin").is_dir():
-                    raise RuntimeError("toolchainにはbinを持つ移設可能なpackageの絶対パスが必要です。")
-                copy_runtime_tree(source, contents / "Resources" / "toolchains" / str(index))
         shutil.copy2(executable, contents / "MacOS" / "PolarisDesktop")
         # SwiftPM生成accessorの優先探索先はBundle.main.bundleURL直下。
         # ビルドディレクトリへのフォールバックに依存しない配置を保持する。

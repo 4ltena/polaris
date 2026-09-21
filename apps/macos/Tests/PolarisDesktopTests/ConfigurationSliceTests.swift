@@ -295,17 +295,27 @@ final class ConfigurationSliceTests: XCTestCase {
     defer { try? FileManager.default.removeItem(at: root) }
     var document = try settings.load()
     document.preferences?.permission = .readOnly
+    document.preferences?.jevEnabled = true
     try settings.save(document)
-    let owner = DesktopWorkspaceOwner(helper: { root.appendingPathComponent("not-launched") }, factory: { _,_,_ in model })
+    let owner = DesktopWorkspaceOwner(helper: { root.appendingPathComponent("not-launched") },
+                                      factory: { _,_,_ in model },
+                                      decisionCredential: { "synthetic-jev-key" })
     _ = try await owner.prepare(document: settings.load(), store: settings)
-    await owner.configureAndStart(store: settings, makeConfiguredTransport: { _ in transport }, verifyAssembly: {})
+    await owner.configureAndStart(store: settings, makeConfiguredTransport: { launch in
+      XCTAssertEqual(launch.environment["POLARIS_JEV_ENABLED"], "1")
+      XCTAssertEqual(launch.environment["POLARIS_JEV_API_KEY"], "synthetic-jev-key")
+      return transport
+    }, verifyAssembly: {})
     XCTAssertTrue(owner.service === model)
     XCTAssertEqual(model.phase, .ready)
     XCTAssertNotNil(try settings.load().bootstrapProof)
     XCTAssertNil(owner.error)
     // An explicit repeat must reconcile the exact earlier receipt, not overwrite it.
     await owner.configureAndStart(store: settings, reconcilePublication: true,
-                                  makeConfiguredTransport: { _ in transport }, verifyAssembly: {})
+                                  makeConfiguredTransport: { launch in
+                                    XCTAssertEqual(launch.environment["POLARIS_JEV_ENABLED"], "1")
+                                    return transport
+                                  }, verifyAssembly: {})
     XCTAssertEqual(model.phase, .ready)
     XCTAssertNil(owner.error)
     _ = await model.saveAndClose()

@@ -11,6 +11,52 @@ public enum LocalPreference: String, Codable, CaseIterable, Sendable {
     case later, linkInstalled
     public var title: String { self == .later ? "後で設定" : "導入済みモデルを連携" }
 }
+public enum LocalRuntimePreference: String, Codable, CaseIterable, Sendable {
+    case ollama, lmstudio, llamacpp
+    public var title: String {
+        switch self {
+        case .ollama: "Ollama"
+        case .lmstudio: "LM Studio"
+        case .llamacpp: "Polaris内蔵 llama.cpp"
+        }
+    }
+    public var defaultEndpoint: String? {
+        switch self {
+        case .ollama: "http://127.0.0.1:11434/"
+        case .lmstudio: "http://127.0.0.1:1234/"
+        case .llamacpp: nil
+        }
+    }
+}
+public struct LocalConnectionPreference: Codable, Equatable, Sendable {
+    public var runtime: LocalRuntimePreference
+    public var endpoint: String?
+    public var model: String?
+    public var verified: Bool
+    public init(runtime: LocalRuntimePreference, endpoint: String? = nil,
+                model: String? = nil, verified: Bool = false) throws {
+        self.runtime = runtime
+        self.endpoint = endpoint ?? runtime.defaultEndpoint
+        self.model = model
+        self.verified = verified
+        try validate()
+    }
+    public func validate() throws {
+        if let model {
+            guard !model.isEmpty, model.utf8.count <= 512,
+                  !model.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            else { throw SettingsError.invalidDocument }
+        }
+        switch runtime {
+        case .ollama, .lmstudio:
+            guard let endpoint else { throw SettingsError.invalidDocument }
+            try ExecutionBinding.validateLocalEndpoint(endpoint)
+        case .llamacpp:
+            guard endpoint == nil else { throw SettingsError.invalidDocument }
+        }
+        guard !verified || model != nil else { throw SettingsError.invalidDocument }
+    }
+}
 public enum ThemePreference: String, Codable, CaseIterable, Sendable {
     case system, light, dark
     public var title: String {
@@ -21,7 +67,7 @@ public enum ThemePreference: String, Codable, CaseIterable, Sendable {
 /// changes the raw transcript retention policy.
 public enum HistoryMode: String, Codable, CaseIterable, Sendable {
     case legacy, strict10
-    public var title: String { self == .legacy ? "従来の履歴" : "strict10" }
+    public var title: String { self == .legacy ? "会話全体をそのまま参照" : "必要な過去だけ参照" }
 }
 // 希望する段階だけを保存する。実権限・編集可否・OS許可はこの型から導出しない。
 public enum PermissionPreference: String, Codable, CaseIterable, Sendable {
@@ -43,8 +89,14 @@ public struct Preferences: Codable, Equatable, Sendable {
     public var theme: ThemePreference = .system
     public var executionBinding: ExecutionBinding? = nil
     public var historyMode: HistoryMode = .legacy
+    public var localConnection: LocalConnectionPreference? = nil
+    /// Uses the optional typed decision service. Its credential is kept in
+    /// Keychain and is never encoded with these shareable settings.
+    public var jevEnabled: Bool = false
     public init() {}
-    private enum CodingKeys: String, CodingKey { case gpt, local, projectPath, permission, theme, executionBinding, historyMode }
+    private enum CodingKeys: String, CodingKey {
+        case gpt, local, projectPath, permission, theme, executionBinding, historyMode, localConnection, jevEnabled
+    }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         gpt = try c.decodeIfPresent(GPTPreference.self, forKey: .gpt) ?? .later
@@ -54,13 +106,17 @@ public struct Preferences: Codable, Equatable, Sendable {
         theme = try c.decodeIfPresent(ThemePreference.self, forKey: .theme) ?? .system
         executionBinding = try c.decodeIfPresent(ExecutionBinding.self, forKey: .executionBinding)
         historyMode = try c.decodeIfPresent(HistoryMode.self, forKey: .historyMode) ?? .legacy
+        localConnection = try c.decodeIfPresent(LocalConnectionPreference.self, forKey: .localConnection)
+        jevEnabled = try c.decodeIfPresent(Bool.self, forKey: .jevEnabled) ?? false
     }
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(gpt, forKey: .gpt); try c.encode(local, forKey: .local)
         try c.encodeIfPresent(projectPath, forKey: .projectPath); try c.encodeIfPresent(permission, forKey: .permission)
         try c.encode(theme, forKey: .theme); try c.encodeIfPresent(executionBinding, forKey: .executionBinding)
+        try c.encodeIfPresent(localConnection, forKey: .localConnection)
         if historyMode != .legacy { try c.encode(historyMode, forKey: .historyMode) }
+        if jevEnabled { try c.encode(jevEnabled, forKey: .jevEnabled) }
     }
 }
 public enum WelcomePage: Int, Codable, CaseIterable, Sendable {
@@ -138,6 +194,10 @@ public struct SettingsDocument: Codable, Equatable, Sendable {
         guard workspace == nil || preferences?.projectPath != nil else { throw SettingsError.invalidDocument }
         for value in [draft.preferences, preferences].compactMap({ $0 }) {
             try value.executionBinding?.validate()
+            try value.localConnection?.validate()
+            guard value.local != .later || value.localConnection == nil else {
+                throw SettingsError.invalidDocument
+            }
             if let path = value.projectPath, !path.hasPrefix("/") || path.contains("\0") {
                 throw SettingsError.invalidDocument
             }

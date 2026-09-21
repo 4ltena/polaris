@@ -23,6 +23,10 @@ class HelperAssemblyTests(unittest.TestCase):
         resources = binary_directory / "PolarisDesktop_PolarisDesktop.bundle"
         resources.mkdir(parents=True)
         (resources / "release.json").write_text('{"version": "0.12.0"}')
+        shutil.copy2(
+            REPOSITORY / "apps/macos/Sources/PolarisDesktop/Resources/runtime-dependencies.json",
+            resources / "runtime-dependencies.json",
+        )
         (binary_directory / "PolarisDesktop").write_bytes(b"compiled native executable")
         shutil.copytree(REPOSITORY / "skills", repository / "skills")
         shutil.copytree(REPOSITORY / "agents", repository / "agents")
@@ -77,6 +81,8 @@ class HelperAssemblyTests(unittest.TestCase):
             self.assertEqual(helper.read_bytes(), b"compiled execution-helper")
             manifest = json.loads((app / "Contents/Resources/execution-helper.json").read_text())
             self.assertEqual(manifest["sha256"], hashlib.sha256(helper.read_bytes()).hexdigest())
+            self.assertFalse((app / "Contents/Resources/toolchains").exists())
+            self.assertTrue((app / "PolarisDesktop_PolarisDesktop.bundle/runtime-dependencies.json").is_file())
 
     def test_local_overrides_do_not_change_the_packaged_catalogs(self):
         with tempfile.TemporaryDirectory() as directory:

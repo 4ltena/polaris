@@ -38,6 +38,8 @@ struct WorkspaceSidebar: View {
             }
             Button("新しい会話") { onAction(.newConversation(projectID: nil)) }
                 .buttonStyle(WorkspaceRowStyle()).padding(6)
+            WorkspaceQuotaWidget(quota: snapshot.quota)
+                .padding(.horizontal, 8).padding(.bottom, 10)
         }
         .sheet(item: $editing) { project in
             WorkspaceProjectEditor(project: project, isDemo: snapshot.isDemo) { candidate in
@@ -114,6 +116,137 @@ struct WorkspaceSidebar: View {
         Button("フォルダを開く") { onAction(.openFolder(project.id)) }
         Divider()
         Button("プロジェクトを外す") { onAction(.removeProject(project.id)) }
+    }
+}
+
+struct WorkspaceQuotaWidget: View {
+    let quota: WorkspaceQuotaDisplay?
+    @State private var isOpen = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Button {
+            setOpen(!isOpen)
+        } label: {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 6) {
+                    Image(systemName: "gauge.with.dots.needle.67percent")
+                    Text("利用枠").font(.caption.weight(.semibold))
+                    Spacer(minLength: 4)
+                    Text(quota.map { "\($0.accounts.count)アカウント" } ?? "未取得")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                }
+                if let account = quota?.accounts.first, let window = account.windows.first {
+                    HStack {
+                        Text(account.name).lineLimit(1)
+                        Spacer()
+                        Text("\(window.title) 残り \(window.remainingPercent)%")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    ProgressView(value: window.boundedUsedPercent, total: 100)
+                        .progressViewStyle(.linear)
+                } else {
+                    Text("利用枠を取得するとアカウント別に表示します")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .padding(10)
+            .background(Color.primary.opacity(isOpen ? 0.075 : 0.035), in: RoundedRectangle(cornerRadius: 9))
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+        }
+        .accessibilityRepresentation {
+            Button("利用枠、\(quota?.accounts.count ?? 0)アカウント。右側に詳細を表示") {
+                setOpen(!isOpen)
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if isOpen {
+                WorkspaceQuotaPanel(quota: quota, close: { setOpen(false) })
+                    .offset(x: 374)
+                    .transition(.opacity)
+            }
+        }
+        .zIndex(isOpen ? 100 : 0)
+        .onExitCommand { setOpen(false) }
+    }
+
+    private func setOpen(_ open: Bool) {
+        if reduceMotion {
+            isOpen = open
+        } else {
+            withAnimation(.easeOut(duration: 0.10)) { isOpen = open }
+        }
+    }
+}
+
+private struct WorkspaceQuotaPanel: View {
+    let quota: WorkspaceQuotaDisplay?
+    let close: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("アカウント別の利用枠").font(.headline)
+                    Text(quota?.status ?? "未取得")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(action: close) { Image(systemName: "xmark") }
+                    .accessibilityLabel("利用枠の詳細を閉じる")
+            }
+            .padding(14)
+            Divider()
+            if let quota, !quota.accounts.isEmpty {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(quota.accounts) { account in
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack {
+                                    Text(account.name).font(.callout.weight(.semibold))
+                                    Spacer()
+                                    Text(account.detail).font(.caption2).foregroundStyle(.secondary)
+                                }
+                                ForEach(account.windows) { window in
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text(window.title)
+                                            Spacer()
+                                            Text("残り \(window.remainingPercent)%").monospacedDigit()
+                                        }.font(.caption)
+                                        ProgressView(value: window.boundedUsedPercent, total: 100)
+                                            .progressViewStyle(.linear)
+                                        Text(window.resetDescription)
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    .accessibilityElement(children: .ignore)
+                                    .accessibilityLabel("\(account.name)、\(window.title)の利用枠")
+                                    .accessibilityValue("残り\(window.remainingPercent)パーセント、\(window.resetDescription)")
+                                }
+                            }
+                            .padding(14)
+                            if account.id != quota.accounts.last?.id { Divider().padding(.leading, 14) }
+                        }
+                    }
+                }
+            } else {
+                Text("アカウントの利用枠を取得すると、残量とリセット日時をここに表示します。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(18)
+                Spacer()
+            }
+        }
+        .frame(width: 356, height: 370)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(0.34), radius: 24, y: 9)
     }
 }
 

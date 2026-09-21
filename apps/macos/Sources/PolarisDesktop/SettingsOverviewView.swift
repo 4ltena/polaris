@@ -121,11 +121,21 @@ struct SettingsOverviewView: View {
             }.pickerStyle(.segmented).frame(maxWidth: 310).disabled(!presentation.canPerform(.theme))
             unavailable(.theme)
         case .history:
-            Picker("直接渡す会話の範囲", selection: Binding(get: { presentation.preferences.historyMode },
+            Picker("会話で参照する過去の範囲", selection: Binding(get: { presentation.preferences.historyMode },
                 set: { presentation.perform(.history($0)) })) {
                 ForEach(HistoryMode.allCases, id: \.self) { Text($0.title).tag($0) }
             }.labelsHidden().frame(maxWidth: 310, alignment: .leading).disabled(!presentation.canPerform(.history))
             unavailable(.history)
+        case .workflow:
+            Picker("作業内容に合わせた情報の使い方", selection: Binding(
+                get: { presentation.workflowMode ?? "disabled" },
+                set: { presentation.perform(.workflow($0)) })) {
+                Text("作業内容に合わせて自動調整").tag("adaptive")
+                Text("現在の段階に固定").tag("manual")
+                Text("段階による調整を使わない").tag("disabled")
+            }.labelsHidden().frame(maxWidth: 310, alignment: .leading)
+                .disabled(!presentation.canPerform(.workflow))
+            unavailable(.workflow)
         case .permission:
             Picker("自動許可の希望", selection: Binding(get: { presentation.preferences.permission },
                 set: { presentation.perform(.permission($0)) })) {
@@ -146,8 +156,6 @@ struct SettingsOverviewView: View {
         case .information:
             if item.id == "general.version" {
                 Text(presentation.releaseTitle ?? "バージョン情報は未取得です").textSelection(.enabled)
-            } else if item.id == "general.setup" {
-                action("セットアップを開く", .setup)
             }
         }
     }
@@ -160,7 +168,13 @@ struct SettingsOverviewView: View {
     }
     @ViewBuilder private func unavailable(_ kind: SettingsActionKind) -> some View {
         if !presentation.canPerform(kind) {
-            Text("この画面からの変更は準備中です").font(.caption).foregroundStyle(.secondary)
+            if presentation.isApplying && presentation.availableActions.contains(kind) {
+                Text("保存しています…").font(.caption).foregroundStyle(.secondary)
+            } else if kind == .history || kind == .workflow {
+                Text("作業中の会話を開くと変更できます").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("この画面からの変更は準備中です").font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 }

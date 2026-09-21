@@ -23,8 +23,9 @@ public struct LocalRoleBinding: Codable, Equatable, Identifiable, Sendable {
     public func validate() throws {
         guard !role.isEmpty, role.utf8.count <= 128,
               !role.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
-              selection.provider == .ollama || selection.provider == .lmstudio,
-              selection.effort == nil, selection.localEndpoint != nil
+              selection.provider == .ollama || selection.provider == .lmstudio || selection.provider == .llamacpp,
+              selection.effort == nil,
+              (selection.provider == .llamacpp ? selection.localEndpoint == nil : selection.localEndpoint != nil)
         else { throw SettingsError.invalidDocument }
         try selection.validate()
     }

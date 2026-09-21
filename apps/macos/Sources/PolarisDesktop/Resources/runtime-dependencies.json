@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "dependencies": [
+    {
+      "id": "llama_cpp",
+      "version": "b10970",
+      "platform": "macos",
+      "architecture": "arm64",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10970/llama-b10970-bin-macos-arm64.tar.gz",
+      "sha256": "7fa278a70b90afae3c3e5dd33553d4d11ebfde62725a03ff2fe6f0d3d1e29b59",
+      "compressed_size": 11149707,
+      "archive": "tar_gzip",
+      "archive_root": "llama-b10970",
+      "required_executable": "llama-server"
+    },
+    {
+      "id": "llama_cpp",
+      "version": "b10970",
+      "platform": "macos",
+      "architecture": "x86_64",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10970/llama-b10970-bin-macos-x64.tar.gz",
+      "sha256": "1c0bde8c4face002be4355da28c8fd33a0a5034e560b3afebdb4a42a694862ed",
+      "compressed_size": 11200007,
+      "archive": "tar_gzip",
+      "archive_root": "llama-b10970",
+      "required_executable": "llama-server"
+    },
+    {
+      "id": "rust",
+      "version": "1.96.0",
+      "platform": "macos",
+      "architecture": "arm64",
+      "url": "https://static.rust-lang.org/dist/2026-05-28/rust-1.96.0-aarch64-apple-darwin.tar.xz",
+      "sha256": "f04a974f3579d3524f6b9bc6490a27c9fb358050e7cd8a641945f30bf24c1dce",
+      "compressed_size": 200450100,
+      "archive": "tar_xz",
+      "archive_root": "rust-1.96.0-aarch64-apple-darwin",
+      "installer": "install.sh",
+      "required_executable": "bin/rustc"
+    },
+    {
+      "id": "rust",
+      "version": "1.96.0",
+      "platform": "macos",
+      "architecture": "x86_64",
+      "url": "https://static.rust-lang.org/dist/2026-05-28/rust-1.96.0-x86_64-apple-darwin.tar.xz",
+      "sha256": "63a6d717a5e5392ac43f0a1593e7aabe6128c8685d318cb890603b1688cb3339",
+      "compressed_size": 185763572,
+      "archive": "tar_xz",
+      "archive_root": "rust-1.96.0-x86_64-apple-darwin",
+      "installer": "install.sh",
+      "required_executable": "bin/rustc"
+    },
+    {
+      "id": "embedding_runtime",
+      "version": "cpython-3.11.9+e5-2026.09",
+      "platform": "macos",
+      "architecture": "arm64",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.16/uv-aarch64-apple-darwin.tar.gz",
+      "sha256": "b6e03fae61704b1aa622f12b792a69483e837b83068e44f4fd34f8a07a8f74a3",
+      "compressed_size": 16854469,
+      "required_space": 3221225472,
+      "archive": "tar_gzip",
+      "archive_root": "uv-aarch64-apple-darwin",
+      "install_kind": "uv_embedding",
+      "required_executable": "runtime/bin/python3.11",
+      "python_version": "3.11.9",
+      "exclude_newer": "2026-09-19T00:00:00Z",
+      "python_packages": {
+        "numpy": "2.4.6",
+        "torch": "2.9.1",
+        "transformers": "5.15.1",
+        "tokenizers": "0.22.2",
+        "safetensors": "0.8.0"
+      }
+    },
+    {
+      "id": "embedding_runtime",
+      "version": "cpython-3.11.9+e5-2026.09-intel",
+      "platform": "macos",
+      "architecture": "x86_64",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.16/uv-x86_64-apple-darwin.tar.gz",
+      "sha256": "a42bcc9ce97eb8b364d7f162233a9c6b8c0ee25388e551d362809795127e0c31",
+      "compressed_size": 20494293,
+      "required_space": 3221225472,
+      "archive": "tar_gzip",
+      "archive_root": "uv-x86_64-apple-darwin",
+      "install_kind": "uv_embedding",
+      "required_executable": "runtime/bin/python3.11",
+      "python_version": "3.11.9",
+      "exclude_newer": "2026-09-19T00:00:00Z",
+      "python_packages": {
+        "numpy": "1.26.4",
+        "torch": "2.2.2",
+        "transformers": "4.48.3",
+        "tokenizers": "0.21.0",
+        "safetensors": "0.5.2"
+      }
+    },
+    {
+      "id": "multilingual_e5_small",
+      "version": "fd1525a9fd15316a2d503bf26ab031a61d056e98",
+      "platform": "macos",
+      "architecture": "universal",
+      "destination": "models/multilingual-e5-small",
+      "files": [
+        {
+          "path": "config.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-small/resolve/fd1525a9fd15316a2d503bf26ab031a61d056e98/config.json",
+          "sha256": "69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959",
+          "size": 655
+        },
+        {
+          "path": "model.safetensors",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-small/resolve/fd1525a9fd15316a2d503bf26ab031a61d056e98/model.safetensors",
+          "sha256": "1a55775f53449dac10a2bcbc312469fac40b96d53198c407081a831f81c98477",
+          "size": 470641600
+        },
+        {
+          "path": "sentencepiece.bpe.model",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-small/resolve/fd1525a9fd15316a2d503bf26ab031a61d056e98/sentencepiece.bpe.model",
+          "sha256": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+          "size": 5069051
+        },
+        {
+          "path": "special_tokens_map.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-small/resolve/fd1525a9fd15316a2d503bf26ab031a61d056e98/special_tokens_map.json",
+          "sha256": "d05497f1da52c5e09554c0cd874037a083e1dc1b9cfd48034d1c717f1afc07a7",
+          "size": 167
+        },
+        {
+          "path": "tokenizer.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-small/resolve/fd1525a9fd15316a2d503bf26ab031a61d056e98/tokenizer.json",
+          "sha256": "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+          "size": 17082730
+        },
+        {
+          "path": "tokenizer_config.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-small/resolve/fd1525a9fd15316a2d503bf26ab031a61d056e98/tokenizer_config.json",
+          "sha256": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
+          "size": 443
+        }
+      ]
+    },
+    {
+      "id": "multilingual_e5_base",
+      "version": "d128750597153bb5987e10b1c3493a34e5a4502a",
+      "platform": "macos",
+      "architecture": "universal",
+      "destination": "models/multilingual-e5-base",
+      "files": [
+        {
+          "path": "config.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/d128750597153bb5987e10b1c3493a34e5a4502a/config.json",
+          "sha256": "9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4",
+          "size": 694
+        },
+        {
+          "path": "model.safetensors",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/d128750597153bb5987e10b1c3493a34e5a4502a/model.safetensors",
+          "sha256": "a18a44fad1d0b46ded15928144138cff1135d5cc8233bdd90be5f18822de09a7",
+          "size": 1112201288
+        },
+        {
+          "path": "sentencepiece.bpe.model",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/d128750597153bb5987e10b1c3493a34e5a4502a/sentencepiece.bpe.model",
+          "sha256": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+          "size": 5069051
+        },
+        {
+          "path": "special_tokens_map.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/d128750597153bb5987e10b1c3493a34e5a4502a/special_tokens_map.json",
+          "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+          "size": 280
+        },
+        {
+          "path": "tokenizer.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/d128750597153bb5987e10b1c3493a34e5a4502a/tokenizer.json",
+          "sha256": "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+          "size": 17082660
+        },
+        {
+          "path": "tokenizer_config.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/d128750597153bb5987e10b1c3493a34e5a4502a/tokenizer_config.json",
+          "sha256": "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15",
+          "size": 418
+        }
+      ]
+    }
+  ]
+}

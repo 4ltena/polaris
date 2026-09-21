@@ -45,7 +45,7 @@ enum SettingsDelivery {
 }
 
 enum SettingsControl {
-    case information, theme, history, permission, model, localModel, project
+    case information, theme, history, workflow, permission, model, localModel, project
 }
 
 struct SettingsItem: Identifiable {
@@ -62,7 +62,6 @@ enum SettingsCatalog {
     // 実装状況の案内。実接続・認証・許可を示す値として使用しない。
     static let items: [SettingsItem] = [
         .init(id: "general.version", category: .general, title: "polarisについて", detail: "このアプリのバージョン。", delivery: .existing),
-        .init(id: "general.setup", category: .general, title: "初回セットアップ", detail: "接続方法、作業フォルダ、許可の希望を設定します。既存のセットアップ画面を利用します。", delivery: .existing),
         .init(id: "general.documentation", category: .general, title: "ドキュメント", detail: "次回公開の直前に、日本語・英語・繁体中国語の資料を整理します。アプリの表示言語とは別の計画です。", delivery: .planned, keywords: "readme changelog docs 翻訳"),
         .init(id: "appearance.theme", category: .appearance, title: "テーマ", detail: "システムに合わせるか、ライト・ダークを選びます。", delivery: .existing, control: .theme),
         .init(id: "appearance.layout", category: .appearance, title: "パネルの配置", detail: "作業画面の境界をドラッグして調整できます。「配置を戻す」で初期配置に戻ります。", delivery: .existing, keywords: "サイドバー チャット 幅 レイアウト"),
@@ -81,13 +80,13 @@ enum SettingsCatalog {
         .init(id: "integrations.resolve", category: .integrations, title: "DaVinci Resolve", detail: "映像制作アプリとの連携を予定しています。接続方法と対応版は未確定です。", delivery: .planned),
         .init(id: "integrations.unity", category: .integrations, title: "Unity", detail: "MCP共通経路の後に、エディタとの連携を予定しています。", delivery: .planned),
         .init(id: "integrations.unreal", category: .integrations, title: "Unreal Engine", detail: "MCP共通経路の後に、エディタとの連携を予定しています。", delivery: .planned, keywords: "UE"),
-        .init(id: "workflow.stages", category: .workflow, title: "作業段階とコンテキスト", detail: "現在の段階に必要な情報だけを渡す仕組みを実装済みです。設定画面への接続は準備中です。", delivery: .inProgress, keywords: "state 計画 実装 レビュー 検証"),
+        .init(id: "workflow.stages", category: .workflow, title: "作業内容に合わせた情報の使い方", detail: "現在の会話について、作業内容に合わせて必要な情報を自動調整するか、現在の段階に固定するかを選びます。", delivery: .existing, control: .workflow, keywords: "state 計画 実装 レビュー 検証 段階 コンテキスト 自動"),
         .init(id: "workflow.goals", category: .workflow, title: "継続する目標と追加指示", detail: "目標の実行中も指示を受け付け、追加指示を優先する予定です。明示停止後は自動で再開しません。", delivery: .planned, keywords: "goal 自律"),
         .init(id: "workflow.delegation", category: .workflow, title: "委任と復旧", detail: "子の進捗をイベントで受け取り、終了・成果・重複を確認して必要な場合だけ復旧する予定です。", delivery: .planned, keywords: "subagent Luna Fusion"),
         .init(id: "workflow.intake", category: .workflow, title: "初動応答と入力整理", detail: "Lunaによる初動応答と入力整理を予定しています。創作など、要約で意図が失われる入力は原文を保持します。", delivery: .planned),
         .init(id: "workflow.templates", category: .workflow, title: "定型開発と検証", detail: "環境構築や決まった検査を再利用し、繰り返し生成する処理を減らす予定です。", delivery: .planned, keywords: "Next.js git_setting nextjs_setting"),
         .init(id: "workflow.refactor", category: .workflow, title: "余剰枠での改善提案", detail: "余った利用枠でリファクタリング案を作り、別ファイルへ保存する予定です。提案を実装済みの変更とは扱いません。", delivery: .planned),
-        .init(id: "memory.history", category: .memory, title: "直接渡す会話の範囲", detail: "strict10では直近10ターンを直接渡します。過去の原文も出典・再取得用として保存します。", delivery: .existing, control: .history, keywords: "履歴 圧縮"),
+        .init(id: "memory.history", category: .memory, title: "会話で参照する過去の範囲", detail: "「必要な過去だけ参照」は直近10ターンをそのまま使い、それ以前から関連する内容だけを探します。過去の原文は削除しません。", delivery: .existing, control: .history, keywords: "履歴 圧縮 strict10 過去 コンテキスト"),
         .init(id: "memory.structured", category: .memory, title: "固有名詞と現在の決定", detail: "正式名・別名の辞書、決定・撤回の状態と原文の参照を管理します。設定画面への接続は準備中です。", delivery: .inProgress, keywords: "structured10 状態表 訂正"),
         .init(id: "memory.search", category: .memory, title: "検索と埋め込み", detail: "関連する過去の文脈を取得します。参照枠、埋め込み資源と検索状態の表示は準備中です。", delivery: .inProgress, keywords: "vector ベクトル e5 日本語 768"),
         .init(id: "memory.skills", category: .memory, title: "必要なスキルの取得", detail: "関連するスキルの候補だけを取得します。選択状態の表示は準備中です。", delivery: .inProgress, keywords: "BM25 skill"),

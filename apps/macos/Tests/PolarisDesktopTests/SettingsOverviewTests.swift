@@ -11,6 +11,14 @@ final class SettingsOverviewTests: XCTestCase {
         for category in SettingsCategory.allCases {
             XCTAssertFalse(SettingsCatalog.matching("", category: category).isEmpty)
         }
+        let history = SettingsCatalog.items.first { $0.id == "memory.history" }
+        XCTAssertEqual(history?.title, "会話で参照する過去の範囲")
+        XCTAssertEqual(history?.delivery, .existing)
+        XCTAssertEqual(history?.control, .history)
+        let workflow = SettingsCatalog.items.first { $0.id == "workflow.stages" }
+        XCTAssertEqual(workflow?.title, "作業内容に合わせた情報の使い方")
+        XCTAssertEqual(workflow?.delivery, .existing)
+        XCTAssertEqual(workflow?.control, .workflow)
         for name in ["Blender", "DaVinci Resolve", "Unity", "Unreal Engine"] {
             let item = SettingsCatalog.matching(name).first { $0.title == name }
             XCTAssertEqual(item?.delivery, .planned)
@@ -54,6 +62,15 @@ final class SettingsOverviewTests: XCTestCase {
         XCTAssertEqual(connected.preferences.theme, .system, "hostの確定前に保存済みの値を変更しない")
         connected.preferences.theme = .dark
         XCTAssertEqual(connected.preferences.theme, .dark)
+
+        var workflowRequests: [SettingsAction] = []
+        let workflow = SettingsPresentation(preferences: Preferences(), workflowMode: "manual",
+            availableActions: [.workflow], onAction: { workflowRequests.append($0) })
+        workflow.perform(.workflow("adaptive"))
+        XCTAssertEqual(workflowRequests.count, 1)
+        if case .workflow("adaptive") = workflowRequests[0] {} else {
+            XCTFail("選択したworkflowをhostへ渡していません")
+        }
     }
 
     func testWindowReusesIdentitySelectionAndSizeAfterClosing() {
@@ -82,9 +99,11 @@ final class SettingsOverviewTests: XCTestCase {
         for (name, appearance, width, category) in [
             ("general-dark", NSAppearance.Name.darkAqua, 1040.0, SettingsCategory.general),
             ("integrations-dark", .darkAqua, 1040.0, .integrations),
+            ("workflow-dark", .darkAqua, 1040.0, .workflow),
             ("memory-light", .aqua, 820.0, .memory),
         ] {
-            let model = SettingsPresentation(preferences: Preferences(), releaseTitle: "UI確認用", isPreview: true)
+            let model = SettingsPresentation(preferences: Preferences(), workflowMode: "adaptive",
+                releaseTitle: "UI確認用", isPreview: true)
             model.select(category)
             let controller = SettingsWindowController(presentation: model)
             let window = try XCTUnwrap(controller.window)

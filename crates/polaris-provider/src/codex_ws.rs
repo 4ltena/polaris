@@ -40,19 +40,162 @@ pub(crate) fn enabled() -> bool {
 type Stream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// The proxy this socket must dial through, if the environment names one.
+///
+/// A confined run is often allowed exactly one outbound destination, so a
+/// socket that dials the host directly is refused by the kernel before it can
+/// be measured at all. The HTTP path already honours these variables through
+/// reqwest; the socket honoured none of them, which is why it could not be
+/// measured under confinement.
+///
+/// Kept as a pure function of the four inputs so the precedence and the
+/// `NO_PROXY` exemption can be tested without touching process environment.
+fn proxy_for(
+    host: &str,
+    https: Option<&str>,
+    all: Option<&str>,
+    no_proxy: Option<&str>,
+) -> Option<String> {
+    let exempt = no_proxy.is_some_and(|list| {
+        list.split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .any(|entry| {
+                entry == "*"
+                    || host == entry
+                    || host.ends_with(&format!(".{}", entry.trim_start_matches('.')))
+            })
+    });
+    if exempt {
+        return None;
+    }
+    let chosen = https
+        .filter(|v| !v.trim().is_empty())
+        .or(all.filter(|v| !v.trim().is_empty()))?;
+    let authority = chosen
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    (!authority.is_empty()).then(|| authority.to_owned())
+}
+
+fn proxy_from_environment(host: &str) -> Option<String> {
+    let read = |name: &str| std::env::var(name).ok();
+    let https = read("HTTPS_PROXY").or_else(|| read("https_proxy"));
+    let all = read("ALL_PROXY").or_else(|| read("all_proxy"));
+    let no_proxy = read("NO_PROXY").or_else(|| read("no_proxy"));
+    proxy_for(host, https.as_deref(), all.as_deref(), no_proxy.as_deref())
+}
+
+/// Opens a tunnel to `host:port` through an HTTP proxy.
+///
+/// Only the tunnel is established here; the TLS handshake and the upgrade
+/// happen on top of the returned stream exactly as they would on a direct
+/// connection, so the peer certificate is still the origin's.
+async fn tunnel(
+    proxy: &str,
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpStream, ProviderError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(proxy)
+        .await
+        .map_err(|error| ProviderError::Decode(format!("proxy connect: {error}")))?;
+    let request = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|error| ProviderError::Decode(format!("proxy request: {error}")))?;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() > 8192 {
+            return Err(ProviderError::Decode("proxy response is too long".into()));
+        }
+        match stream.read(&mut byte).await {
+            Ok(0) => return Err(ProviderError::Decode("proxy closed the tunnel".into())),
+            Ok(_) => head.push(byte[0]),
+            Err(error) => return Err(ProviderError::Decode(format!("proxy response: {error}"))),
+        }
+    }
+    let status = String::from_utf8_lossy(&head);
+    let first = status.lines().next().unwrap_or_default();
+    // The status line is the only part that decides; the proxy may refuse a
+    // destination that is not on its allowlist, and that refusal must not be
+    // mistaken for a transport fault.
+    if !first
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code.starts_with('2'))
+    {
+        return Err(ProviderError::Decode(format!(
+            "proxy refused the tunnel: {first}"
+        )));
+    }
+    Ok(stream)
+}
+
 /// One open socket, and what the next request on it may continue from.
 pub(crate) struct Session {
     stream: Stream,
-    /// The id of the last response this socket completed, and the items the
-    /// request that produced it carried plus the items the server streamed
-    /// back. The next request continues from the id and sends only what is
-    /// beyond that baseline.
+    /// What this socket can continue from, one entry per request shape.
     ///
-    /// `None` until a response completes here. A socket that has not yet
-    /// answered anything has nothing to continue from.
-    continuation: Option<Continuation>,
+    /// **One slot was not enough.** Parent and subagents share a single
+    /// provider handle (`agent::run`'s `provider_pool`), and a tier-routed
+    /// turn asks a different model, so requests of several shapes arrive on
+    /// the same socket. With a single slot each one overwrote the previous,
+    /// and the parent's next turn found the child's continuation, failed the
+    /// shape check, and re-sent its whole history — the transport was paying
+    /// its cost and buying nothing exactly when the run was busiest.
+    ///
+    /// Bounded: the server holds the state behind each id, and a run that
+    /// keeps opening new shapes should not grow this without limit. The
+    /// oldest entry goes first.
+    continuations: Continuations,
 }
 
+/// The continuations one socket holds, one per request shape.
+#[derive(Default)]
+pub(crate) struct Continuations(std::collections::VecDeque<Continuation>);
+
+impl Continuations {
+    pub(crate) fn get(&self, shape: &Shape) -> Option<&Continuation> {
+        self.0.iter().find(|held| &held.shape == shape)
+    }
+
+    /// Replaces this shape's entry. A differently shaped request must not
+    /// evict a continuation it never used.
+    pub(crate) fn remember(&mut self, held: Continuation) {
+        self.0.retain(|other| other.shape != held.shape);
+        self.0.push_back(held);
+        while self.0.len() > CONTINUATIONS {
+            self.0.pop_front();
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// How many distinct request shapes one socket keeps a continuation for.
+/// A root, its tier-routed calls and a wave of subagents fit well inside
+/// this; beyond it the oldest is dropped and that shape simply re-sends.
+const CONTINUATIONS: usize = 8;
+
+/// **A continuation cannot outlive its socket.** Carrying the chain into
+/// the next process was tried on 2026-09-21 and the server refused it:
+/// `400 invalid_request_error: Invalid previous_response_id`. Three
+/// requests of a four-turn task failed that way, fell back to HTTP, and
+/// the run cost more than one that never tried — $0.389 against $0.318.
+///
+/// It matters because the server's prompt cache is reachable only through
+/// the chain: of 212 measured websocket requests, all 120 cache hits
+/// carried a continuation and every one of the 72 without one missed. So
+/// a turn that starts a new process pays for its whole history, and
+/// nothing in this transport changes that. Making it cheaper means fewer
+/// processes, not a longer-lived id.
 pub(crate) struct Continuation {
     pub(crate) response_id: String,
     /// Everything the server already holds: what was sent, followed by what
@@ -60,16 +203,11 @@ pub(crate) struct Continuation {
     /// against the sent items alone would resend every answer it gave.
     pub(crate) baseline: Vec<serde_json::Value>,
     /// The request fields the continuation was produced under. A later
-    /// request that differs in any of them is a different conversation to the
-    /// server, and continuing from this id would splice the two.
+    /// request that differs in any of them is a different conversation to
+    /// the server, and continuing from this id would splice the two.
     pub(crate) shape: Shape,
 }
 
-/// The parts of a request whose change invalidates a continuation. `input` is
-/// deliberately absent: it is the part that grows, and it is compared
-/// separately as a prefix. Per-request telemetry is absent for the same
-/// reason it is on the other side — it changes every time and comparing it
-/// would refuse every continuation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Shape {
     pub(crate) model: String,
@@ -138,52 +276,52 @@ impl Session {
         set(headers, "openai-beta", BETA)?;
         set(headers, "originator", "polaris")?;
 
-        let (stream, _response) = tokio::time::timeout(
-            CONNECT,
-            tokio_tungstenite::connect_async_tls_with_config(request, None, false, None),
-        )
-        .await
-        .map_err(|_| ProviderError::Decode("websocket connect timed out".into()))?
-        .map_err(|error| ProviderError::Decode(format!("websocket upgrade: {error}")))?;
+        let host = request
+            .uri()
+            .host()
+            .ok_or_else(|| ProviderError::Decode("websocket URL has no host".into()))?
+            .to_owned();
+        let port = request.uri().port_u16().unwrap_or(443);
+        let (stream, _response) = match proxy_from_environment(&host) {
+            Some(proxy) => {
+                let tunnelled = tokio::time::timeout(CONNECT, tunnel(&proxy, &host, port))
+                    .await
+                    .map_err(|_| ProviderError::Decode("proxy connect timed out".into()))??;
+                tokio::time::timeout(
+                    CONNECT,
+                    tokio_tungstenite::client_async_tls_with_config(request, tunnelled, None, None),
+                )
+                .await
+                .map_err(|_| ProviderError::Decode("websocket connect timed out".into()))?
+                .map_err(|error| ProviderError::Decode(format!("websocket upgrade: {error}")))?
+            }
+            None => tokio::time::timeout(
+                CONNECT,
+                tokio_tungstenite::connect_async_tls_with_config(request, None, false, None),
+            )
+            .await
+            .map_err(|_| ProviderError::Decode("websocket connect timed out".into()))?
+            .map_err(|error| ProviderError::Decode(format!("websocket upgrade: {error}")))?,
+        };
         Ok(Self {
             stream,
-            continuation: None,
+            continuations: Continuations::default(),
         })
     }
 
     /// The continuation this socket can offer for `shape`, if any.
     pub(crate) fn continuation_for(&self, shape: &Shape) -> Option<&Continuation> {
-        self.continuation
-            .as_ref()
-            .filter(|held| &held.shape == shape)
+        self.continuations.get(shape)
     }
 
     /// Why this socket cannot continue, in the terms the reader needs. For
     /// diagnostics while the transport is behind a flag.
     pub(crate) fn why_no_continuation(&self, shape: &Shape, input: &[serde_json::Value]) -> String {
-        match &self.continuation {
-            None => "前の応答がない".to_owned(),
-            Some(held) if &held.shape != shape => "要求の形が変わった".to_owned(),
-            Some(held) => {
-                let at = held.baseline.iter().zip(input).position(|(a, b)| a != b);
-                match at {
-                    Some(at) => format!(
-                        "{at}件目が違う\n      保持: {}\n      今回: {}",
-                        &held.baseline[at]
-                            .to_string()
-                            .chars()
-                            .take(220)
-                            .collect::<String>(),
-                        &input[at].to_string().chars().take(220).collect::<String>(),
-                    ),
-                    None => format!(
-                        "短い（保持 {}件 / 今回 {}件）",
-                        held.baseline.len(),
-                        input.len()
-                    ),
-                }
-            }
-        }
+        why_refused(
+            self.continuation_for(shape),
+            self.continuations.len(),
+            input,
+        )
     }
 
     /// Sends one `response.create` and folds the reply into a completion.
@@ -280,15 +418,18 @@ impl Session {
         let completed = folder.finish()?;
         // Only a response that named itself can be continued from. Everything
         // the server now holds is what was sent plus what it produced.
-        self.continuation = (!response_id.is_empty()).then(|| {
+        if !response_id.is_empty() {
             let mut baseline = sent_items;
             baseline.extend(produced);
-            Continuation {
+            // Replace this shape's entry rather than the whole slot, so a
+            // differently shaped request does not evict the one it never
+            // used.
+            self.continuations.remember(Continuation {
                 response_id,
                 baseline,
                 shape,
-            }
-        });
+            });
+        }
         Ok((completed, usage))
     }
 }
@@ -304,28 +445,110 @@ pub(crate) fn delta(
     input: &[serde_json::Value],
 ) -> Option<Vec<serde_json::Value>> {
     let (prefix, rest) = input.split_at_checked(baseline.len())?;
+    // `same_item` is not symmetric — the server's record comes first — and
+    // the zip here reads the other way round.
     let same = prefix
         .iter()
         .zip(baseline)
-        .all(|(held, sent)| comparable(held) == comparable(sent));
+        .all(|(sent, held)| same_item(held, sent));
     same.then(|| rest.to_vec())
 }
 
-/// The part of an item that both sides agree on.
+/// The words for a refusal, given what the socket held for that shape.
 ///
-/// The server hands back what it recorded, which carries an `id` it issued
-/// and a `status` it decided. Polaris renders its own history from its own
-/// types and sends neither — it never sends an id at all. Comparing the raw
-/// items therefore finds a difference on the first tool call every time, and
-/// the continuation is refused on every request: correct, and silently
-/// expensive. Only the fields polaris actually round-trips take part.
-fn comparable(item: &serde_json::Value) -> serde_json::Value {
-    let mut held = item.clone();
-    if let Some(object) = held.as_object_mut() {
-        object.remove("id");
-        object.remove("status");
+/// It has to weigh the items exactly as `delta` does. Scanning the raw items
+/// instead names a position `delta` accepts — on the 2026-09-20 todo run that
+/// made every refusal look like the empty `content` the server adds, and hid
+/// whatever the real cause was.
+fn why_refused(held: Option<&Continuation>, kept: usize, input: &[serde_json::Value]) -> String {
+    let Some(held) = held else {
+        return if kept == 0 {
+            "前の応答がない".to_owned()
+        } else {
+            format!("この形の継続がない（保持 {kept}形）")
+        };
+    };
+    let at = held
+        .baseline
+        .iter()
+        .zip(input)
+        .position(|(a, b)| !same_item(a, b));
+    match at {
+        Some(at) => match first_difference(&held.baseline[at], &input[at], "") {
+            Some((path, was, now)) => {
+                format!("{at}件目の{path}が違う\n      保持: {was}\n      今回: {now}")
+            }
+            None => format!("{at}件目が違う（差が見つかりません）"),
+        },
+        None => format!(
+            "短い（保持 {}件 / 今回 {}件）",
+            held.baseline.len(),
+            input.len()
+        ),
     }
-    held
+}
+
+/// Where two items first differ, as a path into them.
+///
+/// The message used to print the head of each raw item. Three separate
+/// causes have now hidden behind that: a field far inside a long item shows
+/// as two identical-looking heads, and the reader blames whatever the head
+/// happens to show. Name the field instead.
+fn first_difference(
+    held: &serde_json::Value,
+    sent: &serde_json::Value,
+    path: &str,
+) -> Option<(String, String, String)> {
+    let cut = |value: &serde_json::Value| value.to_string().chars().take(160).collect::<String>();
+    match (held, sent) {
+        // Only what polaris sends takes part, the same way `same_item`
+        // weighs it: a field the server kept beside the item is not a
+        // difference, and must not be named as one.
+        (serde_json::Value::Object(was), serde_json::Value::Object(now)) => {
+            now.iter().find_map(|(key, value)| match was.get(key) {
+                Some(other) => first_difference(other, value, &format!("{path}.{key}")),
+                None => Some((format!("{path}.{key}"), "（無し）".to_owned(), cut(value))),
+            })
+        }
+        (serde_json::Value::Array(was), serde_json::Value::Array(now)) => {
+            for (index, (one, other)) in was.iter().zip(now).enumerate() {
+                if let Some(found) = first_difference(one, other, &format!("{path}[{index}]")) {
+                    return Some(found);
+                }
+            }
+            (was.len() != now.len()).then(|| {
+                (
+                    path.to_owned(),
+                    format!("{}件", was.len()),
+                    format!("{}件", now.len()),
+                )
+            })
+        }
+        _ => (held != sent).then(|| (path.to_owned(), cut(held), cut(sent))),
+    }
+}
+
+/// Whether what the server recorded is still the item polaris would send.
+///
+/// The server hands back more than it was given: an `id` it issued, a
+/// `status` and a `phase` it decided, and the lists it had nothing to put in
+/// (`content` on a reasoning item, `annotations` and `logprobs` inside every
+/// message part). Polaris renders its own history from its own types and
+/// sends none of them. Naming each one as it turned up cost three separate
+/// measurements on 2026-09-20 — every one of them a continuation refused on
+/// every request, correct and silently expensive — so the rule is the one
+/// those exclusions were approximating: only what polaris sends takes part.
+/// What the server keeps beside it is the server's business.
+fn same_item(held: &serde_json::Value, sent: &serde_json::Value) -> bool {
+    match (held, sent) {
+        (serde_json::Value::Object(was), serde_json::Value::Object(now)) => now
+            .iter()
+            .all(|(key, value)| was.get(key).is_some_and(|other| same_item(other, value))),
+        (serde_json::Value::Array(was), serde_json::Value::Array(now)) => {
+            was.len() == now.len() && was.iter().zip(now).all(|(a, b)| same_item(a, b))
+        }
+        _ => held == sent,
+    }
 }
 
 #[cfg(test)]

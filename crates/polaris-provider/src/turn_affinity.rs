@@ -2,6 +2,13 @@
 //!
 //! This state is deliberately neither serializable nor `Debug`: it may hold
 //! a server-issued header and must never outlive the run loop that owns it.
+//!
+//! Keeping it on disk for the next process was built and measured on
+//! 2026-09-21 and does nothing: the replayed value reached the backend
+//! (`sent: true` in the record) and the cold request still read cache 0,
+//! the same as without it, and once replayed the backend stops issuing a
+//! fresh one. The header is not what carries a warm prefix across
+//! processes, so the lifetime above stands.
 
 use std::sync::Mutex;
 

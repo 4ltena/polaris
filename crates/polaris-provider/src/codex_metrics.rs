@@ -241,7 +241,7 @@ fn metrics_error() -> ProviderError {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn private_file(path: &Path) -> io::Result<File> {
+pub(crate) fn private_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     // Refuse special files before opening. O_NOFOLLOW closes the final-symlink
     // race; O_NONBLOCK avoids blocking if a regular file is replaced by a FIFO.
@@ -268,7 +268,7 @@ fn private_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn private_file(_path: &Path) -> io::Result<File> {
+pub(crate) fn private_file(_path: &Path) -> io::Result<File> {
     // Do not silently produce a world-readable file on platforms without mode 0600.
     Err(io::ErrorKind::Unsupported.into())
 }

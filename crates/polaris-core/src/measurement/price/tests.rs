@@ -49,6 +49,38 @@ fn the_embedded_table_holds_the_figures_the_scripts_use() {
 }
 
 #[test]
+fn luna_children_use_their_own_rates_including_cache_and_long_context() {
+    let rates = rates();
+    let model = rates.model("gpt-5.6-luna").expect("the M23 child model");
+    assert_eq!(model.rates_as_of, "2026-09-19");
+    // 150 uncached, 800 cached, 50 cache writes, 200 output tokens.
+    // $0.20 / $0.02 / $0.25 / $1.20 per million => 298.5 micro-USD,
+    // rounded once to 299. Astra's rates would instead produce 12,925.
+    assert_eq!(
+        api_cost_of(&rates, "gpt-5.6-luna", &observed(1_000, 800, 50, 200)),
+        Cost::Exact { micro_usd: 299 }
+    );
+    for (input, expected) in [(272_000, 55_600), (272_001, 110_600)] {
+        assert_eq!(
+            api_cost_of(&rates, "gpt-5.6-luna", &observed(input, 0, 0, 1_000)),
+            Cost::Exact {
+                micro_usd: expected
+            }
+        );
+    }
+    let mut missing_write = observed(1_000, 800, 0, 200);
+    missing_write.cache_write = Reported::Unknown;
+    assert!(matches!(
+        api_cost_of(&rates, "gpt-5.6-luna", &missing_write),
+        Cost::Partial { .. }
+    ));
+    assert_eq!(
+        api_cost_interval(&rates, "gpt-5.6-luna", &missing_write),
+        Some((296, 306))
+    );
+}
+
+#[test]
 fn a_model_the_table_does_not_name_is_never_priced_with_another_models_figures() {
     let attempts = [attempt("a-1", observed(1_000, 0, 0, 100))];
     assert_eq!(

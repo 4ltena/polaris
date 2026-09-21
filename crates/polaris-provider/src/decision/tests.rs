@@ -257,13 +257,17 @@ async fn the_judges_own_consumption_is_counted() {
     ask(answered(Some(600), Some(30)), &meter).await;
     // Answered, but the reply said nothing about usage. Unknown, not zero.
     ask(answered(None, None), &meter).await;
+    // A partial reply contributes its known subtotal, but cannot make the
+    // response complete or turn the absent output into an observed zero.
+    ask(answered(Some(40), None), &meter).await;
+    ask(answered(None, Some(5)), &meter).await;
     // Did not answer. The service may have worked before refusing.
     ask(Err(DecisionError::Unavailable), &meter).await;
 
     let held = meter.snapshot();
-    assert_eq!(held.input_tokens, 1000);
-    assert_eq!(held.output_tokens, 50);
+    assert_eq!(held.input_tokens, 1040);
+    assert_eq!(held.output_tokens, 55);
     assert_eq!(held.reported, 2);
-    assert_eq!(held.missing, 1, "答えたが使用量を言わなかった分");
+    assert_eq!(held.missing, 3, "使用量が全て揃わなかった回答");
     assert_eq!(held.failed, 1, "答えなかった分");
 }

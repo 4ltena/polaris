@@ -149,6 +149,12 @@ def main():
     ap.add_argument('--tool-memory-embedding-url')
     ap.add_argument('--tool-memory-embedding-model')
     ap.add_argument('--strategy', choices=['default', 'scoped', 'search-first'], default='default')
+    ap.add_argument('--defaults', action='store_true',
+                    help='--model/--effortを渡さず、polarisの公開既定値で走らせる。'
+                         '製品同士の比較ではそれぞれの既定こそが比較対象である。')
+    ap.add_argument('--agents-md', choices=['absent', 'empty'], default='absent',
+                    help='emptyでfixtureへ0バイトのAGENTS.mdを置く。'
+                         '上位ディレクトリのAGENTS.mdを拾わせないため。')
     ap.add_argument('--allow-legacy-metrics', action='store_true',
                     help='旧バイナリの計測ログ欠落を許容する。比較完全性は未確認と記録する')
     args = ap.parse_args()
@@ -162,7 +168,11 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
     fixture = output / 'fixture'
-    metadata = {'model': 'gpt-6-astra', 'effort': 'medium', 'label': args.label,
+    # 実際に使った値は traces から読み直して下で上書きする。ここは要求値。
+    metadata = {'model': None if args.defaults else 'gpt-6-astra',
+                'effort': None if args.defaults else 'medium',
+                'requested': 'published defaults' if args.defaults else 'pinned',
+                'agents_md': args.agents_md, 'label': args.label,
                 'strategy': args.strategy, 'tool_memory': args.tool_memory,
                 'prompts': {task: task_prompt(task, args.strategy) for task in args.tasks},
                 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -179,6 +189,9 @@ def main():
                 raise SystemExit('測定用ルートの隔離を確認できません。')
             for name, body in [('README.md', README), ('rates.py', RATES), ('history.md', HISTORY)]:
                 (fixture / name).write_text(body)
+            if args.agents_md == 'empty':
+                # 0バイト。無いと探索が上位ディレクトリへ抜ける。
+                (fixture / 'AGENTS.md').write_text('')
             before = snapshot(fixture)
             stem = f'{task}-{repeat + 1}'
             metrics = output / f'{stem}.metrics.jsonl'
@@ -190,8 +203,10 @@ def main():
                 env['POLARIS_READ_OUTPUT_BYTES'] = str(args.read_output_bytes)
             if args.cache_mode:
                 env['POLARIS_CACHE_MODE'] = args.cache_mode
-            cmd = [str(binary), '--model', 'gpt-6-astra', '--effort', 'medium',
-                   '--sandbox', 'workspace-write' if task == 'repair' else 'read-only',
+            cmd = [str(binary)]
+            if not args.defaults:
+                cmd.extend(['--model', 'gpt-6-astra', '--effort', 'medium'])
+            cmd += ['--sandbox', 'workspace-write' if task == 'repair' else 'read-only',
                    '--approval', 'never', '--max-turns', '12',
                    '--audit', str(output / f'{stem}.audit.jsonl'), '--prompt', task_prompt(task, args.strategy)]
             if args.tool_memory != 'off':
@@ -219,7 +234,18 @@ def main():
                     traces = []
             except (ValueError, OSError):
                 traces = []
-            model_match = all(r.get('model') == 'gpt-6-astra' and r.get('effort') == 'medium' for r in traces) if traces else None
+            # 既定で走らせたときは「一致」ではなく「実際に何だったか」を記録する。
+            observed = sorted({(r.get('model'), r.get('effort')) for r in traces}) if traces else []
+            # 固定して走らせたときは「要求どおりか」を、既定で走らせたときは
+            # 「run の途中で変わっていないか」を見る。既定値の比較では、値が
+            # 何であったかは結果であって条件ではないので、一致を要求できない。
+            # ただし1 run のなかで揺れていたら、その行の合計は2モデル分の和で
+            # あり、費用比較には使えない。
+            if args.defaults:
+                model_match = (len(observed) == 1) if traces else None
+            else:
+                model_match = (all(r.get('model') == 'gpt-6-astra' and r.get('effort') == 'medium'
+                                   for r in traces) if traces else None)
             after = snapshot(fixture)
             changed = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
             scope_ok = all(k == 'rates.py' for k in changed) if task == 'repair' else not changed
@@ -249,6 +275,7 @@ def main():
             embedding_complete = embedding['missing'] == 0 and embedding['failed'] == 0
             complete = embedding_complete and bool(traces) and model_match is True and missing == 0 and failed == 0 and reconciled and cache_complete and coverage_ok and not log_warning
             row = {'task': task, 'repeat': repeat + 1, 'exit_code': code,
+                   'observed_model_effort': [list(pair) for pair in observed],
                    'strategy': args.strategy, 'tool_memory': args.tool_memory,
                    'elapsed_seconds': round(time.monotonic() - start, 3),
                    'quality_pass': code == 0 and scope_ok and quality(task, stdout, fixture),

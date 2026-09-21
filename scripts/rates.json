@@ -10,7 +10,65 @@
     "reason": "cacheを持たないモデルは未報告が欠測ではないため、そのままでは費用が永久に不明になる。",
     "applied_by": "crates/polaris-core/src/measurement/price.rs と scripts/benchmark_costs.py の両方"
   },
+  "typed_decision_models": {
+    "jev-latest": {
+      "rates_as_of": "2026-09-20",
+      "sources": ["https://typesafe.ai/blog/introducing-system-one-models-and-jev"],
+      "billing": "published_flat_input",
+      "input_per_million": "0.042",
+      "output_per_million": "0",
+      "cache_applicability": "unknown",
+      "failed_request_billing": "unknown"
+    }
+  },
   "models": {
+    "gpt-5.6-terra": {
+      "rates_as_of": "2026-09-20",
+      "sources": ["https://developers.openai.com/api/docs/models/gpt-5.6-terra"],
+      "api_per_million": {
+        "billed_input": "2",
+        "cache_read": "0.2",
+        "cache_write": "2.5",
+        "output": "12"
+      },
+      "long_context": {
+        "input_tokens_above": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      }
+    },
+    "gpt-5.6-sol": {
+      "rates_as_of": "2026-09-20",
+      "sources": ["https://developers.openai.com/api/docs/models/gpt-5.6-sol"],
+      "api_per_million": {
+        "billed_input": "4",
+        "cache_read": "0.4",
+        "cache_write": "5",
+        "output": "20"
+      },
+      "long_context": {
+        "input_tokens_above": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      }
+    },
+    "gpt-5.6-luna": {
+      "rates_as_of": "2026-09-19",
+      "sources": [
+        "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
+      ],
+      "api_per_million": {
+        "billed_input": "0.20",
+        "cache_read": "0.02",
+        "cache_write": "0.25",
+        "output": "1.20"
+      },
+      "long_context": {
+        "input_tokens_above": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      }
+    },
     "gpt-6-astra": {
       "rates_as_of": "2026-09-07",
       "sources": [

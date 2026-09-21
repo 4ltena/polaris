@@ -116,10 +116,10 @@ pub trait Decider: Send + Sync {
 pub struct DecisionUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// Answered requests whose reply carried a usage figure.
+    /// Answered requests whose reply carried both usage figures.
     pub reported: u64,
-    /// Answered requests whose reply carried none. Consumption unknown, not
-    /// zero.
+    /// Answered requests whose reply omitted either usage figure. Known
+    /// token subtotals remain recorded; the response's total is incomplete.
     pub missing: u64,
     /// Requests that did not answer. Consumption unknown; the service may
     /// have done work before refusing.
@@ -161,11 +161,19 @@ impl Decider for MeteredDecider {
         let mut held = self.meter.0.lock().expect("decision meter poisoned");
         match &result {
             Ok(decision) => match (decision.input_tokens, decision.output_tokens) {
-                (None, None) => held.missing = held.missing.saturating_add(1),
-                (input, output) => {
+                (Some(input), Some(output)) => {
                     held.reported = held.reported.saturating_add(1);
-                    held.input_tokens = held.input_tokens.saturating_add(input.unwrap_or(0));
-                    held.output_tokens = held.output_tokens.saturating_add(output.unwrap_or(0));
+                    held.input_tokens = held.input_tokens.saturating_add(input);
+                    held.output_tokens = held.output_tokens.saturating_add(output);
+                }
+                (input, output) => {
+                    held.missing = held.missing.saturating_add(1);
+                    if let Some(input) = input {
+                        held.input_tokens = held.input_tokens.saturating_add(input);
+                    }
+                    if let Some(output) = output {
+                        held.output_tokens = held.output_tokens.saturating_add(output);
+                    }
                 }
             },
             Err(_) => held.failed = held.failed.saturating_add(1),

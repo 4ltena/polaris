@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from benchmark_costs import classify_row, summarize_rows
+from benchmark_costs import classify_row, price_usage, summarize_rows
 
 
 SCRIPT = Path(__file__).with_name('benchmark_costs.py')
@@ -25,6 +25,74 @@ def metric(**overrides):
 
 
 class BenchmarkCostsTests(unittest.TestCase):
+    def test_explicit_parent_child_contract_uses_each_models_rates(self):
+        models = {'gpt-6-astra': 'xhigh', 'gpt-5.6-luna': 'xhigh'}
+        child = metric(model='gpt-5.6-luna', effort='xhigh', usage={
+            'input_tokens': 1000, 'cache_read_tokens': 800,
+            'cache_write_tokens': 50, 'output_tokens': 200,
+            'reasoning_tokens': 100,
+        })
+        summary = summarize_rows([metric(effort='xhigh'), child], 'parent-child',
+                                 expected_models=models)
+        self.assertTrue(summary['measurement_complete'])
+        # Rust price/tests.rs uses the same Luna vector: round 298.5 once.
+        self.assertEqual(summary['standard_api_hypothetical_usd'], '0.001394')
+        self.assertEqual(summary['by_model']['gpt-5.6-luna']
+                         ['known_complete_standard_api_hypothetical_usd'], '0.000299')
+        self.assertEqual(summary['reasoning']['known_tokens'], 100)
+        self.assertEqual(summary['reasoning']['missing_requests'], 1)
+        self.assertFalse(summary['codex_credit_scenario_complete'])
+        self.assertIsNone(summary['codex_credit_scenario'])
+        self.assertEqual(summary['contract']['models']['gpt-5.6-luna']['effort'], 'xhigh')
+
+    def test_luna_boundary_and_missing_credit_do_not_use_astra_prices(self):
+        models = {'gpt-5.6-luna': 'xhigh'}
+        for count, cost in ((272000, '0.0556'), (272001, '0.1106')):
+            with self.subTest(count=count):
+                row = classify_row(metric(model='gpt-5.6-luna', effort='xhigh', usage={
+                    'input_tokens': count, 'cache_read_tokens': 0,
+                    'cache_write_tokens': 0, 'output_tokens': 1000,
+                }), expected_models=models)
+                self.assertEqual(row['standard_api_hypothetical_usd'], cost)
+                self.assertIsNone(row['codex_credit_scenario'])
+
+    def test_explicit_contract_does_not_accept_undeclared_or_unpriced_models(self):
+        models = {'gpt-5.6-luna': 'xhigh', 'unknown': 'medium'}
+        for row, reason in ((metric(), 'wrong_model'),
+                            (metric(model='unknown'), 'unknown_model_rates'),
+                            (metric(model='gpt-5.6-luna'), 'wrong_effort')):
+            with self.subTest(reason=reason):
+                classified = classify_row(row, expected_models=models)
+                self.assertFalse(classified['complete'])
+                self.assertIn(reason, classified['errors'])
+        with self.assertRaises(ValueError):
+            summarize_rows([metric()], 'empty-contract', expected_models={})
+
+    def test_reasoning_is_a_diagnostic_subset_and_never_an_extra_price(self):
+        valid = dict(metric()['usage'], reasoning_tokens=5)
+        row = classify_row(metric(usage=valid))
+        self.assertEqual(row['standard_api_hypothetical_usd'], '0.001095')
+        for count in (6, -1, True, '5'):
+            with self.subTest(count=count):
+                invalid = dict(valid, reasoning_tokens=count)
+                summary = summarize_rows([metric(usage=invalid)], 'invalid-reasoning')
+                self.assertFalse(summary['measurement_complete'])
+                self.assertEqual(summary['reasoning']['invalid_requests'], 1)
+
+    def test_cli_explicit_contract_keeps_default_strict_and_rejects_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'child.metrics.jsonl'
+            path.write_text(json.dumps(metric(model='gpt-5.6-luna', effort='xhigh')) + '\n')
+            base = [sys.executable, str(SCRIPT), '--label', 'child', '--metrics', str(path)]
+            default = subprocess.run(base, capture_output=True, text=True)
+            self.assertEqual(default.returncode, 1)
+            contract = ['--expect-model', 'gpt-5.6-luna=xhigh']
+            result = subprocess.run(base + contract, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout)['measurement_complete'])
+            duplicate = subprocess.run(base + contract + contract, capture_output=True, text=True)
+            self.assertEqual(duplicate.returncode, 2)
+
     def test_cache_components_are_in_input_and_not_double_counted(self):
         row = classify_row(metric())
         self.assertTrue(row['complete'])
@@ -205,6 +273,33 @@ class BenchmarkCostsTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertIn('duplicate metric paths', result.stderr)
+
+
+    def test_price_usage_prices_both_arms_from_one_table(self):
+        from decimal import Decimal
+        price = price_usage
+        # Under the long-context threshold the published per-million rates
+        # apply directly: 10 billed input, 1 cache read, 50 output.
+        self.assertEqual(price('gpt-6-astra', 1000, 0, 0, 0), Decimal('0.010000'))
+        self.assertEqual(price('gpt-6-astra', 1000, 1000, 0, 0), Decimal('0.001000'))
+        self.assertEqual(price('gpt-6-astra', 0, 0, 0, 1000), Decimal('0.050000'))
+        # Cache read is only the cached share; the rest stays billed input.
+        self.assertEqual(price('gpt-6-astra', 1000, 400, 0, 0), Decimal('0.006400'))
+        # Above 272,000 input tokens the table's own multipliers apply.
+        self.assertEqual(price('gpt-6-astra', 300_000, 0, 0, 0), Decimal('6.000000'))
+        self.assertEqual(price('gpt-6-astra', 300_000, 0, 0, 0,
+                               long_context_multipliers=False), Decimal('3.000000'))
+        # A model the table does not name has no price. Borrowing another
+        # model's figures would look like a measurement and be none.
+        with self.assertRaises(KeyError):
+            price('no-such-model', 1, 0, 0, 0)
+        # Counts that cannot be true are refused rather than silently clamped.
+        with self.assertRaises(ValueError):
+            price('gpt-6-astra', 10, 20, 0, 0)
+        with self.assertRaises(ValueError):
+            price('gpt-6-astra', -1, 0, 0, 0)
+        with self.assertRaises(ValueError):
+            price('gpt-6-astra', 1.5, 0, 0, 0)
 
 
 if __name__ == '__main__':

@@ -35,6 +35,7 @@ final class NativeWorkspaceSnapshotTests: XCTestCase {
                 "state": .string("completed"), "acceptance": .array([]),
                 "blockers": .array([.object(["kind": .string("outcome_unknown"), "detail": .string("未保存")])])])]),
             "children": .array([.object(["attempt_id": .string("attempt"), "run_id": .string("run"),
+                "display_name": .string("Vega"),
                 "state": .string("succeeded"), "task_ids": .array([.string("task")])])])
         ])
         let snapshot = NativeWorkspaceSnapshot.make(binding: try binding(), payload: payload)
@@ -42,6 +43,7 @@ final class NativeWorkspaceSnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.activities[0].completedCount, 0)
         XCTAssertEqual(snapshot.activities[0].agents[0].model.id, "unreported")
         XCTAssertEqual(snapshot.activities[0].agents[0].attempt, 0)
+        XCTAssertEqual(snapshot.activities[0].agents[0].name, "Vega")
     }
 
     @MainActor

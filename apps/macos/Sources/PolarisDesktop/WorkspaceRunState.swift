@@ -78,6 +78,7 @@ struct WorkspaceRun: Identifiable, Equatable {
   let attemptID: String
   let generation: UUID
   let state: String
+  var activityKey: WorkspaceRunActivityKey { .init(runID: id, attemptID: attemptID) }
   static func == (lhs: Self, rhs: Self) -> Bool {
     lhs.key == rhs.key && lhs.attemptID.utf8.elementsEqual(rhs.attemptID.utf8)
       && lhs.generation == rhs.generation && lhs.state == rhs.state
@@ -102,6 +103,21 @@ struct WorkspaceRun: Identifiable, Equatable {
     self.generation = generation
     try ServiceSchema.run.check(value)
     id = value["run_id"]!.string!; attemptID = value["attempt_id"]!.string!; state = value["state"]!.string!
+  }
+}
+
+struct WorkspaceRunActivityKey: Hashable {
+  let runID: String
+  let attemptID: String
+}
+
+struct WorkspaceRunActivity: Equatable {
+  let key: WorkspaceRunActivityKey
+  let phase: String
+  init(_ value: ServiceValue) throws {
+    try ServiceSchema.runActivity.check(value)
+    key = .init(runID: value["run_id"]!.string!, attemptID: value["attempt_id"]!.string!)
+    phase = value["phase"]!.string!
   }
 }
 

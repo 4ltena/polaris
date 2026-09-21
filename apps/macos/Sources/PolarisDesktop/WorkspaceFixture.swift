@@ -109,7 +109,21 @@ enum WorkspaceFixture {
                     WorkspaceMessage(id: "m1", author: "あなた · デモ", text: "予約が重複しないよう、データの構成を整理したい。"),
                     WorkspaceMessage(id: "m2", author: "polaris · デモ", text: "利用者、機材、予約、貸出を分けて整理します。\n\n右側の資料と作業状態は操作確認用の表示例です。実際のファイルやモデルには接続していません。")]),
                 WorkspaceConversation(id: "demo-chat-b", projectID: "demo-project", title: "保存した決定 · デモ", model: local, messages: [])],
-            models: [cloud, local], activities: [activity(id: "demo-chat", count: 12)])
+            models: [cloud, local], activities: [activity(id: "demo-chat", count: 12)],
+            quota: WorkspaceQuotaDisplay(status: "表示例", accounts: [
+                WorkspaceQuotaAccountDisplay(id: "demo-personal", name: "個人アカウント", detail: "ChatGPT Pro · 表示例", windows: [
+                    WorkspaceQuotaWindow(id: "demo-personal-five-hour", title: "5時間", usedPercent: 22,
+                        resetDescription: "2時間18分後に更新 · デモ"),
+                    WorkspaceQuotaWindow(id: "demo-personal-weekly", title: "週", usedPercent: 41,
+                        resetDescription: "4日後に更新 · デモ")
+                ]),
+                WorkspaceQuotaAccountDisplay(id: "demo-team", name: "組織アカウント", detail: "Team · 表示例", windows: [
+                    WorkspaceQuotaWindow(id: "demo-team-five-hour", title: "5時間", usedPercent: 58,
+                        resetDescription: "3時間55分後に更新 · デモ"),
+                    WorkspaceQuotaWindow(id: "demo-team-weekly", title: "週", usedPercent: 67,
+                        resetDescription: "5日後に更新 · デモ")
+                ])
+            ]))
     }
     static func activity(id: String, count: Int) -> WorkspaceActivity {
         let statuses: [WorkspaceTaskStatus] = [.completed, .completed, .implementing, .review, .retry, .pending, .cancelled, .failed, .unknown]
@@ -121,9 +135,9 @@ enum WorkspaceFixture {
         }
         return WorkspaceActivity(conversationID: id, planRevision: "デモ版1 · \(count)件", status: "表示例",
             tasks: tasks, agents: count == 0 ? [] : [
-                WorkspaceAgent(id: "attempt-1", title: "決定の抽出", summary: "保存した決定と前提を整理する表示例。",
+                WorkspaceAgent(id: "attempt-1", name: "Sirius", title: "決定の抽出", summary: "保存した決定と前提を整理する表示例。",
                     status: .succeeded, model: local, taskID: "task-0", attempt: 1),
-                WorkspaceAgent(id: "attempt-2", title: "制約の照合", summary: "予約期間と取消時の条件を確認する表示例。",
+                WorkspaceAgent(id: "attempt-2", name: "Canopus", title: "制約の照合", summary: "予約期間と取消時の条件を確認する表示例。",
                     status: .running, model: local, taskID: "task-\(min(2, count - 1))", attempt: 2)],
             files: [WorkspaceFile(id: "schema", path: "schema.sql", body: "-- デモの本文\nCREATE TABLE reservations (\n    id INTEGER PRIMARY KEY,\n    equipment_id INTEGER NOT NULL\n);",
                 unstagedDiff: "-- worktree 対 index（デモ）\n+ equipment_id INTEGER NOT NULL", stagedDiff: "-- index 対 HEAD（デモ）\n+ id INTEGER PRIMARY KEY",

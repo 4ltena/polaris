@@ -47,6 +47,38 @@ struct WorkspaceConversation: Identifiable, Equatable, Sendable {
     var messages: [WorkspaceMessage]
     var phase: WorkspaceInputPhase = .idle
 }
+struct WorkspaceQuotaWindow: Identifiable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let usedPercent: Double
+    let resetDescription: String
+
+    var boundedUsedPercent: Double { min(max(usedPercent, 0), 100) }
+    var remainingPercent: Int { Int((100 - boundedUsedPercent).rounded()) }
+}
+struct WorkspaceQuotaAccountDisplay: Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let detail: String
+    let windows: [WorkspaceQuotaWindow]
+}
+struct WorkspaceQuotaDisplay: Equatable, Sendable {
+    let status: String
+    let accounts: [WorkspaceQuotaAccountDisplay]
+
+    var account: String { accounts.first?.name ?? "" }
+    var windows: [WorkspaceQuotaWindow] { accounts.first?.windows ?? [] }
+
+    init(account: String, status: String, windows: [WorkspaceQuotaWindow]) {
+        self.status = status
+        accounts = [WorkspaceQuotaAccountDisplay(id: account, name: account, detail: "", windows: windows)]
+    }
+
+    init(status: String, accounts: [WorkspaceQuotaAccountDisplay]) {
+        self.status = status
+        self.accounts = accounts
+    }
+}
 enum WorkspaceTaskStatus: String, CaseIterable, Sendable {
     case pending, implementing, review, retry, completed, cancelled, failed, unknown
     var title: String {
@@ -86,6 +118,7 @@ enum WorkspaceAgentStatus: String, Sendable {
 }
 struct WorkspaceAgent: Identifiable, Equatable, Sendable {
     let id: String // 受理済みattempt ID。再試行は別ID。
+    let name: String
     let title: String
     let summary: String
     let status: WorkspaceAgentStatus
@@ -151,6 +184,7 @@ struct WorkspaceSnapshot: Equatable, Sendable {
     var conversations: [WorkspaceConversation]
     let models: [WorkspaceModelConfiguration]
     var activities: [WorkspaceActivity]
+    let quota: WorkspaceQuotaDisplay?
 
     func projects(in section: String) -> [WorkspaceProject] {
         switch section {

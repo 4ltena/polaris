@@ -272,6 +272,23 @@ extension WorkspaceRunTests {
     XCTAssertEqual(m.streamMessages.first?.text, "保存本文")
     _ = await m.close()
   }
+  func testDecisionActivitiesRemainDistinctAndTerminalStateClearsThem() async throws {
+    let t = RunTransport(); await t.setRun("running")
+    let m = try model(t); await m.start()
+    let activity: (String) -> ServiceValue = { phase in
+      .object(["run_id": .string("r"), "attempt_id": .string("a"), "phase": .string(phase)])
+    }
+    await t.enqueue([event("run.activity", activity("judging"), sequence: 1)])
+    await m.poll(); XCTAssertTrue(m.isJudging); XCTAssertFalse(m.isContextJudging)
+    await t.enqueue([event("run.activity", activity("context_judging"), sequence: 2)])
+    await m.poll(); XCTAssertFalse(m.isJudging); XCTAssertTrue(m.isContextJudging)
+    await t.enqueue([event("run.activity", activity("working"), sequence: 3)])
+    await m.poll(); XCTAssertFalse(m.isJudging); XCTAssertFalse(m.isContextJudging)
+    await t.enqueue([event("run.activity", activity("context_judging"), sequence: 4),
+      event("run.state", await t.run("succeeded"), sequence: 5)])
+    await m.poll(); XCTAssertFalse(m.isJudging); XCTAssertFalse(m.isContextJudging)
+    _ = await m.close()
+  }
   func testCancelACKDoesNotInventTerminalState() async throws {
     let t = RunTransport(); await t.setRun("running")
     let m = try model(t); await m.start()

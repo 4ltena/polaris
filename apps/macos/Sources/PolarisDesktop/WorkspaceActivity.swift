@@ -10,17 +10,20 @@ struct WorkspaceActivityView: View {
     @State private var expandedTaskID: String?
     @FocusState private var focused: String?
     private var inspected: WorkspaceTask? { activity.tasks.first { $0.id == inspectedTaskID } }
+    private var activeAgents: [WorkspaceAgent] {
+        activity.agents.filter { [.queued, .loading, .running, .cancelling].contains($0.status) }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text("現在の作業").font(.headline)
                 Text(activity.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Spacer(minLength: 0)
-                Button("子 \(activity.runningCount)") { agentsOpen.toggle() }
-                    .focused($focused, equals: "agents")
-                    .accessibilityLabel("実行中の子\(activity.runningCount)件、累計呼出\(activity.agents.count)回")
-                    .popover(isPresented: $agentsOpen, arrowEdge: .top) { agentPopover }
-                Button("作業一覧") { tasksOpen.toggle() }.focused($focused, equals: "tasks")
+            }
+            HStack(spacing: 7) {
+                Text("マイルストーン").font(.caption.weight(.medium))
+                Spacer(minLength: 0)
+                Button("一覧") { tasksOpen.toggle() }.focused($focused, equals: "tasks")
                     .popover(isPresented: $tasksOpen, arrowEdge: .top) { taskPopover }
             }
             HStack {
@@ -40,12 +43,35 @@ struct WorkspaceActivityView: View {
                     } else if let current = activity.tasks.first(where: { $0.status == .implementing }) {
                         Label(current.title, systemImage: "circle.dotted").font(.headline)
                     }
-                    ForEach(Array(activity.agents.filter { $0.status == .running || $0.status == .cancelling }.prefix(3))) { agent in
-                        HStack {
-                            Text(agent.title).lineLimit(1)
-                            Spacer()
-                            Text(agent.status.title).foregroundStyle(.secondary)
-                        }.font(.caption)
+                    Divider().padding(.vertical, 2)
+                    HStack(spacing: 7) {
+                        Text("Subagents").font(.caption.weight(.medium))
+                        Text("\(activeAgents.count)稼働中 / \(activity.agents.count)累計")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        Button("全て表示") { agentsOpen.toggle() }
+                            .focused($focused, equals: "agents")
+                            .accessibilityLabel("spawnしたsubagentを全て表示。稼働中\(activeAgents.count)件、累計\(activity.agents.count)件")
+                            .popover(isPresented: $agentsOpen, arrowEdge: .top) { agentPopover }
+                    }
+                    ForEach(activeAgents) { agent in
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text(agent.name).lineLimit(1)
+                                Text(agent.title).lineLimit(1).foregroundStyle(.secondary)
+                                Spacer()
+                                Text(agent.status.title).foregroundStyle(.secondary)
+                            }.font(.caption)
+                            Text("\(agent.model.title) · \(agent.model.destination) · \(agent.model.effort)")
+                                .font(.caption2.monospaced()).foregroundStyle(.secondary)
+                                .lineLimit(1).textSelection(.enabled)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("\(agent.name)、\(agent.title)、\(agent.status.title)、モデル \(agent.model.title)、接続先 \(agent.model.destination)、effort \(agent.model.effort)")
+                    }
+                    if activity.agents.isEmpty {
+                        Text("spawnしたsubagentはありません")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     Text("計画版：\(activity.planRevision)").font(.caption2).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -102,7 +128,8 @@ struct WorkspaceActivityView: View {
             if activity.agents.isEmpty { Text("子の呼出はありません").padding(12) }
             ForEach(activity.agents) { agent in
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(agent.title).font(.headline)
+                    Text(agent.name).font(.headline)
+                    Text(agent.title).font(.callout)
                     Text(agent.summary)
                     Text("\(agent.status.title) · " + (agent.attempt > 0 ? "試行\(agent.attempt)" : "試行番号未取得")).foregroundStyle(.secondary)
                     Text("\(agent.model.title) · \(agent.model.destination) · \(agent.model.effort)").font(.caption)

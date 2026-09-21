@@ -24,7 +24,7 @@ enum NativeWorkspaceSnapshot {
     static func make(binding: WorkspaceBinding?, payload: ServiceValue?,
                      files: [WorkspaceFile] = [], git: WorkspaceGit? = nil) -> WorkspaceSnapshot {
         guard let binding else {
-            return WorkspaceSnapshot(isDemo: false, projects: [], sections: [], conversations: [], models: [], activities: [])
+            return WorkspaceSnapshot(isDemo: false, projects: [], sections: [], conversations: [], models: [], activities: [], quota: nil)
         }
         let configuration = model(payload?["configuration"])
         let tasks = values(payload?["tasks"]).compactMap { value -> WorkspaceTask? in
@@ -54,7 +54,8 @@ enum NativeWorkspaceSnapshot {
             // The snapshot has no per-child model. Never attribute today's main model to an older child.
             let unknownModel = WorkspaceModelConfiguration(id: "unreported", title: "モデル未取得",
                 destination: "未取得", effort: "未取得", unavailableReason: "子の保存済みモデル情報は未取得です", supportsAttachments: false)
-            return WorkspaceAgent(id: attempt, title: run, summary: "保存済みの子実行", status: state,
+            return WorkspaceAgent(id: attempt, name: value["display_name"]?.string ?? run,
+                title: "保存済みの子実行", summary: "run ID：\(run)", status: state,
                 model: unknownModel, taskID: values(value["task_ids"]).first?.string ?? "", attempt: 0)
         }
         let activity = WorkspaceActivity(conversationID: binding.sessionID,
@@ -65,7 +66,8 @@ enum NativeWorkspaceSnapshot {
             projects: [WorkspaceProject(id: binding.projectID, name: URL(fileURLWithPath: binding.sourcePath).lastPathComponent,
                 source: binding.sourcePath, permission: nil, pinned: false, sectionID: nil)], sections: [],
             conversations: [WorkspaceConversation(id: binding.sessionID, projectID: binding.projectID,
-                title: "保存済みの会話", model: configuration, messages: [])], models: [configuration], activities: [activity])
+                title: "保存済みの会話", model: configuration, messages: [])], models: [configuration],
+            activities: [activity], quota: nil)
     }
 
     private static func values(_ value: ServiceValue?) -> [ServiceValue] {

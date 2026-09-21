@@ -308,12 +308,14 @@ async fn an_account_is_excluded_when_another_model_of_the_run_is_unknown() {
                 primary: Some(crate::quota::usage::RawUsageWindow {
                     usage_percent: Some(10.0),
                     window_minutes: Some(300),
+                    window_seconds: None,
                     resets_in_seconds: Some(600),
                     resets_at_unix_seconds: None,
                 }),
                 secondary: Some(crate::quota::usage::RawUsageWindow {
                     usage_percent: Some(20.0),
                     window_minutes: Some(10_080),
+                    window_seconds: None,
                     resets_in_seconds: Some(86_400),
                     resets_at_unix_seconds: None,
                 }),

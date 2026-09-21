@@ -18,6 +18,7 @@ fn raw(percent: f64, minutes: i128, resets_in: i128) -> RawUsageWindow {
     RawUsageWindow {
         usage_percent: Some(percent),
         window_minutes: Some(minutes),
+        window_seconds: None,
         resets_in_seconds: Some(resets_in),
         resets_at_unix_seconds: None,
     }
@@ -77,6 +78,42 @@ async fn a_response_keeps_every_field_the_upstream_normalizer_drops() {
 }
 
 #[tokio::test]
+async fn current_rate_limit_shape_preserves_windows_and_exhaustion() {
+    let body = serde_json::json!({"rate_limit": {
+        "allowed": false, "limit_reached": true,
+        "primary_window": {"used_percent": 100, "limit_window_seconds": 604800,
+            "reset_after_seconds": 600, "reset_at": 1800000000},
+        "secondary_window": {"used_percent": 12.5, "limit_window_seconds": 18000,
+            "reset_after_seconds": 120}
+    }});
+    let server = server(ResponseTemplate::new(200).set_body_json(body)).await;
+    let response = get(&server).await.unwrap();
+    assert_eq!(response.allowed, Some(false));
+    assert_eq!(response.limit_reached, Some(true));
+    assert_eq!(
+        response.primary.as_ref().unwrap().usage_percent,
+        Some(100.0)
+    );
+    let ObservationState::Known(known) = observe(&profile(true), &response, 1000).unwrap() else {
+        panic!("synthetic verified profile must normalize both windows");
+    };
+    assert_eq!(known.windows[0].window_millis, 604800000);
+    assert_eq!(known.windows[0].reset_unix_seconds, 1800000000);
+    assert_eq!(known.windows[1].window_millis, 18000000);
+    assert_eq!(known.windows[1].reset_unix_seconds, 1120);
+    assert_eq!(
+        known.bucket_states[0].availability,
+        ServerAvailability::Denied
+    );
+    assert_eq!(known.bucket_states[0].reached, ReachedState::Reached);
+    assert_eq!(
+        observe(&profile(false), &response, 1000).unwrap(),
+        ObservationState::MappingUnknown
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn a_bounded_failure_carries_a_category_without_the_response_body() {
     for (response, expected) in [
         (
@@ -132,6 +169,87 @@ fn an_unverified_profile_can_only_produce_an_unknown_mapping() {
         Some("chatgpt-primary-secondary")
     );
     assert!(profile_for("unknown-model").is_none());
+}
+
+#[test]
+fn current_shape_never_fills_missing_windows_from_other_shapes_or_buckets() {
+    let legacy = serde_json::json!({"allowed":true,"limit_reached":false,
+        "primary":{"used_percent":1,"window_minutes":300,"resets_in_seconds":600},
+        "secondary":{"used_percent":2,"window_minutes":10080,"resets_in_seconds":86400}});
+    assert_eq!(decode(&legacy), complete());
+    for current in [
+        serde_json::Value::Null,
+        serde_json::json!({
+            "allowed":false,"limit_reached":true,
+            "primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":1800000000},
+            "secondary_window":null
+        }),
+    ] {
+        let response = decode(&serde_json::json!({"rate_limit":current,
+            "rate_limit_status_details":legacy,"additional_rate_limits":[legacy]}));
+        assert_eq!(
+            observe(&profile(true), &response, 1000),
+            Err(ExclusionReason::InvalidObservation)
+        );
+        assert_ne!(response.allowed, Some(true));
+        assert!(response.secondary.is_none());
+    }
+}
+
+#[test]
+fn seconds_are_exact_and_invalid_numbers_are_not_rounded_or_defaulted() {
+    let window = serde_json::json!({"used_percent":12.5,"limit_window_seconds":61,"reset_after_seconds":120});
+    let body = serde_json::json!({"rate_limit":{"allowed":true,"limit_reached":false,
+        "primary_window":window,"secondary_window":window}});
+    let ObservationState::Known(known) = observe(&profile(true), &decode(&body), 1000).unwrap()
+    else {
+        panic!("non-minute window should remain exact");
+    };
+    assert_eq!(known.windows[0].window_millis, 61000);
+    for field in ["limit_window_seconds", "reset_after_seconds"] {
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("60"),
+            serde_json::json!(60.5),
+            serde_json::json!(true),
+        ] {
+            let mut malformed = body.clone();
+            malformed["rate_limit"]["primary_window"][field] = invalid;
+            assert_eq!(
+                observe(&profile(true), &decode(&malformed), 1000),
+                Err(ExclusionReason::InvalidObservation),
+                "{field}"
+            );
+        }
+    }
+    let mut overflow = body;
+    overflow["rate_limit"]["primary_window"]["limit_window_seconds"] = serde_json::json!(u64::MAX);
+    assert_eq!(
+        observe(&profile(true), &decode(&overflow), 1000),
+        Err(ExclusionReason::InvalidObservation)
+    );
+}
+
+#[test]
+fn exact_integer_float_notation_remains_compatible_without_fraction_truncation() {
+    let legacy = serde_json::from_str(
+        r#"{"allowed":true,"limit_reached":false,
+        "primary":{"used_percent":1,"window_minutes":300.0,"resets_in_seconds":6e2},
+        "secondary":{"used_percent":2,"window_minutes":1.008e4,"resets_in_seconds":86400.0}}"#,
+    )
+    .unwrap();
+    assert_eq!(decode(&legacy), complete());
+    for invalid in [
+        serde_json::json!(300.5),
+        serde_json::json!(9_007_199_254_740_992.0),
+    ] {
+        let mut body = legacy.clone();
+        body["primary"]["window_minutes"] = invalid;
+        assert_eq!(
+            observe(&profile(true), &decode(&body), 1000),
+            Err(ExclusionReason::InvalidObservation)
+        );
+    }
 }
 
 #[test]

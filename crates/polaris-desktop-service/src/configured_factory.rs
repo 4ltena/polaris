@@ -86,6 +86,8 @@ pub struct TrustedFactoryResources {
     /// Profile text and IDs are trusted startup data. The IPC surface may only
     /// select enabled/mode/initial phase from this fixed configuration.
     pub workflow: polaris_core::workflow::WorkflowConfig,
+    /// Frozen top-level project setting; the IPC/GUI cannot alter it.
+    pub input_preparation: polaris_core::input_preparation::InputPreparationMode,
     /// The typed judge, read from the same `[decision]` configuration the
     /// terminal reads. `None` is the ordinary state: every path that would
     /// ask it something works without an answer.
@@ -743,6 +745,10 @@ impl ConfiguredRunFactory {
 impl TrustedRunFactory for ConfiguredRunFactory {
     fn workflow_config(&self) -> Option<&polaris_core::workflow::WorkflowConfig> {
         Some(&self.resources.workflow)
+    }
+
+    fn input_preparation(&self) -> polaris_core::input_preparation::InputPreparationMode {
+        self.resources.input_preparation
     }
 
     fn decider(&self) -> Option<Arc<dyn polaris_provider::decision::Decider>> {

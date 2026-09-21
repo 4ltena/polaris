@@ -105,6 +105,7 @@ fn preparation_error(error: crate::mcp::runtime::Error, control: &EventControl) 
 
 fn install(session: &mut Session, history: &OwnerRequestHistory) -> String {
     session.messages = history.messages().to_vec();
+    session.input_source = history.input_source();
     history.query().to_owned()
 }
 

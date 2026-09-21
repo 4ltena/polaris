@@ -20,6 +20,7 @@ use polaris_provider::openai::OpenAiProvider;
 use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
 mod account;
+mod benchmark_report;
 mod compare;
 mod decided;
 mod handoff;
@@ -27,6 +28,8 @@ mod mcp;
 mod memory;
 mod setting;
 mod spare;
+#[cfg(test)]
+mod strict_history_tests;
 mod sync;
 
 #[derive(Parser)]
@@ -664,6 +667,7 @@ fn strict_history(
     private_root: &Path,
     attempt_ledger: polaris_provider::attempts::AttemptLedger,
     parent_id: &str,
+    decider: Option<std::sync::Arc<dyn polaris_provider::decision::Decider>>,
 ) -> Result<
     (
         std::sync::Arc<polaris_core::conversation_memory::StrictHistory>,
@@ -724,12 +728,19 @@ fn strict_history(
         .map_err(|e| e.to_string())?;
     embedder.attempt_ledger = Some(attempt_ledger);
     Ok((
-        std::sync::Arc::new(polaris_core::conversation_memory::StrictHistory::new(
-            summary,
-            std::sync::Arc::new(embedder),
-        )),
+        build_strict_history(summary, std::sync::Arc::new(embedder), decider),
         usage,
     ))
+}
+
+fn build_strict_history(
+    summary: std::sync::Arc<dyn polaris_core::conversation_memory::StrictSummaryProvider>,
+    embedder: std::sync::Arc<dyn polaris_core::conversation_memory::StrictEmbedder>,
+    decider: Option<std::sync::Arc<dyn polaris_provider::decision::Decider>>,
+) -> std::sync::Arc<polaris_core::conversation_memory::StrictHistory> {
+    std::sync::Arc::new(
+        polaris_core::conversation_memory::StrictHistory::new(summary, embedder).judged_by(decider),
+    )
 }
 
 #[async_trait::async_trait]
@@ -1104,6 +1115,7 @@ async fn main() -> ExitCode {
         .history_mode
         .map(polaris_core::conversation_state::HistoryMode::from)
         .unwrap_or(config.history_mode);
+    let input_preparation = config.input_preparation;
     let project_id = match polaris_tui::persist::project_identity(&project_root) {
         Ok(id) => id,
         Err(error) => {
@@ -1561,6 +1573,7 @@ async fn main() -> ExitCode {
         let private_root = data_root.to_path_buf();
         let ledger = attempt_ledger.clone();
         let parent_id = attempt_parent_id.clone();
+        let decider = decider.clone();
         std::sync::Arc::new(move || {
             if embedding.runtime.is_none()
                 || embedding.model_path.is_none()
@@ -1576,6 +1589,7 @@ async fn main() -> ExitCode {
                 &private_root,
                 ledger.clone(),
                 &parent_id,
+                decider.clone(),
             )
         })
     };
@@ -1636,6 +1650,13 @@ async fn main() -> ExitCode {
     };
     #[cfg(not(unix))]
     let always_on = prompt::assemble_always_on(&constitution, &environment, &discovered.skills);
+    let always_on = match always_on.with_project_root(&project_root) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            eprintln!("プロジェクトの参照先を設定できません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match args.prompt.clone() {
         Some(prompt) => {
@@ -1647,6 +1668,7 @@ async fn main() -> ExitCode {
                     as std::sync::Arc<dyn polaris_provider::Provider>
             });
             let mut session = Session::new();
+            session.input_preparation = input_preparation;
             session.disable_files_md_auto_regenerate = !config.files_md_auto_regenerate;
             session.approval_auto = config.approval_auto;
             session.tier_decider = tier_decider.clone();
@@ -1745,6 +1767,41 @@ async fn main() -> ExitCode {
                 eprintln!("v2セッションを接続できません: {error}");
                 return ExitCode::FAILURE;
             }
+            let benchmark = benchmark_report::BenchmarkReport::from_environment();
+            let root_effort = initial_effort_name.as_deref().unwrap_or("default");
+            let history_mode_name = match history_mode {
+                polaris_core::conversation_state::HistoryMode::Legacy => "legacy",
+                polaris_core::conversation_state::HistoryMode::Strict10 => "strict10",
+                polaris_core::conversation_state::HistoryMode::Structured10 => "structured10",
+            };
+            let tool_memory = match args.tool_memory {
+                ToolMemoryArg::Off => "off",
+                ToolMemoryArg::History => "reference",
+                ToolMemoryArg::Retrieval => "retrieval",
+            };
+            let (workflow_enabled, workflow_mode) = match session.workflow.as_ref() {
+                Some(workflow) => (
+                    workflow.config.enabled,
+                    match workflow.config.mode {
+                        polaris_core::workflow::WorkflowMode::Manual => "manual",
+                        polaris_core::workflow::WorkflowMode::Adaptive => "adaptive",
+                    },
+                ),
+                None => (false, "manual"),
+            };
+            benchmark.configured(benchmark_report::Configured {
+                root_model: &model_name,
+                root_effort,
+                decision_enabled: config.decision.enabled,
+                decision_active: decider.is_some(),
+                decision_model: config.decision.model.as_deref().unwrap_or("jev-latest"),
+                tiers: benchmark_report::effective_tiers(&config.tiers, &model_name, root_effort),
+                history_mode: history_mode_name,
+                tool_memory,
+                workflow_enabled,
+                workflow_mode,
+            });
+
             if session.strict_history.is_some()
                 && args.resume.is_some()
                 && let Err(error) = session.recover_history().await
@@ -1943,6 +2000,12 @@ async fn main() -> ExitCode {
                     eprintln!("{line}");
                 }
             }
+            benchmark.completed(
+                outcome.is_ok(),
+                decision_meter.snapshot(),
+                usage_meter.by_model(),
+                usage_meter.snapshot(),
+            );
             match outcome {
                 Ok(outcome) => {
                     println!("{}", outcome.text);
@@ -2074,6 +2137,7 @@ async fn main() -> ExitCode {
                 workflow_config: config.workflow,
                 initial_phase: args.phase.map(Phase::from),
                 history_mode,
+                input_preparation,
                 continuation,
                 workflow_mode_overridden: args.workflow_mode.is_some(),
                 strict_history: configured_strict

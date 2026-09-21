@@ -9,6 +9,8 @@ use serde::Deserialize;
 pub struct Config {
     /// Strict history is opt-in and requires a pinned local embedding backend.
     pub history_mode: crate::conversation_state::HistoryMode,
+    /// Reversible preparation for eligible new root inputs. Off unless explicitly set.
+    pub input_preparation: crate::input_preparation::InputPreparationMode,
     pub embedding: EmbeddingConfig,
     /// Built-in workflow skills are enabled unless configuration explicitly opts out.
     pub workflow: crate::workflow::WorkflowConfig,
@@ -122,6 +124,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             history_mode: crate::conversation_state::HistoryMode::Legacy,
+            input_preparation: crate::input_preparation::InputPreparationMode::Off,
             embedding: EmbeddingConfig::default(),
             workflow: crate::workflow::WorkflowConfig {
                 enabled: true,
@@ -151,6 +154,7 @@ impl Default for Config {
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     history_mode: Option<crate::conversation_state::HistoryMode>,
+    input_preparation: Option<crate::input_preparation::InputPreparationMode>,
     #[serde(default)]
     embedding: EmbeddingConfig,
     #[serde(default)]
@@ -499,11 +503,18 @@ fn read_one<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Co
 /// stage with an empty list — there needs to be a way to declare that when
 /// personal skills should not be carried into a given project.
 pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Config, ConfigError> {
+    try_load_layers(&[global, project])
+}
+
+fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
     let mut merged = Config::default();
-    for path in [global, project].into_iter().flatten() {
+    for path in paths.iter().copied().flatten() {
         if let Some(raw) = read_one::<RawConfig>(path)? {
             if let Some(mode) = raw.history_mode {
                 merged.history_mode = mode;
+            }
+            if let Some(mode) = raw.input_preparation {
+                merged.input_preparation = mode;
             }
             if raw.embedding.runtime.is_some() {
                 merged.embedding.runtime = raw.embedding.runtime;
@@ -583,6 +594,27 @@ pub fn try_load_workflow_from(
     Ok(merged)
 }
 
+/// Reads only input preparation so desktop startup can freeze the same
+/// top-level setting without coupling it to optional workflow state.
+pub fn try_load_input_preparation_from(
+    global: Option<&Path>,
+    project: Option<&Path>,
+) -> Result<crate::input_preparation::InputPreparationMode, ConfigError> {
+    #[derive(Deserialize)]
+    struct InputPreparationOnly {
+        input_preparation: Option<crate::input_preparation::InputPreparationMode>,
+    }
+    let mut mode = crate::input_preparation::InputPreparationMode::Off;
+    for path in [global, project].into_iter().flatten() {
+        if let Some(raw) = read_one::<InputPreparationOnly>(path)?
+            && let Some(written) = raw.input_preparation
+        {
+            mode = written;
+        }
+    }
+    Ok(mode)
+}
+
 /// Reads only the judge's configuration, so an owner that cannot start
 /// feature X does not lose the judge with it — the same reason
 /// `try_load_workflow_from` exists.
@@ -604,17 +636,55 @@ pub fn try_load_decision_from(
     Ok(merged)
 }
 
-/// Resolves and reads `~/.polaris/config.toml` and `<project-root>/.polaris/config.toml`.
+/// Resolves the installer-managed resource pins, then the user and project
+/// configs. Explicit user configuration remains authoritative.
 pub fn load(project_root: &Path) -> Result<Config, ConfigError> {
-    let global =
-        std::env::var_os("HOME").map(|h| Path::new(&h).join(".polaris").join("config.toml"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let managed = home
+        .as_ref()
+        .map(|h| h.join(".polaris").join("managed-resources.toml"));
+    let global = home
+        .as_ref()
+        .map(|h| h.join(".polaris").join("config.toml"));
     let project = project_root.join(".polaris").join("config.toml");
-    try_load_from(global.as_deref(), Some(&project))
+    try_load_layers(&[managed.as_deref(), global.as_deref(), Some(&project)])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_resource_pins_are_defaults_below_user_and_project_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = write(
+            directory.path(),
+            "[embedding]\nruntime='/managed/python'\nmodel_path='/managed/small'\nrevision='small-fixed'\npreselect_model_path='/managed/base'\npreselect_revision='base-fixed'\n",
+        );
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "[embedding]\nruntime='/user/python'\n").unwrap();
+        let project = directory.path().join("project.toml");
+        std::fs::write(&project, "[embedding]\nrevision='project-small'\n").unwrap();
+
+        let config = try_load_layers(&[Some(&managed), Some(&global), Some(&project)]).unwrap();
+        assert_eq!(
+            config.embedding.runtime,
+            Some(PathBuf::from("/user/python"))
+        );
+        assert_eq!(
+            config.embedding.model_path,
+            Some(PathBuf::from("/managed/small"))
+        );
+        assert_eq!(config.embedding.revision.as_deref(), Some("project-small"));
+        assert_eq!(
+            config.embedding.preselect_model_path,
+            Some(PathBuf::from("/managed/base"))
+        );
+        assert_eq!(
+            config.embedding.preselect_revision.as_deref(),
+            Some("base-fixed")
+        );
+    }
 
     /// `is_empty` is what the CLI keys its "the ladder is inert" warning
     /// off, so it has to mean exactly "no weight buys anything different".
@@ -698,6 +768,52 @@ mod tests {
         ] {
             assert!(load(refused).is_err(), "{refused}");
         }
+    }
+
+    #[test]
+    fn input_preparation_is_off_by_default_and_project_value_overrides() {
+        use crate::input_preparation::InputPreparationMode;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        assert_eq!(
+            try_load_from(None, None).unwrap().input_preparation,
+            InputPreparationMode::Off
+        );
+        std::fs::write(&path, "input_preparation = \"repeat_refs\"\n").unwrap();
+        assert_eq!(
+            try_load_from(None, Some(&path)).unwrap().input_preparation,
+            InputPreparationMode::RepeatRefs
+        );
+        let project = tempfile::tempdir().unwrap();
+        let project_path = write(project.path(), "input_preparation = 'off'\n");
+        assert_eq!(
+            try_load_from(Some(&path), Some(&project_path))
+                .unwrap()
+                .input_preparation,
+            InputPreparationMode::Off
+        );
+        assert_eq!(
+            try_load_input_preparation_from(Some(&path), Some(&project_path)).unwrap(),
+            InputPreparationMode::Off
+        );
+        std::fs::write(&path, "input_preparation = \"unknown\"\n").unwrap();
+        assert!(try_load_from(None, Some(&path)).is_err());
+    }
+
+    #[test]
+    fn input_preparation_only_loader_ignores_unrelated_configuration_fields() {
+        use crate::input_preparation::InputPreparationMode;
+        let directory = tempfile::tempdir().unwrap();
+        let path = write(
+            directory.path(),
+            "input_preparation = 'repeat_refs'\n[workflow]\nunknown_option = true\n[embedding]\nprovider = 42\n",
+        );
+        assert_eq!(
+            try_load_input_preparation_from(None, Some(&path)).unwrap(),
+            InputPreparationMode::RepeatRefs
+        );
+        let path = write(directory.path(), "input_preparation = 'unknown'\n");
+        assert!(try_load_input_preparation_from(None, Some(&path)).is_err());
     }
 
     /// Nothing starts unless all three are written down. A default path

@@ -6,6 +6,8 @@ mod clipboard;
 #[cfg(test)]
 mod continuation_tests;
 pub mod input;
+#[cfg(test)]
+mod input_preparation_tests;
 mod memory;
 pub mod onboarding;
 pub mod persist;
@@ -101,6 +103,8 @@ pub struct RunArgs<'a> {
     /// CLI input can override the configured initial phase for this launch.
     pub initial_phase: Option<polaris_core::workflow::Phase>,
     pub history_mode: polaris_core::conversation_state::HistoryMode,
+    /// Frozen at root-session creation from top-level `input_preparation`.
+    pub input_preparation: polaris_core::input_preparation::InputPreparationMode,
     /// CLI has already resolved this target against the selected project.  The
     /// TUI must not retry that lookup or fall back to a fresh session.
     pub continuation: Option<PreparedContinuation>,
@@ -130,6 +134,7 @@ struct WorkflowSessionArgs<'a> {
     config: &'a polaris_core::workflow::WorkflowConfig,
     initial_phase: Option<polaris_core::workflow::Phase>,
     history_mode: polaris_core::conversation_state::HistoryMode,
+    input_preparation: polaris_core::input_preparation::InputPreparationMode,
     cwd: &'a std::path::Path,
     state_dir: &'a std::path::Path,
     sessions_dir: &'a std::path::Path,
@@ -227,6 +232,7 @@ async fn new_workflow_session(
         config,
         initial_phase,
         history_mode,
+        input_preparation,
         cwd,
         state_dir,
         sessions_dir,
@@ -240,6 +246,7 @@ async fn new_workflow_session(
         skills,
     } = args;
     let mut session = polaris_core::session::Session::new();
+    session.input_preparation = input_preparation;
     session.disable_files_md_auto_regenerate = !files_md_auto_regenerate;
     session.approval_auto = approval_auto;
     session.strict_history = strict_history;
@@ -634,6 +641,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         config: &args.workflow_config,
         initial_phase: args.initial_phase,
         history_mode: args.history_mode,
+        input_preparation: args.input_preparation,
         cwd: &args.cwd,
         state_dir: &args.state_dir,
         sessions_dir: &args.sessions_dir,
@@ -2311,6 +2319,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
             .map_err(|error| error.to_string())?;
             let mut restored = polaris_core::session::Session::new();
             restored.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
+            restored.input_preparation = session.input_preparation;
             restored.strict_history = strict_history;
             restored.summary_usage = summary_usage;
             restored.examples = examples;
@@ -2379,6 +2388,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 ) {
                     Ok(persistence) => {
                         let mut imported = polaris_core::session::Session::new();
+                        imported.input_preparation = session.input_preparation;
                         imported.disable_files_md_auto_regenerate =
                             disable_files_md_auto_regenerate;
                         imported.workflow = workflow;
@@ -2404,6 +2414,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 }
             } else {
                 loaded.disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+                loaded.input_preparation = session.input_preparation;
                 *session = loaded;
             }
             *session_started_at_millis = persist::read_meta(&new_meta_path)
@@ -2443,6 +2454,7 @@ fn handle_new_session(
         let summary_usage = session.summary_usage.clone();
         let examples = session.examples.clone();
         let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+        let input_preparation = session.input_preparation;
         let snapshot = match previous.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2452,6 +2464,7 @@ fn handle_new_session(
         };
         let mut next = polaris_core::session::Session::new();
         next.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
+        next.input_preparation = input_preparation;
         if let Some(workflow) = &session.workflow {
             next.workflow = Some(polaris_core::workflow::SessionWorkflow::new(
                 workflow.config.clone(),
@@ -2481,8 +2494,10 @@ fn handle_new_session(
         }
     } else {
         let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+        let input_preparation = session.input_preparation;
         *session = polaris_core::session::Session::default();
         session.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
+        session.input_preparation = input_preparation;
     }
     *session_path = sessions_dir.join(format!("{}.jsonl", new_session_id()));
     *meta_path = session_path.with_extension("meta.json");
@@ -2513,6 +2528,7 @@ fn handle_fork(
         let summary_usage = session.summary_usage.clone();
         let examples = session.examples.clone();
         let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+        let input_preparation = session.input_preparation;
         let workflow_config = session
             .workflow
             .as_ref()
@@ -2520,6 +2536,7 @@ fn handle_fork(
         let persistence = previous.fork("");
         let mut next = polaris_core::session::Session::new();
         next.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
+        next.input_preparation = input_preparation;
         next.strict_history = strict_history;
         next.summary_usage = summary_usage;
         next.examples = examples;
@@ -4532,6 +4549,7 @@ mod tests {
                 initial_phase: None,
                 approval_auto: config.approval_auto,
                 history_mode: config.history_mode,
+                input_preparation: config.input_preparation,
                 cwd: dir.path(),
                 state_dir: dir.path(),
                 sessions_dir: &sessions_dir,
@@ -4598,6 +4616,7 @@ mod tests {
             initial_phase: None,
             approval_auto: polaris_core::approval::AutoApproval::default(),
             history_mode: polaris_core::conversation_state::HistoryMode::Legacy,
+            input_preparation: polaris_core::input_preparation::InputPreparationMode::Off,
             cwd: dir.path(),
             state_dir: dir.path(),
             sessions_dir: &dir.path().join("sessions"),

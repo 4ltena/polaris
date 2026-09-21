@@ -1,5 +1,6 @@
 //! Production composition, owned until both IPC channels and engine have drained.
-//! No environment-selected credentials, catalogs, executable or permission grants.
+//! No environment-selected catalogs, executable or permission grants. The native
+//! owner may pass only the optional Jev credential selected in setup.
 use crate::*;
 use polaris_core::{
     audit::AuditLog,
@@ -13,9 +14,12 @@ use polaris_core::{
     prompt::assemble_always_on,
 };
 use polaris_provider::local::{Endpoint, LocalAdapter, Runtime};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     os::fd::{AsRawFd, FromRawFd},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -158,6 +162,135 @@ fn physical_executable(path: &Path) -> PathBuf {
         }
     }
     path.to_owned()
+}
+
+fn apply_native_decision_selection(
+    decision: &mut polaris_core::config::DecisionConfig,
+    selected: Result<String, std::env::VarError>,
+) -> Result<(), StartupError> {
+    match selected.as_deref() {
+        Ok("1") => decision.enabled = true,
+        Ok("0") => decision.enabled = false,
+        Err(std::env::VarError::NotPresent) => {}
+        _ => return Err(StartupError::Generic),
+    }
+    Ok(())
+}
+
+const MANAGED_RUST_VERSION: &str = "1.96.0";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedDependencyReceipt {
+    schema_version: u32,
+    id: String,
+    version: String,
+    manifest_sha256: String,
+    installed_at: String,
+}
+
+fn managed_rust_toolchain(
+    home: &Path,
+    executable: &Path,
+) -> Result<Option<polaris_core::isolated_run::toolchains::RelocatablePackage>, StartupError> {
+    let root = home
+        .join(".polaris/toolchains/rust")
+        .join(MANAGED_RUST_VERSION);
+    match std::fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(StartupError::Generic),
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(StartupError::Generic),
+    }
+    let app_root = executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or(StartupError::Generic)?;
+    let manifest_path =
+        app_root.join("PolarisDesktop_PolarisDesktop.bundle/runtime-dependencies.json");
+    let manifest_metadata =
+        std::fs::symlink_metadata(&manifest_path).map_err(|_| StartupError::Generic)?;
+    if !manifest_metadata.file_type().is_file()
+        || manifest_metadata.file_type().is_symlink()
+        || manifest_metadata.len() > 512 * 1024
+    {
+        return Err(StartupError::Generic);
+    }
+    let manifest = std::fs::read(&manifest_path).map_err(|_| StartupError::Generic)?;
+    let document: serde_json::Value =
+        serde_json::from_slice(&manifest).map_err(|_| StartupError::Generic)?;
+    let architecture = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        return Err(StartupError::Generic);
+    };
+    let matches = document
+        .get("dependencies")
+        .and_then(|value| value.as_array())
+        .ok_or(StartupError::Generic)?
+        .iter()
+        .filter(|entry| {
+            entry.get("id").and_then(|v| v.as_str()) == Some("rust")
+                && entry.get("version").and_then(|v| v.as_str()) == Some(MANAGED_RUST_VERSION)
+                && entry.get("platform").and_then(|v| v.as_str()) == Some("macos")
+                && entry.get("architecture").and_then(|v| v.as_str()) == Some(architecture)
+                && entry.get("required_executable").and_then(|v| v.as_str()) == Some("bin/rustc")
+        })
+        .count();
+    if document.get("schema_version").and_then(|v| v.as_u64()) != Some(1) || matches != 1 {
+        return Err(StartupError::Generic);
+    }
+    let manifest_hash = Sha256::digest(&manifest)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let receipt_path = root
+        .parent()
+        .ok_or(StartupError::Generic)?
+        .join(format!(".{MANAGED_RUST_VERSION}.receipt.json"));
+    let receipt_metadata =
+        std::fs::symlink_metadata(&receipt_path).map_err(|_| StartupError::Generic)?;
+    if !receipt_metadata.file_type().is_file()
+        || receipt_metadata.file_type().is_symlink()
+        || receipt_metadata.len() > 16 * 1024
+    {
+        return Err(StartupError::Generic);
+    }
+    let receipt: ManagedDependencyReceipt =
+        serde_json::from_slice(&std::fs::read(&receipt_path).map_err(|_| StartupError::Generic)?)
+            .map_err(|_| StartupError::Generic)?;
+    if receipt.schema_version != 1
+        || receipt.id != "rust"
+        || receipt.version != MANAGED_RUST_VERSION
+        || receipt.manifest_sha256 != manifest_hash
+        || receipt.installed_at.is_empty()
+        || receipt.installed_at.len() > 128
+    {
+        return Err(StartupError::Generic);
+    }
+    for path in [&root, &root.join("bin"), &root.join("bin/rustc")] {
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| StartupError::Generic)?;
+        if metadata.file_type().is_symlink()
+            || !matches!(metadata.uid(), 0) && metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o002 != 0
+        {
+            return Err(StartupError::Generic);
+        }
+    }
+    let rustc =
+        std::fs::symlink_metadata(root.join("bin/rustc")).map_err(|_| StartupError::Generic)?;
+    if !rustc.file_type().is_file() || rustc.permissions().mode() & 0o111 == 0 {
+        return Err(StartupError::Generic);
+    }
+    Ok(Some(
+        polaris_core::isolated_run::toolchains::RelocatablePackage {
+            root,
+            bin_dirs: vec![PathBuf::from("bin")],
+        },
+    ))
 }
 
 fn start_at(
@@ -362,6 +495,16 @@ fn start_at(
         ),
     };
     let workflow = runtime_workflow.config.clone();
+    let input_preparation = match polaris_core::config::try_load_input_preparation_from(
+        Some(&home.join(".polaris/config.toml")),
+        Some(&args.confirmed_source_path.join(".polaris/config.toml")),
+    ) {
+        Ok(mode) => mode,
+        // A reconnect already has authoritative saved state. An unreadable
+        // optional optimization must retain its original-input request path.
+        Err(_) if saved.state.workflow.is_some() => Default::default(),
+        Err(_) => return Err(StartupError::Generic),
+    };
     // The same `[decision]` table the terminal reads, from the same two
     // pinned paths. The key stays in the environment: a configuration file
     // is shared, a credential is not.
@@ -370,11 +513,14 @@ fn start_at(
     // works without an answer, so refusing to start over an optional
     // optimization would cost more than it protects — and the owner
     // already starts on a saved workflow when this same file is malformed.
-    let decision = polaris_core::config::try_load_decision_from(
+    let mut decision = polaris_core::config::try_load_decision_from(
         Some(&home.join(".polaris/config.toml")),
         Some(&args.confirmed_source_path.join(".polaris/config.toml")),
     )
     .unwrap_or_default();
+    // The native setup selection is explicit and overrides the shareable TOML
+    // for this owner. The key itself remains outside every config and argv.
+    apply_native_decision_selection(&mut decision, std::env::var("POLARIS_JEV_ENABLED"))?;
     let decider = polaris_core::decision_bands::from_configuration(&decision);
     if workflow.enabled && runtime_workflow.begin_turn(&skills.skills).is_err() {
         return Err(StartupError::Generic);
@@ -398,27 +544,11 @@ fn start_at(
         read_allowed: true,
         write_allowed: doc.tier != BootstrapTier::ReadOnly,
     };
-    // Build tiers require actual relocatable packages; never turn an empty
-    // toolchain into a successful build capability or allow a host-wide fallback.
-    let packages_root = resources_root.join("toolchains");
-    let mut packages = Vec::new();
-    if packages_root.is_dir() {
-        for entry in std::fs::read_dir(&packages_root).map_err(|_| StartupError::Generic)? {
-            let entry = entry.map_err(|_| StartupError::Generic)?;
-            if !entry
-                .file_type()
-                .map_err(|_| StartupError::Generic)?
-                .is_dir()
-            {
-                return Err(StartupError::Generic);
-            }
-            packages.push(polaris_core::isolated_run::toolchains::RelocatablePackage {
-                root: entry.path(),
-                bin_dirs: vec![PathBuf::from("bin")],
-            });
-        }
-        packages.sort_by(|a, b| a.root.cmp(&b.root));
-    }
+    // Build tiers require the exact Polaris-managed toolchain. Never adopt a
+    // host PATH toolchain or bytes copied into the application package.
+    let packages = managed_rust_toolchain(home, executable)?
+        .into_iter()
+        .collect::<Vec<_>>();
     if packages.is_empty()
         && matches!(
             doc.tier,
@@ -460,6 +590,7 @@ fn start_at(
         history,
         mcp,
         workflow,
+        input_preparation,
         decider,
     };
     let limits = OwnerLaunchLimits {

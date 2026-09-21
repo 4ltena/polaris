@@ -162,7 +162,16 @@ impl PersistedSession {
         starts_turn: bool,
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<()> {
-        self.update(&[(message, starts_turn)], workflow)
+        self.update(&[(message, starts_turn)], workflow).map(|_| ())
+    }
+
+    /// Return the identity produced by the same locked append/publication.
+    pub(crate) fn append_input(
+        &self,
+        message: Message,
+        workflow: Option<&SessionWorkflow>,
+    ) -> io::Result<Option<crate::request_input::SourceBinding>> {
+        self.update(&[(message, true)], workflow)
     }
 
     /// Publishes a completed assistant/tool suffix and its workflow checkpoint
@@ -178,18 +187,18 @@ impl PersistedSession {
             .cloned()
             .map(|message| (message, false))
             .collect();
-        self.update(&events, workflow)
+        self.update(&events, workflow).map(|_| ())
     }
 
     pub fn checkpoint(&self, workflow: Option<&SessionWorkflow>) -> io::Result<()> {
-        self.update(&[], workflow)
+        self.update(&[], workflow).map(|_| ())
     }
 
     fn update(
         &self,
         events: &[(Message, bool)],
         workflow: Option<&SessionWorkflow>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<crate::request_input::SourceBinding>> {
         let mut cursor = self.cursor()?;
         let mut lock = self.store.lock()?;
         let before = lock.snapshot()?;
@@ -214,10 +223,12 @@ impl PersistedSession {
             let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
             return memory
                 .with_conversation_marker(&published_view(&before.state)?, || Ok(()))
+                .map(|_| None)
                 .map_err(io::Error::other);
         }
         let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
         // The old writer's forget is serialized with both raw append and marker.
+        let mut source = None;
         memory
             .with_conversation_marker(&published_view(&before.state)?, || {
                 crate::conversation_memory::reject_unpublished_structured_attempt(
@@ -237,11 +248,22 @@ impl PersistedSession {
                     next.gates = workflow.gates.clone();
                 }
                 lock.publish(&snapshot, next)?;
+                source = events
+                    .last()
+                    .filter(|(_, starts_turn)| *starts_turn)
+                    .and_then(|_| {
+                        snapshot.events.last().and_then(|event| {
+                            crate::request_input::SourceBinding::from_event(
+                                &snapshot.state.session_id,
+                                event,
+                            )
+                        })
+                    });
                 Ok(())
             })
             .map_err(io::Error::other)?;
         *cursor = before.state.generation + 1;
-        Ok(())
+        Ok(source)
     }
 
     pub fn clear(&self) -> io::Result<()> {

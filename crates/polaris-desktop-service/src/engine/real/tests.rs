@@ -434,6 +434,7 @@ fn fixture_with_history_and_workflow(
             allowed_tools: vec![],
             access: polaris_skills::agent_type::AgentAccess::Read,
             tier: polaris_skills::Tier::Subgiant,
+            tier_min: polaris_skills::Tier::Dwarf,
             wall_seconds: 5,
             max_turns: 2,
             workflow_phase: None,
@@ -475,6 +476,7 @@ fn fixture_with_history_and_workflow(
 }
 
 mod mcp_tests;
+mod project_routes;
 mod structured_tests;
 
 type RecordedRequests = Arc<std::sync::Mutex<Vec<CompletionRequest>>>;
@@ -2061,6 +2063,7 @@ fn real_child_spawn_saved_before_update_and_snapshot_count_is_distinct() {
     assert_eq!(child.child.state, RunState::Succeeded);
     assert_eq!(child.agent_type, "child-fixture");
     assert_eq!(child.task, "child fixture");
+    assert_eq!(child.child.display_name.as_deref(), Some("Sirius"));
     assert_eq!(child.child.task_ids, saved.state.runs[0].run.task_ids);
     assert!(saved.state.tasks.is_empty());
     assert_eq!(saved.state.runs[0].run.state, RunState::Succeeded);
@@ -2200,6 +2203,7 @@ fn real_child_update_is_returned_only_after_persistence_and_rejects_reversal() {
     let Some(EventBody::ChildUpdated(child)) = update else {
         panic!("missing saved update");
     };
+    assert_eq!(child.display_name.as_deref(), Some("Sirius"));
     assert_eq!(
         engine.store.snapshot().unwrap().state.children[0].child,
         child
@@ -3267,7 +3271,8 @@ fn the_activity_follows_events_and_a_person_outranks_work_in_flight() {
     real.refresh_activity(false);
     assert_eq!(real.activity, Some(Activity::Idle));
 
-    real.observe_activity(&AgentEvent::ModelRequestStarted { turn: 1 });
+    real.observe_activity(&AgentEvent::ModelRequestStarted { turn: 1 })
+        .unwrap();
     real.refresh_activity(false);
     assert_eq!(
         real.activity,
@@ -3291,9 +3296,55 @@ fn the_activity_follows_events_and_a_person_outranks_work_in_flight() {
         })
     );
 
-    real.observe_activity(&AgentEvent::ModelRequestFinished { turn: 1, ok: true });
+    real.observe_activity(&AgentEvent::ModelRequestFinished { turn: 1, ok: true })
+        .unwrap();
     real.refresh_activity(false);
     assert_eq!(real.activity, Some(Activity::Idle));
+}
+
+#[test]
+fn decision_activity_is_balanced_and_only_publishes_outer_transitions() {
+    use polaris_desktop_protocol::event::{EventBody, RunActivityPhase};
+    let target = RunTarget {
+        run_id: RunId::new("judging-run").unwrap(),
+        attempt_id: AttemptId::new("judging-attempt").unwrap(),
+    };
+    let (sink, events, _control) =
+        polaris_core::desktop_events::DesktopEventSink::channel(target.run_id.clone());
+    let mut real = RealRun::queued();
+    real.events = Some(events);
+
+    for event in [
+        AgentEvent::DecisionStarted,
+        AgentEvent::DecisionStarted,
+        AgentEvent::DecisionFinished,
+        AgentEvent::DecisionFinished,
+    ] {
+        polaris_core::desktop_events::EventSink::from(sink.clone())
+            .send(event)
+            .unwrap();
+    }
+    let updates = real.poll(&target, None).unwrap();
+    assert_eq!(updates.len(), 2);
+    assert!(matches!(
+        &updates[0],
+        EventBody::RunActivity(activity)
+            if activity.run_id == target.run_id
+                && activity.attempt_id == target.attempt_id
+                && activity.phase == RunActivityPhase::Judging
+    ));
+    assert!(matches!(
+        &updates[1],
+        EventBody::RunActivity(activity) if activity.phase == RunActivityPhase::Working
+    ));
+
+    polaris_core::desktop_events::EventSink::from(sink)
+        .send(AgentEvent::DecisionFinished)
+        .unwrap();
+    assert!(matches!(
+        real.poll(&target, None),
+        Err(ServiceError::Worker)
+    ));
 }
 
 /// M6-3: a goal does not occupy the conversation. While a run is going, a new

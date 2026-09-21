@@ -106,6 +106,7 @@ pub struct DesktopMemory {
 #[derive(Debug)]
 pub struct PreparedDesktopHistory {
     pub messages: Vec<Message>,
+    pub(crate) input_source: Option<crate::request_input::BoundInput>,
     pub evidence: Option<Message>,
     pub observation: crate::conversation_memory::observation::MemoryObservation,
 }
@@ -296,6 +297,7 @@ impl DesktopMemory {
             // Only an acknowledged Ready may expose a successful or blocked observation.
             let request = request.require_dispatch()?;
             return Ok(PreparedDesktopHistory {
+                input_source: history.input_source(),
                 messages: history.into_messages(),
                 evidence: request.text.map(Message::user),
                 observation: request.observation,
@@ -320,6 +322,7 @@ impl DesktopMemory {
             })
             .await?;
         Ok(PreparedDesktopHistory {
+            input_source: history.input_source(),
             messages: history.into_messages(),
             evidence: request.text.map(Message::user),
             observation: request.observation,

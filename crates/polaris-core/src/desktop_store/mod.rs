@@ -13,6 +13,7 @@ mod memory;
 mod model;
 mod roles;
 mod source_apply;
+mod star_names;
 mod workflow;
 mod writer;
 

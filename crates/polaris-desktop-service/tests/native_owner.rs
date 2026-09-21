@@ -155,7 +155,7 @@ async fn native_owner_main_and_recovery_hello_then_eof_release_store() {
         b"---\nname: verify\ndescription: Verify a change.\n---\nInspect the result.\n",
         0o600,
     );
-    put(&contents.join("Resources/agents/inspector/SKILL.md"),b"---\nname: inspector\ndescription: Inspect one file.\nallowed-tools: read\nmetadata:\n  polaris-access: read\n  polaris-tier: low\n  polaris-wall-seconds: \"60\"\n  polaris-max-turns: \"4\"\n  polaris-continuation: denied\n  polaris-output: result.json\n---\nInspect one file.\n",0o600);
+    put(&contents.join("Resources/agents/inspector/SKILL.md"),b"---\nname: inspector\ndescription: Inspect one file.\nallowed-tools: read\nmetadata:\n  polaris-access: read\n  polaris-tier: dwarf\n  polaris-wall-seconds: \"60\"\n  polaris-max-turns: \"4\"\n  polaris-continuation: denied\n  polaris-output: result.json\n---\nInspect one file.\n",0o600);
     put(
         &contents.join("Resources/agents/inspector/result.json"),
         b"{\"type\":\"object\"}",

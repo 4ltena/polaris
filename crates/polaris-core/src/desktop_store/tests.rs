@@ -2346,6 +2346,7 @@ fn role_catalog() -> Vec<polaris_skills::AgentType> {
         allowed_tools: vec![],
         access: polaris_skills::AgentAccess::Read,
         tier: polaris_skills::Tier::Dwarf,
+        tier_min: polaris_skills::Tier::Dwarf,
         wall_seconds: 1,
         max_turns: 1,
         workflow_phase: None,
@@ -2602,6 +2603,7 @@ fn saved_child_fixture(n: usize) -> Child {
         run_id: RunId::new(format!("child-{n}")).unwrap(),
         attempt_id: AttemptId::new(format!("child-attempt-{n}")).unwrap(),
         parent_run_id: target().run_id,
+        display_name: None,
         state: RunState::Running,
         task_ids: vec![],
     }
@@ -2665,6 +2667,74 @@ fn child_ledger_replay_is_idempotent_and_terminal_is_immutable() {
             .is_err()
     );
     unchanged(&terminal, &writer.snapshot().unwrap());
+}
+
+#[test]
+fn child_ledger_assigns_distinct_star_names_and_does_not_reuse_within_root() {
+    let (root, mut writer) = setup();
+    writer.apply(&start("start", 0), Some(target())).unwrap();
+    writer.record_intent(&target(), op()).unwrap();
+    writer
+        .record_operation_result(&target(), &op(), result())
+        .unwrap();
+
+    let first = saved_child_fixture(0);
+    let second = saved_child_fixture(1);
+    writer
+        .record_child_start(&target(), first.clone(), "worker".into(), "one".into())
+        .unwrap();
+    writer
+        .record_child_start(&target(), second.clone(), "worker".into(), "two".into())
+        .unwrap();
+    assert_eq!(
+        writer.snapshot().unwrap().state.children[0]
+            .child
+            .display_name
+            .as_deref(),
+        Some("Sirius")
+    );
+    assert_eq!(
+        writer.snapshot().unwrap().state.children[1]
+            .child
+            .display_name
+            .as_deref(),
+        Some("Canopus")
+    );
+
+    writer
+        .record_child_finish(&target(), &child_identity(&first), Observation::Succeeded)
+        .unwrap();
+    writer
+        .record_child_start(
+            &target(),
+            saved_child_fixture(2),
+            "worker".into(),
+            "three".into(),
+        )
+        .unwrap();
+    assert_eq!(
+        writer.snapshot().unwrap().state.children[2]
+            .child
+            .display_name
+            .as_deref(),
+        Some("Arcturus")
+    );
+
+    drop(writer);
+    let mut writer = root.open(&project(), &session()).unwrap();
+    assert_eq!(
+        writer
+            .record_child_start(&target(), second, "worker".into(), "two".into())
+            .unwrap(),
+        IntentReceipt::AlreadyRecorded
+    );
+    assert_eq!(
+        writer.snapshot().unwrap().state.children[1]
+            .child
+            .display_name
+            .as_deref(),
+        Some("Canopus")
+    );
 }
 #[test]
 fn child_ledger_cancel_and_reopen_preserve_unknown_without_task_success() {

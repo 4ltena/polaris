@@ -10,6 +10,11 @@ pub struct Session {
     pub messages: Vec<Message>,
     /// Configuration-provided examples; never real user turns or raw events.
     pub examples: Vec<Message>,
+    /// Frozen root configuration; never inherited by a new child session.
+    pub input_preparation: crate::input_preparation::InputPreparationMode,
+    /// Ephemeral correspondence produced by the raw-history owner, never persisted.
+    #[doc(hidden)]
+    pub input_source: Option<crate::request_input::BoundInput>,
     pub persistence: Option<crate::session_store::PersistedSession>,
     pub strict_history: Option<std::sync::Arc<crate::conversation_memory::StrictHistory>>,
     pub summary_usage: Option<polaris_provider::UsageMeter>,
@@ -20,6 +25,10 @@ pub struct Session {
     /// Sticky write failure: a failed append must never lead to a later request.
     #[doc(hidden)]
     pub persistence_error: Option<String>,
+    /// What resumable subagents left behind, for the length of this run.
+    /// Shared with every wave the session starts, so a follow-up addressed
+    /// to the same worker continues rather than re-reads.
+    pub child_memory: crate::spawn::ChildMemory,
     /// Optional v2 workflow runtime. Never inferred from model or tool text.
     pub workflow: Option<crate::workflow::SessionWorkflow>,
     /// Saves the full original history before a valid summary replaces it.
@@ -81,10 +90,18 @@ impl DesktopTranscript {
 /// Missing tool outcomes are explicitly unknown and never trigger reexecution.
 /// The durable raw history remains unchanged, including its interrupted calls.
 pub fn desktop_request_history(raw: &[Message]) -> std::io::Result<Vec<Message>> {
+    desktop_request_history_bound(raw, None).map(|(messages, _)| messages)
+}
+
+pub(crate) fn desktop_request_history_bound(
+    raw: &[Message],
+    mut source: Option<crate::request_input::BoundInput>,
+) -> std::io::Result<(Vec<Message>, Option<crate::request_input::BoundInput>)> {
     use polaris_provider::Role;
     let mut projected = Vec::new();
     let mut pending: Vec<String> = Vec::new();
-    for message in raw {
+    let source_index = source.as_ref().map(|bound| bound.index);
+    for (index, message) in raw.iter().enumerate() {
         if message.role != Role::Tool {
             for id in pending.drain(..) {
                 projected.push(Message::tool_result(&id,
@@ -122,13 +139,18 @@ pub fn desktop_request_history(raw: &[Message]) -> std::io::Result<Vec<Message>>
                 }
             }
         }
+        if source_index == Some(index)
+            && let Some(source) = &mut source
+        {
+            source.index = projected.len();
+        }
         projected.push(message.clone());
     }
     for id in pending {
         projected.push(Message::tool_result(&id,
             "中断により結果は不明です。外部への影響を確認してから続行してください。自動再実行はしていません。"));
     }
-    Ok(projected)
+    Ok((projected, source))
 }
 
 impl Session {
@@ -243,6 +265,10 @@ impl Session {
             self.before_compact.as_deref(),
         )
         .await;
+        if matches!(outcome.result, Ok(Some(_))) {
+            // This summarizer does not carry raw identities across its rewrite.
+            self.input_source = None;
+        }
         let usage = outcome.usage_report;
         if usage.reported_responses == 0
             && usage.missing_responses == 0
@@ -263,6 +289,24 @@ impl Session {
             return;
         }
         self.push_message(Message::user(content), true);
+    }
+
+    /// Mid-run steering is persisted but is never a fresh preparation candidate.
+    pub(crate) fn push_instruction(&mut self, content: &str) {
+        let original = self.input_source.take();
+        self.push_user(content);
+        self.input_source = original;
+    }
+
+    /// Rebuilt request slots retain eligibility from the original accepted input.
+    pub(crate) fn refresh_input_source(
+        &mut self,
+        candidate: Option<crate::request_input::BoundInput>,
+    ) {
+        self.input_source = self
+            .input_source
+            .as_ref()
+            .and_then(|source| candidate.and_then(|candidate| source.refreshed(candidate)));
     }
 
     /// Close only unresolved calls when the user resumes or begins a new turn.
@@ -291,6 +335,7 @@ impl Session {
         }
         if !pending.is_empty() {
             self.messages = messages;
+            self.input_source = None;
         }
         for id in pending {
             self.push_tool_result(&id, "中断により結果は不明です。外部への影響を確認してから続行してください。自動再実行はしていません。");
@@ -329,6 +374,9 @@ impl Session {
         if self.persistence_error.is_some() {
             return;
         }
+        if starts_turn {
+            self.input_source = None;
+        }
         if let Some(transcript) = &mut self.desktop_transcript {
             transcript.messages.push(message);
             // Validate before cloning into the mutable request view. Partial
@@ -346,12 +394,28 @@ impl Session {
                 .push(transcript.messages.last().unwrap().clone());
             return;
         }
-        if let Some(persistence) = &self.persistence
-            && let Err(error) =
-                persistence.append(message.clone(), starts_turn, self.workflow.as_ref())
-        {
-            self.persistence_error = Some(error.to_string());
-            return;
+        if let Some(persistence) = &self.persistence {
+            let result = if starts_turn {
+                persistence.append_input(message.clone(), self.workflow.as_ref())
+            } else {
+                persistence
+                    .append(message.clone(), false, self.workflow.as_ref())
+                    .map(|_| None)
+            };
+            match result {
+                Ok(Some(source)) => {
+                    self.input_source = Some(crate::request_input::BoundInput::new(
+                        source,
+                        self.messages.len(),
+                        message.content.len(),
+                    ))
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.persistence_error = Some(error.to_string());
+                    return;
+                }
+            }
         }
         self.messages.push(message);
     }
@@ -381,6 +445,7 @@ impl Session {
         persistence: crate::session_store::PersistedSession,
     ) -> std::io::Result<()> {
         let snapshot = persistence.snapshot()?;
+        self.input_source = None;
         self.messages = snapshot
             .events
             .into_iter()
@@ -398,6 +463,7 @@ impl Session {
             persistence.clear()?;
         }
         self.messages.clear();
+        self.input_source = None;
         self.compaction_retry_tokens = None;
         Ok(())
     }
@@ -490,6 +556,7 @@ impl Session {
                 }
             };
             self.messages = prepared.messages;
+            self.refresh_input_source(prepared.input_source);
             self.memory_observation = Some(prepared.observation);
             return Ok(prepared.evidence);
         }
@@ -537,7 +604,11 @@ impl Session {
         };
         self.memory_observation = Some(request.observation.clone());
         let request = request.require_dispatch()?;
-        self.messages = prepared.messages;
+        let (messages, source) = prepared
+            .snapshot
+            .recent_request(self.input_source.as_ref().map(|bound| &bound.source));
+        self.messages = messages;
+        self.refresh_input_source(source);
         Ok(request.text.map(Message::user))
     }
 }

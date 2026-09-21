@@ -83,6 +83,23 @@ fn launchservices_fixed_alias_resolves_to_verified_package() {
     );
 }
 
+#[tokio::test]
+async fn catalog_startup_requires_the_declared_external_schema() {
+    for missing_external in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (args, home, exe) = fixture(&base);
+        if missing_external {
+            fs::remove_file(base.join("app/Contents/Resources/agents/inspector/result.json"))
+                .unwrap();
+        }
+        let result = tokio::task::spawn_blocking(move || start_at(args, &home, &exe))
+            .await
+            .unwrap();
+        assert_eq!(result.is_ok(), !missing_external);
+    }
+}
+
 fn identity(p: &Path) -> BootstrapIdentity {
     let m = fs::metadata(p).unwrap();
     BootstrapIdentity {
@@ -187,7 +204,7 @@ fn fixture_with_history(
         b"---\nname: verify\ndescription: Verify a change.\n---\nInspect the result.\n",
         0o600,
     );
-    put(&resources.join("agents/inspector/SKILL.md"), b"---\nname: inspector\ndescription: Inspect one file.\nallowed-tools: read\nmetadata:\n  polaris-access: read\n  polaris-tier: low\n  polaris-wall-seconds: \"60\"\n  polaris-max-turns: \"4\"\n  polaris-continuation: denied\n  polaris-output: result.json\n---\nInspect one file.\n", 0o600);
+    put(&resources.join("agents/inspector/SKILL.md"), b"---\nname: inspector\ndescription: Inspect one file.\nallowed-tools: read\nmetadata:\n  polaris-access: read\n  polaris-tier: dwarf\n  polaris-wall-seconds: \"60\"\n  polaris-max-turns: \"4\"\n  polaris-continuation: denied\n  polaris-output: result.json\n---\nInspect one file.\n", 0o600);
     put(
         &resources.join("agents/inspector/result.json"),
         b"{\"type\":\"object\"}",
@@ -217,6 +234,56 @@ fn fixture_with_history(
         home,
         exe,
     )
+}
+
+#[test]
+fn managed_rust_requires_matching_app_manifest_receipt_and_executable() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let (_, home, executable) = fixture(&base);
+    assert!(
+        managed_rust_toolchain(&home, &executable)
+            .unwrap()
+            .is_none()
+    );
+    let architecture = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "dependencies": [{
+            "id": "rust", "version": MANAGED_RUST_VERSION, "platform": "macos",
+            "architecture": architecture, "required_executable": "bin/rustc"
+        }]
+    }))
+    .unwrap();
+    let manifest_path =
+        base.join("app/PolarisDesktop_PolarisDesktop.bundle/runtime-dependencies.json");
+    put(&manifest_path, &manifest, 0o600);
+    let root = home
+        .join(".polaris/toolchains/rust")
+        .join(MANAGED_RUST_VERSION);
+    put(&root.join("bin/rustc"), b"synthetic rustc", 0o700);
+    let receipt = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1, "id": "rust", "version": MANAGED_RUST_VERSION,
+        "manifest_sha256": hash(&manifest), "installed_at": "2026-09-19T00:00:00Z"
+    }))
+    .unwrap();
+    let receipt_path = root
+        .parent()
+        .unwrap()
+        .join(format!(".{MANAGED_RUST_VERSION}.receipt.json"));
+    put(&receipt_path, &receipt, 0o600);
+    let package = managed_rust_toolchain(&home, &executable).unwrap().unwrap();
+    assert_eq!(package.root, root);
+    assert_eq!(package.bin_dirs, [PathBuf::from("bin")]);
+
+    let mut bad: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+    bad["manifest_sha256"] = serde_json::Value::String("0".repeat(64));
+    put(&receipt_path, &serde_json::to_vec(&bad).unwrap(), 0o600);
+    assert!(managed_rust_toolchain(&home, &executable).is_err());
 }
 
 #[tokio::test]
@@ -565,4 +632,17 @@ fn production_approval_clock_uses_unix_epoch() {
         "deadline clock must use Unix milliseconds"
     );
     assert!(clock.now_ms() >= observed);
+}
+
+#[test]
+fn native_decision_selection_overrides_shareable_config_only_for_exact_values() {
+    let mut decision = polaris_core::config::DecisionConfig::default();
+    apply_native_decision_selection(&mut decision, Ok("1".into())).unwrap();
+    assert!(decision.enabled);
+    apply_native_decision_selection(&mut decision, Ok("0".into())).unwrap();
+    assert!(!decision.enabled);
+    decision.enabled = true;
+    apply_native_decision_selection(&mut decision, Err(std::env::VarError::NotPresent)).unwrap();
+    assert!(decision.enabled);
+    assert!(apply_native_decision_selection(&mut decision, Ok("true".into())).is_err());
 }

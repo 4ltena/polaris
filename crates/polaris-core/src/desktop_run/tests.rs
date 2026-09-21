@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 mod history;
+mod input_preparation;
 mod mcp_entry;
 use crate::mcp::runtime::test_fixture as mcp_server;
 
@@ -62,6 +63,18 @@ fn fixture(
     tokio::sync::mpsc::Receiver<crate::desktop_execution::ExecutionRequest>,
     Arc<AtomicUsize>,
 ) {
+    fixture_with_mode(behavior, polaris_sandbox::SandboxMode::WorkspaceWrite)
+}
+
+fn fixture_with_mode(
+    behavior: Behavior,
+    mode: polaris_sandbox::SandboxMode,
+) -> (
+    tempfile::TempDir,
+    DesktopRunInput,
+    tokio::sync::mpsc::Receiver<crate::desktop_execution::ExecutionRequest>,
+    Arc<AtomicUsize>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();
     let source = root.join("source");
@@ -75,7 +88,7 @@ fn fixture(
         PreparedWorkspace::prepare(
             &source,
             &helper,
-            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            mode,
             &[],
             crate::isolated_workspace::Limits {
                 max_entries: 16,
@@ -129,6 +142,90 @@ fn fixture(
         )),
     };
     (temp, input, requests, calls)
+}
+
+#[test]
+fn readonly_project_routes_use_the_run_copy_while_rules_stay_host_bound() {
+    struct Judge;
+    #[async_trait::async_trait]
+    impl polaris_provider::decision::Decider for Judge {
+        async fn decide(
+            &self,
+            _: &serde_json::Value,
+            questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+        ) -> Result<polaris_provider::decision::Decision, polaris_provider::decision::DecisionError>
+        {
+            Ok(polaris_provider::decision::Decision {
+                answers: questions
+                    .keys()
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            polaris_provider::decision::Answer {
+                                noul: Some(1.0),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+    struct Capture(Arc<std::sync::Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl Provider for Capture {
+        async fn complete(
+            &self,
+            request: polaris_provider::CompletionRequest,
+        ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError> {
+            self.0.lock().unwrap().push(request.system);
+            Ok(polaris_provider::CompletionResponse {
+                text: "done".into(),
+                ..Default::default()
+            })
+        }
+    }
+    let (temp, mut input, mut requests, _) =
+        fixture_with_mode(Behavior::Complete, polaris_sandbox::SandboxMode::ReadOnly);
+    let source = temp.path().join("source").canonicalize().unwrap();
+    let copy = input.prepared.snapshot().path().to_path_buf();
+    for (root, marker) in [(&source, "HOST_ROUTE"), (&copy, "COPY_ROUTE")] {
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("docs/filemap.md"),
+            format!("## `src`\n\n- `{marker}.rs` — route fixture\n"),
+        )
+        .unwrap();
+        crate::decisions::append(root, "2026-09-19", &format!("{marker}: settled")).unwrap();
+    }
+    std::fs::write(
+        source.join("AGENTS.md"),
+        "## Always on\n- HOST_RULE remains authoritative.\n",
+    )
+    .unwrap();
+    input.always_on = input
+        .always_on
+        .with_project_root(&source)
+        .unwrap()
+        .with_agents_refresh(crate::constitution::AgentsRefresh::new(None, &source).unwrap())
+        .unwrap();
+    let shared_prompt = input.always_on.clone();
+    input.session.decider = Some(Arc::new(Judge));
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    input.provider = Arc::new(Capture(captured.clone()));
+    assert!(input.prepared.policy().writable_roots().is_empty());
+    let (mut worker, _events) = DesktopRun::start(input).unwrap();
+    assert_eq!(joined(&mut worker).result.unwrap().text, "done");
+    let systems = captured.lock().unwrap();
+    assert_eq!(systems.len(), 1);
+    assert!(systems[0].contains("src/COPY_ROUTE.rs"));
+    assert!(systems[0].contains("COPY_ROUTE: settled"));
+    assert!(!systems[0].contains("HOST_ROUTE"));
+    assert!(systems[0].contains("HOST_RULE"));
+    assert_eq!(shared_prompt.project_root(), Some(source.as_path()));
+    assert!(requests.try_recv().is_err());
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool) {

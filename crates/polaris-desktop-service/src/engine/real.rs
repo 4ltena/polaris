@@ -4,7 +4,9 @@ use polaris_core::{
     AgentEvent,
     agent::AgentError,
     audit::AuditLog,
-    desktop_events::{DesktopEventReceiver, EVENT_CAPACITY, EventEnvelope, EventFailure},
+    desktop_events::{
+        DesktopEventReceiver, DesktopEventSink, EVENT_CAPACITY, EventEnvelope, EventFailure,
+    },
     desktop_run::{DesktopRequestContext, DesktopRun, DesktopRunError, DesktopRunInput},
     desktop_store::{HistoryGap, SavedWorkflow},
     isolated_run::PreparedWorkspace,
@@ -24,6 +26,10 @@ pub trait TrustedRunFactory: Send + Sync {
     /// skill IDs, paths, or bodies.
     fn workflow_config(&self) -> Option<&polaris_core::workflow::WorkflowConfig> {
         None
+    }
+
+    fn input_preparation(&self) -> polaris_core::input_preparation::InputPreparationMode {
+        polaris_core::input_preparation::InputPreparationMode::Off
     }
 
     /// The typed judge this owner was started with, if any. Default `None`
@@ -347,6 +353,7 @@ pub(super) struct RealRun {
     /// M6-2: the work in flight and when it started, from the run's own
     /// events. Silence changes nothing here.
     work: Option<(polaris_core::activity::Work, std::time::Instant)>,
+    judging_depth: usize,
     activity: Option<polaris_core::activity::Activity>,
 }
 impl RealRun {
@@ -374,13 +381,36 @@ impl RealRun {
             joined: false,
             sequence: 0,
             work: None,
+            judging_depth: 0,
             activity: None,
         }
     }
 
     /// Only a start and its matching end move this; a quiet period does not.
-    fn observe_activity(&mut self, event: &AgentEvent) {
+    fn observe_activity(
+        &mut self,
+        event: &AgentEvent,
+    ) -> Result<Option<polaris_desktop_protocol::event::RunActivityPhase>, ServiceError> {
         use polaris_core::activity::Work;
+        use polaris_desktop_protocol::event::RunActivityPhase;
+        let decision = match event {
+            AgentEvent::DecisionStarted => {
+                let was_idle = self.judging_depth == 0;
+                self.judging_depth = self
+                    .judging_depth
+                    .checked_add(1)
+                    .ok_or(ServiceError::Worker)?;
+                was_idle.then_some(RunActivityPhase::Judging)
+            }
+            AgentEvent::DecisionFinished => {
+                self.judging_depth = self
+                    .judging_depth
+                    .checked_sub(1)
+                    .ok_or(ServiceError::Worker)?;
+                (self.judging_depth == 0).then_some(RunActivityPhase::Working)
+            }
+            _ => None,
+        };
         self.work = match event {
             AgentEvent::ModelRequestStarted { .. } => {
                 Some((Work::ModelRequest, std::time::Instant::now()))
@@ -390,8 +420,9 @@ impl RealRun {
             AgentEvent::ModelRequestFinished { .. }
             | AgentEvent::ToolFinished { .. }
             | AgentEvent::SpawnFinished { .. } => None,
-            _ => return,
+            _ => return Ok(decision),
         };
+        Ok(decision)
     }
 
     fn refresh_activity(&mut self, awaiting_approval: bool) {
@@ -465,7 +496,15 @@ impl RealRun {
                 return Err(ServiceError::Worker);
             }
             self.sequence = event.sequence;
-            self.observe_activity(&event.event);
+            if let Some(phase) = self.observe_activity(&event.event)? {
+                updates.push(EventBody::RunActivity(
+                    polaris_desktop_protocol::event::RunActivity {
+                        run_id: target.run_id.clone(),
+                        attempt_id: target.attempt_id.clone(),
+                        phase,
+                    },
+                ));
+            }
             if let Some(store) = store.as_deref_mut() {
                 match persist_child_event(store, target, event) {
                     Ok(Some(update)) => updates.push(update),
@@ -714,6 +753,7 @@ fn persist_child_event(
                     run_id: identity.run_id.clone(),
                     attempt_id: identity.attempt_id.clone(),
                     parent_run_id: identity.parent_run_id.clone(),
+                    display_name: None,
                     state: RunState::Running,
                     task_ids: parent_tasks.clone(),
                 },
@@ -878,6 +918,11 @@ impl Engine {
                 }
             }
         }
+        let input_preparation = self
+            .trusted_runs
+            .as_ref()
+            .map(|trusted| trusted.factory.input_preparation())
+            .unwrap_or_default();
         let active = self.active.as_mut().ok_or(ServiceError::Worker)?;
         let awaiting_approval = active.execution.awaiting_approval();
         let real = active.real.as_mut().ok_or(ServiceError::Worker)?;
@@ -944,6 +989,11 @@ impl Engine {
                         real.outcome = Some(Observation::Cancelled);
                         active.execution.cancel();
                     } else {
+                        let (event_sink, event_receiver, _event_control) =
+                            DesktopEventSink::channel(active.target.run_id.clone());
+                        let observed_judge = judge
+                            .clone()
+                            .map(|decider| event_sink.observe_decider(decider));
                         let mut inputs = real
                             .prepared_inputs
                             .take()
@@ -953,7 +1003,7 @@ impl Engine {
                             &active.target,
                             &mut self.store,
                             &active.usage,
-                            judge.clone(),
+                            observed_judge.clone(),
                         );
                         if desktop_memory.is_err() {
                             real.outcome = Some(Observation::Failed);
@@ -1007,7 +1057,7 @@ impl Engine {
                                                 polaris_core::desktop_run::McpPreselection {
                                                     index,
                                                     selector,
-                                                    decider: judge.clone(),
+                                                    decider: observed_judge.clone(),
                                                 },
                                         }
                                     })
@@ -1054,6 +1104,8 @@ impl Engine {
                                         desktop_memory: desktop_memory.unwrap_or(None),
                                         desktop_workflow,
                                         mcp_setup,
+                                        decider: judge.clone(),
+                                        input_preparation,
                                         ..Session::new()
                                     },
                                     request_context,
@@ -1066,7 +1118,11 @@ impl Engine {
                                     spawn_write_concurrency: inputs.spawn_write_concurrency,
                                 };
                             if real.outcome.is_none() {
-                                match DesktopRun::start(input) {
+                                match DesktopRun::start_with_events(
+                                    input,
+                                    event_sink,
+                                    event_receiver,
+                                ) {
                                     Ok((worker, events)) => {
                                         real.worker = Some(worker);
                                         real.events = Some(events);

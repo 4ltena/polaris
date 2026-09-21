@@ -62,6 +62,15 @@ async fn run(
     use polaris_desktop_service::{DesktopService, LaunchArguments};
     use std::os::fd::AsFd;
     use tokio::net::unix::pipe::{Receiver, Sender};
+    if let LaunchArguments::ProbeLocal { provider, endpoint } = args {
+        drop(recovery);
+        let result = polaris_desktop_service::probe_local_models(provider, &endpoint)
+            .await
+            .map_err(|_| "invalid local probe")?;
+        serde_json::to_writer(std::io::stdout().lock(), &result)?;
+        println!();
+        return Ok(());
+    }
     let reader = Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)?;
     let writer = Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)?;
     match args {
@@ -113,6 +122,7 @@ async fn run(
                 return Err("このOSのowner実行は未対応です".into());
             }
         }
+        LaunchArguments::ProbeLocal { .. } => unreachable!(),
     }
     Ok(())
 }

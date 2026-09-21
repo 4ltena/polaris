@@ -30,6 +30,7 @@ Rules:
 - Read docs/filemap.md before tree searches only when filemap=ready.
 - Verify counts and causal claims against real output before stating them.
 - A cited path:line must actually support the claim it's attached to.
+- Size the work first. Spawn it whole, one delegation per feature; below a file or two the round trip costs more than it saves.
 ";
 
 /// Assembles the context that's always loaded. Drops empty sections
@@ -95,6 +96,9 @@ pub struct AlwaysOn {
     system: String,
     tools: Vec<ToolSpec>,
     skills_seen: usize,
+    // Host-selected routing scope, never serialized into the prompt or treated
+    // as a write grant. Desktop runs bind their own sanitized workspace copy.
+    project_root: Option<std::path::PathBuf>,
     #[cfg(unix)]
     environment: String,
     #[cfg(unix)]
@@ -102,6 +106,23 @@ pub struct AlwaysOn {
 }
 
 impl AlwaysOn {
+    /// Bind the project used for filemap and decision routing. This does not
+    /// change AGENTS refresh sources, tool permissions, or the prompt budget.
+    pub fn with_project_root(mut self, root: &std::path::Path) -> std::io::Result<Self> {
+        if !root.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "routing project root must be absolute",
+            ));
+        }
+        self.project_root = Some(root.to_path_buf());
+        Ok(self)
+    }
+
+    pub(crate) fn project_root(&self) -> Option<&std::path::Path> {
+        self.project_root.as_deref()
+    }
+
     /// Trusted owner only: bind the original host sources, never a run copy.
     /// No timer is started. Failure on the initial read is not an empty profile.
     #[cfg(unix)]
@@ -173,6 +194,7 @@ pub fn assemble_always_on(
         system: build_system(constitution, environment),
         tools: polaris_tools::all_specs(),
         skills_seen: skills.len(),
+        project_root: None,
         #[cfg(unix)]
         environment: environment.to_owned(),
         #[cfg(unix)]
@@ -184,6 +206,22 @@ pub fn assemble_always_on(
 mod tests {
     use super::*;
     use crate::constitution::CONSTITUTION_LIMIT;
+
+    #[test]
+    fn routing_root_is_absolute_metadata_and_does_not_change_the_prompt() {
+        let original = assemble_always_on("", "", &[]);
+        let project = tempfile::tempdir().unwrap();
+        let bound = original.clone().with_project_root(project.path()).unwrap();
+        assert_eq!(bound.project_root(), Some(project.path()));
+        assert_eq!(bound.system(), original.system());
+        assert_eq!(bound.tokens(), original.tokens());
+        assert!(original.project_root().is_none());
+        assert!(
+            original
+                .with_project_root(std::path::Path::new("relative"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn system_prompt_requires_verifying_quantitative_and_causal_claims() {

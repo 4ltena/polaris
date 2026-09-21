@@ -215,7 +215,9 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
         // Model request boundaries are host bookkeeping, not transcript.
         AgentEvent::TextDelta { .. }
         | AgentEvent::ModelRequestStarted { .. }
-        | AgentEvent::ModelRequestFinished { .. } => Vec::new(),
+        | AgentEvent::ModelRequestFinished { .. }
+        | AgentEvent::DecisionStarted
+        | AgentEvent::DecisionFinished => Vec::new(),
         AgentEvent::WorkflowResolved {
             phase,
             skill_ids,

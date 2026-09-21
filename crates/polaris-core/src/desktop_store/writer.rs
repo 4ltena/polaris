@@ -1285,7 +1285,7 @@ impl Writer {
     pub fn record_child_start(
         &mut self,
         target: &RunTarget,
-        child: polaris_desktop_protocol::snapshot::Child,
+        mut child: polaris_desktop_protocol::snapshot::Child,
         agent_type: String,
         task: String,
     ) -> StoreResult<IntentReceipt> {
@@ -1294,19 +1294,27 @@ impl Writer {
         if child.state != RunState::Running {
             return Err(StoreError::RunConflict);
         }
-        let saved = super::SavedChild {
-            root: target.clone(),
-            child,
-            agent_type,
-            task,
-        };
         if let Some(existing) = self
             .published
             .state
             .children
             .iter()
-            .find(|c| c.child.run_id == saved.child.run_id)
+            .find(|c| c.child.run_id == child.run_id)
         {
+            if child
+                .display_name
+                .as_ref()
+                .is_some_and(|name| existing.child.display_name.as_ref() != Some(name))
+            {
+                return Err(StoreError::RunConflict);
+            }
+            child.display_name = existing.child.display_name.clone();
+            let saved = super::SavedChild {
+                root: target.clone(),
+                child,
+                agent_type,
+                task,
+            };
             let mut replay = existing.clone();
             replay.child.state = RunState::Running;
             return if replay == saved {
@@ -1315,10 +1323,29 @@ impl Writer {
                 Err(StoreError::RunConflict)
             };
         }
+        if child.display_name.is_some() {
+            return Err(StoreError::RunConflict);
+        }
         let root_state = self.published.state.runs[index].run.state;
         if root_state == RunState::Queued || root_state.is_terminal() {
             return Err(StoreError::RunConflict);
         }
+        let used_names = self
+            .published
+            .state
+            .children
+            .iter()
+            .filter(|saved| saved.root == *target || !saved.child.state.is_terminal())
+            .filter_map(|saved| saved.child.display_name.as_deref());
+        let display_name =
+            super::star_names::first_available(used_names).ok_or(StoreError::RunConflict)?;
+        child.display_name = Some(display_name.to_owned());
+        let saved = super::SavedChild {
+            root: target.clone(),
+            child,
+            agent_type,
+            task,
+        };
         let mut next = self.published.clone();
         next.state.children.push(saved);
         super::children::validate(&next.state).map_err(|_| StoreError::RunConflict)?;

@@ -2,6 +2,7 @@
 use crate::ServiceConfig;
 use polaris_core::desktop_store::{BootstrapIdentity, BootstrapTier, ExpectedBootstrapFile};
 use polaris_desktop_protocol::ids::{DecimalU64, ProjectId, SessionId};
+use polaris_desktop_protocol::local_models::LocalProvider;
 use std::{ffi::OsString, path::PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +17,11 @@ pub enum LaunchArguments {
     OwnerV1(OwnerLaunchArguments),
     /// Exactly `--browse-home`: the read-only home helper, with no store.
     BrowseHome,
+    /// A credential-free, metadata-only probe used by first-run setup.
+    ProbeLocal {
+        provider: LocalProvider,
+        endpoint: String,
+    },
 }
 /// These values still require native authority/bootstrap/store validation.
 /// OwnerV1 always requires the fixed recovery-fd2 flag; it grants no runtime.
@@ -92,6 +98,21 @@ pub(crate) fn parse_sha256(s: &str) -> Result<[u8; 32], LaunchArgumentsError> {
 pub fn parse_launch_args(args: &[OsString]) -> Result<LaunchArguments, LaunchArgumentsError> {
     if args.len() == 1 && args[0] == "--browse-home" {
         return Ok(LaunchArguments::BrowseHome);
+    }
+    if args.len() == 4 && args[0] == "--probe-local-models" && args[2] == "--endpoint" {
+        let provider = match text(&args[1])? {
+            "ollama" => LocalProvider::Ollama,
+            "lmstudio" => LocalProvider::Lmstudio,
+            _ => return Err(LaunchArgumentsError),
+        };
+        let endpoint = text(&args[3])?;
+        if endpoint.len() > polaris_desktop_protocol::local_models::MAX_ENDPOINT_BYTES {
+            return Err(LaunchArgumentsError);
+        }
+        return Ok(LaunchArguments::ProbeLocal {
+            provider,
+            endpoint: endpoint.into(),
+        });
     }
     if (args.len() == 6 || args.len() == 7)
         && args[0] == "--store-root"

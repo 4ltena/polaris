@@ -92,10 +92,27 @@ pub struct DesktopRun {
 impl DesktopRun {
     pub fn start(input: DesktopRunInput) -> Result<(Self, DesktopEventReceiver), DesktopRunError> {
         validate(&input)?;
-        let (sink, receiver, control) = DesktopEventSink::channel(input.target.run_id.clone());
+        let (sink, receiver, _control) = DesktopEventSink::channel(input.target.run_id.clone());
+        Self::start_with_events(input, sink, receiver)
+    }
+
+    /// Starts with the owner's already-created event channel. The desktop
+    /// service uses this to let memory and MCP preselection report through the
+    /// same run stream before the main agent begins.
+    #[doc(hidden)]
+    pub fn start_with_events(
+        mut input: DesktopRunInput,
+        sink: DesktopEventSink,
+        receiver: DesktopEventReceiver,
+    ) -> Result<(Self, DesktopEventReceiver), DesktopRunError> {
+        validate(&input)?;
         let sink = sink
             .with_execution(input.execution.clone())
             .map_err(|_| DesktopRunError::ExecutionMismatch)?;
+        let control = sink.control();
+        if let Some(decider) = input.session.decider.take() {
+            input.session.decider = Some(sink.observe_decider(decider));
+        }
         let thread = std::thread::Builder::new()
             .name("polaris-desktop-run".into())
             .spawn(move || execute(input, sink))
@@ -192,6 +209,13 @@ fn execute(mut input: DesktopRunInput, sink: DesktopEventSink) -> DesktopRunComp
     // Catch inside the owned input scope, preserving partial in-memory history.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         validate(&input)?;
+        // A desktop owner may serve several runs. Bind this run's copy rather
+        // than the host cwd or the intentionally host-bound AGENTS capability.
+        input.always_on = input
+            .always_on
+            .clone()
+            .with_project_root(input.prepared.snapshot().path())
+            .map_err(AgentError::Io)?;
         input.session.desktop_transcript = Some(Default::default());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -294,6 +318,7 @@ fn execute(mut input: DesktopRunInput, sink: DesktopEventSink) -> DesktopRunComp
         let messages = transcript.into_messages();
         raw_history.extend_from_slice(&messages);
         input.session.messages = raw_history;
+        input.session.input_source = None;
         messages
     } else {
         Vec::new()

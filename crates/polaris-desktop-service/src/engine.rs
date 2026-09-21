@@ -1,6 +1,7 @@
 //! 保存・実行の単一所有者。実行入力は信頼済みownerから明示注入する。
 
 mod local_models;
+pub use local_models::probe_local_models;
 #[cfg(target_os = "macos")]
 mod mcp_catalog;
 #[cfg(all(test, target_os = "macos"))]

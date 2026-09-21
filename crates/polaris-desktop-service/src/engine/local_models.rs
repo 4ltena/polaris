@@ -10,6 +10,102 @@ use polaris_provider::local::{
 };
 const MAX_INSPECTED_MODELS: usize = 32;
 
+pub async fn probe_local_models(
+    provider: LocalProvider,
+    endpoint_text: &str,
+) -> Result<LocalModelsResult, ()> {
+    let endpoint = Endpoint::parse(endpoint_text).map_err(|_| ())?;
+    if endpoint.as_str() != endpoint_text {
+        return Err(());
+    }
+    let runtime = match provider {
+        LocalProvider::Ollama => Runtime::Ollama,
+        LocalProvider::Lmstudio => Runtime::LmStudio,
+    };
+    let canonical = endpoint_text.to_owned();
+    let adapter = match LocalAdapter::new(runtime, endpoint) {
+        Ok(adapter) => adapter,
+        Err(_) => {
+            return Ok(LocalModelsResult {
+                provider,
+                endpoint: canonical,
+                availability: LocalAvailability::InvalidResponse,
+                models: vec![],
+            });
+        }
+    };
+    let observed = match adapter.inventory_with_load_state().await {
+        Ok(observed) => observed,
+        Err(LocalError::Transport | LocalError::Timeout) => {
+            return Ok(LocalModelsResult {
+                provider,
+                endpoint: canonical,
+                availability: LocalAvailability::Unreachable,
+                models: vec![],
+            });
+        }
+        Err(_) => {
+            return Ok(LocalModelsResult {
+                provider,
+                endpoint: canonical,
+                availability: LocalAvailability::InvalidResponse,
+                models: vec![],
+            });
+        }
+    };
+    let mut details = std::collections::HashMap::new();
+    if runtime == Runtime::Ollama {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        for model in observed
+            .iter()
+            .filter(|model| model.execution_location() != ExecutionLocation::Remote)
+            .take(MAX_INSPECTED_MODELS)
+        {
+            match tokio::time::timeout_at(deadline, adapter.select(model)).await {
+                Ok(Ok(selection)) => {
+                    details.insert(model.id().to_owned(), selection);
+                }
+                Ok(Err(_)) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    let models = observed
+        .into_iter()
+        .map(|model| {
+            let selected = details
+                .get(model.id())
+                .map(|selection| selection.model())
+                .unwrap_or(&model);
+            LocalModel {
+                model_id: model.id().to_owned(),
+                digest: selected.digest().map(str::to_owned),
+                variant: selected.variant().map(str::to_owned),
+                max_context_length: selected.max_context_length().map(DecimalU64::new),
+                completion: capability(selected.capabilities().completion),
+                tools: capability(selected.capabilities().tools),
+                vision: capability(selected.capabilities().vision),
+                reasoning: capability(selected.capabilities().reasoning),
+                execution_location: match selected.execution_location() {
+                    ExecutionLocation::Remote => ObservedExecutionLocation::Remote,
+                    ExecutionLocation::Unknown => ObservedExecutionLocation::Unknown,
+                },
+                load_state: match selected.load_state() {
+                    LoadState::Loaded => ObservedLoadState::Loaded,
+                    LoadState::Unloaded => ObservedLoadState::Unloaded,
+                    LoadState::Unknown => ObservedLoadState::Unknown,
+                },
+            }
+        })
+        .collect();
+    Ok(LocalModelsResult {
+        provider,
+        endpoint: canonical,
+        availability: LocalAvailability::Available,
+        models,
+    })
+}
+
 pub(super) struct InventoryJob {
     request: Request,
     generation: u64,
@@ -62,75 +158,30 @@ impl Engine {
             return Err(error(ErrorCode::InvalidRequest));
         }
         let provider = params.provider;
-        let runtime = match provider {
-            LocalProvider::Ollama => Runtime::Ollama,
-            LocalProvider::Lmstudio => Runtime::LmStudio,
-        };
         let canonical = params.endpoint.clone();
         let generation = self
             .inventory_generation
             .checked_add(1)
             .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?;
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        let worker = std::thread::Builder::new().name("polaris-inventory".into()).spawn(move || {
-            let runtime_owner = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ())?;
-            runtime_owner.block_on(async move {
-                tokio::select! {
-                    biased;
-                    _ = cancelled => Err(()),
-                    result = async {
-                        let adapter = match LocalAdapter::new(runtime, endpoint) {
-                            Ok(adapter) => adapter,
-                            Err(_) => return Ok(LocalModelsResult { provider, endpoint: canonical, availability: LocalAvailability::InvalidResponse, models: vec![] }),
-                        };
-                        let observed = match adapter.inventory_with_load_state().await {
-                            Ok(observed) => observed,
-                            Err(LocalError::Transport | LocalError::Timeout) => return Ok(LocalModelsResult { provider, endpoint: canonical, availability: LocalAvailability::Unreachable, models: vec![] }),
-                            Err(_) => return Ok(LocalModelsResult { provider, endpoint: canonical, availability: LocalAvailability::InvalidResponse, models: vec![] }),
-                        };
-                        // Ollama's list omits capabilities. Enrich a bounded
-                        // prefix with metadata-only show calls under one total
-                        // deadline; unobserved entries remain explicitly Unknown.
-                        let mut details = std::collections::HashMap::new();
-                        if runtime == Runtime::Ollama {
-                            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                            for model in observed.iter().filter(|model| model.execution_location() != ExecutionLocation::Remote).take(MAX_INSPECTED_MODELS) {
-                                match tokio::time::timeout_at(deadline, adapter.select(model)).await {
-                                    Ok(Ok(selection)) => { details.insert(model.id().to_owned(), selection); }
-                                    Ok(Err(_)) => {}
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                        let models = observed.into_iter().map(|model| {
-                            let selected = details.get(model.id()).map(|selection| selection.model()).unwrap_or(&model);
-                            LocalModel {
-                            model_id: model.id().to_owned(),
-                            // A successful Ollama show observation deliberately
-                            // drops the earlier list digest; the adapter forbids
-                            // combining non-atomic identity and capability reads.
-                            digest: selected.digest().map(str::to_owned),
-                            variant: selected.variant().map(str::to_owned),
-                            max_context_length: selected.max_context_length().map(DecimalU64::new),
-                            completion: capability(selected.capabilities().completion),
-                            tools: capability(selected.capabilities().tools),
-                            vision: capability(selected.capabilities().vision),
-                            reasoning: capability(selected.capabilities().reasoning),
-                            execution_location: match selected.execution_location() {
-                                ExecutionLocation::Remote => ObservedExecutionLocation::Remote,
-                                ExecutionLocation::Unknown => ObservedExecutionLocation::Unknown,
-                            },
-                            load_state: match selected.load_state() {
-                                LoadState::Loaded => ObservedLoadState::Loaded,
-                                LoadState::Unloaded => ObservedLoadState::Unloaded,
-                                LoadState::Unknown => ObservedLoadState::Unknown,
-                            },
-                        }}).collect();
-                        Ok(LocalModelsResult { provider, endpoint: canonical, availability: LocalAvailability::Available, models })
-                    } => result,
-                }
+        let worker = std::thread::Builder::new()
+            .name("polaris-inventory".into())
+            .spawn(move || {
+                let runtime_owner = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| ())?;
+                runtime_owner.block_on(async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled => Err(()),
+                        result = async {
+                            probe_local_models(provider, &canonical).await
+                        } => result,
+                    }
+                })
             })
-        }).map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
+            .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
         self.inventory_generation = generation;
         self.local_models = Some(InventoryJob {
             request: request.clone(),

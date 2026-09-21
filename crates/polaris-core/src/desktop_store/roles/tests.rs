@@ -22,6 +22,7 @@ fn agent(name: &str) -> AgentType {
         allowed_tools: vec![],
         access: AgentAccess::Read,
         tier: polaris_skills::Tier::Dwarf,
+        tier_min: polaris_skills::Tier::Dwarf,
         wall_seconds: 1,
         max_turns: 1,
         workflow_phase: None,

@@ -161,6 +161,21 @@ fn trusted_home_config_is_required_and_project_config_is_not_consulted() {
 }
 
 #[test]
+fn installer_managed_resources_supply_defaults_and_user_config_can_override_fields() {
+    let f = Fixture::new();
+    let global = f.home.join(".polaris/config.toml");
+    let managed = f.home.join(".polaris/managed-resources.toml");
+    fs::rename(&global, &managed).unwrap();
+    assert!(f.prepare().unwrap().is_some());
+
+    fs::write(&global, "[embedding]\nrevision = 'fixed'\n").unwrap();
+    let loaded = load_config(&f.home).unwrap();
+    assert_eq!(loaded.runtime.as_deref(), Some(f.runtime.as_path()));
+    assert_eq!(loaded.model_path.as_deref(), Some(f.model.as_path()));
+    assert_eq!(loaded.revision.as_deref(), Some("fixed"));
+}
+
+#[test]
 fn malformed_incomplete_oversized_and_writable_configuration_is_rejected() {
     let f = Fixture::new();
     let path = f.home.join(".polaris/config.toml");

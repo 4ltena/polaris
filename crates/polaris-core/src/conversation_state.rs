@@ -224,16 +224,22 @@ impl ConversationSnapshot {
         turns
     }
     pub fn recent_messages(&self) -> Vec<Message> {
+        self.recent_request(None).0
+    }
+    pub(crate) fn recent_request(
+        &self,
+        source: Option<&crate::request_input::SourceBinding>,
+    ) -> (Vec<Message>, Option<crate::request_input::BoundInput>) {
         let turns = self.active_turns();
         let first = turns.get(turns.len().saturating_sub(REAL_TURN_WINDOW));
-        self.events
-            .iter()
-            .filter(|event| {
+        crate::request_input::project_events(
+            &self.state.session_id,
+            self.events.iter().filter(|event| {
                 event.epoch == self.state.epoch
                     && first.is_some_and(|first| event.turn_id >= *first)
-            })
-            .map(|event| event.message.clone())
-            .collect()
+            }),
+            source,
+        )
     }
     /// Expired turns must not split a function call/result group.
     pub fn validate_complete_turn(&self, turn_id: u64) -> io::Result<()> {

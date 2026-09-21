@@ -38,7 +38,7 @@ pub enum ResourceError {
     )]
     Provider,
     #[error(
-        "strict10にはOSユーザーの ~/.polaris/config.toml に [embedding] runtime・model_path・revision の設定が必要です"
+        "strict10には自動導入済み資源、またはOSユーザーの ~/.polaris/config.toml に [embedding] runtime・model_path・revision が必要です"
     )]
     Configuration,
     #[error(
@@ -90,6 +90,7 @@ impl ResourceError {
 
 #[derive(Deserialize)]
 struct TrustedConfig {
+    #[serde(default)]
     embedding: EmbeddingConfig,
 }
 
@@ -229,15 +230,28 @@ fn load_config(home: &Path) -> Result<EmbeddingConfig, ResourceError> {
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
         return Err(ResourceError::Configuration);
     }
-    let (body, metadata) = read_bounded(&home.join(".polaris/config.toml"), MAX_CONFIG)
-        .map_err(|_| ResourceError::Configuration)?;
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
-        return Err(ResourceError::Configuration);
+    let mut embedding = EmbeddingConfig::default();
+    for name in ["managed-resources.toml", "config.toml"] {
+        let path = home.join(".polaris").join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(ResourceError::Configuration),
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => return Err(ResourceError::Configuration),
+        };
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+            return Err(ResourceError::Configuration);
+        }
+        let (body, opened) =
+            read_bounded(&path, MAX_CONFIG).map_err(|_| ResourceError::Configuration)?;
+        if opened.uid() != metadata.uid() || opened.ino() != metadata.ino() {
+            return Err(ResourceError::Configuration);
+        }
+        let config: TrustedConfig =
+            toml::from_str(std::str::from_utf8(&body).map_err(|_| ResourceError::Configuration)?)
+                .map_err(|_| ResourceError::Configuration)?;
+        merge_embedding(&mut embedding, config.embedding);
     }
-    let config: TrustedConfig =
-        toml::from_str(std::str::from_utf8(&body).map_err(|_| ResourceError::Configuration)?)
-            .map_err(|_| ResourceError::Configuration)?;
-    let embedding = config.embedding;
     if embedding.runtime.is_none()
         || embedding.model_path.is_none()
         || embedding
@@ -248,6 +262,24 @@ fn load_config(home: &Path) -> Result<EmbeddingConfig, ResourceError> {
         return Err(ResourceError::Configuration);
     }
     Ok(embedding)
+}
+
+fn merge_embedding(target: &mut EmbeddingConfig, source: EmbeddingConfig) {
+    if source.runtime.is_some() {
+        target.runtime = source.runtime;
+    }
+    if source.model_path.is_some() {
+        target.model_path = source.model_path;
+    }
+    if source.revision.is_some() {
+        target.revision = source.revision;
+    }
+    if source.preselect_model_path.is_some() {
+        target.preselect_model_path = source.preselect_model_path;
+    }
+    if source.preselect_revision.is_some() {
+        target.preselect_revision = source.preselect_revision;
+    }
 }
 
 fn verify(config: EmbeddingConfig, source: &Path) -> Result<Verified, ResourceError> {

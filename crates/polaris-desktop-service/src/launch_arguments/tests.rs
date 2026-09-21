@@ -160,3 +160,55 @@ fn browse_home_is_exactly_one_argument() {
         assert!(parse_launch_args(&args).is_err());
     }
 }
+
+#[test]
+fn local_probe_accepts_only_the_exact_bounded_shape() {
+    for (provider, expected) in [
+        ("ollama", LocalProvider::Ollama),
+        ("lmstudio", LocalProvider::Lmstudio),
+    ] {
+        let args: Vec<OsString> = [
+            "--probe-local-models",
+            provider,
+            "--endpoint",
+            "http://127.0.0.1:11434/",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let LaunchArguments::ProbeLocal { provider, endpoint } = parse_launch_args(&args).unwrap()
+        else {
+            panic!("probe")
+        };
+        assert_eq!(provider, expected);
+        assert_eq!(endpoint, "http://127.0.0.1:11434/");
+    }
+    for values in [
+        vec![
+            "--probe-local-models",
+            "unknown",
+            "--endpoint",
+            "http://127.0.0.1:1/",
+        ],
+        vec![
+            "--probe-local-models",
+            "ollama",
+            "--url",
+            "http://127.0.0.1:1/",
+        ],
+        vec!["--probe-local-models", "ollama", "--endpoint"],
+        vec![
+            "--probe-local-models",
+            "ollama",
+            "--endpoint",
+            "http://127.0.0.1:1/",
+            "extra",
+        ],
+    ] {
+        let args = values
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<OsString>>();
+        assert!(parse_launch_args(&args).is_err());
+    }
+}

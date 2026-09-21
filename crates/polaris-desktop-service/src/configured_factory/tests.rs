@@ -171,6 +171,7 @@ impl Fixture {
                 allowed_tools: self.child_tools.clone(),
                 access: polaris_skills::AgentAccess::Read,
                 tier: polaris_skills::Tier::Subgiant,
+                tier_min: polaris_skills::Tier::Dwarf,
                 wall_seconds: 5,
                 max_turns: 2,
                 workflow_phase: None,
@@ -187,6 +188,7 @@ impl Fixture {
                 enabled: false,
                 ..Default::default()
             },
+            input_preparation: Default::default(),
             decider: None,
         }
     }

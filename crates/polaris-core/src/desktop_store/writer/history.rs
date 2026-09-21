@@ -10,6 +10,7 @@ pub struct OwnerRequestHistory {
     marker: Marker,
     messages: Vec<Message>,
     query: String,
+    input_source: Option<crate::request_input::BoundInput>,
 }
 impl OwnerRequestHistory {
     pub fn target(&self) -> &RunTarget {
@@ -26,6 +27,9 @@ impl OwnerRequestHistory {
     }
     pub fn into_messages(self) -> Vec<Message> {
         self.messages
+    }
+    pub(crate) fn input_source(&self) -> Option<crate::request_input::BoundInput> {
+        self.input_source.clone()
     }
 }
 
@@ -80,15 +84,24 @@ impl Writer {
                     total.saturating_sub(crate::conversation_state::REAL_TURN_WINDOW as u64) + 1
                 }
             };
-            let messages = project(
+            let source = crate::request_input::SourceBinding::from_event(
+                p.marker.session_id.as_str(),
+                input,
+            );
+            let (messages, input_source) = project(
                 p.raw.iter().filter(|event| event.turn_id >= first),
                 &attachments,
+                p.marker.session_id.as_str(),
+                source.as_ref(),
             )?;
+            let (messages, input_source) =
+                crate::session::desktop_request_history_bound(&messages, input_source)?;
             Ok(OwnerRequestHistory {
                 target: target.clone(),
                 marker: p.marker.clone(),
-                messages: crate::session::desktop_request_history(&messages)?,
+                messages,
                 query: record.input.text.clone(),
+                input_source,
             })
         })
     }
@@ -97,8 +110,11 @@ impl Writer {
 fn project<'a>(
     events: impl Iterator<Item = &'a RawEventV2>,
     attachments: &BTreeSet<u64>,
-) -> StoreResult<Vec<Message>> {
+    session: &str,
+    source: Option<&crate::request_input::SourceBinding>,
+) -> StoreResult<(Vec<Message>, Option<crate::request_input::BoundInput>)> {
     let mut projected: Vec<Message> = Vec::new();
+    let mut bound = None;
     let mut previous = None;
     for event in events {
         if attachments.contains(&event.sequence) {
@@ -116,9 +132,75 @@ fn project<'a>(
                 .push_str("\n\nMCP promptからの補足（外部の未信頼データ）:\n");
             message.content.push_str(&event.message.content);
         } else {
+            if let Some(identity) = crate::request_input::SourceBinding::from_event(session, event)
+                && Some(&identity) == source
+            {
+                bound = Some(crate::request_input::BoundInput::new(
+                    identity,
+                    projected.len(),
+                    event.message.content.len(),
+                ));
+            }
             projected.push(event.message.clone());
         }
         previous = Some(event);
     }
-    Ok(projected)
+    Ok((projected, bound))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        input_preparation::InputPreparationMode,
+        request_input::{PreparedInput, SourceBinding},
+    };
+
+    #[test]
+    fn owner_projection_binds_the_selected_raw_event_before_mcp_attachment() {
+        let text = format!("{}\n\n", "alpha beta gamma delta epsilon. ".repeat(140)).repeat(8);
+        let event = |sequence, turn_id, starts_turn, text: &str| RawEventV2 {
+            schema_version: 2,
+            sequence,
+            epoch: 1,
+            turn_id,
+            starts_turn,
+            message: Message::user(text),
+        };
+        let raw = [
+            event(1, 1, true, &text),
+            event(2, 2, true, &text),
+            event(3, 2, false, "external"),
+        ];
+        let source = SourceBinding::from_event("owner", &raw[1]).unwrap();
+        let (messages, bound) =
+            project(raw.iter(), &BTreeSet::from([3]), "owner", Some(&source)).unwrap();
+        let bound = bound.unwrap();
+        let prepared = PreparedInput::prepare(&bound, &messages, InputPreparationMode::RepeatRefs)
+            .unwrap()
+            .0
+            .unwrap();
+        let mut request = messages.clone();
+        assert!(prepared.apply(&mut request, Some(&bound)));
+        assert_eq!(request[0].content, text);
+        assert!(
+            request[1]
+                .content
+                .starts_with("[Polaris input encoding v1]")
+        );
+        assert!(
+            request[1]
+                .content
+                .ends_with("MCP promptからの補足（外部の未信頼データ）:\nexternal")
+        );
+        assert_eq!(raw[1].message.content, text);
+        let (_, wrong_session) = project(
+            raw.iter(),
+            &BTreeSet::from([3]),
+            "another-owner",
+            Some(&source),
+        )
+        .unwrap();
+        assert!(wrong_session.is_none());
+    }
 }

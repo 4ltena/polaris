@@ -29,6 +29,11 @@ pub enum AgentEvent {
         turn: u64,
         ok: bool,
     },
+    /// The configured typed decision engine is evaluating one or more
+    /// questions. Desktop wraps only its configured decision engine, so this
+    /// never relabels the main model request or a local deterministic step.
+    DecisionStarted,
+    DecisionFinished,
     ToolStarted {
         name: String,
         detail: String,
@@ -104,7 +109,10 @@ impl AgentEvent {
             return false;
         }
         match self {
-            Self::ModelRequestStarted { .. } | Self::ModelRequestFinished { .. } => true,
+            Self::ModelRequestStarted { .. }
+            | Self::ModelRequestFinished { .. }
+            | Self::DecisionStarted
+            | Self::DecisionFinished => true,
             Self::MemoryPrepared(observation) => budget.strings(&observation.source_uris),
             Self::TextDelta { text, .. } => budget.string(text),
             Self::WorkflowResolved {

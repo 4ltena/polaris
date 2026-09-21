@@ -17,7 +17,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `README.md` — polaris
 - `rust-toolchain.toml` — pinned toolchain
 
+## `agents/doc-writer`
+
+- `SKILL.md` — 文書を書く
+
 ## `agents/file-inspector`
+
+- `SKILL.md` — SKILL.md
+
+## `agents/file-reader`
 
 - `SKILL.md` — SKILL.md
 
@@ -28,6 +36,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `agents/implementer`
 
 - `SKILL.md` — 実装する
+
+## `agents/reviewer`
+
+- `SKILL.md` — レビューする
 
 ## `apps/macos`
 
@@ -87,6 +99,9 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-cli/examples`
 
 - `cache_quality.rs` — Offline-testable driver for the cache-affinity quality matrix.
+- `m12_input_eval.rs` — Offline, content-free measurements of one M12 input case and preparation mode per process.
+- `m12_model_eval.rs` — Opt-in M12 input comparison through durable sessions and the production agent.
+- `m23_read_eval.rs` — Opt-in M23 comparison through the production agent/read/spawn path.
 - `preimplementation_eval.rs` — One approved two-turn pre-implementation evaluation trial.
 - `preselection_compare.rs` — 段階1: the arms that can be measured without a new adapter.
 - `preselection_cost.rs` — What each preselection route costs, and who pays it.
@@ -94,9 +109,28 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `sadalmelik_pilot.rs` — Two-send live canary using production Session, workflow and Codex transport.
 - `sadalmelik_quality.rs` — Offline run-loop fixture driver.  Live Codex is deliberately blocked.
 
+## `crates/polaris-cli/examples/eval_support`
+
+- `accounting.rs` — Reconcile physical evidence and price known consumption without double counting.
+- `auth.rs` — Explicit, read-only, single-load credentials for opt-in evaluation executables.
+
+## `crates/polaris-cli/examples/m12_model_eval`
+
+- `guard.rs` — Admit one root request, verify its actual input, and reject every tool response.
+- `input.rs` — Bounded M12 fixtures, value-free response instructions and deterministic scoring.
+- `tests.rs` — Offline positive and failure controls at the actual agent/provider boundary.
+
+## `crates/polaris-cli/examples/m23_read_eval`
+
+- `accounting.rs` — M23 model/effort binding for the shared physical-accounting implementation.
+- `guard.rs` — Shared send, fee and tool admission guards for the parent and its one child.
+- `input.rs` — Freeze bounded fixtures, public prompts, pair order and deterministic scoring.
+- `tests.rs` — Offline scripted regressions through the real agent, read and spawn paths.
+
 ## `crates/polaris-cli/src`
 
 - `account.rs` — 複数アカウントの登録操作と、1つのrunを1つの登録へ固定する束縛。
+- `benchmark_report.rs` — Opt-in, machine-readable observations for the offline comparison harness.
 - `compare.rs` — フォルダ同士がどれだけ似ているかを示す。名前とサイズだけを読み、
 - `decided.rs` — `polaris decided` — the ledger of questions this project has settled.
 - `handoff.rs` — 実装が終わったことを、実機で試せる人へ渡す文面にする。
@@ -105,6 +139,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `memory.rs` — Local project memory commands; embedding requests require explicit configuration.
 - `setting.rs` — 同梱の定型コマンド。引数の受け取りと表示だけを行い、検出・計画・記録は
 - `spare.rs` — 頼まれていない整理へ余剰枠を使ってよいかを判定し、その理由を示す。
+- `strict_history_tests.rs` — Exercises the CLI history constructor through persisted retrieval and a counting judge.
 - `sync.rs` — M7b-5: the `polaris sync` entry points. Every command works on this
 
 ## `crates/polaris-cli/tests`
@@ -112,6 +147,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `cli.rs` — Integration tests for the CLI binary. Launches the real process to verify behavior.
 - `confined_helper.rs` — Integration test that launches the real `polaris` binary as a helper
 - `entry_points.rs` — The three commands that had no caller until now: comparing folders,
+- `input_preparation.rs` — Real CLI input preparation with an isolated home and a synthetic loopback model.
 - `mcp.rs` — `polaris mcp` against a synthetic home; no server or model is contacted.
 - `memory.rs` — Exercises project memory through the real CLI without model calls.
 - `setting.rs` — The bundled setting commands from the terminal. Real directories and a
@@ -152,6 +188,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `files_md.rs` — `dir_watch` が検出した変更を、実際に `files.md` を書く subagent の
 - `gitignore.rs` — `files.md`(ハーネスが自動生成する、コミット対象外のファイル)を
 - `handoff.rs` — M7a-1: the prompt that hands a finished implementation to someone who can
+- `input_preparation.rs` — Reversible, host-only projection of repeated paragraphs in a new root input.
 - `isolated_run.rs` — macOS prepare-only composition. Paths and executable identity are supplied by
 - `isolated_workspace.rs` — Bounded, sanitized source snapshots. No apply-back or execution policy lives here.
 - `lib.rs` — Entry point for polaris-core. Ties together the budget, constitution, and prompt modules.
@@ -165,6 +202,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `project_git.rs` — A read-only git call against the user's own repository.
 - `prompt.rs` — The single place that assembles the set of things loaded every turn.
 - `recipe.rs` — M7c: the build recipes Polaris ships. A recipe is a fixed definition, not
+- `request_input.rs` — Ephemeral raw-event identity and request slots for lossless input preparation.
 - `resume.rs` — M6-2b: whether a finished run should be continued without being asked.
 - `scratch_registry.rs` — M6-5: the private copies Polaris created, recorded so that a later start
 - `session.rs` — Request history with optional durable v2 storage or a v3 desktop owner port.
@@ -186,6 +224,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/agent`
 
+- `input_preparation_tests.rs` — Request-boundary regressions for source-bound, host-only input preparation.
 - `mcp_dispatch.rs` — Borrow the run owner; model operations cannot construct settings or grants.
 - `skill_catalog.rs` — Request-local metadata-only optional skill catalog.
 - `workflow_control.rs` — Bounded model proposals; authority and publication stay with the host.
@@ -255,6 +294,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/desktop_run/tests`
 
 - `history.rs` — Desktop inputs are created by a real writer, including retained tool turns.
+- `input_preparation.rs` — Desktop request preparation preserves accepted raw input across worker and reopen boundaries.
 - `mcp_entry.rs` — Real worker/owner boundary with synthetic providers and a loopback MCP server.
 
 ## `crates/polaris-core/src/desktop_run/tests/mcp_entry`
@@ -278,6 +318,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `model.rs` — P1値を共用する保存marker、付随状態、要求結果と明示的な保存エラー。
 - `roles.rs` — Durable role choices and past metadata observations, never runtime authorization.
 - `source_apply.rs` — Controller-only evidence ledger. No filesystem authorization or dispatch.
+- `star_names.rs` — Stable display names for child runs.
 - `tests.rs` — S01〜S08の公開境界、要求台帳、復旧と実OS lockの回帰試験。
 - `workflow.rs` — Durable workflow evidence; never an execution grant or a disk skill loader.
 - `writer.rs` — TempDirの所有、writerのOS lock、対象別CASと実行意図・終端の公開をまとめる。
@@ -394,6 +435,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/handoff`
 
 - `tests.rs` — Fixed inputs only; nothing is sent anywhere.
+
+## `crates/polaris-core/src/input_preparation`
+
+- `tests.rs` — Lossless encoding, bounded decoding and adoption-threshold regressions.
 
 ## `crates/polaris-core/src/isolated_run`
 
@@ -538,6 +583,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/recipe/tool`
 
 - `tests.rs` — Real directories and a real ledger. Nothing is installed and no command
+
+## `crates/polaris-core/src/request_input`
+
+- `tests.rs` — Raw identity, repeated text, request rebuilds and byte-range regression tests.
 
 ## `crates/polaris-core/src/resume`
 
@@ -718,6 +767,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-desktop-service/src/engine/real/tests`
 
 - `mcp_tests.rs` — Trusted factory injection through the real reactor, with no live provider.
+- `project_routes.rs` — The owner's configured judge reaches a root run even without MCP.
 - `structured_tests.rs` — Internal engine admission; the public resource gate remains closed.
 
 ## `crates/polaris-desktop-service/src/engine/real/tests/structured_tests`
@@ -886,6 +936,8 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-provider/src/decision/jev`
 
+- `metrics.rs` — Opt-in physical Jev attempts, with a durable start before network dispatch.
+- `metrics_tests.rs` — Physical attempts survive invalid answers and cancellation without payloads.
 - `tests.rs` — A local stub stands in for the service. No real endpoint is contacted
 
 ## `crates/polaris-provider/src/local`
@@ -1016,6 +1068,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `clipboard.rs` — Copies text to the system clipboard via the OSC 52 terminal escape
 - `continuation_tests.rs` — Shared continuation recovery through real raw/receipt owners and fake backends.
 - `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from
+- `input_preparation_tests.rs` — TUI initialization and cloned run ownership preserve request-only input preparation.
 - `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
 - `memory.rs` — Explicitly enabled project memory and pre-compaction archival.
 - `onboarding.rs` — The onboarding screen: shown by `polaris-cli` when the interactive TUI

@@ -55,6 +55,7 @@ pub use recovery_socket::take_recovery_socket;
 #[cfg(all(test, target_os = "macos"))]
 mod core_integration_tests;
 
+pub use engine::probe_local_models;
 pub use engine::{DesktopService, FakeService, Options, ServiceConfig, project_id, session_id};
 #[cfg(target_os = "macos")]
 pub use engine::{

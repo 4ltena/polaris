@@ -351,7 +351,19 @@ mod tests {
     /// Raising it is allowed. Raising it silently is not.
     #[test]
     fn the_always_on_total_is_pinned() {
-        const PINNED: usize = 602;
+        // 625 since 2026-09-20: `spawn` names implementer and reviewer.
+        // Measured on a 15-turn task where the root did its own writing
+        // and delegated once, to a type that does not exist — the only
+        // delegation text it reads is this description, and it named
+        // file-reader alone. 23 tokens a request against the whole
+        // implementation staying on the parent's model.
+        // 635 since 2026-09-20: one line of SYSTEM_PROMPT tells the root
+        // to spawn its reading, writing and checking. It sits there and
+        // not in a phase profile because the measured run never left the
+        // `general` phase — an adaptive transition happens only when the
+        // model calls `state` itself, and in 15 turns it never did, so
+        // every phase-specific instruction was unreachable.
+        const PINNED: usize = 647;
         let n = crate::prompt::assemble_always_on("", "", &[]).tokens();
         assert_eq!(
             n, PINNED,
@@ -376,7 +388,7 @@ mod tests {
     /// deliberate rather than invisible and free.
     #[test]
     fn the_root_turn_total_is_pinned() {
-        const PINNED: usize = 950;
+        const PINNED: usize = 995;
         let mut tools = polaris_tools::all_specs();
         tools.push(polaris_tools::mcp_setup_spec());
         tools.push(polaris_tools::setting_spec());
@@ -668,5 +680,151 @@ mod tests {
         // ことそのものが不変条件である。
         let with_more = always_on_tokens("system prompt placeholder", &polaris_tools::all_specs());
         assert_eq!(with_zero, with_more);
+    }
+}
+
+#[cfg(test)]
+mod state_budget {
+    /// Pins the fixed input each workflow state adds.
+    ///
+    /// M17 measured `deliver` at 162 and reported the rest only as a range,
+    /// so growth in any other state has been invisible. The always-on
+    /// baseline and the root turn are pinned above; this pins the per-state
+    /// part that rides on top of them, one number per state, for the same
+    /// reason: growth should be deliberate, not free.
+    #[test]
+    fn every_state_profile_is_pinned() {
+        const PINNED: [(&str, usize); 7] = [
+            ("general", 126),
+            ("brainstorm", 198),
+            ("specify", 205),
+            ("implement", 262),
+            ("review", 227),
+            ("verify", 218),
+            ("deliver", 207),
+        ];
+        let core = include_str!("../../polaris-skills/resources/workflow/workflow-core/SKILL.md");
+        let bodies: [(&str, &str); 7] = [
+            ("general", ""),
+            (
+                "brainstorm",
+                include_str!("../../polaris-skills/resources/workflow/brainstorm/SKILL.md"),
+            ),
+            (
+                "specify",
+                include_str!("../../polaris-skills/resources/workflow/specify/SKILL.md"),
+            ),
+            (
+                "implement",
+                include_str!("../../polaris-skills/resources/workflow/implement/SKILL.md"),
+            ),
+            (
+                "review",
+                include_str!("../../polaris-skills/resources/workflow/review/SKILL.md"),
+            ),
+            (
+                "verify",
+                include_str!("../../polaris-skills/resources/workflow/verify/SKILL.md"),
+            ),
+            (
+                "deliver",
+                include_str!("../../polaris-skills/resources/workflow/deliver/SKILL.md"),
+            ),
+        ];
+        let measured: Vec<(&str, usize)> = bodies
+            .iter()
+            .map(|(name, body)| {
+                // What a turn in this state actually carries: the always-on
+                // core skill, the state's own skill, and the state line.
+                let line = format!("phase={name} spec=missing verification=unknown grants=0\n");
+                (
+                    *name,
+                    super::count_tokens(&format!("{core}\n{body}\n{line}")),
+                )
+            })
+            .collect();
+        let expected: Vec<(&str, usize)> = PINNED.to_vec();
+        assert_eq!(
+            measured, expected,
+            "state profile tokens moved: {measured:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase_tools {
+    /// What a read-only phase saves on every request. The six schemas are
+    /// 504 of the 647 always-on tokens; `write`, `edit` and `spawn` are
+    /// 287 of those, and a phase that cannot change a file can call none
+    /// of them.
+    #[test]
+    fn a_read_only_phase_stops_paying_for_what_it_cannot_call() {
+        let specs = polaris_tools::all_specs();
+        let baseline = crate::prompt::assemble_always_on("", "", &[]);
+        let all = super::always_on_tokens(baseline.system(), &specs);
+        let kept = |allowed: &[&str]| {
+            let subset: Vec<_> = specs
+                .iter()
+                .filter(|spec| allowed.contains(&spec.name.as_str()))
+                .cloned()
+                .collect();
+            super::always_on_tokens(baseline.system(), &subset)
+        };
+        assert_eq!(all, 647);
+        assert_eq!(kept(&["read", "bash", "skill"]), 366, "review");
+        assert_eq!(kept(&["read", "skill"]), 300, "brainstorm");
+
+        // Every phase that may change a file keeps everything.
+        for phase in crate::workflow::Phase::ALL {
+            let allowed = crate::agent::read_only_tools(phase);
+            match phase {
+                crate::workflow::Phase::Brainstorm | crate::workflow::Phase::Review => {
+                    assert!(allowed.is_some(), "{phase} is read-only")
+                }
+                _ => assert!(allowed.is_none(), "{phase} may write"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod breakdown {
+    use super::*;
+
+    /// Not an assertion — a way to see where the always-on tokens go, so a
+    /// decision about the budget is made against the parts rather than the
+    /// total. Run with `--nocapture`.
+    #[test]
+    fn what_the_root_only_tools_cost() {
+        let baseline = crate::prompt::assemble_always_on("", "", &[]);
+        let specs = polaris_tools::all_specs();
+        let six = always_on_tokens(baseline.system(), &specs);
+        for (name, spec) in [
+            ("mcp_setup", polaris_tools::mcp_setup_spec()),
+            ("setting", polaris_tools::setting_spec()),
+            ("state", polaris_tools::state_spec()),
+        ] {
+            let mut with = specs.clone();
+            with.push(spec);
+            println!(
+                "  {name:<10} {}",
+                always_on_tokens(baseline.system(), &with) - six
+            );
+        }
+    }
+
+    #[test]
+    fn where_the_always_on_tokens_go() {
+        let specs = polaris_tools::all_specs();
+        let baseline = crate::prompt::assemble_always_on("", "", &[]);
+        let empty: Vec<ToolSpec> = Vec::new();
+        let system_only = always_on_tokens(baseline.system(), &empty);
+        println!("system {system_only}");
+        for spec in &specs {
+            let one = vec![spec.clone()];
+            let with = always_on_tokens(baseline.system(), &one);
+            println!("  {:<14} {}", spec.name, with - system_only);
+        }
+        println!("total {}", always_on_tokens(baseline.system(), &specs));
     }
 }

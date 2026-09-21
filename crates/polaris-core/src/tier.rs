@@ -21,7 +21,7 @@ pub mod typed;
 #[async_trait::async_trait]
 pub trait TierDecider: Send + Sync {
     /// One answer per task, in the order given. A decider that cannot
-    /// answer returns the declared weight rather than failing: routing is
+    /// answer returns `Tier::DEFAULT.min(agent.tier)` rather than failing: routing is
     /// an optimization, and a delegation must not be lost because the
     /// service that prices it was unreachable.
     ///
@@ -48,10 +48,14 @@ pub async fn decide_all(
     // in exactly the configuration that has no judge to notice. The
     // ceiling still binds: a type that declares `dwarf` keeps `dwarf`,
     // because `min` cannot hand it something heavier than it allows.
+    // Both ends of the declaration, applied in one place so no path can
+    // honour one and forget the other: `tier` is the ceiling a decision
+    // may not route above, `tier_min` the floor it may not route below.
+    let bounded = |agent: &AgentType, decided: Tier| decided.min(agent.tier).max(agent.tier_min);
     let unrouted = || {
         tasks
             .iter()
-            .map(|(agent, _)| Tier::DEFAULT.min(agent.tier))
+            .map(|(agent, _)| bounded(agent, Tier::DEFAULT))
             .collect::<Vec<_>>()
     };
     let Some(decider) = decider else {
@@ -63,10 +67,17 @@ pub async fn decide_all(
     if answered.len() != tasks.len() {
         return unrouted();
     }
+    // One call is one piece of work. Pricing its parts separately is
+    // micro-management: splitting a feature across files and running one
+    // on `luna` and its neighbour on `sol` buys a cheap model for half of
+    // something that has to hold together, and the half that was judged
+    // heavy is the half that says what the work is worth. So the wave
+    // takes its heaviest answer — still held down for each task by its own
+    // declared ceiling, which no decision may raise.
+    let heaviest = answered.iter().copied().max().unwrap_or(Tier::DEFAULT);
     tasks
         .iter()
-        .zip(answered)
-        .map(|((agent, _), chosen)| chosen.min(agent.tier))
+        .map(|(agent, _)| bounded(agent, heaviest))
         .collect()
 }
 

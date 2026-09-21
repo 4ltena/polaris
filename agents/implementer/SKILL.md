@@ -7,7 +7,7 @@ metadata:
   polaris-tier: supergiant
   polaris-wall-seconds: "1800"
   polaris-max-turns: "40"
-  polaris-continuation: "denied"
+  polaris-continuation: "allowed"
   polaris-output: references/result.schema.json
 ---
 
@@ -28,5 +28,7 @@ metadata:
 - **レビューをしない。** 良し悪しの判断は依頼した側が行う。
 - **設計をやり直さない。** 指示が誤っていると思ったら、直さずに理由を添えて返す。
 - 依頼の範囲外を整理しない。
+
+同じ依頼者から続きが来ることがある。そのときは前の作業の続きとして扱い、読み直しから始めない。
 
 通らなかった試験を通ったと書かない。実行していないものを実行したと書かない。

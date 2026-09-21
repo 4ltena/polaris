@@ -17,6 +17,52 @@ use super::TierDecider;
 /// the work, not the models: which model a weight buys is configuration,
 /// and telling the decision about it would have it price the run rather
 /// than judge the task.
+///
+/// Ordered, because the question is a `Score` rather than a `Choice`: the
+/// four rungs are a scale, the answer is the probability-weighted position
+/// on it, and a position is what a threshold can be biased against. A
+/// `Choice` returns only the winning name, so a task the judge thought was
+/// 51% heavy and one it thought was 99% heavy bought the same model.
+fn levels() -> Vec<String> {
+    let described = criteria();
+    Tier::ALL
+        .into_iter()
+        .map(|tier| described[tier.name()].clone())
+        .collect()
+}
+
+/// Where each rung starts on the answered scale.
+///
+/// The scale runs 0 to 3 over the four rungs in order, so plain rounding
+/// would split at 0.5, 1.5 and 2.5. These sit a quarter of a rung higher,
+/// so a task has to look clearly heavier before it buys a heavier model.
+///
+/// **A quarter, not a whole rung.** Biasing the first cut all the way to
+/// 1.25 sent an entire feature's implementation to `dwarf` on 2026-09-20:
+/// the run cost more, not less, because the parent then spent 27 shell
+/// calls and 11 edits repairing what came back. Cheap routing that has to
+/// be redone is not cheap, and the命題 is cost at held quality.
+const RUNGS: [(f64, Tier); 3] = [
+    (0.75, Tier::Subgiant),
+    (1.75, Tier::Giant),
+    (2.75, Tier::Supergiant),
+];
+
+/// The rung a score lands on. Below the first threshold is the lightest.
+fn from_score(score: f64) -> Option<Tier> {
+    if !score.is_finite() || score < 0.0 {
+        return None;
+    }
+    Some(
+        RUNGS
+            .iter()
+            .filter(|(at, _)| score >= *at)
+            .map(|(_, tier)| *tier)
+            .next_back()
+            .unwrap_or(Tier::Dwarf),
+    )
+}
+
 fn criteria() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -58,10 +104,10 @@ fn key(index: usize) -> String {
 #[async_trait::async_trait]
 impl<D: Decider> TierDecider for TypedTierDecider<D> {
     async fn decide(&self, tasks: &[(&AgentType, &str)]) -> Vec<Tier> {
-        let declared = || {
+        let unrouted = || {
             tasks
                 .iter()
-                .map(|(agent, _)| agent.tier)
+                .map(|(agent, _)| Tier::DEFAULT.min(agent.tier))
                 .collect::<Vec<_>>()
         };
         if tasks.is_empty() {
@@ -73,12 +119,12 @@ impl<D: Decider> TierDecider for TypedTierDecider<D> {
             .map(|(index, (agent, task))| {
                 (
                     key(index),
-                    Question::Choice {
+                    Question::Score {
                         instructions: format!(
                             "次の依頼は、どの重さの作業か。\n\n担当する型: {}\n型の説明: {}\n依頼: {task}",
                             agent.name, agent.description
                         ),
-                        criteria: criteria(),
+                        criteria: levels(),
                     },
                 )
             })
@@ -99,32 +145,26 @@ impl<D: Decider> TierDecider for TypedTierDecider<D> {
                 })
                 .sum::<usize>();
         if polaris_provider::decision::within_limits(counted, &questions).is_err() {
-            return declared();
+            return unrouted();
         }
         let Ok(decision) = self.decider.decide(&state, &questions).await else {
             // Authentication, the service being unreachable, a malformed
-            // reply: none of them is a reason to lose a delegation. The
-            // declared weight is a complete answer on its own.
-            return declared();
+            // reply, or cancellation: none of them is a reason to lose a
+            // delegation. This is an unrouted task, so use the M16 default
+            // held down by the declared ceiling.
+            return unrouted();
         };
         (0..tasks.len())
             .map(|index| {
                 decision
                     .answers
                     .get(&key(index))
-                    .and_then(|answer| answer.choice.as_deref())
-                    .and_then(from_name)
-                    .unwrap_or(tasks[index].0.tier)
+                    .and_then(|answer| answer.score)
+                    .and_then(from_score)
+                    .unwrap_or_else(|| Tier::DEFAULT.min(tasks[index].0.tier))
             })
             .collect()
     }
-}
-
-/// The reply names an option rather than pointing at a position, so a name
-/// nobody offered is the one thing that cannot be interpreted. It falls
-/// back to the declaration rather than to a guess.
-fn from_name(name: &str) -> Option<Tier> {
-    Tier::ALL.into_iter().find(|tier| tier.name() == name)
 }
 
 #[cfg(test)]

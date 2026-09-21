@@ -94,6 +94,10 @@ pub(crate) async fn run_one_scoped(
         events,
         workflow,
         &Gate::new(ApprovalPolicy::Never),
+        // The files.md regeneration path runs one type directly, outside
+        // any wave. It delegates nothing, so it enters on the last rung.
+        MAX_DEPTH,
+        ChildMemory::default(),
     )
     .await
 }
@@ -109,6 +113,8 @@ async fn run_one_with_gate(
     events: Option<crate::desktop_events::EventSink>,
     workflow: Option<&ChildWorkflow>,
     parent_gate: &Gate,
+    depth: u8,
+    memory: ChildMemory,
 ) -> TaskOutcome {
     let events = match events {
         Some(crate::desktop_events::EventSink::Bounded(sink)) => match sink.child() {
@@ -146,6 +152,8 @@ async fn run_one_with_gate(
             workflow,
             parent_gate,
             child_events,
+            depth,
+            memory,
         ),
     )
     .await;
@@ -250,6 +258,8 @@ async fn run_one_inner(
     workflow: Option<&ChildWorkflow>,
     parent_gate: &Gate,
     events: Option<crate::desktop_events::EventSink>,
+    depth: u8,
+    memory: ChildMemory,
 ) -> TaskOutcome {
     let Some(agent) = agent_types.iter().find(|a| a.name == task.agent_type) else {
         let candidates = polaris_tools::skill::lookup(agent_types, &task.agent_type);
@@ -277,14 +287,18 @@ async fn run_one_inner(
         Err(error) => return TaskOutcome::Failed(error.to_string()),
     };
 
-    // Depth 1: whatever `allowed-tools` says, `spawn` is excluded
-    // unconditionally. This is the only thing that makes the empty
-    // `agent_types` handed to `run_loop` below correct rather than merely
-    // convenient — the subagent's own loop can never reach the `spawn`
-    // arm to consult it.
+    // The last rung cannot delegate: whatever `allowed-tools` says,
+    // `spawn` is excluded there. Above it, a type gets `spawn` only if it
+    // asked for it. The catalogue handed to `run_loop` below follows the
+    // same test, so the tool and the types it resolves against are never
+    // out of step — a loop that can reach the `spawn` arm always has
+    // something to resolve, and one that cannot never does.
+    let may_delegate = depth < MAX_DEPTH;
     let mut tools: Vec<polaris_tools::ToolSpec> = polaris_tools::all_specs()
         .into_iter()
-        .filter(|t| t.name != "spawn" && agent.allowed_tools.iter().any(|a| a == &t.name))
+        .filter(|t| {
+            (may_delegate || t.name != "spawn") && agent.allowed_tools.iter().any(|a| a == &t.name)
+        })
         .collect();
     tools.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -294,6 +308,16 @@ async fn run_one_inner(
     };
 
     let mut session = Session::new();
+    // A resumable type picks up where it left off. The key is the type and
+    // the directory it writes to, which is what "the same implementer"
+    // means to the agent addressing it.
+    let remembered = memory_key(agent, task);
+    if agent.continuation {
+        session.child_memory = memory.clone();
+        if let Some(prior) = memory.lock().await.get(&remembered) {
+            session.messages = prior.clone();
+        }
+    }
     if let Some(inherited) = workflow {
         // A child receives required skills and focus, but no parent grants or
         // completed verification evidence for its new task.
@@ -326,6 +350,9 @@ async fn run_one_inner(
         approver: &mut approver,
     };
 
+    // A grandchild wave started from here shares the one store, so a
+    // follow-up reaches the same worker wherever it sits in the tree.
+    session.child_memory = memory.clone();
     let result = run_loop(
         provider.as_ref(),
         &mut session,
@@ -334,17 +361,14 @@ async fn run_one_inner(
         &agent.body,
         &tools,
         skills,
-        // A subagent can never spawn (depth is fixed at 1), so there is
-        // no type catalog to resolve against, and its own provider /
-        // audit handles are simply the ones it was given.
-        &[],
+        // The same catalogue the root resolves against, but only where
+        // this one may delegate; on the last rung it is empty and the
+        // `spawn` arm is unreachable anyway.
+        if may_delegate { agent_types } else { &[] },
         provider.clone(),
-        // A subagent's tool list never contains `spawn` (depth is fixed
-        // at 1 — see above), so these two never actually gate anything
-        // for it; the constants are passed only because `run_loop`'s
-        // signature requires some value.
-        DEFAULT_CONCURRENCY,
-        DEFAULT_WRITE_CONCURRENCY,
+        // A wave below the root runs on its own, smaller permits.
+        CHILD_CONCURRENCY,
+        CHILD_WRITE_CONCURRENCY,
         &agent.name,
         &task.task,
         true,
@@ -354,6 +378,19 @@ async fn run_one_inner(
     )
     .await;
 
+    if agent.continuation && result.is_ok() {
+        let mut held = memory.lock().await;
+        if held.len() >= REMEMBERED && !held.contains_key(&remembered) {
+            // Nothing here is load-bearing: a conversation that falls out
+            // is re-read rather than lost, which is the behaviour every
+            // type had before this existed.
+            let oldest = held.keys().next().cloned();
+            if let Some(oldest) = oldest {
+                held.remove(&oldest);
+            }
+        }
+        held.insert(remembered, session.messages.clone());
+    }
     match result {
         Ok(outcome) => match validate_output(agent, &outcome.text) {
             Ok(()) => TaskOutcome::Ok(outcome.text),
@@ -456,7 +493,16 @@ fn validate_output(agent: &AgentType, text: &str) -> Result<(), String> {
         .map_err(|e| format!("output schema is not valid JSON: {e}"))?;
     let instance: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| format!("subagent output is not valid JSON: {e}"))?;
-    polaris_tools::validate(&schema, &instance)
+    polaris_tools::validate(&schema, &instance).map_err(|error| {
+        // Validation diagnostics can quote the rejected value. Do not
+        // return an oversized child answer through the error path either.
+        let mut chars = error.chars();
+        let mut bounded: String = chars.by_ref().take(512).collect();
+        if chars.next().is_some() {
+            bounded.push_str("… (truncated)");
+        }
+        bounded
+    })
 }
 
 /// Canonicalizes a declared `write_root`. Shared by `resolve_subagent_sandbox`
@@ -510,6 +556,49 @@ fn resolve_subagent_sandbox(
 /// `Config::spawn_write_concurrency` — see `config.rs`.
 pub const DEFAULT_CONCURRENCY: usize = 8;
 pub const DEFAULT_WRITE_CONCURRENCY: usize = 4;
+
+/// How deep delegation may go. The root is 0, the subagents it spawns are
+/// 1, and theirs are 2 — which is the last rung, so a grandchild's tool
+/// list has no `spawn` in it.
+///
+/// Two rather than one because a feature is managed, not just typed: the
+/// agent holding a feature reads the plan, hands the writing to someone,
+/// and checks what comes back against the plan. Doing that from the root
+/// puts every intermediate reply in the most expensive context in the run.
+pub const MAX_DEPTH: u8 = 2;
+
+/// A wave below the root gets its own, smaller permits rather than sharing
+/// the root's. Sharing one set would deadlock — a parent holds its permit
+/// for as long as its children run, so a full root wave whose members all
+/// spawn would wait on permits none of them can release. Separate sets
+/// cannot deadlock, and the product is the bound: at most
+/// `DEFAULT_CONCURRENCY + DEFAULT_CONCURRENCY * CHILD_CONCURRENCY` agents
+/// run at once.
+pub const CHILD_CONCURRENCY: usize = 2;
+pub const CHILD_WRITE_CONCURRENCY: usize = 1;
+
+/// What a resumable subagent left behind, for the length of one root run.
+///
+/// The identity of "that same implementer" is its type and the directory
+/// it writes to; a follow-up addressed to the same pair continues the
+/// conversation instead of starting one. Without it the follow-up reads
+/// everything again, which costs the reading twice and gives the second
+/// reader less than the first had — the whole reason to send a small
+/// adjustment back to whoever just did the work.
+pub type ChildMemory =
+    Arc<Mutex<std::collections::HashMap<String, Vec<polaris_provider::Message>>>>;
+
+/// How many resumable conversations one run keeps. A feature at a time,
+/// with room for the ones already finished.
+const REMEMBERED: usize = 8;
+
+fn memory_key(agent: &AgentType, task: &SpawnTask) -> String {
+    format!(
+        "{}\0{}",
+        agent.name,
+        task.write_root.as_deref().unwrap_or("")
+    )
+}
 
 /// One wave, run in parallel (Task 10 — Task 9 ran it sequentially), with
 /// write-target collision checking upfront.
@@ -603,8 +692,27 @@ pub async fn run_wave_scoped(
         workflow,
         &Gate::new(ApprovalPolicy::Never),
         None,
+        1,
+        ChildMemory::default(),
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The reply for a wave that cannot start: one refusal per task, in the
+/// shape a successful wave would have returned.
+fn failed_wave(tasks: &[SpawnTask], error: &str) -> String {
+    let entries: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|task| {
+            serde_json::json!({
+                "type": task.agent_type,
+                "ok": false,
+                "error": error,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(entries).to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -621,19 +729,13 @@ pub(crate) async fn run_wave_with_gate(
     workflow: Option<ChildWorkflow>,
     parent_gate: &Gate,
     decider: Option<&dyn crate::tier::TierDecider>,
+    // The rung the tasks in this wave will run on. The root's own wave is
+    // 1; a wave a subagent starts is its own depth plus one.
+    depth: u8,
+    memory: ChildMemory,
 ) -> String {
     if let Err(msg) = check_no_write_root_overlap(&tasks) {
-        let entries: Vec<serde_json::Value> = tasks
-            .iter()
-            .map(|task| {
-                serde_json::json!({
-                    "type": task.agent_type,
-                    "ok": false,
-                    "error": msg,
-                })
-            })
-            .collect();
-        return serde_json::Value::Array(entries).to_string();
+        return failed_wave(&tasks, &msg);
     }
 
     let total_permits = Semaphore::new(concurrency);
@@ -667,7 +769,29 @@ pub(crate) async fn run_wave_with_gate(
             .map(|((index, chosen), declared)| (index, (declared, chosen)))
             .collect();
 
+    // What the wave was priced at, in the record rather than only in the
+    // bill. Without it, calibrating the thresholds means inferring the
+    // rung from which model appeared in the metrics, and a run where the
+    // routing was wrong looks exactly like one where it was right but the
+    // work was light.
+    for (index, agent, _) in &known {
+        if let Some((declared, chosen)) = decided.get(index) {
+            let recorded = audit.lock().await.record(&crate::audit::Record {
+                tool: "spawn-tier",
+                detail: &agent.name,
+                sandbox: None,
+                target: None,
+                result: &format!("declared={} decided={}", declared.name(), chosen.name()),
+                caller: "root",
+            });
+            if let Err(error) = recorded {
+                return failed_wave(&tasks, &error.to_string());
+            }
+        }
+    }
+
     let futures = tasks.iter().enumerate().map(|(index, task)| {
+        let memory = memory.clone();
         let provider = provider.clone();
         let audit = audit.clone();
         let events = events.clone();
@@ -702,6 +826,8 @@ pub(crate) async fn run_wave_with_gate(
                 events,
                 workflow,
                 parent_gate,
+                depth,
+                memory.clone(),
             )
             .await;
             // A successful result has already been parsed as JSON by
@@ -1115,6 +1241,160 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("SKILL.md")).expect("cannot read SKILL.md");
         polaris_skills::agent_type::parse(&text, "file-inspector", &dir)
             .expect("agents/file-inspector does not parse")
+    }
+
+    fn file_reader() -> AgentType {
+        polaris_skills::builtin::agent_types()
+            .into_iter()
+            .find(|agent| agent.name == "file-reader")
+            .expect("file-reader must ship without project-installed agents")
+    }
+
+    #[test]
+    fn file_reader_requires_bounded_evidence_and_explicit_gaps() {
+        let agent = file_reader();
+        assert_eq!(agent.tier, polaris_skills::Tier::Dwarf);
+        assert_eq!(agent.allowed_tools, ["read"]);
+        assert_eq!(agent.access, polaris_skills::AgentAccess::Read);
+        let valid = serde_json::json!({
+            "path": "/fixture/limits.rs",
+            "findings": [{"line": 17, "text": "The timeout is 30 seconds, except for retries."}],
+            "gaps": []
+        });
+        validate_output(&agent, &valid.to_string()).unwrap();
+        let partial = serde_json::json!({
+            "path": "/fixture/limits.rs", "findings": [], "gaps": ["The requested range was unreadable."]
+        });
+        validate_output(&agent, &partial.to_string()).unwrap();
+        for invalid in [
+            serde_json::json!({"path":"relative.rs", "findings":[], "gaps":["unread"]}),
+            serde_json::json!({"path":"/fixture/limits.rs", "findings": valid["findings"]}),
+            serde_json::json!({"path":"/fixture/limits.rs", "findings":[{"text":"30 seconds"}], "gaps":[]}),
+            serde_json::json!({"path":"/fixture/limits.rs", "findings":[{"line":0,"text":"30 seconds"}], "gaps":[]}),
+            serde_json::json!({"path":"/fixture/limits.rs", "findings":[{"line":17,"text":"x".repeat(281)}], "gaps":[]}),
+            serde_json::json!({"path":"/fixture/limits.rs", "findings":vec![valid["findings"][0].clone(); 5], "gaps":[]}),
+            serde_json::json!({"path":"/fixture/limits.rs", "findings":[], "gaps":["x".repeat(161)]}),
+            serde_json::json!({"path":"/fixture/limits.rs", "findings":[], "gaps":vec!["unread"; 4]}),
+            serde_json::json!({"path":format!("/{}", "x".repeat(512)), "findings":[], "gaps":["unread"]}),
+            serde_json::json!({"path":"/fixture/limits.rs", "findings":[], "gaps":[], "raw":"whole file"}),
+        ] {
+            assert!(
+                validate_output(&agent, &invalid.to_string()).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_reader_wave_returns_evidence_without_its_read_transcript() {
+        struct ReadThenAnswer {
+            path: PathBuf,
+            answer: String,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Provider for ReadThenAnswer {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                assert_eq!(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["read"]
+                );
+                match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Ok(read_call(&self.path)),
+                    1 => {
+                        let history = serde_json::to_string(&request.messages).unwrap();
+                        assert!(
+                            history.contains("RAW_ONLY_SENTINEL"),
+                            "read did not reach the child: {history}"
+                        );
+                        assert!(history.contains("const TIMEOUT: u64 = 30;"));
+                        Ok(text(&self.answer))
+                    }
+                    _ => panic!("unexpected retry"),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("limits.rs");
+        std::fs::write(&target, "// RAW_ONLY_SENTINEL\nconst TIMEOUT: u64 = 30;\n").unwrap();
+        let result = serde_json::json!({
+            "path": target.to_str().unwrap(),
+            "findings": [{"line": 2, "text": "TIMEOUT is 30."}],
+            "gaps": []
+        });
+        let provider = Arc::new(ReadThenAnswer {
+            path: target.clone(),
+            answer: result.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let returned = run_wave(
+            vec![SpawnTask {
+                agent_type: "file-reader".into(),
+                task: format!("What is TIMEOUT in {}?", target.display()),
+                write_root: None,
+            }],
+            &[file_reader()],
+            provider.clone(),
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            1,
+            1,
+            None,
+        )
+        .await;
+        let entries: serde_json::Value = serde_json::from_str(&returned).unwrap();
+        assert_eq!(entries[0]["ok"], true, "{returned}");
+        assert_eq!(entries[0]["result"], result);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!returned.contains("RAW_ONLY_SENTINEL"));
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        assert!(log.contains("\"tool\":\"read\""), "{log}");
+        assert!(log.contains("\"caller\":\"file-reader\""), "{log}");
+    }
+
+    #[tokio::test]
+    async fn file_reader_schema_failure_does_not_return_the_rejected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = serde_json::json!({
+            "path": "/fixture/source.rs",
+            "findings": [{"line":1, "text": format!("{}RAW_TAIL_SENTINEL", "文".repeat(4096))}],
+            "gaps": []
+        })
+        .to_string();
+        let returned = run_wave(
+            vec![SpawnTask {
+                agent_type: "file-reader".into(),
+                task: "Read /fixture/source.rs and explain the limit.".into(),
+                write_root: None,
+            }],
+            &[file_reader()],
+            scripted(vec![text(&invalid), text(&invalid)]),
+            audit_in(dir.path()),
+            &full_access(),
+            Path::new("/bin/true"),
+            1,
+            1,
+            None,
+        )
+        .await;
+        let entries: serde_json::Value = serde_json::from_str(&returned).unwrap();
+        assert_eq!(entries[0]["ok"], false);
+        let error = entries[0]["error"].as_str().unwrap();
+        assert!(
+            error.chars().count() < 600,
+            "{} diagnostic characters",
+            error.chars().count()
+        );
+        assert!(!returned.contains("RAW_TAIL_SENTINEL"));
+        assert!(error.contains("truncated"));
     }
 
     #[tokio::test]
@@ -2905,5 +3185,99 @@ mod resolved_type_tests {
             *capture.0.lock().unwrap(),
             ["ro-fixture".to_owned(), "second-fixture".to_owned()]
         );
+    }
+
+    /// Delegation reaches two rungs and stops. The rung below the root may
+    /// spawn, so a feature can be managed by the agent holding it; the rung
+    /// below that may not, so the tree has a bottom.
+    #[test]
+    fn the_tree_has_a_bottom_and_a_rung_that_may_delegate() {
+        // `may_delegate` in `run_one_inner` is `depth < MAX_DEPTH`, read
+        // here at the two rungs a task can actually enter on.
+        let may_delegate = |depth: u8| depth < super::MAX_DEPTH;
+        assert_eq!(super::MAX_DEPTH, 2);
+        assert!(may_delegate(1), "the root's children may delegate");
+        assert!(!may_delegate(super::MAX_DEPTH), "the last rung may not");
+    }
+
+    /// Separate permits per rung, because one shared set deadlocks: a
+    /// parent holds its permit while its children run, so a full wave
+    /// whose members all delegate would wait on permits none of them can
+    /// release.
+    #[test]
+    fn a_rung_below_the_root_runs_on_its_own_smaller_permits() {
+        assert_eq!(
+            (super::CHILD_CONCURRENCY, super::CHILD_WRITE_CONCURRENCY),
+            (2, 1)
+        );
+        assert_eq!(
+            (super::DEFAULT_CONCURRENCY, super::DEFAULT_WRITE_CONCURRENCY),
+            (8, 4)
+        );
+        // The bound the tree actually has, stated rather than inferred.
+        let most =
+            super::DEFAULT_CONCURRENCY + super::DEFAULT_CONCURRENCY * super::CHILD_CONCURRENCY;
+        assert_eq!(most, 24);
+    }
+
+    /// The identity of "that same implementer" is its type and where it
+    /// writes. A follow-up addressed to the same pair continues; a
+    /// different feature, or a different type, does not.
+    #[test]
+    fn a_follow_up_finds_the_worker_that_did_the_work() {
+        let write = |root: Option<&str>| super::SpawnTask {
+            agent_type: "implementer".into(),
+            task: "何かする".into(),
+            write_root: root.map(str::to_owned),
+        };
+        let implementer = shipped("implementer");
+        let writer = shipped("doc-writer");
+        let first = super::memory_key(&implementer, &write(Some("/w/feature-a")));
+        assert_eq!(
+            first,
+            super::memory_key(
+                &implementer,
+                &super::SpawnTask {
+                    task: "続きをする".into(),
+                    ..write(Some("/w/feature-a"))
+                }
+            ),
+            "a later task for the same feature reaches the same worker"
+        );
+        assert_ne!(
+            first,
+            super::memory_key(&implementer, &write(Some("/w/feature-b")))
+        );
+        assert_ne!(
+            first,
+            super::memory_key(&writer, &write(Some("/w/feature-a")))
+        );
+        assert_ne!(first, super::memory_key(&implementer, &write(None)));
+    }
+
+    /// Only a type that says it may be resumed is kept, and the store is
+    /// bounded: what falls out is re-read, which is what every type did
+    /// before this existed.
+    #[test]
+    fn only_resumable_types_are_kept_and_the_store_is_bounded() {
+        assert_eq!(super::REMEMBERED, 8);
+        assert!(
+            shipped("implementer").continuation,
+            "the worker a follow-up is sent back to has to be resumable"
+        );
+        for name in ["file-reader", "file-inspector", "reviewer", "doc-writer"] {
+            let shipped = shipped(name);
+            assert!(
+                !shipped.continuation,
+                "{name} answers one question at a time; keeping it would grow the store for nothing"
+            );
+        }
+    }
+
+    fn shipped(name: &str) -> polaris_skills::AgentType {
+        polaris_skills::builtin::agent_types()
+            .into_iter()
+            .find(|agent| agent.name == name)
+            .unwrap_or_else(|| panic!("{name} is shipped"))
     }
 }

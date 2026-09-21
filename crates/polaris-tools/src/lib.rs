@@ -154,7 +154,7 @@ pub fn setting_spec() -> ToolSpec {
 fn read_spec() -> ToolSpec {
     ToolSpec {
         name: "read".into(),
-        description: "Read a file. Returns it with line numbers. Omit limit unless you truly want less than 2000 lines - a guessed smaller value just forces a second read.".into(),
+        description: "Read lines; offset 0-based, default limit 2000. Use relevant ranges; prefer file-reader for large files when available.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -238,7 +238,7 @@ fn skill_spec() -> ToolSpec {
 fn spawn_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn".into(),
-        description: "Run subagents in parallel. Their steps never enter your context.".into(),
+        description: "Delegate independent work; only results enter your context. implementer writes a decided change and needs write_root, reviewer checks read-only, file-reader answers one question about one absolute path.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -283,25 +283,16 @@ mod tests {
     }
 
     #[test]
-    fn read_spec_tells_the_model_the_default_limit_instead_of_leaving_it_to_guess() {
-        // A live polaris-vs-codex comparison run showed the model choosing
-        // small limits (120-300 lines) with the old wording ("Use offset
-        // and limit to specify a range"), which said nothing about what
-        // happens when limit is omitted. Large files then needed a second
-        // read call for the remainder, and every extra round trip resends
-        // the whole growing history under this provider's store: false
-        // design (see codex.rs:132), so avoidable extra calls are not free
-        // the way they'd be under a stateful API. Naming the actual
-        // default here gives the model a reason to omit limit instead of
-        // guessing.
+    fn read_spec_names_the_actual_default_limit() {
+        // Range selection and delegation advice must still describe what
+        // omitting limit does. Keep the advertised default tied to read.
         let read = all_specs()
             .into_iter()
             .find(|s| s.name == "read")
             .expect("no read");
         assert!(
-            read.description.contains("2000"),
-            "description should name the actual default so the model omits limit \
-             instead of guessing a small one: {:?}",
+            read.description.contains(&read::DEFAULT_LIMIT.to_string()),
+            "description should name the actual default limit: {:?}",
             read.description
         );
     }

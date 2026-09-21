@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "required": ["written", "undecided", "read"],
+  "properties": {
+    "written": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "what"],
+        "properties": {
+          "path": { "type": "string" },
+          "what": { "type": "string" }
+        }
+      }
+    },
+    "undecided": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "read": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

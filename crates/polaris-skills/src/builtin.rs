@@ -82,7 +82,13 @@ struct Builtin {
     schema: &'static str,
 }
 
-const BUILTINS: [Builtin; 3] = [
+const BUILTINS: [Builtin; 6] = [
+    Builtin {
+        name: "file-reader",
+        manifest: include_str!("../../../agents/file-reader/SKILL.md"),
+        schema_path: "references/result.schema.json",
+        schema: include_str!("../../../agents/file-reader/references/result.schema.json"),
+    },
     Builtin {
         name: "file-inspector",
         manifest: include_str!("../../../agents/file-inspector/SKILL.md"),
@@ -100,6 +106,18 @@ const BUILTINS: [Builtin; 3] = [
         manifest: include_str!("../../../agents/implementer/SKILL.md"),
         schema_path: "references/result.schema.json",
         schema: include_str!("../../../agents/implementer/references/result.schema.json"),
+    },
+    Builtin {
+        name: "doc-writer",
+        manifest: include_str!("../../../agents/doc-writer/SKILL.md"),
+        schema_path: "references/result.schema.json",
+        schema: include_str!("../../../agents/doc-writer/references/result.schema.json"),
+    },
+    Builtin {
+        name: "reviewer",
+        manifest: include_str!("../../../agents/reviewer/SKILL.md"),
+        schema_path: "references/result.schema.json",
+        schema: include_str!("../../../agents/reviewer/references/result.schema.json"),
     },
 ];
 

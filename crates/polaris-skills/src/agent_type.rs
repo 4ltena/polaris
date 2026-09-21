@@ -88,6 +88,11 @@ pub struct AgentType {
     pub allowed_tools: Vec<String>,
     pub access: AgentAccess,
     pub tier: Tier,
+    /// The rung a decision may not route below, where `tier` is the one it
+    /// may not route above. A type whose work is worth doing properly —
+    /// a document someone will act on — says so here rather than hoping
+    /// the judge agrees every time.
+    pub tier_min: Tier,
     pub wall_seconds: u32,
     pub max_turns: u32,
     /// Explicit role focus from the local type definition, never task prose.
@@ -246,6 +251,27 @@ pub fn parse(text: &str, dir_name: &str, dir_path: &Path) -> Result<AgentType, A
             });
         }
     };
+    let tier_min = match metadata.get("polaris-tier-min").map(String::as_str) {
+        None => Tier::Dwarf,
+        Some("dwarf") => Tier::Dwarf,
+        Some("subgiant") => Tier::Subgiant,
+        Some("giant") => Tier::Giant,
+        Some("supergiant") => Tier::Supergiant,
+        Some(other) => {
+            return Err(AgentTypeError::InvalidMetadataValue {
+                agent: dir_name.to_string(),
+                key: "polaris-tier-min",
+                value: other.to_string(),
+            });
+        }
+    };
+    if tier_min > tier {
+        return Err(AgentTypeError::InvalidMetadataValue {
+            agent: dir_name.to_string(),
+            key: "polaris-tier-min",
+            value: format!("{} は上限 {} を超えています", tier_min.name(), tier.name()),
+        });
+    }
     let wall_seconds = required_metadata(&metadata, dir_name, "polaris-wall-seconds")?
         .parse::<u32>()
         .map_err(|_| AgentTypeError::InvalidMetadataValue {
@@ -318,6 +344,7 @@ pub fn parse(text: &str, dir_name: &str, dir_path: &Path) -> Result<AgentType, A
         wall_seconds,
         max_turns,
         workflow_phase,
+        tier_min,
         continuation,
         output_schema,
     })

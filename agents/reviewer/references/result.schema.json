@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "required": ["findings", "read", "notes"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "line", "what", "breaks"],
+        "properties": {
+          "path": { "type": "string" },
+          "line": { "type": "integer" },
+          "what": { "type": "string" },
+          "breaks": { "type": "string" }
+        }
+      }
+    },
+    "read": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "notes": { "type": ["string", "null"] }
+  }
+}

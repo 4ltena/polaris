@@ -61,6 +61,7 @@
       "run_id": "child",
       "attempt_id": "child-attempt",
       "parent_run_id": "run",
+      "display_name": "Sirius",
       "state": "queued",
       "task_ids": [
         "task"

@@ -30,6 +30,24 @@ impl TextDelta {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RunActivityPhase {
+    Working,
+    Judging,
+    ContextJudging,
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunActivity {
+    pub run_id: RunId,
+    pub attempt_id: AttemptId,
+    pub phase: RunActivityPhase,
+}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExpiryReason {
     Cancelled,
     Shutdown,
@@ -55,6 +73,8 @@ pub enum EventBody {
     MessageDelta(TextDelta),
     #[serde(rename = "run.state")]
     RunState(Run),
+    #[serde(rename = "run.activity")]
+    RunActivity(RunActivity),
     #[serde(rename = "task.updated")]
     TaskUpdated(Task),
     #[serde(rename = "child.updated")]
@@ -119,6 +139,7 @@ impl<'de> Deserialize<'de> for Event {
             wire.event_type.as_str(),
             "message.delta"
                 | "run.state"
+                | "run.activity"
                 | "task.updated"
                 | "child.updated"
                 | "draft.updated"
@@ -167,6 +188,7 @@ impl Serialize for Event {
         match &self.body {
             EventBody::MessageDelta(p) => payload!("message.delta", p),
             EventBody::RunState(p) => payload!("run.state", p),
+            EventBody::RunActivity(p) => payload!("run.activity", p),
             EventBody::TaskUpdated(p) => payload!("task.updated", p),
             EventBody::ChildUpdated(p) => payload!("child.updated", p),
             EventBody::DraftUpdated(p) => payload!("draft.updated", p),

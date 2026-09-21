@@ -2,7 +2,7 @@
 
 use polaris_desktop_protocol::{
     codec::{self, CodecError, Decode},
-    event::{Durability, Event, EventBody},
+    event::{Durability, Event, EventBody, RunActivityPhase},
     ids::*,
     request::{HistoryPage, Request, RequestBody},
     response::{CorrelationError, RequestStatusResult, Response, SuccessResult},
@@ -142,6 +142,7 @@ fn snapshot_preserves_approval_acceptance_blockers_and_history_start() {
     assert_eq!(task.blockers[0].run_id, snapshot.children[0].run_id);
     assert_eq!(snapshot.runs[0].task_ids, vec![task.task_id.clone()]);
     assert_eq!(snapshot.children[0].task_ids, vec![task.task_id.clone()]);
+    assert_eq!(snapshot.children[0].display_name.as_deref(), Some("Sirius"));
     let page = HistoryPage {
         snapshot_id: snapshot.snapshot_id,
         cursor: snapshot.history_start_cursor,
@@ -301,6 +302,31 @@ fn event_fixtures_preserve_byte_offsets_epoch_and_tentative_content() {
 }
 
 #[test]
+fn run_activity_keeps_decision_phases_separate_from_durable_run_state() {
+    let mut wire = values(include_str!("fixtures/events.json"))[0].clone();
+    wire["type"] = json!("run.activity");
+    wire["payload"] = json!({
+        "run_id": "run",
+        "attempt_id": "attempt",
+        "phase": "judging"
+    });
+    let EventBody::RunActivity(activity) = assert_wire::<Event>(&wire).body else {
+        panic!("run activity")
+    };
+    assert_eq!(activity.phase, RunActivityPhase::Judging);
+    wire["payload"]["phase"] = json!("context_judging");
+    let EventBody::RunActivity(activity) = assert_wire::<Event>(&wire).body else {
+        panic!("run activity")
+    };
+    assert_eq!(activity.phase, RunActivityPhase::ContextJudging);
+    wire["payload"]["phase"] = json!("working");
+    let EventBody::RunActivity(activity) = assert_wire::<Event>(&wire).body else {
+        panic!("run activity")
+    };
+    assert_eq!(activity.phase, RunActivityPhase::Working);
+}
+
+#[test]
 fn handwritten_rejection_reasons_are_stable() {
     for fixture in values(include_str!("fixtures/rejected.json")) {
         let expected = match fixture["reason"].as_str().unwrap() {
@@ -371,6 +397,7 @@ fn rejects_mutations<T: DeserializeOwned>(wire: &Value) {
         let optional = path.ends_with("/resume")
             || path.ends_with("/next_cursor")
             || path.ends_with("/run")
+            || path.ends_with("/display_name")
             || (wire["method"] == "draft.update" && path == "/params/attachment_ids");
         if !optional {
             let mut bad = wire.clone();

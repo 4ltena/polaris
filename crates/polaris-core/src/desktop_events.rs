@@ -87,6 +87,34 @@ pub enum EventSink {
     Legacy(mpsc::UnboundedSender<AgentEvent>),
     Bounded(DesktopEventSink),
 }
+
+struct ObservedDecider {
+    inner: Arc<dyn polaris_provider::decision::Decider>,
+    events: EventSink,
+}
+
+struct DecisionFinished(EventSink);
+impl Drop for DecisionFinished {
+    fn drop(&mut self) {
+        let _ = self.0.send(AgentEvent::DecisionFinished);
+    }
+}
+
+#[async_trait::async_trait]
+impl polaris_provider::decision::Decider for ObservedDecider {
+    async fn decide(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+    ) -> Result<polaris_provider::decision::Decision, polaris_provider::decision::DecisionError>
+    {
+        self.events
+            .send(AgentEvent::DecisionStarted)
+            .map_err(|_| polaris_provider::decision::DecisionError::Cancelled)?;
+        let _finished = DecisionFinished(self.events.clone());
+        self.inner.decide(state, questions).await
+    }
+}
 impl From<mpsc::UnboundedSender<AgentEvent>> for EventSink {
     fn from(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
         Self::Legacy(tx)
@@ -121,6 +149,19 @@ impl DesktopEventSink {
         }
         self.execution = Some(port);
         Ok(self)
+    }
+    /// Decorates only the desktop run's configured typed decision engine.
+    /// The guard emits a matching finish when its future is completed,
+    /// cancelled or unwound, so the window cannot remain stuck on Judging.
+    #[doc(hidden)]
+    pub fn observe_decider(
+        &self,
+        inner: Arc<dyn polaris_provider::decision::Decider>,
+    ) -> Arc<dyn polaris_provider::decision::Decider> {
+        Arc::new(ObservedDecider {
+            inner,
+            events: EventSink::Bounded(self.clone()),
+        })
     }
     pub(crate) fn execution(&self) -> Option<&crate::desktop_execution::ExecutionPort> {
         self.execution.as_ref()
@@ -380,6 +421,85 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), control.cancelled())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observed_decider_balances_judging_events() {
+        struct Judge;
+        #[async_trait::async_trait]
+        impl polaris_provider::decision::Decider for Judge {
+            async fn decide(
+                &self,
+                _: &serde_json::Value,
+                _: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+            ) -> Result<
+                polaris_provider::decision::Decision,
+                polaris_provider::decision::DecisionError,
+            > {
+                Ok(polaris_provider::decision::Decision {
+                    answers: Default::default(),
+                    input_tokens: None,
+                    output_tokens: None,
+                })
+            }
+        }
+        let (sink, mut receiver, control) =
+            DesktopEventSink::channel(RunId::new("judging").unwrap());
+        let observed = sink.observe_decider(Arc::new(Judge));
+        observed
+            .decide(&serde_json::json!({}), &Default::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap().event,
+            AgentEvent::DecisionStarted
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().event,
+            AgentEvent::DecisionFinished
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(control.failure(), None);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_observed_decision_clears_judging() {
+        struct Pending;
+        #[async_trait::async_trait]
+        impl polaris_provider::decision::Decider for Pending {
+            async fn decide(
+                &self,
+                _: &serde_json::Value,
+                _: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+            ) -> Result<
+                polaris_provider::decision::Decision,
+                polaris_provider::decision::DecisionError,
+            > {
+                std::future::pending().await
+            }
+        }
+        let (sink, mut receiver, control) =
+            DesktopEventSink::channel(RunId::new("cancelled-judging").unwrap());
+        let observed = sink.observe_decider(Arc::new(Pending));
+        let state = serde_json::json!({});
+        let questions = Default::default();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                observed.decide(&state, &questions),
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap().event,
+            AgentEvent::DecisionStarted
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().event,
+            AgentEvent::DecisionFinished
+        ));
+        assert_eq!(control.failure(), None);
     }
 
     #[test]

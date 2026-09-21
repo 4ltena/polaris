@@ -216,6 +216,8 @@ pub struct Child {
     pub run_id: RunId,
     pub attempt_id: AttemptId,
     pub parent_run_id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub state: RunState,
     pub task_ids: Vec<TaskId>,
 }

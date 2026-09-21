@@ -34,6 +34,17 @@ pub(super) fn validate(state: &Sidecar) -> StoreResult<()> {
             || saved.agent_type.len() > 128
             || saved.task.is_empty()
             || saved.task.len() > 4096
+            || child
+                .display_name
+                .as_deref()
+                .is_some_and(|name| !super::star_names::contains(name))
+            || child.display_name.as_ref().is_some_and(|name| {
+                state.children[..index].iter().any(|other| {
+                    other.child.display_name.as_ref() == Some(name)
+                        && (other.root == saved.root
+                            || (!other.child.state.is_terminal() && !child.state.is_terminal()))
+                })
+            })
             || child.task_ids.len() > 128
             || state
                 .children

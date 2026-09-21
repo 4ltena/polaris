@@ -13,7 +13,7 @@ struct OwnerServiceLaunch: Sendable {
     let storeDevice: String
     let storeInode: String
     init(store: ServiceClient.PersistentStore, binding: WorkspaceBinding, proof: PublicationProof,
-         permission: PermissionPreference, policyRevision: UInt64) throws {
+         permission: PermissionPreference, policyRevision: UInt64, decisionAPIKey: String? = nil) throws {
         guard Data(store.projectID.utf8) == Data(binding.projectID.utf8),
               Data(store.sessionID.utf8) == Data(binding.sessionID.utf8) else { throw ServiceError.correlation }
         let root = try MetadataDirectory(url: store.root, create: false)
@@ -22,7 +22,17 @@ struct OwnerServiceLaunch: Sendable {
         guard lstat(root.url.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { throw ServiceError.schema }
         self.store = store; self.binding = binding; self.proof = proof
         self.permission = permission; self.policyRevision = policyRevision
+        if let decisionAPIKey {
+            guard !decisionAPIKey.isEmpty, decisionAPIKey.utf8.count <= 8192,
+                  !decisionAPIKey.contains("\0") else { throw ServiceError.schema }
+        }
+        self.decisionAPIKey = decisionAPIKey
         storeDevice = String(UInt64(UInt32(bitPattern: info.st_dev))); storeInode = String(info.st_ino)
+    }
+    private let decisionAPIKey: String?
+    var environment: [String: String] {
+        guard let decisionAPIKey else { return ["POLARIS_JEV_ENABLED": "0"] }
+        return ["POLARIS_JEV_ENABLED": "1", "POLARIS_JEV_API_KEY": decisionAPIKey]
     }
     func verify() throws {
         let directory = try MetadataDirectory(url: store.root, create: false)

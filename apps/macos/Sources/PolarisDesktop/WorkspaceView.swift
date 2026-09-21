@@ -52,6 +52,7 @@ struct WorkspaceView: View {
                     }.frame(width: layout.projects)
                         .background((colorScheme == .dark ? Color(white: 0.16) : Color(white: 0.98))
                             .ignoresSafeArea(edges: .top))
+                        .zIndex(20)
                     divider("プロジェクト一覧の幅", value: layout.projects, keyPath: \.projects)
                     if let nativeConversation {
                         nativeConversation.frame(width: layout.chat)

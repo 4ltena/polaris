@@ -25,7 +25,7 @@ enum OwnerStartupFailure: Equatable {
   var japaneseMessage: String {
     switch self {
     case .providerUnsupported: "strict10 は Codex または OpenAI の主接続でのみ利用できます。"
-    case .configurationInvalid: "strict10 の [embedding] 設定が不足しているか無効です。~/.polaris/config.toml を確認してください。"
+    case .configurationInvalid: "strict10 の自動導入済み資源、または [embedding] 設定を確認してください。"
     case .resourcePath: "strict10 の埋め込み資源のパス、別名、または会話ソースのパスを確認してください。"
     case .runtimeBinary: "strict10 の埋め込み runtime 実行ファイルを確認してください。"
     case .manifestRevision: "strict10 の multilingual-e5-small の manifest、SHA-256、revision を確認してください。"
@@ -119,6 +119,10 @@ final class WorkspaceServiceModel: ObservableObject {
   @Published private(set) var ownerStartupFailure: OwnerStartupFailure?
   @Published private(set) var isRecovering = false
   @Published private(set) var runs: [WorkspaceRun] = []
+  @Published private(set) var judgingRuns: Set<WorkspaceRunActivityKey> = []
+  @Published private(set) var contextJudgingRuns: Set<WorkspaceRunActivityKey> = []
+  var isJudging: Bool { !judgingRuns.isEmpty }
+  var isContextJudging: Bool { !contextJudgingRuns.isEmpty }
   /// One expanded run at a time; details reads never take `isBusy`.
   @Published private(set) var expandedRunKey: Data?
   @Published private(set) var runDetails: WorkspaceRunDetails?
@@ -534,6 +538,7 @@ final class WorkspaceServiceModel: ObservableObject {
     configuredOwnerStartup = false
     phase = .connecting; isBusy = true; failure = nil; shutdownReady = false
     context = nil; hello = nil; needsRefresh = false; pollingGeneration = nil
+    judgingRuns = []; contextJudgingRuns = []
     await stopSourceApplyResultReconciliation()
     recoveryStatus = nil; recoveryFailure = false; recoveryRequestID = nil; recoveryOutcomeUnknown = false
     recoveryEpoch = nil; pendingRecovery = nil; missingRecoveryProofs = []; savedRecoveryResults = []; recoveryObservedExit = nil
@@ -649,6 +654,9 @@ final class WorkspaceServiceModel: ObservableObject {
     retainedHistory = display.history; streamMessages = display.streams
     displayEpoch = incoming.epoch; streamHistoryConflict = false
     runs = restoredRuns; approvals = restoredApprovals
+    let activeActivityKeys = Set(restoredRuns.filter { !$0.isTerminal }.map(\.activityKey))
+    judgingRuns.formIntersection(activeActivityKeys)
+    contextJudgingRuns.formIntersection(activeActivityKeys)
     eventSequence = payload["position"]!["event_seq"]!.decimal!
     eventRevision = incoming.sessionRevision
     pendingApprovalAnswers.formIntersection(Set(approvals.map(\.key)))
@@ -1455,7 +1463,27 @@ extension WorkspaceServiceModel {
           guard runs.count < 4096 else { throw Failure.capacity }
           runs.append(run)
         }
-        if run.isTerminal { cancelRequested.remove(run.key) }
+        if run.isTerminal {
+          cancelRequested.remove(run.key)
+          judgingRuns.remove(run.activityKey)
+          contextJudgingRuns.remove(run.activityKey)
+        }
+      case "run.activity":
+        let activity = try WorkspaceRunActivity(payload)
+        guard runs.contains(where: { $0.activityKey == activity.key && !$0.isTerminal }) else {
+          throw Failure.stale
+        }
+        switch activity.phase {
+        case "judging":
+          judgingRuns.insert(activity.key)
+          contextJudgingRuns.remove(activity.key)
+        case "context_judging":
+          contextJudgingRuns.insert(activity.key)
+          judgingRuns.remove(activity.key)
+        default:
+          judgingRuns.remove(activity.key)
+          contextJudgingRuns.remove(activity.key)
+        }
       case "message.delta":
         let id = payload["message_id"]!.string!
         if let index = streamMessages.firstIndex(where: { $0.id.utf8.elementsEqual(id.utf8) }) {

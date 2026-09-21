@@ -361,10 +361,14 @@ indirect enum ServiceSchema: Sendable {
   static let run: Self = .object([
     "run_id": .id, "attempt_id": .id, "state": .oneOf(states), "task_ids": .array(.id),
   ])
-  static let child: Self = .object([
+  static let runActivity: Self = .object([
+    "run_id": .id, "attempt_id": .id,
+    "phase": .oneOf(["working", "judging", "context_judging"]),
+  ])
+  static let child: Self = .optionalFields([
     "run_id": .id, "attempt_id": .id, "parent_run_id": .id, "state": .oneOf(states),
     "task_ids": .array(.id),
-  ])
+  ], ["display_name": .text])
   static let task: Self = .object([
     "task_id": .id, "title": .text,
     "state": .oneOf(["pending", "implementing", "review_pending", "retry_pending", "completed"]),
@@ -505,6 +509,7 @@ indirect enum ServiceSchema: Sendable {
         "durability": .oneOf(["tentative", "saved"]),
       ])
     case "run.state": run
+    case "run.activity": runActivity
     case "child.updated": child
     case "task.updated": task
     case "draft.updated": draft

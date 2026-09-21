@@ -174,7 +174,7 @@ struct StartupWindowSize: NSViewRepresentable {
             if isWorkspace { requestTermination(); return }
             showingCloseConfirmation = true
             let alert = NSAlert()
-            alert.messageText = "セットアップ画面を閉じますか？"
+            alert.messageText = "Polarisを閉じますか？"
             alert.informativeText = "保存済みの設定は、次回起動時に続きから変更できます。"
             alert.addButton(withTitle: "続ける")
             alert.addButton(withTitle: "閉じる")

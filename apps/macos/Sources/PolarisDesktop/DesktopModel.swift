@@ -2,6 +2,27 @@ import AppKit
 import SwiftUI
 import PolarisSettings
 
+enum PresetInstallationStatus: Equatable {
+    case waiting
+    case installing(completed: Int, total: Int)
+    case installed
+    case failed(String)
+
+    var title: String {
+        switch self {
+        case .waiting: "セットアップ開始待ち"
+        case .installing(let completed, let total): "必要な資源を導入中（\(completed) / \(total)）"
+        case .installed: "必要な資源を導入済み"
+        case .failed: "必要な資源の導入が止まりました"
+        }
+    }
+
+    var isBusy: Bool {
+        if case .installing = self { return true }
+        return false
+    }
+}
+
 @MainActor
 final class DesktopModel: ObservableObject {
     @Published var document = SettingsDocument()
@@ -11,6 +32,19 @@ final class DesktopModel: ObservableObject {
     @Published var startupError: String?
     @Published var saveError: String?
     @Published var assets: [String: NSImage] = [:]
+    @Published var jevAPIKey = ""
+    @Published var localEndpointDraft = "http://127.0.0.1:11434/"
+    @Published var ggufSourceURL = ""
+    @Published private(set) var hasStoredJevAPIKey = false
+    @Published private(set) var jevCredentialError: String?
+    @Published private(set) var localProbeStatus: LocalProbeStatus = .idle
+    @Published private(set) var localInventory: LocalInventory?
+    @Published private(set) var ggufPlan: ManagedGGUFPlan?
+    @Published private(set) var ggufModels: [ManagedGGUFModel] = []
+    @Published private(set) var ggufStatus: ManagedGGUFStatus = .idle
+    @Published private(set) var dependencyStatuses = Dictionary(
+        uniqueKeysWithValues: ManagedDependencyID.allCases.map { ($0, ManagedDependencyStatus.checking) })
+    @Published private(set) var presetInstallationStatus: PresetInstallationStatus = .waiting
     @Published private(set) var preparationID: UUID?
     @Published private(set) var connectionSummary = ""
     private(set) var preparationSeconds: TimeInterval?
@@ -19,16 +53,32 @@ final class DesktopModel: ObservableObject {
     private var screenIsPrepared = false
     private var connectionsArePrepared = false
     private let startupConnections: StartupConnections
+    private let jevCredentials: JevCredentialAccess
+    private let localProbe: LocalModelProbeAccess
+    private let dependencyInstaller: any ManagedDependencyInstalling
+    private var localProbeTask: Task<Void, Never>?
+    private var dependencyTasks: [ManagedDependencyID: Task<Void, Never>] = [:]
+    private var presetInstallationTask: Task<Void, Never>?
+    private var ggufTask: Task<Void, Never>?
     let workspace: DesktopWorkspaceOwner
     private let arguments: [String]
+    let isInstallerMode: Bool
     private var store: SettingsStore?
     private var pendingDocument: SettingsDocument?
 
     init(arguments: [String] = Array(CommandLine.arguments.dropFirst()),
          startupConnections: StartupConnections = StartupConnections(usesProductionProbes: true),
+         jevCredentials: JevCredentialAccess = .keychain,
+         localProbe: LocalModelProbeAccess = .live,
+         dependencyInstaller: any ManagedDependencyInstalling = ManagedDependencyInstaller(),
          workspace: DesktopWorkspaceOwner? = nil) {
-        self.workspace = workspace ?? DesktopWorkspaceOwner()
+        self.jevCredentials = jevCredentials
+        self.localProbe = localProbe
+        self.dependencyInstaller = dependencyInstaller
+        self.workspace = workspace ?? DesktopWorkspaceOwner(decisionCredential: jevCredentials.load)
         self.arguments = arguments
+        self.isInstallerMode = arguments.contains("--installer-mode")
+            || Bundle.main.bundleIdentifier?.hasPrefix("com.polaris.installer.") == true
         self.startupConnections = startupConnections
         // 最初の描画前に同梱素材を用意し、設定I/O中・読取失敗時にも採用画面を表示する。
         bootstrap()
@@ -87,15 +137,33 @@ final class DesktopModel: ObservableObject {
         guard startupError == nil else { return }
         do {
             stage = .settings
-            let location = try SettingsLocation.resolve(arguments: arguments)
+            let location = try SettingsLocation.resolve(arguments: arguments.filter { $0 != "--installer-mode" })
             let (settingsStore, loaded) = try await Task.detached {
                 let store = try SettingsStore(url: location)
                 return (store, try store.load())
             }.value
             store = settingsStore
-            document = loaded
-            if !loaded.isEditing { document = try await workspace.prepare(document: loaded, store: settingsStore) }
-            DesktopTheme.apply(loaded.draft.preferences.theme)
+            var prepared = loaded
+            if isInstallerMode && !prepared.isEditing { prepared.reopen() }
+            document = prepared
+            localEndpointDraft = prepared.draft.preferences.localConnection?.endpoint
+                ?? prepared.draft.preferences.localConnection?.runtime.defaultEndpoint
+                ?? LocalRuntimePreference.ollama.defaultEndpoint!
+            Task { await refreshDependencyStatuses() }
+            if prepared.draft.preferences.jevEnabled || prepared.preferences?.jevEnabled == true {
+                refreshJevCredentialState()
+            } else {
+                hasStoredJevAPIKey = false
+                jevCredentialError = nil
+            }
+            DesktopTheme.apply(prepared.draft.preferences.theme)
+            if isInstallerMode {
+                stage = .ready
+                connectionSummary = "インストール設定を準備しました"
+                isStarting = false
+                return
+            }
+            if !prepared.isEditing { document = try await workspace.prepare(document: prepared, store: settingsStore) }
             stage = .interface
             let id = UUID()
             preparationID = id
@@ -135,6 +203,10 @@ final class DesktopModel: ObservableObject {
     func prepareToQuit() async -> Bool {
         if pendingDocument != nil { retrySave() }
         guard pendingDocument == nil, initialStartupTask == nil, !startInFlight, !transitionInFlight else { return false }
+        if isInstallerMode {
+            localProbeTask?.cancel(); presetInstallationTask?.cancel(); ggufTask?.cancel()
+            return true
+        }
         let closed = await workspace.quit()
         // Settings remain editable while shutdown drains. A save failure or a
         // new preparation during that await must cancel application termination.
@@ -212,10 +284,279 @@ final class DesktopModel: ObservableObject {
         document.isEditing = true
         persist(document)
     }
+    func setJevEnabled(_ enabled: Bool) {
+        change { $0.preferences.jevEnabled = enabled }
+        if enabled { refreshJevCredentialState() }
+        else {
+            jevAPIKey = ""
+            jevCredentialError = nil
+        }
+    }
+    func setLocalPreference(_ preference: LocalPreference) {
+        localProbeTask?.cancel()
+        localInventory = nil
+        localProbeStatus = .idle
+        change { state in
+            state.preferences.local = preference
+            if preference == .later { state.preferences.localConnection = nil }
+            else if state.preferences.localConnection == nil {
+                state.preferences.localConnection = try? LocalConnectionPreference(runtime: .ollama)
+            }
+        }
+    }
+    func setLocalRuntime(_ runtime: LocalRuntimePreference) {
+        localProbeTask?.cancel()
+        localInventory = nil
+        localProbeStatus = .idle
+        localEndpointDraft = runtime.defaultEndpoint ?? ""
+        change { state in
+            state.preferences.local = .linkInstalled
+            state.preferences.localConnection = try? LocalConnectionPreference(runtime: runtime)
+        }
+    }
+    func setLocalEndpointDraft(_ endpoint: String) {
+        localProbeTask?.cancel()
+        localInventory = nil
+        localProbeStatus = .idle
+        localEndpointDraft = endpoint
+    }
+    func probeSelectedLocalRuntime() {
+        localProbeTask?.cancel()
+        guard let connection = document.draft.preferences.localConnection,
+              connection.runtime != .llamacpp else { return }
+        let endpoint = localEndpointDraft
+        do { try ExecutionBinding.validateLocalEndpoint(endpoint) }
+        catch { localProbeStatus = .failed; return }
+        change { state in
+            state.preferences.localConnection = try? LocalConnectionPreference(
+                runtime: connection.runtime, endpoint: endpoint, model: nil, verified: false)
+        }
+        localProbeStatus = .checking
+        localInventory = nil
+        localProbeTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let inventory = try await localProbe.probe(connection.runtime, endpoint)
+                try Task.checkCancellation()
+                localInventory = inventory
+                switch inventory.availability {
+                case .available: localProbeStatus = .available(inventory.models.count)
+                case .unreachable: localProbeStatus = .unreachable
+                case .invalidResponse: localProbeStatus = .invalidResponse
+                }
+            } catch is CancellationError {
+                localProbeStatus = .idle
+            } catch {
+                localProbeStatus = .failed
+            }
+        }
+    }
+    func selectLocalModel(_ model: LocalModelObservation) {
+        guard let current = document.draft.preferences.localConnection,
+              current.runtime != .llamacpp else { return }
+        change { state in
+            state.preferences.localConnection = try? LocalConnectionPreference(
+                runtime: current.runtime, endpoint: current.endpoint, model: model.id, verified: true)
+        }
+    }
+    func dependencyStatus(_ id: ManagedDependencyID) -> ManagedDependencyStatus {
+        dependencyStatuses[id] ?? .checking
+    }
+    func refreshDependencyStatuses() async {
+        do {
+            dependencyStatuses = try await dependencyInstaller.statuses()
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? "依存関係を確認できませんでした。"
+            dependencyStatuses = Dictionary(uniqueKeysWithValues: ManagedDependencyID.allCases.map {
+                ($0, ManagedDependencyStatus.failed(message))
+            })
+        }
+        if ManagedDependencyID.preset.allSatisfy({ id in
+            if case .installed = dependencyStatuses[id] { return true }
+            return false
+        }) {
+            do {
+                try await dependencyInstaller.activatePreset()
+                presetInstallationStatus = .installed
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? "導入済み資源をPolarisへ接続できませんでした。"
+                presetInstallationStatus = .failed(message)
+            }
+        }
+        refreshInstalledGGUFModels()
+    }
+    var presetInstallationReady: Bool { presetInstallationStatus == .installed }
+    func installPresetAndWait() async -> Bool {
+        startPresetInstallation()
+        while presetInstallationStatus.isBusy {
+            do { try await Task.sleep(for: .milliseconds(50)) }
+            catch { return false }
+        }
+        return presetInstallationReady
+    }
+    func startPresetInstallation() {
+        guard presetInstallationTask == nil, !presetInstallationReady else { return }
+        let dependencies = ManagedDependencyID.preset
+        presetInstallationStatus = .installing(completed: 0, total: dependencies.count)
+        presetInstallationTask = Task { [weak self] in
+            guard let self else { return }
+            defer { presetInstallationTask = nil }
+            for (index, id) in dependencies.enumerated() {
+                do {
+                    let current = try await dependencyInstaller.status(id)
+                    if case .installed = current {
+                        dependencyStatuses[id] = current
+                    } else {
+                        dependencyStatuses[id] = .downloading
+                        let version = try await dependencyInstaller.install(id)
+                        dependencyStatuses[id] = .installed(version: version)
+                    }
+                    presetInstallationStatus = .installing(
+                        completed: index + 1, total: dependencies.count)
+                } catch is CancellationError {
+                    presetInstallationStatus = .failed("導入を取り消しました。再試行できます。")
+                    return
+                } catch {
+                    let message = (error as? LocalizedError)?.errorDescription ?? "導入できませんでした。"
+                    dependencyStatuses[id] = .failed(message)
+                    presetInstallationStatus = .failed("\(id.title)：\(message)")
+                    return
+                }
+            }
+            do {
+                try await dependencyInstaller.activatePreset()
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? "導入済み資源をPolarisへ接続できませんでした。"
+                presetInstallationStatus = .failed(message)
+                return
+            }
+            presetInstallationStatus = .installed
+            refreshInstalledGGUFModels()
+        }
+    }
+    func installDependency(_ id: ManagedDependencyID) {
+        guard dependencyTasks[id] == nil else { return }
+        dependencyStatuses[id] = .downloading
+        dependencyTasks[id] = Task { [weak self] in
+            guard let self else { return }
+            defer { dependencyTasks[id] = nil }
+            do {
+                let version = try await dependencyInstaller.install(id)
+                dependencyStatuses[id] = .installed(version: version)
+                if id == .llamaCpp { refreshInstalledGGUFModels() }
+            } catch is CancellationError {
+                dependencyStatuses[id] = .notInstalled
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? "導入できませんでした。"
+                dependencyStatuses[id] = .failed(message)
+            }
+        }
+    }
+    func cancelDependency(_ id: ManagedDependencyID) {
+        dependencyTasks[id]?.cancel()
+    }
+    func cancelPresetInstallation() { presetInstallationTask?.cancel() }
+    func inspectGGUFLink() {
+        ggufTask?.cancel()
+        ggufPlan = nil
+        ggufStatus = .inspecting
+        let source = ggufSourceURL
+        ggufTask = Task { [weak self] in
+            guard let self else { return }
+            defer { ggufTask = nil }
+            do {
+                ggufPlan = try await dependencyInstaller.inspectGGUF(source)
+                ggufStatus = .ready
+            } catch is CancellationError {
+                ggufStatus = .idle
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? "リンクを確認できませんでした。"
+                ggufStatus = .failed(message)
+            }
+        }
+    }
+    func installInspectedGGUF() {
+        guard let plan = ggufPlan, ggufTask == nil else { return }
+        ggufStatus = .downloading
+        ggufTask = Task { [weak self] in
+            guard let self else { return }
+            defer { ggufTask = nil }
+            do {
+                let installed = try await dependencyInstaller.installGGUF(plan)
+                ggufModels = try await dependencyInstaller.installedGGUFModels()
+                ggufStatus = .installed
+                selectGGUFModel(installed)
+            } catch is CancellationError {
+                ggufStatus = .ready
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? "モデルを導入できませんでした。"
+                ggufStatus = .failed(message)
+            }
+        }
+    }
+    func cancelGGUFInstall() {
+        ggufTask?.cancel()
+    }
+    func installQueuedGGUFIfNeeded() async -> Bool {
+        guard !ggufSourceURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return true }
+        inspectGGUFLink()
+        while ggufStatus == .inspecting {
+            do { try await Task.sleep(for: .milliseconds(50)) }
+            catch { return false }
+        }
+        guard ggufStatus == .ready else { return false }
+        installInspectedGGUF()
+        while ggufStatus == .downloading {
+            do { try await Task.sleep(for: .milliseconds(50)) }
+            catch { return false }
+        }
+        return ggufStatus == .installed
+    }
+    func selectGGUFModel(_ installed: ManagedGGUFModel) {
+        change { state in
+            state.preferences.local = .linkInstalled
+            state.preferences.localConnection = try? LocalConnectionPreference(
+                runtime: .llamacpp, endpoint: nil, model: installed.filename, verified: true)
+        }
+    }
+    private func refreshInstalledGGUFModels() {
+        Task { [weak self] in
+            guard let self else { return }
+            do { ggufModels = try await dependencyInstaller.installedGGUFModels() }
+            catch { ggufModels = [] }
+        }
+    }
     func finish() {
+        guard presetInstallationReady else {
+            startPresetInstallation()
+            return
+        }
+        guard saveJevCredentialIfNeeded() else { return }
         var candidate = document
         candidate.finish()
         persist(candidate)
+    }
+    func commitInstallerConfiguration() -> Bool {
+        guard isInstallerMode, presetInstallationReady, saveJevCredentialIfNeeded(), let store else { return false }
+        var candidate = document
+        candidate.finish()
+        do {
+            try store.save(candidate)
+            document = candidate
+            pendingDocument = nil
+            saveError = nil
+            return true
+        } catch {
+            pendingDocument = candidate
+            saveError = (error as? SettingsError)?.errorDescription ?? SettingsError.saveFailed.errorDescription
+            return false
+        }
+    }
+    func releaseInstallerSettingsLock() {
+        guard isInstallerMode else { return }
+        store = nil
     }
     func reopen() {
         var candidate = document
@@ -225,6 +566,35 @@ final class DesktopModel: ObservableObject {
     func retrySave() {
         guard let pendingDocument else { return }
         persist(pendingDocument)
+    }
+    private func refreshJevCredentialState() {
+        do {
+            hasStoredJevAPIKey = try jevCredentials.load() != nil
+            jevCredentialError = nil
+        } catch {
+            hasStoredJevAPIKey = false
+            jevCredentialError = "保存済みのJev APIキーを確認できませんでした。新しいキーを入力してください。"
+        }
+    }
+    private func saveJevCredentialIfNeeded() -> Bool {
+        guard document.draft.preferences.jevEnabled else { return true }
+        let key = jevAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty || hasStoredJevAPIKey else {
+            jevCredentialError = JevCredentialError.invalidKey.errorDescription
+            return false
+        }
+        guard !key.isEmpty else { return true }
+        do {
+            try jevCredentials.save(key)
+            jevAPIKey = ""
+            hasStoredJevAPIKey = true
+            jevCredentialError = nil
+            return true
+        } catch {
+            jevCredentialError = (error as? LocalizedError)?.errorDescription
+                ?? "Jev APIキーを保存できませんでした。"
+            return false
+        }
     }
     private func persist(_ candidate: SettingsDocument) {
         guard let store else { return }

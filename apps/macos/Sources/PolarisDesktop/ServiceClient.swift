@@ -3,7 +3,8 @@ import Foundation
 import PolarisSettings
 
 /// Owned pipe transport for an explicitly supplied helper. Production launches
-/// accept only typed store coordinates, never arbitrary arguments or environment.
+/// accept only typed store coordinates and the owner's exact decision credential,
+/// never arbitrary arguments or environment.
 /// A cancelled send disconnects this transport; it is NOT a run.cancel ACK.
 actor ServiceClient {
   enum RecoveryMode: Sendable { case disabled, resultOnly }
@@ -166,7 +167,7 @@ actor ServiceClient {
     child.executableURL = helperURL
     child.arguments = homeBrowse ? ["--browse-home"]
       : ownerLaunch?.arguments ?? ((persistentStore?.arguments ?? []) + (channel == nil ? [] : ["--source-recovery-fd2"]))
-    child.environment = [:]
+    child.environment = ownerLaunch?.environment ?? [:]
     child.standardInput = stdin
     child.standardOutput = stdout
     child.standardError = channel?.childEndpoint ?? FileHandle.nullDevice

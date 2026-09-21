@@ -10,7 +10,8 @@ struct WorkspaceMainView: View {
     let openDemo: () -> Void
     let openServiceDemo: () -> Void
     @StateObject private var state = WorkspaceState()
-    private let empty = WorkspaceSnapshot(isDemo: false, projects: [], sections: [], conversations: [], models: [], activities: [])
+    @State private var showsMcp = false
+    private let empty = WorkspaceSnapshot(isDemo: false, projects: [], sections: [], conversations: [], models: [], activities: [], quota: nil)
 
     var body: some View {
         if let service = owner.service {
@@ -31,6 +32,10 @@ struct WorkspaceMainView: View {
                 Text(binding.sourcePath).font(.caption).textSelection(.enabled)
                 Button("フォルダを開く") { NSWorkspace.shared.open(URL(fileURLWithPath: binding.sourcePath)) }
                 Label("保存済みの会話", systemImage: "bubble.left")
+                if let service = owner.service, service.canManageMcp {
+                    Button("MCPサーバーを管理") { showsMcp = true }
+                        .sheet(isPresented: $showsMcp) { McpSettingsView(model: McpSettingsModel(service: service)) }
+                }
             } else {
                 Text("プロジェクトは未選択です").foregroundStyle(.secondary)
                 Button("設定でフォルダを選択") { model.reopen() }
@@ -41,6 +46,7 @@ struct WorkspaceMainView: View {
                 Button("作業画面のデモを開く", action: openDemo)
                 Button("ローカル通信を検証する", action: openServiceDemo)
             }
+            WorkspaceQuotaWidget(quota: nil)
         }.padding(14).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
     @ViewBuilder private var conversation: some View {
@@ -61,12 +67,7 @@ struct WorkspaceMainView: View {
         }
     }
     private var activity: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("現在の作業").font(.headline)
-            Text("ファイル・Git の接続は準備中です。実行状態は会話欄に表示します。")
-                .foregroundStyle(.secondary)
-            Spacer()
-        }.padding().frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        HomeBrowseView(model: owner.home)
     }
 }
 
@@ -78,6 +79,7 @@ private struct ConnectedWorkspaceView: View {
     let sidebar: AnyView
     @StateObject private var source = WorkspaceSourceModel()
     @State private var sourceLoading = false
+    @State private var showsHome = false
     private var snapshot: WorkspaceSnapshot {
         NativeWorkspaceSnapshot.make(binding: owner.binding, payload: service.snapshot,
                                      files: source.files, git: source.git)
@@ -98,13 +100,23 @@ private struct ConnectedWorkspaceView: View {
                 reconnect: { await model.reconnectWorkspace() }, startExecution: { await model.startConfiguredExecution() })),
             nativeActivity: AnyView(VStack(spacing: 0) {
                 HStack {
-                    Text(sourceUnavailableReason ?? source.notices.first ?? "選択したプロジェクトのファイル")
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                    Spacer()
-                    Button("ファイル・Gitを更新") { Task { await reloadSource() } }
-                        .disabled(service.phase != .ready || service.isBusy || !service.workspaceReadAvailable)
+                    Picker("表示する場所", selection: $showsHome) {
+                        Text("プロジェクト").tag(false)
+                        Text("ホーム").tag(true)
+                    }.pickerStyle(.segmented).labelsHidden().frame(width: 180)
+                    if !showsHome {
+                        Text(sourceUnavailableReason ?? source.notices.first ?? "選択したプロジェクトのファイル")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        Spacer()
+                        Button("ファイル・Gitを更新") { Task { await reloadSource() } }
+                            .disabled(service.phase != .ready || service.isBusy || !service.workspaceReadAvailable)
+                    } else { Spacer() }
                 }.padding(.horizontal, 12).padding(.top, 6)
-                WorkspaceActivityView(activity: snapshot.activity(for: owner.binding?.sessionID ?? ""), state: state)
+                if showsHome {
+                    HomeBrowseView(model: owner.home)
+                } else {
+                    WorkspaceActivityView(activity: snapshot.activity(for: owner.binding?.sessionID ?? ""), state: state)
+                }
             }), sourceUnavailableReason: sourceUnavailableReason)
         .task {
             state.selectedConversationID = owner.binding?.sessionID
@@ -142,7 +154,13 @@ private struct NativeConversationView: View {
     @State private var roleDraft: [LocalRoleBinding] = []
     @State private var roleRevision: UInt64 = 0
     private var modelOptions: [WorkspaceModelConfiguration] {
-        let options = [WorkspaceModelConfiguration(id: "codex|gpt-6-astra", title: "gpt-6-astra", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true)] + inventories.flatMap { inventory in
+        let cloud = [
+            WorkspaceModelConfiguration(id: "codex|gpt-6-astra", title: "gpt-6-astra", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true),
+            WorkspaceModelConfiguration(id: "codex|gpt-5.6-sol", title: "gpt-5.6-sol", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true),
+            WorkspaceModelConfiguration(id: "codex|gpt-5.6-terra", title: "gpt-5.6-terra", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true),
+            WorkspaceModelConfiguration(id: "codex|gpt-5.6-luna", title: "gpt-5.6-luna", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true)
+        ]
+        let local = inventories.flatMap { inventory in
             inventory.models.map { observed in
                 WorkspaceModelConfiguration(id: inventory.provider.rawValue + "|" + inventory.endpoint + "|" + observed.id,
                     title: observed.id, destination: inventory.provider.rawValue + " · " + inventory.endpoint,
@@ -150,7 +168,11 @@ private struct NativeConversationView: View {
                     supportsAttachments: true)
             }
         }
-        return [currentModel] + options.filter { $0.id != currentModel.id }
+        let localFallback = local.isEmpty
+            ? [WorkspaceModelConfiguration(id: "local|unavailable", title: "ローカルモデル", destination: "未検出", effort: "ランタイム設定",
+                unavailableReason: "ローカルモデルを検出してください", supportsAttachments: true)]
+            : []
+        return [currentModel] + (cloud + local + localFallback).filter { $0.id != currentModel.id && $0.title != currentModel.title }
     }
     private var inputPhase: WorkspaceInputPhase {
         if service.isBusy || service.startOutcomeUnknown { return .sending }
@@ -240,9 +262,6 @@ private struct NativeConversationView: View {
                 Text("保存済み添付があります。添付対応まで下書きの更新は停止しています。").font(.caption)
             }
             HStack {
-                Picker("履歴", selection: historyModeBinding) {
-                    ForEach(HistoryMode.allCases, id: \.self) { Text($0.title).tag($0) }
-                }.pickerStyle(.menu).disabled((service.phase != .ready && !service.canRestoreStorageOnly) || service.isBusy || owner.isRecovering)
                 Button("ローカルモデル・役割設定") {
                     roleDraft = service.observedRoleBindings
                     roleRevision = service.snapshot?["configuration"]?["configuration_revision"]?.decimal ?? 0
@@ -253,12 +272,24 @@ private struct NativeConversationView: View {
                     Button("現在の役割設定を採用") { Task { await service.adoptObservedRoleConfiguration() } }.disabled(service.isBusy)
                 }
             }
-            if model.document.preferences?.historyMode == .strict10 {
-                Text("strict10 は gpt-6-astra / medium の要約呼出を追加し、検証済みのローカル multilingual-e5-small 資源を必要とします。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
             if let notice = service.roleConfigurationNotice { Text(notice).font(.caption).foregroundStyle(.secondary) }
             if let error = model.saveError { Text(error).font(.caption).foregroundStyle(.red) }
+            if service.runs.contains(where: { !$0.isTerminal }) {
+                HStack(spacing: 8) {
+                    PolarisThinkingIndicator()
+                    Text("Thinking").font(.callout.weight(.medium)).foregroundStyle(.secondary)
+                    Text("orchestrator").font(.caption).foregroundStyle(.tertiary)
+                    Text(currentModel.title).font(.caption).foregroundStyle(.secondary)
+                    Text(service.isJudging ? "effort judging" : currentModel.effort)
+                        .font(.caption.monospaced().weight(.medium))
+                        .foregroundStyle(service.isJudging ? Color.primary : .secondary)
+                }
+                .padding(.vertical, 2)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(service.isJudging
+                    ? "Thinking、orchestrator、\(currentModel.title)、effort judging"
+                    : "Thinking、orchestrator、\(currentModel.title)、effort \(currentModel.effort)")
+            }
             composer
             HStack {
                 Text(service.isDirty ? "未保存" : (service.savedDraftRevision == nil ? "未読込" : "保存済み")).font(.caption).foregroundStyle(.secondary)
@@ -272,7 +303,8 @@ private struct NativeConversationView: View {
                 guard id == service.store.sessionID else { return }
                 service.editDraft(service.draftText + (service.draftText.isEmpty ? "" : "\n") + text)
             })
-        }
+  }
+
         .onDisappear { voice.cancelVoice(); isComposing = false }
         .popover(isPresented: $localSettingsOpen) {
             ScrollView {
@@ -322,6 +354,9 @@ private struct NativeConversationView: View {
             .onChange(of: service.streamMessages.last?.text) { _ in
                 proxy.scrollTo("latest-message", anchor: .bottom)
             }
+            .onChange(of: service.runs.last(where: { !$0.isTerminal })?.id) { _ in
+                proxy.scrollTo("latest-message", anchor: .bottom)
+            }
         }
     }
     private var conversationHistoryContent: some View {
@@ -339,12 +374,21 @@ private struct NativeConversationView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(role(message.role)).font(.caption).foregroundStyle(.secondary)
                             Text(message.text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                .foregroundStyle(message.role == .user || message.role == .assistant ? Color.primary : .secondary)
+                            if service.isContextJudging && message.role == .user
+                                && message.id == service.messages.last(where: { $0.role == .user })?.id {
+                                Text("context judging")
+                                    .font(.caption.monospaced().weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityLabel("現在の文脈との関連を判定中")
+                            }
                         }
                     }
                     ForEach(service.retainedHistory.filter { history in !service.streamMessages.contains { $0.id.utf8.elementsEqual(history.id.utf8) } }, id: \.key) { message in
                         VStack(alignment: .leading, spacing: 6) {
                             Text("前回確認した履歴（更新後は未確認）").font(.caption).foregroundStyle(.secondary)
                             Text(message.text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                .foregroundStyle(message.role == .user || message.role == .assistant ? Color.primary : .secondary)
                         }
                     }
                     ForEach(service.streamMessages, id: \.key) { message in
@@ -357,23 +401,71 @@ private struct NativeConversationView: View {
 
                 }
     }
+    /// Saved text shown as plain selectable text; tool data is never run or linked.
+    @ViewBuilder private func runDetailsView(_ run: WorkspaceRun) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let details = service.runDetails {
+                if details.historyGap { Text("この実行の記録には欠落があります。").font(.caption).foregroundStyle(.orange) }
+                if !run.isTerminal { Text("実行中です。表示は保存済みの部分だけです。").font(.caption).foregroundStyle(.secondary) }
+                if service.runDetailsOutdated(run) {
+                    Text("実行状態が更新されています。読み込み直すと最新の保存内容を表示します。").font(.caption).foregroundStyle(.secondary)
+                }
+                if details.entries.count <= 1 && run.state == "cancelled" {
+                    Text("保存された実行ログはありません。").font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(details.entries) { entry in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(entry.title + (entry.complete ? "" : "（続きあり）")).font(.caption2).foregroundStyle(.secondary)
+                        Text(entry.text).font(entry.isPrimary ? .body : .caption.monospaced())
+                            .foregroundStyle(entry.isPrimary ? Color.primary : .secondary)
+                            .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                if details.nextCursor != nil {
+                    Button("続きを読み込む") { Task { await service.continueRunDetails() } }
+                }
+            } else if service.runDetailsNotice == nil {
+                Text("実行内容を読み込んでいます。").font(.caption).foregroundStyle(.secondary)
+            }
+            if let notice = service.runDetailsNotice {
+                Text(notice).font(.caption).foregroundStyle(.secondary)
+            }
+            if service.runDetails != nil || service.runDetailsNotice != nil {
+                Button("読み込み直す") { Task { await service.openRunDetails(run) } }
+                    .disabled(!service.canReadRunDetails)
+            }
+        }
+        .padding(.leading, 12)
+    }
+
     private var conversationExecutionDetails: some View {
         VStack(alignment: .leading, spacing: 12) {
                     ForEach(service.runs, id: \.key) { run in
                         HStack {
-                            Text("実行：" + run.title).font(.caption)
-                            if service.cancelRequested.contains(run.key) { Text("取消要求済み・終了待ち").font(.caption) }
+                            Text("実行：" + run.title).font(.caption).foregroundStyle(.secondary)
+                            if service.cancelRequested.contains(run.key) { Text("取消要求済み・終了待ち").font(.caption).foregroundStyle(.secondary) }
                             Spacer()
+                            if service.expandedRunKey == run.key {
+                                Button("内容を閉じる") { service.closeRunDetails() }
+                            } else if service.canReadRunDetails {
+                                Button("内容を表示") { Task { await service.openRunDetails(run) } }
+                            }
                             if !run.isTerminal {
                                 Button("実行を取り消す") { Task { await service.cancelRun(run) } }
                                     .disabled(!service.canCancel(run))
                             }
                         }
+                        if service.expandedRunKey == run.key {
+                            runDetailsView(run)
+                        }
                     }
                     if let memory = service.memoryStatus {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("記憶の準備：\(memory.phaseTitle) · 実ターン \(memory.recentRawTurns) · 取得 \(memory.retrievalSources.count)件 · 参照 \(memory.referenceTokens) tokens").font(.caption)
+                            Text("記憶の準備：\(memory.phaseTitle) · 実ターン \(memory.recentRawTurns) · 出典 \(memory.retrievalSources.count)件 · 参照 \(memory.referenceTokens) tokens").font(.caption)
                             Text(memory.detail).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            if let omission = memory.relatedOmissionDetail {
+                                Text(omission).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
                             ForEach(memory.retrievalSources, id: \.self) { source in
                                 Text(source).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
                             }
@@ -432,8 +524,12 @@ private struct NativeConversationView: View {
                         Task { await model.selectWorkspaceExecution(selection) }
                         return
                     }
-                    if option.id == "codex|gpt-6-astra", let selection = try? ExecutionBinding(provider: .codex, model: "gpt-6-astra", effort: "medium") {
-                        Task { await model.selectWorkspaceExecution(selection) }
+                    if option.id.hasPrefix("codex|") {
+                        let modelID = String(option.id.dropFirst("codex|".count))
+                        if let selection = try? ExecutionBinding(provider: .codex, model: modelID, effort: option.effort) {
+                            Task { await model.selectWorkspaceExecution(selection) }
+                        }
+                        return
                     }
                     for inventory in inventories {
                         let prefix = inventory.provider.rawValue + "|" + inventory.endpoint + "|"
@@ -442,12 +538,6 @@ private struct NativeConversationView: View {
                             Task { await model.selectWorkspaceExecution(selection) }
                         }
                     }
-    }
-    private var historyModeBinding: Binding<HistoryMode> {
-        Binding(get: { model.document.preferences?.historyMode ?? .legacy }, set: { mode in
-            guard let selection = model.document.preferences?.executionBinding else { return }
-            Task { await model.selectWorkspaceExecution(selection, historyMode: mode) }
-        })
     }
     private var composer: some View {
             WorkspaceComposerInput(
@@ -525,6 +615,38 @@ private struct NativeConversationView: View {
         case .accepted: "受付済みですが、保存完了は未確認です。"
         case .outcomeUnknown: "台帳でも成否不明です。再送せず本文を保持しています。"
         case .completed: "台帳は完了していますが、保存済み本文との照合が必要です。"
+        }
+    }
+}
+
+private struct PolarisThinkingIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Group {
+            if reduceMotion {
+                mark(activeSpoke: 0)
+            } else {
+                TimelineView(.periodic(from: .now, by: 0.16)) { context in
+                    let step = Int(context.date.timeIntervalSinceReferenceDate / 0.16) % 6
+                    mark(activeSpoke: step)
+                }
+            }
+        }
+        .frame(width: 20, height: 20)
+        .accessibilityHidden(true)
+    }
+
+    private func mark(activeSpoke: Int) -> some View {
+        ZStack {
+            ForEach(0..<6, id: \.self) { spoke in
+                Capsule()
+                    .fill(spoke == activeSpoke ? Color.white : Color.gray.opacity(0.48))
+                    .frame(width: 2.5, height: 7)
+                    .offset(y: -5.6)
+                    .rotationEffect(.degrees(Double(spoke) * 60))
+                    .shadow(color: spoke == activeSpoke ? .black.opacity(0.28) : .clear, radius: 0.6)
+            }
         }
     }
 }

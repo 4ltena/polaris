@@ -13,12 +13,14 @@ final class DesktopWorkspaceOwner: ObservableObject {
     let home: HomeBrowseModel
     private let helper: () throws -> URL
     private let factory: ((URL, ServiceClient.PersistentStore, String) throws -> WorkspaceServiceModel)?
+    private let decisionCredential: @Sendable () throws -> String?
     private var preparing = false
     private var quitting = false
 
     init(helper: @escaping () throws -> URL = DesktopWorkspaceOwner.packagedHelper,
-         factory: ((URL, ServiceClient.PersistentStore, String) throws -> WorkspaceServiceModel)? = nil) {
-        self.helper = helper; self.factory = factory
+         factory: ((URL, ServiceClient.PersistentStore, String) throws -> WorkspaceServiceModel)? = nil,
+         decisionCredential: @escaping @Sendable () throws -> String? = JevCredentialAccess.keychain.load) {
+        self.helper = helper; self.factory = factory; self.decisionCredential = decisionCredential
         home = HomeBrowseModel(helper: helper)
     }
 
@@ -69,6 +71,7 @@ final class DesktopWorkspaceOwner: ObservableObject {
         guard !preparing, !quitting, !isRecovering, let binding, let service else { return }
         preparing = true; defer { preparing = false }
         var attemptedHistoryMode: HistoryMode?
+        var attemptedJev = false
         do {
             let selected = try settings.load()
             guard selected.workspace == binding, let preferences = selected.preferences,
@@ -77,6 +80,14 @@ final class DesktopWorkspaceOwner: ObservableObject {
             }
             let historyMode = preferences.historyMode
             attemptedHistoryMode = historyMode
+            attemptedJev = preferences.jevEnabled
+            let decisionAPIKey: String?
+            if preferences.jevEnabled {
+                guard let stored = try decisionCredential(), !stored.isEmpty else { throw ServiceError.notReady }
+                decisionAPIKey = stored
+            } else {
+                decisionAPIKey = nil
+            }
             let generation = settings.selectionGeneration
             func validateSelection() throws {
                 let current = try settings.load()
@@ -122,7 +133,8 @@ final class DesktopWorkspaceOwner: ObservableObject {
             guard case .published(let proof) = publication else { throw ServiceError.notReady }
             try validatePublication(); try verifyAssembly()
             let launch = try OwnerServiceLaunch(store: service.store, binding: binding, proof: proof,
-                                               permission: permission, policyRevision: policy)
+                                               permission: permission, policyRevision: policy,
+                                               decisionAPIKey: decisionAPIKey)
             let executable = try helper(); let clientID = binding.clientID
             try await service.startConfigured(revalidate: validatePublication) {
                 if let makeConfiguredTransport { return try makeConfiguredTransport(launch) }
@@ -137,8 +149,10 @@ final class DesktopWorkspaceOwner: ObservableObject {
             }
             error = service.phase == .ready ? nil : (service.ownerStartupFailure?.japaneseMessage ?? "設定は保存済みです。実行サービスの接続状態を確認してください。")
         } catch {
-            self.error = service.ownerStartupFailure?.japaneseMessage ?? (attemptedHistoryMode == .strict10
-                ? "strict10 の起動準備を確認できませんでした。~/.polaris/config.toml の [embedding] runtime・model_path・revision と multilingual-e5-small の検証状態を確認するか、履歴を従来の履歴へ戻してください。"
+            self.error = service.ownerStartupFailure?.japaneseMessage ?? (attemptedJev
+                ? "JevのAPIキーを確認できませんでした。Polarisインストーラで入力し直してください。"
+                : attemptedHistoryMode == .strict10
+                ? "strict10 の起動準備を確認できませんでした。自動導入済みの埋め込み資源、または [embedding] 設定と multilingual-e5-small の検証状態を確認するか、履歴を従来の履歴へ戻してください。"
                 : "設定の保存結果と本文を保持しています。引継ぎの確認を完了できませんでした。")
         }
     }

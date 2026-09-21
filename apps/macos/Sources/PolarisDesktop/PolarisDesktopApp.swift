@@ -5,11 +5,23 @@ import PolarisSettings
 @main
 struct PolarisDesktopApp: App {
     @NSApplicationDelegateAdaptor(DesktopDelegate.self) private var delegate
-    @StateObject private var model = DesktopModel()
+    @StateObject private var model: DesktopModel
+    private let installerMode: Bool
+
+    init() {
+        let mode = Bundle.main.bundleIdentifier?.hasPrefix("com.polaris.installer.") == true
+            || CommandLine.arguments.contains("--installer-mode")
+        installerMode = mode
+        _model = StateObject(wrappedValue: DesktopModel(arguments: Array(CommandLine.arguments.dropFirst())))
+    }
 
     var body: some Scene {
-        Window("polaris", id: "welcome") {
-            RootView(model: model, openServiceDemo: { delegate.openServiceDemo() })
+        Window(installerMode ? "Polarisインストーラ" : "polaris", id: "main") {
+            Group {
+                if installerMode {
+                    InstallerRootView(model: model)
+                } else {
+                    RootView(model: model, openServiceDemo: { delegate.openServiceDemo() })
                 // The prepared next screen is kept in the view hierarchy while the
                 // splash is visible. Constrain the root to the splash's actual
                 // size, otherwise that hidden screen can make AppKit first show a
@@ -27,14 +39,23 @@ struct PolarisDesktopApp: App {
                     DesktopTheme.apply(theme)
                 }
                 .task { await model.startOnce() }
+                }
+            }
+            .onAppear { delegate.startupModel = model }
         }
-        .defaultSize(width: 668, height: 413)
+        .defaultSize(width: installerMode ? 920 : 668, height: installerMode ? 640 : 413)
         .windowStyle(.hiddenTitleBar)
         // Do not restore a previous wide workspace frame for a fixed-size splash.
         // The phase view relaxes this to a minimum size once the prepared screen
         // is revealed.
-        .windowResizability(model.isStarting ? .contentSize : .contentMinSize)
-        .commands { CommandGroup(replacing: .newItem) {} }
+        .windowResizability(installerMode || model.isStarting ? .contentSize : .contentMinSize)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("設定…") { delegate.openSettings(model) }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
+            CommandGroup(replacing: .newItem) {}
+        }
 
         Window("polaris — 作業画面のデモ", id: "workspace-demo") {
             WorkspaceFixtureView(logo: model.assets["polaris-banner-white"], release: model.release,
@@ -67,12 +88,84 @@ final class DesktopDelegate: NSObject, NSApplicationDelegate {
     let workspaceVoice = WorkspaceNativeSpeechBackend()
     weak var startupModel: DesktopModel?
     private var serviceDemo: ServiceDemoWindowController?
+    private var settingsWindow: SettingsWindowController?
     private var terminationPending = false
 
     func openServiceDemo() {
         if serviceDemo == nil { serviceDemo = ServiceDemoWindowController() }
         serviceDemo?.showWindow(nil)
         serviceDemo?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    func openSettings(_ model: DesktopModel) {
+        if settingsWindow == nil {
+            let presentation = SettingsPresentation(
+                preferences: model.document.preferences ?? model.document.draft.preferences,
+                workflowMode: Self.workflowMode(model.workspace.service?.workflowStatus),
+                releaseTitle: model.release?.title,
+                onAction: { [weak self, weak model] action in
+                    guard let self, let model else { return }
+                    self.applySettings(action, to: model)
+                })
+            settingsWindow = SettingsWindowController(presentation: presentation)
+        }
+        refreshSettings(model)
+        settingsWindow?.present()
+    }
+
+    private func applySettings(_ action: SettingsAction, to model: DesktopModel) {
+        guard let presentation = settingsWindow?.presentation, !presentation.isApplying else { return }
+        presentation.error = nil
+        switch action {
+        case .history(let mode):
+            guard let selection = model.document.preferences?.executionBinding,
+                  model.workspace.service != nil else {
+                presentation.error = "作業中の会話を開いてから変更してください。"
+                return
+            }
+            presentation.isApplying = true
+            Task { [weak self, weak model] in
+                guard let self, let model else { return }
+                await model.selectWorkspaceExecution(selection, historyMode: mode)
+                let saved = model.document.preferences?.historyMode
+                self.refreshSettings(model, error: saved == mode ? nil
+                    : (model.saveError ?? "会話履歴の設定を保存できませんでした。"))
+            }
+        case .workflow(let requested):
+            guard let service = model.workspace.service,
+                  let workflow = service.workflowStatus else {
+                presentation.error = "作業中の会話を開いてから変更してください。"
+                return
+            }
+            presentation.isApplying = true
+            Task { [weak self, weak model, weak service] in
+                guard let self, let model, let service else { return }
+                await service.configureWorkflow(
+                    enabled: requested != "disabled",
+                    mode: requested == "adaptive" ? "adaptive" : "manual",
+                    initialPhase: workflow.phase)
+                self.refreshSettings(model, error: Self.workflowMode(service.workflowStatus) == requested
+                    ? nil : "作業内容に合わせた情報の使い方を保存できませんでした。")
+            }
+        default:
+            presentation.error = "この設定は現在の画面から変更できません。"
+        }
+    }
+
+    private func refreshSettings(_ model: DesktopModel, error: String? = nil) {
+        guard let presentation = settingsWindow?.presentation else { return }
+        presentation.preferences = model.document.preferences ?? model.document.draft.preferences
+        presentation.workflowMode = Self.workflowMode(model.workspace.service?.workflowStatus)
+        presentation.availableActions = model.workspace.service == nil ? [] : [.history, .workflow]
+        presentation.isApplying = false
+        presentation.error = error
+    }
+
+    private static func workflowMode(
+        _ status: (enabled: Bool, mode: String, phase: String, revision: UInt64)?
+    ) -> String? {
+        guard let status else { return nil }
+        return status.enabled ? status.mode : "disabled"
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

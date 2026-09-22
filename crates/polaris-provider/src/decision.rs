@@ -102,6 +102,16 @@ pub trait Decider: Send + Sync {
         state: &serde_json::Value,
         questions: &std::collections::BTreeMap<String, Question>,
     ) -> Result<Decision, DecisionError>;
+
+    /// What answered, for the record.
+    ///
+    /// A stored decision that cannot name its judge cannot be checked
+    /// later, and writing one judge's name into the format is how the
+    /// format stops fitting the others. Implementations return their own
+    /// name; nothing above this hard-codes one.
+    fn name(&self) -> &str {
+        "unknown"
+    }
 }
 
 /// What a run's judge consumed, and how often it was asked.
@@ -282,6 +292,7 @@ pub fn checked(
 }
 
 pub mod jev;
+pub mod semif;
 
 #[cfg(test)]
 mod tests;

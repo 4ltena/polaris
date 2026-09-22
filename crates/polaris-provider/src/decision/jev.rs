@@ -192,6 +192,10 @@ fn outcome(result: &Result<Decision, DecisionError>) -> &'static str {
 
 #[async_trait::async_trait]
 impl Decider for JevDecider {
+    fn name(&self) -> &str {
+        "jev"
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,

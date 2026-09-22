@@ -40,6 +40,62 @@ pub fn run(policy: &SandboxPolicy, command: &str) -> Result<String, ToolError> {
     })
 }
 
+/// A note naming the program that exists, when the one asked for does not.
+///
+/// A shell says `python: command not found` and stops there, and the caller
+/// spends a round trip discovering the name is `python3` — 4 of 12 recorded
+/// runs of the repair task did exactly that, at $0.0152 a round trip. The
+/// note costs about twelve tokens, so the arithmetic was obvious.
+///
+/// **It measured worse.** n=12 each: $0.1433 against $0.1322, with requests
+/// rising from 12.8 to 13.9 and the spread widening from $0.0136 to $0.0334.
+/// Telling the model about `python3` sent it somewhere it had not been going.
+/// Left here, unused, with its numbers: the arithmetic is still right and the
+/// measurement still says no, which is the only pair of facts worth keeping.
+///
+/// Only an exact prefix match on a real entry in PATH counts. A guess that
+/// names something that does not exist would cost the round trip it was
+/// meant to save, and then some.
+#[cfg_attr(not(test), allow(dead_code))]
+fn near_miss(body: &str) -> String {
+    let Some(missing) = body
+        .lines()
+        .find_map(|line| {
+            line.split(": command not found")
+                .next()
+                .filter(|_| line.contains(": command not found"))
+        })
+        .and_then(|head| head.rsplit(':').next())
+        .map(str::trim)
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+    else {
+        return String::new();
+    };
+    let Some(path) = std::env::var_os("PATH") else {
+        return String::new();
+    };
+    let found: Vec<String> = std::env::split_paths(&path)
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(missing) && name != missing)
+        .take(4)
+        .collect();
+    if found.is_empty() {
+        return String::new();
+    }
+    let mut named: Vec<String> = found;
+    named.sort();
+    named.dedup();
+    format!("\n{missing} は無いが、{} はある。", named.join("、"))
+}
+
 /// When the output exceeds the cap, cut it at a character boundary and state
 /// in the body that it was truncated. An unmarked partial result is a wrong
 /// answer presented as a complete one.
@@ -201,5 +257,42 @@ mod tests {
             out.contains("truncated"),
             "the body doesn't say it was truncated"
         );
+    }
+}
+
+#[cfg(test)]
+mod near_miss_tests {
+    use super::near_miss;
+
+    /// The shell says a name does not exist; this says which one does.
+    /// Without it the caller spends a round trip finding out — measured at
+    /// 4 of 12 runs of one task, at $0.0152 a round trip.
+    #[test]
+    fn a_missing_name_is_answered_with_the_one_that_exists() {
+        let said = near_miss("/bin/sh: python: command not found");
+        assert!(
+            said.contains("python3"),
+            "python3 is on PATH here: {said:?}"
+        );
+        assert!(said.contains("python は無いが"));
+    }
+
+    /// Nothing is said unless a real entry on PATH starts with the missing
+    /// name. A guess that names something absent costs the round trip it
+    /// was meant to save.
+    #[test]
+    fn nothing_is_said_when_there_is_no_real_near_miss() {
+        assert_eq!(near_miss("/bin/sh: zqxjkv: command not found"), "");
+        assert_eq!(near_miss("some ordinary failure"), "");
+        // The name itself existing is not a near miss.
+        assert_eq!(near_miss("/bin/sh: : command not found"), "");
+    }
+
+    /// The name is taken from the shell's own words, and anything that is
+    /// not a plain program name is left alone rather than shell-globbed.
+    #[test]
+    fn only_a_plain_program_name_is_looked_up() {
+        assert_eq!(near_miss("/bin/sh: ../../etc/x: command not found"), "");
+        assert_eq!(near_miss("/bin/sh: py thon: command not found"), "");
     }
 }

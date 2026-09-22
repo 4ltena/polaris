@@ -698,7 +698,7 @@ mod state_budget {
             ("general", 126),
             ("brainstorm", 198),
             ("specify", 205),
-            ("implement", 262),
+            ("implement", 294),
             ("review", 227),
             ("verify", 218),
             ("deliver", 207),

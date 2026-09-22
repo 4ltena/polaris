@@ -1,0 +1,7 @@
+{
+  "name": "polaris-jev-lint",
+  "private": true,
+  "description": "Pinned jev-lint for diff review. Deliberately outside the cargo graph and the shipped runtime.",
+  "engines": { "node": ">=20" },
+  "devDependencies": { "jev-lint": "0.5.0" }
+}

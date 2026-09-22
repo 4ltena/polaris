@@ -6,6 +6,7 @@ pub mod approval;
 pub mod audit;
 pub mod budget;
 pub mod build_cache;
+pub mod common_tests;
 pub mod compaction;
 pub mod computer;
 pub mod config;

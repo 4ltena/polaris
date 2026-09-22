@@ -7,6 +7,7 @@ pub mod audit;
 pub mod budget;
 pub mod build_cache;
 pub mod compaction;
+pub mod computer;
 pub mod config;
 pub mod constitution;
 pub mod conversation_memory;

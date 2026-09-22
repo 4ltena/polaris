@@ -44,7 +44,15 @@ pub struct ToolMemory {
 /// compiler error with its location lines or a stack trace with its frames,
 /// and a fraction of the smallest body the retention threshold offloads, so
 /// the replacement is always the shorter of the two.
-const EXCERPT_BYTES: usize = 1024;
+///
+/// 1,024 while the excerpt was a head and a tail, because more of the wrong
+/// lines is not worth paying for. It is 2,048 now that the judge picks them:
+/// raising the judged-line bound so a 324-line log actually reached the judge
+/// took the investigate task from 3.8 astra requests to 3.4 on 2026-09-21,
+/// and the requests that remain are the model coming back for what did not
+/// fit. A round trip on that task is $0.0114; a thousand more bytes of
+/// excerpt is about $0.0026.
+const EXCERPT_BYTES: usize = 2048;
 
 #[derive(Default)]
 pub struct RetentionReport {
@@ -105,6 +113,17 @@ impl ToolMemory {
                 };
                 let excerpt =
                     crate::error_region::select_judged(judge, query, body, EXCERPT_BYTES).await;
+                // The wording was measured on 2026-09-21 and it is not the
+                // lever it looked like. Calling the excerpt "not complete
+                // evidence" and ending with "retrieve missing context before
+                // conclusions" reads as an instruction to go back whatever
+                // the excerpt holds, so it was replaced with wording that
+                // permits concluding from it — $0.1410 over five runs
+                // against $0.1273, with the investigate task rising from
+                // 3.4 astra requests to 3.6 and repair from 4.2 to 4.6. The
+                // run was stopped there. Telling the model it may stop
+                // reading did not make it stop reading; it made it less
+                // careful earlier and it paid for that later.
                 let replacement = format!(
                     "[Stored tool result {}: {} UTF-8 bytes; original preserved.]\n\
                      Excerpt (not complete evidence):\n{}\n\

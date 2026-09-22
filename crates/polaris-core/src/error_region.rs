@@ -43,11 +43,25 @@ pub fn select(text: &str, budget_bytes: usize) -> String {
     assemble(&lines, found, budget_bytes)
 }
 
-/// How many lines one judged request may ask about. A log is unbounded and a
-/// question per line is not, so past this the marker scan answers alone. The
-/// bound is the same order as the tool catalogue the judge already handles in
-/// one request (162 measured on 2026-09-18, ~40 reference tokens each).
-const MAX_JUDGED_LINES: usize = 200;
+/// How many lines one judged request may ask about.
+///
+/// This was 200, and 200 was the bug. The one file in the measured set that
+/// most needed judging — a 324-line log with no failure marker anywhere in
+/// it — was over the bound, so the judge was never asked and the marker scan
+/// answered with a head and a tail. A head and a tail of a log answers
+/// nothing, and the caller spent a round trip grepping for what it could
+/// have been handed.
+///
+/// Asking per block of ten lines instead was tried on 2026-09-21 and made it
+/// worse: the investigate task went from 3.8 astra requests to 4.2 and the
+/// run from $0.1322 to $0.1368. A block is the wrong unit for an excerpt
+/// that has to be small — it carries nine lines nobody asked for to keep
+/// one. So the unit stays the line and the bound is the thing that moves.
+///
+/// 400 covers the measured file with room. The judge reads option logits, so
+/// a question costs its own text and nothing else: 400 lines is about
+/// $0.0004 at the judge's rate against $0.0114 for the round trip it saves.
+const MAX_JUDGED_LINES: usize = 400;
 
 /// The same excerpt, with the judge saying which lines matter when the marker
 /// scan cannot tell.
@@ -92,9 +106,10 @@ pub async fn select_judged(
     else {
         return select(text, budget_bytes);
     };
-    // Adopted and undecided both become something to aim at: the excerpt keeps
-    // context around them and reports every line it left out, so an undecided
-    // line costs a little room rather than being lost.
+    // Adopted and undecided both become something to aim at. Undecided is
+    // deliberately on the keeping side: missing a failure costs a wrong answer
+    // and a round trip to find it again, and carrying ten lines it did not
+    // need costs about two tokens. The two errors are not the same size.
     let mut aimed = bands.adopted;
     aimed.extend(bands.middle);
     aimed.sort_unstable();
@@ -106,8 +121,8 @@ pub async fn select_judged(
     assemble(&lines, aimed, budget_bytes)
 }
 
-/// One line as the judge sees it. A single very long line would otherwise make
-/// one question larger than the whole request is allowed to be.
+/// One line as the judge sees it. A single very long line would otherwise
+/// make one question larger than the whole request is allowed to be.
 fn clamp_line(line: &str) -> &str {
     const LINE_BYTES: usize = 512;
     let mut end = line.len().min(LINE_BYTES);

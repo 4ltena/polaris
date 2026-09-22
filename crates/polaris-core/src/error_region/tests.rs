@@ -188,13 +188,20 @@ impl polaris_provider::decision::Decider for Judge {
             answers: questions
                 .keys()
                 .map(|key| {
-                    // Only the one line that names the thing asked about is
-                    // useful; everything else is noise.
-                    let index: usize = key.trim_start_matches("t-").parse().unwrap_or(0);
+                    // Only the piece that names the thing asked about is
+                    // useful; everything else is noise. Judged on the text
+                    // rather than on an index, so the answer does not depend
+                    // on whether the unit is a line or a block.
+                    let names_it = questions.get(key).is_some_and(|question| match question {
+                        polaris_provider::decision::Question::Noul { instructions } => {
+                            instructions.contains("retry_budget")
+                        }
+                        _ => false,
+                    });
                     (
                         key.clone(),
                         polaris_provider::decision::Answer {
-                            noul: Some(if index == 120 { yes } else { 0.0 }),
+                            noul: Some(if names_it { yes } else { 0.0 }),
                             ..Default::default()
                         },
                     )
@@ -222,20 +229,32 @@ fn unmarked() -> String {
     text.join("\n")
 }
 
+/// The judge aims at a block, and the whole block arrives.
+///
+/// The budget is the real one — `tool_memory::EXCERPT_BYTES` — rather than
+/// the 400 this used when the unit was a single line. A block carries ten
+/// lines and `assemble` adds its own context around them, so a squeeze that
+/// fitted one line cannot fit a region, and testing against a budget no
+/// caller uses would only measure the squeeze.
 #[tokio::test(flavor = "current_thread")]
 async fn a_judged_line_becomes_what_the_excerpt_aims_at() {
+    const BUDGET: usize = 1024;
     let held = judge(Some(1.0));
     let out = select_judged(
         Some(held.as_ref()),
         "retryの予算はどこで決まるか",
         &unmarked(),
-        400,
+        BUDGET,
     )
     .await;
-    assert_eq!(*held.asked.lock().unwrap(), 1);
+    assert_eq!(
+        *held.asked.lock().unwrap(),
+        1,
+        "the judge was asked more than once"
+    );
     assert!(out.contains("retry_budget"), "{out}");
     // The scan alone cannot find it: nothing in this text is a failure marker.
-    assert!(!select(&unmarked(), 400).contains("retry_budget"));
+    assert!(!select(&unmarked(), BUDGET).contains("retry_budget"));
 }
 
 /// A text the scan can already answer is not re-decided. Paying a round trip

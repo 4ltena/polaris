@@ -429,8 +429,11 @@ fn tool_retention_shortens_requests_but_completion_returns_original_raw_history(
             );
             // Well under the 5,100-byte body below. The bound is the excerpt
             // budget plus the retrieval instructions, not the 128 characters
-            // a preview used to be.
-            assert!(request.messages[2].content.len() < 2000);
+            // a preview used to be. The budget doubled to 2,048 on
+            // 2026-09-21 once the judge was picking the lines rather than a
+            // head and a tail, so this follows it rather than pinning the
+            // old number.
+            assert!(request.messages[2].content.len() < 3200);
             Ok(polaris_provider::CompletionResponse {
                 text: "done".into(),
                 ..Default::default()

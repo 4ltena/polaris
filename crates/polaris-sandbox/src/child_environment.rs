@@ -97,6 +97,34 @@ fn apply_policy_with(
             .env("GIT_CONFIG_GLOBAL", "/dev/null");
     } else {
         apply_with(command, lookup);
+        // The isolated branch above pins a writable TMPDIR and takes git's
+        // host configuration out of reach. This branch used to inherit the
+        // parent's TMPDIR from `ALLOWED` and set no `GIT_*` at all — and
+        // under `workspace-write` only the writable roots are writable, so
+        // that inherited directory is not.
+        //
+        // What that cost is measurable. `/usr/bin/python3` and
+        // `/usr/bin/git` are xcrun shims: unable to create
+        // `$TMPDIR/xcrun_db-*`, they fall back to `xcodebuild` and print
+        // about 827 bytes of DVTToolchain errors per invocation, and git
+        // additionally fails on `~/.gitconfig` and exits 128. All of it is
+        // attached to the tool result, enters the history, and is re-billed
+        // on every later request of that turn. Across the recorded parity
+        // sessions that is 452,696 bytes — 8.2% of every tool-result byte
+        // ever sent, and about a third of the billed input of the one task
+        // that runs shell commands.
+        //
+        // It also makes a result lie: a run whose assertions all printed
+        // OK opened with "the command failed with exit code 128" because
+        // `git status` died on a file it was never going to be allowed to
+        // read.
+        // The other half is the writable root, not an environment variable:
+        // `apply_with` above already passes the parent's `TMPDIR` through,
+        // and `build_sandbox_policy` now grants it, so the shims can write
+        // their cache and stop narrating the failure.
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
     }
     Ok(())
 }
@@ -280,5 +308,40 @@ mod tests {
     #[test]
     fn missing_values_are_not_invented() {
         assert!(select(|_| None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod workspace_environment_tests {
+    use super::*;
+    use crate::{SandboxMode, SandboxPolicy};
+
+    /// Under `workspace-write` git is kept away from the host's
+    /// configuration, as it already is under isolation. Without this,
+    /// every `git` the model ran printed "unable to access
+    /// '~/.gitconfig'" into the tool result and exited 128 — a verdict
+    /// that contradicted its own body, on top of the bytes.
+    #[test]
+    fn a_workspace_write_child_cannot_reach_the_hosts_git_configuration() {
+        let root = tempfile::tempdir().expect("no temp dir");
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[root.path().to_path_buf()])
+            .expect("policy");
+        let mut command = Command::new("/usr/bin/true");
+        apply_policy_with(&policy, &mut command, |_| None).expect("apply");
+
+        let seen: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        assert_eq!(
+            seen.get(OsStr::new("GIT_CONFIG_NOSYSTEM"))
+                .map(|v| v.as_os_str()),
+            Some(OsStr::new("1"))
+        );
+        assert_eq!(
+            seen.get(OsStr::new("GIT_CONFIG_GLOBAL"))
+                .map(|v| v.as_os_str()),
+            Some(OsStr::new("/dev/null"))
+        );
     }
 }

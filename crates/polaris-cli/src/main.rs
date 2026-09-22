@@ -2233,11 +2233,34 @@ fn build_sandbox_policy(
     sandbox_mode: SandboxMode,
 ) -> Result<SandboxPolicy, polaris_sandbox::SandboxError> {
     let root = polaris_core::project::resolve_root(cwd);
-    let writable_roots: Vec<PathBuf> = if sandbox_mode == SandboxMode::WorkspaceWrite {
+    let mut writable_roots: Vec<PathBuf> = if sandbox_mode == SandboxMode::WorkspaceWrite {
         vec![root]
     } else {
         Vec::new()
     };
+    // The per-user temporary directory, the way codex grants it. The child
+    // already receives `TMPDIR`; until now it could not write there, and on
+    // macOS `/usr/bin/git` and `/usr/bin/python3` are `xcrun` shims that
+    // write `$TMPDIR/xcrun_db-*` before doing anything else. Denied that,
+    // they fall back to `xcodebuild` and emit about 800 bytes of
+    // `DVTToolchain` complaints per invocation, and `git` exits 128 on top
+    // — 10,884 bytes per shell task measured on 2026-09-21 once the history
+    // re-sends are counted, about a quarter of what that task bills. It
+    // also made results lie: a run whose assertions all printed OK opened
+    // with "the command failed with exit code 128".
+    //
+    // `TMPDIR` only, never the `/tmp` that `std::env::temp_dir` falls back
+    // to: the macOS per-user directory is not readable by other users and
+    // `/tmp` is.
+    if sandbox_mode == SandboxMode::WorkspaceWrite
+        && let Some(tmpdir) = std::env::var_os("TMPDIR")
+        && !tmpdir.is_empty()
+    {
+        let tmpdir = PathBuf::from(tmpdir);
+        if tmpdir.is_absolute() && tmpdir.is_dir() {
+            writable_roots.push(tmpdir);
+        }
+    }
     SandboxPolicy::new(sandbox_mode, &writable_roots)
 }
 

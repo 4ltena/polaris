@@ -374,4 +374,44 @@ mod tests {
         assert_eq!(args[sep + 1], "/bin/echo");
         assert_eq!(args[sep + 2], "hello");
     }
+
+    /// The reason `workspace-write` grants the per-user `TMPDIR`, run
+    /// against the real profile and the real shim.
+    ///
+    /// Without it the child keeps that `TMPDIR` and cannot write to it;
+    /// `/usr/bin/python3` fails to create `$TMPDIR/xcrun_db-*`, falls back
+    /// to `xcodebuild`, and prints its `DVTToolchain` complaint into the
+    /// tool result. Measured on 2026-09-21 at 10,884 bytes per shell task
+    /// once the history re-sends were counted. Only the fixed side is
+    /// asserted: the broken side depends on what the machine's own
+    /// temporary directory happens to hold.
+    #[test]
+    fn granting_the_per_user_tmpdir_keeps_the_xcrun_shims_quiet() {
+        let Some(tmpdir) = std::env::var_os("TMPDIR") else {
+            return; // Nothing to grant, and nothing the shims can write.
+        };
+        let project = tempfile::tempdir().expect("temp dir");
+        let policy = workspace(&[
+            project.path().to_path_buf(),
+            std::path::PathBuf::from(&tmpdir),
+        ]);
+
+        let args = build_args(
+            &policy,
+            std::path::Path::new("/usr/bin/python3"),
+            &["-c".to_string(), "pass".to_string()],
+        );
+        let output = std::process::Command::new(SANDBOX_EXEC)
+            .args(&args)
+            .env("TMPDIR", &tmpdir)
+            .output()
+            .expect("sandbox-exec did not run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "the shim failed: {stderr}");
+        assert!(
+            !stderr.contains("DVTToolchain") && !stderr.contains("xcrun_db-"),
+            "the shim still complained: {stderr}"
+        );
+    }
 }

@@ -80,8 +80,34 @@ pub struct DecisionConfig {
     /// Off unless asked for. Every path that consults the judge works
     /// without one, so enabling it is a choice to spend a round trip.
     pub enabled: bool,
+    /// Which judge answers. Named rather than inferred: a run that picks
+    /// its decider from whichever resource happens to be present is a run
+    /// whose evidence nobody can attribute.
+    pub backend: DecisionBackend,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    /// The SemIf helper, absolute. Only meaningful for that backend, and
+    /// rejected under the other one rather than ignored — a key that does
+    /// nothing reads as a key that did something.
+    pub helper: Option<PathBuf>,
+}
+
+/// The two judges. Unknown spellings are refused at load, so a typo stops
+/// the run instead of silently selecting the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DecisionBackend {
+    #[default]
+    Jev,
+    SemIf,
+}
+
+impl DecisionBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jev => "jev",
+            Self::SemIf => "semif",
+        }
+    }
 }
 
 /// One entry per weight `polaris_skills::Tier` declares, so a new weight
@@ -365,15 +391,26 @@ struct RawDecision {
     #[serde(default)]
     enabled: Option<bool>,
     #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    helper: Option<String>,
 }
 
 impl RawDecision {
     fn apply_to(self, merged: &mut DecisionConfig) -> Result<(), ConfigError> {
         if let Some(enabled) = self.enabled {
             merged.enabled = enabled;
+        }
+        if let Some(backend) = self.backend {
+            merged.backend = match backend.trim() {
+                "jev" => DecisionBackend::Jev,
+                "semif" => DecisionBackend::SemIf,
+                _ => return Err(ConfigError::UnknownDecisionBackend(backend)),
+            };
         }
         for (value, held) in [
             (self.base_url, &mut merged.base_url),
@@ -385,7 +422,31 @@ impl RawDecision {
             }
             *held = Some(value);
         }
+        if let Some(helper) = self.helper {
+            if helper.trim().is_empty() {
+                return Err(ConfigError::EmptyDecisionValue);
+            }
+            let helper = PathBuf::from(helper);
+            if !helper.is_absolute() {
+                return Err(ConfigError::RelativeDecisionHelper(helper));
+            }
+            merged.helper = Some(helper);
+        }
         Ok(())
+    }
+
+    /// Checked after every layer has been applied, because the conflict is
+    /// between the final values and not between one file's lines.
+    fn settled(merged: &DecisionConfig) -> Result<(), ConfigError> {
+        match (merged.backend, merged.helper.is_some()) {
+            // A half-written pin: the backend that needs a helper, without
+            // one. Refused rather than started and found wanting later.
+            (DecisionBackend::SemIf, false) => Err(ConfigError::MissingDecisionHelper),
+            // A helper under the remote backend names a local program this
+            // run will never start. Ambiguous, so it stops.
+            (DecisionBackend::Jev, true) => Err(ConfigError::UnusedDecisionHelper),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -466,6 +527,14 @@ pub enum ConfigError {
     },
     #[error("[tier] のmodelとeffortに空の値は書けません")]
     EmptyTierValue,
+    #[error("[decision] backend は jev か semif のどちらかです（{0} は不明）")]
+    UnknownDecisionBackend(String),
+    #[error("[decision] backend = \"semif\" には helper への絶対pathが必要です")]
+    MissingDecisionHelper,
+    #[error("[decision] helper は backend = \"semif\" のときだけ指定できます")]
+    UnusedDecisionHelper,
+    #[error("[decision] helper は絶対pathで書いてください（{0} は相対）")]
+    RelativeDecisionHelper(PathBuf),
     #[error("[decision] のbase_urlとmodelに空の値は書けません")]
     EmptyDecisionValue,
     #[error("[build_cache] のmax_bytesを読めません。80GiB・500MB・バイト数のいずれかで書きます")]
@@ -570,6 +639,7 @@ fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
             raw.decision.apply_to(&mut merged.decision)?;
         }
     }
+    RawDecision::settled(&merged.decision)?;
     Ok(merged)
 }
 
@@ -633,6 +703,7 @@ pub fn try_load_decision_from(
             raw.decision.apply_to(&mut merged)?;
         }
     }
+    RawDecision::settled(&merged)?;
     Ok(merged)
 }
 
@@ -1073,6 +1144,59 @@ mod tests {
                 ),
                 "{body}"
             );
+        }
+    }
+
+    /// The judge is named, never inferred. Every shape that would leave
+    /// "which decider answered" ambiguous is refused at load, because the
+    /// alternative is a run whose evidence cannot be attributed.
+    #[test]
+    fn the_decision_backend_is_named_and_its_resources_must_match_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("semif-helper");
+        std::fs::write(&helper, "#!/bin/sh\n").unwrap();
+        let helper = helper.display();
+
+        assert_eq!(
+            Config::default().decision.backend,
+            DecisionBackend::Jev,
+            "the default moved"
+        );
+
+        let ok = write(
+            dir.path(),
+            &format!("[decision]\nenabled = true\nbackend = \"semif\"\nhelper = \"{helper}\"\n"),
+        );
+        let held = try_load_from(None, Some(&ok)).expect("a valid semif配置");
+        assert_eq!(held.decision.backend, DecisionBackend::SemIf);
+        assert_eq!(
+            held.decision.helper.as_deref(),
+            Some(Path::new(&format!("{helper}")))
+        );
+        // The decision-only loader answers the same, or a host that reads
+        // just this section would start a different judge.
+        let only = try_load_decision_from(None, Some(&ok)).expect("a read");
+        assert_eq!(only.backend, DecisionBackend::SemIf);
+
+        for (body, expected) in [
+            ("[decision]\nbackend = \"semiff\"\n".to_owned(), "unknown"),
+            ("[decision]\nbackend = \"semif\"\n".to_owned(), "missing"),
+            (format!("[decision]\nhelper = \"{helper}\"\n"), "unused"),
+            (
+                "[decision]\nbackend = \"semif\"\nhelper = \"semif-helper\"\n".to_owned(),
+                "relative",
+            ),
+        ] {
+            let path = write(dir.path(), &body);
+            let error = try_load_from(None, Some(&path)).expect_err(&body);
+            let matched = matches!(
+                (expected, &error),
+                ("unknown", ConfigError::UnknownDecisionBackend(_))
+                    | ("missing", ConfigError::MissingDecisionHelper)
+                    | ("unused", ConfigError::UnusedDecisionHelper)
+                    | ("relative", ConfigError::RelativeDecisionHelper(_))
+            );
+            assert!(matched, "{body} gave {error:?}, wanted {expected}");
         }
     }
 

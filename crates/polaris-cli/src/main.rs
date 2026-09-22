@@ -319,6 +319,12 @@ enum Command {
     /// saved, which provider would be picked with no `POLARIS_PROVIDER`
     /// set, and whether this platform's sandbox backend is available.
     Doctor,
+    /// Check a shared black-box test plan: the argv and the cases an
+    /// implementer selected instead of writing a test program.
+    CommonTests {
+        /// The plan, as JSON. `-` reads it from stdin.
+        plan: String,
+    },
     /// Generate a shell completion script and print it to stdout.
     Completion {
         /// The shell to generate completions for.
@@ -864,36 +870,62 @@ fn sweep_build_cache(cwd: &std::path::Path, config: &polaris_core::config::Confi
     }
 }
 
+/// The judge this run will use, or none with the reason said out loud.
+///
+/// **A backend that cannot start never becomes the other one.** The
+/// adoption plan is explicit that a missing helper, a hash mismatch or a
+/// failed preflight falls back to the path that works without a judge at
+/// all, not to the remote one: a run that quietly answers with a
+/// different decider than the configuration names produces evidence
+/// nobody can attribute. Every return prints the effective backend, so
+/// "which judge answered" is never inferred from the absence of a
+/// message.
 fn build_decider(
     config: &polaris_core::config::DecisionConfig,
 ) -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
+    use polaris_core::config::DecisionBackend;
+
     if !config.enabled {
         return None;
     }
-    let key = match std::env::var("POLARIS_JEV_API_KEY") {
-        Ok(key) => key,
-        Err(_) => {
-            eprintln!(
-                "[decision] enabled = true ですが POLARIS_JEV_API_KEY がありません。判定器なしで実行します"
-            );
-            return None;
+    let refuse = |reason: &str| -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
+        eprintln!(
+            "[decision] backend = \"{}\" を使えません（{reason}）。判定器なしで実行します",
+            config.backend.as_str()
+        );
+        None
+    };
+    let decider: std::sync::Arc<dyn polaris_provider::decision::Decider> = match config.backend {
+        DecisionBackend::SemIf => {
+            // `available` re-checks the path here rather than trusting the
+            // load-time check: the helper can be removed between the two.
+            match polaris_provider::decision::semif::SemIfDecider::available(
+                config.helper.as_deref(),
+            ) {
+                Some(decider) => std::sync::Arc::new(decider),
+                None => return refuse("helperが実在する絶対pathではありません"),
+            }
+        }
+        DecisionBackend::Jev => {
+            let Ok(key) = std::env::var("POLARIS_JEV_API_KEY") else {
+                return refuse("POLARIS_JEV_API_KEY がありません");
+            };
+            let base = config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.typesafe.ai/v1".to_owned());
+            let model = config
+                .model
+                .clone()
+                .unwrap_or_else(|| "jev-latest".to_owned());
+            match polaris_provider::decision::jev::JevDecider::new(&base, key, model) {
+                Ok(decider) => std::sync::Arc::new(decider),
+                Err(error) => return refuse(&format!("{error:?}")),
+            }
         }
     };
-    let base = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| "https://api.typesafe.ai/v1".to_owned());
-    let model = config
-        .model
-        .clone()
-        .unwrap_or_else(|| "jev-latest".to_owned());
-    match polaris_provider::decision::jev::JevDecider::new(&base, key, model) {
-        Ok(decider) => Some(std::sync::Arc::new(decider)),
-        Err(error) => {
-            eprintln!("判定器を作れません（{error:?}）。判定器なしで実行します");
-            None
-        }
-    }
+    eprintln!("[decision] backend = \"{}\"", decider.name());
+    Some(decider)
 }
 
 /// The provider handle everything downstream holds. Named so the three
@@ -1064,6 +1096,7 @@ async fn main() -> ExitCode {
             };
         }
         Some(Command::Doctor) => return run_doctor().await,
+        Some(Command::CommonTests { plan }) => return run_common_tests(&plan),
         Some(Command::Completion { shell }) => {
             clap_complete::generate(
                 shell,
@@ -2264,6 +2297,55 @@ fn build_sandbox_policy(
     SandboxPolicy::new(sandbox_mode, &writable_roots)
 }
 
+/// `polaris common-tests`. Reads a plan and says whether it is one the
+/// shared runner would accept, and which cases it names.
+///
+/// **It checks; it does not run.** The execution engine is not built yet,
+/// and a subcommand that printed a verdict without executing anything
+/// would be read as one that had. What it does do is the half that has to
+/// happen first anyway: the shapes `Plan::check` refuses — an empty argv,
+/// a shell string where an argument vector belongs, no cases at all, a
+/// created path that leaves the write root — are exactly the ones that
+/// would widen a boundary or prove nothing, and finding them costs no
+/// process.
+fn run_common_tests(plan: &str) -> ExitCode {
+    let body = if plan == "-" {
+        let mut held = String::new();
+        if let Err(error) = std::io::Read::read_to_string(&mut io::stdin(), &mut held) {
+            eprintln!("計画を読めません: {error}");
+            return ExitCode::FAILURE;
+        }
+        held
+    } else {
+        match std::fs::read_to_string(plan) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("{plan} を読めません: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let plan: polaris_core::common_tests::Plan = match serde_json::from_str(&body) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("計画の形式が不正です: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(refused) = plan.check() {
+        eprintln!("この計画は受理できません: {refused:?}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "受理: {} 件のcase（{}）",
+        plan.cases.len(),
+        plan.case_names().join(", ")
+    );
+    println!("対象: {:?}", plan.argv);
+    println!("実行器は未実装のため、ここでは実行していない。");
+    ExitCode::SUCCESS
+}
+
 /// `polaris doctor`. Diagnoses the local installation: read-only checks
 /// only, and never prints the credential contents themselves — only
 /// whether each file exists and parses.
@@ -3385,6 +3467,62 @@ mod tests {
 #[cfg(test)]
 mod tool_memory_settings_tests {
     use super::*;
+
+    /// The configured judge is the one that answers, and a judge that
+    /// cannot start yields none rather than the other one.
+    ///
+    /// The env var is set inside the test because the Jev branch reads
+    /// it: without it the second case would pass for the wrong reason,
+    /// reporting "no key" where the property under test is "no silent
+    /// substitution". Nothing else in this binary reads that name.
+    #[test]
+    fn a_configured_backend_answers_or_nothing_does() {
+        use polaris_core::config::{DecisionBackend, DecisionConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("semif-helper");
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        // SAFETY: single-threaded test, and no other test in this binary
+        // reads or writes this variable.
+        unsafe { std::env::set_var("POLARIS_JEV_API_KEY", "test-key") };
+
+        let semif = DecisionConfig {
+            enabled: true,
+            backend: DecisionBackend::SemIf,
+            helper: Some(helper.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_decider(&semif).map(|d| d.name().to_owned()),
+            Some("semif".to_owned())
+        );
+
+        let missing = DecisionConfig {
+            helper: Some(dir.path().join("absent")),
+            ..semif.clone()
+        };
+        assert!(
+            build_decider(&missing).is_none(),
+            "a SemIf that cannot start was answered by the remote judge"
+        );
+
+        let jev = DecisionConfig {
+            enabled: true,
+            backend: DecisionBackend::Jev,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_decider(&jev).map(|d| d.name().to_owned()),
+            Some("jev".to_owned())
+        );
+
+        let off = DecisionConfig {
+            enabled: false,
+            ..semif
+        };
+        assert!(build_decider(&off).is_none(), "disabled still built one");
+        unsafe { std::env::remove_var("POLARIS_JEV_API_KEY") };
+    }
 
     #[test]
     fn tool_memory_defaults_off_and_is_independent_of_remember() {

@@ -28,6 +28,7 @@ pub struct SandboxPolicy {
     mode: SandboxMode,
     writable_roots: Vec<PathBuf>,
     isolated: Option<IsolatedBoundary>,
+    require_process_containment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +157,7 @@ impl SandboxPolicy {
             mode,
             writable_roots,
             isolated: None,
+            require_process_containment: false,
         })
     }
 
@@ -216,11 +218,29 @@ impl SandboxPolicy {
                 environment: None,
                 loopback_network: false,
             }),
+            require_process_containment: false,
         })
     }
 
     pub fn isolated_boundary(&self) -> Option<&IsolatedBoundary> {
         self.isolated.as_ref()
+    }
+
+    /// Common-case execution opts into a no-fork profile. This is required to
+    /// prove that a passed case cannot retain a setsid descendant outside the
+    /// direct child's process group.
+    pub fn require_process_containment(mut self) -> Result<Self, SandboxError> {
+        if self.isolated.is_none() {
+            return Err(SandboxError::NotEnforced(
+                "process containment requires an isolated policy".into(),
+            ));
+        }
+        self.require_process_containment = true;
+        Ok(self)
+    }
+
+    pub(crate) fn requires_process_containment(&self) -> bool {
+        self.require_process_containment
     }
 
     /// A read-only isolated child that talks to a local app over loopback.

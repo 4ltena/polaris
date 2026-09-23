@@ -32,9 +32,11 @@ fn readable_ancestors(policy: &SandboxPolicy) -> Vec<&Path> {
 /// Builds the SBPL profile body from the policy.
 pub fn build_profile(policy: &SandboxPolicy) -> String {
     if let Some(boundary) = policy.isolated_boundary() {
-        let mut p = String::from(
-            "(version 1)\n(deny default)\n(allow process-fork process-exec)\n(allow signal (target same-sandbox))\n(allow sysctl-read (sysctl-name \"hw.pagesize\" \"hw.pagesize_compat\" \"hw.ncpu\" \"hw.memsize\" \"hw.activecpu\" \"kern.osrelease\" \"kern.osversion\" \"kern.ostype\" \"kern.hostname\" \"kern.version\" \"hw.machine\"))\n(allow file-read* (literal \"/\" \"/dev/null\" \"/dev/urandom\" \"/dev/random\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
-        );
+        let mut p = String::from("(version 1)\n(deny default)\n");
+        if !policy.requires_process_containment() {
+            p.push_str("(allow process-fork)\n");
+        }
+        p.push_str("(allow process-exec)\n(allow signal (target same-sandbox))\n(allow sysctl-read (sysctl-name \"hw.pagesize\" \"hw.pagesize_compat\" \"hw.ncpu\" \"hw.memsize\" \"hw.activecpu\" \"kern.osrelease\" \"kern.osversion\" \"kern.ostype\" \"kern.hostname\" \"kern.version\" \"hw.machine\"))\n(allow file-read* (literal \"/\" \"/dev/null\" \"/dev/urandom\" \"/dev/random\"))\n(allow file-write-data (literal \"/dev/null\"))\n");
         // deny-default and named sysctl grants alone did not reject
         // KERN_PROCARGS2 on macOS. Explicitly deny other-process inspection;
         // self inspection remains useful and sees only the fixed child env.

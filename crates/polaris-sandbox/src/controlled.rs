@@ -40,7 +40,21 @@ pub fn run_confined_controlled(
     stdin: Option<&str>,
     cancelled: impl FnMut() -> bool,
 ) -> Result<ControlledOutcome, SandboxError> {
-    run_confined_controlled_authorized(policy, program, args, stdin, cancelled, || true)
+    run_confined_controlled_in_dir(policy, program, args, stdin, None, cancelled)
+}
+
+/// Like [`run_confined_controlled`], with an explicitly caller-owned working
+/// directory. The sandbox policy still decides which filesystem operations
+/// the child may perform; this only avoids inheriting the host process cwd.
+pub fn run_confined_controlled_in_dir(
+    policy: &SandboxPolicy,
+    program: &Path,
+    args: &[String],
+    stdin: Option<&str>,
+    cwd: Option<&Path>,
+    cancelled: impl FnMut() -> bool,
+) -> Result<ControlledOutcome, SandboxError> {
+    run_confined_controlled_authorized_in_dir(policy, program, args, stdin, cwd, cancelled, || true)
 }
 
 /// `authorized` must be fast and nonblocking. It is checked once immediately
@@ -54,6 +68,20 @@ pub fn run_confined_controlled_authorized(
     cancelled: impl FnMut() -> bool,
     authorized: impl FnMut() -> bool,
 ) -> Result<ControlledOutcome, SandboxError> {
+    run_confined_controlled_authorized_in_dir(
+        policy, program, args, stdin, None, cancelled, authorized,
+    )
+}
+
+fn run_confined_controlled_authorized_in_dir(
+    policy: &SandboxPolicy,
+    program: &Path,
+    args: &[String],
+    stdin: Option<&str>,
+    cwd: Option<&Path>,
+    cancelled: impl FnMut() -> bool,
+    authorized: impl FnMut() -> bool,
+) -> Result<ControlledOutcome, SandboxError> {
     // v1 has no cancellation/ownership protocol: reject before connecting or
     // transmitting a command, never fall back from an opted-in broker.
     if crate::broker::from_environment()?.is_some() {
@@ -64,24 +92,30 @@ pub fn run_confined_controlled_authorized(
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         native::run_authorized(
-            policy,
-            program,
-            args,
-            stdin,
+            native::RunSpec {
+                policy,
+                program,
+                args,
+                stdin,
+                cwd,
+                timing: native::Timing::default(),
+            },
             cancelled,
             authorized,
-            native::Timing::default(),
         )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (policy, program, args, stdin, cancelled, authorized);
+        let _ = (policy, program, args, stdin, cwd, cancelled, authorized);
         Err(SandboxError::UnsupportedPlatform)
     }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use native::{ManagedStdio, ManagedStdioPipes, PendingCleanup, take_pending_cleanups};
+pub use native::{
+    ManagedStdio, ManagedStdioPipes, PendingCleanup, take_pending_cleanup_for,
+    take_pending_cleanups,
+};
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[derive(Debug)]
@@ -97,10 +131,17 @@ impl PendingCleanup {
             "controlled execution is unsupported",
         ))
     }
+    pub fn try_stop_and_reap(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.try_reap()
+    }
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn take_pending_cleanups() -> Vec<PendingCleanup> {
     Vec::new()
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn take_pending_cleanup_for(_child_id: u32) -> Option<PendingCleanup> {
+    None
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -124,6 +165,15 @@ mod native {
         kill: Duration,
         drain: Duration,
         defer_reap: bool,
+    }
+
+    pub(super) struct RunSpec<'a> {
+        pub(super) policy: &'a SandboxPolicy,
+        pub(super) program: &'a Path,
+        pub(super) args: &'a [String],
+        pub(super) stdin: Option<&'a str>,
+        pub(super) cwd: Option<&'a Path>,
+        pub(super) timing: Timing,
     }
     impl Default for Timing {
         fn default() -> Self {
@@ -183,7 +233,6 @@ mod native {
             let Some(owned) = self.owned.as_mut() else {
                 return Ok(None);
             };
-            owned.may_signal = false;
             if owned.status.is_none() {
                 owned.status = owned.child.try_wait()?;
             }
@@ -194,16 +243,48 @@ mod native {
             }
             Ok(None)
         }
+
+        /// Request another bounded stop attempt for this exact owned group,
+        /// then observe the direct child and group.  A failed signal leaves
+        /// ownership signal-capable so a caller can retry; it is disabled only
+        /// after the direct child is reaped.
+        pub fn try_stop_and_reap(&mut self) -> io::Result<Option<ExitStatus>> {
+            let Some(owned) = self.owned.as_mut() else {
+                return Ok(None);
+            };
+            // Keep the original group owner signal-capable until its absence
+            // is observed. A direct leader can exit while a same-PGID
+            // grandchild remains alive.
+            if owned.may_signal {
+                // `child` is still owned and unreaped, so its PID cannot be
+                // recycled.  The direct child may have left the original
+                // process group (for example after a successful `setsid`), in
+                // which case a group signal alone cannot finish cleanup.
+                let child_error = (owned.status.is_none())
+                    .then(|| signal_child(&owned.child, libc::SIGKILL))
+                    .transpose()
+                    .err();
+                // Always make the original-group attempt too: a direct-child
+                // permission error must not skip cleanup of owned descendants.
+                let group_error = signal(owned.pgid, libc::SIGKILL).err();
+                if let Some(error) = child_error.or(group_error) {
+                    return Err(error);
+                }
+            }
+            self.try_reap()
+        }
     }
     impl Drop for PendingCleanup {
         fn drop(&mut self) {
-            if let Some(mut owned) = self.owned.take() {
-                // Before reap, the child pins this PID. After final signal or
-                // reap, never send another group signal based on its number.
-                if owned.may_signal && owned.status.is_none() {
+            if let Some(owned) = self.owned.take() {
+                // A live process group keeps its identity until it is absent;
+                // retain one last exact-group stop attempt for grandchildren.
+                if owned.may_signal {
+                    if owned.status.is_none() {
+                        let _ = signal_child(&owned.child, libc::SIGKILL);
+                    }
                     let _ = signal(owned.pgid, libc::SIGKILL);
                 }
-                owned.may_signal = false;
                 PENDING
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -220,10 +301,38 @@ mod native {
             .collect()
     }
 
+    /// Transfers only the pending child with this exact PID. Unlike the
+    /// all-owner drain, this leaves every unrelated run owner parked.
+    pub fn take_pending_cleanup_for(child_id: u32) -> Option<PendingCleanup> {
+        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        let index = pending
+            .iter()
+            .position(|owned| owned.child.id() == child_id)?;
+        Some(PendingCleanup {
+            owned: Some(pending.swap_remove(index)),
+        })
+    }
+
     fn signal(pgid: libc::pid_t, sig: libc::c_int) -> io::Result<()> {
         assert!(pgid > 1);
         // SAFETY: negative, validated PID selects only our spawned group.
         if unsafe { libc::kill(-pgid, sig) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    }
+    fn signal_child(child: &Child, sig: libc::c_int) -> io::Result<()> {
+        let pid = libc::pid_t::try_from(child.id()).expect("OS child PID fits pid_t");
+        assert!(pid > 1);
+        // SAFETY: `Child` remains exclusively owned and has not been reaped,
+        // so this is its exact unrecycled PID rather than a process-group or
+        // descendant selection.
+        if unsafe { libc::kill(pid, sig) } == 0 {
             return Ok(());
         }
         let e = io::Error::last_os_error();
@@ -245,29 +354,14 @@ mod native {
             _ => Err(e),
         }
     }
+    // Kept as the shared lifecycle probe for the managed-stdio owner. Unlike
+    // the former waitid(WNOWAIT) implementation, this consumes the direct
+    // child's exit status immediately while the owning `Child` is present.
     fn exited_without_reap(owned: &mut Owned) -> io::Result<bool> {
-        // SAFETY: initialized OS-provided layout; WNOWAIT preserves PID ownership.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                owned.child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if rc == 0 {
-            return Ok(unsafe { info.si_pid() } != 0);
+        if owned.status.is_none() {
+            owned.status = owned.child.try_wait()?;
         }
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ECHILD) {
-            owned.may_signal = false;
-        }
-        if e.kind() == io::ErrorKind::Interrupted {
-            Ok(false)
-        } else {
-            Err(e)
-        }
+        Ok(owned.status.is_some())
     }
     fn nonblocking(fd: &impl AsRawFd) -> io::Result<()> {
         // SAFETY: owned, open pipe FD; preserve all existing status flags.
@@ -337,18 +431,33 @@ mod native {
         cancelled: impl FnMut() -> bool,
         timing: Timing,
     ) -> Result<ControlledOutcome, SandboxError> {
-        run_authorized(policy, program, args, stdin, cancelled, || true, timing)
+        run_authorized(
+            RunSpec {
+                policy,
+                program,
+                args,
+                stdin,
+                cwd: None,
+                timing,
+            },
+            cancelled,
+            || true,
+        )
     }
 
     pub(super) fn run_authorized(
-        policy: &SandboxPolicy,
-        program: &Path,
-        args: &[String],
-        stdin: Option<&str>,
+        spec: RunSpec<'_>,
         mut cancelled: impl FnMut() -> bool,
         mut authorized: impl FnMut() -> bool,
-        timing: Timing,
     ) -> Result<ControlledOutcome, SandboxError> {
+        let RunSpec {
+            policy,
+            program,
+            args,
+            stdin,
+            cwd,
+            timing,
+        } = spec;
         let empty = || ControlledOutcome {
             end: ControlledEnd::CancelledBeforeSpawn,
             status: None,
@@ -368,6 +477,9 @@ mod native {
         // a handle never releases capacity; only completed cleanup does.
         let reservation = Reservation::acquire()?;
         let mut command = crate::confine::build_command(policy, program, args)?;
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         command
             .process_group(0)
             .stdin(if stdin.is_some() {
@@ -458,14 +570,26 @@ mod native {
                 term_at = Some(now);
             }
             if term_at.is_some_and(|t| now.duration_since(t) >= timing.term) && kill_at.is_none() {
-                if owned.may_signal
-                    && let Err(e) = signal(pgid, libc::SIGKILL)
-                {
-                    stop_problem.get_or_insert(e.to_string());
+                if !owned.may_signal {
+                    kill_at = Some(now);
+                    drain_until.get_or_insert(now + timing.drain);
+                } else {
+                    match signal(pgid, libc::SIGKILL) {
+                        Ok(()) => {
+                            // Retain signal capability until the direct child
+                            // is reaped.  A later owner may need to retry if
+                            // polling races this stop request.
+                            kill_at = Some(now);
+                            drain_until.get_or_insert(now + timing.drain);
+                        }
+                        Err(e) => {
+                            // Do not mark the group as no longer signalable on
+                            // failure; the next loop pass retains the exact
+                            // owner and retries within the bounded run.
+                            stop_problem.get_or_insert(e.to_string());
+                        }
+                    }
                 }
-                owned.may_signal = false;
-                kill_at = Some(now);
-                drain_until.get_or_insert(now + timing.drain);
             }
             if let Err(e) = out.drain(&mut output) {
                 problem.get_or_insert(e.to_string());
@@ -499,6 +623,19 @@ mod native {
             if drain_until.is_some_and(|until| now >= until) {
                 output = None;
                 error = None;
+            }
+            // A normal direct-child exit needs no grace-period delay once its
+            // original group is gone and both owned output pipes are drained.
+            // If descendants remain, the regular TERM/KILL schedule below
+            // still owns their original group before this call can succeed.
+            if exited && owned.status.is_some() && output.is_none() && error.is_none() {
+                match group_absent(pgid) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => {
+                        problem.get_or_insert(e.to_string());
+                    }
+                }
             }
             if let Some(killed) = kill_at {
                 if !timing.defer_reap && owned.status.is_none() {
@@ -656,6 +793,19 @@ mod native {
                 loop {
                     std::thread::sleep(Duration::from_millis(20));
                 }
+            } else if let Some(ready) = mode.strip_prefix("grandchild|") {
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0);
+                if pid == 0 {
+                    unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+                    std::fs::write(ready, std::process::id().to_string()).unwrap();
+                    loop {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                // The child is the process-group leader and exits first. Its
+                // descendant remains in the same group, exercising cleanup
+                // after the direct child has become reapable.
             } else if let Some(ready) = mode.strip_prefix("escape|") {
                 // This fixture retains the pipe in a new session. The test
                 // owns its PID separately and explicitly cleans it up.
@@ -669,6 +819,16 @@ mod native {
                     }
                 }
                 std::fs::write(ready, pid.to_string()).unwrap();
+            } else if let Some(ready) = mode.strip_prefix("setsid-direct|") {
+                // The launcher normally makes this process its own group
+                // leader, so `setsid` should fail with EPERM. If a platform or
+                // confinement layer permits it, keep running to exercise the
+                // owned-direct-child fallback in PendingCleanup.
+                let result = unsafe { libc::setsid() };
+                std::fs::write(ready, format!("{}:{result}", std::process::id())).unwrap();
+                loop {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             } else {
                 panic!("unknown fixture mode");
             }
@@ -891,6 +1051,28 @@ mod native {
         }
 
         #[test]
+        fn true_is_reaped_without_a_wnowait_exit_probe() {
+            let result = run(
+                &policy(),
+                Path::new("/usr/bin/true"),
+                &[],
+                None,
+                || false,
+                Timing::default(),
+            );
+            let out = match result {
+                Ok(out) => out,
+                // A confinement implementation that rejects this executable
+                // must fail before execution rather than leave a child owner.
+                Err(SandboxError::NotEnforced(_)) => return,
+                Err(error) => panic!("unexpected /usr/bin/true result: {error}"),
+            };
+            assert_eq!(out.end, ControlledEnd::Exited, "{out:?}");
+            assert!(out.status.is_some_and(|status| status.success()));
+            assert!(out.pending.is_none());
+        }
+
+        #[test]
         fn output_is_bounded_but_excess_is_drained() {
             // A small OS pipe must not incur a full idle tick for every read.
             // Keep the same deadline as the service's output ownership fixture.
@@ -965,6 +1147,23 @@ mod native {
         }
 
         #[test]
+        fn direct_exit_does_not_abandon_a_same_group_grandchild() {
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let out = launch(
+                &format!("grandchild|{}\n", ready.display()),
+                || false,
+                Timing::default(),
+            );
+            assert!(ready.exists(), "grandchild did not start");
+            assert_eq!(out.end, ControlledEnd::Exited, "{out:?}");
+            assert!(out.status.is_some());
+            let grandchild: libc::pid_t = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+            let still_exists = unsafe { libc::kill(grandchild, 0) } == 0;
+            assert!(!still_exists, "same-PGID grandchild escaped cleanup");
+        }
+
+        #[test]
         fn deadline_retains_handle_and_drop_parks_ownership() {
             let _serial = REGISTRY_TEST.lock().unwrap_or_else(|e| e.into_inner());
             let dir = tempfile::tempdir().unwrap();
@@ -1000,6 +1199,38 @@ mod native {
         }
 
         #[test]
+        fn deferred_owner_retries_cleanup_without_registry_transfer() {
+            let _serial = REGISTRY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let timing = Timing {
+                defer_reap: true,
+                ..Timing::default()
+            };
+            let mut out = launch(
+                &format!("ignore|{}\n", ready.display()),
+                || ready.exists(),
+                timing,
+            );
+            let mut handle = out.pending.take().expect("deferred owner");
+            let id = handle.child_id().expect("child id");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(status) = handle.try_stop_and_reap().unwrap() {
+                    assert_reaped(Some(status), id);
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "direct owner did not finish cleanup"
+                );
+                std::thread::sleep(TICK);
+            }
+            assert!(handle.child_id().is_none());
+            assert!(PENDING.lock().unwrap().is_empty());
+        }
+
+        #[test]
         fn escaped_pipe_does_not_block_return() {
             let dir = tempfile::tempdir().unwrap();
             let ready = dir.path().join("ready");
@@ -1025,6 +1256,58 @@ mod native {
             assert!(start.elapsed() < Duration::from_secs(3));
             assert_eq!(out.end, ControlledEnd::Exited, "{out:?}");
             assert!(!out.stdout_eof || !out.stderr_eof);
+        }
+
+        #[test]
+        fn attempted_direct_setsid_never_leaks_or_hangs() {
+            let _serial = REGISTRY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let timing = Timing {
+                term: Duration::from_millis(40),
+                kill: Duration::from_millis(120),
+                drain: Duration::from_millis(20),
+                defer_reap: false,
+            };
+            let start = Instant::now();
+            let result = run(
+                &policy(),
+                &std::env::current_exe().unwrap(),
+                &dummy_args(),
+                Some(&format!("setsid-direct|{}\n", ready.display())),
+                || ready.exists(),
+                timing,
+            );
+            let mut out = match result {
+                Ok(out) => out,
+                // The sandbox may reject the fixture before it can attempt
+                // setsid. That is fail-closed and cannot leave a child behind.
+                Err(SandboxError::NotEnforced(_)) => return,
+                Err(error) => panic!("unexpected setsid fixture result: {error}"),
+            };
+            assert!(ready.exists(), "setsid fixture did not start");
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "setsid fixture hung for {:?}",
+                start.elapsed()
+            );
+            if let Some(mut pending) = out.pending.take() {
+                let id = pending.child_id().expect("owned direct child");
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Some(status) = pending.try_stop_and_reap().unwrap() {
+                        assert_reaped(Some(status), id);
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "setsid child escaped cleanup");
+                    std::thread::sleep(TICK);
+                }
+                assert!(pending.child_id().is_none());
+            } else {
+                assert_eq!(out.end, ControlledEnd::Cancelled, "{out:?}");
+                assert!(out.status.is_some());
+            }
+            assert!(PENDING.lock().unwrap().is_empty());
         }
 
         #[test]

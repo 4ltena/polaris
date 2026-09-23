@@ -22,7 +22,8 @@ pub mod linux;
 pub use confine::{Outcome, run_confined};
 pub use controlled::{
     ControlledEnd, ControlledOutcome, PendingCleanup, run_confined_controlled,
-    run_confined_controlled_authorized, take_pending_cleanups,
+    run_confined_controlled_authorized, run_confined_controlled_in_dir, take_pending_cleanup_for,
+    take_pending_cleanups,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use controlled::{ManagedStdio, ManagedStdioPipes};

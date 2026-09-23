@@ -1,18 +1,15 @@
-//! Copies text to the system clipboard via the OSC 52 terminal escape
-//! sequence — the mechanism codex's own `/copy`/`Ctrl+O` fall back to for
-//! SSH/tmux sessions (see its `clipboard_copy.rs`). polaris uses OSC 52
-//! unconditionally rather than also trying a native clipboard crate first:
-//! it's supported by the terminals this project already tests against
-//! (iTerm2, WezTerm, kitty, Ghostty — with iTerm2 needing "Applications in
-//! terminal may access clipboard" enabled) and needs no new heavy
-//! dependency. A terminal with no OSC 52 support just silently ignores the
-//! sequence — there is no reliable way to detect that from the app side.
+//! Copies text to the system clipboard. macOS uses `/usr/bin/pbcopy`, whose
+//! exit status confirms whether the write reached the pasteboard. Other
+//! terminals use OSC 52 as the portable fallback. Treating a successful tty
+//! write as a successful copy on macOS produced a false confirmation whenever
+//! the terminal ignored OSC 52.
 
 use std::io::Write;
 
 /// Maximum raw bytes base64-encoded into an OSC 52 sequence — matches
 /// codex's own limit, well past anything a single reply's text will hit
 /// while still bounding worst-case escape-sequence size.
+#[cfg(any(not(target_os = "macos"), test))]
 const OSC52_MAX_RAW_BYTES: usize = 100_000;
 
 /// Builds the OSC 52 escape sequence that sets the terminal clipboard to
@@ -20,6 +17,7 @@ const OSC52_MAX_RAW_BYTES: usize = 100_000;
 /// since tmux otherwise swallows the raw sequence instead of forwarding it
 /// to the outer terminal. Errors (instead of silently truncating) when
 /// `text` exceeds `OSC52_MAX_RAW_BYTES`.
+#[cfg(any(not(target_os = "macos"), test))]
 fn osc52_sequence(text: &str, tmux: bool) -> Result<String, String> {
     use base64::Engine;
     let raw_bytes = text.len();
@@ -36,6 +34,7 @@ fn osc52_sequence(text: &str, tmux: bool) -> Result<String, String> {
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn write_osc52_to_writer(mut writer: impl Write, sequence: &str) -> Result<(), String> {
     writer
         .write_all(sequence.as_bytes())
@@ -51,6 +50,49 @@ fn write_osc52_to_writer(mut writer: impl Write, sequence: &str) -> Result<(), S
 /// the next draw. Falls back to stdout only if `/dev/tty` can't be opened
 /// (e.g. it's been redirected away in some unusual invocation).
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        copy_with_pbcopy(text)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        copy_with_osc52(text)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn copy_with_pbcopy(text: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start pbcopy: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "pbcopy stdin was unavailable".to_string())?
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("failed to write pbcopy input: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for pbcopy: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if detail.is_empty() {
+            format!("pbcopy exited with {}", output.status)
+        } else {
+            format!("pbcopy failed: {detail}")
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_with_osc52(text: &str) -> Result<(), String> {
     let tmux = std::env::var_os("TMUX").is_some();
     let sequence = osc52_sequence(text, tmux)?;
     #[cfg(unix)]

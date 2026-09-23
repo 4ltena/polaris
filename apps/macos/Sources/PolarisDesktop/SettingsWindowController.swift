@@ -3,12 +3,13 @@ import SwiftUI
 import PolarisSettings
 
 enum SettingsActionKind: Hashable {
-    case theme, history, workflow, permission, model, localModel, project
+    case theme, history, workflow, permission, model, localModel, project, answerFinalizer
 }
 
 enum SettingsAction {
     case theme(ThemePreference), history(HistoryMode), permission(PermissionPreference?)
     case workflow(String)
+    case answerFinalizer(PresentationLanguagePreference, AnswerFinalizerPreference)
     case model, localModel, project
 
     var kind: SettingsActionKind {
@@ -16,6 +17,7 @@ enum SettingsAction {
         case .theme: .theme
         case .history: .history
         case .workflow: .workflow
+        case .answerFinalizer: .answerFinalizer
         case .permission: .permission
         case .model: .model
         case .localModel: .localModel
@@ -60,6 +62,45 @@ final class SettingsPresentation: ObservableObject {
         guard canPerform(action.kind) else { return }
         onAction?(action)
     }
+
+    func setPresentationLanguage(_ language: PresentationLanguagePreference) {
+        var finalizer = preferences.answerFinalizer
+        if language != .ja { finalizer.translation = TranslationPreference() }
+        perform(.answerFinalizer(language, finalizer))
+    }
+
+    func setFinalizerMode(_ mode: AnswerFinalizerModePreference) {
+        guard mode == .off || mode == .shadow else { return }
+        var finalizer = preferences.answerFinalizer
+        finalizer.mode = mode
+        switch mode {
+        case .off:
+            finalizer.judgeProfile = nil
+            finalizer.externalDisclosure = false
+            finalizer.translation = TranslationPreference()
+        case .shadow:
+            finalizer.judgeProfile = .fulfillmentV1
+            if preferences.presentationLanguage != .ja { finalizer.translation = TranslationPreference() }
+        case .enforce: return
+        }
+        perform(.answerFinalizer(preferences.presentationLanguage, finalizer))
+    }
+
+    func setExternalDisclosure(_ allowed: Bool) {
+        guard preferences.answerFinalizer.mode == .shadow else { return }
+        var finalizer = preferences.answerFinalizer
+        finalizer.externalDisclosure = allowed
+        perform(.answerFinalizer(preferences.presentationLanguage, finalizer))
+    }
+
+    func setTranslationRequested(_ requested: Bool) {
+        guard preferences.presentationLanguage == .ja,
+              preferences.answerFinalizer.mode == .shadow else { return }
+        var finalizer = preferences.answerFinalizer
+        finalizer.translation.activation = requested ? .requested : .disabled
+        finalizer.translation.profile = requested ? .catTranslate3_3b : nil
+        perform(.answerFinalizer(preferences.presentationLanguage, finalizer))
+    }
     func select(_ category: SettingsCategory) {
         self.category = category
         query = ""
@@ -87,7 +128,12 @@ final class SettingsWindowController: NSWindowController {
     required init?(coder: NSCoder) { nil }
 
     func present() {
+        // NSHostingView may apply its fitting width when the window is ordered
+        // front. Keep the controller-owned size so a resized settings window
+        // does not collapse back to its SwiftUI minimum on reopen.
+        let frame = window?.frame
         showWindow(nil)
+        if let frame { window?.setFrame(frame, display: false) }
         window?.makeKeyAndOrderFront(nil)
     }
 }

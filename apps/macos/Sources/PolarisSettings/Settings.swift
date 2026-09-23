@@ -69,6 +69,96 @@ public enum HistoryMode: String, Codable, CaseIterable, Sendable {
     case legacy, strict10
     public var title: String { self == .legacy ? "会話全体をそのまま参照" : "必要な過去だけ参照" }
 }
+/// An explicit answer language. `.unspecified` never falls back to the OS
+/// locale or to language detection from the current prompt.
+public enum PresentationLanguagePreference: String, Codable, CaseIterable, Sendable {
+    case unspecified, ja, en
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        guard value == Self.ja.rawValue || value == Self.en.rawValue,
+              let language = Self(rawValue: value) else { throw SettingsError.invalidDocument }
+        self = language
+    }
+    public func encode(to encoder: Encoder) throws {
+        guard self != .unspecified else { throw SettingsError.invalidDocument }
+        var c = encoder.singleValueContainer()
+        try c.encode(rawValue)
+    }
+}
+public enum AnswerFinalizerModePreference: String, Codable, CaseIterable, Sendable {
+    case off, shadow, enforce
+    public var requiresBenchmarkLock: Bool { self == .enforce }
+}
+public enum AnswerFinalizerJudgeProfilePreference: String, Codable, Sendable {
+    case fulfillmentV1 = "fulfillment-v1"
+}
+/// A named managed profile. There is deliberately no path field: installer
+/// and runtime resolve this identifier to the pinned ~/.polaris/models path.
+public enum TranslationProfilePreference: String, Codable, Sendable {
+    case catTranslate3_3b = "cat-translate-3.3b"
+}
+public enum TranslationActivationPreference: String, Codable, Sendable {
+    case disabled, requested
+}
+public struct TranslationPreference: Codable, Equatable, Sendable {
+    public var activation: TranslationActivationPreference = .disabled
+    public var profile: TranslationProfilePreference? = nil
+    public init() {}
+    private enum CodingKeys: String, CodingKey { case activation, profile }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        activation = try c.decodeIfPresent(TranslationActivationPreference.self,
+                                           forKey: .activation) ?? .disabled
+        profile = try c.decodeIfPresent(TranslationProfilePreference.self, forKey: .profile)
+        try validate()
+    }
+    public func encode(to encoder: Encoder) throws {
+        try validate()
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        if activation != .disabled { try c.encode(activation, forKey: .activation) }
+        try c.encodeIfPresent(profile, forKey: .profile)
+    }
+    public func validate() throws {
+        guard activation != .requested || profile != nil else { throw SettingsError.invalidDocument }
+    }
+}
+public struct AnswerFinalizerPreference: Codable, Equatable, Sendable {
+    public var mode: AnswerFinalizerModePreference = .off
+    public var judgeProfile: AnswerFinalizerJudgeProfilePreference? = nil
+    /// Explicit user consent for the shadow judge to send its bounded evaluation
+    /// payload to the configured external Jev endpoint. It is never implied by
+    /// selecting shadow mode.
+    public var externalDisclosure = false
+    public var translation = TranslationPreference()
+    public init() {}
+    private enum CodingKeys: String, CodingKey { case mode, judgeProfile, externalDisclosure, translation }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try c.decodeIfPresent(AnswerFinalizerModePreference.self, forKey: .mode) ?? .off
+        judgeProfile = try c.decodeIfPresent(AnswerFinalizerJudgeProfilePreference.self,
+                                             forKey: .judgeProfile)
+        externalDisclosure = try c.decodeIfPresent(Bool.self, forKey: .externalDisclosure) ?? false
+        translation = try c.decodeIfPresent(TranslationPreference.self,
+                                            forKey: .translation) ?? TranslationPreference()
+        try validate()
+    }
+    public func encode(to encoder: Encoder) throws {
+        try validate()
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        if mode != .off { try c.encode(mode, forKey: .mode) }
+        try c.encodeIfPresent(judgeProfile, forKey: .judgeProfile)
+        if externalDisclosure { try c.encode(true, forKey: .externalDisclosure) }
+        if translation != TranslationPreference() {
+            try c.encode(translation, forKey: .translation)
+        }
+    }
+    public var requiresBenchmarkLock: Bool { mode.requiresBenchmarkLock }
+    public func validate() throws {
+        guard mode == .off || judgeProfile != nil else { throw SettingsError.invalidDocument }
+        guard !externalDisclosure || mode == .shadow else { throw SettingsError.invalidDocument }
+        try translation.validate()
+    }
+}
 // 希望する段階だけを保存する。実権限・編集可否・OS許可はこの型から導出しない。
 public enum PermissionPreference: String, Codable, CaseIterable, Sendable {
     case readOnly, readCreate, readCreateBuild, readCreateBuildExternal
@@ -90,12 +180,15 @@ public struct Preferences: Codable, Equatable, Sendable {
     public var executionBinding: ExecutionBinding? = nil
     public var historyMode: HistoryMode = .legacy
     public var localConnection: LocalConnectionPreference? = nil
+    public var presentationLanguage: PresentationLanguagePreference = .unspecified
+    public var answerFinalizer = AnswerFinalizerPreference()
     /// Uses the optional typed decision service. Its credential is kept in
     /// Keychain and is never encoded with these shareable settings.
     public var jevEnabled: Bool = false
     public init() {}
     private enum CodingKeys: String, CodingKey {
         case gpt, local, projectPath, permission, theme, executionBinding, historyMode, localConnection, jevEnabled
+        case presentationLanguage, answerFinalizer
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -108,8 +201,14 @@ public struct Preferences: Codable, Equatable, Sendable {
         historyMode = try c.decodeIfPresent(HistoryMode.self, forKey: .historyMode) ?? .legacy
         localConnection = try c.decodeIfPresent(LocalConnectionPreference.self, forKey: .localConnection)
         jevEnabled = try c.decodeIfPresent(Bool.self, forKey: .jevEnabled) ?? false
+        presentationLanguage = try c.decodeIfPresent(PresentationLanguagePreference.self,
+                                                     forKey: .presentationLanguage) ?? .unspecified
+        answerFinalizer = try c.decodeIfPresent(AnswerFinalizerPreference.self,
+                                                forKey: .answerFinalizer) ?? AnswerFinalizerPreference()
+        try answerFinalizer.validate()
     }
     public func encode(to encoder: Encoder) throws {
+        try answerFinalizer.validate()
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(gpt, forKey: .gpt); try c.encode(local, forKey: .local)
         try c.encodeIfPresent(projectPath, forKey: .projectPath); try c.encodeIfPresent(permission, forKey: .permission)
@@ -117,6 +216,12 @@ public struct Preferences: Codable, Equatable, Sendable {
         try c.encodeIfPresent(localConnection, forKey: .localConnection)
         if historyMode != .legacy { try c.encode(historyMode, forKey: .historyMode) }
         if jevEnabled { try c.encode(jevEnabled, forKey: .jevEnabled) }
+        if presentationLanguage != .unspecified {
+            try c.encode(presentationLanguage, forKey: .presentationLanguage)
+        }
+        if answerFinalizer != AnswerFinalizerPreference() {
+            try c.encode(answerFinalizer, forKey: .answerFinalizer)
+        }
     }
 }
 public enum WelcomePage: Int, Codable, CaseIterable, Sendable {
@@ -195,6 +300,7 @@ public struct SettingsDocument: Codable, Equatable, Sendable {
         for value in [draft.preferences, preferences].compactMap({ $0 }) {
             try value.executionBinding?.validate()
             try value.localConnection?.validate()
+            try value.answerFinalizer.validate()
             guard value.local != .later || value.localConnection == nil else {
                 throw SettingsError.invalidDocument
             }

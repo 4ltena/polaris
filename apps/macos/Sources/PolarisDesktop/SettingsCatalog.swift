@@ -45,7 +45,7 @@ enum SettingsDelivery {
 }
 
 enum SettingsControl {
-    case information, theme, history, workflow, permission, model, localModel, project
+    case information, theme, history, workflow, permission, model, localModel, project, answerFinalizer
 }
 
 struct SettingsItem: Identifiable {
@@ -62,6 +62,7 @@ enum SettingsCatalog {
     // 実装状況の案内。実接続・認証・許可を示す値として使用しない。
     static let items: [SettingsItem] = [
         .init(id: "general.version", category: .general, title: "polarisについて", detail: "このアプリのバージョン。", delivery: .existing),
+        .init(id: "general.answer-finalizer", category: .general, title: "回答の表示と言語確認", detail: "表示言語と回答確認を、個人用設定として保存します。変更後はサービスの再起動が必要です。明示的なユーザー設定はこの管理設定より優先し、プロジェクト設定では変更できません。", delivery: .existing, control: .answerFinalizer, keywords: "回答 finalizer shadow 日本語 英語 翻訳 CAT 再起動"),
         .init(id: "general.documentation", category: .general, title: "ドキュメント", detail: "次回公開の直前に、日本語・英語・繁体中国語の資料を整理します。アプリの表示言語とは別の計画です。", delivery: .planned, keywords: "readme changelog docs 翻訳"),
         .init(id: "appearance.theme", category: .appearance, title: "テーマ", detail: "システムに合わせるか、ライト・ダークを選びます。", delivery: .existing, control: .theme),
         .init(id: "appearance.layout", category: .appearance, title: "パネルの配置", detail: "作業画面の境界をドラッグして調整できます。「配置を戻す」で初期配置に戻ります。", delivery: .existing, keywords: "サイドバー チャット 幅 レイアウト"),

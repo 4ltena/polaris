@@ -75,7 +75,7 @@ private actor ServiceDemoFixture: ServiceDemoTransport {
     }
     let payload: ServiceValue
     switch request {
-        case .workspaceRead, .attachmentRead, .localModels, .configureRoles, .sourceApplyList, .sourceApplyPage, .sourceApplyResolve, .runDetails, .browseList, .browseRead, .mcpRegistryRead, .mcpRegistrySave, .mcpCatalogCheck, .mcpCatalogCancel, .mcpSetupDetect, .mcpSetupRegister: throw ServiceError.notReady
+        case .workspaceRead, .attachmentRead, .localModels, .configureRoles, .sourceApplyList, .sourceApplyPage, .sourceApplyResolve, .runDetails, .browseList, .browseRead, .mcpRegistryRead, .mcpRegistrySave, .mcpCatalogCheck, .mcpCatalogCancel, .mcpSetupDetect, .mcpSetupRegister, .sessionList, .sessionSelect, .inputSubmit, .inputStatus, .inputCancel, .subagentWait, .subagentCancel: throw ServiceError.notReady
     case .configure, .workflowConfigure: throw ServiceError.notReady
     case .approval: throw ServiceError.notReady
     case .snapshot, .subscribe: payload = snapshot

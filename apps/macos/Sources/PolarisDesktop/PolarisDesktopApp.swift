@@ -90,6 +90,7 @@ final class DesktopDelegate: NSObject, NSApplicationDelegate {
     private var serviceDemo: ServiceDemoWindowController?
     private var settingsWindow: SettingsWindowController?
     private var terminationPending = false
+    private var managedPreferencesStore: ManagedPreferencesStore?
 
     func openServiceDemo() {
         if serviceDemo == nil { serviceDemo = ServiceDemoWindowController() }
@@ -147,6 +148,28 @@ final class DesktopDelegate: NSObject, NSApplicationDelegate {
                 self.refreshSettings(model, error: Self.workflowMode(service.workflowStatus) == requested
                     ? nil : "作業内容に合わせた情報の使い方を保存できませんでした。")
             }
+        case .answerFinalizer(let language, let finalizer):
+            let requested: ManagedPreferences
+            do { requested = try ManagedPreferences(language: language, finalizer: finalizer) }
+            catch {
+                presentation.error = "回答の表示設定の組合せを確認してください。"
+                return
+            }
+            do {
+                let store = try managedPreferences()
+                let previous = try store.load()
+                try store.save(requested)
+                guard model.updateAnswerFinalizerPreferences(language: language, finalizer: finalizer) else {
+                    // The visible document is still authoritative for this UI. Restore
+                    // the private service file if its companion write did not commit.
+                    try store.save(previous)
+                    presentation.error = model.saveError ?? "回答の表示設定を保存できませんでした。"
+                    return
+                }
+                refreshSettings(model)
+            } catch {
+                presentation.error = "回答の表示設定を保存できませんでした。"
+            }
         default:
             presentation.error = "この設定は現在の画面から変更できません。"
         }
@@ -156,9 +179,17 @@ final class DesktopDelegate: NSObject, NSApplicationDelegate {
         guard let presentation = settingsWindow?.presentation else { return }
         presentation.preferences = model.document.preferences ?? model.document.draft.preferences
         presentation.workflowMode = Self.workflowMode(model.workspace.service?.workflowStatus)
-        presentation.availableActions = model.workspace.service == nil ? [] : [.history, .workflow]
+        let serviceActions: Set<SettingsActionKind> = model.workspace.service == nil ? [] : [.history, .workflow]
+        presentation.availableActions = serviceActions.union([.answerFinalizer])
         presentation.isApplying = false
         presentation.error = error
+    }
+
+    private func managedPreferences() throws -> ManagedPreferencesStore {
+        if let managedPreferencesStore { return managedPreferencesStore }
+        let store = try ManagedPreferencesStore()
+        managedPreferencesStore = store
+        return store
     }
 
     private static func workflowMode(

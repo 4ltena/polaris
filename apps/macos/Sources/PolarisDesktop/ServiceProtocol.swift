@@ -7,6 +7,14 @@ enum ServiceRequest: Sendable {
   case attachmentRead(session: String, path: String)
   case snapshot(session: String)
   case subscribe(session: String)
+  case sessionList
+  case sessionSelect(session: String)
+  case inputSubmit(session: String, managerRevision: UInt64, sessionRevision: UInt64, goalRevision: UInt64,
+                   route: String, text: String?, attachments: [String], reference: String?, admission: String?)
+  case inputStatus(session: String, admission: String)
+  case inputCancel(session: String, managerRevision: UInt64, admission: String)
+  case subagentWait(session: String, rootRun: String, rootAttempt: String, revision: UInt64, afterCursor: UInt64?)
+  case subagentCancel(session: String, rootRun: String, rootAttempt: String, logicalChild: String, childAttempt: String, revision: UInt64)
   case configure(session: String, revision: UInt64, selection: ExecutionBinding, historyMode: HistoryMode)
   case workflowConfigure(session: String, revision: UInt64, enabled: Bool, mode: String, initialPhase: String)
   case localModels(session: String, provider: ExecutionBinding.Provider, endpoint: String)
@@ -46,6 +54,13 @@ enum ServiceRequest: Sendable {
     case .attachmentRead: "attachment.read"
     case .snapshot: "session.snapshot"
     case .subscribe: "session.subscribe"
+    case .sessionList: "session.list"
+    case .sessionSelect: "session.select"
+    case .inputSubmit: "input.submit"
+    case .inputStatus: "input.status"
+    case .inputCancel: "input.cancel"
+    case .subagentWait: "subagent.wait"
+    case .subagentCancel: "subagent.cancel"
     case .configure: "session.configure"
     case .workflowConfigure: "workflow.configure"
     case .localModels: "local.models"
@@ -74,6 +89,12 @@ enum ServiceRequest: Sendable {
     case .workspaceRead: "workspace_read"
     case .attachmentRead: "attachment_read"
     case .snapshot, .subscribe: "session_read"
+    case .sessionList: "session_list"
+    case .sessionSelect: "session_manage"
+    case .inputSubmit: "input_submit"
+    case .inputStatus: "input_status"
+    case .inputCancel: "input_cancel"
+    case .subagentWait, .subagentCancel: "subagent_control"
     case .configure: "session_configure"
     case .workflowConfigure: "workflow_configure"
     case .localModels: "local_models"
@@ -102,6 +123,46 @@ enum ServiceRequest: Sendable {
       guard path.hasPrefix("/"), !path.contains("\0"), path.utf8.count <= 4096 else { throw ServiceError.schema }
       session = s; params = ["path": .string(path)]
     case .snapshot(let s), .subscribe(let s): session = s
+    case .sessionList:
+      break
+    case .sessionSelect(let target):
+      try ServiceSchema.id.check(.string(target)); session = target
+    case .inputSubmit(let s, let managerRevision, let sessionRevision, let goalRevision, let route, let text, let attachments, let reference, let admission):
+      guard ["current", "new", "auto"].contains(route), (text == nil) != (reference == nil), attachments.count <= 16 else { throw ServiceError.schema }
+      session = s
+      params = ["expected_manager_revision": .string(String(managerRevision)),
+                "expected_session_revision": .string(String(sessionRevision)),
+                "expected_goal_revision": .string(String(goalRevision)), "route": .string(route)]
+      if let admission { try ServiceSchema.id.check(.string(admission)); params["admission_id"] = .string(admission) }
+      if let text {
+        guard !text.isEmpty, text.utf8.count <= 32_768 else { throw ServiceError.capacity }
+        let attachmentValues = try attachments.map { attachment -> ServiceValue in
+          try ServiceSchema.id.check(.string(attachment)); return .string(attachment)
+        }
+        params["kind"] = .string("text"); params["text"] = .string(text); params["attachment_ids"] = .array(attachmentValues)
+      } else if let reference {
+        guard attachments.isEmpty else { throw ServiceError.schema }
+        try ServiceSchema.id.check(.string(reference))
+        params["kind"] = .string("reference"); params["input_ref"] = .string(reference)
+      }
+    case .inputStatus(let s, let admission):
+      try ServiceSchema.id.check(.string(admission))
+      session = s; params = ["admission_id": .string(admission)]
+    case .inputCancel(let s, let managerRevision, let admission):
+      try ServiceSchema.id.check(.string(admission))
+      session = s; params = ["expected_manager_revision": .string(String(managerRevision)), "admission_id": .string(admission)]
+    case .subagentWait(let s, let rootRun, let rootAttempt, let revision, let afterCursor):
+      for value in [rootRun, rootAttempt] { try ServiceSchema.id.check(.string(value)) }
+      session = s
+      params = ["root_run_id": .string(rootRun), "root_attempt_id": .string(rootAttempt),
+                "expected_revision": .string(String(revision))]
+      if let afterCursor { params["after_cursor"] = .string(String(afterCursor)) }
+    case .subagentCancel(let s, let rootRun, let rootAttempt, let logicalChild, let childAttempt, let revision):
+      for value in [rootRun, rootAttempt, logicalChild, childAttempt] { try ServiceSchema.id.check(.string(value)) }
+      session = s
+      params = ["root_run_id": .string(rootRun), "root_attempt_id": .string(rootAttempt),
+                "logical_child_id": .string(logicalChild), "child_attempt_id": .string(childAttempt),
+                "expected_revision": .string(String(revision))]
     case .configure(let s, let revision, let selection, let historyMode):
       try selection.validate()
       session = s
@@ -216,7 +277,7 @@ enum ServiceRequest: Sendable {
     try ServiceSchema.id.check(.string(clientID))
     try ServiceSchema.id.check(.string(requestID))
     return [
-      "protocol_version": .number("1"), "kind": .string("request"), "client_id": .string(clientID),
+      "protocol_version": .number("2"), "kind": .string("request"), "client_id": .string(clientID),
       "request_id": .string(requestID), "method": .string(method), "params": .object(params),
     ]
   }
@@ -231,7 +292,7 @@ struct ServiceHello: Sendable, Equatable {
 
   init(_ payload: ServiceValue) throws {
     try ServiceSchema.hello.check(payload)
-    guard payload["protocol_version"] == .number("1") else { throw ServiceError.version }
+    guard ServiceSchema.supportedProtocolVersion(payload["protocol_version"]) else { throw ServiceError.version }
     epoch = payload["engine_epoch"]!.string!
     guard case .array(let capabilities) = payload["capabilities"] else { throw ServiceError.schema }
     self.capabilities = Set(capabilities.compactMap(\.string))
@@ -259,9 +320,10 @@ struct ServiceReply: Sendable, Equatable {
 /// Closed schemas for P5's requests and all P1 state events. Unknown state means
 /// resync/connection failure, never silently dropping an unrecognised update.
 indirect enum ServiceSchema: Sendable {
-  case text, id, decimal, uint32Number, version, bool
+  case text, boundedText(Int), hash, id, decimal, decimalAtMost(UInt64), uint32Number, version, bool
   case oneOf(Set<String>)
   case array(ServiceSchema)
+  case boundedArray(ServiceSchema, Int)
   case object([String: ServiceSchema])
   case optionalFields([String: ServiceSchema], [String: ServiceSchema])
   case alternatives([ServiceSchema])
@@ -271,14 +333,21 @@ indirect enum ServiceSchema: Sendable {
   func check(_ value: ServiceValue) throws {
     switch (self, value) {
     case (.text, .string): break
+    case (.boundedText(let maximum), .string(let value)) where !value.isEmpty && value.utf8.count <= maximum: break
+    case (.hash, .string(let value)) where value.utf8.count == 64 && value.utf8.allSatisfy({
+      (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+    }): break
     case (.id, .string(let s)) where !s.isEmpty && s.utf8.count <= 128: break
     case (.decimal, _) where value.decimal != nil: break
+    case (.decimalAtMost(let maximum), _) where value.decimal.map({ $0 <= maximum }) == true: break
     case (.uint32Number, .number(let number)) where Self.isCanonicalUInt(number, maximum: UInt64(UInt32.max)): break
-    case (.version, .number("1")): break
+    case (.version, .number("1")), (.version, .number("2")): break
     case (.bool, .bool): break
     case (.anyObject, .object): break
     case (.oneOf(let choices), .string(let s)) where choices.contains(s): break
     case (.array(let schema), .array(let items)): for item in items { try schema.check(item) }
+    case (.boundedArray(let schema, let maximum), .array(let items)) where items.count <= maximum:
+      for item in items { try schema.check(item) }
     case (.object(let fields), .object(let object)) where Set(fields.keys) == Set(object.keys):
       for (key, schema) in fields { try schema.check(object[key]!) }
     case (.optionalFields(let required, let optional), .object(let object)):
@@ -298,10 +367,13 @@ indirect enum ServiceSchema: Sendable {
     else { return false }
     return parsed <= maximum
   }
+  static func supportedProtocolVersion(_ value: ServiceValue?) -> Bool {
+    value == .number("1") || value == .number("2")
+  }
   static let capabilities: Set<String> = [
-    "workspace_read", "attachment_read", "session_read", "history_read", "draft_update", "session_configure", "workflow_configure", "role_configure", "run_start", "run_cancel", "local_models",
+    "workspace_read", "attachment_read", "session_read", "session_list", "session_manage", "input_submit", "input_status", "input_cancel", "history_read", "draft_update", "session_configure", "workflow_configure", "role_configure", "run_start", "run_cancel", "local_models",
     "approval_resolve", "request_status", "shutdown", "source_apply_read", "source_apply_resolve", "mcp_settings",
-    "run_details_read", "home_browse",
+    "run_details_read", "home_browse", "subagent_control",
   ]
   static let hello: Self = .object([
     "protocol_version": .version, "engine_epoch": .id, "capabilities": .array(.oneOf(capabilities)),
@@ -324,6 +396,77 @@ indirect enum ServiceSchema: Sendable {
     "phase": .oneOf(["general", "brainstorm", "specify", "implement", "review", "verify", "deliver"]),
     "revision": .decimal,
   ])
+  static let artifactRefV2: Self = .object(["artifact_id": .id, "content_hash": .hash])
+  static let acceptanceV2: Self = .object([
+    "criterion_id": .id, "state": .oneOf(["pending", "passed", "failed", "stale", "unavailable"]),
+    "evidence_count": .decimalAtMost(64),
+  ])
+  static let evidenceV2: Self = .object([
+    "passed": .decimalAtMost(64), "failed": .decimalAtMost(64), "stale": .decimalAtMost(64), "unavailable": .decimalAtMost(64),
+  ])
+  static let convergenceV2: Self = .object([
+    "state": .oneOf(["unavailable", "pending", "blocked", "allowed"]),
+    "required_criteria": .decimalAtMost(64), "unresolved_gaps": .decimalAtMost(64),
+  ])
+  static let workflowV2: Self = .optionalFields([
+    "phase": .oneOf(["general", "brainstorm", "specify", "implement", "review", "verify", "deliver"]),
+    "step": .oneOf(["idle", "context", "planning", "executing", "reviewing", "converging", "blocked", "complete"]),
+    "acceptance": .boundedArray(acceptanceV2, 64), "evidence": evidenceV2, "convergence": convergenceV2,
+  ], ["active_feature": artifactRefV2, "active_plan": artifactRefV2, "active_task": artifactRefV2])
+  static let sessionManagerV2: Self = .object([
+    "manager_revision": .decimal, "session_count": .decimalAtMost(2), "session_total": .decimalAtMost(2),
+    "session_omitted": .bool,
+    "sessions": .boundedArray(.optionalFields([
+      "session_id": .id, "kind": .oneOf(["current", "sidechat"]),
+      "state": .oneOf(["idle", "queued", "running", "closed"]),
+    ], ["source_session_id": .id]), 2),
+    "sidechat": .oneOf(["none", "active", "full"]), "queued_admissions": .decimalAtMost(32), "active_runs": .decimalAtMost(2),
+  ])
+  static let subagentAttemptV2: Self = .optionalFields([
+    "root_run_id": .id, "root_attempt_id": .id, "control_revision": .decimal,
+    "logical_child_id": .id, "attempt_id": .id, "display_name": .boundedText(512), "role": .boundedText(512),
+    "state": .oneOf(["queued", "running", "waiting", "cancelling", "succeeded", "failed", "cancelled", "outcome_unknown"]),
+  ], ["activity": .boundedText(512)])
+  static let mcpLeaseV2: Self = .object([
+    "lease_id": .id, "server_id": .id, "holder_run_id": .id, "holder_attempt_id": .id,
+    "state": .oneOf(["reserved", "active", "releasing", "released", "expired", "outcome_unknown"]),
+    "expires_at_unix_ms": .decimal,
+  ])
+  static let commonRunnerV2: Self = .optionalFields([
+    "state": .oneOf(["unavailable", "idle", "preparing", "running", "completed", "failed", "cleanup_pending", "outcome_unknown"]),
+    "completed_cases": .decimalAtMost(32), "failed_cases": .decimalAtMost(32), "cleanup_pending": .bool,
+  ], ["case_id": .id])
+  static let clarificationOptionV2: Self = .object(["option_id": .id, "label": .boundedText(512)])
+  static let clarificationV2: Self = .object([
+    "state": .oneOf(["unavailable", "none", "pending", "resolved"]),
+    "questions": .boundedArray(.object([
+      "question_id": .id, "text": .boundedText(4096), "options": .boundedArray(clarificationOptionV2, 16),
+      "free_text": .object(["allowed": .bool, "required": .bool, "max_bytes": .decimal]), "answered": .bool,
+    ]), 3), "unanswered_count": .decimalAtMost(3),
+  ])
+  static let orchestration: Self = .object([
+    "workflow": workflowV2, "session_manager": sessionManagerV2,
+    "subagents": .boundedArray(subagentAttemptV2, 32), "subagent_total": .decimal,
+    "subagent_omitted": .bool, "mcp_leases": .boundedArray(mcpLeaseV2, 32),
+    "mcp_lease_total": .decimal, "mcp_lease_omitted": .bool,
+    "common_runner": commonRunnerV2, "clarification": clarificationV2,
+  ])
+  static let inputSubmit: Self = .alternatives([
+    .optionalFields([
+      "expected_manager_revision": .decimal, "expected_session_revision": .decimal, "expected_goal_revision": .decimal,
+      "route": .oneOf(["current", "new", "auto"]), "kind": .oneOf(["text"]), "text": .boundedText(32_768),
+      "attachment_ids": .boundedArray(.id, 16),
+    ], ["admission_id": .id]),
+    .optionalFields([
+      "expected_manager_revision": .decimal, "expected_session_revision": .decimal, "expected_goal_revision": .decimal,
+      "route": .oneOf(["current", "new", "auto"]), "kind": .oneOf(["reference"]), "input_ref": .id,
+    ], ["admission_id": .id]),
+  ])
+  static let inputStatus: Self = .object(["admission_id": .id])
+  static let sessionListEntry: Self = .optionalFields([
+    "session_id": .id, "kind": .oneOf(["current", "sidechat"]),
+    "session_revision": .decimal, "goal_revision": .decimal,
+  ], ["source_session_id": .id, "active_run": .object(["run_id": .id, "attempt_id": .id])])
   static let memoryUsage: Self = .object([
     "input_tokens": .decimal, "output_tokens": .decimal, "cached_tokens": .decimal,
     "reported_responses": .decimal, "missing_responses": .decimal, "failed_requests": .decimal,
@@ -425,7 +568,7 @@ indirect enum ServiceSchema: Sendable {
     "runs": .array(run),
     "children": .array(child), "child_attempt_count": .decimal,
     "unresolved_approvals": .array(approval),
-  ], ["memory": memory, "workflow": workflow])
+  ], ["memory": memory, "workflow": workflow, "orchestration": orchestration])
   static func result(_ type: String) throws -> Self {
     switch type {
     case "workspace.read": .object([
@@ -440,7 +583,35 @@ indirect enum ServiceSchema: Sendable {
     ])
     case "attachment.read": .optionalFields(["state": .oneOf(["ready", "unavailable"])], ["name": .text, "text": .text, "reason": .text])
     case "hello": hello
-    case "session.snapshot", "session.subscribe": snapshot
+    case "session.list": .object(["manager_revision": .decimal, "session_total": .decimalAtMost(2), "session_omitted": .bool, "sessions": .boundedArray(sessionListEntry, 2)])
+    case "session.select", "session.snapshot", "session.subscribe": snapshot
+    case "input.submit": .optionalFields([
+      "manager_revision": .decimal, "session_revision": .decimal, "admission_id": .id, "input_hash": .hash,
+      "route": .oneOf(["current", "new", "auto"]),
+      "state": .oneOf(["reserved", "classifying", "decided", "destination_ready", "input_appended", "run_queued", "queued", "running", "completed", "failed", "cancelled", "outcome_unknown"]),
+    ], ["route_reason": .oneOf(["explicit_current", "explicit_new", "same_context", "distinct_context", "ambiguous", "classifier_unavailable", "classifier_invalid", "cancelled", "approval_reply", "context_changed", "crash_recovery"]), "destination_session_id": .id, "run": .object(["run_id": .id, "attempt_id": .id])])
+    case "input.status": .optionalFields([
+      "manager_revision": .decimal, "admission_id": .id, "source_session_id": .id, "session_revision": .decimal,
+      "route": .oneOf(["current", "new", "auto"]),
+      "state": .oneOf(["reserved", "classifying", "decided", "destination_ready", "input_appended", "run_queued", "queued", "running", "completed", "failed", "cancelled", "outcome_unknown"]),
+    ], ["route_reason": .oneOf(["explicit_current", "explicit_new", "same_context", "distinct_context", "ambiguous", "classifier_unavailable", "classifier_invalid", "cancelled", "approval_reply", "context_changed", "crash_recovery"]), "destination_session_id": .id, "run": .object(["run_id": .id, "attempt_id": .id])])
+    case "input.cancel": .optionalFields([
+      "manager_revision": .decimal, "session_revision": .decimal, "admission_id": .id, "input_hash": .hash,
+      "route": .oneOf(["current", "new", "auto"]),
+      "state": .oneOf(["reserved", "classifying", "decided", "destination_ready", "input_appended", "run_queued", "queued", "running", "completed", "failed", "cancelled", "outcome_unknown"]),
+    ], ["route_reason": .oneOf(["explicit_current", "explicit_new", "same_context", "distinct_context", "ambiguous", "classifier_unavailable", "classifier_invalid", "cancelled", "approval_reply", "context_changed", "crash_recovery"]), "destination_session_id": .id, "run": .object(["run_id": .id, "attempt_id": .id])])
+    case "subagent.wait": .object([
+      "root_run_id": .id, "root_attempt_id": .id, "revision": .decimal, "cursor": .decimal,
+      "state": .oneOf(["unchanged", "updated"]), "child_total": .decimal,
+      "child_omitted": .bool, "children": .boundedArray(subagentAttemptV2, 32),
+    ])
+    case "subagent.cancel": .object([
+      "root_run_id": .id, "root_attempt_id": .id, "logical_child_id": .id, "child_attempt_id": .id,
+      "revision": .decimal, "cursor": .decimal,
+      "disposition": .oneOf(["requested", "already_requested", "already_terminal"]),
+      "state": .oneOf(["queued", "running", "waiting", "cancelling", "succeeded", "failed", "cancelled", "outcome_unknown"]),
+      "runtime_effect": .oneOf(["unavailable", "requested", "outcome_unknown"]),
+    ])
     case "history.page": ServiceHistoryPage.schema
     case "run.details": ServiceRunDetailsPage.schema
     case "mcp.registry.read", "mcp.registry.save", "mcp.setup.register": .object([
@@ -515,6 +686,7 @@ indirect enum ServiceSchema: Sendable {
     case "draft.updated": draft
     case "configuration.updated": configuration
     case "memory.updated": memory
+    case "orchestration.updated": orchestration
     case "role_bindings.updated": .object([
       "configuration_revision": .decimal, "bindings": .array(roleBinding),
     ])
@@ -532,7 +704,7 @@ indirect enum ServiceSchema: Sendable {
   static func response(_ value: ServiceValue, clientID: String, method: String) throws
     -> ServiceReply
   {
-    guard value["protocol_version"] == .number("1") else { throw ServiceError.version }
+    guard supportedProtocolVersion(value["protocol_version"]) else { throw ServiceError.version }
     guard value["client_id"]?.matchesID(clientID) == true else { throw ServiceError.correlation }
     let base: [String: Self] = [
       "protocol_version": .version, "kind": .oneOf(["response"]), "client_id": .id,
@@ -558,7 +730,7 @@ indirect enum ServiceSchema: Sendable {
       rejection: nil)
   }
   static func validateEvent(_ value: ServiceValue, epoch: String) throws {
-    guard value["protocol_version"] == .number("1") else { throw ServiceError.version }
+    guard supportedProtocolVersion(value["protocol_version"]) else { throw ServiceError.version }
     guard value["engine_epoch"]?.matchesID(epoch) == true, let type = value["type"]?.string else {
       throw ServiceError.schema
     }

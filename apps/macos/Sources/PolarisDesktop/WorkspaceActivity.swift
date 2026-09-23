@@ -17,7 +17,8 @@ struct WorkspaceActivityView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text("現在の作業").font(.headline)
-                Text(activity.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(activity.orchestration.map(workflowTitle) ?? activity.status)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Spacer(minLength: 0)
             }
             HStack(spacing: 7) {
@@ -26,11 +27,12 @@ struct WorkspaceActivityView: View {
                 Button("一覧") { tasksOpen.toggle() }.focused($focused, equals: "tasks")
                     .popover(isPresented: $tasksOpen, arrowEdge: .top) { taskPopover }
             }
-            HStack {
-                Text("\(activity.completedCount) / \(activity.tasks.count) 完了")
-                Spacer()
-                Text("残り \(activity.tasks.count - activity.completedCount) 件")
-            }.font(.caption).foregroundStyle(.secondary)
+            if let orchestration = activity.orchestration {
+                orchestrationSummary(orchestration)
+            } else {
+                Text("v1 service: 作業段階の詳細は未提供です。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             WorkspaceTaskStrip(tasks: activity.tasks, inspectedTaskID: $inspectedTaskID)
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
@@ -46,7 +48,7 @@ struct WorkspaceActivityView: View {
                     Divider().padding(.vertical, 2)
                     HStack(spacing: 7) {
                         Text("Subagents").font(.caption.weight(.medium))
-                        Text("\(activeAgents.count)稼働中 / \(activity.agents.count)累計")
+                        Text(agentSummary)
                             .font(.caption2).foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                         Button("全て表示") { agentsOpen.toggle() }
@@ -93,6 +95,31 @@ struct WorkspaceActivityView: View {
         .onChange(of: activity.conversationID) { _ in
             tasksOpen = false; agentsOpen = false; historyOpen = false
             inspectedTaskID = nil; expandedTaskID = nil
+        }
+    }
+    @ViewBuilder private func orchestrationSummary(_ orchestration: WorkspaceOrchestration) -> some View {
+        HStack(spacing: 8) {
+            Text("収束: \(convergenceTitle(orchestration.workflow.convergence.state))")
+            Text("証拠: 合格\(orchestration.workflow.evidence.passed) / 失敗\(orchestration.workflow.evidence.failed) / 要確認\(orchestration.workflow.evidence.stale + orchestration.workflow.evidence.unavailable)")
+        }.font(.caption).foregroundStyle(.secondary)
+        if let runner = orchestration.commonRunner {
+            Text("共通試験: \(runner.state.rawValue) · 完了\(runner.completedCases) · 失敗\(runner.failedCases)")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+    private var agentSummary: String {
+        guard let orchestration = activity.orchestration else { return "保存済み状態を表示" }
+        return "\(orchestration.subagents.filter { [.queued, .running, .waiting, .cancelling].contains($0.state) }.count)稼働中 / 記録\(orchestration.subagentTotal)"
+    }
+    private func workflowTitle(_ orchestration: WorkspaceOrchestration) -> String {
+        "\(orchestration.workflow.phase) · \(orchestration.workflow.step)"
+    }
+    private func convergenceTitle(_ state: WorkspaceConvergenceState) -> String {
+        switch state {
+        case .unavailable: "未取得"
+        case .pending: "確認中"
+        case .blocked: "停止中"
+        case .allowed: "許可済み"
         }
     }
     private var taskPopover: some View {

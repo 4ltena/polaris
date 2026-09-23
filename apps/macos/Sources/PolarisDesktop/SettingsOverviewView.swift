@@ -153,6 +153,34 @@ struct SettingsOverviewView: View {
             Text(presentation.preferences.projectPath ?? "フォルダは未選択です")
                 .font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             action("フォルダを選択", .project)
+        case .answerFinalizer:
+            Picker("回答の表示言語", selection: Binding(
+                get: { presentation.preferences.presentationLanguage },
+                set: { presentation.setPresentationLanguage($0) })) {
+                Text("指定しない").tag(PresentationLanguagePreference.unspecified)
+                Text("日本語").tag(PresentationLanguagePreference.ja)
+                Text("English").tag(PresentationLanguagePreference.en)
+            }.labelsHidden().disabled(!presentation.canPerform(.answerFinalizer))
+            Picker("回答確認", selection: Binding(
+                get: { presentation.preferences.answerFinalizer.mode == .shadow ? AnswerFinalizerModePreference.shadow : .off },
+                set: { presentation.setFinalizerMode($0) })) {
+                Text("オフ").tag(AnswerFinalizerModePreference.off)
+                Text("Shadow").tag(AnswerFinalizerModePreference.shadow)
+            }.labelsHidden().disabled(!presentation.canPerform(.answerFinalizer))
+            Toggle("直前prompt・回答・必要なtool evidenceを、設定済みの外部Jevへ評価用に送る", isOn: Binding(
+                get: { presentation.preferences.answerFinalizer.externalDisclosure },
+                set: { presentation.setExternalDisclosure($0) }))
+                .disabled(!presentation.canPerform(.answerFinalizer)
+                    || presentation.preferences.answerFinalizer.mode != .shadow)
+            Toggle("CAT-Translateで英語回答を日本語へ翻訳", isOn: Binding(
+                get: { presentation.preferences.presentationLanguage == .ja && presentation.preferences.answerFinalizer.mode == .shadow && presentation.preferences.answerFinalizer.translation.activation == .requested },
+                set: { presentation.setTranslationRequested($0) }))
+                .disabled(!presentation.canPerform(.answerFinalizer)
+                    || presentation.preferences.presentationLanguage != .ja
+                    || presentation.preferences.answerFinalizer.mode != .shadow)
+            Text("変更は次回のサービス起動から反映されます。Shadowは配信内容を変更しません。")
+                .font(.caption).foregroundStyle(.secondary)
+            unavailable(.answerFinalizer)
         case .information:
             if item.id == "general.version" {
                 Text(presentation.releaseTitle ?? "バージョン情報は未取得です").textSelection(.enabled)

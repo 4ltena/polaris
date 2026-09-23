@@ -49,7 +49,48 @@ final class SettingsTests: XCTestCase {
 
     func testLegacyPreferencesDecodeWithoutInventingLocalConnection() throws {
         let data = Data(#"{"gpt":"later","local":"later","theme":"system"}"#.utf8)
-        XCTAssertNil(try JSONDecoder().decode(Preferences.self, from: data).localConnection)
+        let preferences = try JSONDecoder().decode(Preferences.self, from: data)
+        XCTAssertNil(preferences.localConnection)
+        XCTAssertEqual(preferences.presentationLanguage, .unspecified)
+        XCTAssertEqual(preferences.answerFinalizer, AnswerFinalizerPreference())
+    }
+
+    func testTypedAnswerFinalizerPreferencesRoundTripWithoutGrantingBenchmarkLock() throws {
+        var preferences = Preferences()
+        preferences.presentationLanguage = .ja
+        preferences.answerFinalizer.mode = .enforce
+        preferences.answerFinalizer.judgeProfile = .fulfillmentV1
+        preferences.answerFinalizer.translation.activation = .requested
+        preferences.answerFinalizer.translation.profile = .catTranslate3_3b
+
+        let restored = try JSONDecoder().decode(
+            Preferences.self,
+            from: JSONEncoder().encode(preferences)
+        )
+        XCTAssertEqual(restored, preferences)
+        XCTAssertTrue(restored.answerFinalizer.requiresBenchmarkLock)
+        XCTAssertEqual(restored.answerFinalizer.translation.profile, .catTranslate3_3b)
+    }
+
+    func testAnswerFinalizerPreferencesFailClosedForUnknownOrIncompleteValues() throws {
+        for json in [
+            #"{"presentationLanguage":"auto"}"#,
+            #"{"presentationLanguage":"unspecified"}"#,
+            #"{"answerFinalizer":{"mode":"observe"}}"#,
+            #"{"answerFinalizer":{"mode":"shadow"}}"#,
+            #"{"answerFinalizer":{"translation":{"activation":"requested"}}}"#,
+            #"{"answerFinalizer":{"translation":{"profile":"project-model"}}}"#
+        ] {
+            XCTAssertThrowsError(try JSONDecoder().decode(Preferences.self, from: Data(json.utf8)), json)
+        }
+    }
+
+    func testPartialLegacyFinalizerObjectKeepsSafeDefaults() throws {
+        let preferences = try JSONDecoder().decode(
+            Preferences.self,
+            from: Data(#"{"answerFinalizer":{}}"#.utf8)
+        )
+        XCTAssertEqual(preferences.answerFinalizer, AnswerFinalizerPreference())
     }
 
     func testDraftCompletionAndReopenRoundTrip() throws {
@@ -166,5 +207,77 @@ final class SettingsTests: XCTestCase {
             XCTAssertThrowsError(try store.save(invalid))
             XCTAssertEqual(try store.load(), original)
         }
+    }
+
+    func testManagedPreferencesWritesExactPrivateTOMLAndRoundTrips() throws {
+        try isolated { url in
+            let managedURL = url.deletingLastPathComponent().appendingPathComponent("managed-preferences.toml")
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: managedURL.deletingLastPathComponent().path)
+            let store = try ManagedPreferencesStore(url: managedURL)
+            var finalizer = AnswerFinalizerPreference()
+            finalizer.mode = .shadow
+            finalizer.judgeProfile = .fulfillmentV1
+            finalizer.externalDisclosure = true
+            finalizer.translation.activation = .requested
+            finalizer.translation.profile = .catTranslate3_3b
+            let expected = try ManagedPreferences(language: .ja, finalizer: finalizer)
+            try store.save(expected)
+            XCTAssertEqual(try String(contentsOf: managedURL, encoding: .utf8), """
+            [presentation]
+            language = "ja"
+
+            [answer_finalizer]
+            mode = "shadow"
+            judge_profile = "fulfillment-v1"
+            external_disclosure = true
+
+            [answer_finalizer.translation]
+            enabled = true
+            profile = "cat-translate-3.3b"
+
+            """)
+            XCTAssertEqual(try store.load(), expected)
+            let attributes = try FileManager.default.attributesOfItem(atPath: managedURL.path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        }
+    }
+
+    func testManagedPreferencesRejectInvalidCombinationsAndPreservesExistingFile() throws {
+        try isolated { url in
+            let managedURL = url.deletingLastPathComponent().appendingPathComponent("managed-preferences.toml")
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: managedURL.deletingLastPathComponent().path)
+            let store = try ManagedPreferencesStore(url: managedURL)
+            let original = ManagedPreferences()
+            try store.save(original)
+            var invalid = AnswerFinalizerPreference()
+            invalid.mode = .shadow
+            invalid.judgeProfile = .fulfillmentV1
+            invalid.translation.activation = .requested
+            invalid.translation.profile = .catTranslate3_3b
+            XCTAssertThrowsError(try ManagedPreferences(language: .en, finalizer: invalid))
+            invalid.mode = .enforce
+            XCTAssertThrowsError(try ManagedPreferences(language: .ja, finalizer: invalid))
+            invalid.mode = .off
+            invalid.judgeProfile = nil
+            invalid.externalDisclosure = true
+            XCTAssertThrowsError(try ManagedPreferences(language: .ja, finalizer: invalid))
+            XCTAssertEqual(try store.load(), original)
+            try FileManager.default.removeItem(at: managedURL)
+            try FileManager.default.createSymbolicLink(at: managedURL, withDestinationURL: url)
+            XCTAssertThrowsError(try store.save(original))
+        }
+    }
+
+    func testManagedPreferencesOmitsExternalDisclosureUntilShadowConsent() throws {
+        let disabled = ManagedPreferencesStore.encode(ManagedPreferences())
+        XCTAssertEqual(disabled, "[answer_finalizer]\nmode = \"off\"\n")
+        var finalizer = AnswerFinalizerPreference()
+        finalizer.mode = .shadow
+        finalizer.judgeProfile = .fulfillmentV1
+        let shadow = try ManagedPreferences(language: .unspecified, finalizer: finalizer)
+        XCTAssertFalse(ManagedPreferencesStore.encode(shadow).contains("external_disclosure"))
+        finalizer.externalDisclosure = true
+        XCTAssertTrue(ManagedPreferencesStore.encode(try ManagedPreferences(language: .unspecified, finalizer: finalizer))
+            .contains("external_disclosure = true"))
     }
 }

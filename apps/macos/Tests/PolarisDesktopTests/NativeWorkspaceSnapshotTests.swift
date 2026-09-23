@@ -46,6 +46,37 @@ final class NativeWorkspaceSnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.activities[0].agents[0].name, "Vega")
     }
 
+    func testV2OrchestrationProjectsExplicitControlPlaneState() throws {
+        let payload: ServiceValue = .object([
+            "configuration": .object(["model": .string("astra"), "provider": .string("codex"), "effort": .string("medium")]),
+            "tasks": .array([]), "children": .array([]),
+            "orchestration": .object([
+                "workflow": .object([
+                    "phase": .string("verify"), "step": .string("converging"),
+                    "acceptance": .array([.object(["criterion_id": .string("criterion"), "state": .string("passed"), "evidence_count": .string("1")])]),
+                    "evidence": .object(["passed": .string("1"), "failed": .string("0"), "stale": .string("0"), "unavailable": .string("0")]),
+                    "convergence": .object(["state": .string("allowed"), "required_criteria": .string("1"), "unresolved_gaps": .string("0")]),
+                ]),
+                "session_manager": .object([
+                    "manager_revision": .string("4"), "session_count": .string("2"), "session_total": .string("2"), "session_omitted": .bool(false),
+                    "sessions": .array([.object(["session_id": .string("main"), "kind": .string("current"), "state": .string("running")])]),
+                    "sidechat": .string("active"), "queued_admissions": .string("0"), "active_runs": .string("1"),
+                ]),
+                "subagents": .array([.object(["root_run_id": .string("run"), "root_attempt_id": .string("attempt-root"), "control_revision": .string("1"), "logical_child_id": .string("child"), "attempt_id": .string("attempt"), "display_name": .string("Sirius"), "role": .string("reviewer"), "state": .string("running")])]),
+                "subagent_total": .string("1"), "subagent_omitted": .bool(false), "mcp_leases": .array([]), "mcp_lease_total": .string("0"), "mcp_lease_omitted": .bool(false),
+                "common_runner": .object(["state": .string("idle"), "completed_cases": .string("0"), "failed_cases": .string("0"), "cleanup_pending": .bool(false)]),
+                "clarification": .object(["state": .string("none"), "questions": .array([]), "unanswered_count": .string("0")]),
+            ]),
+        ])
+        let snapshot = NativeWorkspaceSnapshot.make(binding: try binding(), payload: payload)
+        let projected = try XCTUnwrap(snapshot.activities.first?.orchestration)
+        XCTAssertEqual(projected.workflow.phase, "verify")
+        XCTAssertEqual(projected.workflow.convergence.state, .allowed)
+        XCTAssertEqual(projected.sessionManager.sidechat, "active")
+        XCTAssertEqual(projected.subagents.first?.displayName, "Sirius")
+        XCTAssertEqual(snapshot.activities.first?.agents.first?.status, .running)
+    }
+
     @MainActor
     func testNativeVoiceUsesAuthoritativeDraftAndLeavesDisplayDraftEmpty() {
         let state = WorkspaceState(conversationID: "native")

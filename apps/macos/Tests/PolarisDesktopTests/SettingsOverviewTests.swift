@@ -19,6 +19,9 @@ final class SettingsOverviewTests: XCTestCase {
         XCTAssertEqual(workflow?.title, "作業内容に合わせた情報の使い方")
         XCTAssertEqual(workflow?.delivery, .existing)
         XCTAssertEqual(workflow?.control, .workflow)
+        let finalizer = SettingsCatalog.items.first { $0.id == "general.answer-finalizer" }
+        XCTAssertTrue(finalizer?.detail.contains("明示的なユーザー設定") == true)
+        XCTAssertTrue(finalizer?.detail.contains("プロジェクト設定では変更できません") == true)
         for name in ["Blender", "DaVinci Resolve", "Unity", "Unreal Engine"] {
             let item = SettingsCatalog.matching(name).first { $0.title == name }
             XCTAssertEqual(item?.delivery, .planned)
@@ -71,6 +74,39 @@ final class SettingsOverviewTests: XCTestCase {
         if case .workflow("adaptive") = workflowRequests[0] {} else {
             XCTFail("選択したworkflowをhostへ渡していません")
         }
+    }
+
+    func testAnswerFinalizerControlsExposeOnlySafeCombinations() {
+        var actions: [SettingsAction] = []
+        var presentation: SettingsPresentation!
+        presentation = SettingsPresentation(preferences: Preferences(),
+            availableActions: [.answerFinalizer], onAction: { action in
+                actions.append(action)
+                if case let .answerFinalizer(language, finalizer) = action {
+                    presentation.preferences.presentationLanguage = language
+                    presentation.preferences.answerFinalizer = finalizer
+                }
+            })
+        XCTAssertTrue(presentation.canPerform(.answerFinalizer))
+        presentation.setFinalizerMode(.enforce)
+        XCTAssertTrue(actions.isEmpty)
+        presentation.setTranslationRequested(true)
+        XCTAssertTrue(actions.isEmpty)
+        presentation.setExternalDisclosure(true)
+        XCTAssertTrue(actions.isEmpty)
+        presentation.setPresentationLanguage(.ja)
+        presentation.setFinalizerMode(.shadow)
+        guard case let .answerFinalizer(_, shadow) = actions.last else { return XCTFail("shadow action") }
+        XCTAssertFalse(shadow.externalDisclosure, "Shadow alone must not authorize disclosure")
+        presentation.setExternalDisclosure(true)
+        presentation.setTranslationRequested(true)
+        XCTAssertEqual(actions.count, 4)
+        guard case let .answerFinalizer(language, finalizer) = actions.last else { return XCTFail("action") }
+        XCTAssertEqual(language, .ja)
+        XCTAssertEqual(finalizer.mode, .shadow)
+        XCTAssertEqual(finalizer.judgeProfile, .fulfillmentV1)
+        XCTAssertTrue(finalizer.externalDisclosure)
+        XCTAssertEqual(finalizer.translation.profile, .catTranslate3_3b)
     }
 
     func testWindowReusesIdentitySelectionAndSizeAfterClosing() {

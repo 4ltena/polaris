@@ -82,7 +82,7 @@ private struct ConnectedWorkspaceView: View {
     @State private var showsHome = false
     private var snapshot: WorkspaceSnapshot {
         NativeWorkspaceSnapshot.make(binding: owner.binding, payload: service.snapshot,
-                                     files: source.files, git: source.git)
+                                     files: source.files, git: source.git, orchestration: service.orchestration)
     }
     private var selectedPath: String? {
         guard let id = owner.binding?.sessionID else { return nil }
@@ -153,6 +153,7 @@ private struct NativeConversationView: View {
     @State private var localRefreshing = false
     @State private var roleDraft: [LocalRoleBinding] = []
     @State private var roleRevision: UInt64 = 0
+    @State private var clarificationText: [String: String] = [:]
     private var modelOptions: [WorkspaceModelConfiguration] {
         let cloud = [
             WorkspaceModelConfiguration(id: "codex|gpt-6-astra", title: "gpt-6-astra", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true),
@@ -176,7 +177,7 @@ private struct NativeConversationView: View {
     }
     private var inputPhase: WorkspaceInputPhase {
         if service.isBusy || service.startOutcomeUnknown { return .sending }
-        return voice.voicePhases[service.store.sessionID] ?? .idle
+        return voice.voicePhases[service.activeSessionID] ?? .idle
     }
     private var currentModel: WorkspaceModelConfiguration { NativeWorkspaceSnapshot.selectedModel(model.document.preferences?.executionBinding, fallback: service.snapshot?["configuration"]) }
     private func recoveryTitle(_ state: SourceRecoveryClient.State) -> String {
@@ -259,7 +260,7 @@ private struct NativeConversationView: View {
                 }
             }
             if !service.attachmentIDs.isEmpty {
-                Text("保存済み添付があります。添付対応まで下書きの更新は停止しています。").font(.caption)
+                Text("保存済み添付 \(service.attachmentIDs.count) 件を次の入力へ含めます。").font(.caption).foregroundStyle(.secondary)
             }
             HStack {
                 Button("ローカルモデル・役割設定") {
@@ -290,6 +291,27 @@ private struct NativeConversationView: View {
                     ? "Thinking、orchestrator、\(currentModel.title)、effort judging"
                     : "Thinking、orchestrator、\(currentModel.title)、effort \(currentModel.effort)")
             }
+            if let admission = service.inputAdmission {
+                Text(inputAdmissionTitle(admission))
+                    .font(.caption).foregroundStyle(admission.state == .outcomeUnknown ? .red : .secondary)
+                Text(inputAdmissionDetails(admission))
+                    .font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                    .accessibilityLabel("入力の経路。\(inputAdmissionDetails(admission))")
+                if admission.state != .completed && admission.state != .failed && admission.state != .cancelled {
+                    Button("この入力を取り消す") { Task { await service.cancelPendingInput() } }
+                        .disabled(service.isBusy || service.orchestration == nil)
+                        .accessibilityLabel("現在の入力を取り消す")
+                }
+                if service.inputAdmissionOutcomeUnknown {
+                    Text("入力の受付成否は未確認です。本文を保持し、同じ内容は再送しません。")
+                        .font(.caption).foregroundStyle(.red)
+                    Button("入力受付の状態を確認") { Task { await service.refreshInputAdmissionStatus() } }
+                        .disabled(service.isBusy || service.phase != .ready)
+                }
+            }
+            if let manager = service.orchestration?.sessionManager, manager.sessions.count > 1 {
+                sessionStatus(manager)
+            }
             composer
             HStack {
                 Text(service.isDirty ? "未保存" : (service.savedDraftRevision == nil ? "未読込" : "保存済み")).font(.caption).foregroundStyle(.secondary)
@@ -298,12 +320,16 @@ private struct NativeConversationView: View {
             }
         }.padding(16)
         .onAppear {
-            voice.selectedConversationID = service.store.sessionID
+            voice.selectedConversationID = service.activeSessionID
             voice.enableVoice(backend: WorkspaceNativeSpeechBackend(), appendText: { id, text in
-                guard id == service.store.sessionID else { return }
+                guard id == service.activeSessionID else { return }
                 service.editDraft(service.draftText + (service.draftText.isEmpty ? "" : "\n") + text)
             })
-  }
+        }
+        .onChange(of: service.activeSessionID) { sessionID in
+            isComposing = false
+            voice.selectedConversationID = sessionID
+        }
 
         .onDisappear { voice.cancelVoice(); isComposing = false }
         .popover(isPresented: $localSettingsOpen) {
@@ -486,6 +512,10 @@ private struct NativeConversationView: View {
                         Button("元の開始要求を照合") { Task { await service.reconcileStart() } }
                             .disabled(service.phase != .ready || service.isBusy)
                     }
+                    if let orchestration = service.orchestration {
+                        controlPlaneStatus(orchestration)
+                        clarificationCards(orchestration.clarification)
+                    }
                     ForEach(service.approvals, id: \.key) { approval in
                         VStack(alignment: .leading, spacing: 6) {
                             Text(approval.title).font(.headline)
@@ -506,6 +536,118 @@ private struct NativeConversationView: View {
                     }
                     SourceApplyReviewView(service: service)
         }
+    }
+    @ViewBuilder private func sessionStatus(_ manager: WorkspaceSessionManagerProjection) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(sidechatTitle(manager.sidechat)).font(.caption).foregroundStyle(.secondary)
+            if manager.sessions.count > 1 {
+                Picker("表示する会話", selection: Binding(get: { service.activeSessionID }, set: { id in
+                    guard id != service.activeSessionID else { return }
+                    Task { await service.selectManagedSession(id) }
+                })) {
+                    ForEach(manager.sessions) { session in
+                        Text(sessionDisplayName(session)).tag(session.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(!service.canSelectManagedSession)
+                .accessibilityLabel("表示する会話")
+                Text(service.canSelectManagedSession ? "会話を選ぶと、保存済みの会話を表示します。" : "この接続では会話切替を利用できません。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+    @ViewBuilder private func clarificationCards(_ clarification: WorkspaceClarification) -> some View {
+        if clarification.state == .pending {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("確認したいことがあります").font(.caption.weight(.medium))
+                ForEach(clarification.questions.filter { !$0.answered }) { question in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(question.text).font(.caption)
+                        ForEach(question.options) { option in
+                            Button(option.label) { submitClarification(question, answer: option.label) }
+                                .disabled(service.isBusy)
+                                .accessibilityLabel("\(question.text)。\(option.label) を選ぶ")
+                        }
+                        if question.freeText.allowed {
+                            TextField(question.freeText.required ? "回答を入力（必須）" : "補足を入力（任意）",
+                                      text: Binding(get: { clarificationText[question.id, default: ""] }, set: { clarificationText[question.id] = String($0.utf8.prefix(Int(question.freeText.maxBytes))) }))
+                                .accessibilityLabel("確認事項 \(question.id)：\(question.text)")
+                            Button("回答を送る") { submitClarification(question, answer: clarificationText[question.id, default: ""]) }
+                                .disabled(service.isBusy || (question.freeText.required && clarificationText[question.id, default: ""].isEmpty))
+                        }
+                    }.padding(8).background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+    }
+    @ViewBuilder private func controlPlaneStatus(_ orchestration: WorkspaceOrchestration) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if !orchestration.subagents.isEmpty {
+                Text("協力中の作業").font(.caption.weight(.medium))
+                ForEach(orchestration.subagents.filter { [.queued, .running, .waiting, .cancelling, .outcomeUnknown].contains($0.state) }) { child in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(subagentDisplayTitle(child))
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .accessibilityLabel(subagentAccessibilityLabel(child))
+                            .accessibilityHint(child.state == .outcomeUnknown ? "子作業の実行結果は未確認です。" : "子作業の現在の保存済み状態です。")
+                        if child.state == .outcomeUnknown {
+                            Text("子作業の結果は未確認です。更新しても確定できない場合があります。")
+                                .font(.caption2).foregroundStyle(.orange)
+                        }
+                        if let result = service.subagentCancelResult,
+                           result.logicalChildID == child.logicalChildID, result.childAttemptID == child.id {
+                            if result.runtimeEffect == .unavailable {
+                                Text("停止要求は記録されましたが、実行環境へは届いていません。")
+                                    .font(.caption2).foregroundStyle(.orange)
+                            } else if result.runtimeEffect == .outcomeUnknown {
+                                Text("停止要求の実行結果を確認できません。更新してください。")
+                                    .font(.caption2).foregroundStyle(.orange)
+                            }
+                        }
+                        if let root = activeRoot(for: child) {
+                            HStack(spacing: 8) {
+                                Button("更新") {
+                                    let cursor = service.subagentWaitResult?.rootRunID == root.id
+                                      && service.subagentWaitResult?.rootAttemptID == root.attemptID
+                                      ? service.subagentWaitResult?.cursor : nil
+                                    Task { await service.waitSubagents(root: root, afterCursor: cursor, controlRevision: child.controlRevision) }
+                                }
+                                .disabled(!service.canWaitSubagents)
+                                .accessibilityLabel("\(child.displayName) の状態を更新")
+                                .accessibilityHint("保存済みの子作業状態を読み込みます。")
+                                if [.queued, .running, .waiting].contains(child.state) {
+                                    Button("停止") { Task { await service.cancelSubagent(root: root, child: child) } }
+                                        .disabled(!service.canCancelSubagents)
+                                        .accessibilityLabel("\(child.displayName) を停止")
+                                        .accessibilityHint("子作業への停止要求を送ります。")
+                                }
+                            }.font(.caption2)
+                        }
+                    }
+                }
+            }
+            if !orchestration.mcpLeases.isEmpty {
+                Text("連携中の外部ツール").font(.caption.weight(.medium))
+                ForEach(orchestration.mcpLeases) { lease in
+                    Text(lease.serverID + " · " + leaseTitle(lease.state))
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .accessibilityLabel("外部ツール \(lease.serverID)、\(leaseTitle(lease.state))")
+                }
+            }
+            if let runner = orchestration.commonRunner {
+                Text("共通試験：" + runnerTitle(runner))
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .accessibilityLabel("共通試験、\(runnerTitle(runner))")
+            }
+        }
+    }
+    private func submitClarification(_ question: WorkspaceClarificationQuestion, answer: String) {
+        guard !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // M25 accepts a normal next user input. The card retains its question
+        // identity locally for rendering; only the user's answer enters history.
+        service.editDraft(answer)
+        Task { await service.submitInput() }
     }
     private var attachmentSelection: (() -> Void)? {
         guard service.executionAvailable && !importing else { return nil }
@@ -543,11 +685,12 @@ private struct NativeConversationView: View {
             WorkspaceComposerInput(
                 text: Binding(get: { service.draftText }, set: { service.editDraft($0) }),
                 isComposing: Binding(get: { isComposing }, set: {
-                    isComposing = $0; voice.editDraft(service.store.sessionID) { $0.isComposing = isComposing }
+                    isComposing = $0; voice.editDraft(service.activeSessionID) { $0.isComposing = isComposing }
                 }), attachments: service.importedAttachments.map(\.attachment), models: modelOptions,
                 selectedModel: currentModel, selectedPermission: model.document.preferences?.permission,
                 phase: inputPhase, showsSend: !service.draftText.isEmpty || !service.importedAttachments.isEmpty,
-                canSend: service.canSend && !isComposing && !importing && inputPhase == .idle && voice.voiceDeferred[service.store.sessionID] == nil,
+                canSend: (service.inputAdmissionAvailable ? service.canSubmitInput : service.canSend)
+                    && !isComposing && !importing && inputPhase == .idle && voice.voiceDeferred[service.activeSessionID] == nil,
                 attachmentPreview: { attachment in
                     service.reviewImportedAttachment(attachment.id)
                     return WorkspaceComposerAttachmentPreview(attachment: attachment,
@@ -559,11 +702,14 @@ private struct NativeConversationView: View {
                     if let selection = model.document.preferences?.executionBinding {
                         Task { await model.selectWorkspaceExecution(selection, permission: permission) }
                     }
-                }, onSend: { Task { await service.startRun() } },
-                onVoice: { voice.voice(service.store.sessionID, $0) },
-                voiceNote: voice.voiceNotes[service.store.sessionID], deferredVoice: voice.voiceDeferred[service.store.sessionID],
-                onApplyDeferredVoice: { voice.applyDeferredVoice(service.store.sessionID) },
-                onDiscardDeferredVoice: { voice.voiceDeferred[service.store.sessionID] = nil },
+                }, onSend: { Task {
+                    if service.inputAdmissionAvailable { await service.submitInput() }
+                    else { await service.startRun() }
+                } },
+                onVoice: { voice.voice(service.activeSessionID, $0) },
+                voiceNote: voice.voiceNotes[service.activeSessionID], deferredVoice: voice.voiceDeferred[service.activeSessionID],
+                onApplyDeferredVoice: { voice.applyDeferredVoice(service.activeSessionID) },
+                onDiscardDeferredVoice: { voice.voiceDeferred[service.activeSessionID] = nil },
                 attachmentNotice: inputNotice ?? (service.importedAttachments.isEmpty ? nil : "添付名を押して内容を確認してください。UTF-8テキスト4件・各64KiB・合計128KiBまで。画像・バイナリは非対応です。"))
                 .padding(12).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 18))
                 .overlay(RoundedRectangle(cornerRadius: 18).stroke(.separator, lineWidth: 1))
@@ -605,6 +751,87 @@ private struct NativeConversationView: View {
     }
     private func recoveryResultTitle(_ result: SourceRecoveryClient.SavedResult) -> String {
         "結果の保存証明：\(result.resultID)（revision \(result.savedRevision)）"
+    }
+    private func inputAdmissionTitle(_ admission: WorkspaceInputAdmission) -> String {
+        switch admission.state {
+        case .reserved: "入力を受付予約しています。"
+        case .classifying: "入力の経路を判定しています。"
+        case .decided: "入力先を決定しています。"
+        case .destinationReady: "入力先の会話を準備しています。"
+        case .inputAppended: "入力を保存しています。"
+        case .runQueued: "入力の実行を準備しています。"
+        case .queued: "入力は実行待ちです。"
+        case .running: "入力を実行しています。"
+        case .completed: "入力の実行は完了として記録されています。"
+        case .failed: "入力の実行は失敗として記録されています。"
+        case .cancelled: "入力は取り消されました。"
+        case .outcomeUnknown: "入力の受付状態を確認できません。"
+        }
+    }
+    private func inputAdmissionDetails(_ admission: WorkspaceInputAdmission) -> String {
+        var values = ["経路：\(routeTitle(admission.route))"]
+        if let reason = admission.routeReason { values.append("理由：\(routeReasonTitle(reason))") }
+        if let destination = admission.destinationSessionID { values.append("入力先：\(destination)") }
+        if let run = admission.runID {
+            values.append("実行：\(run)" + (admission.attemptID.map { "（試行 \($0)）" } ?? ""))
+        }
+        return values.joined(separator: " · ")
+    }
+    private func routeTitle(_ route: String) -> String {
+        switch route { case "current": "この会話"; case "new": "別の会話"; default: "自動選択" }
+    }
+    private func routeReasonTitle(_ reason: String) -> String {
+        switch reason {
+        case "same_context": return "現在の話題に続くため"
+        case "distinct_context": return "別の話題のため"
+        case "ambiguous": return "判断が分かれるため"
+        case "classifier_unavailable", "classifier_invalid": return "自動判定を使えないため"
+        case "explicit_current": return "この会話が指定されたため"
+        case "explicit_new": return "別の会話が指定されたため"
+        case "approval_reply": return "確認への回答のため"
+        case "context_changed": return "作業状況が変わったため"
+        case "crash_recovery": return "復旧中のため"
+        case "cancelled": return "取り消されたため"
+        default: return reason
+        }
+    }
+    private func sidechatTitle(_ state: String) -> String {
+        switch state {
+        case "active": "Sidechat は有効です。上の会話選択から切り替えられます。"
+        case "full": "Sidechat の上限に達しています。上の会話選択で既存の会話へ切り替えられます。"
+        default: "Sidechat の状態を確認できません。"
+        }
+    }
+    private func activeRoot(for child: WorkspaceSubagentProjection) -> WorkspaceRun? {
+        service.runs.first {
+            $0.id.utf8.elementsEqual(child.rootRunID.utf8)
+              && $0.attemptID.utf8.elementsEqual(child.rootAttemptID.utf8)
+              && !$0.isTerminal
+        }
+    }
+    private func sessionDisplayName(_ session: WorkspaceManagedSession) -> String {
+        let kind = session.kind == .current ? "現在の会話" : "Sidechat"
+        return kind + " · " + sessionStateTitle(session.state)
+    }
+    private func sessionStateTitle(_ state: WorkspaceManagedSessionState) -> String {
+        switch state { case .idle: "待機中"; case .queued: "実行待ち"; case .running: "実行中"; case .closed: "終了" }
+    }
+    private func subagentTitle(_ state: WorkspaceSubagentState) -> String {
+        switch state { case .queued: "待機中"; case .running: "実行中"; case .waiting: "待機中"; case .cancelling: "停止中"; case .succeeded: "完了"; case .failed: "失敗"; case .cancelled: "取消"; case .outcomeUnknown: "状態不明" }
+    }
+    private func subagentAccessibilityLabel(_ child: WorkspaceSubagentProjection) -> String {
+        "協力中の作業、" + child.displayName + "、" + child.role + "、" + subagentTitle(child.state) + "、" + (child.activity ?? "状況は未取得")
+    }
+    private func subagentDisplayTitle(_ child: WorkspaceSubagentProjection) -> String {
+        child.displayName + " · " + child.role + " · " + subagentTitle(child.state) + (child.activity.map { " · " + $0 } ?? "")
+    }
+    private func leaseTitle(_ state: WorkspaceMcpLeaseState) -> String {
+        switch state { case .reserved: "準備中"; case .active: "利用中"; case .releasing: "終了中"; case .released: "終了"; case .expired: "期限切れ"; case .outcomeUnknown: "状態不明" }
+    }
+    private func runnerTitle(_ runner: WorkspaceCommonRunnerProjection) -> String {
+        let state: String
+        switch runner.state { case .unavailable: state = "未提供"; case .idle: state = "待機中"; case .preparing: state = "準備中"; case .running: state = "実行中"; case .completed: state = "完了"; case .failed: state = "失敗"; case .cleanupPending: state = "片付け待ち"; case .outcomeUnknown: state = "状態不明" }
+        return state + " · 完了 \(runner.completedCases) · 失敗 \(runner.failedCases)"
     }
     private func role(_ value: ServiceHistoryMessage.Role) -> String {
         switch value { case .user: "ユーザー"; case .assistant: "アシスタント"; case .tool: "ツール"; case .system: "システム" }

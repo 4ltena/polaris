@@ -75,6 +75,9 @@ actor ServiceClient {
   private let clientID: String
   private let configuration: Configuration
   private let persistentStore: PersistentStore?
+  /// v2 sidechat selection keeps the same owned process/store root but changes
+  /// the selected lane. This is never inferred from an event.
+  private var activeSessionID: String?
   private let recoveryMode: RecoveryMode
   private let ownerLaunch: OwnerServiceLaunch?
   private var recovery: SourceRecoveryClient?
@@ -137,6 +140,7 @@ actor ServiceClient {
       throw ServiceError.schema
     }
     self.homeBrowse = homeBrowse
+    self.activeSessionID = persistentStore?.sessionID
     self.ownerLaunch = ownerLaunch
     self.recoveryMode = recoveryMode
     self.helperURL = helperURL
@@ -237,10 +241,21 @@ actor ServiceClient {
       throw ServiceError.schema
     }
     let wire = try request.wire(clientID: clientID, requestID: requestID)
-    if let store = persistentStore, let session = wire["session_id"],
-      !session.matchesID(store.sessionID) { throw ServiceError.correlation }
-    return try await exchange(
+    if let store = persistentStore, let session = wire["session_id"] {
+      let selected = activeSessionID ?? store.sessionID
+      if request.method == "session.select" {
+        guard session.string != nil else { throw ServiceError.correlation }
+      } else if !session.matchesID(selected) { throw ServiceError.correlation }
+    }
+    let reply = try await exchange(
       id: requestID, method: request.method, session: wire["session_id"]?.string, wire: wire)
+    // A rejected selection leaves the service lane unchanged. The following
+    // request must therefore remain bound to the prior selected session.
+    if request.method == "session.select", reply.rejection == nil,
+      let session = wire["session_id"]?.string {
+      activeSessionID = session
+    }
+    return reply
   }
 
   func send(requestID: String, request: ServiceReadRequest) async throws -> ServiceReply {

@@ -8,13 +8,30 @@ private actor RunTransport: WorkspaceServiceTransport {
   var revision: UInt64 = 10
   var draftRevision: UInt64 = 4
   var text = "合成入力"
+  var attachmentIDs: [String] = []
+  var selectedSession = "s"
   var runState: String?
+  var admissionID = "adm-test"
+  var retainSourceDraftForSidechatAdmission = false
+  var lastAdmissionDestination = "s"
+  var lastAdmissionRouteReason = "same_context"
   var workflow: (enabled: Bool, mode: String, phase: String, revision: UInt64)? = (true, "manual", "general", 4)
   var events: [ServiceValue] = []
+  var deliveredEventSequence: UInt64 = 0
   var history: [ServiceValue] = []
   var eventWaiter: CheckedContinuation<Void, Never>?
   var holdEvents = false
   func setHistory(_ values: [ServiceValue]) { history = values }
+  func setAttachmentIDs(_ values: [String]) { attachmentIDs = values }
+  func routeNextAdmissionToSidechatWithoutConsumingSourceDraft() {
+    retainSourceDraftForSidechatAdmission = true
+  }
+  func inputSubmissions() -> [(text: String?, attachments: [String], admission: String?)] {
+    calls.compactMap { _, request in
+      guard case let .inputSubmit(_, _, _, _, _, text, attachments, _, admission) = request else { return nil }
+      return (text, attachments, admission)
+    }
+  }
   func suspendEvents() { holdEvents = true }
   func eventsWaiting() -> Bool { eventWaiter != nil }
   func releaseEvents() { holdEvents = false; eventWaiter?.resume(); eventWaiter = nil }
@@ -45,7 +62,8 @@ private actor RunTransport: WorkspaceServiceTransport {
   func setMcp(_ replies: [ServiceValue]) { mcpReplies = replies }
   func setDetails(_ pages: [ServiceValue]) { detailsPages = pages }
   func start() throws -> ServiceHello {
-    let caps = ["session_read", "history_read", "draft_update", "request_status", "shutdown", "workflow_configure"]
+    let caps = ["session_read", "history_read", "draft_update", "request_status", "shutdown", "workflow_configure",
+      "input_submit", "input_status", "session_list", "session_manage", "input_cancel", "subagent_control"]
       + (enabled ? ["run_start", "run_cancel", "approval_resolve", "run_details_read", "mcp_settings"] : [])
     return try ServiceHello(.object([
       "protocol_version": .number("1"), "engine_epoch": .string("e"),
@@ -54,11 +72,12 @@ private actor RunTransport: WorkspaceServiceTransport {
         "subscription_bytes": .string("4194304"), "text_batch_bytes": .string("32768"), "text_batch_ms": .string("50")])]))
   }
   func snapshot() -> ServiceValue {
-    var fields: [String: ServiceValue] = ["snapshot_id": .string("snap"), "session_id": .string("s"), "summary": .string(""),
+    var fields: [String: ServiceValue] = ["snapshot_id": .string("snap-\(selectedSession)"), "session_id": .string(selectedSession), "summary": .string(""),
       "session_revision": .string(String(revision)), "content_revision": .string("0"), "plan_revision": .string("0"),
       "policy_revision": .string("2"), "history_start_cursor": .string("first"),
-      "position": .object(["engine_epoch": .string("e"), "subscription_id": .string("sub"), "event_seq": .string("0")]),
-      "draft": .object(["draft_revision": .string(String(draftRevision)), "text": .string(text), "attachment_ids": .array([])]),
+      "position": .object(["engine_epoch": .string("e"), "subscription_id": .string("sub"),
+        "event_seq": .string(String(deliveredEventSequence))]),
+      "draft": .object(["draft_revision": .string(String(draftRevision)), "text": .string(text), "attachment_ids": .array(attachmentIDs.map(ServiceValue.string))]),
       "configuration": .object(["configuration_revision": .string("3"), "provider": .string("synthetic"), "model": .string("test"), "effort": .string("medium")]),
       "runs": .array(runState.map { [run($0)] } ?? []), "children": .array([]), "child_attempt_count": .string("0"), "role_bindings": .array([]), "role_catalog": .array([]),
       "tasks": .array([]), "unresolved_approvals": .array(pendingApprovals)]
@@ -66,6 +85,23 @@ private actor RunTransport: WorkspaceServiceTransport {
       fields["workflow"] = .object(["enabled": .bool(workflow.enabled), "mode": .string(workflow.mode),
         "phase": .string(workflow.phase), "revision": .string(String(workflow.revision))])
     }
+    fields["orchestration"] = .object([
+      "workflow": .object(["phase": .string("general"), "step": .string("idle"), "acceptance": .array([]),
+        "evidence": .object(["passed": .string("0"), "failed": .string("0"), "stale": .string("0"), "unavailable": .string("0")]),
+        "convergence": .object(["state": .string("pending"), "required_criteria": .string("0"), "unresolved_gaps": .string("0")])]),
+      "session_manager": .object(["manager_revision": .string("1"), "session_count": .string("2"), "session_total": .string("2"),
+        "session_omitted": .bool(false), "sessions": .array([
+          .object(["session_id": .string("s"), "kind": .string("current"), "state": .string("idle")]),
+          .object(["session_id": .string("side"), "kind": .string("sidechat"), "state": .string("idle"), "source_session_id": .string("s")]),
+        ]),
+        "sidechat": .string("active"),
+        "queued_admissions": .string("0"), "active_runs": .string("0")]),
+      "subagents": .array([]), "subagent_total": .string("0"), "subagent_omitted": .bool(false),
+      "mcp_leases": .array([]), "mcp_lease_total": .string("0"), "mcp_lease_omitted": .bool(false),
+      "common_runner": .object(["state": .string("idle"), "completed_cases": .string("0"),
+        "failed_cases": .string("0"), "cleanup_pending": .bool(false)]),
+      "clarification": .object(["state": .string("none"), "questions": .array([]), "unanswered_count": .string("0")]),
+    ])
     return .object(fields)
   }
   func run(_ state: String) -> ServiceValue {
@@ -81,7 +117,18 @@ private actor RunTransport: WorkspaceServiceTransport {
     }
     let payload: ServiceValue
     switch request {
-    case .workspaceRead, .attachmentRead, .localModels, .configureRoles, .sourceApplyList, .sourceApplyPage, .sourceApplyResolve, .browseList, .browseRead: throw ServiceError.notReady
+    case .workspaceRead, .attachmentRead, .localModels, .configureRoles, .sourceApplyList, .sourceApplyPage, .sourceApplyResolve, .browseList, .browseRead, .subagentWait, .subagentCancel: throw ServiceError.notReady
+    case .sessionSelect(let session):
+      guard session == "side" else { throw ServiceError.correlation }
+      selectedSession = session
+      payload = snapshot()
+    case .inputCancel(_, let managerRevision, let admission):
+      guard managerRevision == 1, admission == admissionID else { throw ServiceError.correlation }
+      revision += 1
+      payload = .object(["manager_revision": .string("1"), "admission_id": .string(admission), "input_hash": .string(String(repeating: "a", count: 64)),
+        "state": .string("cancelled"), "route": .string("auto"), "route_reason": .string(lastAdmissionRouteReason),
+        "destination_session_id": .string(lastAdmissionDestination), "run": .object(["run_id": .string("r"), "attempt_id": .string("a")]),
+        "session_revision": .string(String(revision))])
     case .mcpRegistryRead, .mcpRegistrySave, .mcpCatalogCheck, .mcpCatalogCancel, .mcpSetupDetect, .mcpSetupRegister:
       guard !mcpReplies.isEmpty else { throw ServiceError.io }
       payload = mcpReplies.removeFirst()
@@ -114,6 +161,34 @@ private actor RunTransport: WorkspaceServiceTransport {
       revision += 1; draftRevision += 1; text = ""; runState = "queued"
       if failRun { throw ServiceError.io }
       payload = .object(["session_revision": .string(String(revision)), "run_id": .string("r"), "attempt_id": .string("a"), "state": .string("queued")])
+    case .sessionList:
+      payload = .object(["manager_revision": .string("1"), "session_total": .string("2"),
+        "session_omitted": .bool(false), "sessions": .array([
+          .object(["session_id": .string("s"), "kind": .string("current"),
+            "session_revision": .string(String(revision)), "goal_revision": .string("0")]),
+          .object(["session_id": .string("side"), "kind": .string("sidechat"),
+            "session_revision": .string(String(revision)), "goal_revision": .string("0")]),
+        ])])
+    case .inputSubmit(_, _, _, _, _, _, _, _, let admission):
+      guard let admission else { throw ServiceError.correlation }
+      admissionID = admission; revision += 1; runState = "queued"
+      if retainSourceDraftForSidechatAdmission {
+        lastAdmissionDestination = "side"
+        lastAdmissionRouteReason = "distinct_context"
+      } else {
+        draftRevision += 1; text = ""; lastAdmissionDestination = selectedSession
+        lastAdmissionRouteReason = "same_context"
+      }
+      payload = .object(["manager_revision": .string("2"), "session_revision": .string(String(revision)),
+        "admission_id": .string(admission), "input_hash": .string(String(repeating: "a", count: 64)), "route": .string("auto"),
+        "route_reason": .string(lastAdmissionRouteReason), "destination_session_id": .string(lastAdmissionDestination),
+        "state": .string("running"), "run": .object(["run_id": .string("r"), "attempt_id": .string("a")])])
+    case .inputStatus(_, let admission):
+      guard admission == admissionID else { throw ServiceError.correlation }
+      payload = .object(["manager_revision": .string("2"), "session_revision": .string(String(revision)),
+        "admission_id": .string(admission), "input_hash": .string(String(repeating: "a", count: 64)), "route": .string("auto"),
+        "route_reason": .string(lastAdmissionRouteReason), "destination_session_id": .string(lastAdmissionDestination),
+        "state": .string("running"), "run": .object(["run_id": .string("r"), "attempt_id": .string("a")])])
     case .cancel: payload = .object(["status": .string("cancel_requested")])
     case .shutdown: payload = .object(["engine_epoch": .string("e"), "state": .string("ready")])
     case .approval(_, let id, _, _, _, let decision):
@@ -128,7 +203,7 @@ private actor RunTransport: WorkspaceServiceTransport {
     case .history(_, let cursor, let limit):
       let start = cursor == "first" ? 0 : Int(cursor)!
       let end = min(history.count, start + limit)
-      var fields: [String: ServiceValue] = ["snapshot_id": .string("snap"), "session_revision": .string(String(staleAfterRun && runState != nil ? 10 : revision)), "messages": .array(Array(history[start..<end]))]
+      var fields: [String: ServiceValue] = ["snapshot_id": .string("snap-\(selectedSession)"), "session_revision": .string(String(staleAfterRun && runState != nil ? 10 : revision)), "messages": .array(Array(history[start..<end]))]
       if end < history.count { fields["next_cursor"] = .string(String(end)) }
       payload = .object(fields)
     case .status: statusReads += 1; payload = status
@@ -137,6 +212,9 @@ private actor RunTransport: WorkspaceServiceTransport {
   }
   func takeEvents() async -> [ServiceValue] {
     if holdEvents { await withCheckedContinuation { eventWaiter = $0 } }
+    if let last = events.compactMap({ $0["event_seq"]?.decimal }).max() {
+      deliveredEventSequence = last
+    }
     defer { events = [] }; return events
   }
   func close() -> ServiceClient.Exit? { .init(status: 0, forced: false) }
@@ -165,10 +243,10 @@ extension WorkspaceRunTests {
     while !(await transport.waiting()), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
     let waiting = await transport.waiting(); XCTAssertTrue(waiting)
   }
-  private func event(_ type: String, _ payload: ServiceValue, sequence: UInt64, epoch: String = "e") -> ServiceValue {
+  private func event(_ type: String, _ payload: ServiceValue, sequence: UInt64, epoch: String = "e", session: String = "s", revision: UInt64 = 10) -> ServiceValue {
     .object(["protocol_version": .number("1"), "kind": .string("event"), "engine_epoch": .string(epoch),
-      "subscription_id": .string("sub"), "session_id": .string("s"), "event_seq": .string(String(sequence)),
-      "session_revision": .string("10"), "type": .string(type), "payload": payload])
+      "subscription_id": .string("sub"), "session_id": .string(session), "event_seq": .string(String(sequence)),
+      "session_revision": .string(String(revision)), "type": .string(type), "payload": payload])
   }
   private func delta(_ text: String, offset: UInt64 = 0, saved: Bool = false) -> ServiceValue {
     .object(["message_id": .string("m"), "byte_offset": .string(String(offset)), "text": .string(text),
@@ -296,6 +374,173 @@ extension WorkspaceRunTests {
     await m.cancelRun(run); await m.cancelRun(run)
     XCTAssertEqual(m.runs.first?.state, "running"); XCTAssertTrue(m.cancelRequested.contains(Data("r".utf8)))
     let count = await t.callCount("run.cancel"); XCTAssertEqual(count, 1)
+    _ = await m.close()
+  }
+  func testSubagentControlCapabilityEnablesWaitAndCancelControls() async throws {
+    let t = RunTransport(), m = try model(t)
+    await m.start()
+    XCTAssertTrue(m.canWaitSubagents)
+    XCTAssertTrue(m.canCancelSubagents)
+    _ = await m.close()
+  }
+  func testTerminalAdmissionRunReleasesOnlyItsExactPendingInput() async throws {
+    let t = RunTransport(), m = try model(t)
+    await m.start(); m.editDraft("最初の入力")
+    await m.submitInput()
+    XCTAssertEqual(m.inputAdmission?.state, .running)
+    XCTAssertEqual(m.inputAdmission?.route, "auto")
+    XCTAssertEqual(m.inputAdmission?.routeReason, "same_context")
+    XCTAssertEqual(m.inputAdmission?.destinationSessionID, "s")
+    XCTAssertFalse(m.canSubmitInput)
+
+    await t.enqueue([event("run.state", .object(["run_id": .string("other"), "attempt_id": .string("a"),
+      "state": .string("succeeded"), "task_ids": .array([])]), sequence: 1, revision: 11)])
+    await m.poll()
+    XCTAssertEqual(m.inputAdmission?.state, .running)
+    XCTAssertNotNil(m.pendingInputAdmissionID)
+    XCTAssertFalse(m.canSubmitInput)
+
+    await t.enqueue([event("run.state", await t.run("succeeded"), sequence: 2, revision: 11)])
+    await m.poll()
+    XCTAssertEqual(m.inputAdmission?.state, .completed)
+    XCTAssertNil(m.pendingInputAdmissionID)
+    XCTAssertFalse(m.canSubmitInput)
+
+    m.editDraft("次の入力")
+    XCTAssertTrue(m.canSubmitInput)
+    await m.submitInput()
+    let submissions = await t.inputSubmissions()
+    XCTAssertEqual(submissions.count, 2)
+    XCTAssertNotEqual(submissions[0].admission, submissions[1].admission)
+    XCTAssertEqual(m.inputAdmission?.state, .running)
+    XCTAssertNotNil(m.pendingInputAdmissionID)
+    _ = await m.close()
+  }
+  func testAdmissionConsumesOnlyItsDurableEmptyDraftAndRetainsLateEdit() async throws {
+    let t = RunTransport(), m = try model(t)
+    await m.start(); m.editDraft("送信する本文")
+    await t.suspend("session.subscribe")
+    let submit = Task { await m.submitInput() }
+    try await wait(t)
+    m.editDraft("送信後の別本文")
+    await t.release(); await submit.value
+
+    XCTAssertEqual(m.inputAdmission?.state, .running)
+    XCTAssertEqual(m.draftText, "送信後の別本文")
+    XCTAssertTrue(m.isDirty)
+    XCTAssertTrue(m.canSubmitInput == false) // The first admission remains pending.
+    _ = await m.close()
+  }
+  func testInputCancelRefreshesTheAdmittedRevision() async throws {
+    let t = RunTransport(), m = try model(t)
+    await m.start(); m.editDraft("取り消す入力")
+    await m.submitInput()
+    let admission = try XCTUnwrap(m.inputAdmission)
+    XCTAssertEqual(admission.state, .running)
+    XCTAssertNil(m.failure)
+
+    await m.cancelPendingInput()
+
+    XCTAssertNil(m.failure)
+    XCTAssertEqual(m.inputAdmission?.id, admission.id)
+    XCTAssertEqual(m.inputAdmission?.state, .cancelled)
+    XCTAssertNil(m.pendingInputAdmissionID)
+    XCTAssertEqual(m.snapshot?["session_revision"]?.decimal, 12)
+    let cancelCount = await t.callCount("input.cancel")
+    XCTAssertEqual(cancelCount, 1)
+    _ = await m.close()
+  }
+  func testCompletedSidechatAdmissionDoesNotReenableItsUnchangedSourceDraft() async throws {
+    let t = RunTransport(); await t.routeNextAdmissionToSidechatWithoutConsumingSourceDraft()
+    let m = try model(t)
+    await m.start(); m.editDraft("sidechat に送る本文")
+    await m.submitInput()
+    XCTAssertEqual(m.inputAdmission?.destinationSessionID, "side")
+    XCTAssertEqual(m.draftText, "sidechat に送る本文")
+    XCTAssertFalse(m.canSubmitInput)
+
+    await t.enqueue([event("run.state", await t.run("succeeded"), sequence: 1, revision: 11)])
+    await m.poll()
+
+    XCTAssertEqual(m.inputAdmission?.state, .completed)
+    XCTAssertEqual(m.draftText, "sidechat に送る本文")
+    XCTAssertFalse(m.canSubmitInput)
+    m.editDraft("送信元で追加した別本文")
+    XCTAssertTrue(m.canSubmitInput)
+    _ = await m.close()
+  }
+  func testCancelledSidechatAdmissionDoesNotReenableItsUnchangedSourceDraft() async throws {
+    let t = RunTransport(); await t.routeNextAdmissionToSidechatWithoutConsumingSourceDraft()
+    let m = try model(t)
+    await m.start(); m.editDraft("取消対象の本文")
+    await m.submitInput()
+    XCTAssertEqual(m.inputAdmission?.destinationSessionID, "side")
+
+    await m.cancelPendingInput()
+
+    XCTAssertEqual(m.inputAdmission?.state, .cancelled)
+    XCTAssertEqual(m.draftText, "取消対象の本文")
+    XCTAssertFalse(m.canSubmitInput)
+    m.editDraft("取消後の別本文")
+    XCTAssertTrue(m.canSubmitInput)
+    _ = await m.close()
+  }
+  func testSelectedSidechatAcceptsNewLaneEvents() async throws {
+    let t = RunTransport(), m = try model(t)
+    await m.start(); await m.selectManagedSession("side")
+    XCTAssertEqual(m.activeSessionID, "side")
+    XCTAssertEqual(m.snapshot?["session_id"], .string("side"))
+
+    await t.enqueue([event("message.delta", delta("sidechat"), sequence: 1, session: "side")])
+    await m.poll()
+    XCTAssertEqual(m.streamMessages.first?.text, "sidechat")
+    XCTAssertEqual(m.phase, .ready)
+    _ = await m.close()
+  }
+  func testSelectedSidechatRejectsOldLaneEvents() async throws {
+    let t = RunTransport(), m = try model(t)
+    await m.start(); await m.selectManagedSession("side")
+
+    await t.enqueue([event("message.delta", delta("old"), sequence: 1, session: "s")])
+    await m.poll()
+    XCTAssertEqual(m.phase, .unavailable)
+    XCTAssertTrue(m.streamMessages.isEmpty)
+    _ = await m.close()
+  }
+  func testSelectedSidechatKeepsLegacyMutationsOutOfMainLane() async throws {
+    let t = RunTransport(); await t.setApprovals([approval()])
+    let m = try model(t)
+    await m.start(); await m.selectManagedSession("side")
+    m.editDraft("sidechat の下書き")
+    await m.saveDraft(); await m.startRun()
+    if let run = m.runs.first { await m.cancelRun(run) }
+    if let pending = m.approvals.first { await m.resolveApproval(pending, decision: .allow) }
+
+    let calls = await t.calls.map(\.1)
+    let sessions = calls.compactMap { request -> String? in
+      switch request {
+      case .draft(let session, _, _), .run(let session, _, _, _), .cancel(let session, _, _), .approval(let session, _, _, _, _, _): return session
+      default: return nil
+      }
+    }
+    XCTAssertFalse(sessions.isEmpty)
+    XCTAssertTrue(sessions.allSatisfy { $0 == "side" })
+    _ = await m.close()
+  }
+  func testAdmissionCarriesDurableAttachmentIDsWithoutReopeningFiles() async throws {
+    let t = RunTransport(); await t.setAttachmentIDs(["attachment-a", "attachment-b"])
+    let m = try model(t); await m.start()
+    XCTAssertEqual(m.attachmentIDs, ["attachment-a", "attachment-b"])
+    m.editDraft("添付を参照して確認する")
+    XCTAssertTrue(m.canSubmitInput)
+
+    await m.submitInput()
+
+    let submissions = await t.inputSubmissions()
+    let request = try XCTUnwrap(submissions.first)
+    XCTAssertEqual(request.text, "添付を参照して確認する")
+    XCTAssertEqual(request.attachments, ["attachment-a", "attachment-b"])
+    XCTAssertNotNil(request.admission)
     _ = await m.close()
   }
   func testApprovalGatesAndExactTypedWire() async throws {

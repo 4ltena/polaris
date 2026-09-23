@@ -9,6 +9,12 @@ final class DesktopModelTests: XCTestCase {
     private actor FakeDependencyInstaller: ManagedDependencyInstalling {
         private var installed = Set<ManagedDependencyID>()
         private var order: [ManagedDependencyID] = []
+        private var presetActivationCount = 0
+        private let cancelledIDs: Set<ManagedDependencyID>
+
+        init(cancelledIDs: Set<ManagedDependencyID> = []) {
+            self.cancelledIDs = cancelledIDs
+        }
 
         func statuses() -> [ManagedDependencyID: ManagedDependencyStatus] {
             Dictionary(uniqueKeysWithValues: ManagedDependencyID.allCases.map {
@@ -18,12 +24,13 @@ final class DesktopModelTests: XCTestCase {
         func status(_ id: ManagedDependencyID) -> ManagedDependencyStatus {
             installed.contains(id) ? .installed(version: "fixture") : .notInstalled
         }
-        func install(_ id: ManagedDependencyID) -> String {
+        func install(_ id: ManagedDependencyID) throws -> String {
             order.append(id)
+            if cancelledIDs.contains(id) { throw ManagedDependencyError.cancelled }
             installed.insert(id)
             return "fixture"
         }
-        func activatePreset() {}
+        func activatePreset() { presetActivationCount += 1 }
         func inspectGGUF(_ source: String) throws -> ManagedGGUFPlan {
             throw ManagedDependencyError.manifest
         }
@@ -32,6 +39,7 @@ final class DesktopModelTests: XCTestCase {
             throw ManagedDependencyError.install
         }
         func installationOrder() -> [ManagedDependencyID] { order }
+        func activationCount() -> Int { presetActivationCount }
     }
 
     private final class StoredKey: @unchecked Sendable {
@@ -98,6 +106,43 @@ final class DesktopModelTests: XCTestCase {
         await Task.yield()
         let secondOrder = await installer.installationOrder()
         XCTAssertEqual(secondOrder, ManagedDependencyID.preset)
+    }
+
+    @MainActor
+    func testOptionalCATInstallFollowsPresetWithoutActivatingIt() async throws {
+        let installer = FakeDependencyInstaller()
+        let model = DesktopModel(arguments: ["--invalid"], dependencyInstaller: installer)
+
+        let beforePreset = try await model.installOptionalDependencyAndWait(.catTranslate3B)
+        XCTAssertFalse(beforePreset)
+        try await installPreset(model)
+        let installed = try await model.installOptionalDependencyAndWait(.catTranslate3B)
+        XCTAssertTrue(installed)
+
+        let order = await installer.installationOrder()
+        XCTAssertEqual(order, ManagedDependencyID.preset + [.catTranslate3B])
+        XCTAssertEqual(model.dependencyStatus(.catTranslate3B), .installed(version: "fixture"))
+        let activationCount = await installer.activationCount()
+        XCTAssertEqual(activationCount, 1)
+    }
+
+    @MainActor
+    func testOptionalCATInstallerChoiceStartsUnchecked() {
+        XCTAssertFalse(InstallerCoordinator().installCATTranslate)
+    }
+
+    @MainActor
+    func testOptionalCATCancellationReturnsToTheInstallerCancellationPath() async throws {
+        let installer = FakeDependencyInstaller(cancelledIDs: [.catTranslate3B])
+        let model = DesktopModel(arguments: ["--invalid"], dependencyInstaller: installer)
+        try await installPreset(model)
+
+        do {
+            _ = try await model.installOptionalDependencyAndWait(.catTranslate3B)
+            XCTFail("optional cancellation must reach the coordinator")
+        } catch is CancellationError {
+            XCTAssertEqual(model.dependencyStatus(.catTranslate3B), .notInstalled)
+        }
     }
 
     @MainActor

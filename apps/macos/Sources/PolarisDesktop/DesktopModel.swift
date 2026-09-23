@@ -657,6 +657,24 @@ final class DesktopModel: ObservableObject {
             saveError = (error as? SettingsError)?.errorDescription ?? SettingsError.saveFailed.errorDescription
         }
     }
+
+    /// Keeps the existing desktop document in sync with the private service
+    /// preferences. The caller writes the private file first and restores it if
+    /// this document save is rejected.
+    func updateAnswerFinalizerPreferences(language: PresentationLanguagePreference,
+                                          finalizer: AnswerFinalizerPreference) -> Bool {
+        var candidate = document
+        candidate.draft.preferences.presentationLanguage = language
+        candidate.draft.preferences.answerFinalizer = finalizer
+        if var saved = candidate.preferences {
+            saved.presentationLanguage = language
+            saved.answerFinalizer = finalizer
+            candidate.preferences = saved
+        }
+        persist(candidate)
+        let current = document.preferences ?? document.draft.preferences
+        return current.presentationLanguage == language && current.answerFinalizer == finalizer && saveError == nil
+    }
     func selectFolder() {
         let panel = NSOpenPanel()
         panel.title = "プロジェクトのフォルダを選択"

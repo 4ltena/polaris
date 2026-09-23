@@ -97,6 +97,9 @@ final class WorkspaceServiceModel: ObservableObject {
   @Published private(set) var phase: Phase = .idle
   @Published private(set) var failure: Failure?
   @Published private(set) var snapshot: ServiceValue?
+  /// The bounded v2 control-plane projection.  It is replaced as a whole from
+  /// a snapshot or `orchestration.updated`; consumers must not merge rows.
+  @Published private(set) var orchestration: WorkspaceOrchestration?
   @Published private(set) var messages: [ServiceHistoryMessage] = []
   @Published private(set) var draftText = ""
   @Published private(set) var attachmentIDs: [String] = []
@@ -159,6 +162,15 @@ final class WorkspaceServiceModel: ObservableObject {
   @Published private(set) var startOutcomeUnknown = false
   @Published private(set) var lastStartRequestID: String?
   @Published private(set) var startStatus: ServiceRequestStatus?
+  @Published private(set) var inputAdmission: WorkspaceInputAdmission?
+  @Published private(set) var selectedSessionID: String?
+  @Published private(set) var inputAdmissionOutcomeUnknown = false
+  /// Client-issued before the request leaves this process.  It is retained
+  /// across an ambiguous reply so the only recovery operation is status on the
+  /// same admission, never another submission of the same text.
+  @Published private(set) var pendingInputAdmissionID: String?
+  @Published private(set) var subagentWaitResult: WorkspaceSubagentWaitResult?
+  @Published private(set) var subagentCancelResult: WorkspaceSubagentCancelResult?
   @Published private(set) var cancelRequested: Set<Data> = []
   @Published private(set) var pendingApprovalAnswers: Set<Data> = []
   private var needsRefresh = false
@@ -173,6 +185,20 @@ final class WorkspaceServiceModel: ObservableObject {
     var accepted = false
   }
   private var pendingStart: PendingStart?
+  private struct PendingAdmissionConsumption {
+    let id: String
+    let edit: UUID
+    let sourceSessionID: String
+    let text: String
+    let attachmentIDs: [String]
+    var runID: String?
+    var attemptID: String?
+  }
+  private var pendingAdmissionConsumption: PendingAdmissionConsumption?
+  // Sidechat admission is normally reflected by an emptied source draft. Keep
+  // this bounded local guard as well: a stale source snapshot after a durable
+  // terminal admission must never make the exact same input sendable again.
+  private var admittedSourceDraft: PendingAdmissionConsumption?
   let store: ServiceClient.PersistentStore
   let clientID: String
 
@@ -198,6 +224,7 @@ final class WorkspaceServiceModel: ObservableObject {
   @Published private(set) var nextHistoryCursor: String?
   private var historyCursors: Set<Data> = []
   private var followsLatestHistory = false
+  var activeSessionID: String { selectedSessionID ?? store.sessionID }
 
   init(helperURL: URL, store: ServiceClient.PersistentStore, clientID: String,
        makeTransport: (@Sendable () throws -> any WorkspaceServiceTransport)? = nil,
@@ -239,6 +266,7 @@ final class WorkspaceServiceModel: ObservableObject {
       && hello?.capabilities.contains("draft_update") == true
   }
   var executionAvailable: Bool { supports("run_start") }
+  var inputAdmissionAvailable: Bool { supports("input_submit") && supports("input_status") }
   var workspaceReadAvailable: Bool { supports("workspace_read") }
   var sourceApplyReadAvailable: Bool { supports("source_apply_read") }
   var canSend: Bool {
@@ -597,8 +625,8 @@ final class WorkspaceServiceModel: ObservableObject {
     guard let hello else { throw ServiceError.notReady }
     observedDraftIsCurrent = false
     let editAtStart = localEdit
-    let payload = try await send(.subscribe(session: store.sessionID), connection: connection, token: token)
-    let incoming = try ServiceReadContext(snapshot: payload, epoch: hello.epoch, sessionID: store.sessionID)
+    let payload = try await send(.subscribe(session: activeSessionID), connection: connection, token: token)
+    let incoming = try ServiceReadContext(snapshot: payload, epoch: hello.epoch, sessionID: activeSessionID)
     if let context, context.epoch.utf8.elementsEqual(incoming.epoch.utf8),
        incoming.sessionRevision < max(context.sessionRevision, eventRevision) { throw Failure.stale }
     // A confirmed mutation is a durable lower bound even across transport restart.
@@ -644,9 +672,29 @@ final class WorkspaceServiceModel: ObservableObject {
       draftConflict = false
       pendingStart = nil
     }
+    // Admission is the v2 equivalent of a consumed draft, but its ACK alone
+    // is not durable proof.  Clear only after the selected lane publishes an
+    // empty draft together with the exact admitted run, and never erase a
+    // local edit made after submission.
+    if let pending = pendingAdmissionConsumption,
+       let admission = inputAdmission,
+       admission.id.utf8.elementsEqual(pending.id.utf8),
+       let runID = pending.runID, let attemptID = pending.attemptID,
+       admission.runID?.utf8.elementsEqual(runID.utf8) == true,
+       admission.attemptID?.utf8.elementsEqual(attemptID.utf8) == true,
+       restoredRuns.contains(where: { $0.id.utf8.elementsEqual(runID.utf8) && $0.attemptID.utf8.elementsEqual(attemptID.utf8) }),
+       draft["text"] == .string("") {
+      savedDraftRevision = remoteRevision
+      if localEdit == pending.edit { isDirty = false; draftText = "" }
+      draftConflict = false
+      pendingAdmissionConsumption = nil
+    }
     let display = try reconciledDisplay(history: loaded, epoch: incoming.epoch)
     let restoredMemory = try payload["memory"].map(WorkspaceMemoryStatus.init)
-    snapshot = payload; context = incoming; messages = loaded; memoryStatus = restoredMemory
+    let restoredOrchestration = try payload["orchestration"].map(WorkspaceOrchestration.init)
+    // Publish the durable snapshot and its bounded control-plane replacement
+    // together on this MainActor turn.  Neither is pieced together from rows.
+    snapshot = payload; orchestration = restoredOrchestration; context = incoming; messages = loaded; memoryStatus = restoredMemory
     if executionAvailable, let revision = payload["configuration"]?["configuration_revision"]?.decimal {
       if let connectedConfigurationRevision { executionNeedsRefresh = revision != connectedConfigurationRevision }
       else { connectedConfigurationRevision = revision }
@@ -823,7 +871,7 @@ final class WorkspaceServiceModel: ObservableObject {
     isBusy = true; failure = nil
     do {
       let reply = try await transport.send(requestID: requestID,
-        request: .draft(session: store.sessionID, revision: revision, text: text))
+        request: .draft(session: activeSessionID, revision: revision, text: text))
       try requireCurrent(token)
       let payload = try checked(reply, id: requestID, method: "draft.update")
       guard revision < UInt64.max, payload["draft_revision"]?.decimal == revision + 1,
@@ -1077,6 +1125,275 @@ final class WorkspaceServiceModel: ObservableObject {
 }
 
 extension WorkspaceServiceModel {
+  // A switch replaces the displayed durable draft. Require the current draft
+  // to be settled so choosing a sidechat cannot silently discard typed input.
+  var canSelectManagedSession: Bool {
+    phase == .ready && !isBusy && !isDirty && !draftOutcomeUnknown && supports("session_manage")
+  }
+
+  /// The service owns lane selection. Do not pre-emptively change the local
+  /// session: the returned snapshot is the proof that the requested lane won.
+  func selectManagedSession(_ id: String) async {
+    guard canSelectManagedSession, let connection = transport else { return }
+    let token = generation
+    isBusy = true; failure = nil
+    do {
+      let requestID = UUID().uuidString
+      let reply = try await connection.send(requestID: requestID, request: .sessionSelect(session: id))
+      let payload = try checked(reply, id: requestID, method: "session.select")
+      guard payload["session_id"]?.matchesID(id) == true else { throw Failure.stale }
+      selectedSessionID = id
+      try await loadSelectedSnapshot(payload, token: token, sessionID: id)
+      isBusy = false
+    } catch { failed(error, token: token) }
+  }
+
+  func cancelPendingInput() async {
+    guard phase == .ready, !isBusy, supports("input_cancel"), let connection = transport,
+          let admission = inputAdmission, let managerRevision = orchestration?.sessionManager.revision else { return }
+    let token = generation
+    isBusy = true; failure = nil
+    do {
+      let requestID = UUID().uuidString
+      let reply = try await connection.send(requestID: requestID,
+        request: .inputCancel(session: activeSessionID, managerRevision: managerRevision, admission: admission.id))
+      let payload = try checked(reply, id: requestID, method: "input.cancel")
+      guard let cancelled = try Self.inputAdmission(payload, fallbackHash: admission.inputHash),
+            cancelled.id.utf8.elementsEqual(admission.id.utf8) else { throw Failure.stale }
+      recordInputAdmission(cancelled)
+      isBusy = false
+      await refresh()
+    } catch { failed(error, token: token) }
+  }
+
+  private func loadSelectedSnapshot(_ payload: ServiceValue, token: UUID, sessionID: String) async throws {
+    guard let hello else { throw ServiceError.notReady }
+    let incoming = try ServiceReadContext(snapshot: payload, epoch: hello.epoch, sessionID: sessionID)
+    snapshot = payload; context = incoming; orchestration = try payload["orchestration"].map(WorkspaceOrchestration.init)
+    draftText = payload["draft"]?["text"]?.string ?? ""
+    if case .array(let ids) = payload["draft"]?["attachment_ids"] { attachmentIDs = ids.compactMap(\.string) }
+    else { attachmentIDs = [] }
+    savedDraftRevision = payload["draft"]?["draft_revision"]?.decimal
+    messages = []; retainedHistory = []; streamMessages = []; runs = []; approvals = []
+    inputAdmission = nil; pendingInputAdmissionID = nil; inputAdmissionOutcomeUnknown = false
+    draftConflict = false; observedDraftIsCurrent = true; isDirty = false
+    eventRevision = incoming.sessionRevision; eventSequence = payload["position"]?["event_seq"]?.decimal ?? 0
+    selectedSessionID = sessionID
+  }
+
+  var canSubmitInput: Bool {
+    guard phase == .ready, !isBusy, inputAdmissionAvailable, !inputAdmissionOutcomeUnknown,
+          let managerRevision = orchestration?.sessionManager.revision, managerRevision < UInt64.max else { return false }
+    // Attachment IDs already owned by the durable draft are a supported v2
+    // input field. Imported files are deliberately different: until they are
+    // persisted they have no service-issued ID and must not be guessed here.
+    return pendingInputAdmissionID == nil && attachmentIDs.count <= 16 && importedAttachments.isEmpty
+      && !isUnchangedAdmittedSourceDraft
+      && !draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  private var isUnchangedAdmittedSourceDraft: Bool {
+    guard let admitted = admittedSourceDraft,
+          admitted.sourceSessionID.utf8.elementsEqual(activeSessionID.utf8) else { return false }
+    return draftText.utf8.elementsEqual(admitted.text.utf8)
+      && attachmentIDs.elementsEqual(admitted.attachmentIDs)
+  }
+
+  /// The v2 admission owner decides routing.  This request is not a draft/run
+  /// retry: an uncertain reply leaves the exact input visible and requires a
+  /// status read of the original admission ID.
+  func submitInput() async {
+    guard canSubmitInput, let connection = transport else { return }
+    let text = draftText
+    let token = generation
+    let requestID = UUID().uuidString
+    let admissionID = "adm-" + UUID().uuidString
+    pendingAdmissionConsumption = .init(id: admissionID, edit: localEdit,
+                                        sourceSessionID: activeSessionID, text: text,
+                                        attachmentIDs: attachmentIDs, runID: nil, attemptID: nil)
+    pendingInputAdmissionID = admissionID
+    isBusy = true; failure = nil; inputAdmissionOutcomeUnknown = true
+    do {
+      let sessions = try await send(.sessionList, connection: connection, token: token)
+      guard let coordinates = try Self.currentSessionAdmissionCoordinates(sessions, id: activeSessionID) else {
+        throw Failure.stale
+      }
+      let reply = try await connection.send(requestID: requestID,
+        request: .inputSubmit(session: activeSessionID, managerRevision: coordinates.managerRevision,
+                              sessionRevision: coordinates.sessionRevision, goalRevision: coordinates.goalRevision,
+                              route: "auto", text: text, attachments: attachmentIDs, reference: nil, admission: admissionID))
+      try requireCurrent(token)
+      let payload = try checked(reply, id: requestID, method: "input.submit")
+      guard let admission = try Self.inputAdmission(payload) else { throw ServiceError.schema }
+      guard admission.id.utf8.elementsEqual(admissionID.utf8) else { throw Failure.stale }
+      recordInputAdmission(admission)
+      isBusy = false
+      // The owner will publish a new snapshot/event. Keep text until that
+      // durable state is observed; this prevents an accidental blind resend.
+      await refresh()
+    } catch {
+      guard generation == token else { return }
+      if case Failure.rejected(let code) = error, !Self.ambiguousPublication(code) {
+        inputAdmissionOutcomeUnknown = false
+        pendingAdmissionConsumption = nil
+      }
+      failed(error, token: token)
+    }
+  }
+
+  func refreshInputAdmissionStatus() async {
+    guard phase == .ready, !isBusy, inputAdmissionAvailable, let admissionID = pendingInputAdmissionID,
+          let connection = transport else { return }
+    let token = generation
+    isBusy = true; failure = nil
+    do {
+      let payload = try await send(.inputStatus(session: activeSessionID, admission: admissionID), connection: connection, token: token)
+      guard let observed = try Self.inputAdmission(payload, fallbackHash: inputAdmission?.inputHash),
+            observed.id.utf8.elementsEqual(admissionID.utf8) else { throw Failure.stale }
+      recordInputAdmission(observed)
+      isBusy = false
+      await refresh()
+    } catch { failed(error, token: token) }
+  }
+
+  // `subagent.wait` and `subagent.cancel` are one service capability. The
+  // wire method names are not capability identifiers.
+  var canWaitSubagents: Bool { phase == .ready && !isBusy && supports("subagent_control") }
+  var canCancelSubagents: Bool { phase == .ready && !isBusy && supports("subagent_control") }
+
+  func waitSubagents(root: WorkspaceRun, afterCursor: UInt64? = nil, controlRevision: UInt64) async {
+    guard canWaitSubagents, let connection = transport,
+          runs.contains(where: { $0.key == root.key && !$0.isTerminal }),
+          orchestration?.subagents.contains(where: {
+            $0.rootRunID.utf8.elementsEqual(root.id.utf8)
+              && $0.rootAttemptID.utf8.elementsEqual(root.attemptID.utf8)
+              && $0.controlRevision == controlRevision
+          }) == true else { return }
+    let token = generation
+    isBusy = true; failure = nil
+    do {
+      let payload = try await send(.subagentWait(session: activeSessionID, rootRun: root.id,
+        rootAttempt: root.attemptID, revision: controlRevision, afterCursor: afterCursor), connection: connection, token: token)
+      let result = try Self.subagentWait(payload, root: root, minimumRevision: controlRevision, afterCursor: afterCursor)
+      subagentWaitResult = result
+      isBusy = false
+      await refresh()
+    } catch { failed(error, token: token) }
+  }
+
+  func cancelSubagent(root: WorkspaceRun, child: WorkspaceSubagentProjection) async {
+    guard canCancelSubagents, let connection = transport,
+          runs.contains(where: { $0.key == root.key && !$0.isTerminal }),
+          orchestration?.subagents.contains(where: {
+            $0.id.utf8.elementsEqual(child.id.utf8)
+              && $0.rootRunID.utf8.elementsEqual(root.id.utf8)
+              && $0.rootAttemptID.utf8.elementsEqual(root.attemptID.utf8)
+              && $0.controlRevision == child.controlRevision
+          }) == true else { return }
+    let token = generation
+    isBusy = true; failure = nil
+    do {
+      let payload = try await send(.subagentCancel(session: activeSessionID, rootRun: root.id,
+        rootAttempt: root.attemptID, logicalChild: child.logicalChildID, childAttempt: child.id,
+        revision: child.controlRevision), connection: connection, token: token)
+      let result = try Self.subagentCancel(payload, root: root, child: child, minimumRevision: child.controlRevision)
+      subagentCancelResult = result
+      isBusy = false
+      await refresh()
+    } catch { failed(error, token: token) }
+  }
+
+  private static func subagentWait(_ payload: ServiceValue, root: WorkspaceRun, minimumRevision: UInt64,
+                                   afterCursor: UInt64?) throws -> WorkspaceSubagentWaitResult {
+    guard payload["root_run_id"]?.matchesID(root.id) == true,
+          payload["root_attempt_id"]?.matchesID(root.attemptID) == true,
+          let revision = payload["revision"]?.decimal, revision >= minimumRevision,
+          let cursor = payload["cursor"]?.decimal, afterCursor.map({ cursor >= $0 }) ?? true,
+          let stateText = payload["state"]?.string, let state = WorkspaceSubagentWaitState(rawValue: stateText),
+          let total = payload["child_total"]?.decimal, let omitted = payload["child_omitted"],
+          case .bool(let childOmitted) = omitted, case .array(let rows) = payload["children"], rows.count <= 32
+    else { throw Failure.stale }
+    let children = try rows.map { row -> WorkspaceSubagentProjection in
+      guard row["root_run_id"]?.matchesID(root.id) == true,
+            row["root_attempt_id"]?.matchesID(root.attemptID) == true,
+            let controlRevision = row["control_revision"]?.decimal, controlRevision >= minimumRevision,
+            let logical = row["logical_child_id"]?.string, let attempt = row["attempt_id"]?.string,
+            let name = row["display_name"]?.string, let role = row["role"]?.string,
+            let stateText = row["state"]?.string, let childState = WorkspaceSubagentState(rawValue: stateText) else {
+        throw ServiceError.schema
+      }
+      return .init(id: attempt, rootRunID: root.id, rootAttemptID: root.attemptID, controlRevision: controlRevision,
+                   logicalChildID: logical, displayName: name,
+                   role: role, state: childState, activity: row["activity"]?.string)
+    }
+    guard Set(children.map(\.id)).count == children.count, total >= UInt64(children.count) else { throw Failure.stale }
+    return .init(rootRunID: root.id, rootAttemptID: root.attemptID, revision: revision, cursor: cursor,
+                 state: state, childTotal: total, childOmitted: childOmitted, children: children)
+  }
+
+  private static func subagentCancel(_ payload: ServiceValue, root: WorkspaceRun,
+                                     child: WorkspaceSubagentProjection, minimumRevision: UInt64) throws -> WorkspaceSubagentCancelResult {
+    guard payload["root_run_id"]?.matchesID(root.id) == true,
+          payload["root_attempt_id"]?.matchesID(root.attemptID) == true,
+          payload["logical_child_id"]?.matchesID(child.logicalChildID) == true,
+          payload["child_attempt_id"]?.matchesID(child.id) == true,
+          let revision = payload["revision"]?.decimal, revision >= minimumRevision,
+          let cursor = payload["cursor"]?.decimal,
+          let dispositionText = payload["disposition"]?.string,
+          let disposition = WorkspaceSubagentCancelDisposition(rawValue: dispositionText),
+          let stateText = payload["state"]?.string, let state = WorkspaceSubagentState(rawValue: stateText),
+          let effectText = payload["runtime_effect"]?.string,
+          let effect = WorkspaceSubagentRuntimeEffect(rawValue: effectText)
+    else { throw Failure.stale }
+    return .init(rootRunID: root.id, rootAttemptID: root.attemptID, logicalChildID: child.logicalChildID,
+                 childAttemptID: child.id, revision: revision, cursor: cursor,
+                 disposition: disposition, state: state, runtimeEffect: effect)
+  }
+
+  private static func inputAdmission(_ payload: ServiceValue, fallbackHash: String? = nil) throws -> WorkspaceInputAdmission? {
+    guard let id = payload["admission_id"]?.string, let hash = payload["input_hash"]?.string ?? fallbackHash,
+          let stateText = payload["state"]?.string, let state = WorkspaceInputAdmissionState(rawValue: stateText),
+          let revision = payload["session_revision"]?.decimal else { return nil }
+    let run = payload["run"]
+    guard let route = payload["route"]?.string else { return nil }
+    return .init(id: id, inputHash: hash, state: state, sessionRevision: revision,
+                 route: route, routeReason: payload["route_reason"]?.string,
+                 destinationSessionID: payload["destination_session_id"]?.string,
+                 runID: run?["run_id"]?.string, attemptID: run?["attempt_id"]?.string)
+  }
+
+  private func recordInputAdmission(_ admission: WorkspaceInputAdmission) {
+    inputAdmission = admission
+    inputAdmissionOutcomeUnknown = admission.state == WorkspaceInputAdmissionState.outcomeUnknown
+    if var pending = pendingAdmissionConsumption, pending.id.utf8.elementsEqual(admission.id.utf8) {
+      pending.runID = admission.runID; pending.attemptID = admission.attemptID
+      pendingAdmissionConsumption = pending
+      let isDifferentDestination = admission.destinationSessionID.map {
+        !$0.utf8.elementsEqual(pending.sourceSessionID.utf8)
+      } ?? false
+      if (admission.state == .completed || admission.state == .cancelled), isDifferentDestination {
+        admittedSourceDraft = pending
+      }
+    }
+    switch admission.state {
+    case .completed, .failed, .cancelled:
+      pendingInputAdmissionID = nil
+      pendingAdmissionConsumption = nil
+    default:
+      break
+    }
+  }
+
+  private static func currentSessionAdmissionCoordinates(_ payload: ServiceValue, id: String)
+    throws -> (managerRevision: UInt64, sessionRevision: UInt64, goalRevision: UInt64)? {
+    guard let managerRevision = payload["manager_revision"]?.decimal,
+          case .array(let sessions) = payload["sessions"] else { return nil }
+    let row = sessions.first { $0["session_id"]?.matchesID(id) == true }
+    guard let row, let sessionRevision = row["session_revision"]?.decimal,
+          let goalRevision = row["goal_revision"]?.decimal else { return nil }
+    return (managerRevision, sessionRevision, goalRevision)
+  }
+
   /// The snapshot remains authoritative. This sends no skill/profile text and
   /// does not update local selection until the durable snapshot is reloaded.
   func configureWorkflow(enabled: Bool, mode: String, initialPhase: String) async {
@@ -1088,7 +1405,7 @@ extension WorkspaceServiceModel {
     do {
       let id = UUID().uuidString
       let reply = try await connection.send(requestID: id,
-        request: .workflowConfigure(session: store.sessionID, revision: revision,
+        request: .workflowConfigure(session: activeSessionID, revision: revision,
                                     enabled: enabled, mode: mode, initialPhase: initialPhase))
       try requireCurrent(token)
       _ = try checked(reply, id: id, method: "workflow.configure")
@@ -1117,7 +1434,7 @@ extension WorkspaceServiceModel {
     isBusy = true; failure = nil
     do {
       let reply = try await connection.send(requestID: id,
-        request: .run(session: store.sessionID, draft: draft, configuration: configuration, policy: policy))
+        request: .run(session: activeSessionID, draft: draft, configuration: configuration, policy: policy))
       try requireCurrent(token)
       let payload = try checked(reply, id: id, method: "run.start")
       guard let revision = payload["session_revision"]?.decimal, revision > max(context?.sessionRevision ?? 0, savedSessionRevision) else { throw Failure.stale }
@@ -1167,7 +1484,7 @@ extension WorkspaceServiceModel {
     // Unknown ACK cannot silently become a fresh cancel; state comes from events/snapshot.
     cancelRequested.insert(run.key)
     do {
-      _ = try await send(.cancel(session: store.sessionID, run: run.id, attempt: run.attemptID), connection: connection, token: token)
+      _ = try await send(.cancel(session: activeSessionID, run: run.id, attempt: run.attemptID), connection: connection, token: token)
       isBusy = false
     } catch {
       if generation == token, case Failure.rejected(let code) = error, !Self.ambiguousPublication(code) {
@@ -1182,7 +1499,7 @@ extension WorkspaceServiceModel {
     let token = generation
     isBusy = true; failure = nil; pendingApprovalAnswers.insert(approval.key)
     do {
-      let payload = try await send(.approval(session: store.sessionID, id: approval.id, run: approval.runID,
+      let payload = try await send(.approval(session: activeSessionID, id: approval.id, run: approval.runID,
         attempt: approval.attemptID, policy: approval.policy, decision: decision), connection: connection, token: token)
       guard payload["approval_id"]?.matchesID(approval.id) == true,
             payload["decision"] == .string(decision.rawValue) else { throw Failure.stale }
@@ -1300,7 +1617,7 @@ extension WorkspaceServiceModel {
       var next: UInt64?
       repeat {
         guard seenOffsets.insert(offset).inserted, values.count < 256 else { throw Failure.capacity }
-        let payload = try await send(.sourceApplyList(session: store.sessionID, revision: revision,
+        let payload = try await send(.sourceApplyList(session: activeSessionID, revision: revision,
           offset: offset, limit: 32), connection: connection, token: token)
         try ServiceSchema.sourceApplyList.check(payload)
         guard payload["session_revision"]?.decimal == revision,
@@ -1352,7 +1669,7 @@ extension WorkspaceServiceModel {
     isBusy = true; failure = nil; sourceApplyNotice = nil
     defer { if generation == token { isBusy = false } }
     do {
-      let payload = try await send(.sourceApplyPage(session: store.sessionID, approval: candidate.id,
+      let payload = try await send(.sourceApplyPage(session: activeSessionID, approval: candidate.id,
         hash: candidate.payloadHash, revision: revision, offset: offset, limit: 32), connection: connection, token: token)
       let page = try SourceApplyPage(payload)
       guard page.approvalID.utf8.elementsEqual(candidate.id.utf8),
@@ -1381,7 +1698,7 @@ extension WorkspaceServiceModel {
     isBusy = true; failure = nil; sourceApplyNotice = nil; sourceApplyResultTimedOut = false
     pendingSourceApplyAnswers.insert(candidate.key)
     do {
-      let payload = try await send(.sourceApplyResolve(session: store.sessionID, run: candidate.runID,
+      let payload = try await send(.sourceApplyResolve(session: activeSessionID, run: candidate.runID,
         attempt: candidate.attemptID, approval: candidate.id, hash: candidate.payloadHash, revision: revision,
         policy: candidate.policyRevision, decision: decision), connection: connection, token: token)
       guard payload["approval_id"]?.matchesID(candidate.id) == true,
@@ -1444,7 +1761,7 @@ extension WorkspaceServiceModel {
     guard let hello, context != nil else { throw ServiceError.notReady }
     for event in events {
       try ServiceSchema.validateEvent(event, epoch: hello.epoch)
-      guard event["session_id"]?.matchesID(store.sessionID) == true,
+      guard event["session_id"]?.matchesID(activeSessionID) == true,
             event["subscription_id"]?.matchesID(snapshot?["position"]?["subscription_id"]?.string ?? "") == true,
             eventSequence < UInt64.max, event["event_seq"]?.decimal == eventSequence + 1,
             let revision = event["session_revision"]?.decimal, revision >= eventRevision else { throw Failure.stale }
@@ -1454,6 +1771,10 @@ extension WorkspaceServiceModel {
         if executionAvailable { executionNeedsRefresh = true }
       case "memory.updated":
         memoryStatus = try WorkspaceMemoryStatus(payload)
+      case "orchestration.updated":
+        // v2 event payload is a full replacement, never a delta.  Retaining
+        // old child/lease rows here would invent a live control-plane state.
+        orchestration = try WorkspaceOrchestration(payload)
       case "run.state":
         let run = try WorkspaceRun(payload, generation: generation)
         if let index = runs.firstIndex(where: { $0.key == run.key }) {
@@ -1467,6 +1788,7 @@ extension WorkspaceServiceModel {
           cancelRequested.remove(run.key)
           judgingRuns.remove(run.activityKey)
           contextJudgingRuns.remove(run.activityKey)
+          completeInputAdmission(for: run)
         }
       case "run.activity":
         let activity = try WorkspaceRunActivity(payload)
@@ -1510,6 +1832,28 @@ extension WorkspaceServiceModel {
       eventSequence += 1; eventRevision = revision
     }
   }
+
+  /// A terminal event is the durable completion signal for the exact run
+  /// admitted above.  Do not release an unrelated pending admission merely
+  /// because another lane reached a terminal state.
+  private func completeInputAdmission(for run: WorkspaceRun) {
+    guard let admission = inputAdmission,
+          admission.runID?.utf8.elementsEqual(run.id.utf8) == true,
+          admission.attemptID?.utf8.elementsEqual(run.attemptID.utf8) == true else { return }
+    let state: WorkspaceInputAdmissionState
+    switch run.state {
+    case "succeeded": state = .completed
+    case "cancelled": state = .cancelled
+    case "failed", "interrupted": state = .failed
+    case "outcome_unknown": state = .outcomeUnknown
+    default: return
+    }
+    recordInputAdmission(.init(id: admission.id, inputHash: admission.inputHash, state: state,
+                               sessionRevision: admission.sessionRevision, route: admission.route,
+                               routeReason: admission.routeReason,
+                               destinationSessionID: admission.destinationSessionID,
+                               runID: admission.runID, attemptID: admission.attemptID))
+  }
 }
 
 extension WorkspaceServiceModel {
@@ -1524,7 +1868,7 @@ extension WorkspaceServiceModel {
       return
     }
     do {
-      let payload = try await send(.runDetails(session: store.sessionID, run: run.id, attempt: run.attemptID,
+      let payload = try await send(.runDetails(session: activeSessionID, run: run.id, attempt: run.attemptID,
                                                snapshot: nil, cursor: nil), connection: connection, token: generation)
       let details = try WorkspaceRunDetails(run: run, first: ServiceRunDetailsPage(payload))
       guard runDetailsToken == token else { return }
@@ -1544,7 +1888,7 @@ extension WorkspaceServiceModel {
     let token = UUID()
     runDetailsToken = token; runDetailsNotice = nil
     do {
-      let payload = try await send(.runDetails(session: store.sessionID, run: String(decoding: details.runKey, as: UTF8.self),
+      let payload = try await send(.runDetails(session: activeSessionID, run: String(decoding: details.runKey, as: UTF8.self),
                                                attempt: details.attemptID, snapshot: details.snapshotID, cursor: cursor),
                                    connection: connection, token: generation)
       let page = try ServiceRunDetailsPage(payload)

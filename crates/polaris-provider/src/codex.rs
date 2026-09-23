@@ -165,7 +165,13 @@ pub fn tool_wire_shape(tools: &[polaris_tools::ToolSpec]) -> Vec<Value> {
 /// Astra's output is 646 tokens a run, 24% of what the parity family
 /// costs, so this is worth a measurement rather than an assumption.
 fn verbosity() -> Option<String> {
-    let value = std::env::var("POLARIS_VERBOSITY").ok()?;
+    // Low by default. Measured on 2026-09-21 at $0.1288 against $0.1344
+    // over n=12 with quality 36/36 — a 4% difference that did not
+    // separate from noise on its own (t=1.42), which is why it sat behind
+    // the variable until the cost target made the trade explicit. pi
+    // ships `low` as its own default and answers the same three questions
+    // correctly on a third of the output.
+    let value = std::env::var("POLARIS_VERBOSITY").unwrap_or_else(|_| "low".to_owned());
     matches!(value.as_str(), "low" | "medium" | "high").then_some(value)
 }
 

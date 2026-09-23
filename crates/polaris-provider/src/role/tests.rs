@@ -1,7 +1,10 @@
 //! Immutable role routing, missing-binding refusal, and usage propagation.
 use super::*;
 use crate::{Usage, UsageMeter, turn_affinity::TurnContext};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 struct Fake {
     name: &'static str,
@@ -35,6 +38,53 @@ fn request() -> CompletionRequest {
         messages: vec![],
         tools: vec![],
     }
+}
+
+#[test]
+fn root_model_and_effort_changes_reach_only_the_parent() {
+    struct Configurable {
+        changes: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for Configurable {
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            unreachable!()
+        }
+
+        fn set_model(&self, model: &str) {
+            self.changes.lock().unwrap().push(format!("model={model}"));
+        }
+
+        fn set_effort(&self, effort: Option<&str>) {
+            self.changes
+                .lock()
+                .unwrap()
+                .push(format!("effort={}", effort.unwrap_or("none")));
+        }
+    }
+
+    let parent = Arc::new(Configurable {
+        changes: Mutex::new(Vec::new()),
+    });
+    let child = Arc::new(Configurable {
+        changes: Mutex::new(Vec::new()),
+    });
+    let router = RoleProvider::new(
+        parent.clone(),
+        HashMap::from([("reviewer".into(), child.clone() as Arc<dyn Provider>)]),
+    );
+
+    router.set_model("gpt-6-astra");
+    router.set_effort(Some("high"));
+
+    assert_eq!(
+        *parent.changes.lock().unwrap(),
+        ["model=gpt-6-astra", "effort=high"]
+    );
+    assert!(child.changes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

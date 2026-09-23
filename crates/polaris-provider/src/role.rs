@@ -101,8 +101,16 @@ impl Provider for RoleProvider {
     fn model(&self) -> Option<String> {
         self.parent.model()
     }
-    // Model/effort setters intentionally retain fixed-provider no-op defaults:
-    // the weights above are separate instances, not one instance retuned.
+    // Root switches affect only the parent. Tier providers remain separate,
+    // immutable instances, so concurrent delegated tasks cannot retune one
+    // another.
+    fn set_model(&self, model: &str) {
+        self.parent.set_model(model);
+    }
+
+    fn set_effort(&self, effort: Option<&str>) {
+        self.parent.set_effort(effort);
+    }
 }
 
 #[cfg(test)]

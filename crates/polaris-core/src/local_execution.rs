@@ -170,6 +170,12 @@ impl Provider for LocalBinding {
     {
         Box::pin(self.execute(req))
     }
+
+    fn model(&self) -> Option<String> {
+        self.selection
+            .as_ref()
+            .map(|selection| selection.model().id().to_string())
+    }
 }
 #[cfg(test)]
 #[path = "local_execution/tests.rs"]

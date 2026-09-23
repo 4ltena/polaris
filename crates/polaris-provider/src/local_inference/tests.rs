@@ -80,6 +80,8 @@ async fn parallel_models_are_fixed_and_usage_and_tool_wire_are_shared() {
     a.set_model("wrong");
     a.set_effort(Some("high"));
     b.set_model("alpha");
+    assert_eq!(a.model().as_deref(), Some("alpha"));
+    assert_eq!(b.model().as_deref(), Some("beta"));
     let mut tool_request = request();
     tool_request.tools = polaris_tools::all_specs();
     let expected_tools = crate::openai::tool_wire_shape(&tool_request.tools);

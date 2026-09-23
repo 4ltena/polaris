@@ -82,6 +82,10 @@ impl Provider for LocalInferenceProvider {
         }
         self.transport.complete(req).await
     }
+
+    fn model(&self) -> Option<String> {
+        Some(self.selection.model().id().to_string())
+    }
 }
 
 #[cfg(test)]

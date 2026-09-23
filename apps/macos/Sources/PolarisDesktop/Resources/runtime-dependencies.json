@@ -53,7 +53,7 @@
     },
     {
       "id": "embedding_runtime",
-      "version": "cpython-3.11.9+e5-2026.09",
+      "version": "cpython-3.11.9+e5-cat-2026.09",
       "platform": "macos",
       "architecture": "arm64",
       "url": "https://github.com/astral-sh/uv/releases/download/0.12.16/uv-aarch64-apple-darwin.tar.gz",
@@ -63,6 +63,7 @@
       "archive": "tar_gzip",
       "archive_root": "uv-aarch64-apple-darwin",
       "install_kind": "uv_embedding",
+      "legacy_runtime": true,
       "required_executable": "runtime/bin/python3.11",
       "python_version": "3.11.9",
       "exclude_newer": "2026-09-19T00:00:00Z",
@@ -71,12 +72,13 @@
         "torch": "2.9.1",
         "transformers": "5.15.1",
         "tokenizers": "0.22.2",
-        "safetensors": "0.8.0"
+        "safetensors": "0.8.0",
+        "sentencepiece": "0.2.1"
       }
     },
     {
       "id": "embedding_runtime",
-      "version": "cpython-3.11.9+e5-2026.09-intel",
+      "version": "cpython-3.11.9+e5-cat-2026.09-intel",
       "platform": "macos",
       "architecture": "x86_64",
       "url": "https://github.com/astral-sh/uv/releases/download/0.12.16/uv-x86_64-apple-darwin.tar.gz",
@@ -86,6 +88,7 @@
       "archive": "tar_gzip",
       "archive_root": "uv-x86_64-apple-darwin",
       "install_kind": "uv_embedding",
+      "legacy_runtime": true,
       "required_executable": "runtime/bin/python3.11",
       "python_version": "3.11.9",
       "exclude_newer": "2026-09-19T00:00:00Z",
@@ -94,7 +97,8 @@
         "torch": "2.2.2",
         "transformers": "4.48.3",
         "tokenizers": "0.21.0",
-        "safetensors": "0.5.2"
+        "safetensors": "0.5.2",
+        "sentencepiece": "0.2.1"
       }
     },
     {
@@ -184,6 +188,75 @@
           "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/d128750597153bb5987e10b1c3493a34e5a4502a/tokenizer_config.json",
           "sha256": "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15",
           "size": 418
+        }
+      ]
+    },
+    {
+      "id": "cat_translate_3_3b",
+      "version": "47e382331d005acd54a42cdf088a76aa88788e0c",
+      "platform": "macos",
+      "architecture": "universal",
+      "destination": "models/cat-translate-3.3b",
+      "files": [
+        {
+          "path": "LICENSE",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/LICENSE",
+          "sha256": "b117dfdeb28b464adf227207c9129bdd6a1ec9de5852a01bd0ffaa6a7ab0d4f0",
+          "size": 1074
+        },
+        {
+          "path": "chat_template.jinja",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/chat_template.jinja",
+          "sha256": "037114fd990645ecdb1a75c802e9d25e4ddce2489e9476268221627e50055999",
+          "size": 2512
+        },
+        {
+          "path": "config.json",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/config.json",
+          "sha256": "d0c6ed07dec6ceeb0025d74ec893366d81df9866cbc35674066e1c89bbde5e9d",
+          "size": 692
+        },
+        {
+          "path": "generation_config.json",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/generation_config.json",
+          "sha256": "d09ffa8e771d749f1d3033dfa80b3ef9bf830f6f1a9724a4d5f0bfca9a9d1b84",
+          "size": 142
+        },
+        {
+          "path": "model-00001-of-00002.safetensors",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/model-00001-of-00002.safetensors",
+          "sha256": "04ae20e8c181825ac6051ec3b301fbdc9b13850577567db4dc196b63b7476bce",
+          "size": 4987572280
+        },
+        {
+          "path": "model-00002-of-00002.safetensors",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/model-00002-of-00002.safetensors",
+          "sha256": "2c65c0cac567eab6215dc843d266e67ab98c758ed13fb581c6bd5d846095a4f7",
+          "size": 1723680640
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/model.safetensors.index.json",
+          "sha256": "58779efec3a9705f1b3effdb604246f6c30b726ac20325ba43529f29bb5b8844",
+          "size": 23985
+        },
+        {
+          "path": "special_tokens_map.json",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/special_tokens_map.json",
+          "sha256": "30bf8256f9a1eb3287af2a9b7940465e29a38aad4a459a3e773bb3a14bd34c0f",
+          "size": 968
+        },
+        {
+          "path": "tokenizer.model",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/tokenizer.model",
+          "sha256": "008293028e1a9d9a1038d9b63d989a2319797dfeaa03f171093a57b33a3a8277",
+          "size": 1831879
+        },
+        {
+          "path": "tokenizer_config.json",
+          "url": "https://huggingface.co/cyberagent/CAT-Translate-3.3b/resolve/47e382331d005acd54a42cdf088a76aa88788e0c/tokenizer_config.json",
+          "sha256": "d7c6896cce71d6e942bd957ad1a31addaa3d4d74df7a31a5eb87dc68da9354b1",
+          "size": 3807
         }
       ]
     }

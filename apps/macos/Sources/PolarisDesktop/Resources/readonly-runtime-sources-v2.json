@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "runtime_id": "python-e5-cat",
+  "release_version": "cpython-3.11.9+e5-cat-2026.09",
+  "sources": [
+    {
+      "platform": "macos",
+      "architecture": "arm64",
+      "python_version": "3.11.9",
+      "archive_filename": "cpython-3.11.9+20240814-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "archive_root": "python",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20240814/cpython-3.11.9%2B20240814-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "sha256": "c4e2f7774421bcb381245945e132419b529399dfa4a56059acda1493751fa377",
+      "packages": {
+        "numpy": "2.4.6",
+        "safetensors": "0.8.0",
+        "sentencepiece": "0.2.1",
+        "tokenizers": "0.22.2",
+        "torch": "2.9.1",
+        "transformers": "5.15.1"
+      }
+    },
+    {
+      "platform": "macos",
+      "architecture": "x86_64",
+      "python_version": "3.11.9",
+      "archive_filename": "cpython-3.11.9+20240814-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "archive_root": "python",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20240814/cpython-3.11.9%2B20240814-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "sha256": "c8680f90137e36b54b3631271ccdfe5de363e7d563d8df87c53e11b956a00e04",
+      "packages": {
+        "numpy": "1.26.4",
+        "safetensors": "0.5.2",
+        "sentencepiece": "0.2.1",
+        "tokenizers": "0.21.0",
+        "torch": "2.2.2",
+        "transformers": "4.48.3"
+      }
+    }
+  ]
+}

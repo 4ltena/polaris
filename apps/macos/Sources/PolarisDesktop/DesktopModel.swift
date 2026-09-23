@@ -454,6 +454,33 @@ final class DesktopModel: ObservableObject {
             }
         }
     }
+
+    /// Installs an explicitly selected optional resource as part of the installer flow.
+    /// Unlike the preset, this never changes the managed-resource activation file.
+    func installOptionalDependencyAndWait(_ id: ManagedDependencyID) async throws -> Bool {
+        guard !ManagedDependencyID.preset.contains(id), presetInstallationReady else { return false }
+        do {
+            let current = try await dependencyInstaller.status(id)
+            if case .installed = current {
+                dependencyStatuses[id] = current
+                return true
+            }
+            dependencyStatuses[id] = .downloading
+            let version = try await dependencyInstaller.install(id)
+            dependencyStatuses[id] = .installed(version: version)
+            return true
+        } catch is CancellationError {
+            dependencyStatuses[id] = .notInstalled
+            throw CancellationError()
+        } catch ManagedDependencyError.cancelled {
+            dependencyStatuses[id] = .notInstalled
+            throw CancellationError()
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? "導入できませんでした。"
+            dependencyStatuses[id] = .failed(message)
+            return false
+        }
+    }
     func cancelDependency(_ id: ManagedDependencyID) {
         dependencyTasks[id]?.cancel()
     }

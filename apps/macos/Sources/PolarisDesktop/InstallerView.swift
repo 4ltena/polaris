@@ -47,6 +47,7 @@ final class InstallerCoordinator: ObservableObject {
     @Published private(set) var runState: InstallerRunState = .idle
     @Published var replacementPending = false
     @Published var launchAfterInstall = true
+    @Published var installCATTranslate = false
 
     private let payload: InstallerPayloadManager
     private var task: Task<Void, Never>?
@@ -119,20 +120,30 @@ final class InstallerCoordinator: ObservableObject {
                     throw InstallFailure.message("必要な資源を導入できませんでした。")
                 }
 
+                if installCATTranslate {
+                    runState = .running(detail: "CAT-Translate 3.3Bを導入しています", progress: 0.72)
+                    guard try await model.installOptionalDependencyAndWait(.catTranslate3B) else {
+                        if case .failed(let message) = model.dependencyStatus(.catTranslate3B) {
+                            throw InstallFailure.message("CAT-Translate 3.3B：\(message)")
+                        }
+                        throw InstallFailure.message("CAT-Translate 3.3Bを導入できませんでした。")
+                    }
+                }
+
                 if !model.ggufSourceURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    runState = .running(detail: "指定した端末内モデルを導入しています", progress: 0.74)
+                    runState = .running(detail: "指定した端末内モデルを導入しています", progress: 0.78)
                     guard await model.installQueuedGGUFIfNeeded() else {
                         if case .failed(let message) = model.ggufStatus { throw InstallFailure.message(message) }
                         throw InstallFailure.message("指定した端末内モデルを導入できませんでした。")
                     }
                 }
 
-                runState = .running(detail: "設定を安全に保存しています", progress: 0.86)
+                runState = .running(detail: "設定を安全に保存しています", progress: 0.88)
                 guard model.commitInstallerConfiguration() else {
                     throw InstallFailure.message(model.jevCredentialError ?? model.saveError ?? "設定を保存できませんでした。")
                 }
 
-                runState = .running(detail: "Polaris.appを配置しています", progress: 0.94)
+                runState = .running(detail: "Polaris.appを配置しています", progress: 0.95)
                 let installed = try await payload.install(destination: destination, replaceExisting: replaceExisting)
                 model.releaseInstallerSettingsLock()
                 runState = .completed(installed)
@@ -248,7 +259,7 @@ struct InstallerRootView: View {
                          ? "既存のPolaris.appは確認後に安全に置き換えます。"
                          : "この場所へインストールできます。")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("必要：約4.1 GB　利用可能：\(capacity(preflight.availableBytes))")
+                    Text("必要：\(installer.installCATTranslate ? "CAT導入時は\(capacity(ManagedDependencyInstaller.catTranslateRequiredSpaceBytes))以上" : "約4.1 GB")　利用可能：\(capacity(preflight.availableBytes))")
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 } else {
                     Label("この場所へ書き込めないか、空き容量が不足しています。", systemImage: "exclamationmark.triangle")
@@ -309,6 +320,13 @@ struct InstallerRootView: View {
                     }.pickerStyle(.segmented)
                     if model.document.draft.preferences.local == .linkInstalled { localModelFields }
                 }
+            }
+            installerSection("日本語翻訳モデル（任意）") {
+                Toggle("CAT-Translate 3.3Bを導入する", isOn: $installer.installCATTranslate)
+                Text(installer.installCATTranslate
+                     ? "取得サイズは約6.7 GBです。展開・検証を含め、導入時には\(capacity(ManagedDependencyInstaller.catTranslateRequiredSpaceBytes))以上の空き容量が必要です。固定した版を ~/.polaris/models/cat-translate-3.3b/\(ManagedDependencyInstaller.catTranslateRevision) へ保存し、導入後も自動では有効化しません。"
+                     : "既定では導入しません。必要になった場合だけ、このインストールで追加できます。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -386,6 +404,9 @@ struct InstallerRootView: View {
                 summary("GPT接続", model.document.draft.preferences.gpt.title)
                 summary("内部判定", model.document.draft.preferences.jevEnabled ? "Jev API" : "端末内のe5")
                 summary("端末内モデル", localSummary)
+                summary("翻訳モデル", installer.installCATTranslate
+                        ? "CAT-Translate 3.3Bを導入（必要空き：\(capacity(ManagedDependencyInstaller.catTranslateRequiredSpaceBytes))以上）"
+                        : "導入しない")
                 summary("プロジェクト", model.document.draft.preferences.projectPath ?? "後で選択")
                 summary("自動許可", model.document.draft.preferences.permission?.title ?? "未選択")
                 summary("テーマ", model.document.draft.preferences.theme.title)

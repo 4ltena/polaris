@@ -70,11 +70,91 @@ pub async fn bind_callback() -> Result<TcpListener, AuthError> {
         .map_err(|e| AuthError::PortInUse(e.to_string()))
 }
 
+#[derive(Clone, Copy)]
+enum CallbackPage {
+    AuthorizationReceived,
+    AuthorizationFailed,
+}
+
+fn callback_page(page: CallbackPage) -> String {
+    let (tone, status, title, message) = match page {
+        CallbackPage::AuthorizationReceived => (
+            "success",
+            "Authorization received",
+            "Return to Polaris",
+            "Polaris is finishing sign-in. Continue in the app or terminal.",
+        ),
+        CallbackPage::AuthorizationFailed => (
+            "failure",
+            "Authorization not completed",
+            "Return to Polaris",
+            "Check Polaris for details, then try signing in again.",
+        ),
+    };
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{status} · Polaris</title>
+<style>
+:root {{ color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; color: #f3f7fb; background: #050a10; background-image: linear-gradient(rgba(110,180,224,.07) 1px, transparent 1px), linear-gradient(90deg, rgba(110,180,224,.07) 1px, transparent 1px); background-size: 52px 52px; }}
+main {{ width: min(760px, calc(100% - 40px)); display: grid; grid-template-columns: 150px minmax(0,1fr); gap: 52px; align-items: center; }}
+.brand {{ display: flex; flex-direction: column; align-items: center; gap: 18px; color: #a8c7da; font-size: 14px; letter-spacing: .08em; }}
+.mark {{ position: relative; width: 74px; height: 74px; color: #c9eaff; }}
+.mark i {{ position: absolute; left: 50%; top: 50%; width: 25px; height: 7px; border-radius: 5px; background: currentColor; transform-origin: -9px 50%; transform: translate(9px,-50%) rotate(var(--r)); }}
+.status {{ display: flex; align-items: center; gap: 10px; color: #a7c7dc; font-size: 14px; }}
+.status::before {{ content: ""; width: 8px; height: 8px; flex: none; border-radius: 50%; background: #8fd4ff; box-shadow: 0 0 14px rgba(143,212,255,.72); }}
+.failure .status::before {{ background: #ff9d96; box-shadow: 0 0 14px rgba(255,115,105,.55); }}
+h1 {{ margin: 18px 0 12px; font-size: clamp(38px,7vw,68px); line-height: .98; letter-spacing: -.045em; font-weight: 600; }}
+p {{ max-width: 520px; margin: 0; color: #92a4b7; font-size: 18px; line-height: 1.55; }}
+small {{ display: block; margin-top: 28px; color: #62778a; font-size: 14px; }}
+@media (max-width: 620px) {{ main {{ grid-template-columns: 1fr; gap: 34px; padding-block: 48px; }} .brand {{ align-items: flex-start; }} h1 {{ font-size: clamp(42px,14vw,64px); }} }}
+@media (prefers-reduced-motion: no-preference) {{ .status::before {{ animation: pulse 1.8s ease-in-out 1; }} @keyframes pulse {{ 0% {{ transform: scale(.5); opacity: .3; }} 55% {{ transform: scale(1.45); opacity: 1; }} 100% {{ transform: scale(1); opacity: 1; }} }} }}
+</style>
+</head>
+<body class="{tone}">
+<main>
+  <div class="brand" aria-label="Polaris">
+    <div class="mark" aria-hidden="true"><i style="--r:0deg"></i><i style="--r:60deg"></i><i style="--r:120deg"></i><i style="--r:180deg"></i><i style="--r:240deg"></i><i style="--r:300deg"></i></div>
+    <span>Polaris</span>
+  </div>
+  <section>
+    <div class="status">{status}</div>
+    <h1>{title}</h1>
+    <p>{message}</p>
+    <small>You can safely close this tab.</small>
+  </section>
+</main>
+</body>
+</html>"#
+    )
+}
+
+fn callback_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Content-Length: {}\r\n\
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
+Cache-Control: no-store\r\n\
+Referrer-Policy: no-referrer\r\n\
+X-Content-Type-Options: nosniff\r\n\
+Connection: close\r\n\r\n\
+{body}",
+        body.len()
+    )
+}
+
 /// Receives the callback exactly once and returns `code`.
 ///
-/// Cut off with `timeout` so we don't wait forever. Returns a short body to
-/// the browser. With an empty response, the user would return to the
-/// terminal with no idea whether it succeeded.
+/// Cut off with `timeout` so we don't wait forever. Returns a self-contained
+/// status page to the browser. This acknowledges receipt of the authorization
+/// response; token exchange and storage still happen after this function.
 pub async fn wait_for_callback(
     listener: TcpListener,
     expected_state: &str,
@@ -103,20 +183,12 @@ pub async fn wait_for_callback(
         }
     });
 
-    let (status, body) = match &result {
-        Ok(_) => (
-            "200 OK",
-            "polaris login is complete. Return to the terminal.",
-        ),
-        Err(_) => (
-            "400 Bad Request",
-            "polaris login failed. Check the terminal.",
-        ),
+    let (status, page) = match &result {
+        Ok(_) => ("200 OK", CallbackPage::AuthorizationReceived),
+        Err(_) => ("400 Bad Request", CallbackPage::AuthorizationFailed),
     };
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let body = callback_page(page);
+    let resp = callback_response(status, &body);
     let _ = stream.write_all(resp.as_bytes()).await;
     let _ = stream.shutdown().await;
 
@@ -220,6 +292,45 @@ mod tests {
         assert!(parse_callback("garbage").is_err());
     }
 
+    #[test]
+    fn mission_status_pages_are_self_contained_and_do_not_echo_auth_data() {
+        let success = callback_page(CallbackPage::AuthorizationReceived);
+        let failure = callback_page(CallbackPage::AuthorizationFailed);
+
+        assert!(success.contains("Authorization received"));
+        assert!(success.contains("Return to Polaris"));
+        assert!(failure.contains("Authorization not completed"));
+        assert!(failure.contains("Return to Polaris"));
+        for page in [&success, &failure] {
+            assert!(page.starts_with("<!doctype html>"));
+            assert!(page.contains("prefers-reduced-motion"));
+            assert!(!page.contains("http://"));
+            assert!(!page.contains("https://"));
+            assert!(!page.contains("access_token"));
+            assert!(!page.contains("refresh_token"));
+        }
+    }
+
+    #[test]
+    fn callback_response_has_browser_security_headers_and_exact_length() {
+        let body = callback_page(CallbackPage::AuthorizationReceived);
+        let response = callback_response("200 OK", &body);
+        let (head, sent_body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .expect("Content-Length")
+            .parse::<usize>()
+            .expect("numeric Content-Length");
+
+        assert_eq!(length, sent_body.len());
+        assert!(head.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(head.contains("Content-Security-Policy:"));
+        assert!(head.contains("Cache-Control: no-store"));
+        assert!(head.contains("Referrer-Policy: no-referrer"));
+        assert!(head.contains("X-Content-Type-Options: nosniff"));
+    }
+
     /// A callback with a mismatched state is not accepted. This is a CSRF
     /// defense; removing it would let an attacker-planted code get accepted.
     #[tokio::test]
@@ -234,6 +345,7 @@ mod tests {
                 .expect("write");
             let mut buf = Vec::new();
             let _ = s.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
         });
 
         let err = wait_for_callback(listener, "EXPECTED", Duration::from_secs(5))
@@ -243,7 +355,10 @@ mod tests {
             matches!(err, AuthError::Denied(_)),
             "other than Denied: {err:?}"
         );
-        client.await.expect("client");
+        let response = client.await.expect("client");
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("Authorization not completed"));
+        assert!(!response.contains("WRONG"));
     }
 
     /// The positive counterpart. If state matches, returns the code.
@@ -276,6 +391,9 @@ mod tests {
             body.starts_with("HTTP/1.1 200"),
             "didn't return 200: {body}"
         );
+        assert!(body.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(body.contains("Authorization received"));
+        assert!(body.contains("Return to Polaris"));
         assert!(!body.trim().is_empty(), "returned nothing to the browser");
     }
 

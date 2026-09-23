@@ -112,6 +112,23 @@ fn legacy_does_not_read_resources_or_invoke_probe() {
 }
 
 #[test]
+fn product_strict10_refuses_legacy_runtime_without_v2_lease() {
+    let fixture = Fixture::new();
+    assert!(matches!(
+        prepare(
+            HistoryMode::Strict10,
+            BootstrapProvider::Codex,
+            &fixture.home,
+            &fixture.store,
+            &fixture.source,
+            None,
+        ),
+        Err(ResourceError::Runtime)
+    ));
+    assert!(!fixture.store.join("embedding-helper").exists());
+}
+
+#[test]
 fn structured10_is_refused_before_any_resource_read_or_probe() {
     let temp = tempfile::tempdir().unwrap();
     let missing = temp.path().join("missing");

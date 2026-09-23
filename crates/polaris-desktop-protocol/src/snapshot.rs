@@ -283,6 +283,10 @@ pub struct Snapshot {
     pub configuration: Configuration,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
     pub workflow: Option<WorkflowStatus>,
+    /// V2's bounded projection is separate from the v1 workflow status so an
+    /// old snapshot remains exactly decodable by a v2 client.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub orchestration: Option<crate::orchestration::OrchestrationSummaryV2>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
     pub memory: Option<MemoryStatus>,
     pub role_bindings: Vec<crate::role_bindings::RoleBinding>,

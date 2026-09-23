@@ -913,6 +913,32 @@ fn begin(engine: &mut Engine) -> RunTarget {
     }
 }
 
+#[tokio::test]
+async fn fake_engine_steps_legacy_run_without_an_admission_owner() {
+    let (_root, mut engine) = service();
+    hello(&mut engine);
+    let target = begin(&mut engine);
+    assert!(engine.admission.is_none());
+    let (out, _input, _workers) = transport::workers(
+        tokio::io::empty(),
+        tokio::io::sink(),
+        Duration::from_secs(1),
+    );
+
+    engine.step(&out).unwrap();
+
+    let run = engine
+        .store
+        .snapshot()
+        .unwrap()
+        .state
+        .runs
+        .into_iter()
+        .find(|run| run.run.run_id == target.run_id)
+        .unwrap();
+    assert_eq!(run.run.state, RunState::Running);
+}
+
 struct Client {
     tx: pipe::Sender,
     rx: pipe::Receiver,
@@ -1072,8 +1098,14 @@ async fn hello_gate_capabilities_authorization_and_unknown_version() {
         client.call(&approval).await.unwrap_err().code,
         ErrorCode::NotFound
     );
+    let mut mixed_version = request("mixed-version", RequestBody::SessionSnapshot(session_id()));
+    mixed_version.protocol_version = ProtocolVersion::V1;
+    assert_eq!(
+        client.call(&mixed_version).await.unwrap_err().code,
+        ErrorCode::UnsupportedVersion
+    );
     let mut value = serde_json::to_value(request("unknown", RequestBody::Hello)).unwrap();
-    value["protocol_version"] = 2.into();
+    value["protocol_version"] = 3.into();
     client
         .tx
         .write_all(&codec::encode(&value).unwrap())
@@ -2401,4 +2433,1401 @@ fn run_details_pages_rebuild_every_byte_and_refuse_foreign_or_expired_cursors() 
         ErrorCode::NotFound
     );
     assert_eq!(engine.store.snapshot().unwrap().marker, before);
+}
+
+fn production_engine() -> (tempfile::TempDir, ServiceConfig, Engine) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let store_root = root.path().canonicalize().unwrap();
+    std::fs::set_permissions(&store_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = ServiceConfig {
+        store_root,
+        project_id: project_id(),
+        session_id: session_id(),
+    };
+    let mut service = DesktopService::open(config.clone()).unwrap();
+    (root, config, service.engine.take().unwrap())
+}
+
+fn submit_input(
+    id: &str,
+    session: SessionId,
+    manager_revision: u64,
+    session_revision: u64,
+    route: InputRoute,
+    admission: &str,
+    text: &str,
+) -> Request {
+    request(
+        id,
+        RequestBody::InputSubmit(
+            session,
+            InputSubmit::Text {
+                expected_manager_revision: DecimalU64::new(manager_revision),
+                expected_session_revision: DecimalU64::new(session_revision),
+                expected_goal_revision: DecimalU64::new(0),
+                route,
+                attachment_ids: Vec::new(),
+                admission_id: Some(AdmissionId::new(admission).unwrap()),
+                text: text.into(),
+            },
+        ),
+    )
+}
+
+#[test]
+fn input_submit_is_idempotent_and_restart_never_resends_a_running_admission() {
+    let (_root, config, mut engine) = production_engine();
+    hello(&mut engine);
+    let submit = submit_input(
+        "input-current",
+        session_id(),
+        0,
+        0,
+        InputRoute::Current,
+        "adm-client-current",
+        "implement this",
+    );
+    let mut events = Vec::new();
+    let SuccessResult::InputSubmit(first) = engine.handle(&submit, &mut events).unwrap() else {
+        panic!("input.submit response");
+    };
+    assert_eq!(first.state, InputAdmissionState::Running);
+    assert_eq!(first.route_reason, Some(InputRouteReason::ExplicitCurrent));
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], EventBody::OrchestrationUpdated(_)));
+    assert_eq!(engine.store.snapshot().unwrap().raw.len(), 1);
+
+    let mut replay = submit.clone();
+    replay.request_id = RequestId::new("input-current-replay").unwrap();
+    let SuccessResult::InputSubmit(replayed) = direct(&mut engine, &replay).unwrap() else {
+        panic!("replayed input.submit response");
+    };
+    assert_eq!(replayed.admission_id, first.admission_id);
+    assert_eq!(replayed.input_hash, first.input_hash);
+    assert_eq!(engine.store.snapshot().unwrap().raw.len(), 1);
+    drop(engine);
+
+    let mut reopened_service = DesktopService::open(config).unwrap();
+    let mut reopened = reopened_service.engine.take().unwrap();
+    hello(&mut reopened);
+    let SuccessResult::InputStatus(status) = direct(
+        &mut reopened,
+        &request(
+            "input-current-status",
+            RequestBody::InputStatus(
+                session_id(),
+                InputStatus {
+                    admission_id: first.admission_id,
+                },
+            ),
+        ),
+    )
+    .unwrap() else {
+        panic!("input.status response");
+    };
+    assert_eq!(status.state, InputAdmissionState::OutcomeUnknown);
+    assert!(reopened.active.is_none());
+}
+
+#[test]
+fn admitted_input_consumes_only_the_matching_destination_draft() {
+    let (_root, _config, mut engine) = production_engine();
+    hello(&mut engine);
+    direct(&mut engine, &draft("draft-first", 0, "first input")).unwrap();
+    let before = engine.store.snapshot().unwrap();
+    let unavailable = direct(
+        &mut engine,
+        &request(
+            "input-reference-unavailable",
+            RequestBody::InputSubmit(
+                session_id(),
+                InputSubmit::Reference {
+                    expected_manager_revision: DecimalU64::new(0),
+                    expected_session_revision: before.marker.session_revision,
+                    expected_goal_revision: DecimalU64::new(0),
+                    route: InputRoute::Current,
+                    admission_id: Some(AdmissionId::new("adm-reference-unavailable").unwrap()),
+                    input_ref: ResultId::new("result-unavailable").unwrap(),
+                },
+            ),
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(unavailable.code, ErrorCode::ReferenceUnavailable);
+    assert_eq!(
+        engine.store.snapshot().unwrap().state.draft.text,
+        "first input"
+    );
+    let SuccessResult::InputSubmit(first) = direct(
+        &mut engine,
+        &submit_input(
+            "input-first",
+            session_id(),
+            0,
+            before.marker.session_revision.get(),
+            InputRoute::Current,
+            "adm-draft-first",
+            "first input",
+        ),
+    )
+    .unwrap() else {
+        panic!("input.submit response");
+    };
+    assert!(first.run.is_some());
+    let consumed = engine.store.snapshot().unwrap();
+    assert_eq!(consumed.state.draft.text, "");
+    assert!(consumed.state.draft.attachment_ids.is_empty());
+    assert_eq!(consumed.state.draft.draft_revision, DecimalU64::new(2));
+    assert_eq!(consumed.state.runs[0].input.text, "first input");
+
+    direct(&mut engine, &draft("draft-next", 2, "next input")).unwrap();
+    assert_eq!(
+        engine.store.snapshot().unwrap().state.draft.text,
+        "next input"
+    );
+    direct(
+        &mut engine,
+        &submit_input(
+            "input-first-replay",
+            session_id(),
+            0,
+            before.marker.session_revision.get(),
+            InputRoute::Current,
+            "adm-draft-first",
+            "first input",
+        ),
+    )
+    .unwrap();
+    let replayed = engine.store.snapshot().unwrap();
+    assert_eq!(replayed.state.draft.text, "next input");
+    assert_eq!(replayed.raw.len(), 1);
+
+    let (_other_root, _other_config, mut other) = production_engine();
+    hello(&mut other);
+    direct(&mut other, &draft("draft-edited", 0, "newer edit")).unwrap();
+    let revision = other
+        .store
+        .snapshot()
+        .unwrap()
+        .marker
+        .session_revision
+        .get();
+    direct(
+        &mut other,
+        &submit_input(
+            "input-other",
+            session_id(),
+            0,
+            revision,
+            InputRoute::Current,
+            "adm-draft-other",
+            "admitted input",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        other.store.snapshot().unwrap().state.draft.text,
+        "newer edit"
+    );
+}
+
+#[test]
+fn sidechat_admission_consumes_only_the_unchanged_source_lane_draft() {
+    let (_root, _config, mut engine) = production_engine();
+    hello(&mut engine);
+    direct(&mut engine, &draft("draft-side", 0, "side input")).unwrap();
+    let revision = engine
+        .store
+        .snapshot()
+        .unwrap()
+        .marker
+        .session_revision
+        .get();
+    let SuccessResult::InputSubmit(sidechat) = direct(
+        &mut engine,
+        &submit_input(
+            "input-side",
+            session_id(),
+            0,
+            revision,
+            InputRoute::New,
+            "adm-draft-side",
+            "side input",
+        ),
+    )
+    .unwrap() else {
+        panic!("sidechat input.submit response");
+    };
+    let sidechat_id = sidechat.destination_session_id.unwrap();
+    // The sidechat owns the admitted run, but the source copy is consumed
+    // after that append commits.  It cannot become a second submission after
+    // the sidechat completes or is cancelled.
+    assert_eq!(engine.store.snapshot().unwrap().state.draft.text, "");
+    let source_revision = engine
+        .store
+        .snapshot()
+        .unwrap()
+        .state
+        .draft
+        .draft_revision
+        .get();
+    direct(
+        &mut engine,
+        &draft("draft-after-sidechat", source_revision, "newer edit"),
+    )
+    .unwrap();
+    let SuccessResult::InputCancel(_) = direct(
+        &mut engine,
+        &request(
+            "cancel-sidechat",
+            RequestBody::InputCancel(
+                session_id(),
+                InputCancel {
+                    expected_manager_revision: sidechat.manager_revision,
+                    admission_id: sidechat.admission_id.clone(),
+                },
+            ),
+        ),
+    )
+    .unwrap() else {
+        panic!("sidechat input.cancel response");
+    };
+    // A distinct source draft, including one entered while the sidechat was
+    // running, is not overwritten by terminal admission processing.
+    assert_eq!(
+        engine.store.snapshot().unwrap().state.draft.text,
+        "newer edit"
+    );
+    engine.select_lane(&sidechat_id).unwrap();
+    let side = engine.store.snapshot().unwrap();
+    assert_eq!(side.state.draft.text, "");
+    assert_eq!(side.state.runs[0].input.text, "side input");
+}
+
+#[test]
+fn explicit_new_uses_an_empty_second_lane_and_both_sessions_can_run() {
+    let (_root, _config, mut engine) = production_engine();
+    hello(&mut engine);
+    let SuccessResult::InputSubmit(current) = direct(
+        &mut engine,
+        &submit_input(
+            "input-current",
+            session_id(),
+            0,
+            0,
+            InputRoute::Current,
+            "adm-client-current",
+            "current work",
+        ),
+    )
+    .unwrap() else {
+        panic!("current input.submit response");
+    };
+    let SuccessResult::InputSubmit(sidechat) = direct(
+        &mut engine,
+        &submit_input(
+            "input-sidechat",
+            session_id(),
+            current.manager_revision.get(),
+            current.session_revision.get(),
+            InputRoute::New,
+            "adm-client-sidechat",
+            "independent work",
+        ),
+    )
+    .unwrap() else {
+        panic!("sidechat input.submit response");
+    };
+    assert_eq!(sidechat.state, InputAdmissionState::Running);
+    assert_eq!(sidechat.route_reason, Some(InputRouteReason::ExplicitNew));
+    let destination = sidechat.destination_session_id.clone().unwrap();
+    assert_ne!(destination, session_id());
+    engine.select_lane(&destination).unwrap();
+    let saved = engine.store.snapshot().unwrap();
+    assert_eq!(saved.raw.len(), 1);
+    assert_eq!(saved.state.inherited_turn_count.get(), 0);
+    assert!(saved.state.goal.is_none());
+    assert!(saved.state.unresolved_approvals.is_empty());
+
+    let SuccessResult::SessionList(sessions) = direct(
+        &mut engine,
+        &request("session-list", RequestBody::SessionList),
+    )
+    .unwrap() else {
+        panic!("session.list response");
+    };
+    assert_eq!(sessions.session_total.get(), 2);
+    assert_eq!(sessions.sessions.len(), 2);
+    assert!(
+        sessions
+            .sessions
+            .iter()
+            .all(|session| session.active_run.is_some())
+    );
+}
+
+#[tokio::test]
+async fn transport_selection_invalidates_previous_lane_subscription() {
+    let (_root, _config, mut engine) = production_engine();
+    hello(&mut engine);
+    let SuccessResult::InputSubmit(sidechat) = direct(
+        &mut engine,
+        &submit_input(
+            "input-sidechat",
+            session_id(),
+            0,
+            0,
+            InputRoute::New,
+            "adm-transport-sidechat",
+            "independent work",
+        ),
+    )
+    .unwrap() else {
+        panic!("sidechat input.submit response");
+    };
+    let sidechat_session = sidechat.destination_session_id.unwrap();
+    // The setup uses the direct owner API only to create the managed lane.
+    // The correlation under test is the pipe transport's resume handling.
+    engine.connection = ConnectionState::AwaitingHello;
+    engine.client = None;
+    let (mut client, task) = connect(engine);
+    client
+        .call(&request("hello", RequestBody::Hello))
+        .await
+        .unwrap();
+    let SuccessResult::SessionSubscribe(main) = client
+        .call(&request(
+            "subscribe-main",
+            RequestBody::SessionSubscribe(session_id(), Subscribe::default()),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("main subscribe response");
+    };
+    let SuccessResult::SessionSubscribe(sidechat) = client
+        .call(&request(
+            "subscribe-sidechat",
+            RequestBody::SessionSubscribe(sidechat_session.clone(), Subscribe::default()),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("sidechat subscribe response");
+    };
+
+    assert_eq!(
+        client
+            .call(&request(
+                "resume-main",
+                RequestBody::SessionSubscribe(
+                    session_id(),
+                    Subscribe {
+                        resume: Some(main.position.clone()),
+                    },
+                ),
+            ))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::RevisionConflict
+    );
+    let SuccessResult::SessionSubscribe(resubscribed) = client
+        .call(&request(
+            "resubscribe-main",
+            RequestBody::SessionSubscribe(session_id(), Subscribe::default()),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("main resubscribe response");
+    };
+    assert_eq!(resubscribed.session_id, session_id());
+    assert_ne!(
+        main.position.subscription_id,
+        sidechat.position.subscription_id
+    );
+    assert_ne!(
+        main.position.subscription_id,
+        resubscribed.position.subscription_id
+    );
+    assert_ne!(
+        sidechat.position.subscription_id,
+        resubscribed.position.subscription_id
+    );
+    drop(client.tx);
+    let (_engine, result) = task.await.unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn transport_selected_sidechat_never_receives_background_main_events() {
+    let (_root, _config, mut engine) = production_engine();
+    // Keep durable SessionManager behavior while using the finite local fake
+    // runner. Enough chunks remain after selection for both lanes to step.
+    engine.production = false;
+    engine.options.script = (0..16).map(|index| format!("chunk-{index}")).collect();
+    hello(&mut engine);
+    let SuccessResult::InputSubmit(main) = direct(
+        &mut engine,
+        &submit_input(
+            "start-running-main",
+            session_id(),
+            0,
+            0,
+            InputRoute::Current,
+            "adm-running-main",
+            "main work",
+        ),
+    )
+    .unwrap() else {
+        panic!("main admission response");
+    };
+    let SuccessResult::InputSubmit(side) = direct(
+        &mut engine,
+        &submit_input(
+            "start-running-side",
+            session_id(),
+            main.manager_revision.get(),
+            main.session_revision.get(),
+            InputRoute::New,
+            "adm-running-side",
+            "side work",
+        ),
+    )
+    .unwrap() else {
+        panic!("side admission response");
+    };
+    let side_session = side.destination_session_id.clone().unwrap();
+    let side_run = side.run.clone().unwrap();
+    engine.connection = ConnectionState::AwaitingHello;
+    engine.client = None;
+    engine.wire_version = None;
+    let (mut client, task) = connect(engine);
+    client
+        .call(&request("hello-lane-stream", RequestBody::Hello))
+        .await
+        .unwrap();
+    client
+        .call(&request(
+            "subscribe-running-main",
+            RequestBody::SessionSubscribe(session_id(), Subscribe::default()),
+        ))
+        .await
+        .unwrap();
+    let SuccessResult::SessionSelect(side_snapshot) = client
+        .call(&request(
+            "select-running-side",
+            RequestBody::SessionSelect(side_session.clone()),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("side selection response");
+    };
+    // `session.select` atomically establishes the returned sidechat stream;
+    // no second subscribe request is required. `call` drains every event
+    // ordered before its response, so observe only later events here.
+    client.events.clear();
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let event = client.event().await;
+            assert_eq!(event.session_id, side_session);
+            assert_eq!(
+                event.subscription_id,
+                side_snapshot.position.subscription_id
+            );
+            if matches!(
+                event.body,
+                EventBody::RunState(ref run)
+                    if run.run_id == side_run.run_id && run.state.is_terminal()
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    drop(client.tx);
+    let (mut engine, result) = task.await.unwrap();
+    result.unwrap();
+    engine.select_lane(&session_id()).unwrap();
+    assert!(
+        engine
+            .store
+            .snapshot()
+            .unwrap()
+            .state
+            .runs
+            .iter()
+            .any(|run| {
+                run.admission
+                    .as_ref()
+                    .is_some_and(|binding| binding.admission_id == "adm-running-main")
+            })
+    );
+}
+
+#[tokio::test]
+async fn transport_cancels_consecutive_input_preserves_attachments_and_selects_sidechat() {
+    let (_root, _config, mut engine) = production_engine();
+    // Keep the durable production SessionManager while using the local fake
+    // runner. This transport test must not contact a provider.
+    engine.production = false;
+    let (mut client, task) = connect(engine);
+    client
+        .call(&request("hello", RequestBody::Hello))
+        .await
+        .unwrap();
+
+    let attachment = AttachmentId::new("attachment-transport-1").unwrap();
+    let first_request = request(
+        "input-first",
+        RequestBody::InputSubmit(
+            session_id(),
+            InputSubmit::Text {
+                expected_manager_revision: DecimalU64::new(0),
+                expected_session_revision: DecimalU64::new(0),
+                expected_goal_revision: DecimalU64::new(0),
+                route: InputRoute::Current,
+                attachment_ids: vec![attachment.clone()],
+                admission_id: Some(AdmissionId::new("adm-transport-first").unwrap()),
+                text: "main work".into(),
+            },
+        ),
+    );
+    let SuccessResult::InputSubmit(first) = client.call(&first_request).await.unwrap() else {
+        panic!("first input.submit response");
+    };
+    assert_eq!(first.destination_session_id, Some(session_id()));
+    assert!(first.run.is_some());
+
+    let first_status_request = request(
+        "input-first-status",
+        RequestBody::InputStatus(
+            session_id(),
+            InputStatus {
+                admission_id: first.admission_id.clone(),
+            },
+        ),
+    );
+    let first_terminal = timeout(Duration::from_secs(3), async {
+        loop {
+            let SuccessResult::InputStatus(status) =
+                client.call(&first_status_request).await.unwrap()
+            else {
+                panic!("first input.status response");
+            };
+            if matches!(
+                status.state,
+                InputAdmissionState::Completed
+                    | InputAdmissionState::Failed
+                    | InputAdmissionState::OutcomeUnknown
+            ) {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let second_request = submit_input(
+        "input-second",
+        session_id(),
+        first_terminal.manager_revision.get(),
+        first_terminal.session_revision.get(),
+        InputRoute::Current,
+        "adm-transport-second",
+        "follow-up work",
+    );
+    let SuccessResult::InputSubmit(second) = client.call(&second_request).await.unwrap() else {
+        panic!("second input.submit response");
+    };
+    let cancel = request(
+        "cancel-second",
+        RequestBody::InputCancel(
+            session_id(),
+            InputCancel {
+                expected_manager_revision: second.manager_revision,
+                admission_id: second.admission_id.clone(),
+            },
+        ),
+    );
+    let SuccessResult::InputCancel(cancelled) = client.call(&cancel).await.unwrap() else {
+        panic!("input.cancel response");
+    };
+    assert_eq!(cancelled.state, InputAdmissionState::Cancelled);
+    assert_eq!(cancelled.route, InputRoute::Current);
+    assert_eq!(
+        cancelled.route_reason,
+        Some(InputRouteReason::ExplicitCurrent)
+    );
+    assert_eq!(cancelled.destination_session_id, Some(session_id()));
+    assert!(cancelled.run.is_some());
+
+    // The transport settles the cancelled runtime before accepting the next
+    // control request. Refresh the writer revision after that local terminal
+    // commit instead of reusing the cancellation response's earlier marker.
+    let SuccessResult::InputStatus(cancelled) = client
+        .call(&request(
+            "cancel-second-status",
+            RequestBody::InputStatus(
+                session_id(),
+                InputStatus {
+                    admission_id: cancelled.admission_id.clone(),
+                },
+            ),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("cancelled input.status response");
+    };
+    assert_eq!(cancelled.state, InputAdmissionState::Cancelled);
+
+    let sidechat_request = submit_input(
+        "input-sidechat-select",
+        session_id(),
+        cancelled.manager_revision.get(),
+        cancelled.session_revision.get(),
+        InputRoute::New,
+        "adm-transport-select",
+        "independent work",
+    );
+    let SuccessResult::InputSubmit(sidechat) = client.call(&sidechat_request).await.unwrap() else {
+        panic!("sidechat input.submit response");
+    };
+    let sidechat_id = sidechat.destination_session_id.clone().unwrap();
+    let SuccessResult::SessionSelect(selected) = client
+        .call(&request(
+            "select-sidechat",
+            RequestBody::SessionSelect(sidechat_id.clone()),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("session.select response");
+    };
+    assert_eq!(selected.session_id, sidechat_id);
+
+    drop(client.tx);
+    let (mut engine, result) = task.await.unwrap();
+    result.unwrap();
+    engine.select_lane(&session_id()).unwrap();
+    let saved = engine.store.snapshot().unwrap();
+    assert!(saved.state.runs.iter().any(|run| {
+        run.admission
+            .as_ref()
+            .is_some_and(|binding| binding.admission_id == "adm-transport-first")
+            && run.input.attachment_ids == vec![attachment.clone()]
+    }));
+}
+
+#[tokio::test]
+async fn transport_input_submit_resolves_lossless_projected_clarification() {
+    let (_root, _config, mut engine) = production_engine();
+    engine.production = false;
+    hello(&mut engine);
+    let run = begin(&mut engine);
+    let active = engine.active.as_ref().unwrap();
+    let operation = active.operation.clone();
+    engine.store.record_intent(&run, operation.clone()).unwrap();
+    let question = "JSON/TOMLのどちらにしますか？  \"既存値\"も保持します。";
+    engine
+        .store
+        .finish_with_messages(
+            &run,
+            &operation,
+            Observation::Succeeded,
+            ResultId::new("clarification-result").unwrap(),
+            vec![
+                polaris_provider::Message::assistant_with_tool_calls(
+                    "",
+                    vec![polaris_provider::ToolCall {
+                        id: "clarify-call".into(),
+                        name: polaris_core::turn_intent::CLARIFY.into(),
+                        arguments: serde_json::json!({"questions":[question]}),
+                    }],
+                ),
+                polaris_provider::Message::tool_result("clarify-call", "waiting for user response"),
+                polaris_provider::Message::assistant("回答待ち"),
+            ],
+        )
+        .unwrap();
+    engine.active = None;
+
+    let pending_snapshot = engine.snapshot(false).unwrap();
+    let pending = &pending_snapshot.orchestration.unwrap().clarification;
+    assert_eq!(pending.state, ClarificationStateV2::Pending);
+    assert_eq!(pending.unanswered_count.get(), 1);
+    assert_eq!(pending.questions.len(), 1);
+    assert_eq!(pending.questions[0].text, question);
+    assert!(pending.questions[0].options.is_empty());
+    assert!(pending.questions[0].free_text.allowed);
+    assert!(pending.questions[0].free_text.required);
+    let question_id = pending.questions[0].question_id.clone();
+
+    let SuccessResult::SessionList(sessions) = direct(
+        &mut engine,
+        &request("clarify-sessions", RequestBody::SessionList),
+    )
+    .unwrap() else {
+        panic!("session.list response");
+    };
+    engine.connection = ConnectionState::AwaitingHello;
+    engine.client = None;
+    engine.wire_version = None;
+    let (mut client, task) = connect(engine);
+    client
+        .call(&request("hello-clarify", RequestBody::Hello))
+        .await
+        .unwrap();
+    let answer = submit_input(
+        "clarify-answer",
+        session_id(),
+        sessions.manager_revision.get(),
+        pending_snapshot.session_revision.get(),
+        InputRoute::Current,
+        "adm-clarify-answer",
+        "JSONでお願いします。",
+    );
+    let SuccessResult::InputSubmit(_) = client.call(&answer).await.unwrap() else {
+        panic!("clarification answer input.submit response");
+    };
+    let SuccessResult::SessionSnapshot(answered) = client
+        .call(&request(
+            "clarify-snapshot",
+            RequestBody::SessionSnapshot(session_id()),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("clarification snapshot response");
+    };
+    let resolved = &answered.orchestration.unwrap().clarification;
+    assert_eq!(resolved.state, ClarificationStateV2::Resolved);
+    assert_eq!(resolved.unanswered_count.get(), 0);
+    assert_eq!(resolved.questions.len(), 1);
+    assert_eq!(resolved.questions[0].question_id, question_id);
+    assert_eq!(resolved.questions[0].text, question);
+    assert!(resolved.questions[0].options.is_empty());
+    assert!(resolved.questions[0].answered);
+
+    drop(client.tx);
+    task.await.unwrap().1.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn attach_delegation(engine: &mut Engine, target: &RunTarget, child_suffix: &str, terminal: bool) {
+    use polaris_core::{
+        session::{
+            ChildControlProjectionV1, RootDelegationConfigV1, RootDelegationControlV1,
+            RootDelegationProjectionV1,
+        },
+        subagent_control::{
+            ApprovalCapabilityV1, CapabilitySnapshotV1, ChildAttemptId as CoreChildAttemptId,
+            ChildAttemptV1, ChildBindingV1, ChildControlPlaneV1, ChildStateV1,
+            LogicalChildId as CoreLogicalChildId, LogicalChildV1, McpCapabilityV1, ParentBindingV1,
+            RootAttemptId, RootRunId, SandboxCapabilityV1, TaskId, UsageAttributionV1,
+        },
+    };
+
+    let root_run_id = RootRunId::new(target.run_id.as_str()).unwrap();
+    let root_attempt_id = RootAttemptId::new(target.attempt_id.as_str()).unwrap();
+    let active_task_id = TaskId::new(format!("task-{child_suffix}")).unwrap();
+    let logical_child_id = CoreLogicalChildId::new(format!("child-{child_suffix}")).unwrap();
+    let attempt_id = CoreChildAttemptId::new(format!("child-attempt-{child_suffix}")).unwrap();
+    let state = if terminal {
+        ChildStateV1::Succeeded
+    } else {
+        ChildStateV1::Running
+    };
+    let child = LogicalChildV1 {
+        logical_child_id: logical_child_id.clone(),
+        display_name: "Sirius".into(),
+        binding: ChildBindingV1 {
+            root_run_id: root_run_id.clone(),
+            root_attempt_id: root_attempt_id.clone(),
+            active_task_id: active_task_id.clone(),
+            parent: ParentBindingV1::Root,
+        },
+        role: "file-reader".into(),
+        tier: "dwarf".into(),
+        model: "gpt-6-astra".into(),
+        effort: "xhigh".into(),
+        capabilities: CapabilitySnapshotV1 {
+            sandbox: SandboxCapabilityV1::ReadOnly,
+            write_roots: Vec::new(),
+            tool_names: vec!["read".into()],
+            approval: ApprovalCapabilityV1::Never,
+            mcp: McpCapabilityV1::None,
+        },
+        attempts: vec![ChildAttemptV1 {
+            attempt_id: attempt_id.clone(),
+            attempt_number: 0,
+            restart_of: None,
+            retry_capabilities: None,
+            state: state.clone(),
+            activity: None,
+            usage: UsageAttributionV1::Missing,
+            terminal_reason: terminal.then(|| "done".into()),
+            result_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+        }],
+    };
+    let plane = ChildControlPlaneV1 {
+        schema_version: 1,
+        children: vec![child.clone()],
+        cursor: 7,
+    };
+    let config = RootDelegationConfigV1 {
+        session_id: engine.session.as_str().into(),
+        root_run_id: root_run_id.clone(),
+        root_attempt_id: root_attempt_id.clone(),
+        active_task_id: active_task_id.clone(),
+        parent_capabilities: child.capabilities.clone(),
+        model: "gpt-6-astra".into(),
+        effort: "xhigh".into(),
+    };
+    let hook = Arc::new(|_| Ok(()));
+    let control = if terminal {
+        RootDelegationControlV1::restore_with_persistence_hook(config, plane, 0, hook)
+    } else {
+        RootDelegationControlV1::new_live_with_persistence_hook_for_test(config, plane, 0, hook)
+    }
+    .unwrap();
+    let initial = RootDelegationProjectionV1 {
+        revision: 0,
+        session_id: engine.session.as_str().into(),
+        root_run_id,
+        root_attempt_id,
+        active_task_id,
+        children: vec![ChildControlProjectionV1 {
+            logical_child_id,
+            attempt_id,
+            display_name: child.display_name,
+            role: child.role,
+            tier: child.tier,
+            model: child.model,
+            effort: child.effort,
+            state,
+            activity: None,
+        }],
+        mcp_leases: Vec::new(),
+    };
+    let projection = Arc::new(std::sync::RwLock::new(initial));
+    let projected = projection.clone();
+    let (updates, receiver) = std::sync::mpsc::sync_channel(1);
+    control.set_projection_hook(Some(Arc::new(move |next| {
+        *projected.write().unwrap() = next;
+        let _ = updates.try_send(());
+    })));
+    engine.active.as_mut().unwrap().delegation = Some(DelegationRuntime {
+        control,
+        projection,
+        updates: receiver,
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn attach_terminal_delegation(engine: &mut Engine, target: &RunTarget, child_suffix: &str) {
+    attach_delegation(engine, target, child_suffix, true);
+}
+
+#[cfg(target_os = "macos")]
+fn attach_running_delegation(engine: &mut Engine, target: &RunTarget, child_suffix: &str) {
+    attach_delegation(engine, target, child_suffix, false);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_cancel_records_durable_child_plan_before_exact_runtime_effect() {
+    let (_root, mut engine) = service();
+    hello(&mut engine);
+    let target = begin(&mut engine);
+    attach_running_delegation(&mut engine, &target, "root-cancel");
+    let control = engine
+        .active
+        .as_ref()
+        .unwrap()
+        .delegation
+        .as_ref()
+        .unwrap()
+        .control
+        .clone();
+    let runtime_abort = control
+        .install_runtime_attempt_for_test(&polaris_core::subagent_control::ChildAttemptRefV1 {
+            logical_child_id: polaris_core::subagent_control::LogicalChildId::new(
+                "child-root-cancel",
+            )
+            .unwrap(),
+            attempt_id: polaris_core::subagent_control::ChildAttemptId::new(
+                "child-attempt-root-cancel",
+            )
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let SuccessResult::RunCancel(cancelled) = direct(
+        &mut engine,
+        &request(
+            "root-cancel-with-child",
+            RequestBody::RunCancel(session_id(), target),
+        ),
+    )
+    .unwrap() else {
+        panic!("run.cancel response");
+    };
+    assert_eq!(cancelled.status, CancelStatus::CancelRequested);
+    let projection = engine.delegation_projection().unwrap();
+    assert_eq!(projection.revision, 1);
+    assert_eq!(projection.children.len(), 1);
+    assert_eq!(
+        projection.children[0].state,
+        polaris_core::subagent_control::ChildStateV1::Cancelling
+    );
+    assert!(runtime_abort.is_aborted());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn transport_subagent_cancel_persists_before_exact_runtime_effect() {
+    let (_root, mut engine) = service();
+    hello(&mut engine);
+    let target = begin(&mut engine);
+    attach_running_delegation(&mut engine, &target, "running");
+    let control = engine
+        .active
+        .as_ref()
+        .unwrap()
+        .delegation
+        .as_ref()
+        .unwrap()
+        .control
+        .clone();
+    let runtime_reference = polaris_core::subagent_control::ChildAttemptRefV1 {
+        logical_child_id: polaris_core::subagent_control::LogicalChildId::new("child-running")
+            .unwrap(),
+        attempt_id: polaris_core::subagent_control::ChildAttemptId::new("child-attempt-running")
+            .unwrap(),
+    };
+    let runtime_abort = control
+        .install_runtime_attempt_for_test(&runtime_reference)
+        .await
+        .unwrap();
+    engine.connection = ConnectionState::AwaitingHello;
+    engine.client = None;
+    engine.wire_version = None;
+
+    let (mut client, task) = connect(engine);
+    client
+        .call(&request("subagent-running-hello", RequestBody::Hello))
+        .await
+        .unwrap();
+    let cancel_request = |request_id: &str, revision: u64| {
+        request(
+            request_id,
+            RequestBody::SubagentCancel(
+                session_id(),
+                SubagentCancel {
+                    root_run_id: target.run_id.clone(),
+                    root_attempt_id: target.attempt_id.clone(),
+                    logical_child_id: LogicalChildId::new("child-running").unwrap(),
+                    child_attempt_id: ChildAttemptId::new("child-attempt-running").unwrap(),
+                    expected_revision: DecimalU64::new(revision),
+                },
+            ),
+        )
+    };
+    let SuccessResult::SubagentCancel(first) = client
+        .call(&cancel_request("subagent-running-cancel", 0))
+        .await
+        .unwrap()
+    else {
+        panic!("running subagent.cancel response");
+    };
+    assert_eq!(first.disposition, SubagentCancelDispositionV2::Requested);
+    assert_eq!(first.revision, DecimalU64::new(1));
+    assert_eq!(
+        first.state,
+        polaris_desktop_protocol::orchestration::ChildControlStateV2::Cancelling
+    );
+    assert_eq!(first.runtime_effect, SubagentRuntimeEffectV2::Requested);
+    assert!(runtime_abort.is_aborted());
+
+    let SuccessResult::SubagentWait(saved) = client
+        .call(&request(
+            "subagent-running-wait",
+            RequestBody::SubagentWait(
+                session_id(),
+                SubagentWait {
+                    root_run_id: target.run_id.clone(),
+                    root_attempt_id: target.attempt_id.clone(),
+                    expected_revision: DecimalU64::new(1),
+                    after_cursor: None,
+                },
+            ),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("saved subagent.wait response");
+    };
+    assert_eq!(saved.children[0].control_revision, DecimalU64::new(1));
+    assert_eq!(
+        saved.children[0].state,
+        polaris_desktop_protocol::orchestration::ChildControlStateV2::Cancelling
+    );
+
+    let SuccessResult::SubagentCancel(replayed) = client
+        .call(&cancel_request("subagent-running-cancel-replay", 1))
+        .await
+        .unwrap()
+    else {
+        panic!("replayed subagent.cancel response");
+    };
+    assert_eq!(
+        replayed.disposition,
+        SubagentCancelDispositionV2::AlreadyRequested
+    );
+    assert_eq!(replayed.revision, DecimalU64::new(1));
+    assert_eq!(
+        replayed.runtime_effect,
+        SubagentRuntimeEffectV2::Unavailable
+    );
+
+    drop(client.tx);
+    let (_engine, result) = task.await.unwrap();
+    result.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn transport_subagent_control_is_cursor_bound_idempotent_and_lane_exact() {
+    let (root, mut engine) = service();
+    hello(&mut engine);
+    let main_target = begin(&mut engine);
+    attach_terminal_delegation(&mut engine, &main_target, "main");
+
+    let (_side_root, mut side_engine) = service();
+    hello(&mut side_engine);
+    let side_target = begin(&mut side_engine);
+    let side_session = SessionId::new("side-session").unwrap();
+    side_engine.session = side_session.clone();
+    attach_terminal_delegation(&mut side_engine, &side_target, "side");
+    let mut side_store = root
+        .create(
+            project_id(),
+            side_session.clone(),
+            InitialState {
+                draft: Draft {
+                    draft_revision: DecimalU64::new(0),
+                    text: "side root".into(),
+                    attachment_ids: Vec::new(),
+                },
+                configuration: Configuration {
+                    history_mode: Default::default(),
+                    configuration_revision: DecimalU64::new(0),
+                    provider: "fake".into(),
+                    model: "scripted".into(),
+                    effort: "none".into(),
+                },
+                policy_revision: DecimalU64::new(0),
+            },
+        )
+        .unwrap();
+    side_store
+        .apply_bound(
+            &Request {
+                protocol_version: ProtocolVersion,
+                client_id: ClientId::new("side-fixture").unwrap(),
+                request_id: RequestId::new("side-run-start").unwrap(),
+                body: RequestBody::RunStart(
+                    side_session.clone(),
+                    RunStart {
+                        mcp_prompt: None,
+                        expected_draft_revision: DecimalU64::new(0),
+                        expected_configuration_revision: DecimalU64::new(0),
+                        expected_policy_revision: DecimalU64::new(0),
+                    },
+                ),
+            },
+            Some(side_target.clone()),
+            None,
+        )
+        .unwrap();
+    engine.other_lane = Some(SessionLane {
+        session: side_session.clone(),
+        store: side_store,
+        subscription: None,
+        active: side_engine.active.take(),
+        history: None,
+        details: None,
+        cleanups: Default::default(),
+    });
+    drop(root);
+    engine.connection = ConnectionState::AwaitingHello;
+    engine.client = None;
+    engine.wire_version = None;
+
+    let (mut client, task) = connect(engine);
+    client
+        .call(&request("subagent-hello", RequestBody::Hello))
+        .await
+        .unwrap();
+    let SuccessResult::SubagentWait(updated) = client
+        .call(&request(
+            "subagent-wait-updated",
+            RequestBody::SubagentWait(
+                session_id(),
+                SubagentWait {
+                    root_run_id: main_target.run_id.clone(),
+                    root_attempt_id: main_target.attempt_id.clone(),
+                    expected_revision: DecimalU64::new(0),
+                    after_cursor: None,
+                },
+            ),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("subagent.wait updated response");
+    };
+    assert_eq!(updated.state, SubagentWaitStateV2::Updated);
+    assert_eq!(updated.cursor, DecimalU64::new(7));
+    assert_eq!(updated.children.len(), 1);
+    assert_eq!(updated.children[0].root_run_id, main_target.run_id);
+    assert_eq!(updated.children[0].root_attempt_id, main_target.attempt_id);
+    assert_eq!(updated.children[0].control_revision, DecimalU64::new(0));
+
+    let SuccessResult::SubagentWait(unchanged) = client
+        .call(&request(
+            "subagent-wait-unchanged",
+            RequestBody::SubagentWait(
+                session_id(),
+                SubagentWait {
+                    root_run_id: main_target.run_id.clone(),
+                    root_attempt_id: main_target.attempt_id.clone(),
+                    expected_revision: DecimalU64::new(0),
+                    after_cursor: Some(updated.cursor),
+                },
+            ),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("subagent.wait unchanged response");
+    };
+    assert_eq!(unchanged.state, SubagentWaitStateV2::Unchanged);
+    assert!(unchanged.children.is_empty());
+
+    let wrong_lane = client
+        .call(&request(
+            "subagent-wrong-lane",
+            RequestBody::SubagentWait(
+                side_session.clone(),
+                SubagentWait {
+                    root_run_id: main_target.run_id.clone(),
+                    root_attempt_id: main_target.attempt_id.clone(),
+                    expected_revision: DecimalU64::new(0),
+                    after_cursor: None,
+                },
+            ),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_lane.code, ErrorCode::PermissionDenied);
+
+    let stale = client
+        .call(&request(
+            "subagent-stale",
+            RequestBody::SubagentCancel(
+                session_id(),
+                SubagentCancel {
+                    root_run_id: main_target.run_id.clone(),
+                    root_attempt_id: main_target.attempt_id.clone(),
+                    logical_child_id: LogicalChildId::new("child-main").unwrap(),
+                    child_attempt_id: ChildAttemptId::new("child-attempt-main").unwrap(),
+                    expected_revision: DecimalU64::new(1),
+                },
+            ),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, ErrorCode::RevisionConflict);
+
+    let foreign = client
+        .call(&request(
+            "subagent-foreign",
+            RequestBody::SubagentCancel(
+                session_id(),
+                SubagentCancel {
+                    root_run_id: main_target.run_id.clone(),
+                    root_attempt_id: main_target.attempt_id.clone(),
+                    logical_child_id: LogicalChildId::new("child-main").unwrap(),
+                    child_attempt_id: ChildAttemptId::new("child-attempt-foreign").unwrap(),
+                    expected_revision: DecimalU64::new(0),
+                },
+            ),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code, ErrorCode::NotFound);
+
+    for request_id in ["subagent-terminal", "subagent-terminal-replay"] {
+        let SuccessResult::SubagentCancel(cancelled) = client
+            .call(&request(
+                request_id,
+                RequestBody::SubagentCancel(
+                    session_id(),
+                    SubagentCancel {
+                        root_run_id: main_target.run_id.clone(),
+                        root_attempt_id: main_target.attempt_id.clone(),
+                        logical_child_id: LogicalChildId::new("child-main").unwrap(),
+                        child_attempt_id: ChildAttemptId::new("child-attempt-main").unwrap(),
+                        expected_revision: DecimalU64::new(0),
+                    },
+                ),
+            ))
+            .await
+            .unwrap()
+        else {
+            panic!("subagent.cancel terminal response");
+        };
+        assert_eq!(
+            cancelled.disposition,
+            SubagentCancelDispositionV2::AlreadyTerminal
+        );
+        assert_eq!(
+            cancelled.state,
+            polaris_desktop_protocol::orchestration::ChildControlStateV2::Succeeded
+        );
+        assert_eq!(
+            cancelled.runtime_effect,
+            SubagentRuntimeEffectV2::Unavailable
+        );
+    }
+
+    let SuccessResult::SubagentWait(side) = client
+        .call(&request(
+            "subagent-side-exact",
+            RequestBody::SubagentWait(
+                side_session,
+                SubagentWait {
+                    root_run_id: side_target.run_id,
+                    root_attempt_id: side_target.attempt_id,
+                    expected_revision: DecimalU64::new(0),
+                    after_cursor: None,
+                },
+            ),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("side lane subagent.wait response");
+    };
+    assert_eq!(side.children[0].logical_child_id, "child-side");
+
+    let SuccessResult::SubagentWait(main_after_side_wait) = client
+        .call(&request(
+            "subagent-main-after-side-wait",
+            RequestBody::SubagentWait(
+                session_id(),
+                SubagentWait {
+                    root_run_id: main_target.run_id.clone(),
+                    root_attempt_id: main_target.attempt_id.clone(),
+                    expected_revision: DecimalU64::new(0),
+                    after_cursor: None,
+                },
+            ),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("main lane wait after side wait");
+    };
+    assert_eq!(
+        main_after_side_wait.children[0].logical_child_id,
+        "child-main"
+    );
+
+    let SuccessResult::RunCancel(_) = client
+        .call(&request(
+            "subagent-side-root-cancel",
+            RequestBody::RunCancel(
+                SessionId::new("side-session").unwrap(),
+                RunTarget {
+                    run_id: side.root_run_id,
+                    attempt_id: side.root_attempt_id,
+                },
+            ),
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("side lane run.cancel response");
+    };
+
+    drop(client.tx);
+    let (_engine, result) = task.await.unwrap();
+    result.unwrap();
+}
+
+#[test]
+fn orchestration_snapshot_projects_safe_child_activity_and_typed_unavailability() {
+    use polaris_core::{
+        session::{ChildControlProjectionV1, RootDelegationProjectionV1},
+        subagent_control::{
+            ChildAttemptId, ChildStateV1, LogicalChildId, RootAttemptId, RootRunId, SafeActivityV1,
+            TaskId,
+        },
+    };
+
+    let (_root, engine) = service();
+    let saved = engine.store.snapshot().unwrap();
+    let projection = RootDelegationProjectionV1 {
+        revision: 4,
+        session_id: session_id().as_str().into(),
+        root_run_id: RootRunId::new("root-run").unwrap(),
+        root_attempt_id: RootAttemptId::new("root-attempt").unwrap(),
+        active_task_id: TaskId::new("active-task").unwrap(),
+        children: vec![ChildControlProjectionV1 {
+            logical_child_id: LogicalChildId::new("child-1").unwrap(),
+            attempt_id: ChildAttemptId::new("child-attempt-1").unwrap(),
+            display_name: "Sirius".into(),
+            role: "file-reader".into(),
+            tier: "dwarf".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: "low".into(),
+            state: ChildStateV1::Running,
+            activity: Some(SafeActivityV1 {
+                summary: "read(CURRENT.md)".into(),
+                sequence: 2,
+            }),
+        }],
+        mcp_leases: Vec::new(),
+    };
+    let summary = orchestration_summary(&saved, None, Some(&projection));
+    assert_eq!(summary.subagent_total.get(), 1);
+    assert_eq!(summary.subagents[0].root_run_id.as_str(), "root-run");
+    assert_eq!(
+        summary.subagents[0].root_attempt_id.as_str(),
+        "root-attempt"
+    );
+    assert_eq!(summary.subagents[0].control_revision, DecimalU64::new(4));
+    assert_eq!(
+        summary.subagents[0].activity.as_deref(),
+        Some("read(CURRENT.md)")
+    );
+    assert_eq!(
+        summary.common_runner.state,
+        CommonRunnerStateV2::Unavailable
+    );
+    assert_eq!(summary.clarification.state, ClarificationStateV2::None);
 }

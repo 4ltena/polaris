@@ -88,6 +88,19 @@ impl JevDecider {
         })
     }
 
+    /// A finalization receipt represents a single, explicitly disclosed
+    /// observation. It must never turn one consent into retry traffic.
+    /// Ordinary Jev callers retain the regular bounded retry policy.
+    pub fn new_finalizer(
+        base_url: &str,
+        api_key: String,
+        model: String,
+    ) -> Result<Self, DecisionError> {
+        let mut decider = Self::new(base_url, api_key, model)?;
+        decider.max_attempts = 1;
+        Ok(decider)
+    }
+
     /// Reads the endpoint and key from the environment. The key never
     /// reaches a log, an error message or a record: only whether it was
     /// there at all.

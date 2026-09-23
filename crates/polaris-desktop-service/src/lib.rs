@@ -34,6 +34,8 @@ mod configured_factory;
 #[cfg(target_os = "macos")]
 mod memory_resources;
 #[cfg(target_os = "macos")]
+pub mod shadow_finalizer;
+#[cfg(target_os = "macos")]
 pub use configured_factory::{
     ConfiguredRunFactory, ConfirmedSourceGrant, FactoryError, TrustedBackend,
     TrustedFactoryResources, TrustedMemoryIndex, WorkspacePreparationRecipe,

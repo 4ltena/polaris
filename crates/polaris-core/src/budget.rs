@@ -190,7 +190,9 @@ mod tests {
 
     #[test]
     fn workflow_modes_measure_all_phases_and_full_wire_without_claiming_cost_savings() {
-        use crate::workflow::{Phase, SessionWorkflow, WorkflowMode};
+        use crate::workflow::{
+            Phase, SessionWorkflow, WorkflowGatesV1, WorkflowMode, WorkflowStateV1,
+        };
         use polaris_provider::{CompletionRequest, Message};
         let baseline = crate::prompt::assemble_always_on("", "", &[]);
         let config = crate::config::Config::default().workflow;
@@ -201,7 +203,15 @@ mod tests {
             .clone();
         let mut adaptive_config = config;
         adaptive_config.mode = WorkflowMode::Adaptive;
-        let workflow = SessionWorkflow::new(adaptive_config);
+        let workflow = SessionWorkflow::restore(
+            adaptive_config,
+            WorkflowGatesV1 {
+                phase_gate_schema_version: None,
+                ..WorkflowGatesV1::default()
+            },
+            WorkflowStateV1::default(),
+        )
+        .unwrap();
         let turn = workflow.begin_turn(&[]).unwrap();
         let all_phases = polaris_skills::workflow_profile::recommended_bindings()
             .iter()
@@ -363,7 +373,7 @@ mod tests {
         // `general` phase — an adaptive transition happens only when the
         // model calls `state` itself, and in 15 turns it never did, so
         // every phase-specific instruction was unreachable.
-        const PINNED: usize = 647;
+        const PINNED: usize = 639;
         let n = crate::prompt::assemble_always_on("", "", &[]).tokens();
         assert_eq!(
             n, PINNED,
@@ -388,20 +398,29 @@ mod tests {
     /// deliberate rather than invisible and free.
     #[test]
     fn the_root_turn_total_is_pinned() {
-        const PINNED: usize = 995;
+        // 995 until the `computer` tool joined the root-only set on
+        // 2026-09-21, then 1,179, then this. The tool is what carries the
+        // root prefix over the backend's 1,024-token cache minimum, which
+        // polaris had been 29 tokens short of; the 110 tokens between 1,179
+        // and here came back out of five descriptions that were explaining
+        // themselves rather than telling the caller what to pass. 45 tokens
+        // of margin is deliberate — enough that a project's own rules do
+        // not push the prefix back under the threshold.
+        const PINNED: usize = 1069;
         let mut tools = polaris_tools::all_specs();
         tools.push(polaris_tools::mcp_setup_spec());
         tools.push(polaris_tools::setting_spec());
         tools.push(polaris_tools::state_spec());
+        tools.push(polaris_tools::computer_spec());
 
         let baseline = crate::prompt::assemble_always_on("", "", &[]);
         let n = always_on_tokens(baseline.system(), &tools);
 
-        // Guards against a vacuous pass: the three root-only tools must
+        // Guards against a vacuous pass: the four root-only tools must
         // really be in the list being measured.
         assert_eq!(
             tools.len(),
-            MAX_TOOLS + 3,
+            MAX_TOOLS + 4,
             "the root-only tools are missing"
         );
         assert!(
@@ -699,7 +718,7 @@ mod state_budget {
             ("brainstorm", 198),
             ("specify", 205),
             ("implement", 294),
-            ("review", 227),
+            ("review", 284),
             ("verify", 218),
             ("deliver", 207),
         ];
@@ -754,7 +773,7 @@ mod state_budget {
 #[cfg(test)]
 mod phase_tools {
     /// What a read-only phase saves on every request. The six schemas are
-    /// 504 of the 647 always-on tokens; `write`, `edit` and `spawn` are
+    /// 496 of the 639 always-on tokens; `write`, `edit` and `spawn` are
     /// 287 of those, and a phase that cannot change a file can call none
     /// of them.
     #[test]
@@ -770,18 +789,25 @@ mod phase_tools {
                 .collect();
             super::always_on_tokens(baseline.system(), &subset)
         };
-        assert_eq!(all, 647);
+        assert_eq!(all, 639);
         assert_eq!(kept(&["read", "bash", "skill"]), 366, "review");
         assert_eq!(kept(&["read", "skill"]), 300, "brainstorm");
 
-        // Every phase that may change a file keeps everything.
+        // Only an authorized Implement phase may expose mutation tools. The
+        // runtime gate still checks the current contract at dispatch time.
         for phase in crate::workflow::Phase::ALL {
             let allowed = crate::agent::read_only_tools(phase);
             match phase {
-                crate::workflow::Phase::Brainstorm | crate::workflow::Phase::Review => {
-                    assert!(allowed.is_some(), "{phase} is read-only")
+                crate::workflow::Phase::Implement => {
+                    assert!(
+                        allowed.is_none(),
+                        "{phase} may write with a current contract"
+                    )
                 }
-                _ => assert!(allowed.is_none(), "{phase} may write"),
+                _ => {
+                    let allowed = allowed.expect("read-only phase has an allowlist");
+                    assert!(allowed.contains(&"state"), "{phase} lost its phase control");
+                }
             }
         }
     }
@@ -803,6 +829,7 @@ mod breakdown {
             ("mcp_setup", polaris_tools::mcp_setup_spec()),
             ("setting", polaris_tools::setting_spec()),
             ("state", polaris_tools::state_spec()),
+            ("computer", polaris_tools::computer_spec()),
         ] {
             let mut with = specs.clone();
             with.push(spec);

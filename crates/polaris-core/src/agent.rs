@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use polaris_provider::{CompletionRequest, Provider};
+use polaris_provider::{CompletionRequest, Provider, ToolCall};
 use tokio::sync::Mutex;
 
 use crate::audit::{AuditLog, Record};
@@ -20,6 +20,9 @@ use crate::stop::{StopReason, StopTracker};
 mod input_preparation_tests;
 mod mcp_dispatch;
 mod skill_catalog;
+pub(crate) mod verification;
+pub(crate) mod workflow_artifact;
+mod workflow_context;
 mod workflow_control;
 
 #[derive(Debug, thiserror::Error)]
@@ -260,15 +263,31 @@ pub(crate) fn check_event_delivery(
 /// all three runs. Re-classifying could in principle fight the model's own
 /// transitions; in practice the model never asks for one, so classifying
 /// every turn is strictly better than classifying none.
-async fn classify_opening(session: &mut Session) {
-    use polaris_provider::decision::Question;
-    use std::collections::BTreeMap;
+/// Classify the user's turn along every axis at once, and route it.
+///
+/// This replaced a single three-way `Choice` between `brainstorm`,
+/// `review` and `implement`. That one label could not tell a fix from a
+/// feature, a question from a request, or a decision that is open from one
+/// that is merely undecided-by-me, so a proposal worth one question and a
+/// detail worth none arrived the same way.
+///
+/// The six axes are asked together in one request and the route is a rule
+/// over the answers — see [`crate::turn_intent`]. A turn the judge could
+/// not classify keeps the phase it already had and is recorded as
+/// unclassified, because the one outcome worth ruling out is a failure
+/// stored as a decision.
+async fn classify_opening(
+    provider: &dyn Provider,
+    session: &mut Session,
+    audit: &Arc<Mutex<AuditLog>>,
+    events: Option<&crate::desktop_events::EventSink>,
+) {
+    use crate::turn_intent::{Clarity, Effort, Route};
 
-    let Some(decider) = session.decider.clone() else {
-        return;
-    };
-    if session.workflow.is_none() {
-        return;
+    if session.automatic_effort {
+        // A failed decision must not silently retain the previous turn's
+        // explicit override while the footer says the new turn is undecided.
+        provider.set_effort(None);
     }
     let Some(opening) = session
         .messages
@@ -279,48 +298,141 @@ async fn classify_opening(session: &mut Session) {
     else {
         return;
     };
-    let questions = BTreeMap::from([(
-        "kind".to_owned(),
-        Question::Choice {
-            instructions: format!("この依頼はどれか。\n依頼: {opening}"),
-            criteria: BTreeMap::from([
-                (
-                    "brainstorm".to_owned(),
-                    "何を作るかがまだ決まっていない。案を出して選ぶところから始まる。ファイルは変えない。"
-                        .to_owned(),
-                ),
-                (
-                    "review".to_owned(),
-                    "読んで報告するだけで、ファイルを一つも変えない。調査、指摘、まとめ、判断の材料集め。\
-                     直してほしいと書かれていたらこれではない。"
-                        .to_owned(),
-                ),
-                (
-                    "implement".to_owned(),
-                    "ファイルを変える。新しく作る場合も、既にあるものを直す場合も、どちらもこれ。"
-                        .to_owned(),
-                ),
-            ]),
-        },
-    )]);
-    let state = serde_json::json!({ "purpose": "最初の依頼がどの段階から始まるかを決める" });
-    let Ok(decision) = decider.decide(&state, &questions).await else {
+    let first_user_turn = session
+        .messages
+        .iter()
+        .filter(|message| message.role == polaris_provider::Role::User)
+        .count()
+        == 1;
+    session.project_analysis = crate::project_analysis::ProjectAnalysisState::resolve(
+        session
+            .request_prompt
+            .as_ref()
+            .and_then(crate::prompt::AlwaysOn::project_root),
+        &opening,
+        first_user_turn,
+    );
+    if session.workflow.is_none() && !session.automatic_effort {
+        return;
+    }
+    if session.automatic_effort
+        && let Some(events) = events
+    {
+        let _ = events.send(crate::events::AgentEvent::EffortJudging);
+    }
+    let decider = session.decider.clone();
+    let state = serde_json::json!({
+        "purpose": "この利用者のturnが何であり、どう進めるべきかを決める",
+        "request": opening,
+    });
+    let turn = session.messages.len() as u64;
+    let intent = crate::turn_intent::classify(decider.as_deref(), &state, turn).await;
+    let route = intent.route;
+    // Automatic routing must settle before the main request. An unavailable
+    // classifier used to leave the footer at `undecided` while the provider
+    // silently used its account default. Use the conservative effort for a
+    // missing answer, and also for an explicitly ambiguous first request.
+    let effective_effort = if session.automatic_effort {
+        match (intent.effort, intent.clarity) {
+            (_, Some(Clarity::MateriallyAmbiguous | Clarity::Conflicting)) if first_user_turn => {
+                Some(Effort::XHigh)
+            }
+            (Some(effort), _) => Some(effort),
+            (None, _) => Some(Effort::XHigh),
+        }
+    } else {
+        None
+    };
+    if session.automatic_effort {
+        if let Some(effort) = effective_effort {
+            provider.set_effort(Some(effort.as_str()));
+        }
+        if let Some(events) = events {
+            let _ = events.send(crate::events::AgentEvent::EffortJudged {
+                effort: effective_effort
+                    .map(|effort| effort.as_str())
+                    .unwrap_or("xhigh")
+                    .to_owned(),
+            });
+        }
+    }
+    // Kept in the audit record rather than written to stderr. The TUI owns
+    // the same terminal as stderr, so direct diagnostics were painted over
+    // its composer and looked like editable input.
+    let axes = format!(
+        "route={} 発話={:?} 作業={:?} 明確さ={:?} 文脈={:?} 進め方={:?} effort={:?} effective_effort={:?} analysis_stage={}",
+        route.map_or("-".to_owned(), |route| format!("{route:?}")),
+        intent.utterance,
+        intent.work,
+        intent.clarity,
+        intent.relation,
+        intent.approach,
+        intent.effort,
+        effective_effort,
+        session.project_analysis.stage().unwrap_or("inactive"),
+    );
+    let _ = audit.lock().await.record(&Record {
+        tool: "turn-intent",
+        detail: &axes,
+        sandbox: None,
+        target: None,
+        result: intent.unavailable.as_deref().unwrap_or("classified"),
+        caller: "root",
+    });
+    session.turn_intent = Some(intent);
+    // A turn waiting on the user is not a turn that edits files. The phase
+    // carries that, so the existing read-only tool gate applies without a
+    // second mechanism deciding the same thing.
+    let Some(route) = route else {
+        // A broad first-turn analysis has a deterministic read-only phase
+        // even when the optional judge is unavailable. Its source expansion
+        // remains controlled by ProjectAnalysisState below.
+        if session.project_analysis.is_active()
+            && let Some(workflow) = &session.workflow
+        {
+            let _ = workflow.request_phase(crate::workflow::Phase::Review);
+        }
         return;
     };
-    let Some(chosen) = decision
-        .answers
-        .get("kind")
-        .and_then(|answer| answer.choice.as_deref())
-    else {
-        return;
+    // `Pending` with nothing asked is not a waiting state — it is a run
+    // with its write tools removed and no question whose answer gives
+    // them back. Setting it on the route alone was measured on 2026-09-21
+    // at $0.149 against $0.133: the model finished the same work through
+    // `bash` instead, and the quality checks still passed, so it cost
+    // round trips rather than correctness. The state becomes `Pending`
+    // when a question exists; until then the phase below is what holds
+    // the turn back.
+    let phase = match route {
+        Route::Direct | Route::InspectThenExecute => crate::workflow::Phase::Implement,
+        Route::Brainstorm | Route::Grilling => crate::workflow::Phase::Brainstorm,
+        Route::Specify => crate::workflow::Phase::Specify,
+        Route::Review | Route::Sidechat => crate::workflow::Phase::Review,
     };
-    let Ok(phase) = chosen.parse::<crate::workflow::Phase>() else {
-        return;
-    };
-    if let Some(workflow) = &session.workflow {
-        // A refusal here is not a reason to lose the turn: the run simply
-        // starts where it would have started before.
-        let _ = workflow.request_phase(phase);
+    if let Some(workflow) = &session.workflow
+        && workflow.request_phase(phase).is_err()
+        && phase == crate::workflow::Phase::Implement
+    {
+        // A new routine change must first acquire its durable contract.
+        // Keeping the old general phase would leave write tools available
+        // while hiding the gate refusal from the workflow context.
+        let _ = workflow.request_phase(crate::workflow::Phase::Specify);
+    }
+}
+
+/// Whether a capability tool is worth its schema on this turn.
+///
+/// `setting` and `computer` are for particular kinds of work, and the
+/// classifier now says which kind a turn is. Offering them regardless
+/// costs 85 and 133 tokens on every root request of every turn that will
+/// never call them — the same waste the read-only phase gate already
+/// removes, just visible from a different direction.
+///
+/// An unclassified turn still gets them. A judge that is down is a reason
+/// to lose an optimisation, not a capability.
+fn wants(session: &Session, kinds: &[crate::turn_intent::Work]) -> bool {
+    match session.turn_intent.as_ref().and_then(|intent| intent.work) {
+        Some(work) => kinds.contains(&work),
+        None => true,
     }
 }
 
@@ -340,18 +452,68 @@ async fn classify_opening(session: &mut Session) {
 /// short, and 73 tokens a request is cheaper than the prose they saved.
 pub(crate) fn read_only_tools(phase: crate::workflow::Phase) -> Option<&'static [&'static str]> {
     match phase {
-        crate::workflow::Phase::Brainstorm => Some(&["read", "skill"]),
-        // `bash` stays: taking it away was measured on 2026-09-21 and
-        // cost more, not less ($0.175 against $0.145). A review that
-        // cannot grep reads more files to find the same thing.
-        // `spawn` goes too, though the file bodies it would keep out are
-        // the largest item left: delegating the read was measured on
-        // 2026-09-21 at $0.161 against $0.131 without it. The runs that
-        // delegated took 20 to 22 requests where the others took 13, and
-        // the round trips cost more than the text they saved.
-        crate::workflow::Phase::Review => Some(&["read", "bash", "skill"]),
-        _ => None,
+        // General and Specify are deliberately read-only.  In particular,
+        // a failed Direct -> Implement transition recovers to Specify; that
+        // recovery must not leave the original write-capable schemas around.
+        crate::workflow::Phase::General | crate::workflow::Phase::Specify => {
+            Some(&["read", "skill", "clarify", "state", "workflow_artifact"])
+        }
+        // `clarify` belongs here because `grilling` resolves to this
+        // phase. Withholding it would leave the one route whose whole
+        // purpose is to ask without the means to ask.
+        crate::workflow::Phase::Brainstorm => {
+            Some(&["read", "skill", "clarify", "state", "workflow_artifact"])
+        }
+        // `bash` is withheld too.  A shell schema can execute arbitrary
+        // mutations, so it cannot be a read-only capability even when a
+        // particular review command happens to be a grep. `spawn` is also
+        // withheld: a model-planned child may request a write root.
+        // Unbounded,
+        // model-planned read delegation was measured on 2026-09-21 at
+        // $0.161 against $0.131 without it because it grew to 20--22
+        // requests. Deep reviews instead use the host-bounded path below:
+        // two direct reads, at most four file-reader runs, then synthesis.
+        crate::workflow::Phase::Review => Some(&[
+            "read",
+            "skill",
+            "state",
+            "workflow_artifact",
+            "verification",
+        ]),
+        // Verify and Deliver never regain mutation authority.  They retain
+        // only inspection and evidence preparation tools.
+        crate::workflow::Phase::Verify | crate::workflow::Phase::Deliver => Some(&[
+            "read",
+            "skill",
+            "state",
+            "workflow_artifact",
+            "verification",
+        ]),
+        crate::workflow::Phase::Implement => None,
     }
+}
+
+fn workflow_mutation_authorized(session: &Session) -> bool {
+    match session
+        .workflow
+        .as_ref()
+        .filter(|workflow| workflow.config.enabled)
+    {
+        Some(workflow) => workflow.mutation_authorized(),
+        None => true,
+    }
+}
+
+fn call_requests_mutation(call: &ToolCall) -> bool {
+    matches!(call.name.as_str(), "write" | "edit" | "bash" | "computer")
+        || (call.name == "spawn"
+            && call.arguments["tasks"]
+                .as_array()
+                .is_some_and(|tasks| tasks.iter().any(|task| task["write_root"].is_string())))
+}
+
+fn mutation_refusal() -> String {
+    "phase gate denies mutation: an active Implement phase with a current approved routine contract or full-spec task binding is required".into()
 }
 
 fn real_user_query(session: &Session) -> String {
@@ -362,6 +524,84 @@ fn real_user_query(session: &Session) -> String {
         .find(|message| message.role == polaris_provider::Role::User)
         .map(|message| message.content.clone())
         .unwrap_or_default()
+}
+
+const DIRECT_REVIEW_READS: usize = 2;
+const DELEGATED_REVIEW_READS: usize = 4;
+
+/// A review that is actually investigating source may keep two local reads
+/// for orientation. Beyond that, the bundled file-reader keeps file bodies
+/// out of the root history. Status questions share the Review phase but do
+/// not need this path, so the turn kind and the current wording both matter.
+fn delegates_review_reads(
+    session: &Session,
+    caller: &str,
+    query: &str,
+    agent_types: &[polaris_skills::AgentType],
+) -> bool {
+    if caller != "root"
+        || !agent_types.iter().any(|agent| agent.name == "file-reader")
+        || session
+            .workflow
+            .as_ref()
+            .filter(|workflow| workflow.config.enabled)
+            .is_none_or(|workflow| workflow.state().phase != crate::workflow::Phase::Review)
+    {
+        return false;
+    }
+    if matches!(
+        session.turn_intent.as_ref().and_then(|intent| intent.work),
+        Some(crate::turn_intent::Work::Investigation | crate::turn_intent::Work::Verification)
+    ) {
+        return true;
+    }
+    let query = query.to_lowercase();
+    [
+        "分析",
+        "解析",
+        "調査",
+        "検証",
+        "深掘り",
+        "詳しく",
+        "アルゴリズム",
+        "architecture",
+        "analy",
+        "inspect",
+        "review",
+        "deep dive",
+    ]
+    .iter()
+    .any(|term| query.contains(term))
+}
+
+/// Resolve a normal project file for delegated reading. URI-backed reads,
+/// directories, symlinks, and paths outside the bound project keep the
+/// existing direct-read path instead of widening the child's authority.
+fn delegated_review_path(session: &Session, call: &polaris_provider::ToolCall) -> Option<PathBuf> {
+    if call.name != "read" {
+        return None;
+    }
+    let raw = call.arguments["path"].as_str()?;
+    if raw.contains("://") {
+        return None;
+    }
+    let root = session
+        .request_prompt
+        .as_ref()
+        .and_then(crate::prompt::AlwaysOn::project_root)?;
+    let raw = Path::new(raw);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        root.join(raw)
+    };
+    let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let path = candidate.canonicalize().ok()?;
+    path.starts_with(&root).then_some(path)
 }
 
 /// The most directories one tool call may set `files.md` regeneration
@@ -720,7 +960,14 @@ pub(crate) async fn run_loop(
     // Before the turn is opened, so the phase it resolves is the one the
     // opening asked for rather than the one the config defaulted to.
     if caller == "root" {
-        classify_opening(session).await;
+        // Read back before classifying, because a `-p` run that asked a
+        // question exited and the `--resume` answering it is a different
+        // process. Without this the answer arrives at a session that has
+        // forgotten it was waiting, the write tools never come back, and
+        // the question is free to be asked a second time.
+        session.clarification =
+            crate::turn_intent::ClarificationState::from_history(&session.messages);
+        classify_opening(provider, session, &audit, events.as_ref()).await;
     }
     let mut workflow_turn = session
         .workflow
@@ -746,11 +993,24 @@ pub(crate) async fn run_loop(
                 .map_err(std::io::Error::other)?;
         }
     }
+    let prepared_workflow_context = if caller == "root" {
+        match workflow_turn.as_ref() {
+            Some(turn) => Some(
+                workflow_context::prepare(session, turn)
+                    .await
+                    .map_err(std::io::Error::other)?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
     let is_adaptive = workflow_control::adaptive(session);
-    let lookup_skills = workflow_turn
+    let lookup_skills_owned = workflow_turn
         .as_ref()
-        .map(|turn| turn.skill_corpus())
-        .unwrap_or(skills);
+        .map(|turn| turn.skill_corpus().to_vec())
+        .unwrap_or_else(|| skills.to_vec());
+    let lookup_skills = lookup_skills_owned.as_slice();
     let mut optional_skills = tools
         .iter()
         .any(|tool| tool.name == "skill")
@@ -806,6 +1066,13 @@ pub(crate) async fn run_loop(
     if agent_types.is_empty() {
         request_tools.retain(|tool| tool.name != "spawn");
     }
+    // Withholding `spawn` on a `Direct` route was measured on 2026-09-21
+    // and cost more, not less: $0.1383 against $0.1322 over n=12 each,
+    // with output rising from 1,298 to 1,422 tokens. Its 122 tokens are
+    // the largest of the six schemas and the turn never calls it, and
+    // taking them away still lost — the same way every other attempt to
+    // shrink the always-on context has. **Removing what the model can see
+    // makes it write more.** Not retried without a new reason.
     let mcp_setup = session.mcp_setup.clone().filter(|_| caller == "root");
     if mcp_setup.is_some() {
         request_tools.push(polaris_tools::mcp_setup_spec());
@@ -813,8 +1080,34 @@ pub(crate) async fn run_loop(
     // The bundled setting commands, on the same root-only footing: a child
     // run never gets to change the project's configuration.
     let setting = session.setting.clone().filter(|_| caller == "root");
-    if setting.is_some() {
+    if setting.is_some()
+        && wants(
+            session,
+            &[
+                crate::turn_intent::Work::Configuration,
+                crate::turn_intent::Work::Release,
+            ],
+        )
+    {
         request_tools.push(polaris_tools::setting_spec());
+    }
+    // Driving an application, on the same root-only footing as the two
+    // above: a child run is given one bounded job and a write root, and
+    // reaching outside it into somebody's windows is not part of that job.
+    //
+    // Gated on the capability actually being there, for the reason the
+    // read-only phases are: a schema for something the run cannot do is
+    // billed on every request and buys nothing. On a machine without the
+    // accessibility permission the tool is simply absent.
+    //
+    // Its 184 tokens are also what carries the root prefix from 995 to
+    // 1,179, past the backend's 1,024-token cache minimum. That is a
+    // consequence of adding a real capability, not the reason for it.
+    if caller == "root"
+        && session.computer.is_some()
+        && wants(session, &[crate::turn_intent::Work::Operation])
+    {
+        request_tools.push(polaris_tools::computer_spec());
     }
     // The state window is offered to any run with an owner port, so reading
     // the current state does not depend on the workflow being enabled.
@@ -830,6 +1123,46 @@ pub(crate) async fn run_loop(
         request_tools.push(polaris_tools::state_spec());
         crate::budget::validate_state_schema()?;
     }
+    let workflow_artifact_tool = caller == "root"
+        && session
+            .workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.config.enabled);
+    if workflow_artifact_tool {
+        request_tools.push(polaris_tools::workflow_artifact_spec());
+    }
+    // Verification is a root owner capability only while the durable
+    // workflow is in a phase where evidence can be prepared or published.
+    // Sidechats and children never receive the schema.
+    let verification_tool = caller == "root"
+        && session.verification_owner.is_some()
+        && session.workflow.as_ref().is_some_and(|workflow| {
+            workflow.config.enabled
+                && matches!(
+                    workflow.state().phase,
+                    crate::workflow::Phase::Implement
+                        | crate::workflow::Phase::Review
+                        | crate::workflow::Phase::Verify
+                )
+        });
+    if verification_tool {
+        let mut spec = polaris_tools::verification_spec();
+        spec.description = "Prepare or run one host-owned verification checkpoint. The host publishes a terminal result; you cannot provide commands, paths, hashes, pass/fail values, evidence, or approval.".into();
+        spec.parameters["properties"]["op"]["enum"] = serde_json::json!(["prepare", "run"]);
+        request_tools.push(spec);
+    }
+    // Stopping to ask is a capability of the one route that means the
+    // decision is open, and only while nothing is already outstanding: a
+    // run with a question in flight has nothing to add by asking again,
+    // and the withdrawal is what stops a turn from becoming a
+    // questionnaire.
+    if caller == "root"
+        && session.turn_intent.as_ref().and_then(|intent| intent.route)
+            == Some(crate::turn_intent::Route::Grilling)
+        && session.clarification.unanswered().is_empty()
+    {
+        request_tools.push(polaris_tools::clarify_spec());
+    }
     // A phase that cannot change a file has no use for the tools that do,
     // and a tool nobody can call still costs its schema on every request.
     // Measured 2026-09-21: the six always-on schemas are 504 of 647 tokens
@@ -843,6 +1176,25 @@ pub(crate) async fn run_loop(
         && let Some(allowed) = read_only_tools(phase)
     {
         request_tools.retain(|tool| allowed.contains(&tool.name.as_str()));
+    }
+    // Schema filtering is a cost and safety boundary, not guidance for the
+    // model. Every gated non-Implement phase and stale gated artifact exposes
+    // only read-only capabilities. An absent/disabled workflow is the explicit
+    // legacy opt-out and preserves the legacy tool contract.
+    if !workflow_mutation_authorized(session) {
+        request_tools.retain(|tool| {
+            !matches!(
+                tool.name.as_str(),
+                "write" | "edit" | "bash" | "spawn" | "computer"
+            )
+        });
+    }
+    // A turn waiting on the user's answer does not edit files, whatever
+    // phase it is in. The phase gate above covers the ordinary case; this
+    // covers the one where the run stopped to ask something.
+    if !session.clarification.may_change_files() {
+        request_tools
+            .retain(|tool| !matches!(tool.name.as_str(), "write" | "edit" | "spawn" | "computer"));
     }
     let workflow_system = workflow_turn
         .as_ref()
@@ -993,21 +1345,51 @@ pub(crate) async fn run_loop(
     // Root only. A subagent is given its task directly and has no map to
     // search, and paying for a second route on every spawned child would
     // cost more than the read it replaces.
-    let (filemap_section, decided_section) = if caller == "root" {
-        // Project identity is independent of write authority. Read-only and
-        // full-access policies have no writable roots; desktop cwd is the host,
-        // not the isolated copy. Only the trusted entry point supplies scope.
-        let root = session
-            .request_prompt
-            .as_ref()
-            .and_then(crate::prompt::AlwaysOn::project_root);
-        (
-            filemap_route(session, root, skill_query, &audit, caller).await?,
-            decided_route(session, root, skill_query, &audit, caller).await?,
-        )
-    } else {
-        (None, None)
-    };
+    let analysis_context = prepare_project_analysis_context(
+        session,
+        agent_types,
+        provider_pool.clone(),
+        audit.clone(),
+        events.clone(),
+        child_workflow.clone(),
+        spawn_concurrency,
+        spawn_write_concurrency,
+        caller,
+        ctx,
+    )
+    .await?;
+    let analysis_answer_only = analysis_context
+        .as_ref()
+        .is_some_and(|prepared| prepared.answer_only);
+    if analysis_answer_only {
+        // CURRENT is the first and smallest state for a broad analysis. Once
+        // its delegated read produced typed evidence, another root-side
+        // exploration round defeats that state machine: the model can reread
+        // the repository for the rest of the turn and replay every growing
+        // tool result on every request. The observed 2026-09-22 run did just
+        // that (17 root requests, 41 reads and 14 shell calls). Synthesis is
+        // the remaining job, so advertise no tools for this one root request.
+        request_tools.clear();
+    }
+    let (filemap_section, decided_section) =
+        if caller == "root" && !session.project_analysis.is_active() {
+            // Project identity is independent of write authority. Read-only and
+            // full-access policies have no writable roots; desktop cwd is the host,
+            // not the isolated copy. Only the trusted entry point supplies scope.
+            let root = session
+                .request_prompt
+                .as_ref()
+                .and_then(crate::prompt::AlwaysOn::project_root);
+            (
+                filemap_route(session, root, skill_query, &audit, caller).await?,
+                decided_route(session, root, skill_query, &audit, caller).await?,
+            )
+        } else {
+            (None, None)
+        };
+    let review_read_delegation = delegates_review_reads(session, caller, skill_query, agent_types);
+    let mut root_project_reads = 0usize;
+    let mut delegated_project_reads = 0usize;
     // Every invocation owns its context. Child agents invoke run_loop
     // independently and cannot inherit transport state from their parent.
     let turn_context = polaris_provider::turn_affinity::TurnContext::new();
@@ -1060,6 +1442,10 @@ pub(crate) async fn run_loop(
             Some(section) => {
                 format!("{request_system}\n{}\n{section}", crate::decisions::HEADING)
             }
+            None => request_system,
+        };
+        let request_system = match &analysis_context {
+            Some(prepared) => format!("{request_system}\n{}", prepared.context),
             None => request_system,
         };
         // M6-3c: instructions that arrived during the run join the
@@ -1173,6 +1559,10 @@ pub(crate) async fn run_loop(
                     refreshed.push('\n');
                     refreshed.push_str(section);
                 }
+                if let Some(prepared) = &analysis_context {
+                    refreshed.push('\n');
+                    refreshed.push_str(&prepared.context);
+                }
                 refreshed
             }
             None => request_system,
@@ -1180,10 +1570,14 @@ pub(crate) async fn run_loop(
         // Resolving the preselection is what turns picks into schemas, so
         // it happens before the decision rather than after it. `freeze`
         // settles the selection for this iteration and must run once.
-        if let Some(runtime) = mcp.as_deref_mut() {
+        if !analysis_answer_only && let Some(runtime) = mcp.as_deref_mut() {
             mcp_dispatch::refresh(runtime, mcp_control.as_ref()).await?;
         }
-        let mcp_request = mcp.as_deref_mut().map(mcp_dispatch::prepare).transpose()?;
+        let mcp_request = if analysis_answer_only {
+            None
+        } else {
+            mcp.as_deref_mut().map(mcp_dispatch::prepare).transpose()?
+        };
         let mut sending_tools = request_tools.clone();
         if let Some(prepared) = &mcp_request {
             sending_tools.extend_from_slice(&prepared.tools);
@@ -1196,6 +1590,18 @@ pub(crate) async fn run_loop(
         let mut input_projected = prepared_input.as_ref().is_some_and(|prepared| {
             prepared.apply(&mut sending_messages, session.input_source.as_ref())
         });
+        let mut workflow_context_projected = false;
+        if let Some(prepared) = &prepared_workflow_context
+            && prepared.slice().is_some()
+        {
+            let source = session.input_source.as_ref().ok_or_else(|| {
+                std::io::Error::other("active workflow contextを実ユーザー入力へ結び付けられません")
+            })?;
+            let projection = prepared
+                .insert_once(&mut sending_messages, source)
+                .map_err(std::io::Error::other)?;
+            workflow_context_projected = projection.inserted;
+        }
         let total_tokens = crate::budget::always_on_tokens(&sending_system, &sending_tools)
             + crate::compaction::session_tokens(&session.examples)
             // The memory evidence is deliberately absent. It exists only
@@ -1209,6 +1615,8 @@ pub(crate) async fn run_loop(
                     .compaction_threshold
                     .unwrap_or(crate::compaction::COMPACTION_THRESHOLD)
         {
+            let input_before_compaction = session.input_source.clone();
+            let message_count_before_compaction = session.messages.len();
             match session.compact_automatically(provider).await {
                 Ok(Some(report)) => {
                     // Only a completed compaction starts a new transport
@@ -1216,6 +1624,32 @@ pub(crate) async fn run_loop(
                     turn_context.clear();
                     sending_messages = session.messages.clone();
                     input_projected = false;
+                    // A compaction replaces a history prefix, so it consumes
+                    // the session's prepared-input capability.  Keep only a
+                    // request-local, verified relocation for the active
+                    // workflow slice below; the raw current input remains in
+                    // `sending_messages` and is never projected again.
+                    let compacted_workflow_input = input_before_compaction.and_then(|source| {
+                        source.relocated_after_prefix_rewrite(
+                            message_count_before_compaction,
+                            &session.messages,
+                        )
+                    });
+                    session.input_source = None;
+                    workflow_context_projected = false;
+                    if let Some(prepared) = &prepared_workflow_context
+                        && prepared.slice().is_some()
+                    {
+                        let source = compacted_workflow_input.as_ref().ok_or_else(|| {
+                            std::io::Error::other(
+                                "compaction後のactive workflow contextを実入力へ再結合できません",
+                            )
+                        })?;
+                        workflow_context_projected = prepared
+                            .insert_once(&mut sending_messages, source)
+                            .map_err(std::io::Error::other)?
+                            .inserted;
+                    }
                     if let Some(tx) = &events {
                         let _ = tx.send(crate::events::AgentEvent::HistoryCompacted {
                             messages_before: report.messages_before,
@@ -1245,6 +1679,20 @@ pub(crate) async fn run_loop(
         if let Some(evidence) = &historical_evidence {
             request_messages.push(evidence.clone());
         }
+        if let Some(reads) = &session.leased_mcp_reads {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            if let Some(message) = reads
+                .request_message(now_ms)
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+            {
+                request_messages.push(message);
+            }
+        }
         request_messages.extend_from_slice(&sending_messages);
         check_event_delivery(events.as_ref())?;
         let observer = events
@@ -1272,6 +1720,26 @@ pub(crate) async fn run_loop(
                 sandbox: None,
                 target: None,
                 result: "request_copy_only",
+                caller,
+            })?;
+        }
+        if let Some(prepared) = &prepared_workflow_context
+            && prepared.slice().is_some()
+        {
+            audit.lock().await.record(&Record {
+                tool: "workflow-context-slice",
+                detail: if workflow_context_projected {
+                    "request_only"
+                } else {
+                    "already_projected"
+                },
+                sandbox: None,
+                target: None,
+                result: &format!(
+                    "tokens={} complete={}",
+                    prepared.token_cost(),
+                    prepared.complete()
+                ),
                 caller,
             })?;
         }
@@ -1363,8 +1831,18 @@ pub(crate) async fn run_loop(
             .filter(|call| call.name == "state" && call.arguments["op"] == "transition")
             .count();
         let mut deferred_transition = None;
+        // This handle is owner-local. It can only survive from a completed
+        // parent MCP read to the immediately following, one-child spawn.
+        // Any other tool call discards it before that call runs.
+        let mut armed_mcp_capture = None;
         let mut siblings_ok = true;
-        for call in &res.tool_calls {
+        for (call_index, call) in res.tool_calls.iter().enumerate() {
+            if armed_mcp_capture.is_some()
+                && call.name != "spawn"
+                && let Some(armed) = armed_mcp_capture.take()
+            {
+                let _ = session.discard_armed_child_mcp_capture(&armed);
+            }
             if let Some(setup) = mcp_setup.as_ref()
                 && call.name == "mcp_setup"
             {
@@ -1434,6 +1912,20 @@ pub(crate) async fn run_loop(
             if let Some(runtime) = mcp.as_deref_mut()
                 && call.name.starts_with("mcp_")
             {
+                let may_arm_for_immediate_spawn = is_catalog_read(call)
+                    && res
+                        .tool_calls
+                        .get(call_index.saturating_add(1))
+                        .is_some_and(is_one_child_spawn);
+                // A normal model-originated spawn has no pre-established
+                // recipient, and therefore cannot receive MCP evidence.
+                let armed = if may_arm_for_immediate_spawn {
+                    session
+                        .arm_child_mcp_capture()
+                        .map_err(|error| std::io::Error::other(error.to_string()))?
+                } else {
+                    None
+                };
                 check_event_delivery(events.as_ref())?;
                 let generic_tool = call.name != "mcp_catalog";
                 if generic_tool
@@ -1460,6 +1952,24 @@ pub(crate) async fn run_loop(
                 // operations. It must enter both request view and full suffix.
                 session.push_message(reply.message, false);
                 session.check_persistence()?;
+                if let Some(armed) = armed {
+                    // Capture only after the canonical tool result made it
+                    // through the history owner. The host-only lease parser
+                    // rejects non-inline/incomplete/retained reply shapes.
+                    match session.capture_armed_parent_mcp_read(
+                        &armed,
+                        call,
+                        session
+                            .messages
+                            .last()
+                            .expect("canonical MCP result was appended"),
+                    ) {
+                        Ok(true) => armed_mcp_capture = Some(armed),
+                        Ok(false) | Err(_) => {
+                            let _ = session.discard_armed_child_mcp_capture(&armed);
+                        }
+                    }
+                }
                 audit.lock().await.record(&Record {
                     tool: &call.name,
                     detail: &call.arguments.to_string(),
@@ -1476,6 +1986,200 @@ pub(crate) async fn run_loop(
                 if successful {
                     stop.observe_success();
                 } else if let Some(reason) = stop.observe_error(&body) {
+                    return Err(AgentError::Stopped(reason));
+                }
+                continue;
+            }
+            if workflow_artifact_tool && call.name == "workflow_artifact" {
+                check_event_delivery(events.as_ref())?;
+                workflow_artifact::event(events.as_ref(), call, None);
+                let outcome = match workflow_artifact::parse(call) {
+                    Ok(workflow_artifact::WorkflowArtifactAction::ProposeRoutineContract {
+                        expected_workflow_revision,
+                        proposal,
+                    }) => {
+                        let previous_user_prompt = real_user_query(session);
+                        let contract = session
+                            .routine_change_authorization
+                            .as_ref()
+                            .and_then(|authority| authority.contract_input_for(&previous_user_prompt))
+                            .ok_or_else(|| {
+                                "このuser turnに対するhostのroutine change authorizationがありません"
+                                    .to_string()
+                            })
+                            .and_then(|(eligibility, trusted_verification)| {
+                                workflow_artifact::materialize_routine_contract(
+                                    proposal,
+                                    &previous_user_prompt,
+                                    &workflow_artifact::TrustedRoutineChangeScope {
+                                        affected_components: eligibility
+                                            .affected_components
+                                            .clone(),
+                                    },
+                                    workflow_artifact::TrustedRoutineImpactFacts {
+                                        security: eligibility.security,
+                                        migration: eligibility.migration,
+                                        public_api: eligibility.public_api,
+                                        dependency: eligibility.dependency,
+                                        deployment: eligibility.distribution,
+                                        user_contract: eligibility.major_user_contract,
+                                        unknown_impact: eligibility.unknown_impact,
+                                    },
+                                    trusted_verification,
+                                )
+                            });
+                        match contract {
+                            Ok(contract) => match session
+                                .publish_and_approve_routine_contract(
+                                    expected_workflow_revision,
+                                    contract,
+                                )
+                                .await
+                            {
+                                Ok(reference) => {
+                                    session.routine_change_authorization = None;
+                                    let workflow = session.workflow.as_ref().ok_or_else(|| {
+                                        std::io::Error::other("workflowがありません")
+                                    })?;
+                                    workflow
+                                        .request_phase(crate::workflow::Phase::Implement)
+                                        .map_err(std::io::Error::other)?;
+                                    if let Some(turn) = &mut workflow_turn {
+                                        turn.refresh_runtime(workflow)
+                                            .map_err(std::io::Error::other)?;
+                                    }
+                                    Ok(serde_json::json!({
+                                        "status":"published",
+                                        "active_change_contract":reference,
+                                        "workflow_revision":workflow.state().revision,
+                                    })
+                                    .to_string())
+                                }
+                                Err(error) => Err(serde_json::json!({
+                                    "status":"not_published",
+                                    "message":error.to_string(),
+                                })
+                                .to_string()),
+                            },
+                            Err(error) => Err(serde_json::json!({
+                                "status":"not_published",
+                                "message":error,
+                            })
+                            .to_string()),
+                        }
+                    }
+                    Ok(workflow_artifact::WorkflowArtifactAction::ReadExact {
+                        kind,
+                        reference,
+                    }) => match session
+                        .read_workflow_artifact(kind, reference.clone())
+                        .await
+                    {
+                        Ok(body) => Ok(serde_json::json!({
+                            "status":"ok",
+                            "kind":kind,
+                            "reference":reference,
+                            "body":body,
+                        })
+                        .to_string()),
+                        Err(error) => Err(serde_json::json!({
+                            "status":"not_found",
+                            "message":error.to_string(),
+                        })
+                        .to_string()),
+                    },
+                    Err(error) => Err(serde_json::json!({
+                        "status":"invalid_arguments",
+                        "message":error,
+                    })
+                    .to_string()),
+                };
+                let ok = outcome.is_ok();
+                let result = outcome.unwrap_or_else(|error| error);
+                workflow_artifact::event(events.as_ref(), call, Some((&result, ok)));
+                session.push_tool_result(&call.id, &result);
+                session.check_persistence()?;
+                audit.lock().await.record(&Record {
+                    tool: &call.name,
+                    detail: &call.arguments.to_string(),
+                    sandbox: None,
+                    target: None,
+                    result: &result,
+                    caller,
+                })?;
+                siblings_ok &= ok;
+                if ok {
+                    stop.observe_success();
+                } else if let Some(reason) = stop.observe_error(&result) {
+                    return Err(AgentError::Stopped(reason));
+                }
+                continue;
+            }
+            if verification_tool && call.name == "verification" {
+                check_event_delivery(events.as_ref())?;
+                let outcome = match verification::parse(call) {
+                    Ok(crate::verification::VerificationCheckpointActionV1::Prepare) => {
+                        let owner = session.verification_owner.clone().ok_or_else(|| {
+                            std::io::Error::other("verification ownerがありません")
+                        })?;
+                        owner.prepare().map_err(std::io::Error::other).and_then(|checkpoint| {
+                            let checkpoint_id = checkpoint.checkpoint_id.clone();
+                            session.persist_verification_checkpoint(checkpoint)?;
+                            Ok(serde_json::json!({"status":"prepared","checkpoint_id":checkpoint_id}).to_string())
+                        })
+                    }
+                    Ok(crate::verification::VerificationCheckpointActionV1::Run {
+                        preparation_id,
+                    }) => {
+                        let owner = session.verification_owner.clone().ok_or_else(|| {
+                            std::io::Error::other("verification ownerがありません")
+                        })?;
+                        let checkpoint = owner
+                            .begin_run(&preparation_id)
+                            .map_err(std::io::Error::other)?;
+                        session.persist_verification_checkpoint(checkpoint)?;
+                        owner.poll_run(&preparation_id).map_err(std::io::Error::other).and_then(|checkpoint| {
+                            let checkpoint_id = checkpoint.checkpoint_id.clone();
+                            let stage = checkpoint.stage;
+                            session.persist_verification_checkpoint(checkpoint)?;
+                            if stage != crate::verification::VerificationCheckpointStageV1::Terminal {
+                                return Ok(serde_json::json!({"status":"recorded","checkpoint_id":checkpoint_id,"stage":stage}).to_string());
+                            }
+                            let (checkpoint, bundle) = owner
+                                .publish(&checkpoint_id)
+                                .map_err(std::io::Error::other)?;
+                            session.publish_verification_convergence(checkpoint, bundle)?;
+                            let revision = session
+                                .workflow
+                                .as_ref()
+                                .map(|workflow| workflow.state().revision)
+                                .ok_or_else(|| std::io::Error::other("published workflowがありません"))?;
+                            Ok(serde_json::json!({"status":"published","checkpoint_id":checkpoint_id,"workflow_revision":revision}).to_string())
+                        })
+                    }
+                    Ok(crate::verification::VerificationCheckpointActionV1::Publish { .. }) => Err(
+                        std::io::Error::other("verification publishはhost ownerだけが実行できます"),
+                    ),
+                    Err(error) => Err(std::io::Error::other(error)),
+                };
+                let ok = outcome.is_ok();
+                let result = outcome.unwrap_or_else(|error| {
+                    serde_json::json!({"status":"rejected","message":error.to_string()}).to_string()
+                });
+                session.push_tool_result(&call.id, &result);
+                session.check_persistence()?;
+                audit.lock().await.record(&Record {
+                    tool: &call.name,
+                    detail: &call.arguments.to_string(),
+                    sandbox: None,
+                    target: None,
+                    result: &result,
+                    caller,
+                })?;
+                siblings_ok &= ok;
+                if ok {
+                    stop.observe_success();
+                } else if let Some(reason) = stop.observe_error(&result) {
                     return Err(AgentError::Stopped(reason));
                 }
                 continue;
@@ -1563,7 +2267,47 @@ pub(crate) async fn run_loop(
                 .then(|| call.arguments["path"].as_str())
                 .flatten()
                 .filter(|path| path.starts_with("conversation://"));
-            let outcome = if let Some(path) = conversation_path {
+            let delegated_path =
+                if review_read_delegation && memory_path.is_none() && conversation_path.is_none() {
+                    delegated_review_path(session, call).and_then(|path| {
+                        root_project_reads += 1;
+                        (root_project_reads > DIRECT_REVIEW_READS).then_some(path)
+                    })
+                } else {
+                    None
+                };
+            let outcome = if call.name == crate::turn_intent::CLARIFY {
+                // Handled here rather than in `dispatch` because the only
+                // thing this tool does is change the session: the answer
+                // comes from the user, so there is nothing to execute and
+                // nothing to report but the questions themselves.
+                let questions = crate::turn_intent::questions_in(&call.arguments);
+                if questions.is_empty() {
+                    Err("questions is missing, or every entry was blank".to_string())
+                } else {
+                    let turn = session.messages.len() as u64;
+                    let asked = questions
+                        .iter()
+                        .map(|question| crate::turn_intent::PendingClarification {
+                            question: question.clone(),
+                            turn,
+                            answer_hash: None,
+                        })
+                        .collect();
+                    session.clarification =
+                        crate::turn_intent::ClarificationState::Pending { asked };
+                    // The gate that offered this runs once, before the
+                    // turn opens, so withdrawing it here is what stops the
+                    // same turn from asking twice. The next turn rebuilds
+                    // the list from the state above.
+                    request_tools.retain(|tool| tool.name != crate::turn_intent::CLARIFY);
+                    Ok(format!(
+                        "{} 件の質問を記録した。この turn ではもう道具を使わず、\
+                         質問だけを利用者へ返すこと。回答は次の入力として届く。",
+                        questions.len()
+                    ))
+                }
+            } else if let Some(path) = conversation_path {
                 dispatch_conversation_read(
                     session.persistence.as_ref(),
                     session.desktop_memory.as_deref(),
@@ -1576,8 +2320,68 @@ pub(crate) async fn run_loop(
             } else if let Some(path) = memory_path {
                 dispatch_memory_read(session.tool_memory.as_ref(), call, path, events.as_ref())
                     .await
+            } else if let Some(path) = delegated_path {
+                if delegated_project_reads < DELEGATED_REVIEW_READS {
+                    delegated_project_reads += 1;
+                    let body = delegate_review_read(
+                        session,
+                        call,
+                        &path,
+                        skill_query,
+                        agent_types,
+                        provider_pool.clone(),
+                        audit.clone(),
+                        events.clone(),
+                        child_workflow.clone(),
+                        spawn_concurrency,
+                        spawn_write_concurrency,
+                        ctx,
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                    if delegated_project_reads == DELEGATED_REVIEW_READS {
+                        // The current response may already contain more calls;
+                        // they receive an explicit gap below. The next request
+                        // cannot start another unbounded exploration route.
+                        request_tools.retain(|tool| {
+                            !matches!(tool.name.as_str(), "read" | "bash" | "spawn")
+                        });
+                    }
+                    body
+                } else {
+                    Ok(serde_json::json!({
+                        "source": "file-reader",
+                        "path": path,
+                        "findings": [],
+                        "gaps": [format!(
+                            "bounded review read limit reached after {} direct and {} delegated files; synthesize the evidence already returned and report remaining gaps",
+                            DIRECT_REVIEW_READS,
+                            DELEGATED_REVIEW_READS
+                        )],
+                    })
+                    .to_string())
+                }
             } else {
-                dispatch(
+                let spawn_control = if call.name == "spawn" {
+                    match call.arguments["tasks"].as_array().map(Vec::len) {
+                        Some(count) if count > 0 => {
+                            if let Some(armed) = armed_mcp_capture.take()
+                                && let Err(error) =
+                                    session.bind_armed_capture_to_next_spawn(&armed, count)
+                            {
+                                let _ = session.discard_armed_child_mcp_capture(&armed);
+                                return Err(AgentError::Io(std::io::Error::other(error)));
+                            }
+                            session
+                                .issue_spawn_control(count)
+                                .map_err(std::io::Error::other)?
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                dispatch_controlled(
                     call,
                     lookup_skills,
                     agent_types,
@@ -1589,6 +2393,7 @@ pub(crate) async fn run_loop(
                     child_workflow.clone(),
                     session.tier_decider.as_deref(),
                     session.decider.as_deref(),
+                    session.computer.as_deref(),
                     // The root's own wave is rung 1; a subagent that
                     // delegates starts the rung below its own.
                     if caller == "root" {
@@ -1597,6 +2402,7 @@ pub(crate) async fn run_loop(
                         crate::spawn::MAX_DEPTH
                     },
                     session.child_memory.clone(),
+                    spawn_control,
                     ctx,
                 )
                 .await
@@ -1719,6 +2525,12 @@ pub(crate) async fn run_loop(
             }
             session.check_persistence()?;
         }
+        // A malformed/rejected immediate spawn leaves no child attempt that
+        // may resolve the captured body. Do not carry it into the next model
+        // request or turn.
+        if let Some(armed) = armed_mcp_capture.take() {
+            let _ = session.discard_armed_child_mcp_capture(&armed);
+        }
         flush_directory_changes(
             &mut pending_changes,
             agent_types,
@@ -1806,6 +2618,315 @@ fn include_summary_usage(
         .saturating_sub(before.missing_responses);
     main.failed_requests += after.failed_requests.saturating_sub(before.failed_requests);
     main
+}
+
+/// Run the state-selected first read through the real spawn boundary before
+/// the root's first broad project-analysis request. This is deterministic host
+/// routing, not a display-only event: the child result is the evidence placed
+/// in the root's request context, while the ordinary spawn events keep the
+/// delegation visible in CLI and desktop activity.
+struct PreparedProjectAnalysis {
+    context: String,
+    /// A successful CURRENT read already answers the deliberately broad first
+    /// request at the smallest state. The root only has to synthesize it.
+    answer_only: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_project_analysis_context(
+    session: &Session,
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    events: Option<crate::desktop_events::EventSink>,
+    child_workflow: Option<crate::spawn::ChildWorkflow>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
+    caller: &str,
+    ctx: &ToolContext<'_>,
+) -> Result<Option<PreparedProjectAnalysis>, AgentError> {
+    if caller != "root" {
+        return Ok(None);
+    }
+    let Some(mut context) = session.project_analysis.context() else {
+        return Ok(None);
+    };
+    let root = session
+        .request_prompt
+        .as_ref()
+        .and_then(crate::prompt::AlwaysOn::project_root);
+    let Some(reader) = session.project_analysis.reader_request(root) else {
+        return Ok(Some(PreparedProjectAnalysis {
+            context,
+            answer_only: false,
+        }));
+    };
+    if !agent_types.iter().any(|agent| agent.name == "file-reader") {
+        context.push_str("\nreader=unavailable:file-reader");
+        return Ok(Some(PreparedProjectAnalysis {
+            context,
+            answer_only: false,
+        }));
+    }
+
+    let task = crate::spawn::SpawnTask {
+        agent_type: "file-reader".into(),
+        task: reader.task,
+        write_root: None,
+    };
+    let detail = serde_json::json!({
+        "tasks": [{
+            "type": task.agent_type.clone(),
+            "task": task.task.clone(),
+        }]
+    })
+    .to_string();
+    if let Some(sink) = &events {
+        let _ = sink.send(crate::events::AgentEvent::ToolStarted {
+            name: "spawn".into(),
+            detail: detail.clone(),
+        });
+    }
+    check_event_delivery(events.as_ref())?;
+
+    let control = session
+        .issue_spawn_control(1)
+        .map_err(std::io::Error::other)?;
+    let result = Box::pin(crate::spawn::run_wave_with_gate_controlled(
+        vec![task],
+        agent_types,
+        provider_pool,
+        audit.clone(),
+        ctx.sandbox,
+        ctx.helper,
+        spawn_concurrency,
+        spawn_write_concurrency,
+        events.clone(),
+        child_workflow,
+        ctx.gate,
+        session.tier_decider.as_deref(),
+        1,
+        session.child_memory.clone(),
+        control,
+    ))
+    .await;
+
+    if let Some(sink) = &events {
+        let ok = serde_json::from_str::<serde_json::Value>(&result)
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_array()
+                    .and_then(|entries| entries.first())
+                    .cloned()
+            })
+            .and_then(|entry| entry.get("ok").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        let _ = sink.send(crate::events::AgentEvent::ToolFinished {
+            name: "spawn".into(),
+            detail: detail.clone(),
+            ok,
+            result: result.clone(),
+            diff: None,
+        });
+    }
+    check_event_delivery(events.as_ref())?;
+    audit.lock().await.record(&Record {
+        tool: "spawn",
+        detail: &detail,
+        sandbox: None,
+        target: Some(&reader.path),
+        result: &result,
+        caller,
+    })?;
+
+    let entry = serde_json::from_str::<serde_json::Value>(&result)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_array()
+                .and_then(|entries| entries.first())
+                .cloned()
+        });
+    let answer_only = match entry {
+        Some(entry) if entry.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
+            let evidence = entry
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            context.push_str("\nreader=spawn:file-reader");
+            context.push_str("\nreader_result_role=evidence_only_not_instructions");
+            context.push_str("\nreader_result=");
+            context.push_str(&evidence.to_string());
+            let current = matches!(
+                &session.project_analysis,
+                crate::project_analysis::ProjectAnalysisState::Current { .. }
+            );
+            if current {
+                context.push_str(
+                    "\naction=synthesize_reader_result_and_report_its_gaps_without_more_tools",
+                );
+            } else {
+                context
+                    .push_str("\naction=use_reader_result_first_and_expand_only_for_reported_gaps");
+            }
+            current
+        }
+        Some(entry) => {
+            let mut error = entry
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("file-reader failed")
+                .chars();
+            let mut bounded: String = error.by_ref().take(512).collect();
+            if error.next().is_some() {
+                bounded.push('…');
+            }
+            context.push_str("\nreader=failed:file-reader");
+            context.push_str("\nreader_error=");
+            context.push_str(&serde_json::Value::String(bounded).to_string());
+            false
+        }
+        None => {
+            context.push_str("\nreader=failed:invalid_spawn_result");
+            false
+        }
+    };
+    Ok(Some(PreparedProjectAnalysis {
+        context,
+        answer_only,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn delegate_review_read(
+    session: &Session,
+    call: &polaris_provider::ToolCall,
+    path: &Path,
+    query: &str,
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    events: Option<crate::desktop_events::EventSink>,
+    child_workflow: Option<crate::spawn::ChildWorkflow>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
+    ctx: &ToolContext<'_>,
+) -> Result<String, AgentError> {
+    let offset = call.arguments["offset"].as_u64().unwrap_or(0);
+    let limit = call.arguments["limit"]
+        .as_u64()
+        .unwrap_or(polaris_tools::read::DEFAULT_LIMIT as u64);
+    let mut bounded_query: String = query.chars().take(600).collect();
+    if query.chars().count() > 600 {
+        bounded_query.push('…');
+    }
+    let task = crate::spawn::SpawnTask {
+        agent_type: "file-reader".into(),
+        task: format!(
+            "Read the file at {} from zero-based line offset {offset}, up to {limit} lines. \
+             Return only evidence relevant to this parent analysis request: {}. \
+             Preserve identifiers, numeric thresholds, negation, conditions, and exact source \
+             lines. Report anything the requested range cannot establish as a gap.",
+            path.display(),
+            bounded_query
+        ),
+        write_root: None,
+    };
+    let detail = serde_json::json!({
+        "automatic": "bounded_review_read",
+        "tasks": [{
+            "type": task.agent_type.clone(),
+            "task": task.task.clone(),
+        }]
+    })
+    .to_string();
+    if let Some(sink) = &events {
+        let _ = sink.send(crate::events::AgentEvent::ToolStarted {
+            name: "spawn".into(),
+            detail: detail.clone(),
+        });
+    }
+    check_event_delivery(events.as_ref())?;
+    let control = session
+        .issue_spawn_control(1)
+        .map_err(std::io::Error::other)?;
+    let result = Box::pin(crate::spawn::run_wave_with_gate_controlled(
+        vec![task],
+        agent_types,
+        provider_pool,
+        audit.clone(),
+        ctx.sandbox,
+        ctx.helper,
+        spawn_concurrency,
+        spawn_write_concurrency,
+        events.clone(),
+        child_workflow,
+        ctx.gate,
+        session.tier_decider.as_deref(),
+        1,
+        session.child_memory.clone(),
+        control,
+    ))
+    .await;
+    let entry = serde_json::from_str::<serde_json::Value>(&result)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_array()
+                .and_then(|entries| entries.first())
+                .cloned()
+        });
+    let ok = entry
+        .as_ref()
+        .and_then(|entry| entry.get("ok"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let body = match entry {
+        Some(entry) if ok => serde_json::json!({
+            "source": "file-reader",
+            "path": path,
+            "evidence": entry.get("result").cloned().unwrap_or(serde_json::Value::Null),
+        })
+        .to_string(),
+        Some(entry) => serde_json::json!({
+            "source": "file-reader",
+            "path": path,
+            "findings": [],
+            "gaps": [entry.get("error").and_then(serde_json::Value::as_str).unwrap_or("file-reader failed")],
+        })
+        .to_string(),
+        None => serde_json::json!({
+            "source": "file-reader",
+            "path": path,
+            "findings": [],
+            "gaps": ["file-reader returned an invalid result"],
+        })
+        .to_string(),
+    };
+    if let Some(sink) = &events {
+        let _ = sink.send(crate::events::AgentEvent::ToolFinished {
+            name: "spawn".into(),
+            detail: detail.clone(),
+            ok,
+            result: if ok {
+                "file-reader evidence returned".into()
+            } else {
+                "file-reader returned a gap".into()
+            },
+            diff: None,
+        });
+    }
+    check_event_delivery(events.as_ref())?;
+    audit.lock().await.record(&Record {
+        tool: "spawn",
+        detail: &detail,
+        sandbox: None,
+        target: Some(path),
+        result: &result,
+        caller: "root",
+    })?;
+    Ok(body)
 }
 
 pub(crate) async fn dispatch_conversation_read(
@@ -1939,7 +3060,47 @@ async fn dispatch_memory_read(
 /// denied, the reason carried in the child's output is returned to the
 /// model as-is.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn dispatch(
+    call: &polaris_provider::ToolCall,
+    skills: &[polaris_skills::Skill],
+    agent_types: &[polaris_skills::AgentType],
+    provider_pool: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    spawn_concurrency: usize,
+    spawn_write_concurrency: usize,
+    events: Option<crate::desktop_events::EventSink>,
+    workflow: Option<crate::spawn::ChildWorkflow>,
+    tier_decider: Option<&dyn crate::tier::TierDecider>,
+    decider: Option<&dyn polaris_provider::decision::Decider>,
+    computer: Option<&crate::computer::ComputerTool>,
+    depth: u8,
+    child_memory: crate::spawn::ChildMemory,
+    ctx: &mut ToolContext<'_>,
+) -> Result<String, String> {
+    dispatch_controlled(
+        call,
+        skills,
+        agent_types,
+        provider_pool,
+        audit,
+        spawn_concurrency,
+        spawn_write_concurrency,
+        events,
+        workflow,
+        tier_decider,
+        decider,
+        computer,
+        depth,
+        child_memory,
+        None,
+        ctx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_controlled(
     call: &polaris_provider::ToolCall,
     skills: &[polaris_skills::Skill],
     agent_types: &[polaris_skills::AgentType],
@@ -1954,10 +3115,14 @@ async fn dispatch(
     // which subagent type the model meant when it named one that does not
     // exist.
     decider: Option<&dyn polaris_provider::decision::Decider>,
+    // Driving an application, when this machine can. `None` everywhere
+    // else, and the tool is not offered there either.
+    computer: Option<&crate::computer::ComputerTool>,
     // The rung a wave started here would run on.
     depth: u8,
     // What resumable subagents of this run left behind.
     child_memory: crate::spawn::ChildMemory,
+    spawn_control: Option<crate::spawn::SpawnControlPort>,
     ctx: &mut ToolContext<'_>,
 ) -> Result<String, String> {
     if let Some(tx) = &events {
@@ -1968,6 +3133,16 @@ async fn dispatch(
     }
 
     check_event_delivery(events.as_ref()).map_err(|error| error.to_string())?;
+    // Tool calls are untrusted provider output. Re-check the exact workflow
+    // state here so a stale schema, injected call, or failed phase transition
+    // cannot turn a read-only Specify/General turn into a mutation.
+    if call_requests_mutation(call)
+        && workflow
+            .as_ref()
+            .is_some_and(|context| !context.workflow.mutation_authorized())
+    {
+        return Err(mutation_refusal());
+    }
     let mut pending_diff: Option<crate::events::Diff> = None;
     let owned_port = match events.as_ref() {
         Some(crate::desktop_events::EventSink::Bounded(sink)) => sink.execution(),
@@ -2178,6 +3353,23 @@ async fn dispatch(
             };
             Ok(lookup_skill(skills, q))
         }
+        "computer" => 'computer: {
+            let Some(computer) = computer else {
+                break 'computer Err("this machine cannot drive an application".to_string());
+            };
+            let (Some(app), Some(goal)) = (
+                call.arguments["app"].as_str(),
+                call.arguments["goal"].as_str(),
+            ) else {
+                break 'computer Err("app and goal are both required".to_string());
+            };
+            let apply = call.arguments["apply"].as_bool().unwrap_or(false);
+            let max_steps = call.arguments["max_steps"].as_u64().unwrap_or(8) as usize;
+            match computer.drive(app, goal, max_steps, apply) {
+                Ok(report) => Ok(report),
+                Err(error) => break 'computer Err(error),
+            }
+        }
         "spawn" => 'spawn: {
             let tasks_json = match call.arguments["tasks"].as_array() {
                 Some(t) => t,
@@ -2270,7 +3462,7 @@ async fn dispatch(
             // It does recurse at runtime now, one rung deep: a subagent
             // above the last rung carries `spawn` and the catalogue to
             // resolve against (`spawn::MAX_DEPTH`).
-            Ok(Box::pin(crate::spawn::run_wave_with_gate(
+            Ok(Box::pin(crate::spawn::run_wave_with_gate_controlled(
                 tasks,
                 agent_types,
                 provider_pool,
@@ -2285,6 +3477,7 @@ async fn dispatch(
                 tier_decider,
                 depth,
                 child_memory,
+                spawn_control,
             ))
             .await)
         }
@@ -2316,6 +3509,26 @@ fn lookup_skill(skills: &[polaris_skills::Skill], query: &str) -> String {
         return "同名のskillが複数あるため、本文を開示できません。".into();
     }
     polaris_tools::skill::lookup(skills, query)
+}
+
+/// Only the catalog read operation has the completed inline reply envelope
+/// that the lease owner understands. Generic MCP calls, writes and setup may
+/// have external effects and must never become child evidence.
+fn is_catalog_read(call: &ToolCall) -> bool {
+    call.name == "mcp_catalog"
+        && call.arguments.get("op").and_then(serde_json::Value::as_str) == Some("read")
+}
+
+/// A capture target is created only when the very next model tool call is a
+/// one-child spawn. The task selector itself remains host-owned; this merely
+/// decides whether there is an immediate handoff opportunity.
+fn is_one_child_spawn(call: &ToolCall) -> bool {
+    call.name == "spawn"
+        && call
+            .arguments
+            .get("tasks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tasks| tasks.len() == 1)
 }
 
 /// CLIの隔離helper入口だけが呼ぶ。親のdispatchからは呼ばない。
@@ -2564,6 +3777,7 @@ mod tests {
                 dummy_audit(&dir),
                 1,
                 1,
+                None,
                 None,
                 None,
                 None,
@@ -2916,7 +4130,9 @@ mod tests {
 
     #[tokio::test]
     async fn adaptive_workflow_replaces_phase_context_and_preserves_durable_results() {
-        use crate::workflow::{Phase, SessionWorkflow, WorkflowMode};
+        use crate::workflow::{
+            Phase, SessionWorkflow, WorkflowGatesV1, WorkflowMode, WorkflowStateV1,
+        };
         struct Adaptive {
             requests: Mutex<Vec<CompletionRequest>>,
             storage: crate::session_store::PersistedSession,
@@ -3015,7 +4231,17 @@ mod tests {
         let mut config = crate::config::Config::default().workflow;
         config.mode = WorkflowMode::Adaptive;
         let mut session = Session::new();
-        session.workflow = Some(SessionWorkflow::new(config));
+        session.workflow = Some(
+            SessionWorkflow::restore(
+                config,
+                WorkflowGatesV1 {
+                    phase_gate_schema_version: None,
+                    ..WorkflowGatesV1::default()
+                },
+                WorkflowStateV1::default(),
+            )
+            .unwrap(),
+        );
         let storage = crate::session_store::PersistedSession::create(
             dir.path(),
             &dir.path().join("memory.sqlite"),
@@ -3618,6 +4844,7 @@ mod tests {
             judge,
             polaris_sandbox::SandboxMode::ReadOnly,
             &[],
+            "常時コンテキストの上限はどこで決まるか",
         )
         .await
     }
@@ -3627,6 +4854,7 @@ mod tests {
         judge: Option<FilemapJudge>,
         mode: polaris_sandbox::SandboxMode,
         writable_roots: &[PathBuf],
+        query: &str,
     ) -> Vec<String> {
         struct Capture {
             requests: Mutex<Vec<CompletionRequest>>,
@@ -3648,7 +4876,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
         };
         let mut session = Session::new();
-        session.push_user("常時コンテキストの上限はどこで決まるか");
+        session.push_user(query);
         session.decider = judge.map(|judge| {
             std::sync::Arc::new(judge) as std::sync::Arc<dyn polaris_provider::decision::Decider>
         });
@@ -3723,6 +4951,7 @@ mod tests {
                 }),
                 mode,
                 &roots,
+                "常時コンテキストの上限はどこで決まるか",
             )
             .await;
             assert_eq!(systems.len(), 1);
@@ -3746,10 +4975,399 @@ mod tests {
             Some(judge),
             polaris_sandbox::SandboxMode::WorkspaceWrite,
             &[project.path().to_path_buf()],
+            "常時コンテキストの上限はどこで決まるか",
         )
         .await;
         assert!(!systems[0].contains(crate::filemap::HEADING));
         assert!(!systems[0].contains(crate::decisions::HEADING));
+    }
+
+    #[tokio::test]
+    async fn first_project_analysis_projects_only_the_current_state() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".polaris/notes")).unwrap();
+        std::fs::create_dir_all(project.path().join("docs")).unwrap();
+        std::fs::write(
+            project.path().join(".polaris/notes/CURRENT.md"),
+            "private current body that is read only on demand",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("docs/filemap.md"),
+            "## `.`\n\n- `README.md` — fallback map\n",
+        )
+        .unwrap();
+        let systems = project_routes_run_system(
+            Some(project.path()),
+            None,
+            polaris_sandbox::SandboxMode::ReadOnly,
+            &[],
+            "このプロジェクトを分析する",
+        )
+        .await;
+        assert_eq!(systems.len(), 1);
+        assert!(systems[0].contains(crate::project_analysis::CONTEXT_HEADING));
+        assert!(systems[0].contains("stage=current"));
+        assert!(systems[0].contains("source=.polaris/notes/CURRENT.md"));
+        assert!(!systems[0].contains(crate::filemap::HEADING));
+        assert!(!systems[0].contains("private current body"));
+    }
+
+    #[tokio::test]
+    async fn first_project_analysis_actually_spawns_file_reader_before_root_request() {
+        struct CaptureRoot(Mutex<Vec<CompletionRequest>>);
+        #[async_trait::async_trait]
+        impl Provider for CaptureRoot {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                self.0.lock().unwrap().push(request);
+                Ok(CompletionResponse {
+                    text: "root done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("CURRENT.md"),
+            "Milestone v1.0.0\nNext: verify delegated project analysis.\n",
+        )
+        .unwrap();
+        let current = project.path().join("CURRENT.md").canonicalize().unwrap();
+        let reader = std::sync::Arc::new(Scripted {
+            replies: Mutex::new(vec![
+                CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "read-current".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": current}),
+                    }],
+                    ..Default::default()
+                },
+                CompletionResponse {
+                    text: serde_json::json!({
+                        "path": current,
+                        "findings": [{
+                            "line": 1,
+                            "text": "The current milestone is v1.0.0."
+                        }],
+                        "gaps": []
+                    })
+                    .to_string(),
+                    ..Default::default()
+                },
+            ]),
+        });
+        let root = CaptureRoot(Mutex::new(Vec::new()));
+        let mut session = Session::new();
+        session.push_user("このプロジェクトを分析");
+        let always_on = crate::prompt::assemble_always_on("", "", &[])
+            .with_project_root(project.path())
+            .unwrap();
+        let file_reader: Vec<_> = polaris_skills::builtin::agent_types()
+            .into_iter()
+            .filter(|agent| agent.name == "file-reader")
+            .collect();
+        assert_eq!(file_reader.len(), 1);
+        let audit_dir = tempfile::tempdir().unwrap();
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run(
+            &root,
+            &mut session,
+            dummy_audit(&audit_dir),
+            &mut StopTracker::new(3),
+            &always_on,
+            &[],
+            &file_reader,
+            reader.clone(),
+            1,
+            1,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(reader.replies.lock().unwrap().is_empty());
+        let requests = root.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].tools.is_empty(),
+            "a successful CURRENT delegation should leave synthesis to the root without advertising another exploration round"
+        );
+        let system = &requests[0].system;
+        assert!(system.contains("stage=current"));
+        assert!(system.contains("reader=spawn:file-reader"));
+        assert!(system.contains("The current milestone is v1.0.0."));
+        assert!(!system.contains("Next: verify delegated project analysis."));
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(
+            events.first(),
+            Some(crate::events::AgentEvent::ToolStarted { name, .. }) if name == "spawn"
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::events::AgentEvent::SpawnStarted { agent_type, .. }
+                if agent_type == "file-reader"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::events::AgentEvent::SpawnFinished {
+                agent_type,
+                ok: true,
+                ..
+            } if agent_type == "file-reader"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::events::AgentEvent::ToolFinished {
+                name,
+                ok: true,
+                ..
+            } if name == "spawn"
+        )));
+    }
+
+    #[test]
+    fn review_read_delegation_requires_the_bundled_reader_and_a_plain_project_file() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside = project.path().join("inside.rs");
+        let outside_file = outside.path().join("outside.rs");
+        let link = project.path().join("link.rs");
+        std::fs::write(&inside, "inside\n").unwrap();
+        std::fs::write(&outside_file, "outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+
+        let mut session = Session::new();
+        session.workflow = Some(crate::workflow::SessionWorkflow::new(
+            crate::workflow::WorkflowConfig {
+                enabled: true,
+                initial_phase: crate::workflow::Phase::Review,
+                ..Default::default()
+            },
+        ));
+        session.request_prompt = Some(
+            crate::prompt::assemble_always_on("", "", &[])
+                .with_project_root(project.path())
+                .unwrap(),
+        );
+        let readers: Vec<_> = polaris_skills::builtin::agent_types()
+            .into_iter()
+            .filter(|agent| agent.name == "file-reader")
+            .collect();
+        assert!(!delegates_review_reads(
+            &session,
+            "root",
+            "アルゴリズムを深掘りする",
+            &[]
+        ));
+        assert!(delegates_review_reads(
+            &session,
+            "root",
+            "アルゴリズムを深掘りする",
+            &readers
+        ));
+
+        let call = |path: &Path| ToolCall {
+            id: "read".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": path}),
+        };
+        assert_eq!(
+            delegated_review_path(&session, &call(&inside)),
+            Some(inside.canonicalize().unwrap())
+        );
+        assert!(delegated_review_path(&session, &call(&outside_file)).is_none());
+        assert!(delegated_review_path(&session, &call(&link)).is_none());
+        assert!(delegated_review_path(&session, &call(project.path())).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_deep_review_delegates_after_two_files_and_stops_at_the_bound() {
+        struct Root {
+            paths: Vec<PathBuf>,
+            requests: Mutex<Vec<CompletionRequest>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Root {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request);
+                if requests.len() == 1 {
+                    return Ok(CompletionResponse {
+                        tool_calls: self
+                            .paths
+                            .iter()
+                            .enumerate()
+                            .map(|(index, path)| ToolCall {
+                                id: format!("read-{index}"),
+                                name: "read".into(),
+                                arguments: serde_json::json!({"path": path}),
+                            })
+                            .collect(),
+                        ..Default::default()
+                    });
+                }
+                let history = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+                for number in 3..=6 {
+                    assert!(history.contains(&format!("EVIDENCE_{number}")), "{history}");
+                    assert!(
+                        !history.contains(&format!("RAW_BODY_{number}")),
+                        "a delegated file body leaked into root history: {history}"
+                    );
+                }
+                assert!(
+                    history.contains("bounded review read limit reached"),
+                    "{history}"
+                );
+                for removed in ["read", "bash", "spawn"] {
+                    assert!(
+                        !requests
+                            .last()
+                            .unwrap()
+                            .tools
+                            .iter()
+                            .any(|tool| tool.name == removed),
+                        "{removed} remained after the bounded evidence wave"
+                    );
+                }
+                Ok(CompletionResponse {
+                    text: "review done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        struct Reader {
+            paths: Vec<PathBuf>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Reader {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let index = call / 2;
+                let path = &self.paths[index];
+                if call.is_multiple_of(2) {
+                    Ok(CompletionResponse {
+                        tool_calls: vec![ToolCall {
+                            id: format!("child-read-{index}"),
+                            name: "read".into(),
+                            arguments: serde_json::json!({"path": path}),
+                        }],
+                        ..Default::default()
+                    })
+                } else {
+                    let history = serde_json::to_string(&request.messages).unwrap();
+                    let number = index + 3;
+                    assert!(history.contains(&format!("RAW_BODY_{number}")), "{history}");
+                    Ok(CompletionResponse {
+                        text: serde_json::json!({
+                            "path": path,
+                            "findings": [{"line": 1, "text": format!("EVIDENCE_{number}")}],
+                            "gaps": []
+                        })
+                        .to_string(),
+                        ..Default::default()
+                    })
+                }
+            }
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (1..=7)
+            .map(|number| project.path().join(format!("{number}.rs")))
+            .collect();
+        for (index, path) in paths.iter().enumerate() {
+            std::fs::write(path, format!("RAW_BODY_{}\n", index + 1)).unwrap();
+        }
+        let root = Root {
+            paths: paths.clone(),
+            requests: Mutex::new(Vec::new()),
+        };
+        let reader = Arc::new(Reader {
+            paths: paths[2..6].to_vec(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let file_reader: Vec<_> = polaris_skills::builtin::agent_types()
+            .into_iter()
+            .filter(|agent| agent.name == "file-reader")
+            .collect();
+        let mut session = Session::new();
+        session.workflow = Some(crate::workflow::SessionWorkflow::new(
+            crate::workflow::WorkflowConfig {
+                enabled: true,
+                initial_phase: crate::workflow::Phase::Review,
+                ..Default::default()
+            },
+        ));
+        session.push_user("アルゴリズムをもう少し深掘りする");
+        let always_on = crate::prompt::assemble_always_on("", "", &[])
+            .with_project_root(project.path())
+            .unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = run(
+            &root,
+            &mut session,
+            dummy_audit(&audit_dir),
+            &mut StopTracker::new(4),
+            &always_on,
+            &[],
+            &file_reader,
+            reader.clone(),
+            1,
+            1,
+            Some(tx),
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "review done");
+        assert_eq!(root.requests.lock().unwrap().len(), 2);
+        assert_eq!(reader.calls.load(std::sync::atomic::Ordering::SeqCst), 8);
+        let mut saw_reader = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                crate::events::AgentEvent::SpawnStarted { agent_type, .. }
+                    if agent_type == "file-reader"
+            ) {
+                saw_reader = true;
+            }
+        }
+        assert!(saw_reader, "automatic delegation was not visible");
     }
 
     /// The point of the route: the model is handed the file, not the map.
@@ -4307,6 +5925,280 @@ mod tests {
         assert!(!request.system.contains("not automatic"));
     }
 
+    /// The one route that means a decision is open is the only one that
+    /// can ask, the question withdraws the tool that asked it, and while
+    /// the answer is outstanding nothing that changes a file is offered.
+    #[tokio::test]
+    async fn only_the_grilling_route_may_ask_and_only_once() {
+        struct Capture(Mutex<Option<CompletionRequest>>);
+        #[async_trait::async_trait]
+        impl Provider for Capture {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                *self.0.lock().unwrap() = Some(request);
+                Ok(CompletionResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        async fn offered_tools(
+            route: crate::turn_intent::Route,
+            outstanding: Option<&str>,
+        ) -> Vec<String> {
+            let provider = Capture(Mutex::new(None));
+            let mut session = Session::new();
+            session.push_user("設定の保存先を変えたい");
+            if let Some(question) = outstanding {
+                session.messages.push(polaris_provider::Message {
+                    tool_calls: vec![polaris_provider::ToolCall {
+                        id: "c1".into(),
+                        name: crate::turn_intent::CLARIFY.into(),
+                        arguments: serde_json::json!({ "questions": [question] }),
+                    }],
+                    ..polaris_provider::Message::assistant("")
+                });
+            }
+            let mut intent = crate::turn_intent::TurnIntentV1::unavailable(1, "test");
+            intent.route = Some(route);
+            session.turn_intent = Some(intent);
+            let dir = tempfile::tempdir().unwrap();
+            let always_on = crate::prompt::assemble_always_on("", "", &[]);
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            run(
+                &provider,
+                &mut session,
+                dummy_audit(&dir),
+                &mut StopTracker::new(2),
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                1,
+                1,
+                None,
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+            let request = provider.0.lock().unwrap().take().unwrap();
+            request.tools.iter().map(|t| t.name.clone()).collect()
+        }
+
+        let grilling = offered_tools(crate::turn_intent::Route::Grilling, None).await;
+        assert!(
+            grilling.iter().any(|name| name == "clarify"),
+            "the route that exists to ask cannot ask: {grilling:?}"
+        );
+
+        let direct = offered_tools(crate::turn_intent::Route::Direct, None).await;
+        assert!(
+            !direct.iter().any(|name| name == "clarify"),
+            "an unambiguous turn was offered a way to stop and ask: {direct:?}"
+        );
+
+        let waiting = offered_tools(
+            crate::turn_intent::Route::Grilling,
+            Some("どこへ保存するか"),
+        )
+        .await;
+        assert!(
+            !waiting.iter().any(|name| name == "clarify"),
+            "a run with a question in flight asked again: {waiting:?}"
+        );
+        for name in ["write", "edit", "spawn"] {
+            assert!(
+                !waiting.iter().any(|offered| offered == name),
+                "{name} was offered while the answer was outstanding: {waiting:?}"
+            );
+        }
+        assert!(waiting.iter().any(|name| name == "read"), "{waiting:?}");
+    }
+
+    #[tokio::test]
+    async fn phase_gate_denies_injected_mutations_until_a_current_contract_is_active() {
+        use crate::workflow::{
+            ArtifactStatusV1, ChangeContractV1, Phase, RoutineEligibilityV1, SessionWorkflow,
+            WorkflowArtifactGraphV1, WorkflowConfig, WorkflowGatesV1, WorkflowStateV1,
+            WorkflowStepV1,
+        };
+
+        fn workflow(phase: Phase) -> crate::spawn::ChildWorkflow {
+            let state = WorkflowStateV1 {
+                phase,
+                step: phase.default_step(),
+                ..Default::default()
+            };
+            crate::spawn::ChildWorkflow {
+                workflow: SessionWorkflow::restore_with_artifacts(
+                    WorkflowConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    if phase == Phase::Implement {
+                        WorkflowGatesV1 {
+                            phase_gate_schema_version: None,
+                            ..WorkflowGatesV1::default()
+                        }
+                    } else {
+                        WorkflowGatesV1::default()
+                    },
+                    state,
+                    WorkflowArtifactGraphV1::default(),
+                )
+                .unwrap(),
+                skills: Vec::new(),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist.txt");
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::FullAccess, &[])
+                .unwrap();
+        let calls = [
+            (
+                "write",
+                serde_json::json!({"path": target, "content": "no"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path": target, "old": "a", "new": "b"}),
+            ),
+            (
+                "bash",
+                serde_json::json!({"command": "touch must-not-exist.txt"}),
+            ),
+            (
+                "spawn",
+                serde_json::json!({"tasks":[{"type":"writer","task":"mutate","write_root":dir.path()}]}),
+            ),
+        ];
+        for phase in [Phase::General, Phase::Specify, Phase::Implement] {
+            for (name, arguments) in &calls {
+                let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+                let mut approver = AlwaysAllow { asked: 0 };
+                let mut ctx = ToolContext {
+                    sandbox: &sandbox,
+                    helper: Path::new("/bin/true"),
+                    gate: &mut gate,
+                    approver: &mut approver,
+                };
+                let result = dispatch(
+                    &ToolCall {
+                        id: format!("blocked-{phase}-{name}"),
+                        name: (*name).into(),
+                        arguments: arguments.clone(),
+                    },
+                    &[],
+                    &[],
+                    unused_provider_pool(),
+                    dummy_audit(&dir),
+                    1,
+                    1,
+                    None,
+                    Some(workflow(phase)),
+                    None,
+                    None,
+                    None,
+                    1,
+                    Default::default(),
+                    &mut ctx,
+                )
+                .await;
+                assert!(
+                    result.unwrap_err().contains("phase gate denies mutation"),
+                    "{phase}/{name} was not rejected by the phase gate"
+                );
+                assert_eq!(approver.asked, 0, "{phase}/{name} reached approval");
+            }
+        }
+        assert!(!target.exists(), "rejected write changed the filesystem");
+
+        let draft = ChangeContractV1::draft(
+            "contract-authorized",
+            RoutineEligibilityV1::local_component("core"),
+            "small change",
+            "bounded scope",
+            "write one file",
+            vec!["file is written".into()],
+        )
+        .unwrap();
+        let approved = draft.revised(ArtifactStatusV1::Approved).unwrap();
+        let mut graph = WorkflowArtifactGraphV1::default();
+        graph.insert_change_contract(&draft).unwrap();
+        graph.insert_change_contract(&approved).unwrap();
+        let authorized = crate::spawn::ChildWorkflow {
+            workflow: SessionWorkflow::restore_with_artifacts(
+                WorkflowConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                WorkflowGatesV1::default(),
+                WorkflowStateV1 {
+                    phase: Phase::Implement,
+                    step: Some(WorkflowStepV1::Implement),
+                    active_change_contract: Some(approved.reference()),
+                    ..Default::default()
+                },
+                graph,
+            )
+            .unwrap(),
+            skills: Vec::new(),
+        };
+        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::Always);
+        let mut approver = AlwaysAllow { asked: 0 };
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: Path::new("/bin/true"),
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let result = dispatch(
+            &ToolCall {
+                id: "allowed-write".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({"path": target, "content": "yes"}),
+            },
+            &[],
+            &[],
+            unused_provider_pool(),
+            dummy_audit(&dir),
+            1,
+            1,
+            None,
+            Some(authorized),
+            None,
+            None,
+            None,
+            1,
+            Default::default(),
+            &mut ctx,
+        )
+        .await;
+        // This test process cannot apply macOS `sandbox-exec`, so execution
+        // itself may fail after approval. What belongs to this gate is that
+        // an approved current contract reaches the normal mutation path
+        // rather than the phase refusal.
+        assert!(
+            !result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("phase gate denies mutation")),
+            "authorized mutation was refused by the phase gate: {result:?}"
+        );
+        assert_eq!(approver.asked, 1, "authorized write did not reach its gate");
+    }
+
     /// `spawn` is paid for on every request. With no type to resolve
     /// against, every call it invites ends before a provider call and two
     /// of the three branches stop the run outright, so advertising it into
@@ -4375,7 +6267,7 @@ mod tests {
         let with = offered_tools(&shipped).await;
         assert!(
             with.iter().any(|n| n == "spawn"),
-            "spawn vanished even with types available: {with:?}"
+            "spawn was not advertised for the shipped agent catalogue: {with:?}"
         );
         assert_eq!(with.len(), without.len() + 1, "{with:?} vs {without:?}");
     }
@@ -4738,6 +6630,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             1,
             Default::default(),
             &mut ctx,
@@ -4830,6 +6723,7 @@ mod tests {
                 1,
                 1,
                 Some(sink.with_execution(port).unwrap().into()),
+                None,
                 None,
                 None,
                 None,
@@ -4945,6 +6839,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 1,
                 Default::default(),
                 &mut ctx,
@@ -5013,6 +6908,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             1,
             Default::default(),
             &mut ctx,
@@ -5045,6 +6941,7 @@ mod tests {
         );
         for _ in 0..crate::desktop_events::EVENT_CAPACITY {
             sink.send(crate::events::AgentEvent::SpawnFinished {
+                display_name: "Sirius".into(),
                 agent_type: "fixture".into(),
                 ok: true,
             })
@@ -5072,6 +6969,7 @@ mod tests {
             1,
             1,
             Some(sink),
+            None,
             None,
             None,
             None,
@@ -5629,6 +7527,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             1,
             Default::default(),
             &mut ctx,
@@ -5674,6 +7573,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             1,
             Default::default(),
             &mut ctx,
@@ -5714,6 +7614,7 @@ mod tests {
             dummy_audit(&dir),
             crate::spawn::DEFAULT_CONCURRENCY,
             crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+            None,
             None,
             None,
             None,
@@ -6747,6 +8648,7 @@ print("wrote")
                     None,
                     None,
                     None,
+                    None,
                     1,
                     Default::default(),
                     &mut ToolContext {
@@ -6923,6 +8825,7 @@ print("wrote")
                     dummy_audit(&dir),
                     1,
                     1,
+                    None,
                     None,
                     None,
                     None,
@@ -9868,31 +11771,54 @@ print("wrote")
         use std::collections::BTreeMap;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct Says(&'static str, std::sync::Arc<AtomicUsize>);
+        /// A judge that answers all six axes, named by the route the
+        /// caller wants. One request, six answers — the shape the real
+        /// classifier asks for.
+        struct Says([&'static str; 5], &'static str, std::sync::Arc<AtomicUsize>);
 
         #[async_trait::async_trait]
         impl polaris_provider::decision::Decider for Says {
             async fn decide(
                 &self,
                 _: &serde_json::Value,
-                _: &BTreeMap<String, Question>,
+                questions: &BTreeMap<String, Question>,
             ) -> Result<Decision, DecisionError> {
-                self.1.fetch_add(1, Ordering::SeqCst);
+                self.2.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(questions.len(), 6, "the axes were not asked in one request");
+                let keys = ["approach", "clarity", "relation", "utterance", "work"];
+                let mut answers: BTreeMap<String, Answer> = keys
+                    .iter()
+                    .zip(self.0)
+                    .map(|(key, value)| {
+                        (
+                            (*key).to_owned(),
+                            Answer {
+                                choice: Some(value.to_owned()),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect();
+                answers.insert(
+                    "effort".to_owned(),
+                    Answer {
+                        choice: Some(self.1.to_owned()),
+                        ..Default::default()
+                    },
+                );
                 Ok(Decision {
-                    answers: BTreeMap::from([(
-                        "kind".to_owned(),
-                        Answer {
-                            choice: Some(self.0.to_owned()),
-                            ..Default::default()
-                        },
-                    )]),
+                    answers,
                     input_tokens: Some(40),
                     output_tokens: Some(1),
                 })
             }
+
+            fn name(&self) -> &str {
+                "test"
+            }
         }
 
-        fn opened(with: &'static str) -> (Session, std::sync::Arc<AtomicUsize>) {
+        fn opened(with: [&'static str; 5]) -> (Session, std::sync::Arc<AtomicUsize>) {
             let asked = std::sync::Arc::new(AtomicUsize::new(0));
             let mut session = Session::new();
             session.workflow = Some(crate::workflow::SessionWorkflow::new(
@@ -9901,7 +11827,7 @@ print("wrote")
                     ..Default::default()
                 },
             ));
-            session.decider = Some(std::sync::Arc::new(Says(with, asked.clone())));
+            session.decider = Some(std::sync::Arc::new(Says(with, "medium", asked.clone())));
             session
                 .messages
                 .push(polaris_provider::Message::user("何かを頼む"));
@@ -9914,35 +11840,182 @@ print("wrote")
 
         #[tokio::test]
         async fn each_kind_of_opening_enters_its_own_phase() {
+            // approach, clarity, relation, utterance, work — the keys in
+            // the order the judge is asked them.
             for (says, expected) in [
-                ("brainstorm", crate::workflow::Phase::Brainstorm),
-                ("review", crate::workflow::Phase::Review),
-                ("implement", crate::workflow::Phase::Implement),
+                (
+                    [
+                        "design_first",
+                        "clear",
+                        "continue",
+                        "proposal",
+                        "feature_add",
+                    ],
+                    crate::workflow::Phase::Brainstorm,
+                ),
+                (
+                    [
+                        "execute_now",
+                        "clear",
+                        "continue",
+                        "instruction",
+                        "investigation",
+                    ],
+                    crate::workflow::Phase::Review,
+                ),
+                (
+                    ["execute_now", "clear", "continue", "instruction", "bug_fix"],
+                    crate::workflow::Phase::Specify,
+                ),
             ] {
                 let (mut session, asked) = opened(says);
-                super::super::classify_opening(&mut session).await;
-                assert_eq!(phase_of(&session), expected, "{says}");
-                assert_eq!(asked.load(Ordering::SeqCst), 1, "one question, not more");
+                super::super::classify_opening(
+                    &NeverCalled,
+                    &mut session,
+                    &dummy_audit(&tempfile::tempdir().unwrap()),
+                    None,
+                )
+                .await;
+                assert_eq!(phase_of(&session), expected, "{says:?}");
+                assert_eq!(asked.load(Ordering::SeqCst), 1, "one request, not more");
             }
         }
 
         /// A conversation that changes what it is doing changes phase with
         /// it. Classifying only the first turn left a repair request in
-        /// `review`, where the phase's own words stopped it from editing.
+        /// `review`, where the phase's own words stopped it from progressing.
+        /// A new repair stops at specification until its durable change
+        /// contract is approved.
         #[tokio::test]
         async fn every_turn_is_classified_from_its_own_request() {
-            let (mut session, asked) = opened("implement");
-            super::super::classify_opening(&mut session).await;
-            assert_eq!(phase_of(&session), crate::workflow::Phase::Implement);
+            let (mut session, asked) =
+                opened(["execute_now", "clear", "continue", "instruction", "bug_fix"]);
+            super::super::classify_opening(
+                &NeverCalled,
+                &mut session,
+                &dummy_audit(&tempfile::tempdir().unwrap()),
+                None,
+            )
+            .await;
+            assert_eq!(phase_of(&session), crate::workflow::Phase::Specify);
             session
                 .messages
                 .push(polaris_provider::Message::user("二つ目の依頼"));
-            super::super::classify_opening(&mut session).await;
+            super::super::classify_opening(
+                &NeverCalled,
+                &mut session,
+                &dummy_audit(&tempfile::tempdir().unwrap()),
+                None,
+            )
+            .await;
             assert_eq!(
                 asked.load(Ordering::SeqCst),
                 2,
                 "one question per user turn"
             );
+        }
+
+        #[tokio::test]
+        async fn review_to_repair_cannot_restore_write_phase_without_a_contract() {
+            let (mut session, _) = opened([
+                "execute_now",
+                "clear",
+                "continue",
+                "instruction",
+                "investigation",
+            ]);
+            let audit_dir = tempfile::tempdir().unwrap();
+            super::super::classify_opening(
+                &NeverCalled,
+                &mut session,
+                &dummy_audit(&audit_dir),
+                None,
+            )
+            .await;
+            assert_eq!(phase_of(&session), crate::workflow::Phase::Review);
+
+            session.decider = Some(std::sync::Arc::new(Says(
+                ["execute_now", "clear", "continue", "instruction", "bug_fix"],
+                "medium",
+                std::sync::Arc::new(AtomicUsize::new(0)),
+            )));
+            session
+                .messages
+                .push(polaris_provider::Message::user("では、その不具合を直す"));
+            super::super::classify_opening(
+                &NeverCalled,
+                &mut session,
+                &dummy_audit(&audit_dir),
+                None,
+            )
+            .await;
+            assert_eq!(phase_of(&session), crate::workflow::Phase::Specify);
+        }
+
+        #[tokio::test]
+        async fn rejected_direct_implement_exposes_only_read_only_schemas() {
+            struct Capture(Mutex<Option<CompletionRequest>>);
+            #[async_trait::async_trait]
+            impl Provider for Capture {
+                async fn complete(
+                    &self,
+                    request: CompletionRequest,
+                ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                    *self.0.lock().unwrap() = Some(request);
+                    Ok(CompletionResponse {
+                        text: "done".into(),
+                        ..Default::default()
+                    })
+                }
+            }
+
+            let (mut session, _) =
+                opened(["execute_now", "clear", "continue", "instruction", "bug_fix"]);
+            let audit_dir = tempfile::tempdir().unwrap();
+            super::super::classify_opening(
+                &NeverCalled,
+                &mut session,
+                &dummy_audit(&audit_dir),
+                None,
+            )
+            .await;
+            assert_eq!(phase_of(&session), crate::workflow::Phase::Specify);
+            // Keep the already-resolved rejection state stable while the
+            // provider captures the request schemas.
+            session.decider = None;
+            let provider = Capture(Mutex::new(None));
+            let always_on = crate::prompt::assemble_always_on("", "", &[]);
+            let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+            run(
+                &provider,
+                &mut session,
+                dummy_audit(&audit_dir),
+                &mut StopTracker::new(2),
+                &always_on,
+                &[],
+                &polaris_skills::builtin::agent_types(),
+                unused_provider_pool(),
+                1,
+                1,
+                None,
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+            let request = provider.0.lock().unwrap().take().unwrap();
+            for name in ["write", "edit", "bash", "spawn", "computer"] {
+                assert!(
+                    !request.tools.iter().any(|tool| tool.name == name),
+                    "{name} was exposed after Implement fell back to Specify"
+                );
+            }
+            assert!(request.tools.iter().any(|tool| tool.name == "read"));
         }
 
         #[tokio::test]
@@ -9957,8 +12030,127 @@ print("wrote")
             session
                 .messages
                 .push(polaris_provider::Message::user("何かを頼む"));
-            super::super::classify_opening(&mut session).await;
+            super::super::classify_opening(
+                &NeverCalled,
+                &mut session,
+                &dummy_audit(&tempfile::tempdir().unwrap()),
+                None,
+            )
+            .await;
             assert_eq!(phase_of(&session), crate::workflow::Phase::default());
+        }
+
+        struct EffortCapture(std::sync::Mutex<Vec<Option<String>>>);
+
+        #[async_trait::async_trait]
+        impl Provider for EffortCapture {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                panic!("classification must finish before the main request")
+            }
+
+            fn set_effort(&self, effort: Option<&str>) {
+                self.0.lock().unwrap().push(effort.map(str::to_owned));
+            }
+        }
+
+        #[tokio::test]
+        async fn automatic_effort_clears_the_previous_turn_then_publishes_the_judgement() {
+            let (mut session, _) =
+                opened(["execute_now", "clear", "continue", "instruction", "bug_fix"]);
+            session.automatic_effort = true;
+            session.decider = Some(std::sync::Arc::new(Says(
+                ["execute_now", "clear", "continue", "instruction", "bug_fix"],
+                "high",
+                std::sync::Arc::new(AtomicUsize::new(0)),
+            )));
+            let provider = EffortCapture(std::sync::Mutex::new(Vec::new()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let events: crate::desktop_events::EventSink = tx.into();
+            super::super::classify_opening(
+                &provider,
+                &mut session,
+                &dummy_audit(&tempfile::tempdir().unwrap()),
+                Some(&events),
+            )
+            .await;
+            assert_eq!(
+                *provider.0.lock().unwrap(),
+                vec![None, Some("high".to_owned())]
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(crate::events::AgentEvent::EffortJudging)
+            ));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(crate::events::AgentEvent::EffortJudged { effort }) if effort == "high"
+            ));
+        }
+
+        #[tokio::test]
+        async fn unavailable_automatic_effort_settles_on_xhigh() {
+            let mut session = Session::new();
+            session.automatic_effort = true;
+            session.messages.push(polaris_provider::Message::user(
+                "このプロジェクトを分析する",
+            ));
+            let provider = EffortCapture(std::sync::Mutex::new(Vec::new()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let events: crate::desktop_events::EventSink = tx.into();
+            super::super::classify_opening(
+                &provider,
+                &mut session,
+                &dummy_audit(&tempfile::tempdir().unwrap()),
+                Some(&events),
+            )
+            .await;
+            assert_eq!(
+                *provider.0.lock().unwrap(),
+                vec![None, Some("xhigh".to_owned())]
+            );
+            assert_eq!(
+                session.turn_intent.as_ref().unwrap().unavailable.as_deref(),
+                Some("classifier_unavailable")
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(crate::events::AgentEvent::EffortJudging)
+            ));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(crate::events::AgentEvent::EffortJudged { effort }) if effort == "xhigh"
+            ));
+        }
+
+        #[tokio::test]
+        async fn ambiguous_first_turn_uses_xhigh_even_when_the_judge_says_lower() {
+            let (mut session, _) = opened([
+                "execute_now",
+                "materially_ambiguous",
+                "continue",
+                "instruction",
+                "feature_change",
+            ]);
+            session.automatic_effort = true;
+            let provider = EffortCapture(std::sync::Mutex::new(Vec::new()));
+            super::super::classify_opening(
+                &provider,
+                &mut session,
+                &dummy_audit(&tempfile::tempdir().unwrap()),
+                None,
+            )
+            .await;
+            assert_eq!(
+                session.turn_intent.as_ref().unwrap().effort,
+                Some(crate::turn_intent::Effort::Medium)
+            );
+            assert_eq!(
+                *provider.0.lock().unwrap(),
+                vec![None, Some("xhigh".to_owned())]
+            );
         }
     }
 }

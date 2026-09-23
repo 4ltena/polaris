@@ -197,7 +197,8 @@ async fn prompt_ack_preserves_raw_and_query_and_checkpoint_finish_use_only_turn_
                 completion.session.messages[1..].to_vec(),
                 previous.clone(),
                 candidate.clone(),
-                None
+                None,
+                None,
             )
             .is_err()
     );
@@ -207,6 +208,7 @@ async fn prompt_ack_preserves_raw_and_query_and_checkpoint_finish_use_only_turn_
             completion.turn_suffix.clone(),
             previous,
             candidate.clone(),
+            None,
             None,
         )
         .unwrap();

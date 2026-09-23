@@ -190,6 +190,7 @@ impl Fixture {
             },
             input_preparation: Default::default(),
             decider: None,
+            answer_finalizer: None,
         }
     }
     fn factory(&self) -> ConfiguredRunFactory {

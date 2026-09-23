@@ -37,6 +37,7 @@ pub mod codec;
 pub mod event;
 pub mod ids;
 pub mod mcp_settings;
+pub mod orchestration;
 pub mod request;
 pub mod response;
 pub mod role_bindings;
@@ -50,20 +51,47 @@ pub mod workspace_view;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-/// M1で対応する版。生成・復号した値は常にversion 1。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ProtocolVersion;
+/// IPC wire version.  V2 adds the bounded orchestration projection to a
+/// snapshot.  Decoded V1 frames retain their version so a read/serialize
+/// bridge does not silently rewrite an older peer's message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolVersion {
+    version: u8,
+}
+
+/// The version used by locally-created requests, responses, hello messages,
+/// and events.  Keeping this value in the value namespace preserves existing
+/// `ProtocolVersion` construction sites while the type retains the decoded
+/// version internally.
+#[allow(non_upper_case_globals)]
+pub const ProtocolVersion: ProtocolVersion = ProtocolVersion::V2;
+
+impl Default for ProtocolVersion {
+    fn default() -> Self {
+        Self::V2
+    }
+}
+
+impl ProtocolVersion {
+    pub const V1: Self = Self { version: 1 };
+    pub const V2: Self = Self { version: 2 };
+
+    pub const fn get(self) -> u8 {
+        self.version
+    }
+}
 
 impl Serialize for ProtocolVersion {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u32(1)
+        serializer.serialize_u32(self.version as u32)
     }
 }
 
 impl<'de> Deserialize<'de> for ProtocolVersion {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         match u32::deserialize(deserializer)? {
-            1 => Ok(Self),
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
             _ => Err(de::Error::custom("unsupported protocol version")),
         }
     }

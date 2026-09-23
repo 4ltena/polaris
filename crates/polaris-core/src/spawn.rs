@@ -3,8 +3,12 @@
 //! `agent::run_loop`. Parallelism will be contained entirely within this
 //! file; `agent::dispatch`'s own outer loop stays sequential.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use tokio::sync::{Mutex, Semaphore};
 
@@ -18,6 +22,66 @@ use crate::approval::{ApprovalPolicy, Approver, Decision, Gate};
 use crate::audit::AuditLog;
 use crate::session::Session;
 use crate::stop::StopTracker;
+use crate::subagent_control::{
+    ApprovalCapabilityV1, CapabilitySnapshotV1, ChildAttemptId, ChildAttemptRefV1, ChildBindingV1,
+    ChildControlPlaneV1, ChildStateV1, FailureClassV1, LogicalChildId, McpCapabilityV1,
+    RegisterChildV1, SandboxCapabilityV1, UsageAttributionV1,
+};
+
+/// Caller-owned identities and authority for a controlled spawn wave.
+///
+/// The execution layer deliberately does not derive these IDs from task text
+/// or model output.  The root/session owner supplies stable IDs before it
+/// asks this module to start work, and can therefore cancel or restore the
+/// same attempt without trusting any model-provided identifier.
+type ChildControlPlaneChangeCallback =
+    Arc<dyn Fn(&ChildControlPlaneV1) -> Result<(), String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct SpawnControlPort {
+    pub plane: Arc<Mutex<ChildControlPlaneV1>>,
+    pub binding: ChildBindingV1,
+    pub parent_capabilities: CapabilitySnapshotV1,
+    pub model: String,
+    pub effort: String,
+    /// Exactly one caller-issued identity pair for each task in the wave.
+    /// `retry_attempt_id` is used only after an observed SafeTransient
+    /// failure, never for schema repair or an arbitrary failed result.
+    pub children: Vec<ControlledChildIds>,
+    pub retry_safe_transient: bool,
+    /// Immutable parent-captured reads only. This is not an MCP runtime.
+    pub lease_owner: Option<Arc<crate::mcp::lease::McpReadLeaseOwnerV1>>,
+    /// Trusted host persistence/projection callback; the model cannot set it.
+    /// It is invoked only after the plane mutex has been released.
+    pub on_change: Option<ChildControlPlaneChangeCallback>,
+    /// Root owner inherited by a child only so nested delegation remains in
+    /// the same control plane. It grants no live MCP connection.
+    pub root_owner: Option<Arc<crate::session::RootDelegationControlV1>>,
+    /// Serializes mutations and their durable publication across every wave
+    /// owned by the same root, without keeping the plane mutex in the hook.
+    pub transition_gate: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlledChildIds {
+    pub logical_child_id: LogicalChildId,
+    pub task_id: crate::subagent_control::TaskId,
+    pub first_attempt_id: ChildAttemptId,
+    pub retry_attempt_id: ChildAttemptId,
+}
+
+struct ControlledChildContext {
+    root_owner: Arc<crate::session::RootDelegationControlV1>,
+    logical_child_id: LogicalChildId,
+    reads: crate::mcp::lease::ChildMcpReadContextV1,
+}
+
+#[derive(Clone)]
+struct ControlledActivityPort {
+    control: SpawnControlPort,
+    reference: ChildAttemptRefV1,
+    sequence: Arc<AtomicU64>,
+}
 
 /// There is no synchronous approval relay for background children.
 struct UnavailableApprover;
@@ -35,9 +99,92 @@ pub struct SpawnTask {
     pub write_root: Option<String>,
 }
 
+/// The child result retained by the control plane's terminal record. Raw
+/// output still travels only through the spawn tool response; the plane keeps
+/// a content-addressed reference and the usage observed for this exact child
+/// attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSuccess {
+    pub text: String,
+    pub usage: UsageAttributionV1,
+    pub result_refs: Vec<String>,
+    pub artifact_refs: Vec<String>,
+}
+
+impl TaskSuccess {
+    fn from_agent_outcome(outcome: crate::agent::AgentOutcome) -> Self {
+        let usage = usage_attribution(&outcome.usage_report);
+        Self::with_usage(outcome.text, usage)
+    }
+
+    fn with_usage(text: String, usage: UsageAttributionV1) -> Self {
+        Self {
+            result_refs: vec![format!(
+                "sha256:{}",
+                crate::conversation_state::content_hash(text.as_bytes())
+            )],
+            text,
+            usage,
+            artifact_refs: Vec::new(),
+        }
+    }
+
+    fn add_usage(&mut self, report: &polaris_provider::UsageReport) {
+        self.usage = merge_usage_attribution(&self.usage, usage_attribution(report));
+    }
+}
+
+impl From<String> for TaskSuccess {
+    fn from(text: String) -> Self {
+        Self::with_usage(text, UsageAttributionV1::Missing)
+    }
+}
+
+impl From<&str> for TaskSuccess {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_owned())
+    }
+}
+
+fn usage_attribution(report: &polaris_provider::UsageReport) -> UsageAttributionV1 {
+    if report.reported_responses == 0
+        || report.missing_responses != 0
+        || report.failed_requests != 0
+    {
+        UsageAttributionV1::Missing
+    } else {
+        UsageAttributionV1::Known {
+            input_tokens: u64::from(report.usage.input_tokens),
+            output_tokens: u64::from(report.usage.output_tokens),
+        }
+    }
+}
+
+fn merge_usage_attribution(
+    left: &UsageAttributionV1,
+    right: UsageAttributionV1,
+) -> UsageAttributionV1 {
+    match (left, right) {
+        (
+            UsageAttributionV1::Known {
+                input_tokens: left_input,
+                output_tokens: left_output,
+            },
+            UsageAttributionV1::Known {
+                input_tokens: right_input,
+                output_tokens: right_output,
+            },
+        ) => UsageAttributionV1::Known {
+            input_tokens: left_input.saturating_add(right_input),
+            output_tokens: left_output.saturating_add(right_output),
+        },
+        _ => UsageAttributionV1::Missing,
+    }
+}
+
 #[derive(Debug)]
 pub enum TaskOutcome {
-    Ok(String),
+    Ok(TaskSuccess),
     Failed(String),
 }
 
@@ -86,6 +233,7 @@ pub(crate) async fn run_one_scoped(
 ) -> TaskOutcome {
     run_one_with_gate(
         task,
+        crate::desktop_store::child_display_name(0),
         agent_types,
         provider,
         audit,
@@ -98,6 +246,8 @@ pub(crate) async fn run_one_scoped(
         // any wave. It delegates nothing, so it enters on the last rung.
         MAX_DEPTH,
         ChildMemory::default(),
+        None,
+        None,
     )
     .await
 }
@@ -105,6 +255,7 @@ pub(crate) async fn run_one_scoped(
 #[allow(clippy::too_many_arguments)]
 async fn run_one_with_gate(
     task: &SpawnTask,
+    display_name: &str,
     agent_types: &[AgentType],
     provider: Arc<dyn Provider>,
     audit: Arc<Mutex<AuditLog>>,
@@ -115,16 +266,54 @@ async fn run_one_with_gate(
     parent_gate: &Gate,
     depth: u8,
     memory: ChildMemory,
+    controlled: Option<ControlledChildContext>,
+    activity: Option<ControlledActivityPort>,
 ) -> TaskOutcome {
     let events = match events {
-        Some(crate::desktop_events::EventSink::Bounded(sink)) => match sink.child() {
-            Ok(child) => Some(crate::desktop_events::EventSink::Bounded(child)),
+        Some(sink) => match sink.child(display_name, &task.agent_type) {
+            Ok(child) => Some(child),
             Err(error) => return TaskOutcome::Failed(error.to_string()),
         },
-        events => events,
+        None => None,
     };
+    let (events, activity_recorder) = match activity.as_ref() {
+        Some(activity) => {
+            if let Err(error) = control_record_activity(
+                &activity.control,
+                &activity.reference,
+                activity.sequence.fetch_add(1, Ordering::Relaxed),
+                "started".to_owned(),
+            )
+            .await
+            {
+                return TaskOutcome::Failed(format!(
+                    "spawn control could not record child start activity: {error}"
+                ));
+            }
+            let (activity_tx, activity_rx) = tokio::sync::watch::channel(None);
+            let sink = match events {
+                Some(sink) => sink,
+                None => {
+                    let (tx, _receiver) = tokio::sync::mpsc::unbounded_channel();
+                    crate::desktop_events::EventSink::Legacy(tx)
+                        .child(display_name, &task.agent_type)
+                        .expect("legacy child activity sink has no bounded allocation")
+                }
+            }
+            .with_child_activity_observer(activity_tx);
+            let port = activity.clone();
+            let recorder =
+                tokio::spawn(async move { record_child_tool_activity(port, activity_rx).await });
+            (Some(sink), Some(recorder))
+        }
+        None => (events, None),
+    };
+    let completion_events = events
+        .as_ref()
+        .map(crate::desktop_events::EventSink::without_child_activity_observer);
     if let Some(tx) = &events {
         let _ = tx.send(crate::events::AgentEvent::SpawnStarted {
+            display_name: display_name.to_owned(),
             agent_type: task.agent_type.clone(),
             task: task.task.clone(),
         });
@@ -133,11 +322,8 @@ async fn run_one_with_gate(
     if let Err(error) = crate::agent::check_event_delivery(events.as_ref()) {
         return TaskOutcome::Failed(error.to_string());
     }
-    let child_events = events
-        .as_ref()
-        .filter(|sink| matches!(sink, crate::desktop_events::EventSink::Bounded(_)))
-        .cloned();
-    let outcome = polaris_provider::attempts::in_scope(
+    let child_events = events.clone();
+    let mut outcome = polaris_provider::attempts::in_scope(
         polaris_provider::attempts::AttemptContext {
             parent_id: Some(format!("spawn:{}", task.agent_type)),
             kind: polaris_provider::attempts::AttemptKind::Child,
@@ -151,15 +337,35 @@ async fn run_one_with_gate(
             helper,
             workflow,
             parent_gate,
-            child_events,
+            child_events.clone(),
             depth,
             memory,
+            controlled,
         ),
     )
     .await;
 
-    if let Some(tx) = &events {
+    drop(child_events);
+    drop(events);
+    if let Some(recorder) = activity_recorder {
+        match recorder.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                outcome = TaskOutcome::Failed(format!(
+                    "spawn control could not record child activity: {error}"
+                ));
+            }
+            Err(error) => {
+                outcome = TaskOutcome::Failed(format!(
+                    "spawn control activity recorder stopped: {error}"
+                ));
+            }
+        }
+    }
+
+    if let Some(tx) = &completion_events {
         let _ = tx.send(crate::events::AgentEvent::SpawnFinished {
+            display_name: display_name.to_owned(),
             agent_type: task.agent_type.clone(),
             ok: matches!(outcome, TaskOutcome::Ok(_)),
         });
@@ -260,6 +466,7 @@ async fn run_one_inner(
     events: Option<crate::desktop_events::EventSink>,
     depth: u8,
     memory: ChildMemory,
+    controlled: Option<ControlledChildContext>,
 ) -> TaskOutcome {
     let Some(agent) = agent_types.iter().find(|a| a.name == task.agent_type) else {
         let candidates = polaris_tools::skill::lookup(agent_types, &task.agent_type);
@@ -294,10 +501,13 @@ async fn run_one_inner(
     // out of step — a loop that can reach the `spawn` arm always has
     // something to resolve, and one that cannot never does.
     let may_delegate = depth < MAX_DEPTH;
+    let controlled_child = controlled.is_some();
     let mut tools: Vec<polaris_tools::ToolSpec> = polaris_tools::all_specs()
         .into_iter()
         .filter(|t| {
-            (may_delegate || t.name != "spawn") && agent.allowed_tools.iter().any(|a| a == &t.name)
+            (may_delegate || t.name != "spawn")
+                && agent.allowed_tools.iter().any(|a| a == &t.name)
+                && (!controlled_child || t.name != "mcp_catalog")
         })
         .collect();
     tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -308,6 +518,13 @@ async fn run_one_inner(
     };
 
     let mut session = Session::new();
+    if let Some(controlled) = controlled {
+        session.install_child_delegation_control(
+            controlled.root_owner,
+            controlled.logical_child_id,
+            controlled.reads,
+        );
+    }
     // A resumable type picks up where it left off. The key is the type and
     // the directory it writes to, which is what "the same implementer"
     // means to the agent addressing it.
@@ -353,7 +570,7 @@ async fn run_one_inner(
     // A grandchild wave started from here shares the one store, so a
     // follow-up reaches the same worker wherever it sits in the tree.
     session.child_memory = memory.clone();
-    let result = run_loop(
+    let result = Box::pin(run_loop(
         provider.as_ref(),
         &mut session,
         audit.clone(),
@@ -375,7 +592,7 @@ async fn run_one_inner(
         events.clone(),
         &mut ctx,
         None,
-    )
+    ))
     .await;
 
     if agent.continuation && result.is_ok() {
@@ -393,8 +610,9 @@ async fn run_one_inner(
     }
     match result {
         Ok(outcome) => match validate_output(agent, &outcome.text) {
-            Ok(()) => TaskOutcome::Ok(outcome.text),
+            Ok(()) => TaskOutcome::Ok(TaskSuccess::from_agent_outcome(outcome)),
             Err(first_err) => {
+                let mut first_success = TaskSuccess::from_agent_outcome(outcome);
                 // The "retry once, then stop" rule belongs to the tracker,
                 // not to this function: `observe_schema_mismatch` returns
                 // `None` on the first miss and `StopReason::SchemaMismatch`
@@ -426,7 +644,7 @@ async fn run_one_inner(
                     gate: &mut gate2,
                     approver: &mut approver2,
                 };
-                let retry = run_loop(
+                let retry = Box::pin(run_loop(
                     provider.as_ref(),
                     &mut session,
                     audit.clone(),
@@ -444,11 +662,21 @@ async fn run_one_inner(
                     events.clone(),
                     &mut ctx2,
                     None,
-                )
+                ))
                 .await;
                 match retry {
                     Ok(outcome2) => match validate_output(agent, &outcome2.text) {
-                        Ok(()) => TaskOutcome::Ok(outcome2.text),
+                        Ok(()) => {
+                            first_success.add_usage(&outcome2.usage_report);
+                            first_success.text = outcome2.text;
+                            first_success.result_refs = vec![format!(
+                                "sha256:{}",
+                                crate::conversation_state::content_hash(
+                                    first_success.text.as_bytes()
+                                )
+                            )];
+                            TaskOutcome::Ok(first_success)
+                        }
                         // The second miss. The tracker, not a counter
                         // kept here, is what declares the run over; the
                         // reason it names is folded into the text the
@@ -715,6 +943,396 @@ fn failed_wave(tasks: &[SpawnTask], error: &str) -> String {
     serde_json::Value::Array(entries).to_string()
 }
 
+fn controlled_capabilities(
+    task: &SpawnTask,
+    agent: &AgentType,
+    base_sandbox: &SandboxPolicy,
+    depth: u8,
+) -> Result<CapabilitySnapshotV1, String> {
+    // Resolve the same policy used by the child before registering it.  This
+    // makes the durable snapshot describe authority actually granted, rather
+    // than the looser parent policy or the task's untrusted prose.
+    let policy = resolve_subagent_sandbox(agent, task, base_sandbox)?;
+    let sandbox = match policy.mode() {
+        SandboxMode::ReadOnly => SandboxCapabilityV1::ReadOnly,
+        SandboxMode::WorkspaceWrite => SandboxCapabilityV1::WorkspaceWrite,
+        SandboxMode::FullAccess => SandboxCapabilityV1::FullAccess,
+    };
+    let mut tool_names: Vec<String> = polaris_tools::all_specs()
+        .into_iter()
+        .filter(|tool| {
+            (depth < MAX_DEPTH || tool.name != "spawn")
+                && tool.name != "mcp_catalog"
+                && agent
+                    .allowed_tools
+                    .iter()
+                    .any(|name| name.as_str() == tool.name)
+        })
+        .map(|tool| tool.name.to_owned())
+        .collect();
+    tool_names.sort();
+    tool_names.dedup();
+    Ok(CapabilitySnapshotV1 {
+        sandbox,
+        write_roots: policy
+            .writable_roots()
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect(),
+        tool_names,
+        approval: ApprovalCapabilityV1::Never,
+        // Children do not inherit live MCP connections.  A later lease API
+        // may grant immutable snapshots explicitly, but this path cannot.
+        mcp: McpCapabilityV1::None,
+    })
+}
+
+fn safe_transient_failure(message: &str) -> bool {
+    // Retrying is deliberately closed over explicit transport failures.  A
+    // validation, authorization, tool, or model-result error must become a
+    // terminal record rather than a second attempt with unknown effects.
+    let lowered = message.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "connection reset",
+        "temporarily unavailable",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn failure_class(message: &str) -> FailureClassV1 {
+    if safe_transient_failure(message) {
+        FailureClassV1::SafeTransient
+    } else {
+        FailureClassV1::Deterministic
+    }
+}
+
+async fn control_register_and_start(
+    control: &SpawnControlPort,
+    ids: &ControlledChildIds,
+    task: &SpawnTask,
+    agent: &AgentType,
+    base_sandbox: &SandboxPolicy,
+    depth: u8,
+) -> Result<ChildAttemptRefV1, String> {
+    let _transition = control.transition_gate.lock().await;
+    let mut capabilities = controlled_capabilities(task, agent, base_sandbox, depth)?;
+    if control
+        .lease_owner
+        .as_ref()
+        .is_some_and(|owner| owner.has_pending_for(&ids.task_id, unix_time_ms()))
+    {
+        capabilities.mcp = McpCapabilityV1::ReadSnapshotsOnly;
+    }
+    if !capabilities.does_not_escalate_from(&control.parent_capabilities) {
+        return Err("subagent control refused an authority escalation".into());
+    }
+    let reference = ChildAttemptRefV1 {
+        logical_child_id: ids.logical_child_id.clone(),
+        attempt_id: ids.first_attempt_id.clone(),
+    };
+    let queued = {
+        let mut owner = control.plane.lock().await;
+        owner
+            .register_before_start(RegisterChildV1 {
+                logical_child_id: ids.logical_child_id.clone(),
+                attempt_id: ids.first_attempt_id.clone(),
+                binding: control.binding.clone(),
+                role: agent.name.clone(),
+                tier: agent.tier.name().to_owned(),
+                model: control.model.clone(),
+                effort: control.effort.clone(),
+                capabilities,
+            })
+            .map_err(|error| error.to_string())?;
+        owner.clone()
+    };
+    control_changed(control, &queued)?;
+    let running = {
+        let mut owner = control.plane.lock().await;
+        owner
+            .mark_running(&reference, &control.binding)
+            .map_err(|error| error.to_string())?;
+        owner.clone()
+    };
+    control_changed(control, &running)?;
+    Ok(reference)
+}
+
+async fn control_finish(
+    control: &SpawnControlPort,
+    reference: &ChildAttemptRefV1,
+    outcome: &TaskOutcome,
+) -> Result<bool, String> {
+    let _transition = control.transition_gate.lock().await;
+    let (terminal, reason, usage, result_refs, artifact_refs) = match outcome {
+        TaskOutcome::Ok(success) => (
+            ChildStateV1::Succeeded,
+            "child completed".to_owned(),
+            success.usage.clone(),
+            success.result_refs.clone(),
+            success.artifact_refs.clone(),
+        ),
+        TaskOutcome::Failed(message) => (
+            ChildStateV1::Failed {
+                class: failure_class(message),
+            },
+            message.clone(),
+            UsageAttributionV1::Missing,
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
+    let (result, terminal_plane) = {
+        let mut owner = control.plane.lock().await;
+        let result = match owner.finish(
+            reference,
+            &control.binding,
+            terminal,
+            reason,
+            usage.clone(),
+            result_refs.clone(),
+            artifact_refs.clone(),
+        ) {
+            Ok(_) => Ok(true),
+            // A cancellation may race with a provider completion.  The control
+            // plane rejects a late success/failure; retain only the honest state
+            // that its external effect is unknown, and never return that success
+            // to the parent as if cancellation had not happened.
+            Err(crate::subagent_control::ControlError::InvalidTransition) => {
+                owner
+                    .finish(
+                        reference,
+                        &control.binding,
+                        ChildStateV1::OutcomeUnknown,
+                        "cancellation raced with child completion".to_owned(),
+                        usage,
+                        result_refs,
+                        artifact_refs,
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(false)
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        (result, owner.clone())
+    };
+    if result.is_ok() {
+        control_changed(control, &terminal_plane)?;
+    }
+    result
+}
+
+async fn run_with_runtime_cancel<F>(
+    control: Option<&SpawnControlPort>,
+    reference: Option<&ChildAttemptRefV1>,
+    future: F,
+) -> (TaskOutcome, bool)
+where
+    F: Future<Output = TaskOutcome>,
+{
+    let (Some(owner), Some(reference)) =
+        (control.and_then(|port| port.root_owner.as_ref()), reference)
+    else {
+        return (future.await, false);
+    };
+    let (handle, registration) = futures_util::future::AbortHandle::new_pair();
+    if let Err(error) = owner.register_runtime_attempt(reference, handle).await {
+        return (
+            TaskOutcome::Failed(format!(
+                "subagent runtime cancellation registration failed: {error}"
+            )),
+            false,
+        );
+    }
+    match futures_util::future::Abortable::new(future, registration).await {
+        Ok(outcome) => (outcome, false),
+        Err(_) => {
+            let outcome = match owner.finish_runtime_abort_unknown(reference).await {
+                Ok(()) => TaskOutcome::Failed(
+                    "subagent runtime was cancelled; external outcome is unknown".into(),
+                ),
+                Err(error) => TaskOutcome::Failed(format!(
+                    "subagent runtime was cancelled but its outcome could not be recorded: {error}"
+                )),
+            };
+            (outcome, true)
+        }
+    }
+}
+
+fn unregister_runtime_attempt(
+    control: Option<&SpawnControlPort>,
+    reference: Option<&ChildAttemptRefV1>,
+) -> Result<(), String> {
+    match (control.and_then(|port| port.root_owner.as_ref()), reference) {
+        (Some(owner), Some(reference)) => owner.unregister_runtime_attempt(reference),
+        _ => Ok(()),
+    }
+}
+
+async fn control_restart_after_safe_transient(
+    control: &SpawnControlPort,
+    ids: &ControlledChildIds,
+    task: &SpawnTask,
+    agent: &AgentType,
+    base_sandbox: &SandboxPolicy,
+    depth: u8,
+) -> Result<ChildAttemptRefV1, String> {
+    let _transition = control.transition_gate.lock().await;
+    let mut capabilities = controlled_capabilities(task, agent, base_sandbox, depth)?;
+    if control
+        .lease_owner
+        .as_ref()
+        .is_some_and(|owner| owner.has_pending_for(&ids.task_id, unix_time_ms()))
+    {
+        capabilities.mcp = McpCapabilityV1::ReadSnapshotsOnly;
+    }
+    if !capabilities.does_not_escalate_from(&control.parent_capabilities) {
+        return Err("subagent control refused retry authority escalation".into());
+    }
+    let (reference, queued) = {
+        let mut owner = control.plane.lock().await;
+        let reference = owner
+            .restart_as_new_attempt(
+                &ids.logical_child_id,
+                &control.binding,
+                ids.retry_attempt_id.clone(),
+                capabilities,
+            )
+            .map_err(|error| error.to_string())?;
+        (reference, owner.clone())
+    };
+    control_changed(control, &queued)?;
+    let running = {
+        let mut owner = control.plane.lock().await;
+        owner
+            .mark_running(&reference, &control.binding)
+            .map_err(|error| error.to_string())?;
+        owner.clone()
+    };
+    control_changed(control, &running)?;
+    Ok(reference)
+}
+
+fn control_changed(control: &SpawnControlPort, plane: &ChildControlPlaneV1) -> Result<(), String> {
+    if let Some(on_change) = &control.on_change {
+        on_change(plane)
+    } else {
+        Ok(())
+    }
+}
+
+async fn control_record_activity(
+    control: &SpawnControlPort,
+    reference: &ChildAttemptRefV1,
+    sequence: u64,
+    summary: String,
+) -> Result<(), String> {
+    let _transition = control.transition_gate.lock().await;
+    let changed = {
+        let mut owner = control.plane.lock().await;
+        owner
+            .mark_activity(
+                reference,
+                &control.binding,
+                crate::subagent_control::SafeActivityV1 { summary, sequence },
+            )
+            .map_err(|error| error.to_string())?;
+        owner.clone()
+    };
+    control_changed(control, &changed)
+}
+
+async fn record_child_tool_activity(
+    activity: ControlledActivityPort,
+    mut updates: tokio::sync::watch::Receiver<Option<crate::desktop_events::ChildToolActivity>>,
+) -> Result<(), String> {
+    while updates.changed().await.is_ok() {
+        let Some(update) = updates.borrow_and_update().clone() else {
+            continue;
+        };
+        let sequence = activity.sequence.fetch_add(1, Ordering::Relaxed);
+        control_record_activity(
+            &activity.control,
+            &activity.reference,
+            sequence,
+            safe_activity_summary(&update.name, &update.detail),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn safe_activity_summary(name: &str, detail: &str) -> String {
+    const MAX_DETAIL_BYTES: usize = 320;
+    let mut safe = String::with_capacity(detail.len().min(MAX_DETAIL_BYTES));
+    for character in detail.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if safe.len() + character.len_utf8() > MAX_DETAIL_BYTES {
+            break;
+        }
+        safe.push(character);
+    }
+    let mut summary = format!("{}({})", name.trim(), safe.trim());
+    while summary.len() > 384 {
+        summary.pop();
+    }
+    if summary.is_empty() {
+        "tool".to_owned()
+    } else {
+        summary
+    }
+}
+
+fn child_lease_context(
+    control: &SpawnControlPort,
+    ids: &ControlledChildIds,
+    reference: &ChildAttemptRefV1,
+) -> Result<
+    (
+        Option<ControlledChildContext>,
+        Option<crate::mcp::lease::ChildLeaseGuardV1>,
+    ),
+    String,
+> {
+    let (Some(lease_owner), Some(root_owner)) = (&control.lease_owner, &control.root_owner) else {
+        return Ok((None, None));
+    };
+    let binding = crate::mcp::lease::ChildLeaseBindingV1 {
+        root_run_id: control.binding.root_run_id.clone(),
+        child_attempt_id: reference.attempt_id.clone(),
+        task_id: ids.task_id.clone(),
+    };
+    let (reads, guard) = lease_owner
+        .grant_child(binding, unix_time_ms())
+        .map_err(|error| error.to_string())?;
+    Ok((
+        Some(ControlledChildContext {
+            root_owner: root_owner.clone(),
+            logical_child_id: ids.logical_child_id.clone(),
+            reads,
+        }),
+        Some(guard),
+    ))
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_wave_with_gate(
     tasks: Vec<SpawnTask>,
@@ -734,6 +1352,57 @@ pub(crate) async fn run_wave_with_gate(
     depth: u8,
     memory: ChildMemory,
 ) -> String {
+    run_wave_with_gate_controlled(
+        tasks,
+        agent_types,
+        provider,
+        audit,
+        base_sandbox,
+        helper,
+        concurrency,
+        write_concurrency,
+        events,
+        workflow,
+        parent_gate,
+        decider,
+        depth,
+        memory,
+        None,
+    )
+    .await
+}
+
+/// Controlled variant of [`run_wave_with_gate`].  It is intentionally an
+/// opt-in entry point: compatibility callers do not get fabricated root or
+/// child IDs, while the session owner can pass its durable control plane and
+/// caller-issued bindings.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_wave_with_gate_controlled(
+    tasks: Vec<SpawnTask>,
+    agent_types: &[AgentType],
+    provider: Arc<dyn Provider>,
+    audit: Arc<Mutex<AuditLog>>,
+    base_sandbox: &SandboxPolicy,
+    helper: &Path,
+    concurrency: usize,
+    write_concurrency: usize,
+    events: Option<crate::desktop_events::EventSink>,
+    workflow: Option<ChildWorkflow>,
+    parent_gate: &Gate,
+    decider: Option<&dyn crate::tier::TierDecider>,
+    depth: u8,
+    memory: ChildMemory,
+    control: Option<SpawnControlPort>,
+) -> String {
+    if control
+        .as_ref()
+        .is_some_and(|port| port.children.len() != tasks.len())
+    {
+        return failed_wave(
+            &tasks,
+            "spawn control refused a wave without one caller-issued identity per task",
+        );
+    }
     if let Err(msg) = check_no_write_root_overlap(&tasks) {
         return failed_wave(&tasks, &msg);
     }
@@ -800,6 +1469,7 @@ pub(crate) async fn run_wave_with_gate(
         let needs_write = task.write_root.is_some();
         let workflow = workflow.as_ref();
         let weight = decided.get(&index).copied();
+        let control = control.as_ref();
         async move {
             // Held across `run_one`'s whole `.await` — that is the point:
             // the permit bounds how many tasks are *running* at once, not
@@ -816,31 +1486,201 @@ pub(crate) async fn run_wave_with_gate(
                 }
                 None => provider,
             };
-            let outcome = run_one_with_gate(
-                task,
-                agent_types,
-                provider,
-                audit,
-                base_sandbox,
-                helper,
-                events,
-                workflow,
-                parent_gate,
-                depth,
-                memory.clone(),
+            let control_agent = agent_types.iter().find(|agent| agent.name == task.agent_type);
+            let control_attempt = match (control, control_agent) {
+                (Some(port), Some(agent)) => match control_register_and_start(
+                    port,
+                    &port.children[index],
+                    task,
+                    agent,
+                    base_sandbox,
+                    depth,
+                )
+                .await {
+                    Ok(reference) => Some(reference),
+                    Err(error) => {
+                        return serde_json::json!({
+                            "type": task.agent_type,
+                            "ok": false,
+                            "error": format!("spawn control refused child start: {error}"),
+                        });
+                    }
+                },
+                // Unknown types keep the existing run_one failure path. They
+                // cannot be registered because no fixed role/capability set
+                // exists to bind.
+                _ => None,
+            };
+            let (first_child_context, first_lease_guard) =
+                match (control, control_attempt.as_ref()) {
+                    (Some(port), Some(reference)) => {
+                        match child_lease_context(port, &port.children[index], reference) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let failure = TaskOutcome::Failed(format!(
+                                    "spawn control refused child MCP read lease: {error}"
+                                ));
+                                let _ = control_finish(port, reference, &failure).await;
+                                return serde_json::json!({
+                                    "type": task.agent_type,
+                                    "ok": false,
+                                    "error": match failure { TaskOutcome::Failed(error) => error, _ => unreachable!() },
+                                });
+                            }
+                        }
+                    }
+                    _ => (None, None),
+                };
+            let first_activity = match (control, control_attempt.as_ref()) {
+                (Some(port), Some(reference)) => Some(ControlledActivityPort {
+                    control: port.clone(),
+                    reference: reference.clone(),
+                    sequence: Arc::new(AtomicU64::new(1)),
+                }),
+                _ => None,
+            };
+            let (first_outcome, first_aborted) = run_with_runtime_cancel(
+                control,
+                control_attempt.as_ref(),
+                run_one_with_gate(
+                    task,
+                    crate::desktop_store::child_display_name(index),
+                    agent_types,
+                    provider.clone(),
+                    audit.clone(),
+                    base_sandbox,
+                    helper,
+                    events.clone(),
+                    workflow,
+                    parent_gate,
+                    depth,
+                    memory.clone(),
+                    first_child_context,
+                    first_activity,
+                ),
             )
             .await;
+            drop(first_lease_guard);
+            let mut outcome = if first_aborted {
+                first_outcome
+            } else if let (Some(port), Some(reference)) = (control, control_attempt.as_ref()) {
+                let finished = control_finish(port, reference, &first_outcome).await;
+                let unregistered = unregister_runtime_attempt(control, Some(reference));
+                match (finished, unregistered) {
+                    (Ok(true), Ok(())) => first_outcome,
+                    (Ok(false), Ok(())) => TaskOutcome::Failed(
+                        "child cancellation raced with completion; outcome is unknown".into(),
+                    ),
+                    (Err(error), _) | (_, Err(error)) => TaskOutcome::Failed(format!(
+                        "spawn control could not record terminal outcome: {error}"
+                    )),
+                }
+            } else {
+                first_outcome
+            };
+            // The control plane admits one retry only after the first,
+            // durably-recorded terminal state is SafeTransient.  Schema
+            // repair is internal to one run and must never masquerade as a
+            // second child attempt.
+            if let (Some(port), Some(agent), TaskOutcome::Failed(message)) =
+                (control, control_agent, &outcome)
+                && port.retry_safe_transient && safe_transient_failure(message)
+            {
+                    match control_restart_after_safe_transient(
+                        port,
+                        &port.children[index],
+                        task,
+                        agent,
+                        base_sandbox,
+                        depth,
+                    )
+                    .await
+                    {
+                        Ok(retry_reference) => {
+                            let (retry_child_context, retry_lease_guard) =
+                                match child_lease_context(
+                                    port,
+                                    &port.children[index],
+                                    &retry_reference,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        outcome = TaskOutcome::Failed(format!(
+                                            "spawn control refused retry MCP read lease: {error}"
+                                        ));
+                                        let _ = control_finish(port, &retry_reference, &outcome).await;
+                                        return match outcome {
+                                            TaskOutcome::Failed(msg) => serde_json::json!({
+                                                "type": task.agent_type,
+                                                "ok": false,
+                                                "error": msg,
+                                            }),
+                                            TaskOutcome::Ok(_) => unreachable!(),
+                                        };
+                                    }
+                                };
+                            let (retry_outcome, retry_aborted) = run_with_runtime_cancel(
+                                control,
+                                Some(&retry_reference),
+                                run_one_with_gate(
+                                    task,
+                                    crate::desktop_store::child_display_name(index),
+                                    agent_types,
+                                    provider,
+                                    audit,
+                                    base_sandbox,
+                                    helper,
+                                    events,
+                                    workflow,
+                                    parent_gate,
+                                    depth,
+                                    memory,
+                                    retry_child_context,
+                                    Some(ControlledActivityPort {
+                                        control: port.clone(),
+                                        reference: retry_reference.clone(),
+                                        sequence: Arc::new(AtomicU64::new(1)),
+                                    }),
+                                ),
+                            )
+                            .await;
+                            drop(retry_lease_guard);
+                            outcome = if retry_aborted {
+                                retry_outcome
+                            } else {
+                                let finished =
+                                    control_finish(port, &retry_reference, &retry_outcome).await;
+                                let unregistered =
+                                    unregister_runtime_attempt(control, Some(&retry_reference));
+                                match (finished, unregistered) {
+                                    (Ok(true), Ok(())) => retry_outcome,
+                                    (Ok(false), Ok(())) => TaskOutcome::Failed(
+                                        "child cancellation raced with retry completion; outcome is unknown".into(),
+                                    ),
+                                    (Err(error), _) | (_, Err(error)) => TaskOutcome::Failed(format!(
+                                        "spawn control could not record retry outcome: {error}"
+                                    )),
+                                }
+                            };
+                        }
+                        Err(error) => {
+                            outcome = TaskOutcome::Failed(format!(
+                                "spawn control refused SafeTransient retry: {error}"
+                            ));
+                        }
+                    }
+                }
             // A successful result has already been parsed as JSON by
             // `validate_output`, so it is embedded as the structure it is
             // rather than as a string holding an escaped copy of itself.
             // The fallback cannot be reached from `run_one`'s success
             // path; it exists so that this function never has to unwrap.
             match outcome {
-                TaskOutcome::Ok(text) => serde_json::json!({
+                TaskOutcome::Ok(success) => serde_json::json!({
                     "type": task.agent_type,
                     "ok": true,
-                    "result": serde_json::from_str::<serde_json::Value>(&text)
-                        .unwrap_or(serde_json::Value::String(text)),
+                    "result": serde_json::from_str::<serde_json::Value>(&success.text)
+                        .unwrap_or(serde_json::Value::String(success.text)),
                 }),
                 TaskOutcome::Failed(msg) => serde_json::json!({
                     "type": task.agent_type,
@@ -1076,28 +1916,31 @@ mod tests {
         let types = [file_inspector()];
         let sandbox = full_access();
         let results = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(
-                run_one_scoped(
-                    &task,
-                    &types,
-                    good.clone(),
-                    audit_in(dir.path()),
-                    &sandbox,
-                    Path::new("/bin/true"),
-                    Some(EventSink::from(sink.clone())),
-                    None
-                ),
-                run_one_scoped(
-                    &task,
-                    &types,
-                    bad.clone(),
-                    audit_in(dir.path()),
-                    &sandbox,
-                    Path::new("/bin/true"),
-                    Some(EventSink::from(sink.clone())),
-                    None
-                )
-            )
+            // Keep the two large child-run futures off the test thread's
+            // fixed stack. Production waves already store each child future
+            // behind `join_all`; this test should exercise the same ownership
+            // shape instead of requiring a larger test-thread stack.
+            let good_run = Box::pin(run_one_scoped(
+                &task,
+                &types,
+                good.clone(),
+                audit_in(dir.path()),
+                &sandbox,
+                Path::new("/bin/true"),
+                Some(EventSink::from(sink.clone())),
+                None,
+            ));
+            let bad_run = Box::pin(run_one_scoped(
+                &task,
+                &types,
+                bad.clone(),
+                audit_in(dir.path()),
+                &sandbox,
+                Path::new("/bin/true"),
+                Some(EventSink::from(sink.clone())),
+                None,
+            ));
+            tokio::join!(good_run, bad_run)
         })
         .await
         .unwrap();
@@ -1498,6 +2341,194 @@ mod tests {
         SandboxPolicy::new(SandboxMode::FullAccess, &[]).expect("policy")
     }
 
+    fn controlled_port(owner: Arc<Mutex<ChildControlPlaneV1>>) -> SpawnControlPort {
+        SpawnControlPort {
+            plane: owner,
+            binding: ChildBindingV1 {
+                root_run_id: crate::subagent_control::RootRunId::new("root-run").unwrap(),
+                root_attempt_id: crate::subagent_control::RootAttemptId::new("root-attempt")
+                    .unwrap(),
+                active_task_id: crate::subagent_control::TaskId::new("task-1").unwrap(),
+                parent: crate::subagent_control::ParentBindingV1::Root,
+            },
+            parent_capabilities: CapabilitySnapshotV1 {
+                sandbox: SandboxCapabilityV1::FullAccess,
+                write_roots: Vec::new(),
+                tool_names: vec!["read".into(), "spawn".into()],
+                approval: ApprovalCapabilityV1::TrustedOwnerOnly,
+                mcp: McpCapabilityV1::ReadSnapshotsOnly,
+            },
+            model: "test-model".into(),
+            effort: "medium".into(),
+            children: vec![ControlledChildIds {
+                logical_child_id: LogicalChildId::new("child-1").unwrap(),
+                task_id: crate::subagent_control::TaskId::new("child-task-1").unwrap(),
+                first_attempt_id: ChildAttemptId::new("child-1-attempt-1").unwrap(),
+                retry_attempt_id: ChildAttemptId::new("child-1-attempt-2").unwrap(),
+            }],
+            retry_safe_transient: true,
+            lease_owner: None,
+            on_change: None,
+            root_owner: None,
+            transition_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[test]
+    fn controlled_child_capability_never_contains_live_mcp_catalog() {
+        let mut agent = file_reader();
+        agent.allowed_tools.push("mcp_catalog".into());
+        let task = SpawnTask {
+            agent_type: agent.name.clone(),
+            task: "inspect".into(),
+            write_root: None,
+        };
+        let capabilities = controlled_capabilities(&task, &agent, &full_access(), 1).unwrap();
+        assert!(
+            !capabilities
+                .tool_names
+                .iter()
+                .any(|name| name == "mcp_catalog")
+        );
+        assert_eq!(capabilities.mcp, McpCapabilityV1::None);
+    }
+
+    #[tokio::test]
+    async fn controlled_spawn_records_caller_bound_queued_running_and_terminal_states() {
+        let owner = Arc::new(Mutex::new(ChildControlPlaneV1::default()));
+        let port = controlled_port(owner.clone());
+        let agent = file_reader();
+        let task = SpawnTask {
+            agent_type: agent.name.clone(),
+            task: "inspect".into(),
+            write_root: None,
+        };
+
+        let reference =
+            control_register_and_start(&port, &port.children[0], &task, &agent, &full_access(), 1)
+                .await
+                .expect("mock owner admits the child");
+        assert!(
+            control_finish(&port, &reference, &TaskOutcome::Ok("{}".into()))
+                .await
+                .expect("mock owner records terminal success")
+        );
+
+        let owner = owner.lock().await;
+        let child = &owner.children[0];
+        assert_eq!(child.binding, port.binding);
+        assert_eq!(child.attempts.len(), 1);
+        assert_eq!(child.attempts[0].state, ChildStateV1::Succeeded);
+        assert_eq!(child.attempts[0].usage, UsageAttributionV1::Missing);
+    }
+
+    #[tokio::test]
+    async fn controlled_finish_keeps_exact_result_reference_and_known_child_usage() {
+        let owner = Arc::new(Mutex::new(ChildControlPlaneV1::default()));
+        let port = controlled_port(owner.clone());
+        let agent = file_reader();
+        let task = SpawnTask {
+            agent_type: agent.name.clone(),
+            task: "inspect".into(),
+            write_root: None,
+        };
+        let reference =
+            control_register_and_start(&port, &port.children[0], &task, &agent, &full_access(), 1)
+                .await
+                .unwrap();
+        let success = TaskSuccess::with_usage(
+            r#"{"ok":true}"#.into(),
+            UsageAttributionV1::Known {
+                input_tokens: 7,
+                output_tokens: 3,
+            },
+        );
+        assert!(
+            control_finish(&port, &reference, &TaskOutcome::Ok(success))
+                .await
+                .unwrap()
+        );
+
+        let owner = owner.lock().await;
+        let attempt = &owner.children[0].attempts[0];
+        assert_eq!(
+            attempt.usage,
+            UsageAttributionV1::Known {
+                input_tokens: 7,
+                output_tokens: 3,
+            }
+        );
+        assert_eq!(attempt.result_refs.len(), 1);
+        assert!(attempt.result_refs[0].starts_with("sha256:"));
+        assert!(attempt.artifact_refs.is_empty());
+        assert_eq!(
+            owner
+                .usage_projection(&reference, &port.binding)
+                .unwrap()
+                .root_total_increment,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_activity_is_monotonic_for_the_exact_attempt() {
+        let owner = Arc::new(Mutex::new(ChildControlPlaneV1::default()));
+        let port = controlled_port(owner.clone());
+        let agent = file_reader();
+        let task = SpawnTask {
+            agent_type: agent.name.clone(),
+            task: "inspect".into(),
+            write_root: None,
+        };
+        let reference =
+            control_register_and_start(&port, &port.children[0], &task, &agent, &full_access(), 1)
+                .await
+                .unwrap();
+        control_record_activity(&port, &reference, 2, "read(CURRENT.md)".into())
+            .await
+            .unwrap();
+        control_record_activity(&port, &reference, 1, "write(ignored)".into())
+            .await
+            .unwrap();
+
+        let owner = owner.lock().await;
+        let activity = owner.children[0].attempts[0].activity.as_ref().unwrap();
+        assert_eq!(activity.sequence, 2);
+        assert_eq!(activity.summary, "read(CURRENT.md)");
+    }
+
+    #[tokio::test]
+    async fn controlled_spawn_cancellation_race_never_accepts_late_success() {
+        let owner = Arc::new(Mutex::new(ChildControlPlaneV1::default()));
+        let port = controlled_port(owner.clone());
+        let agent = file_reader();
+        let task = SpawnTask {
+            agent_type: agent.name.clone(),
+            task: "inspect".into(),
+            write_root: None,
+        };
+        let reference =
+            control_register_and_start(&port, &port.children[0], &task, &agent, &full_access(), 1)
+                .await
+                .unwrap();
+        owner
+            .lock()
+            .await
+            .cancel_requested(&reference, &port.binding)
+            .expect("mock owner accepts cancellation");
+
+        assert!(
+            !control_finish(&port, &reference, &TaskOutcome::Ok("{}".into()))
+                .await
+                .expect("late result is converted to outcome unknown")
+        );
+        let owner = owner.lock().await;
+        assert_eq!(
+            owner.children[0].attempts[0].state,
+            ChildStateV1::OutcomeUnknown
+        );
+    }
+
     #[tokio::test]
     async fn desktop_spawn_started_failure_prevents_child_provider_calls() {
         use crate::desktop_events::{
@@ -1518,6 +2549,7 @@ mod tests {
                 for _ in 0..EVENT_CAPACITY {
                     events
                         .send(crate::events::AgentEvent::SpawnFinished {
+                            display_name: "Sirius".into(),
                             agent_type: "prefill".into(),
                             ok: true,
                         })
@@ -1704,7 +2736,7 @@ mod tests {
         .await;
 
         let body = match outcome {
-            TaskOutcome::Ok(b) => b,
+            TaskOutcome::Ok(b) => b.text,
             TaskOutcome::Failed(e) => panic!("the subagent failed: {e}"),
         };
         assert_eq!(body, result);
@@ -1769,7 +2801,7 @@ mod tests {
                     "the stop condition was never consulted: {e}"
                 );
             }
-            TaskOutcome::Ok(b) => panic!("output not matching the schema was accepted: {b}"),
+            TaskOutcome::Ok(b) => panic!("output not matching the schema was accepted: {b:?}"),
         }
     }
 
@@ -1968,7 +3000,7 @@ mod tests {
                     "the candidate list is missing the type that does exist: {e}"
                 );
             }
-            TaskOutcome::Ok(b) => panic!("an unknown type was run anyway: {b}"),
+            TaskOutcome::Ok(b) => panic!("an unknown type was run anyway: {b:?}"),
         }
     }
 
@@ -2058,7 +3090,7 @@ mod tests {
         .await;
         match outcome {
             TaskOutcome::Failed(e) => assert!(e.contains("write_root"), "{e}"),
-            TaskOutcome::Ok(b) => panic!("a read-write type ran with no write root: {b}"),
+            TaskOutcome::Ok(b) => panic!("a read-write type ran with no write root: {b:?}"),
         }
     }
 
@@ -2091,7 +3123,7 @@ mod tests {
             TaskOutcome::Failed(e) => {
                 assert!(e.contains("outside the parent's own writable roots"), "{e}")
             }
-            TaskOutcome::Ok(b) => panic!("a subagent was granted a root its parent lacks: {b}"),
+            TaskOutcome::Ok(b) => panic!("a subagent was granted a root its parent lacks: {b:?}"),
         }
     }
 
@@ -2221,7 +3253,7 @@ mod tests {
                 e.contains("MaxTurns"),
                 "the retry was given a fresh turn budget instead of the remaining one: {e}"
             ),
-            TaskOutcome::Ok(b) => panic!("the type's declared turn budget was exceeded: {b}"),
+            TaskOutcome::Ok(b) => panic!("the type's declared turn budget was exceeded: {b:?}"),
         }
     }
 
@@ -2960,10 +3992,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_subagents_own_tool_calls_never_reach_the_events_channel() {
-        // 深さ1の原則: サブエージェント自身のrun_loop呼び出しには
-        // events: None が渡る(Task 2で確立済み)。run_one自体が送るのは
-        // SpawnStarted/SpawnFinishedの2件だけであることを確認する。
+    async fn a_subagent_without_tool_calls_emits_only_started_and_finished() {
+        // A child with no tool activity has no progress-row update between its
+        // lifecycle markers.
         let agent_types = vec![readonly_fixture_agent_type()];
         let provider = counting_mock_provider_returning_valid_output(std::sync::Arc::new(
             std::sync::atomic::AtomicUsize::new(0),
@@ -3003,19 +4034,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_subagent_that_actually_calls_a_tool_still_only_emits_started_and_finished() {
-        // Task 4's other non-leakage test (above) proves `run_one` itself
-        // sends only 2 events, but its subagent never calls a tool — the
-        // provider hands back matching JSON on the first turn, so there is
-        // nothing internal that *could* have leaked. This test closes that
-        // gap from a different angle: the scripted subagent here calls
-        // `read` before returning its final JSON (the same fixture
-        // `a_subagent_that_uses_a_tool_and_returns_matching_json_succeeds`
-        // uses to prove audit attribution), while `run_one` is given a
-        // live events channel. If `run_one`'s inner `run_loop` call ever
-        // stopped passing `events: None` down to the subagent's own turn,
-        // the `read` call's events would show up here alongside
-        // SpawnStarted/SpawnFinished.
+    async fn a_subagents_tool_start_reaches_legacy_tui_as_named_activity() {
+        // The TUI receives one identity-bearing activity event for the read,
+        // but not the tool result body or an extra finish row.
         let dir = tempfile::tempdir().expect("temp directory");
         let target = dir.path().join("a.rs");
         std::fs::write(&target, "fn main() {}\n").expect("cannot write");
@@ -3048,20 +4069,28 @@ mod tests {
         .await;
 
         match outcome {
-            TaskOutcome::Ok(body) => assert_eq!(body, result),
+            TaskOutcome::Ok(body) => assert_eq!(body.text, result),
             TaskOutcome::Failed(e) => panic!("the subagent failed: {e}"),
         }
 
-        let _started = rx.recv().await.unwrap();
-        let _finished = rx.recv().await.unwrap();
-        let mut count = 0;
-        while rx.try_recv().is_ok() {
-            count += 1;
-        }
-        assert_eq!(
-            count, 0,
-            "the subagent's own `read` call must not have reached the parent's events channel"
-        );
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            crate::events::AgentEvent::SpawnStarted { .. }
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            crate::events::AgentEvent::SpawnActivity {
+                display_name,
+                agent_type,
+                name,
+                ..
+            } if display_name == "Sirius" && agent_type == "file-inspector" && name == "read"
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            crate::events::AgentEvent::SpawnFinished { .. }
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }
 

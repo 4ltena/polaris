@@ -109,6 +109,13 @@ pub const STAR_NAMES: [&str; 100] = [
     "Kornephoros",
 ];
 
+/// Stable presentation name for one child in a wave. Waves are bounded far
+/// below this catalogue; modulo keeps the helper total for defensive callers
+/// without turning an absent display label into an execution failure.
+pub(crate) fn at(index: usize) -> &'static str {
+    STAR_NAMES[index % STAR_NAMES.len()]
+}
+
 pub(super) fn first_available<'a>(used: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
     let used: HashSet<&str> = used.into_iter().collect();
     STAR_NAMES.iter().copied().find(|name| !used.contains(name))
@@ -133,5 +140,12 @@ mod tests {
     fn allocation_uses_first_free_name_and_refuses_exhaustion() {
         assert_eq!(first_available(["Sirius", "Canopus"]), Some("Arcturus"));
         assert_eq!(first_available(STAR_NAMES), None);
+    }
+
+    #[test]
+    fn wave_positions_use_the_same_familiar_names_as_the_desktop() {
+        assert_eq!(at(0), "Sirius");
+        assert_eq!(at(1), "Canopus");
+        assert_eq!(at(2), "Arcturus");
     }
 }

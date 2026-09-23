@@ -17,6 +17,7 @@ pub(crate) use mcp_settings::McpSettings;
 mod real;
 mod role_bindings;
 mod run_details;
+mod session_admission;
 #[cfg(target_os = "macos")]
 mod source_owner;
 #[cfg(target_os = "macos")]
@@ -37,16 +38,24 @@ use polaris_core::desktop_store::{
     Acceptance, DesktopRoot, InitialState, IntentReceipt, PrototypeRoot, Published, RequestResult,
     StoreError, Writer,
 };
+use polaris_desktop_protocol::orchestration::{
+    AcceptanceSummaryStateV2, AcceptanceSummaryV2, ArtifactRefV2, ClarificationFreeTextV2,
+    ClarificationQuestionV2, ClarificationStateV2, ClarificationSummaryV2, CommonRunnerStateV2,
+    CommonRunnerSummaryV2, ConvergenceStateV2, ConvergenceSummaryV2, EvidenceSummaryV2,
+    McpLeaseStateV2, McpLeaseSummaryV2, OrchestrationSummaryV2, SessionManagerSummaryV2,
+    SidechatStateV2, SubagentAttemptSummaryV2, WorkflowStepV2, WorkflowSummaryV2,
+};
 use polaris_desktop_protocol::{
     ProtocolVersion,
     event::{Durability, Event, EventBody, TextDelta},
     ids::*,
-    request::{Request, RequestBody, RunTarget},
+    request::{DraftUpdate, Request, RequestBody, RunTarget},
     response::*,
     run_state::{Observation, RunState},
     snapshot::{Configuration, Draft, Position, Snapshot, WorkflowStatus},
     validate::{ConnectionState, validate_request},
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -67,6 +76,85 @@ const REQUEST_RECORDS: usize = 128;
 const RUNS: usize = 32;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 static EPOCH_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+fn child_control_state(
+    state: &polaris_core::subagent_control::ChildStateV1,
+) -> polaris_desktop_protocol::orchestration::ChildControlStateV2 {
+    use polaris_core::subagent_control::ChildStateV1 as State;
+    use polaris_desktop_protocol::orchestration::ChildControlStateV2 as Wire;
+    match state {
+        State::Queued => Wire::Queued,
+        State::Running => Wire::Running,
+        State::Waiting { .. } => Wire::Waiting,
+        State::Cancelling => Wire::Cancelling,
+        State::Succeeded => Wire::Succeeded,
+        State::Failed { .. } => Wire::Failed,
+        State::Cancelled => Wire::Cancelled,
+        State::OutcomeUnknown => Wire::OutcomeUnknown,
+    }
+}
+
+fn child_summary(
+    root_run_id: &str,
+    root_attempt_id: &str,
+    control_revision: u64,
+    child: &polaris_core::session::ChildControlProjectionV1,
+) -> Option<SubagentAttemptSummaryV2> {
+    Some(SubagentAttemptSummaryV2 {
+        root_run_id: RunId::new(root_run_id).ok()?,
+        root_attempt_id: AttemptId::new(root_attempt_id).ok()?,
+        control_revision: DecimalU64::new(control_revision),
+        logical_child_id: child.logical_child_id.0.clone(),
+        attempt_id: child.attempt_id.0.clone(),
+        display_name: child.display_name.clone(),
+        role: child.role.clone(),
+        state: child_control_state(&child.state),
+        activity: child
+            .activity
+            .as_ref()
+            .map(|activity| activity.summary.clone()),
+    })
+}
+
+fn delegation_control_error(message: String) -> ProtocolError {
+    let code = if message.contains("revision mismatch")
+        || message.contains("conflicting idempotent operation")
+    {
+        ErrorCode::RevisionConflict
+    } else if message.contains("binding mismatch") || message.contains("wrong root") {
+        ErrorCode::PermissionDenied
+    } else if message.contains("unknown child or attempt") {
+        ErrorCode::NotFound
+    } else if message.contains("invalid state") || message.contains("invalid control-plane") {
+        ErrorCode::InvalidRequest
+    } else if message.contains("runtime unavailable") {
+        ErrorCode::CapabilityUnavailable
+    } else {
+        ErrorCode::StorageFailed
+    };
+    error(code)
+}
+
+fn admission_target(id: &polaris_core::session_manager::AdmissionId) -> RunTarget {
+    fn derive(prefix: &[u8], id: &str) -> String {
+        let mut hash = Sha256::new();
+        hash.update(prefix);
+        hash.update(id.as_bytes());
+        format!("{:x}", hash.finalize())
+    }
+    RunTarget {
+        run_id: RunId::new(format!(
+            "run-{}",
+            derive(b"polaris-admission-run-v1\0", id.as_str())
+        ))
+        .expect("derived run ID"),
+        attempt_id: AttemptId::new(format!(
+            "attempt-{}",
+            derive(b"polaris-admission-attempt-v1\0", id.as_str())
+        ))
+        .expect("derived attempt ID"),
+    }
+}
 
 fn workflow_phase(
     phase: polaris_desktop_protocol::request::WorkflowPhase,
@@ -106,15 +194,369 @@ fn workflow_status(saved: &polaris_core::desktop_store::SavedWorkflow) -> Workfl
     }
 }
 
+fn orchestration_summary(
+    saved: &Published,
+    admission: Option<&session_admission::AdmissionOwner>,
+    delegation: Option<&polaris_core::session::RootDelegationProjectionV1>,
+) -> OrchestrationSummaryV2 {
+    let workflow = saved.state.workflow.as_ref();
+    let phase = workflow.map(workflow_status).map_or(
+        polaris_desktop_protocol::request::WorkflowPhase::General,
+        |value| value.phase,
+    );
+    let step = workflow
+        .and_then(|saved| saved.state.step)
+        .map_or(WorkflowStepV2::Idle, |step| match step {
+            polaris_core::workflow::WorkflowStepV1::Intake
+            | polaris_core::workflow::WorkflowStepV1::Research => WorkflowStepV2::Context,
+            polaris_core::workflow::WorkflowStepV1::Define
+            | polaris_core::workflow::WorkflowStepV1::Shape
+            | polaris_core::workflow::WorkflowStepV1::Decide
+            | polaris_core::workflow::WorkflowStepV1::Specify
+            | polaris_core::workflow::WorkflowStepV1::Clarify
+            | polaris_core::workflow::WorkflowStepV1::Plan
+            | polaris_core::workflow::WorkflowStepV1::Decompose => WorkflowStepV2::Planning,
+            polaris_core::workflow::WorkflowStepV1::Analyze
+            | polaris_core::workflow::WorkflowStepV1::Implement => WorkflowStepV2::Executing,
+            polaris_core::workflow::WorkflowStepV1::Review => WorkflowStepV2::Reviewing,
+            polaris_core::workflow::WorkflowStepV1::Verify
+            | polaris_core::workflow::WorkflowStepV1::Converge => WorkflowStepV2::Converging,
+            polaris_core::workflow::WorkflowStepV1::Deliver => WorkflowStepV2::Complete,
+        });
+    let active_feature = workflow
+        .and_then(|saved| saved.state.active_feature.as_ref())
+        .map(|reference| ArtifactRefV2 {
+            artifact_id: reference.id.clone(),
+            content_hash: reference.content_hash.clone(),
+        });
+    let active_task = workflow
+        .and_then(|saved| saved.state.active_task.as_ref())
+        .map(|reference| ArtifactRefV2 {
+            artifact_id: reference.task_id.clone(),
+            content_hash: reference.definition_hash.clone(),
+        });
+    let active_plan = workflow
+        .and_then(|saved| saved.state.active_task.as_ref())
+        .and_then(|active| {
+            saved
+                .state
+                .workflow_artifacts
+                .artifacts
+                .iter()
+                .find(|metadata| metadata.reference() == active.task_graph)
+        })
+        .and_then(|task_graph| {
+            task_graph.header.created_from.iter().find(|reference| {
+                saved
+                    .state
+                    .workflow_artifacts
+                    .artifacts
+                    .iter()
+                    .any(|metadata| {
+                        metadata.reference() == **reference
+                            && metadata.kind
+                                == polaris_core::workflow::WorkflowArtifactKindV1::ImplementationPlan
+                    })
+            })
+        })
+        .map(|reference| ArtifactRefV2 {
+            artifact_id: reference.id.clone(),
+            content_hash: reference.content_hash.clone(),
+        });
+    let convergence = workflow.and_then(|saved| saved.gates.convergence.as_ref());
+    let convergence_report = convergence.map(polaris_core::workflow::evaluate_convergence);
+    let acceptance = convergence.map_or_else(Vec::new, |input| {
+        input
+            .required_criterion_ids
+            .iter()
+            .map(|criterion_id| {
+                let records = input
+                    .evidence
+                    .iter()
+                    .filter(|record| {
+                        &record.criterion_id == criterion_id && record.binding == input.binding
+                    })
+                    .collect::<Vec<_>>();
+                let state =
+                    if records.iter().any(|record| {
+                        record.result == polaris_core::workflow::EvidenceResultV1::Failed
+                    }) {
+                        AcceptanceSummaryStateV2::Failed
+                    } else if records.iter().any(|record| {
+                        record.result == polaris_core::workflow::EvidenceResultV1::Stale
+                    }) {
+                        AcceptanceSummaryStateV2::Stale
+                    } else if records.iter().any(|record| {
+                        record.result == polaris_core::workflow::EvidenceResultV1::Unavailable
+                    }) {
+                        AcceptanceSummaryStateV2::Unavailable
+                    } else if records.iter().any(|record| {
+                        record.result == polaris_core::workflow::EvidenceResultV1::Passed
+                    }) {
+                        AcceptanceSummaryStateV2::Passed
+                    } else {
+                        AcceptanceSummaryStateV2::Pending
+                    };
+                AcceptanceSummaryV2 {
+                    criterion_id: criterion_id.clone(),
+                    state,
+                    evidence_count: DecimalU64::new(records.len() as u64),
+                }
+            })
+            .collect()
+    });
+    let evidence_summary = convergence.map_or(
+        EvidenceSummaryV2 {
+            passed: DecimalU64::new(0),
+            failed: DecimalU64::new(0),
+            stale: DecimalU64::new(0),
+            unavailable: DecimalU64::new(0),
+        },
+        |input| {
+            let count = |result| {
+                DecimalU64::new(
+                    input
+                        .evidence
+                        .iter()
+                        .filter(|record| record.result == result)
+                        .count() as u64,
+                )
+            };
+            EvidenceSummaryV2 {
+                passed: count(polaris_core::workflow::EvidenceResultV1::Passed),
+                failed: count(polaris_core::workflow::EvidenceResultV1::Failed),
+                stale: count(polaris_core::workflow::EvidenceResultV1::Stale),
+                unavailable: count(polaris_core::workflow::EvidenceResultV1::Unavailable),
+            }
+        },
+    );
+    let convergence_summary = match (convergence, convergence_report.as_ref()) {
+        (None, _) => ConvergenceSummaryV2 {
+            state: ConvergenceStateV2::Unavailable,
+            required_criteria: DecimalU64::new(0),
+            unresolved_gaps: DecimalU64::new(0),
+        },
+        (Some(input), Some(report)) => ConvergenceSummaryV2 {
+            state: if report.converged() {
+                ConvergenceStateV2::Allowed
+            } else if input.evidence.is_empty()
+                && input.reviews.is_empty()
+                && input.implementation_receipts.is_empty()
+            {
+                ConvergenceStateV2::Pending
+            } else {
+                ConvergenceStateV2::Blocked
+            },
+            required_criteria: DecimalU64::new(input.required_criterion_ids.len() as u64),
+            unresolved_gaps: DecimalU64::new(report.gaps.len() as u64),
+        },
+        _ => unreachable!("a report exists for every convergence input"),
+    };
+    let subagent_total = delegation.map_or(0, |projection| projection.children.len());
+    let subagents = delegation.map_or_else(Vec::new, |projection| {
+        projection
+            .children
+            .iter()
+            .take(32)
+            .filter_map(|child| {
+                child_summary(
+                    &projection.root_run_id.0,
+                    &projection.root_attempt_id.0,
+                    projection.revision,
+                    child,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let mcp_lease_total = delegation.map_or(0, |projection| projection.mcp_leases.len());
+    let mcp_leases = delegation
+        .into_iter()
+        .flat_map(|projection| projection.mcp_leases.iter())
+        .take(32)
+        .filter_map(|lease| {
+            Some(McpLeaseSummaryV2 {
+                lease_id: lease.lease_id.clone(),
+                server_id: lease.server_id.clone(),
+                holder_run_id: RunId::new(lease.root_run_id.0.clone()).ok()?,
+                holder_attempt_id: AttemptId::new(lease.child_attempt_id.0.clone()).ok()?,
+                state: match lease.state {
+                    polaris_core::mcp::lease::McpLeaseProjectionStateV1::Active => {
+                        McpLeaseStateV2::Active
+                    }
+                },
+                expires_at_unix_ms: DecimalU64::new(lease.expires_at_ms),
+            })
+        })
+        .collect::<Vec<_>>();
+    let common_evidence = convergence.map_or_else(Vec::new, |input| {
+        input
+            .evidence
+            .iter()
+            .filter(|record| {
+                record.binding == input.binding
+                    && record.provenance.source_kind
+                        == polaris_core::workflow::EvidenceSourceKindV1::TestExecution
+            })
+            .collect::<Vec<_>>()
+    });
+    let common_runner = if common_evidence.is_empty() {
+        CommonRunnerSummaryV2 {
+            state: CommonRunnerStateV2::Unavailable,
+            case_id: None,
+            completed_cases: DecimalU64::new(0),
+            failed_cases: DecimalU64::new(0),
+            cleanup_pending: false,
+        }
+    } else {
+        let completed = common_evidence
+            .iter()
+            .filter(|record| record.result == polaris_core::workflow::EvidenceResultV1::Passed)
+            .count();
+        let failed = common_evidence
+            .iter()
+            .filter(|record| record.result == polaris_core::workflow::EvidenceResultV1::Failed)
+            .count();
+        let unknown = common_evidence.iter().any(|record| {
+            matches!(
+                record.result,
+                polaris_core::workflow::EvidenceResultV1::Stale
+                    | polaris_core::workflow::EvidenceResultV1::Unavailable
+            )
+        });
+        let mut sources = common_evidence
+            .iter()
+            .map(|record| record.provenance.source_ref.as_str());
+        let first = sources.next();
+        let case_id = first
+            .filter(|first| {
+                !first.is_empty() && first.len() <= 128 && sources.all(|source| source == *first)
+            })
+            .map(str::to_owned);
+        CommonRunnerSummaryV2 {
+            state: if failed != 0 {
+                CommonRunnerStateV2::Failed
+            } else if unknown {
+                CommonRunnerStateV2::OutcomeUnknown
+            } else {
+                CommonRunnerStateV2::Completed
+            },
+            case_id,
+            completed_cases: DecimalU64::new(completed.min(32) as u64),
+            failed_cases: DecimalU64::new(failed.min(32) as u64),
+            cleanup_pending: false,
+        }
+    };
+    let raw_messages = saved
+        .raw
+        .iter()
+        .map(|event| event.message.clone())
+        .collect::<Vec<_>>();
+    let wire_questions = |asked: Vec<polaris_core::turn_intent::PendingClarification>| {
+        asked
+            .into_iter()
+            .take(3)
+            .enumerate()
+            .map(|(index, question)| {
+                let mut hash = Sha256::new();
+                hash.update(b"polaris-clarification-question-v1\0");
+                hash.update(saved.marker.session_id.as_str().as_bytes());
+                hash.update(question.turn.to_be_bytes());
+                hash.update((index as u64).to_be_bytes());
+                hash.update(question.question.as_bytes());
+                ClarificationQuestionV2 {
+                    question_id: format!("question-{:x}", hash.finalize()),
+                    text: question.question,
+                    // The current core clarify contract accepts only strings.
+                    // An empty choice list plus required free text is its exact
+                    // answer shape, rather than a fabricated option set.
+                    options: Vec::new(),
+                    free_text: ClarificationFreeTextV2 {
+                        allowed: true,
+                        required: true,
+                        max_bytes: DecimalU64::new(32 * 1024),
+                    },
+                    answered: question.answer_hash.is_some(),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let clarification =
+        match polaris_core::turn_intent::ClarificationState::from_history(&raw_messages) {
+            polaris_core::turn_intent::ClarificationState::None => ClarificationSummaryV2 {
+                state: ClarificationStateV2::None,
+                questions: Vec::new(),
+                unanswered_count: DecimalU64::new(0),
+            },
+            polaris_core::turn_intent::ClarificationState::Pending { asked } => {
+                let questions = wire_questions(asked);
+                ClarificationSummaryV2 {
+                    state: ClarificationStateV2::Pending,
+                    unanswered_count: DecimalU64::new(
+                        questions
+                            .iter()
+                            .filter(|question| !question.answered)
+                            .count() as u64,
+                    ),
+                    questions,
+                }
+            }
+            polaris_core::turn_intent::ClarificationState::Resolved { asked } => {
+                ClarificationSummaryV2 {
+                    state: ClarificationStateV2::Resolved,
+                    questions: wire_questions(asked),
+                    unanswered_count: DecimalU64::new(0),
+                }
+            }
+        };
+    OrchestrationSummaryV2 {
+        workflow: WorkflowSummaryV2 {
+            phase,
+            step,
+            active_feature,
+            active_plan,
+            active_task,
+            acceptance,
+            evidence: evidence_summary,
+            convergence: convergence_summary,
+        },
+        session_manager: admission.map_or(
+            SessionManagerSummaryV2 {
+                manager_revision: DecimalU64::new(0),
+                session_count: DecimalU64::new(0),
+                session_total: DecimalU64::new(0),
+                session_omitted: false,
+                sessions: Vec::new(),
+                sidechat: SidechatStateV2::None,
+                queued_admissions: DecimalU64::new(0),
+                active_runs: DecimalU64::new(0),
+            },
+            session_admission::AdmissionOwner::summary,
+        ),
+        subagent_total: DecimalU64::new(subagent_total as u64),
+        subagent_omitted: subagents.len() != subagent_total,
+        subagents,
+        mcp_lease_total: DecimalU64::new(mcp_lease_total as u64),
+        mcp_lease_omitted: mcp_leases.len() != mcp_lease_total,
+        mcp_leases,
+        common_runner,
+        clarification,
+    }
+}
+
 pub(super) fn validated_workflow(
     config: polaris_core::workflow::WorkflowConfig,
     gates: polaris_core::workflow::WorkflowGatesV1,
     state: polaris_core::workflow::WorkflowStateV1,
+    artifacts: polaris_core::workflow::WorkflowArtifactGraphV1,
     skills: &[polaris_skills::Skill],
 ) -> Result<polaris_core::desktop_store::SavedWorkflow, ProtocolError> {
-    let workflow =
-        polaris_core::workflow::SessionWorkflow::restore(config.clone(), gates.clone(), state)
-            .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
+    let workflow = polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
+        config.clone(),
+        gates.clone(),
+        state,
+        artifacts.clone(),
+    )
+    .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
     if !config.enabled {
         return Ok(polaris_core::desktop_store::SavedWorkflow::capture(
             &workflow,
@@ -124,8 +566,13 @@ pub(super) fn validated_workflow(
         .begin_turn(skills)
         .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
     Ok(polaris_core::desktop_store::SavedWorkflow::capture(
-        &polaris_core::workflow::SessionWorkflow::restore(config, gates, turn.state.clone())
-            .map_err(|_| error(ErrorCode::CapabilityUnavailable))?,
+        &polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
+            config,
+            gates,
+            turn.state.clone(),
+            artifacts,
+        )
+        .map_err(|_| error(ErrorCode::CapabilityUnavailable))?,
     ))
 }
 
@@ -178,6 +625,9 @@ struct Active {
     text: String,
     started: bool,
     execution: crate::execution::RunExecution,
+    admission: Option<polaris_core::session_manager::AdmissionId>,
+    #[cfg(target_os = "macos")]
+    delegation: Option<DelegationRuntime>,
 }
 impl Active {
     fn cancel(&mut self) {
@@ -188,10 +638,112 @@ impl Active {
         self.execution.cancel();
     }
 }
+
+#[cfg(target_os = "macos")]
+struct DelegationRuntime {
+    control: Arc<polaris_core::session::RootDelegationControlV1>,
+    projection: Arc<std::sync::RwLock<polaris_core::session::RootDelegationProjectionV1>>,
+    updates: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(target_os = "macos")]
+impl DelegationRuntime {
+    fn projection(&self) -> Option<polaris_core::session::RootDelegationProjectionV1> {
+        self.projection.read().ok().map(|value| value.clone())
+    }
+
+    fn take_update(&self) -> bool {
+        let mut changed = false;
+        while self.updates.try_recv().is_ok() {
+            changed = true;
+        }
+        changed
+    }
+
+    fn wait_children(
+        &self,
+        binding: polaris_core::session::RootDelegationHostBindingV1,
+        expected_revision: u64,
+        after_cursor: Option<u64>,
+    ) -> Result<Option<polaris_core::session::ChildWaitSnapshotV1>, String> {
+        let control = self.control.clone();
+        std::thread::Builder::new()
+            .name("polaris-delegation-wait".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "delegation runtime unavailable".to_owned())?
+                    .block_on(control.wait_children(&binding, expected_revision, after_cursor))
+            })
+            .map_err(|_| "delegation runtime unavailable".to_owned())?
+            .join()
+            .map_err(|_| "delegation runtime unavailable".to_owned())?
+    }
+
+    fn request_child_cancel(
+        &self,
+        binding: polaris_core::session::RootDelegationHostBindingV1,
+        expected_revision: u64,
+        reference: polaris_core::subagent_control::ChildAttemptRefV1,
+    ) -> Result<polaris_core::session::ChildCancelAckV1, String> {
+        let control = self.control.clone();
+        std::thread::Builder::new()
+            .name("polaris-delegation-child-cancel".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "delegation runtime unavailable".to_owned())?
+                    .block_on(control.request_child_cancel(&binding, expected_revision, reference))
+            })
+            .map_err(|_| "delegation runtime unavailable".to_owned())?
+            .join()
+            .map_err(|_| "delegation runtime unavailable".to_owned())?
+    }
+
+    fn request_root_cancel(
+        &self,
+        binding: polaris_core::session::RootDelegationHostBindingV1,
+        expected_revision: u64,
+    ) -> Result<polaris_core::session::RootCancelAckV1, String> {
+        let control = self.control.clone();
+        std::thread::Builder::new()
+            .name("polaris-delegation-root-cancel".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "delegation runtime unavailable".to_owned())?
+                    .block_on(control.request_root_cancel(&binding, expected_revision))
+            })
+            .map_err(|_| "delegation runtime unavailable".to_owned())?
+            .join()
+            .map_err(|_| "delegation runtime unavailable".to_owned())?
+    }
+}
 struct History {
     id: SnapshotId,
     published: Published,
     expires: Instant,
+}
+
+struct SessionLane {
+    session: SessionId,
+    store: Writer,
+    // A subscription position belongs to the session it names.  The root
+    // swaps lanes for a request, so keeping this on Engine would otherwise
+    // let a sidechat subscribe replace the main session's event identity.
+    subscription: Option<Position>,
+    active: Option<Active>,
+    history: Option<History>,
+    details: Option<run_details::Details>,
+    cleanups: crate::execution::CleanupOwner,
+}
+
+struct RoutingJob {
+    admission: polaris_core::session_manager::AdmissionId,
+    worker: std::thread::JoinHandle<Option<polaris_core::session_manager::RoutingJudgementV1>>,
 }
 
 /// Explicit native-owner configuration. No environment/path discovery or auth.
@@ -244,7 +796,30 @@ impl DesktopService {
                 policy_revision: DecimalU64::new(0),
             },
         )?;
-        Self::from_production_store(store, config.session_id)
+        let saved = store.snapshot()?;
+        let admission = session_admission::AdmissionOwner::open(
+            &root,
+            &config.session_id,
+            saved.marker.session_revision,
+            saved
+                .state
+                .goal
+                .as_ref()
+                .map_or(DecimalU64::new(0), |goal| goal.revision),
+        )?;
+        let mut service = Self::from_production_store(store, config.session_id)?;
+        service
+            .engine
+            .as_mut()
+            .ok_or(ServiceError::Worker)?
+            .admission = Some(admission);
+        service.engine.as_mut().ok_or(ServiceError::Worker)?.root = Some(root);
+        service
+            .engine
+            .as_mut()
+            .ok_or(ServiceError::Worker)?
+            .restore_admission_lanes()?;
+        Ok(service)
     }
     fn from_production_store(store: Writer, session: SessionId) -> Result<Self, ServiceError> {
         let mut engine = Engine::from_store(
@@ -400,7 +975,9 @@ where
                         && !ready
                         && matches!(
                             request.body,
-                            RequestBody::RunCancel(..) | RequestBody::ShutdownRequest(..)
+                            RequestBody::RunCancel(..)
+                                | RequestBody::InputCancel(..)
+                                | RequestBody::ShutdownRequest(..)
                         );
                     if stop_worker.load(Ordering::Acquire) {
                         break;
@@ -508,7 +1085,13 @@ where
             request = input.recv() => {
                 let Some(request) = request else { continue; };
                 if queued.len() == 8 { break Ok(Exit::OutputClosed); }
-                if matches!(request.body, RequestBody::RunCancel(..) | RequestBody::ShutdownRequest(..)) {
+                if matches!(
+                    request.body,
+                    RequestBody::RunCancel(..)
+                        | RequestBody::InputCancel(..)
+                        | RequestBody::SubagentCancel(..)
+                        | RequestBody::ShutdownRequest(..)
+                ) {
                     queued.push_front(request);
                 } else { queued.push_back(request); }
             }
@@ -585,7 +1168,10 @@ impl Dispatch {
         let control_waiting = queued.front().is_some_and(|request| {
             matches!(
                 request.body,
-                RequestBody::RunCancel(..) | RequestBody::ShutdownRequest(..)
+                RequestBody::RunCancel(..)
+                    | RequestBody::InputCancel(..)
+                    | RequestBody::SubagentCancel(..)
+                    | RequestBody::ShutdownRequest(..)
             )
         });
         let command = if !self.settle_soon && control_waiting {
@@ -623,6 +1209,10 @@ struct Engine {
     inventory_generation: u64,
     store: Writer,
     session: SessionId,
+    project: ProjectId,
+    root: Option<DesktopRoot>,
+    other_lane: Option<SessionLane>,
+    routing_jobs: Vec<RoutingJob>,
     production: bool,
     #[cfg(target_os = "macos")]
     trusted_runs: Option<real::TrustedRuns>,
@@ -633,12 +1223,14 @@ struct Engine {
     options: Options,
     epoch: EngineEpoch,
     connection: ConnectionState,
+    wire_version: Option<ProtocolVersion>,
     client: Option<ClientId>,
     subscription: Option<Position>,
     history: Option<History>,
     details: Option<run_details::Details>,
     serial: u64,
     active: Option<Active>,
+    admission: Option<session_admission::AdmissionOwner>,
     draining: bool,
     ready: bool,
     failed: bool,
@@ -693,9 +1285,14 @@ impl Engine {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        let project = store.coordinates().0.clone();
         Self {
             store,
             session,
+            project,
+            root: None,
+            other_lane: None,
+            routing_jobs: Vec::new(),
             production: false,
             #[cfg(target_os = "macos")]
             workspace_reader: None,
@@ -712,12 +1309,14 @@ impl Engine {
             epoch: EngineEpoch::new(format!("fake-{}-{time}-{serial}", std::process::id()))
                 .unwrap(),
             connection: ConnectionState::AwaitingHello,
+            wire_version: None,
             client: None,
             subscription: None,
             history: None,
             details: None,
             serial: 0,
             active: None,
+            admission: None,
             draining: false,
             ready: false,
             failed: false,
@@ -792,9 +1391,323 @@ impl Engine {
             false
         }
     }
+
+    fn delegation_projection(&self) -> Option<polaris_core::session::RootDelegationProjectionV1> {
+        #[cfg(target_os = "macos")]
+        {
+            self.active
+                .as_ref()
+                .and_then(|active| active.delegation.as_ref())
+                .and_then(DelegationRuntime::projection)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn delegation_for(
+        &self,
+        root_run_id: &RunId,
+        root_attempt_id: &AttemptId,
+    ) -> Result<
+        (
+            &DelegationRuntime,
+            polaris_core::session::RootDelegationHostBindingV1,
+        ),
+        ProtocolError,
+    > {
+        let active = self
+            .active
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::NotFound))?;
+        if &active.target.run_id != root_run_id || &active.target.attempt_id != root_attempt_id {
+            return Err(error(ErrorCode::PermissionDenied));
+        }
+        let runtime = active
+            .delegation
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?;
+        let projection = runtime
+            .projection()
+            .ok_or_else(|| error(ErrorCode::StorageFailed))?;
+        if projection.session_id != self.session.as_str()
+            || projection.root_run_id.0 != root_run_id.as_str()
+            || projection.root_attempt_id.0 != root_attempt_id.as_str()
+        {
+            return Err(error(ErrorCode::PermissionDenied));
+        }
+        let binding = polaris_core::session::RootDelegationHostBindingV1 {
+            session_id: projection.session_id,
+            root_run_id: projection.root_run_id,
+            root_attempt_id: projection.root_attempt_id,
+            active_task_id: projection.active_task_id,
+        };
+        Ok((runtime, binding))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn emit_delegation_update(&mut self, out: &Outbox) -> Result<(), ServiceError> {
+        let changed = self
+            .active
+            .as_ref()
+            .and_then(|active| active.delegation.as_ref())
+            .is_some_and(DelegationRuntime::take_update);
+        if changed {
+            let published = self.store.snapshot()?;
+            self.emit(
+                EventBody::OrchestrationUpdated(orchestration_summary(
+                    &published,
+                    self.admission.as_ref(),
+                    self.delegation_projection().as_ref(),
+                )),
+                out,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn record_root_cancel_plan(&self, target: &RunTarget) -> Result<(), ProtocolError> {
+        let Some(active) = self
+            .active
+            .as_ref()
+            .filter(|active| active.target == *target)
+        else {
+            return Ok(());
+        };
+        let Some(runtime) = active.delegation.as_ref() else {
+            return Ok(());
+        };
+        let projection = runtime
+            .projection()
+            .ok_or_else(|| error(ErrorCode::StorageFailed))?;
+        if projection.session_id != self.session.as_str()
+            || projection.root_run_id.0 != target.run_id.as_str()
+            || projection.root_attempt_id.0 != target.attempt_id.as_str()
+        {
+            return Err(error(ErrorCode::PermissionDenied));
+        }
+        let expected_revision = projection.revision;
+        runtime
+            .request_root_cancel(
+                polaris_core::session::RootDelegationHostBindingV1 {
+                    session_id: projection.session_id,
+                    root_run_id: projection.root_run_id,
+                    root_attempt_id: projection.root_attempt_id,
+                    active_task_id: projection.active_task_id,
+                },
+                expected_revision,
+            )
+            .map_err(delegation_control_error)?;
+        Ok(())
+    }
     fn id(&mut self, prefix: &str) -> String {
         self.serial += 1; // 有界な要求数に達する前に接続queueが閉じる。u64はwrapさせない。
         format!("{prefix}-{}-{}", self.epoch.as_str(), self.serial)
+    }
+
+    fn swap_lane(&mut self) -> Result<(), ProtocolError> {
+        let mut other = self
+            .other_lane
+            .take()
+            .ok_or_else(|| error(ErrorCode::PermissionDenied))?;
+        std::mem::swap(&mut self.session, &mut other.session);
+        std::mem::swap(&mut self.store, &mut other.store);
+        std::mem::swap(&mut self.subscription, &mut other.subscription);
+        std::mem::swap(&mut self.active, &mut other.active);
+        std::mem::swap(&mut self.history, &mut other.history);
+        std::mem::swap(&mut self.details, &mut other.details);
+        std::mem::swap(&mut self.cleanups, &mut other.cleanups);
+        self.other_lane = Some(other);
+        Ok(())
+    }
+
+    fn select_lane(&mut self, session: &SessionId) -> Result<(), ProtocolError> {
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|owner| !owner.contains_session(session))
+        {
+            return Err(error(ErrorCode::PermissionDenied));
+        }
+        if session == &self.session {
+            return Ok(());
+        }
+        if self
+            .other_lane
+            .as_ref()
+            .is_some_and(|lane| &lane.session == session)
+        {
+            self.swap_lane()?;
+            // A subscription belongs to the lane currently selected by this
+            // connection.  The background lane keeps running durably, but its
+            // old stream must not publish into the newly selected lane's
+            // connection.  A later selection obtains a fresh subscription.
+            if let Some(inactive) = &mut self.other_lane {
+                inactive.subscription = None;
+            }
+            Ok(())
+        } else {
+            Err(error(ErrorCode::PermissionDenied))
+        }
+    }
+
+    fn restore_admission_lanes(&mut self) -> Result<(), ServiceError> {
+        if let Some(sidechat) = self
+            .admission
+            .as_ref()
+            .and_then(session_admission::AdmissionOwner::sidechat_session)
+        {
+            let sidechat = SessionId::new(sidechat.as_str()).map_err(|_| ServiceError::Worker)?;
+            let root = self.root.as_ref().ok_or(ServiceError::Worker)?;
+            let current = self.store.snapshot()?;
+            // The manager commit deliberately precedes creation of the empty
+            // destination. A crash in that window is recovered by creating
+            // exactly that manager-owned session, without copying any parent
+            // conversation, memory, approval, goal, workflow, or tool state.
+            let store = root.open_or_create(
+                self.project.clone(),
+                sidechat.clone(),
+                InitialState {
+                    draft: Draft {
+                        draft_revision: DecimalU64::new(0),
+                        text: String::new(),
+                        attachment_ids: Vec::new(),
+                    },
+                    configuration: current.state.configuration,
+                    policy_revision: current.state.policy_revision,
+                },
+            )?;
+            self.other_lane = Some(SessionLane {
+                session: sidechat,
+                store,
+                subscription: None,
+                active: None,
+                history: None,
+                details: None,
+                cleanups: Default::default(),
+            });
+        }
+        // A Reserved receipt proves that classification was never dispatched.
+        // Reconcile its parent writer, then resume that one pre-dispatch window
+        // or choose the persisted context-changed fallback.
+        let reserved = self
+            .admission
+            .as_ref()
+            .map(session_admission::AdmissionOwner::recovery_admissions)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|admission| {
+                matches!(
+                    admission.state,
+                    polaris_core::session_manager::AdmissionState::Reserved
+                )
+            })
+            .collect::<Vec<_>>();
+        for admission in reserved {
+            let source = self.session.clone();
+            let parent = SessionId::new(admission.parent_session.as_str())
+                .map_err(|_| ServiceError::Worker)?;
+            self.select_lane(&parent)
+                .map_err(|_| ServiceError::Worker)?;
+            let published = self.store.snapshot()?;
+            let goal_revision = published
+                .state
+                .goal
+                .as_ref()
+                .map_or(DecimalU64::new(0), |goal| goal.revision);
+            self.admission
+                .as_mut()
+                .ok_or(ServiceError::Worker)?
+                .observe_session(
+                    &polaris_core::session_manager::SessionId::new(parent.as_str())
+                        .map_err(|_| ServiceError::Worker)?,
+                    published.marker.session_revision,
+                    goal_revision,
+                )?;
+            let context_unchanged = published.marker.session_revision.get()
+                == admission.payload.expected_session_revision
+                && goal_revision.get() == admission.payload.expected_goal_revision;
+            if context_unchanged {
+                let classify = self
+                    .admission
+                    .as_mut()
+                    .ok_or(ServiceError::Worker)?
+                    .resume_reserved(&admission.id)?;
+                if classify {
+                    self.start_routing(admission.id.clone())
+                        .map_err(|_| ServiceError::Worker)?;
+                }
+            } else {
+                self.admission
+                    .as_mut()
+                    .ok_or(ServiceError::Worker)?
+                    .context_changed(&admission.id)?;
+            }
+            self.select_lane(&source)
+                .map_err(|_| ServiceError::Worker)?;
+        }
+        let admissions = self
+            .admission
+            .as_ref()
+            .map(session_admission::AdmissionOwner::recovery_admissions)
+            .unwrap_or_default();
+        for admission in admissions {
+            use polaris_core::session_manager::AdmissionState;
+            let (destination, recover_append, running) = match &admission.state {
+                AdmissionState::DestinationReady { session_id, .. }
+                | AdmissionState::InputAppended { session_id } => {
+                    (Some(session_id.clone()), true, false)
+                }
+                AdmissionState::RunQueued { session_id, .. } => {
+                    (Some(session_id.clone()), false, false)
+                }
+                AdmissionState::Running { session_id, .. } => {
+                    (Some(session_id.clone()), false, true)
+                }
+                _ => (None, false, false),
+            };
+            let Some(destination) = destination else {
+                continue;
+            };
+            let destination =
+                SessionId::new(destination.as_str()).map_err(|_| ServiceError::Worker)?;
+            let source = self.session.clone();
+            self.select_lane(&destination)
+                .map_err(|_| ServiceError::Worker)?;
+            let durable = self.store.admitted_run(admission.id.as_str())?;
+            self.select_lane(&source)
+                .map_err(|_| ServiceError::Worker)?;
+            if recover_append {
+                if durable.is_some() {
+                    self.admission
+                        .as_mut()
+                        .ok_or(ServiceError::Worker)?
+                        .recover_input_appended_and_queue(&admission.id)?;
+                } else if matches!(admission.state, AdmissionState::DestinationReady { .. }) {
+                    // No external send has happened yet. Finish the owner-local
+                    // durable append exactly once from the persisted routing
+                    // decision, then queue it normally.
+                    self.append_admission(&admission.id)
+                        .map_err(|_| ServiceError::Worker)?;
+                } else {
+                    return Err(StoreError::Corrupt("admission append missing").into());
+                }
+            } else if durable.is_none() {
+                return Err(StoreError::Corrupt("admission run missing").into());
+            } else if running {
+                self.admission
+                    .as_mut()
+                    .ok_or(ServiceError::Worker)?
+                    .terminal(
+                        &admission.id,
+                        polaris_core::session_manager::TerminalStatus::OutcomeUnknown,
+                    )?;
+            }
+        }
+        Ok(())
     }
 
     fn handle(
@@ -802,6 +1715,15 @@ impl Engine {
         request: &Request,
         events: &mut Vec<EventBody>,
     ) -> Result<SuccessResult, ProtocolError> {
+        if request.protocol_version == ProtocolVersion::V1 && request.body.requires_v2() {
+            return Err(error(ErrorCode::UnsupportedVersion));
+        }
+        if self
+            .wire_version
+            .is_some_and(|version| version != request.protocol_version)
+        {
+            return Err(error(ErrorCode::UnsupportedVersion));
+        }
         let gate = validate_request(self.connection, request)
             .map_err(|_| error(ErrorCode::InvalidRequest))?;
         if self
@@ -812,68 +1734,74 @@ impl Engine {
         {
             return Err(error(ErrorCode::PermissionDenied));
         }
-        // 固定のproject/session所属を台帳やsnapshotを読む前に照合する。
-        if request
-            .body
-            .session_id()
-            .is_some_and(|id| id != &self.session)
-        {
-            return Err(error(ErrorCode::PermissionDenied));
+        // The root owns at most two exact session lanes. Select the addressed
+        // writer before reading its ledger; unrelated sessions still fail
+        // without revealing whether a directory exists.
+        if let Some(session) = request.body.session_id() {
+            self.select_lane(session)?;
         }
         if matches!(request.body, RequestBody::Hello) {
             self.connection = gate.next_state;
+            self.wire_version = Some(request.protocol_version);
             self.client = Some(request.client_id.clone());
+            let mut capabilities = if self.production && !self.real_enabled() {
+                vec![
+                    Capability::SessionRead,
+                    Capability::HistoryRead,
+                    Capability::SourceApplyRead,
+                    Capability::DraftUpdate,
+                    Capability::SessionConfigure,
+                    Capability::LocalModels,
+                    Capability::RequestStatus,
+                    Capability::Shutdown,
+                    Capability::RunDetailsRead,
+                ]
+            } else {
+                let mut capabilities = vec![
+                    Capability::SessionRead,
+                    Capability::HistoryRead,
+                    Capability::SourceApplyRead,
+                    Capability::DraftUpdate,
+                    Capability::SessionConfigure,
+                    Capability::RunStart,
+                    Capability::RunCancel,
+                    Capability::ApprovalResolve,
+                    Capability::RequestStatus,
+                    Capability::Shutdown,
+                    Capability::RunDetailsRead,
+                ];
+                #[cfg(target_os = "macos")]
+                if self.workspace_reader.is_some() {
+                    capabilities.extend([Capability::WorkspaceRead, Capability::AttachmentRead]);
+                }
+                if self.source_enabled() {
+                    capabilities.push(Capability::SourceApplyResolve);
+                }
+                if self.real_enabled() {
+                    capabilities.push(Capability::WorkflowConfigure);
+                    capabilities.push(Capability::LocalModels);
+                    capabilities.push(Capability::RoleConfigure);
+                }
+                if self.production {
+                    capabilities.retain(|c| *c != Capability::SessionConfigure);
+                }
+                #[cfg(target_os = "macos")]
+                if self.mcp_settings.is_some() {
+                    capabilities.push(Capability::McpSettings);
+                }
+                capabilities
+            };
+            if request.protocol_version == ProtocolVersion::V2 && self.admission.is_some() {
+                capabilities.extend([Capability::SessionManage, Capability::InputCancel]);
+            }
+            #[cfg(target_os = "macos")]
+            if request.protocol_version == ProtocolVersion::V2 && self.real_enabled() {
+                capabilities.push(Capability::SubagentControl);
+            }
             return Ok(SuccessResult::Hello(Hello {
-                protocol_version: ProtocolVersion,
+                protocol_version: request.protocol_version,
                 engine_epoch: self.epoch.clone(),
-                capabilities: if self.production && !self.real_enabled() {
-                    vec![
-                        Capability::SessionRead,
-                        Capability::HistoryRead,
-                        Capability::SourceApplyRead,
-                        Capability::DraftUpdate,
-                        Capability::SessionConfigure,
-                        Capability::LocalModels,
-                        Capability::RequestStatus,
-                        Capability::Shutdown,
-                        Capability::RunDetailsRead,
-                    ]
-                } else {
-                    let mut capabilities = vec![
-                        Capability::SessionRead,
-                        Capability::HistoryRead,
-                        Capability::SourceApplyRead,
-                        Capability::DraftUpdate,
-                        Capability::SessionConfigure,
-                        Capability::RunStart,
-                        Capability::RunCancel,
-                        Capability::ApprovalResolve,
-                        Capability::RequestStatus,
-                        Capability::Shutdown,
-                        Capability::RunDetailsRead,
-                    ];
-                    #[cfg(target_os = "macos")]
-                    if self.workspace_reader.is_some() {
-                        capabilities
-                            .extend([Capability::WorkspaceRead, Capability::AttachmentRead]);
-                    }
-                    if self.source_enabled() {
-                        capabilities.push(Capability::SourceApplyResolve);
-                    }
-                    if self.real_enabled() {
-                        capabilities.push(Capability::WorkflowConfigure);
-                        capabilities.push(Capability::LocalModels);
-                        capabilities.push(Capability::RoleConfigure);
-                    }
-                    if self.production {
-                        capabilities.retain(|c| *c != Capability::SessionConfigure);
-                    }
-                    #[cfg(target_os = "macos")]
-                    if self.mcp_settings.is_some() {
-                        capabilities.push(Capability::McpSettings);
-                    }
-                    capabilities
-                },
+                capabilities,
                 limits: Limits::default(),
             }));
         }
@@ -964,6 +1892,18 @@ impl Engine {
             RequestBody::SessionOpen(_) => {
                 Ok(SuccessResult::SessionOpen(Box::new(self.snapshot(false)?)))
             }
+            RequestBody::SessionList => self.session_list(),
+            // Selection is also the atomic subscription hand-off for this
+            // connection. The returned position is the only stream identity
+            // valid after the old lane subscription was invalidated.
+            RequestBody::SessionSelect(_) => {
+                Ok(SuccessResult::SessionSelect(Box::new(self.snapshot(true)?)))
+            }
+            RequestBody::InputStatus(_, params) => self.input_status(&params.admission_id),
+            RequestBody::InputSubmit(_, params) => self.input_submit(request, params, events),
+            RequestBody::InputCancel(_, params) => self.input_cancel(params, events),
+            RequestBody::SubagentWait(_, params) => self.subagent_wait(params),
+            RequestBody::SubagentCancel(_, params) => self.subagent_cancel(params, events),
             RequestBody::SessionSnapshot(_) => Ok(SuccessResult::SessionSnapshot(Box::new(
                 self.snapshot(false)?,
             ))),
@@ -984,7 +1924,7 @@ impl Engine {
             RequestBody::HistoryPage(_, params) => {
                 Ok(SuccessResult::HistoryPage(self.history_page(params)?))
             }
-            RequestBody::WorkflowConfigure(_, params) => self.configure_workflow(params),
+            RequestBody::WorkflowConfigure(_, params) => self.configure_workflow(params, events),
             RequestBody::SourceApplyList(_, params) => self.source_list(params),
             RequestBody::SourceApplyPage(_, params) => self.source_page(params),
             RequestBody::ApprovalResolve(..) => self.resolve_approval(request, events),
@@ -1061,6 +2001,788 @@ impl Engine {
         }
     }
 
+    fn session_list(&self) -> Result<SuccessResult, ProtocolError> {
+        let owner = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?;
+        let mut result = owner.session_list().map_err(store_error)?;
+        if let Some(active) = &self.active
+            && let Some(entry) = result
+                .sessions
+                .iter_mut()
+                .find(|entry| entry.session_id == self.session)
+        {
+            entry.active_run = Some(active.target.clone());
+        }
+        if let Some(lane) = &self.other_lane
+            && let Some(active) = &lane.active
+            && let Some(entry) = result
+                .sessions
+                .iter_mut()
+                .find(|entry| entry.session_id == lane.session)
+        {
+            entry.active_run = Some(active.target.clone());
+        }
+        Ok(SuccessResult::SessionList(result))
+    }
+
+    fn input_status(&self, admission: &AdmissionId) -> Result<SuccessResult, ProtocolError> {
+        let owner = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?;
+        let mut result = owner.input_status(admission).map_err(store_error)?;
+        self.overlay_admission_status(&mut result)?;
+        Ok(SuccessResult::InputStatus(result))
+    }
+
+    fn subagent_wait(
+        &self,
+        params: &polaris_desktop_protocol::request::SubagentWait,
+    ) -> Result<SuccessResult, ProtocolError> {
+        #[cfg(target_os = "macos")]
+        {
+            let (runtime, binding) =
+                self.delegation_for(&params.root_run_id, &params.root_attempt_id)?;
+            let projected_root_run_id = binding.root_run_id.0.clone();
+            let projected_root_attempt_id = binding.root_attempt_id.0.clone();
+            let waited = runtime
+                .wait_children(
+                    binding,
+                    params.expected_revision.get(),
+                    params.after_cursor.map(DecimalU64::get),
+                )
+                .map_err(delegation_control_error)?;
+            let (revision, cursor, state, child_total, children) = match waited {
+                Some(snapshot) => {
+                    let child_total = snapshot.children.len();
+                    let children = snapshot
+                        .children
+                        .iter()
+                        .take(32)
+                        .filter_map(|child| {
+                            child_summary(
+                                &projected_root_run_id,
+                                &projected_root_attempt_id,
+                                snapshot.revision,
+                                child,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        snapshot.revision,
+                        snapshot.cursor,
+                        SubagentWaitStateV2::Updated,
+                        child_total,
+                        children,
+                    )
+                }
+                None => {
+                    let child_total = runtime
+                        .projection()
+                        .ok_or_else(|| error(ErrorCode::StorageFailed))?
+                        .children
+                        .len();
+                    (
+                        params.expected_revision.get(),
+                        params.after_cursor.map_or(0, DecimalU64::get),
+                        SubagentWaitStateV2::Unchanged,
+                        child_total,
+                        Vec::new(),
+                    )
+                }
+            };
+            Ok(SuccessResult::SubagentWait(SubagentWaitResult {
+                root_run_id: params.root_run_id.clone(),
+                root_attempt_id: params.root_attempt_id.clone(),
+                revision: DecimalU64::new(revision),
+                cursor: DecimalU64::new(cursor),
+                state,
+                child_total: DecimalU64::new(child_total as u64),
+                child_omitted: children.len() != child_total,
+                children,
+            }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = params;
+            Err(error(ErrorCode::CapabilityUnavailable))
+        }
+    }
+
+    fn subagent_cancel(
+        &mut self,
+        params: &polaris_desktop_protocol::request::SubagentCancel,
+        events: &mut Vec<EventBody>,
+    ) -> Result<SuccessResult, ProtocolError> {
+        #[cfg(target_os = "macos")]
+        {
+            let (runtime, binding) =
+                self.delegation_for(&params.root_run_id, &params.root_attempt_id)?;
+            let reference = polaris_core::subagent_control::ChildAttemptRefV1 {
+                logical_child_id: polaris_core::subagent_control::LogicalChildId::new(
+                    params.logical_child_id.as_str(),
+                )
+                .map_err(|_| error(ErrorCode::InvalidRequest))?,
+                attempt_id: polaris_core::subagent_control::ChildAttemptId::new(
+                    params.child_attempt_id.as_str(),
+                )
+                .map_err(|_| error(ErrorCode::InvalidRequest))?,
+            };
+            let ack = runtime
+                .request_child_cancel(binding, params.expected_revision.get(), reference)
+                .map_err(delegation_control_error)?;
+            let (disposition, state, cursor) = match ack.result {
+                polaris_core::subagent_control::CancelResultV1::Requested { cursor } => (
+                    SubagentCancelDispositionV2::Requested,
+                    polaris_desktop_protocol::orchestration::ChildControlStateV2::Cancelling,
+                    cursor,
+                ),
+                polaris_core::subagent_control::CancelResultV1::AlreadyRequested { cursor } => (
+                    SubagentCancelDispositionV2::AlreadyRequested,
+                    polaris_desktop_protocol::orchestration::ChildControlStateV2::Cancelling,
+                    cursor,
+                ),
+                polaris_core::subagent_control::CancelResultV1::AlreadyTerminal {
+                    state,
+                    cursor,
+                } => (
+                    SubagentCancelDispositionV2::AlreadyTerminal,
+                    child_control_state(&state),
+                    cursor,
+                ),
+            };
+            let runtime_effect = match ack.runtime_effect {
+                polaris_core::session::RuntimeCancelEffectV1::Unavailable => {
+                    SubagentRuntimeEffectV2::Unavailable
+                }
+                polaris_core::session::RuntimeCancelEffectV1::Requested => {
+                    SubagentRuntimeEffectV2::Requested
+                }
+            };
+            let published = self.store.snapshot().map_err(store_error)?;
+            events.push(EventBody::OrchestrationUpdated(orchestration_summary(
+                &published,
+                self.admission.as_ref(),
+                self.delegation_projection().as_ref(),
+            )));
+            Ok(SuccessResult::SubagentCancel(SubagentCancelResult {
+                root_run_id: params.root_run_id.clone(),
+                root_attempt_id: params.root_attempt_id.clone(),
+                logical_child_id: params.logical_child_id.clone(),
+                child_attempt_id: params.child_attempt_id.clone(),
+                revision: DecimalU64::new(ack.revision),
+                cursor: DecimalU64::new(cursor),
+                disposition,
+                state,
+                runtime_effect,
+            }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (params, events);
+            Err(error(ErrorCode::CapabilityUnavailable))
+        }
+    }
+
+    fn overlay_admission_status(
+        &self,
+        result: &mut InputStatusResult,
+    ) -> Result<(), ProtocolError> {
+        let internal =
+            polaris_core::session_manager::AdmissionId::new(result.admission_id.as_str())
+                .map_err(|_| error(ErrorCode::StorageFailed))?;
+        self.overlay_admission_run(&internal, &mut result.run);
+        let Some(destination) = result.destination_session_id.as_ref() else {
+            return Ok(());
+        };
+        if destination == &self.session {
+            result.session_revision = self
+                .store
+                .snapshot()
+                .map_err(store_error)?
+                .marker
+                .session_revision;
+        } else if let Some(lane) = self
+            .other_lane
+            .as_ref()
+            .filter(|lane| &lane.session == destination)
+        {
+            result.session_revision = lane
+                .store
+                .snapshot()
+                .map_err(store_error)?
+                .marker
+                .session_revision;
+        }
+        Ok(())
+    }
+
+    fn input_cancel(
+        &mut self,
+        params: &polaris_desktop_protocol::request::InputCancel,
+        events: &mut Vec<EventBody>,
+    ) -> Result<SuccessResult, ProtocolError> {
+        let current = self.session.clone();
+        let before = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .input_status(&params.admission_id)
+            .map_err(store_error)?;
+        if before.source_session_id != current
+            && before.destination_session_id.as_ref() != Some(&current)
+        {
+            return Err(error(ErrorCode::PermissionDenied));
+        }
+        let internal =
+            polaris_core::session_manager::AdmissionId::new(params.admission_id.as_str())
+                .map_err(|_| error(ErrorCode::InvalidRequest))?;
+        let mut result = self
+            .admission
+            .as_mut()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .cancel(&params.admission_id, params.expected_manager_revision)
+            .map_err(store_error)?;
+        if let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.admission.as_ref() == Some(&internal))
+        {
+            active.cancel();
+        }
+        if let Some(active) = self
+            .other_lane
+            .as_mut()
+            .and_then(|lane| lane.active.as_mut())
+            .filter(|active| active.admission.as_ref() == Some(&internal))
+        {
+            active.cancel();
+        }
+        if result.destination_session_id.is_none() {
+            result.destination_session_id = before.destination_session_id.clone();
+        }
+        self.overlay_admission_status(&mut result)?;
+
+        // Cancelling an unappended explicit-new admission can remove the
+        // manager's unused sidechat slot. Keep the remaining managed lane
+        // selected and stop exposing the detached writer by session ID.
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|owner| !owner.contains_session(&self.session))
+        {
+            self.swap_lane()?;
+        }
+        if self.other_lane.as_ref().is_some_and(|lane| {
+            self.admission
+                .as_ref()
+                .is_some_and(|owner| !owner.contains_session(&lane.session))
+                && lane.active.is_none()
+        }) {
+            self.other_lane = None;
+        }
+        let published = self.store.snapshot().map_err(store_error)?;
+        events.push(EventBody::OrchestrationUpdated(orchestration_summary(
+            &published,
+            self.admission.as_ref(),
+            self.delegation_projection().as_ref(),
+        )));
+        Ok(SuccessResult::InputCancel(result))
+    }
+
+    fn input_submit(
+        &mut self,
+        request: &Request,
+        params: &polaris_desktop_protocol::request::InputSubmit,
+        events: &mut Vec<EventBody>,
+    ) -> Result<SuccessResult, ProtocolError> {
+        let source = request
+            .body
+            .session_id()
+            .cloned()
+            .ok_or_else(|| error(ErrorCode::InvalidRequest))?;
+        self.select_lane(&source)?;
+        let (
+            expected_manager_revision,
+            expected_session_revision,
+            expected_goal_revision,
+            route,
+            attachment_ids,
+            admission_id,
+            text,
+        ) = match params {
+            polaris_desktop_protocol::request::InputSubmit::Text {
+                expected_manager_revision,
+                expected_session_revision,
+                expected_goal_revision,
+                route,
+                attachment_ids,
+                admission_id,
+                text,
+            } => (
+                *expected_manager_revision,
+                *expected_session_revision,
+                *expected_goal_revision,
+                *route,
+                attachment_ids.as_slice(),
+                admission_id.as_ref(),
+                text.as_str(),
+            ),
+            polaris_desktop_protocol::request::InputSubmit::Reference { .. } => {
+                // The reference resolver has no owner API yet. Never turn a
+                // missing immutable result into an empty or duplicate input.
+                return Err(error(ErrorCode::ReferenceUnavailable));
+            }
+        };
+        let source_snapshot = self.store.snapshot().map_err(store_error)?;
+        let source_goal_revision = source_snapshot
+            .state
+            .goal
+            .as_ref()
+            .map_or(DecimalU64::new(0), |goal| goal.revision);
+        let (id, needs_classification) = self
+            .admission
+            .as_mut()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .submit_text(
+                &source,
+                expected_manager_revision,
+                expected_session_revision,
+                expected_goal_revision,
+                source_snapshot.marker.session_revision,
+                source_goal_revision,
+                route,
+                attachment_ids,
+                admission_id,
+                text,
+            )
+            .map_err(store_error)?;
+        if needs_classification {
+            self.start_routing(id.clone())?;
+        }
+        let ready = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .admission(&id)
+            .map_err(store_error)?;
+        if matches!(
+            ready.state,
+            polaris_core::session_manager::AdmissionState::DestinationReady { .. }
+        ) {
+            self.append_admission(&id)?;
+        }
+        self.pump_admissions()?;
+        let mut submitted = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .submitted(&id)
+            .map_err(store_error)?;
+        self.overlay_admission_run(&id, &mut submitted.run);
+        let published = self.store.snapshot().map_err(store_error)?;
+        events.push(EventBody::OrchestrationUpdated(orchestration_summary(
+            &published,
+            self.admission.as_ref(),
+            self.delegation_projection().as_ref(),
+        )));
+        Ok(SuccessResult::InputSubmit(submitted))
+    }
+
+    fn start_routing(
+        &mut self,
+        admission: polaris_core::session_manager::AdmissionId,
+    ) -> Result<(), ProtocolError> {
+        if self
+            .routing_jobs
+            .iter()
+            .any(|job| job.admission == admission)
+        {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        let decider = self
+            .trusted_runs
+            .as_ref()
+            .and_then(|runs| runs.factory.decider());
+        #[cfg(not(target_os = "macos"))]
+        let decider: Option<Arc<dyn polaris_provider::decision::Decider>> = None;
+        let Some(decider) = decider else {
+            self.admission
+                .as_mut()
+                .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                .finish_classification(&admission, None)
+                .map_err(store_error)?;
+            return Ok(());
+        };
+        let context = self.routing_context()?;
+        let current_input = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .admission(&admission)
+            .map_err(store_error)?
+            .payload
+            .text;
+        let worker = std::thread::Builder::new()
+            .name("polaris-input-route".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                runtime.block_on(polaris_core::session_manager::classify_context(
+                    decider.as_ref(),
+                    &context,
+                    &current_input,
+                ))
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(_) => {
+                self.admission
+                    .as_mut()
+                    .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                    .finish_classification(&admission, None)
+                    .map_err(store_error)?;
+                return Ok(());
+            }
+        };
+        self.routing_jobs.push(RoutingJob { admission, worker });
+        Ok(())
+    }
+
+    fn routing_context(
+        &self,
+    ) -> Result<polaris_core::session_manager::RoutingContextV1, ProtocolError> {
+        let published = self.store.snapshot().map_err(store_error)?;
+        let goal = published
+            .state
+            .goal
+            .as_ref()
+            .filter(|goal| goal.active)
+            .map_or_else(|| "none".to_owned(), |goal| goal.text.clone());
+        let starts: Vec<_> = published
+            .raw
+            .iter()
+            .filter(|event| event.starts_turn && event.message.role == polaris_provider::Role::User)
+            .collect();
+        let inherited = usize::try_from(published.state.inherited_turn_count.get())
+            .map_err(|_| error(ErrorCode::StorageFailed))?;
+        let mut turns = Vec::new();
+        for (index, event) in starts.into_iter().enumerate().filter(|(index, _)| {
+            *index < inherited
+                || published
+                    .state
+                    .runs
+                    .get(index.saturating_sub(inherited))
+                    .is_some_and(|record| record.run.state.is_terminal())
+        }) {
+            let mut text = event.message.content.clone();
+            if text.len() > polaris_core::session_manager::MAX_TURN_BYTES {
+                let mut end = polaris_core::session_manager::MAX_TURN_BYTES;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            turns.push(
+                polaris_core::session_manager::CompletedUserTurnV1::new(
+                    format!("turn-{index}-{}", event.turn_id),
+                    text,
+                )
+                .map_err(|_| error(ErrorCode::StorageFailed))?,
+            );
+        }
+        polaris_core::session_manager::RoutingContextV1::new(goal, turns)
+            .map_err(|_| error(ErrorCode::StorageFailed))
+    }
+
+    fn poll_routing(&mut self, events: &mut Vec<EventBody>) -> Result<(), ProtocolError> {
+        let mut index = 0;
+        while index < self.routing_jobs.len() {
+            if !self.routing_jobs[index].worker.is_finished() {
+                index += 1;
+                continue;
+            }
+            let job = self.routing_jobs.swap_remove(index);
+            let judgement = job.worker.join().ok().flatten();
+            self.admission
+                .as_mut()
+                .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                .finish_classification(&job.admission, judgement)
+                .map_err(store_error)?;
+            self.append_admission(&job.admission)?;
+            self.pump_admissions()?;
+            let published = self.store.snapshot().map_err(store_error)?;
+            events.push(EventBody::OrchestrationUpdated(orchestration_summary(
+                &published,
+                self.admission.as_ref(),
+                self.delegation_projection().as_ref(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_admission_lane(
+        &mut self,
+        admission: &polaris_core::session_manager::AdmissionV1,
+    ) -> Result<SessionId, ProtocolError> {
+        let destination = match &admission.state {
+            polaris_core::session_manager::AdmissionState::DestinationReady {
+                session_id, ..
+            } => {
+                SessionId::new(session_id.as_str()).map_err(|_| error(ErrorCode::StorageFailed))?
+            }
+            _ => return Err(error(ErrorCode::RevisionConflict)),
+        };
+        if destination == self.session
+            || self
+                .other_lane
+                .as_ref()
+                .is_some_and(|lane| lane.session == destination)
+        {
+            return Ok(destination);
+        }
+        if self.other_lane.is_some() {
+            return Err(error(ErrorCode::SessionBusy));
+        }
+        let root = self
+            .root
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?;
+        let current = self.store.snapshot().map_err(store_error)?;
+        let store = root
+            .create(
+                self.project.clone(),
+                destination.clone(),
+                InitialState {
+                    draft: Draft {
+                        draft_revision: DecimalU64::new(0),
+                        text: String::new(),
+                        attachment_ids: Vec::new(),
+                    },
+                    configuration: current.state.configuration,
+                    policy_revision: current.state.policy_revision,
+                },
+            )
+            .map_err(store_error)?;
+        self.other_lane = Some(SessionLane {
+            session: destination.clone(),
+            store,
+            subscription: None,
+            active: None,
+            history: None,
+            details: None,
+            cleanups: Default::default(),
+        });
+        Ok(destination)
+    }
+
+    fn append_admission(
+        &mut self,
+        id: &polaris_core::session_manager::AdmissionId,
+    ) -> Result<(), ProtocolError> {
+        let mut admission = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+            .admission(id)
+            .map_err(store_error)?;
+        let source = self.session.clone();
+        let parent = SessionId::new(admission.parent_session.as_str())
+            .map_err(|_| error(ErrorCode::StorageFailed))?;
+        self.select_lane(&parent)?;
+        let parent_snapshot = self.store.snapshot().map_err(store_error)?;
+        let parent_goal_revision = parent_snapshot
+            .state
+            .goal
+            .as_ref()
+            .map_or(0, |goal| goal.revision.get());
+        if parent_snapshot.marker.session_revision.get()
+            != admission.payload.expected_session_revision
+            || parent_goal_revision != admission.payload.expected_goal_revision
+        {
+            self.admission
+                .as_mut()
+                .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                .context_changed(id)
+                .map_err(store_error)?;
+            admission = self
+                .admission
+                .as_ref()
+                .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                .admission(id)
+                .map_err(store_error)?;
+        }
+        let destination = self.ensure_admission_lane(&admission)?;
+        self.select_lane(&destination)?;
+        let target = admission_target(id);
+        let existing = self.store.admitted_run(id.as_str()).map_err(store_error)?;
+        #[cfg(target_os = "macos")]
+        let account = if existing.is_none() {
+            self.trusted_runs
+                .as_ref()
+                .map(|runs| runs.factory.bind_account())
+                .transpose()
+                .map_err(|_| error(ErrorCode::CapabilityUnavailable))?
+                .flatten()
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let account = None;
+        let appended = self
+            .store
+            .append_admitted_run(&admission, target, account)
+            .map_err(store_error)?;
+        if appended.newly_appended {
+            self.admission
+                .as_mut()
+                .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                .input_appended_and_queue(id)
+                .map_err(store_error)?;
+        } else {
+            // The writer's exact admission binding proves that a prior append
+            // committed even if its manager acknowledgement was lost.
+            self.admission
+                .as_mut()
+                .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                .recover_input_appended_and_queue(id)
+                .map_err(store_error)?;
+        }
+        // A sidechat appends its run in a different writer, so that writer
+        // cannot consume the source draft itself.  Once the destination run
+        // and admission transition are both durable, consume only the exact
+        // source draft that was admitted.  A later edit remains untouched.
+        self.select_lane(&parent)?;
+        self.consume_unchanged_admission_source_draft(&admission)?;
+        self.select_lane(&source)?;
+        Ok(())
+    }
+
+    /// Consume the source-lane copy only after a destination append is durable.
+    /// The deterministic request identity makes crash recovery idempotent, and
+    /// the exact text/attachment comparison preserves a newer source draft.
+    fn consume_unchanged_admission_source_draft(
+        &mut self,
+        admission: &polaris_core::session_manager::AdmissionV1,
+    ) -> Result<(), ProtocolError> {
+        let snapshot = self.store.snapshot().map_err(store_error)?;
+        let attachments = admission
+            .payload
+            .attachment_ids
+            .iter()
+            .map(|id| AttachmentId::new(id.as_str()).map_err(|_| error(ErrorCode::StorageFailed)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if snapshot.state.draft.text != admission.payload.text
+            || snapshot.state.draft.attachment_ids != attachments
+        {
+            return Ok(());
+        }
+        let digest = Sha256::digest(
+            [
+                b"polaris-admission-source-consume-v1\0".as_slice(),
+                admission.id.as_str().as_bytes(),
+            ]
+            .concat(),
+        );
+        let request = Request {
+            protocol_version: ProtocolVersion,
+            client_id: ClientId::new("admission-owner").expect("fixed client ID"),
+            request_id: RequestId::new(format!("admission-consume-{digest:x}"))
+                .expect("derived request ID"),
+            body: RequestBody::DraftUpdate(
+                self.session.clone(),
+                DraftUpdate {
+                    expected_draft_revision: snapshot.state.draft.draft_revision,
+                    text: String::new(),
+                    attachment_ids: Vec::new(),
+                },
+            ),
+        };
+        self.store
+            .apply_bound(&request, None, None)
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    fn overlay_admission_run(
+        &self,
+        id: &polaris_core::session_manager::AdmissionId,
+        target: &mut Option<RunTarget>,
+    ) {
+        let matches = |active: &Active| active.admission.as_ref().is_some_and(|saved| saved == id);
+        if let Some(active) = self.active.as_ref().filter(|active| matches(active)) {
+            *target = Some(active.target.clone());
+        } else if let Some(active) = self
+            .other_lane
+            .as_ref()
+            .and_then(|lane| lane.active.as_ref())
+            .filter(|active| matches(active))
+        {
+            *target = Some(active.target.clone());
+        }
+    }
+
+    fn pump_admissions(&mut self) -> Result<(), ProtocolError> {
+        loop {
+            let next = self
+                .admission
+                .as_ref()
+                .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                .next_runnable()
+                .map_err(store_error)?;
+            let Some((id, destination)) = next else {
+                return Ok(());
+            };
+            let source = self.session.clone();
+            let destination = SessionId::new(destination.as_str())
+                .map_err(|_| error(ErrorCode::StorageFailed))?;
+            self.select_lane(&destination)?;
+            if self.active.is_some() {
+                self.select_lane(&source)?;
+                return Ok(());
+            }
+            let run = self
+                .store
+                .admitted_run(id.as_str())
+                .map_err(store_error)?
+                .ok_or_else(|| error(ErrorCode::StorageFailed))?;
+            self.admission
+                .as_mut()
+                .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
+                .start_next()
+                .map_err(store_error)?
+                .ok_or_else(|| error(ErrorCode::RevisionConflict))?;
+            let target = RunTarget {
+                run_id: run.run.run_id,
+                attempt_id: run.run.attempt_id,
+            };
+            self.active = Some(Active {
+                #[cfg(target_os = "macos")]
+                real: self.real_enabled().then(real::RealRun::queued),
+                usage: polaris_provider::UsageMeter::default(),
+                execution: crate::execution::RunExecution::new(&target, self.disconnected.clone()),
+                target,
+                operation: OperationId::new(self.id("operation"))
+                    .map_err(|_| error(ErrorCode::StorageFailed))?,
+                message: message_id(
+                    self.store.snapshot().map_err(store_error)?.raw.len() as u64 + 1,
+                ),
+                chunk: 0,
+                text: String::new(),
+                started: false,
+                admission: Some(id),
+                #[cfg(target_os = "macos")]
+                delegation: None,
+            });
+            self.select_lane(&source)?;
+        }
+    }
+
     fn resolve_approval(
         &mut self,
         request: &Request,
@@ -1121,6 +2843,7 @@ impl Engine {
     fn configure_workflow(
         &mut self,
         params: &polaris_desktop_protocol::request::WorkflowConfigure,
+        events: &mut Vec<EventBody>,
     ) -> Result<SuccessResult, ProtocolError> {
         if self.active.is_some()
             || !self.cleanups.is_empty()
@@ -1143,6 +2866,7 @@ impl Engine {
             .factory
             .clone();
         let saved = self.store.snapshot().map_err(store_error)?;
+        let artifacts = saved.state.workflow_artifacts.clone();
         let (mut config, gates, state) = match saved.state.workflow {
             Some(saved) => (saved.config, saved.gates, saved.state),
             None => {
@@ -1172,21 +2896,33 @@ impl Engine {
         let phase = workflow_phase(params.initial_phase);
         config.initial_phase = phase;
         let workflow = {
-            let candidate = polaris_core::workflow::SessionWorkflow::restore(
+            let candidate = polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
                 config.clone(),
                 gates.clone(),
                 state,
+                artifacts.clone(),
             )
             .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
             candidate
                 .request_phase(phase)
                 .map_err(|_| error(ErrorCode::CapabilityUnavailable))?;
-            validated_workflow(config, gates, candidate.state(), factory.workflow_skills())?
+            validated_workflow(
+                config,
+                gates,
+                candidate.state(),
+                artifacts,
+                factory.workflow_skills(),
+            )?
         };
         self.store
             .configure_workflow(params.expected_session_revision, Some(workflow))
             .map_err(store_error)?;
         let saved = self.store.snapshot().map_err(store_error)?;
+        events.push(EventBody::OrchestrationUpdated(orchestration_summary(
+            &saved,
+            self.admission.as_ref(),
+            self.delegation_projection().as_ref(),
+        )));
         Ok(SuccessResult::WorkflowConfigure(WorkflowConfigured {
             session_revision: saved.marker.session_revision,
             workflow: saved.state.workflow.as_ref().map(workflow_status),
@@ -1206,6 +2942,12 @@ impl Engine {
             .workflow_config()
             .ok_or_else(|| error(ErrorCode::CapabilityUnavailable))?
             .clone();
+        let artifacts = self
+            .store
+            .snapshot()
+            .map_err(store_error)?
+            .state
+            .workflow_artifacts;
         let workflow = validated_workflow(
             config.clone(),
             polaris_core::workflow::WorkflowGatesV1::default(),
@@ -1213,6 +2955,7 @@ impl Engine {
                 phase: config.initial_phase,
                 ..Default::default()
             },
+            artifacts,
             factory.workflow_skills(),
         )?;
         self.store
@@ -1317,6 +3060,15 @@ impl Engine {
         });
         #[cfg(target_os = "macos")]
         if existing.is_none()
+            && let RequestBody::RunCancel(_, target) = &request.body
+        {
+            // Child cancellation intent must be durable before the root's
+            // run.cancel receipt can make the root cancellation externally
+            // observable.
+            self.record_root_cancel_plan(target)?;
+        }
+        #[cfg(target_os = "macos")]
+        if existing.is_none()
             && let (Some(source), Some(target)) = (&mut self.source, &target)
         {
             source.reserve(target.clone())?;
@@ -1338,6 +3090,9 @@ impl Engine {
             },
             _ => None,
         };
+        // Legacy `run.start` remains an explicit current-session operation.
+        // It is not auto-routed and therefore never consumes an admission ID.
+        let admission_id = None;
         let accepted = match self.store.apply_bound(request, target.clone(), account) {
             Ok(accepted) => accepted,
             Err(e) => {
@@ -1422,7 +3177,18 @@ impl Engine {
                         chunk: 0,
                         text: String::new(),
                         started: false,
+                        admission: admission_id,
+                        #[cfg(target_os = "macos")]
+                        delegation: None,
                     });
+                    if self.admission.is_some() {
+                        let published = self.store.snapshot().map_err(store_error)?;
+                        events.push(EventBody::OrchestrationUpdated(orchestration_summary(
+                            &published,
+                            self.admission.as_ref(),
+                            self.delegation_projection().as_ref(),
+                        )));
+                    }
                 }
                 Ok(SuccessResult::RunStart(RunAccepted {
                     session_revision: revision,
@@ -1483,6 +3249,13 @@ impl Engine {
             draft: state.draft.clone(),
             configuration: state.configuration.clone(),
             workflow: state.workflow.as_ref().map(workflow_status),
+            orchestration: (self.wire_version == Some(ProtocolVersion::V2)).then(|| {
+                orchestration_summary(
+                    &published,
+                    self.admission.as_ref(),
+                    self.delegation_projection().as_ref(),
+                )
+            }),
             memory: state.runs.last().and_then(|r| r.memory.clone()),
             role_bindings: role_bindings::to_wire(state.role_bindings.as_ref()),
             role_catalog: self.role_catalog_wire(),
@@ -1555,13 +3328,18 @@ impl Engine {
         Ok(())
     }
     fn emit(&mut self, body: EventBody, out: &Outbox) -> Result<(), ServiceError> {
+        if self.wire_version == Some(ProtocolVersion::V1)
+            && matches!(body, EventBody::OrchestrationUpdated(_))
+        {
+            return Ok(());
+        }
         if let Some(position) = &mut self.subscription {
             position.event_seq = position
                 .event_seq
                 .checked_add(1)
                 .map_err(|_| ServiceError::Worker)?;
             let event = Event {
-                protocol_version: ProtocolVersion,
+                protocol_version: self.wire_version.unwrap_or(ProtocolVersion),
                 engine_epoch: self.epoch.clone(),
                 subscription_id: position.subscription_id.clone(),
                 event_seq: position.event_seq,
@@ -1597,6 +3375,24 @@ impl Engine {
         }
     }
     fn step(&mut self, out: &Outbox) -> Result<(), ServiceError> {
+        let mut routing_events = Vec::new();
+        self.poll_routing(&mut routing_events)
+            .map_err(|_| ServiceError::Worker)?;
+        self.emit_all(routing_events, out)?;
+        self.step_lane(out)?;
+        if self.other_lane.is_some() {
+            self.swap_lane().map_err(|_| ServiceError::Worker)?;
+            let result = self.step_lane(out);
+            self.swap_lane().map_err(|_| ServiceError::Worker)?;
+            result?;
+        }
+        if self.admission.is_some() {
+            self.pump_admissions().map_err(|_| ServiceError::Worker)?;
+        }
+        Ok(())
+    }
+
+    fn step_lane(&mut self, out: &Outbox) -> Result<(), ServiceError> {
         self.poll_local_models(Some(out), false)?;
         #[cfg(target_os = "macos")]
         self.poll_mcp_catalog(Some(out), false)?;
@@ -1622,7 +3418,10 @@ impl Engine {
             .as_ref()
             .is_some_and(|active| active.real.is_some())
         {
-            return self.step_real(Some(out), false);
+            self.emit_delegation_update(out)?;
+            let result = self.step_real(Some(out), false);
+            self.emit_delegation_update(out)?;
+            return result;
         }
         if self
             .active
@@ -1749,6 +3548,36 @@ impl Engine {
         }
         self.active.as_mut().unwrap().text = saved_text;
         self.active.as_mut().unwrap().execution.saved = true;
+        let admission_terminal = self.active.as_ref().and_then(|active| {
+            active.admission.clone().map(|id| {
+                let status = if !active.started || outcome == Observation::Cancelled {
+                    polaris_core::session_manager::TerminalStatus::Cancelled
+                } else if outcome == Observation::Succeeded {
+                    polaris_core::session_manager::TerminalStatus::Completed
+                } else if outcome == Observation::OutcomeUnknown {
+                    polaris_core::session_manager::TerminalStatus::OutcomeUnknown
+                } else {
+                    polaris_core::session_manager::TerminalStatus::Failed
+                };
+                (id, status)
+            })
+        });
+        if let (Some(owner), Some((admission, status))) =
+            (self.admission.as_mut(), admission_terminal)
+        {
+            owner.terminal(&admission, status)?;
+            if let Some(out) = out {
+                let published = self.store.snapshot()?;
+                self.emit(
+                    EventBody::OrchestrationUpdated(orchestration_summary(
+                        &published,
+                        self.admission.as_ref(),
+                        self.delegation_projection().as_ref(),
+                    )),
+                    out,
+                )?;
+            }
+        }
         let active = self.active.take().unwrap();
         let run = self
             .store
@@ -1776,12 +3605,30 @@ impl Engine {
         Ok(())
     }
     fn settle(&mut self, out: &Outbox) -> Result<(), ServiceError> {
+        let mut routing_events = Vec::new();
+        self.poll_routing(&mut routing_events)
+            .map_err(|_| ServiceError::Worker)?;
+        self.emit_all(routing_events, out)?;
+        self.settle_lane(Some(out))?;
+        let mut all_ready = self.ready;
+        if self.other_lane.is_some() {
+            self.swap_lane().map_err(|_| ServiceError::Worker)?;
+            let result = self.settle_lane(Some(out));
+            self.swap_lane().map_err(|_| ServiceError::Worker)?;
+            result?;
+            all_ready &= self.ready;
+        }
+        self.ready = all_ready && self.routing_jobs.is_empty();
+        Ok(())
+    }
+
+    fn settle_lane(&mut self, out: Option<&Outbox>) -> Result<(), ServiceError> {
         self.ready = false;
-        self.poll_local_models(Some(out), true)?;
+        self.poll_local_models(out, true)?;
         #[cfg(target_os = "macos")]
-        self.poll_mcp_catalog(Some(out), true)?;
+        self.poll_mcp_catalog(out, true)?;
         #[cfg(target_os = "macos")]
-        self.poll_mcp_setup(Some(out), true)?;
+        self.poll_mcp_setup(out, true)?;
         let source_result = self.poll_source(true);
         self.cleanups.step();
         self.cancel_and_poll_core();
@@ -1789,7 +3636,7 @@ impl Engine {
         if self.failed {
             return Err(StoreError::RecoveryRequired.into());
         }
-        self.complete(Observation::Cancelled, Some(out))?;
+        self.complete(Observation::Cancelled, out)?;
         self.store.snapshot()?;
         self.ready = self.active.is_none()
             && self.cleanups.is_empty()
@@ -1799,26 +3646,19 @@ impl Engine {
         Ok(())
     }
     fn settle_without_output(&mut self) -> Result<(), ServiceError> {
-        self.ready = false;
-        self.poll_local_models(None, true)?;
-        #[cfg(target_os = "macos")]
-        self.poll_mcp_catalog(None, true)?;
-        #[cfg(target_os = "macos")]
-        self.poll_mcp_setup(None, true)?;
-        let source_result = self.poll_source(true);
-        self.cleanups.step();
-        self.cancel_and_poll_core();
-        source_result?;
-        if self.failed {
-            return Err(StoreError::RecoveryRequired.into());
+        let mut ignored = Vec::new();
+        self.poll_routing(&mut ignored)
+            .map_err(|_| ServiceError::Worker)?;
+        self.settle_lane(None)?;
+        let mut all_ready = self.ready;
+        if self.other_lane.is_some() {
+            self.swap_lane().map_err(|_| ServiceError::Worker)?;
+            let result = self.settle_lane(None);
+            self.swap_lane().map_err(|_| ServiceError::Worker)?;
+            result?;
+            all_ready &= self.ready;
         }
-        self.complete(Observation::Cancelled, None)?;
-        self.store.snapshot()?;
-        self.ready = self.active.is_none()
-            && self.cleanups.is_empty()
-            && !self.source_unsettled()
-            && self.local_models.is_none()
-            && self.mcp_catalog_idle();
+        self.ready = all_ready && self.routing_jobs.is_empty();
         Ok(())
     }
 }
@@ -1837,6 +3677,7 @@ fn error(code: ErrorCode) -> ProtocolError {
             ErrorCode::RevisionConflict => "期待版または要求内容が一致しません",
             ErrorCode::SessionBusy => "実行中または終了処理中です",
             ErrorCode::CapabilityUnavailable => "このserviceでは利用できません",
+            ErrorCode::ReferenceUnavailable => "参照入力はこのserviceでは利用できません",
             ErrorCode::StorageFailed | ErrorCode::RecoveryRequired => "保存状態を確認できません",
             ErrorCode::NotFound => "対象がありません",
             _ => "要求を受け付けられません",

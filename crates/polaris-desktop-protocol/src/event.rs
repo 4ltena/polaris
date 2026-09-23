@@ -85,6 +85,11 @@ pub enum EventBody {
     ConfigurationUpdated(Configuration),
     #[serde(rename = "memory.updated")]
     MemoryUpdated(MemoryStatus),
+    /// A bounded complete replacement. Consumers must not merge this with a
+    /// prior projection, because omissions are meaningful and stale lease or
+    /// convergence state must disappear atomically.
+    #[serde(rename = "orchestration.updated")]
+    OrchestrationUpdated(crate::orchestration::OrchestrationSummaryV2),
     #[serde(rename = "role_bindings.updated")]
     RoleBindingsUpdated(crate::role_bindings::RoleBindingsConfigured),
     #[serde(rename = "approval.requested")]
@@ -145,12 +150,18 @@ impl<'de> Deserialize<'de> for Event {
                 | "draft.updated"
                 | "configuration.updated"
                 | "memory.updated"
+                | "orchestration.updated"
                 | "role_bindings.updated"
                 | "approval.requested"
                 | "approval.resolved"
                 | "approval.expired"
         ) {
             return Err(de::Error::custom("unknown state event; resync required"));
+        }
+        if wire.protocol_version == ProtocolVersion::V1
+            && wire.event_type == "orchestration.updated"
+        {
+            return Err(de::Error::custom("protocol v2 event on v1 frame"));
         }
         let body = serde_json::from_value(
             serde_json::json!({"type": wire.event_type, "payload": wire.payload}),
@@ -194,6 +205,7 @@ impl Serialize for Event {
             EventBody::DraftUpdated(p) => payload!("draft.updated", p),
             EventBody::ConfigurationUpdated(p) => payload!("configuration.updated", p),
             EventBody::MemoryUpdated(p) => payload!("memory.updated", p),
+            EventBody::OrchestrationUpdated(p) => payload!("orchestration.updated", p),
             EventBody::RoleBindingsUpdated(p) => payload!("role_bindings.updated", p),
             EventBody::ApprovalRequested(p) => payload!("approval.requested", p),
             EventBody::ApprovalResolved(p) => payload!("approval.resolved", p),

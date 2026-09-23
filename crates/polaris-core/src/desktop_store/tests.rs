@@ -5,6 +5,7 @@ use super::*;
 use polaris_desktop_protocol::{ids::*, request::*, run_state::*, snapshot::*};
 use std::{fs, io::Write};
 
+mod admission_tests;
 mod details_tests;
 mod mcp_tests;
 mod prompt_tests;
@@ -1433,13 +1434,17 @@ fn desktop_tool_suffix_bounds_escaped_history_text_without_truncation() {
 }
 
 fn workflow_fixture() -> SavedWorkflow {
-    SavedWorkflow::capture(&crate::workflow::SessionWorkflow::new(
+    let mut saved = SavedWorkflow::capture(&crate::workflow::SessionWorkflow::new(
         crate::workflow::WorkflowConfig {
             enabled: true,
             always: vec!["builtin:workflow-core".into()],
             ..Default::default()
         },
-    ))
+    ));
+    // Storage/replay fixtures exercise the pre-M27 checkpoint protocol. Gate
+    // enforcement has dedicated tests with an approved contract and basis.
+    saved.gates.phase_gate_schema_version = None;
+    saved
 }
 
 #[test]
@@ -1462,9 +1467,20 @@ fn workflow_checkpoint_reopens_and_old_run_replays_after_configuration_changes()
         Err(StoreError::Busy)
     ));
     writer.record_intent(&target(), op()).unwrap();
-    let mut finished = initial_workflow;
+    let mut finished = initial_workflow.clone();
     finished.state.phase = crate::workflow::Phase::Review;
+    finished.state.step = Some(crate::workflow::WorkflowStepV1::Review);
     finished.state.revision = 1;
+    writer
+        .checkpoint_workflow(
+            &target(),
+            desktop_tool_turn(),
+            initial_workflow,
+            finished.clone(),
+            Some("call-1"),
+            None,
+        )
+        .unwrap();
     writer
         .finish_with_messages_and_workflow(
             &target(),
@@ -1531,6 +1547,7 @@ fn workflow_checkpoint_publishes_suffix_once_and_terminal_reuses_its_cursor() {
             previous.clone(),
             candidate.clone(),
             Some("call-1"),
+            None,
         )
         .unwrap();
     let checkpointed = writer.snapshot().unwrap();
@@ -1545,6 +1562,7 @@ fn workflow_checkpoint_publishes_suffix_once_and_terminal_reuses_its_cursor() {
                 candidate.clone(),
                 candidate.clone(),
                 Some("different-call"),
+                None,
             )
             .is_err()
     );
@@ -1558,6 +1576,7 @@ fn workflow_checkpoint_publishes_suffix_once_and_terminal_reuses_its_cursor() {
             previous,
             candidate.clone(),
             Some("call-1"),
+            None,
         )
         .unwrap();
     unchanged(&checkpointed, &writer.snapshot().unwrap());
@@ -1579,6 +1598,240 @@ fn workflow_checkpoint_publishes_suffix_once_and_terminal_reuses_its_cursor() {
         "terminal must reuse checkpoint cursor"
     );
     assert_eq!(terminal.state.runs[0].run.state, RunState::Succeeded);
+}
+
+#[test]
+fn m27_contract_publication_and_writer_gate_use_the_exact_graph_basis() {
+    let (root, mut writer) = setup();
+    let workflow = SavedWorkflow::capture(&crate::workflow::SessionWorkflow::new(
+        crate::workflow::WorkflowConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    ));
+    writer
+        .configure_workflow(DecimalU64::new(0), Some(workflow))
+        .unwrap();
+
+    let draft = crate::workflow::ChangeContractV1::draft(
+        "desktop-m27-contract",
+        crate::workflow::RoutineEligibilityV1::local_component("desktop_store"),
+        "phase changes could bypass their durable contract",
+        "the writer did not compare the gate basis",
+        "the owner re-evaluates the exact graph before publication",
+        vec!["missing and stale gate bases are rejected".into()],
+    )
+    .unwrap();
+    let revision = writer.snapshot().unwrap().marker.session_revision;
+    let draft_ref = writer
+        .publish_change_contract(revision, draft.clone())
+        .unwrap();
+    assert_eq!(writer.load_change_contract(&draft_ref).unwrap(), draft);
+    let revision = writer.snapshot().unwrap().marker.session_revision;
+    let approved_ref = writer
+        .approve_change_contract_trusted(revision, &draft_ref)
+        .unwrap();
+    let approved = writer.load_change_contract(&approved_ref).unwrap();
+    assert_eq!(
+        approved.header.status,
+        crate::workflow::ArtifactStatusV1::Approved
+    );
+    drop(writer);
+    let mut writer = root.open(&project(), &session()).unwrap();
+    let published = writer.snapshot().unwrap();
+    assert_eq!(
+        published
+            .state
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state
+            .active_change_contract
+            .as_ref(),
+        Some(&approved_ref)
+    );
+    writer
+        .apply(&start("m27-writer-gate", 0), Some(target()))
+        .unwrap();
+
+    let previous = writer.snapshot().unwrap().state.runs[0]
+        .workflow
+        .clone()
+        .unwrap();
+    let graph = writer.snapshot().unwrap().state.workflow_artifacts;
+    let specify_proof = crate::workflow::evaluate_phase_transition(
+        &previous.state,
+        crate::workflow::Phase::Specify,
+        &previous.gates,
+        &graph,
+    )
+    .unwrap();
+    let mut specify = previous.clone();
+    specify.state.phase = crate::workflow::Phase::Specify;
+    specify.state.step = Some(crate::workflow::WorkflowStepV1::Specify);
+    specify.state.revision += 1;
+    assert!(
+        writer
+            .checkpoint_workflow(
+                &target(),
+                vec![],
+                previous.clone(),
+                specify.clone(),
+                None,
+                None,
+            )
+            .is_err()
+    );
+    writer
+        .checkpoint_workflow(
+            &target(),
+            vec![],
+            previous,
+            specify.clone(),
+            None,
+            Some(&specify_proof.basis_hash),
+        )
+        .unwrap();
+
+    let implement_proof = crate::workflow::evaluate_phase_transition(
+        &specify.state,
+        crate::workflow::Phase::Implement,
+        &specify.gates,
+        &graph,
+    )
+    .unwrap();
+    let mut implement = specify.clone();
+    implement.state.phase = crate::workflow::Phase::Implement;
+    implement.state.step = Some(crate::workflow::WorkflowStepV1::Implement);
+    implement.state.revision += 1;
+    assert!(
+        writer
+            .checkpoint_workflow(
+                &target(),
+                vec![],
+                specify.clone(),
+                implement.clone(),
+                None,
+                Some("wrong-basis"),
+            )
+            .is_err()
+    );
+    writer
+        .checkpoint_workflow(
+            &target(),
+            vec![],
+            specify,
+            implement.clone(),
+            None,
+            Some(&implement_proof.basis_hash),
+        )
+        .unwrap();
+
+    writer.record_intent(&target(), op()).unwrap();
+    let mut uncheckpointed = implement.clone();
+    uncheckpointed.state.phase = crate::workflow::Phase::Review;
+    uncheckpointed.state.step = Some(crate::workflow::WorkflowStepV1::Review);
+    uncheckpointed.state.revision += 1;
+    assert!(
+        writer
+            .finish_with_messages_and_workflow(
+                &target(),
+                &op(),
+                Observation::Succeeded,
+                result(),
+                vec![polaris_provider::Message::assistant("done")],
+                Some(uncheckpointed),
+            )
+            .is_err()
+    );
+    writer
+        .finish_with_messages_and_workflow(
+            &target(),
+            &op(),
+            Observation::Succeeded,
+            result(),
+            vec![polaris_provider::Message::assistant("done")],
+            Some(implement),
+        )
+        .unwrap();
+}
+
+#[test]
+fn m27_approval_initializes_a_missing_desktop_workflow_and_survives_reopen() {
+    let (root, mut writer) = setup();
+    assert!(writer.snapshot().unwrap().state.workflow.is_none());
+    let draft = crate::workflow::ChangeContractV1::draft(
+        "desktop-m27-initial-workflow",
+        crate::workflow::RoutineEligibilityV1::local_component("desktop_store"),
+        "the session has no saved workflow yet",
+        "contract approval previously required an existing workflow",
+        "approval initializes the default workflow atomically",
+        vec!["the approved contract survives reopen".into()],
+    )
+    .unwrap();
+    let revision = writer.snapshot().unwrap().marker.session_revision;
+    let draft_ref = writer.publish_change_contract(revision, draft).unwrap();
+    let revision = writer.snapshot().unwrap().marker.session_revision;
+    let approved_ref = writer
+        .approve_change_contract_trusted(revision, &draft_ref)
+        .unwrap();
+    assert_eq!(
+        writer
+            .snapshot()
+            .unwrap()
+            .state
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state
+            .active_change_contract
+            .as_ref(),
+        Some(&approved_ref)
+    );
+    drop(writer);
+    let reopened = root.open(&project(), &session()).unwrap();
+    assert_eq!(
+        reopened
+            .snapshot()
+            .unwrap()
+            .state
+            .workflow
+            .unwrap()
+            .state
+            .active_change_contract,
+        Some(approved_ref)
+    );
+}
+
+#[test]
+fn m27_reopen_rejects_an_active_contract_with_a_missing_body() {
+    let (root, mut writer) = setup();
+    let draft = crate::workflow::ChangeContractV1::draft(
+        "desktop-m27-missing-body",
+        crate::workflow::RoutineEligibilityV1::local_component("desktop_store"),
+        "the graph can outlive a removed object",
+        "startup only validated graph metadata",
+        "startup revalidates the active immutable body",
+        vec!["missing bodies fail closed".into()],
+    )
+    .unwrap();
+    let revision = writer.snapshot().unwrap().marker.session_revision;
+    let draft_ref = writer.publish_change_contract(revision, draft).unwrap();
+    let revision = writer.snapshot().unwrap().marker.session_revision;
+    let approved_ref = writer
+        .approve_change_contract_trusted(revision, &draft_ref)
+        .unwrap();
+    let root_path = dir(&writer).parent().unwrap().to_path_buf();
+    let object = root_path
+        .join("workflow-artifacts-v1")
+        .join(crate::conversation_state::content_hash(
+            project().as_str().as_bytes(),
+        ))
+        .join("objects")
+        .join(format!("{}.json", approved_ref.content_hash));
+    drop(writer);
+    std::fs::remove_file(object).unwrap();
+    assert!(root.open(&project(), &session()).is_err());
 }
 
 #[tokio::test]
@@ -1606,6 +1859,7 @@ async fn workflow_lost_ack_confirms_marker_without_repeating_checkpoint() {
         previous,
         candidate.clone(),
         Some("call-1".into()),
+        None,
     ));
     let mut context = Context::from_waker(Waker::noop());
     assert!(matches!(

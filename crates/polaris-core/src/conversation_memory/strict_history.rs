@@ -869,7 +869,7 @@ pub(crate) fn evidence_page(
 
 /// Fixed-argv, offline stdio configuration. The runtime is intentionally not
 /// auto-discovered or downloaded. Parent creates the helper in its private run dir.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LocalStdioEmbedder {
     metadata: EmbeddingModel,
     pub python: PathBuf,
@@ -879,6 +879,24 @@ pub struct LocalStdioEmbedder {
     pub cpu_threads: usize,
     pub timeout: Duration,
     pub attempt_ledger: Option<polaris_provider::attempts::AttemptLedger>,
+    pre_spawn_guard: Option<std::sync::Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for LocalStdioEmbedder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalStdioEmbedder")
+            .field("metadata", &self.metadata)
+            .field("python", &self.python)
+            .field("helper", &self.helper)
+            .field("model_path", &self.model_path)
+            .field("run_temp", &self.run_temp)
+            .field("cpu_threads", &self.cpu_threads)
+            .field("timeout", &self.timeout)
+            .field("attempt_ledger", &self.attempt_ledger)
+            .field("pre_spawn_guard", &self.pre_spawn_guard.is_some())
+            .finish()
+    }
 }
 
 /// The models the bundled helper will run, and the hidden size each has.
@@ -976,7 +994,19 @@ impl LocalStdioEmbedder {
             cpu_threads,
             timeout,
             attempt_ledger: None,
+            pre_spawn_guard: None,
         })
+    }
+
+    /// Binds a host-owned identity check to every helper spawn. The closure is
+    /// not model/config data and must retain any descriptors that establish the
+    /// executable's identity for at least as long as this embedder.
+    pub fn with_pre_spawn_guard(
+        mut self,
+        guard: std::sync::Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
+    ) -> Self {
+        self.pre_spawn_guard = Some(guard);
+        self
     }
 }
 
@@ -1074,6 +1104,9 @@ impl LocalStdioEmbedder {
     async fn helper_call(&self, request: Option<String>) -> io::Result<serde_json::Value> {
         use std::process::Stdio;
         use tokio::{io::AsyncWriteExt, process::Command};
+        if let Some(guard) = &self.pre_spawn_guard {
+            guard()?;
+        }
         // Each helper gets a fresh private directory. `TempDir` removes only this
         // call's files on success, timeout, error, or future cancellation.
         let call_temp = tempfile::Builder::new()

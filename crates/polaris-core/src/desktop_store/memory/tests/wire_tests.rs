@@ -62,13 +62,76 @@ async fn owner_wire_and_audit(omit_related: bool) {
             query.push_str(&format!(" unused{i}"));
         }
     }
-    let (_root, mut writer, target) = setup_query_turns(
+    let (_root, mut writer, previous) = setup_turns(
         "memory-project",
         "memory-session",
         HistoryMode::Structured10,
-        11,
-        &query,
+        10,
     );
+    finish(&mut writer, &previous, 10);
+    let initial_workflow = crate::workflow::SessionWorkflow::new(crate::workflow::WorkflowConfig {
+        enabled: true,
+        mode: crate::workflow::WorkflowMode::Adaptive,
+        initial_phase: crate::workflow::Phase::Specify,
+        ..crate::config::Config::default().workflow
+    });
+    let session_revision = writer.snapshot().unwrap().marker.session_revision;
+    writer
+        .configure_workflow(
+            session_revision,
+            Some(crate::desktop_store::SavedWorkflow::capture(
+                &initial_workflow,
+            )),
+        )
+        .unwrap();
+    let target = accept_text(&mut writer, 11, &query);
+    writer.bind_memory(&target, resources()).unwrap();
+    let contract = crate::workflow::ChangeContractV1::draft(
+        "structured-wire-budget",
+        crate::workflow::RoutineEligibilityV1::local_component("polaris-core"),
+        "the full request wire needs a stable production fixture",
+        "memory, workflow, skill, and provider projections share one request",
+        "the complete implement-phase request stays within every wire budget",
+        vec!["both provider wire shapes preserve the same request".into()],
+    )
+    .unwrap();
+    let approved_workflow = writer
+        .publish_and_approve_routine_contract(&target, initial_workflow.state().revision, contract)
+        .unwrap();
+    let previous_workflow = crate::desktop_store::SavedWorkflow::capture(&approved_workflow);
+    let gate = crate::workflow::evaluate_phase_transition(
+        &previous_workflow.state,
+        crate::workflow::Phase::Implement,
+        &previous_workflow.gates,
+        approved_workflow.artifact_graph(),
+    )
+    .unwrap();
+    let mut implement_state = previous_workflow.state.clone();
+    implement_state.phase = crate::workflow::Phase::Implement;
+    implement_state.step = Some(crate::workflow::WorkflowStepV1::Implement);
+    implement_state.revision = implement_state.revision.checked_add(1).unwrap();
+    implement_state.skill_manifest_hash.clear();
+    implement_state.skills.clear();
+    let implement_workflow = crate::workflow::SessionWorkflow::restore_with_artifacts(
+        previous_workflow.config.clone(),
+        previous_workflow.gates.clone(),
+        implement_state,
+        approved_workflow.artifact_graph().clone(),
+    )
+    .unwrap();
+    writer
+        .checkpoint_workflow(
+            &target,
+            vec![],
+            previous_workflow,
+            crate::desktop_store::SavedWorkflow::capture(&implement_workflow),
+            None,
+            Some(&gate.basis_hash),
+        )
+        .unwrap();
+    let request_history = writer.project_request_history(&target).unwrap();
+    let request_messages = request_history.messages().to_vec();
+    let input_source = request_history.input_source();
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("memory.sqlite3");
     let (work, pending, response) = structured_pending(&mut writer, &target).await;
@@ -91,6 +154,8 @@ async fn owner_wire_and_audit(omit_related: bool) {
         resources(),
     )
     .unwrap();
+    let (workflow_port, mut workflow_owner) =
+        crate::desktop_workflow::DesktopWorkflow::pair(target.clone());
     let skill_body = "OPTIONAL BODY: verify the service after deploying it.";
     let skill_path = directory.path().join("SKILL.md");
     std::fs::write(
@@ -112,17 +177,15 @@ async fn owner_wire_and_audit(omit_related: bool) {
     let baseline = crate::prompt::assemble_always_on("", "", &[]);
     let always_on = baseline.clone();
     let task = async move {
-        let mut session = crate::session::Session::new();
-        session.push_user(&query);
-        session.desktop_memory = Some(runtime);
-        session.workflow = Some(crate::workflow::SessionWorkflow::new(
-            crate::workflow::WorkflowConfig {
-                enabled: true,
-                mode: crate::workflow::WorkflowMode::Adaptive,
-                initial_phase: crate::workflow::Phase::Implement,
-                ..crate::config::Config::default().workflow
-            },
-        ));
+        let mut session = crate::session::Session {
+            messages: request_messages,
+            input_source,
+            workflow: Some(implement_workflow),
+            desktop_memory: Some(runtime),
+            desktop_workflow: Some(workflow_port),
+            desktop_transcript: Some(Default::default()),
+            ..crate::session::Session::new()
+        };
         let sandbox =
             polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
                 .unwrap();
@@ -158,7 +221,10 @@ async fn owner_wire_and_audit(omit_related: bool) {
         loop {
             tokio::select! {
                 result = &mut task => break result,
-                _ = tokio::task::yield_now() => owner.poll(Some(&mut writer), false),
+                _ = tokio::task::yield_now() => {
+                    owner.poll(Some(&mut writer), false);
+                    workflow_owner.poll(Some(&mut writer), false, None);
+                },
             }
         }
     })
@@ -207,9 +273,27 @@ async fn owner_wire_and_audit(omit_related: bool) {
         reported_tokens
     );
     assert!(reported_tokens <= 768);
+    let projected = &requests[0].messages[1..];
+    assert_eq!(projected.len(), recent.len() + 1);
+    let workflow_context_index = projected.len() - 2;
     assert_eq!(
-        serde_json::to_value(&requests[0].messages[1..]).unwrap(),
-        serde_json::to_value(&recent).unwrap()
+        serde_json::to_value(&projected[..workflow_context_index]).unwrap(),
+        serde_json::to_value(&recent[..recent.len() - 1]).unwrap()
+    );
+    assert_eq!(projected[workflow_context_index].role, Role::User);
+    assert!(
+        projected[workflow_context_index]
+            .content
+            .contains("<polaris-root-workflow-context-v1>")
+    );
+    assert_eq!(
+        serde_json::to_value(projected.last()).unwrap(),
+        serde_json::to_value(recent.last()).unwrap()
+    );
+    assert!(
+        recent
+            .iter()
+            .all(|message| !message.content.contains("polaris-root-workflow-context-v1"))
     );
     assert_eq!(recent.iter().filter(|m| m.role == Role::User).count(), 10);
     assert!(!recent.iter().any(|m| m.content == "turn 1: Rigel"));
@@ -283,7 +367,7 @@ async fn owner_wire_and_audit(omit_related: bool) {
         let components = crate::budget::request_context_tokens(request);
         assert!(components.openai_state <= crate::budget::STATE_SCHEMA_LIMIT);
         assert!(components.codex_state <= crate::budget::STATE_SCHEMA_LIMIT);
-        assert_eq!(request.tools.len(), 7);
+        assert_eq!(request.tools.len(), 8);
         assert_eq!(
             request.tools[..6]
                 .iter()
@@ -292,6 +376,7 @@ async fn owner_wire_and_audit(omit_related: bool) {
             base_names
         );
         assert_eq!(request.tools[6].name, "state");
+        assert_eq!(request.tools[7].name, "workflow_artifact");
         let openai = polaris_provider::openai::build_body("fixture", request, Some("medium"));
         let codex = polaris_provider::codex::build_body("fixture", request, Some("medium"));
         assert_eq!(openai["messages"][0]["content"], request.system);

@@ -92,6 +92,8 @@ pub struct TrustedFactoryResources {
     /// terminal reads. `None` is the ordinary state: every path that would
     /// ask it something works without an answer.
     pub decider: Option<Arc<dyn polaris_provider::decision::Decider>>,
+    /// User-scoped startup snapshot. `None` is the default/off path.
+    pub answer_finalizer: Option<Arc<crate::shadow_finalizer::ShadowFinalizerOwner>>,
 }
 
 /// Fixed local resource snapshot, prepared by the trusted startup owner.
@@ -753,6 +755,10 @@ impl TrustedRunFactory for ConfiguredRunFactory {
 
     fn decider(&self) -> Option<Arc<dyn polaris_provider::decision::Decider>> {
         self.resources.decider.clone()
+    }
+
+    fn answer_finalizer(&self) -> Option<Arc<crate::shadow_finalizer::ShadowFinalizerOwner>> {
+        self.resources.answer_finalizer.clone()
     }
 
     fn workflow_skills(&self) -> &[polaris_skills::Skill] {

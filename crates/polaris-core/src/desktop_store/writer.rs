@@ -2,6 +2,10 @@
 
 use super::{disk, model::*, source_apply::*};
 use crate::conversation_state::{RawEventV2, content_hash};
+use crate::workflow::{
+    ActiveEvidenceArtifactsV1, ConvergenceInputV1, ObservedEvidenceSubjectV1,
+    build_owner_convergence, validate_owner_convergence,
+};
 use polaris_desktop_protocol::{
     ids::*,
     request::{Request, RequestBody, RunTarget},
@@ -87,6 +91,20 @@ impl DesktopRoot {
             },
         })
     }
+
+    /// Opens the root-scoped admission ledger through the same pinned root
+    /// capability used by all session writers.
+    pub fn session_manager(&self) -> StoreResult<super::SessionManagerStore> {
+        super::SessionManagerStore::from_root(self.backing.directory.clone())
+    }
+    /// Opens one root-run subagent control plane through this already-pinned
+    /// desktop root capability.
+    pub fn subagent_control(
+        &self,
+        binding: super::SubagentControlBindingV1,
+    ) -> StoreResult<super::SubagentControlOwner> {
+        super::SubagentControlOwner::from_root(self.backing.directory.clone(), binding)
+    }
     pub fn create(
         &self,
         project: ProjectId,
@@ -145,6 +163,7 @@ impl StoreRoot {
             unresolved_approvals: Vec::new(),
             approval_records: Vec::new(),
             workflow: None,
+            workflow_artifacts: crate::workflow::WorkflowArtifactGraphV1::default(),
         };
         self.create_seeded(project, session, state, Vec::new())
     }
@@ -177,6 +196,7 @@ impl StoreRoot {
         };
         let published = Published { marker, state, raw };
         validate_ledger(&published)?;
+        validate_artifact_bodies(self, &published)?;
         self.directory.verify()?;
         let directory = Arc::new(self.directory.child(
             &content_hash(published.marker.session_id.as_str().as_bytes()),
@@ -211,6 +231,7 @@ impl StoreRoot {
         let guard = directory.open("writer.lock", true, false)?;
         acquire(&guard)?;
         let published = reconcile(&directory, project, session)?;
+        validate_artifact_bodies(self, &published)?;
         self.directory.sync()?;
         if published.marker.deleted {
             return Err(StoreError::Deleted);
@@ -226,8 +247,19 @@ impl StoreRoot {
         let mut changed = !next.state.unresolved_approvals.is_empty();
         changed |= invalidate_approvals(&mut next.state, |_| true);
         changed |= super::source_apply::invalidate_unconsumed(&mut next.state);
+        // A reopened desktop owner has not re-observed the source/diff/subject
+        // hashes. Evidence must therefore be gathered again before it can
+        // satisfy an evidence-bearing phase edge.
+        if let Some(workflow) = &mut next.state.workflow {
+            changed |= workflow.gates.convergence.take().is_some();
+        }
         for record in &mut next.state.runs {
-            if !record.run.state.is_terminal() {
+            if let Some(workflow) = &mut record.workflow {
+                changed |= workflow.gates.convergence.take().is_some();
+            }
+            if !(record.run.state.is_terminal()
+                || record.admission.is_some() && record.run.state == RunState::Queued)
+            {
                 let unresolved = record.operations.iter().any(mcp::unresolved);
                 record.run.state = if unresolved {
                     RunState::OutcomeUnknown
@@ -278,6 +310,18 @@ fn reconcile(
 }
 
 fn validate_ledger(p: &Published) -> StoreResult<()> {
+    p.state
+        .workflow_artifacts
+        .validate()
+        .map_err(|_| StoreError::Corrupt("workflow artifact graph"))?;
+    if let Some(workflow) = &p.state.workflow {
+        workflow.validate_with_artifacts(&p.state.workflow_artifacts)?;
+    }
+    for run in &p.state.runs {
+        if let Some(workflow) = &run.workflow {
+            workflow.validate_with_artifacts(&p.state.workflow_artifacts)?;
+        }
+    }
     if p.state.inherited_turn_count.get() > 10
         || p.raw.iter().filter(|event| event.starts_turn).count() as u64
             != p.state
@@ -297,13 +341,28 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
     let mut keys = BTreeSet::new();
     let mut runs = BTreeSet::new();
     let mut attempts = BTreeSet::new();
+    let mut admissions = BTreeSet::new();
     let mut operations = BTreeSet::new();
     let mut active = 0;
     for record in &p.state.runs {
         if !runs.insert(&record.run.run_id) || !attempts.insert(&record.run.attempt_id) {
             return Err(StoreError::Corrupt("run/attemptの重複"));
         }
-        active += usize::from(!record.run.state.is_terminal());
+        if let Some(binding) = &record.admission
+            && (binding.admission_id.is_empty()
+                || binding.admission_id.len() > 128
+                || !binding
+                    .admission_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                || !valid_hash(&binding.payload_hash)
+                || binding.destination_session_id != p.marker.session_id
+                || !admissions.insert(&binding.admission_id))
+        {
+            return Err(StoreError::Corrupt("admission binding"));
+        }
+        active +=
+            usize::from(!record.run.state.is_terminal() && record.run.state != RunState::Queued);
         for op in &record.operations {
             if !operations.insert(&op.operation_id) {
                 return Err(StoreError::Corrupt("operationの重複"));
@@ -392,6 +451,191 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
             return Err(StoreError::Corrupt("回答の承認参照"));
         }
     }
+    Ok(())
+}
+
+fn validate_artifact_bodies(root: &StoreRoot, published: &Published) -> StoreResult<()> {
+    let mut contracts = std::collections::BTreeSet::new();
+    let mut features = std::collections::BTreeSet::new();
+    let mut tasks = Vec::new();
+    let workflows = published
+        .state
+        .workflow
+        .iter()
+        .chain(
+            published
+                .state
+                .runs
+                .iter()
+                .filter_map(|record| record.workflow.as_ref()),
+        )
+        .collect::<Vec<_>>();
+    for workflow in &workflows {
+        if let Some(reference) = &workflow.state.active_change_contract {
+            contracts.insert(reference.clone());
+        }
+        if let Some(reference) = &workflow.state.active_feature {
+            features.insert(reference.clone());
+        }
+        if let Some(reference) = &workflow.state.active_task
+            && !tasks.contains(reference)
+        {
+            tasks.push(reference.clone());
+        }
+    }
+    if contracts.is_empty()
+        && features.is_empty()
+        && tasks.is_empty()
+        && workflows
+            .iter()
+            .all(|workflow| workflow.gates.convergence.is_none())
+    {
+        return Ok(());
+    }
+
+    let store = super::WorkflowArtifactStore::from_root(
+        root.directory.clone(),
+        &published.marker.project_id,
+    )?;
+    for reference in contracts {
+        let metadata = published
+            .state
+            .workflow_artifacts
+            .metadata(&reference)
+            .ok_or(StoreError::Corrupt("workflow artifact graph/body"))?;
+        let contract = store.read_change_contract(&reference)?;
+        if contract.header != metadata.header || contract.eligibility != metadata.eligibility {
+            return Err(StoreError::Corrupt("workflow artifact graph/body"));
+        }
+    }
+    for reference in features {
+        store.read_feature_spec(&published.state.workflow_artifacts, &reference)?;
+    }
+    for reference in tasks {
+        let task_graph =
+            store.read_task_graph(&published.state.workflow_artifacts, &reference.task_graph)?;
+        reference
+            .validate_against(&task_graph)
+            .map_err(|_| StoreError::Corrupt("workflow active task/body"))?;
+    }
+    for workflow in workflows {
+        if let Some(convergence) = &workflow.gates.convergence {
+            validate_owner_convergence_for_workflow(
+                &workflow.state,
+                &published.state.workflow_artifacts,
+                &store,
+                convergence,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn build_owner_convergence_for_workflow(
+    state: &crate::workflow::WorkflowStateV1,
+    graph: &crate::workflow::WorkflowArtifactGraphV1,
+    store: &super::WorkflowArtifactStore,
+    bundle: &crate::verification::owner::VerifiedConvergenceBundleV1,
+) -> StoreResult<ConvergenceInputV1> {
+    let observed = ObservedEvidenceSubjectV1 {
+        subject_hash: bundle.binding().subject_hash.clone(),
+        source_hash: bundle.binding().source_hash.clone(),
+        diff_hash: bundle.binding().diff_hash.clone(),
+    };
+    if let Some(reference) = &state.active_change_contract {
+        let contract = store.read_change_contract(reference)?;
+        return build_owner_convergence(
+            ActiveEvidenceArtifactsV1::RoutineContract {
+                artifact_graph: graph,
+                active_contract: reference,
+                contract: &contract,
+            },
+            &observed,
+            bundle.implementation_receipts().to_vec(),
+            bundle.reviews().to_vec(),
+            bundle.evidence().to_vec(),
+        )
+        .and_then(|convergence| {
+            if convergence.binding != *bundle.binding() {
+                return Err("verification bundle binding is not current".into());
+            }
+            Ok(convergence)
+        })
+        .map_err(|_| StoreError::RunConflict);
+    }
+    let (feature_reference, active_task) =
+        match (state.active_feature.as_ref(), state.active_task.as_ref()) {
+            (Some(feature), Some(task)) => (feature, task),
+            _ => return Err(StoreError::RunConflict),
+        };
+    let feature = store.read_feature_spec(graph, feature_reference)?;
+    let task_graph = store.read_task_graph(graph, &active_task.task_graph)?;
+    build_owner_convergence(
+        ActiveEvidenceArtifactsV1::PlannedTask {
+            artifact_graph: graph,
+            active_feature: feature_reference,
+            active_task,
+            feature: &feature,
+            task_graph: &task_graph,
+        },
+        &observed,
+        bundle.implementation_receipts().to_vec(),
+        bundle.reviews().to_vec(),
+        bundle.evidence().to_vec(),
+    )
+    .and_then(|convergence| {
+        if convergence.binding != *bundle.binding() {
+            return Err("verification bundle binding is not current".into());
+        }
+        Ok(convergence)
+    })
+    .map_err(|_| StoreError::RunConflict)
+}
+
+fn validate_owner_convergence_for_workflow(
+    state: &crate::workflow::WorkflowStateV1,
+    graph: &crate::workflow::WorkflowArtifactGraphV1,
+    store: &super::WorkflowArtifactStore,
+    convergence: &ConvergenceInputV1,
+) -> StoreResult<()> {
+    let observed = ObservedEvidenceSubjectV1 {
+        subject_hash: convergence.binding.subject_hash.clone(),
+        source_hash: convergence.binding.source_hash.clone(),
+        diff_hash: convergence.binding.diff_hash.clone(),
+    };
+    if let Some(reference) = &state.active_change_contract {
+        let contract = store.read_change_contract(reference)?;
+        validate_owner_convergence(
+            ActiveEvidenceArtifactsV1::RoutineContract {
+                artifact_graph: graph,
+                active_contract: reference,
+                contract: &contract,
+            },
+            &observed,
+            convergence.clone(),
+        )
+        .map_err(|_| StoreError::Corrupt("workflow convergence/body"))?;
+        return Ok(());
+    }
+    let (feature_reference, active_task) =
+        match (state.active_feature.as_ref(), state.active_task.as_ref()) {
+            (Some(feature), Some(task)) => (feature, task),
+            _ => return Err(StoreError::Corrupt("workflow convergence/active artifact")),
+        };
+    let feature = store.read_feature_spec(graph, feature_reference)?;
+    let task_graph = store.read_task_graph(graph, &active_task.task_graph)?;
+    validate_owner_convergence(
+        ActiveEvidenceArtifactsV1::PlannedTask {
+            artifact_graph: graph,
+            active_feature: feature_reference,
+            active_task,
+            feature: &feature,
+            task_graph: &task_graph,
+        },
+        &observed,
+        convergence.clone(),
+    )
+    .map_err(|_| StoreError::Corrupt("workflow convergence/body"))?;
     Ok(())
 }
 
@@ -555,6 +799,7 @@ impl Writer {
         )?;
         let current = &self.published.marker;
         let published = reconcile(&self.directory, &current.project_id, &current.session_id)?;
+        validate_artifact_bodies(&self.root, &published)?;
         self.root.directory.sync()?;
         self.published = published;
         self.recovery_required = false;
@@ -615,11 +860,316 @@ impl Writer {
             return Err(StoreError::Busy);
         }
         if let Some(saved) = &workflow {
-            saved.validate()?;
+            saved.validate_with_artifacts(&self.published.state.workflow_artifacts)?;
         }
         let mut next = self.published.clone();
         next.state.workflow = workflow;
         self.commit(next, false)
+    }
+
+    /// Publish an immutable draft/ready contract body before advancing the
+    /// session's metadata graph. This operation does not approve the body or
+    /// grant a phase transition.
+    pub fn publish_change_contract(
+        &mut self,
+        expected_session_revision: DecimalU64,
+        contract: crate::workflow::ChangeContractV1,
+    ) -> StoreResult<crate::workflow::ArtifactRefV1> {
+        self.ready()?;
+        cas(
+            expected_session_revision,
+            self.published.marker.session_revision,
+            "session",
+        )?;
+        if !matches!(
+            contract.header.status,
+            crate::workflow::ArtifactStatusV1::Draft | crate::workflow::ArtifactStatusV1::Ready
+        ) {
+            return Err(StoreError::RunConflict);
+        }
+        let reference = contract.reference();
+        let mut graph = self.published.state.workflow_artifacts.clone();
+        let inserted = graph
+            .insert_change_contract(&contract)
+            .map_err(|_| StoreError::RunConflict)?;
+        let store = super::WorkflowArtifactStore::from_root(
+            self.root.directory.clone(),
+            &self.published.marker.project_id,
+        )?;
+        store.put_change_contract(&contract)?;
+        if !inserted {
+            return Ok(reference);
+        }
+        let mut next = self.published.clone();
+        next.state.workflow_artifacts = graph;
+        self.commit(next, false)?;
+        Ok(reference)
+    }
+
+    /// Trusted approval creates a new immutable revision and publishes its
+    /// graph entry together with the compact active reference. Runs already in
+    /// flight retain their accepted snapshot, so approval is idle-only.
+    pub fn approve_change_contract_trusted(
+        &mut self,
+        expected_session_revision: DecimalU64,
+        reference: &crate::workflow::ArtifactRefV1,
+    ) -> StoreResult<crate::workflow::ArtifactRefV1> {
+        self.ready()?;
+        cas(
+            expected_session_revision,
+            self.published.marker.session_revision,
+            "session",
+        )?;
+        if self
+            .published
+            .state
+            .runs
+            .iter()
+            .any(|run| !run.run.state.is_terminal())
+        {
+            return Err(StoreError::Busy);
+        }
+        let metadata = self
+            .published
+            .state
+            .workflow_artifacts
+            .metadata(reference)
+            .ok_or(StoreError::NotFound)?
+            .clone();
+        let store = super::WorkflowArtifactStore::from_root(
+            self.root.directory.clone(),
+            &self.published.marker.project_id,
+        )?;
+        let contract = store.read_change_contract(reference)?;
+        if contract.header != metadata.header
+            || contract.eligibility != metadata.eligibility
+            || !matches!(
+                contract.header.status,
+                crate::workflow::ArtifactStatusV1::Draft | crate::workflow::ArtifactStatusV1::Ready
+            )
+        {
+            return Err(StoreError::RunConflict);
+        }
+        let approved = contract
+            .revised(crate::workflow::ArtifactStatusV1::Approved)
+            .map_err(|_| StoreError::RunConflict)?;
+        let approved_reference = approved.reference();
+        let mut graph = self.published.state.workflow_artifacts.clone();
+        graph
+            .insert_change_contract(&approved)
+            .map_err(|_| StoreError::RunConflict)?;
+        store.put_change_contract(&approved)?;
+
+        let saved = self.published.state.workflow.clone().unwrap_or_else(|| {
+            super::SavedWorkflow::capture(&crate::workflow::SessionWorkflow::new(
+                crate::workflow::WorkflowConfig::default(),
+            ))
+        });
+        let mut gates = saved.gates.clone();
+        gates.phase_gate_schema_version = Some(crate::workflow::WORKFLOW_ARTIFACT_SCHEMA_VERSION);
+        let restored = crate::workflow::SessionWorkflow::restore_with_artifacts(
+            saved.config.clone(),
+            gates,
+            saved.state.clone(),
+            graph.clone(),
+        )
+        .map_err(|_| StoreError::RunConflict)?;
+        let workflow = restored
+            .with_approved_change_contract(graph.clone(), approved_reference.clone())
+            .map_err(|_| StoreError::RunConflict)?;
+        let mut next = self.published.clone();
+        next.state.workflow_artifacts = graph;
+        next.state.workflow = Some(super::SavedWorkflow::capture(&workflow));
+        self.commit(next, false)?;
+        Ok(approved_reference)
+    }
+
+    /// Root run entry point for an ordinary local change. Artifact bodies are
+    /// written first and the graph, active ref, session workflow and accepted
+    /// run snapshot advance in one marker commit. The model cannot select an
+    /// approved status or bypass the deterministic routine predicate.
+    pub fn publish_and_approve_routine_contract(
+        &mut self,
+        target: &RunTarget,
+        expected_workflow_revision: u64,
+        contract: crate::workflow::ChangeContractV1,
+    ) -> StoreResult<crate::workflow::SessionWorkflow> {
+        self.ready()?;
+        if contract.header.status != crate::workflow::ArtifactStatusV1::Draft
+            || !contract.eligibility.is_routine()
+        {
+            return Err(StoreError::RunConflict);
+        }
+        let run_index = self.run_index(target)?;
+        if self.published.state.runs[run_index].run.state.is_terminal() {
+            return Err(StoreError::RunConflict);
+        }
+        let saved = self.published.state.runs[run_index]
+            .workflow
+            .clone()
+            .or_else(|| self.published.state.workflow.clone())
+            .unwrap_or_else(|| {
+                super::SavedWorkflow::capture(&crate::workflow::SessionWorkflow::new(
+                    crate::workflow::WorkflowConfig::default(),
+                ))
+            });
+        if saved.state.revision != expected_workflow_revision {
+            return Err(StoreError::CasConflict("workflow"));
+        }
+        let store = super::WorkflowArtifactStore::from_root(
+            self.root.directory.clone(),
+            &self.published.marker.project_id,
+        )?;
+        let mut graph = self.published.state.workflow_artifacts.clone();
+        graph
+            .insert_change_contract(&contract)
+            .map_err(|_| StoreError::RunConflict)?;
+        store.put_change_contract(&contract)?;
+        let approved = contract
+            .revised(crate::workflow::ArtifactStatusV1::Approved)
+            .map_err(|_| StoreError::RunConflict)?;
+        let approved_reference = approved.reference();
+        graph
+            .insert_change_contract(&approved)
+            .map_err(|_| StoreError::RunConflict)?;
+        store.put_change_contract(&approved)?;
+
+        let mut gates = saved.gates.clone();
+        gates.phase_gate_schema_version = Some(crate::workflow::WORKFLOW_ARTIFACT_SCHEMA_VERSION);
+        let restored = crate::workflow::SessionWorkflow::restore_with_artifacts(
+            saved.config.clone(),
+            gates,
+            saved.state,
+            graph.clone(),
+        )
+        .map_err(|_| StoreError::RunConflict)?;
+        let workflow = restored
+            .with_approved_change_contract(graph.clone(), approved_reference)
+            .map_err(|_| StoreError::RunConflict)?;
+        let captured = super::SavedWorkflow::capture(&workflow);
+        let mut next = self.published.clone();
+        next.state.workflow_artifacts = graph;
+        next.state.workflow = Some(captured.clone());
+        next.state.runs[run_index].workflow = Some(captured.clone());
+        self.commit(next, false)?;
+        Ok(workflow)
+    }
+
+    /// The desktop store is the sole writer for a run. It reloads the exact
+    /// active body under its lock, derives the required criteria and binding,
+    /// and commits the resulting convergence with the run workflow snapshot.
+    pub fn publish_convergence_trusted(
+        &mut self,
+        target: &RunTarget,
+        expected_workflow_revision: u64,
+        bundle: crate::verification::owner::VerifiedConvergenceBundleV1,
+    ) -> StoreResult<crate::workflow::SessionWorkflow> {
+        self.ready()?;
+        let run_index = self.run_index(target)?;
+        if self.published.state.runs[run_index].run.state.is_terminal() {
+            return Err(StoreError::RunConflict);
+        }
+        let saved = self.published.state.runs[run_index]
+            .workflow
+            .clone()
+            .or_else(|| self.published.state.workflow.clone())
+            .unwrap_or_else(|| {
+                super::SavedWorkflow::capture(&crate::workflow::SessionWorkflow::new(
+                    crate::workflow::WorkflowConfig::default(),
+                ))
+            });
+        if saved.state.revision != expected_workflow_revision {
+            return Err(StoreError::CasConflict("workflow"));
+        }
+        let store = super::WorkflowArtifactStore::from_root(
+            self.root.directory.clone(),
+            &self.published.marker.project_id,
+        )?;
+        let convergence = build_owner_convergence_for_workflow(
+            &saved.state,
+            &self.published.state.workflow_artifacts,
+            &store,
+            &bundle,
+        )?;
+        let restored = crate::workflow::SessionWorkflow::restore_with_artifacts(
+            saved.config.clone(),
+            saved.gates.clone(),
+            saved.state,
+            self.published.state.workflow_artifacts.clone(),
+        )
+        .map_err(|_| StoreError::RunConflict)?;
+        let workflow = restored
+            .with_convergence_trusted(convergence)
+            .map_err(|_| StoreError::RunConflict)?;
+        let captured = super::SavedWorkflow::capture(&workflow);
+        let mut next = self.published.clone();
+        next.state.workflow = Some(captured.clone());
+        next.state.runs[run_index].workflow = Some(captured);
+        self.commit(next, false)?;
+        Ok(workflow)
+    }
+
+    /// Load only a body referenced by this session's current metadata graph.
+    pub fn load_change_contract(
+        &self,
+        reference: &crate::workflow::ArtifactRefV1,
+    ) -> StoreResult<crate::workflow::ChangeContractV1> {
+        self.ready()?;
+        let metadata = self
+            .published
+            .state
+            .workflow_artifacts
+            .metadata(reference)
+            .ok_or(StoreError::NotFound)?;
+        let store = super::WorkflowArtifactStore::from_root(
+            self.root.directory.clone(),
+            &self.published.marker.project_id,
+        )?;
+        let contract = store.read_change_contract(reference)?;
+        if contract.header != metadata.header || contract.eligibility != metadata.eligibility {
+            return Err(StoreError::Corrupt("workflow artifact graph/body"));
+        }
+        Ok(contract)
+    }
+
+    /// Read one exact immutable workflow body. The caller names the kind and
+    /// complete content-addressed reference; there is no "latest" lookup.
+    pub fn read_workflow_artifact(
+        &self,
+        kind: crate::workflow::WorkflowArtifactKindV1,
+        reference: &crate::workflow::ArtifactRefV1,
+    ) -> StoreResult<serde_json::Value> {
+        self.ready()?;
+        let graph = &self.published.state.workflow_artifacts;
+        let metadata = graph.metadata(reference).ok_or(StoreError::NotFound)?;
+        if metadata.kind != kind {
+            return Err(StoreError::RunConflict);
+        }
+        let store = super::WorkflowArtifactStore::from_root(
+            self.root.directory.clone(),
+            &self.published.marker.project_id,
+        )?;
+        let value = match kind {
+            crate::workflow::WorkflowArtifactKindV1::ProjectPrinciples => {
+                serde_json::to_value(store.read_project_principles(graph, reference)?)?
+            }
+            crate::workflow::WorkflowArtifactKindV1::IdeaDecision => {
+                serde_json::to_value(store.read_idea_decision(graph, reference)?)?
+            }
+            crate::workflow::WorkflowArtifactKindV1::ChangeContract => {
+                serde_json::to_value(self.load_change_contract(reference)?)?
+            }
+            crate::workflow::WorkflowArtifactKindV1::FeatureSpec => {
+                serde_json::to_value(store.read_feature_spec(graph, reference)?)?
+            }
+            crate::workflow::WorkflowArtifactKindV1::ImplementationPlan => {
+                serde_json::to_value(store.read_implementation_plan(graph, reference)?)?
+            }
+            crate::workflow::WorkflowArtifactKindV1::TaskGraph => {
+                serde_json::to_value(store.read_task_graph(graph, reference)?)?
+            }
+        };
+        Ok(value)
     }
 
     pub(super) fn commit(&mut self, mut next: Published, content_changed: bool) -> StoreResult<()> {
@@ -905,6 +1455,7 @@ impl Writer {
                             state: RunState::Queued,
                             task_ids: Vec::new(),
                         },
+                        admission: None,
                         configuration: state.configuration.clone(),
                         role_bindings: state.role_bindings.clone(),
                         tier_bindings: state.tier_bindings.clone(),
@@ -970,6 +1521,156 @@ impl Writer {
         state.requests.push(record.clone());
         self.commit(next, content_changed)?;
         Ok(self.acceptance(&record))
+    }
+
+    /// Atomically appends one manager-admitted user input and its queued run.
+    ///
+    /// The admission binding is part of the same sidecar generation as the
+    /// raw user message.  A recovered manager can therefore advance from
+    /// `DestinationReady` without ever sending or appending the input again.
+    /// Replaying the same admission is a read; reusing its ID for another
+    /// payload or destination fails closed.
+    pub fn append_admitted_run(
+        &mut self,
+        admission: &crate::session_manager::AdmissionV1,
+        target: RunTarget,
+        account: Option<super::SavedAccount>,
+    ) -> StoreResult<AdmittedRun> {
+        if let Some(account) = &account {
+            account.validate()?;
+        }
+        self.ready()?;
+        let destination = match &admission.state {
+            crate::session_manager::AdmissionState::DestinationReady { session_id, .. }
+                if session_id.as_str() == self.published.marker.session_id.as_str() =>
+            {
+                session_id
+            }
+            _ => return Err(StoreError::TargetMismatch),
+        };
+        if let Some(existing) = self.published.state.runs.iter().find(|record| {
+            record
+                .admission
+                .as_ref()
+                .is_some_and(|saved| saved.admission_id == admission.id.as_str())
+        }) {
+            let saved = existing
+                .admission
+                .as_ref()
+                .ok_or(StoreError::Corrupt("admission binding"))?;
+            let attachments = admission
+                .payload
+                .attachment_ids
+                .iter()
+                .map(|id| {
+                    AttachmentId::new(id.as_str()).map_err(|_| StoreError::Corrupt("attachment"))
+                })
+                .collect::<StoreResult<Vec<_>>>()?;
+            if saved.payload_hash != admission.payload_hash
+                || saved.destination_session_id != self.published.marker.session_id
+                || existing.input.text != admission.payload.text
+                || existing.input.attachment_ids != attachments
+            {
+                return Err(StoreError::RequestConflict);
+            }
+            return Ok(AdmittedRun {
+                run: existing.clone(),
+                newly_appended: false,
+            });
+        }
+        if self.published.state.runs.iter().any(|record| {
+            record.run.run_id == target.run_id || record.run.attempt_id == target.attempt_id
+        }) {
+            return Err(StoreError::RunConflict);
+        }
+        let attachments = admission
+            .payload
+            .attachment_ids
+            .iter()
+            .map(|id| AttachmentId::new(id.as_str()).map_err(|_| StoreError::Corrupt("attachment")))
+            .collect::<StoreResult<Vec<_>>>()?;
+        let consumed_draft_revision = self.published.state.draft.draft_revision;
+        let consumes_current_draft = self.published.marker.session_revision.get()
+            == admission.payload.expected_session_revision
+            && self.published.state.draft.text == admission.payload.text
+            && self.published.state.draft.attachment_ids == attachments;
+        let input = Draft {
+            draft_revision: consumed_draft_revision,
+            text: admission.payload.text.clone(),
+            attachment_ids: attachments.clone(),
+        };
+        let mut next = self.published.clone();
+        let prior = next.raw.last();
+        next.raw.push(RawEventV2 {
+            schema_version: 2,
+            sequence: prior.map_or(Ok(1), |event| {
+                event.sequence.checked_add(1).ok_or(StoreError::Overflow)
+            })?,
+            epoch: next.marker.epoch.get(),
+            turn_id: prior.map_or(Ok(1), |event| {
+                event.turn_id.checked_add(1).ok_or(StoreError::Overflow)
+            })?,
+            starts_turn: true,
+            message: Message::user(input.text.clone()),
+        });
+        let state = &mut next.state;
+        let record = RunRecord {
+            run: Run {
+                run_id: target.run_id,
+                attempt_id: target.attempt_id,
+                state: RunState::Queued,
+                task_ids: Vec::new(),
+            },
+            admission: Some(SavedAdmissionBinding {
+                admission_id: admission.id.as_str().to_owned(),
+                payload_hash: admission.payload_hash.clone(),
+                destination_session_id: self.published.marker.session_id.clone(),
+            }),
+            configuration: state.configuration.clone(),
+            role_bindings: state.role_bindings.clone(),
+            tier_bindings: state.tier_bindings.clone(),
+            account,
+            policy_revision: state.policy_revision,
+            input,
+            mcp_prompt: None,
+            operations: Vec::new(),
+            result_id: None,
+            usage: None,
+            memory: None,
+            memory_resources: None,
+            workflow: state.workflow.clone(),
+            history_gap: None,
+        };
+        state.runs.push(record.clone());
+        if consumes_current_draft && state.draft.draft_revision == consumed_draft_revision {
+            state.draft = Draft {
+                draft_revision: state.draft.draft_revision.checked_add(1)?,
+                text: String::new(),
+                attachment_ids: Vec::new(),
+            };
+        }
+        self.commit(next, true)?;
+        let _ = destination;
+        Ok(AdmittedRun {
+            run: record,
+            newly_appended: true,
+        })
+    }
+
+    pub fn admitted_run(&self, admission_id: &str) -> StoreResult<Option<RunRecord>> {
+        self.ready()?;
+        Ok(self
+            .published
+            .state
+            .runs
+            .iter()
+            .find(|record| {
+                record
+                    .admission
+                    .as_ref()
+                    .is_some_and(|binding| binding.admission_id == admission_id)
+            })
+            .cloned())
     }
 
     /// NewlyPublishedだけが新しい開始意図の耐久保存を示す。実際の認可は上位層の責務。
@@ -1440,10 +2141,11 @@ impl Writer {
         previous: super::SavedWorkflow,
         candidate: super::SavedWorkflow,
         tool_call_id: Option<&str>,
+        gate_basis_hash: Option<&str>,
     ) -> StoreResult<()> {
         self.ready()?;
-        previous.validate()?;
-        candidate.validate()?;
+        previous.validate_with_artifacts(&self.published.state.workflow_artifacts)?;
+        candidate.validate_with_artifacts(&self.published.state.workflow_artifacts)?;
         validate_turn_suffix(&full_turn_suffix, Observation::Cancelled)?;
         if let Some(id) = tool_call_id
             && !full_turn_suffix
@@ -1454,6 +2156,7 @@ impl Writer {
         }
         if previous.config != candidate.config
             || !same_or_staled_gates(&previous.gates, &candidate.gates)
+            || previous.state.active_change_contract != candidate.state.active_change_contract
             || (candidate.state.revision == previous.state.revision
                 && candidate.state != previous.state)
             || (candidate.state.revision != previous.state.revision
@@ -1465,6 +2168,37 @@ impl Writer {
                         .ok_or(StoreError::Overflow)?)
         {
             return Err(StoreError::RunConflict);
+        }
+        let phase_changed = previous.state.phase != candidate.state.phase;
+        if phase_changed || gate_basis_hash.is_some() {
+            // The graph hash does not prove that the immutable body still
+            // exists. Revalidate it under the writer lock immediately before
+            // evaluating the phase gate.
+            validate_artifact_bodies(&self.root, &self.published)?;
+        }
+        if phase_changed && previous.gates.phase_gate_schema_version.is_some() {
+            let supplied = gate_basis_hash.ok_or(StoreError::RunConflict)?;
+            let proof = crate::workflow::evaluate_phase_transition(
+                &previous.state,
+                candidate.state.phase,
+                &previous.gates,
+                &self.published.state.workflow_artifacts,
+            )
+            .map_err(|_| StoreError::RunConflict)?;
+            if proof.basis_hash != supplied {
+                return Err(StoreError::RunConflict);
+            }
+        } else if let Some(supplied) = gate_basis_hash {
+            let proof = crate::workflow::evaluate_phase_transition(
+                &previous.state,
+                candidate.state.phase,
+                &previous.gates,
+                &self.published.state.workflow_artifacts,
+            )
+            .map_err(|_| StoreError::RunConflict)?;
+            if proof.basis_hash != supplied {
+                return Err(StoreError::RunConflict);
+            }
         }
         let index = self.run_index(target)?;
         let record = &self.published.state.runs[index];
@@ -1536,11 +2270,16 @@ impl Writer {
     ) -> StoreResult<()> {
         self.ready()?;
         if let Some(saved) = &workflow {
-            saved.validate()?;
+            saved.validate_with_artifacts(&self.published.state.workflow_artifacts)?;
         }
         validate_turn_suffix(&messages, outcome)?;
         let index = self.run_index(target)?;
         let record = &self.published.state.runs[index];
+        // The terminal publication may append raw output, but it may not
+        // smuggle in a workflow state that was never checkpointed and ACKed.
+        if record.workflow != workflow {
+            return Err(StoreError::RunConflict);
+        }
         if record.history_gap.is_some() && outcome == Observation::Succeeded {
             return Err(StoreError::RunConflict);
         }
@@ -2295,7 +3034,9 @@ fn same_or_staled_gates(
     candidate: &crate::workflow::WorkflowGatesV1,
 ) -> bool {
     if previous.schema_version != candidate.schema_version
+        || previous.phase_gate_schema_version != candidate.phase_gate_schema_version
         || previous.approved_spec_hash != candidate.approved_spec_hash
+        || previous.convergence != candidate.convergence
         || previous.external_grants != candidate.external_grants
     {
         return false;
@@ -2312,15 +3053,16 @@ fn same_or_staled_gates(
 }
 
 fn checkpoint_base_matches(saved: &super::SavedWorkflow, previous: &super::SavedWorkflow) -> bool {
+    let mut previous_without_first_manifest = previous.state.clone();
+    previous_without_first_manifest.skill_manifest_hash.clear();
+    previous_without_first_manifest.skills.clear();
     saved.config == previous.config
-        && saved.state.phase == previous.state.phase
-        && saved.state.revision == previous.state.revision
         && same_or_staled_gates(&saved.gates, &previous.gates)
         && (saved.state == previous.state
             // `begin_turn` fixes the first request's manifest before provider
-            // admission. A legacy durable snapshot has no manifest yet.
-            || (saved.state.skill_manifest_hash.is_empty()
-                && saved.state.skills.is_empty()
+            // admission. A legacy durable snapshot has no manifest yet; every
+            // other field, including step and active artifact, must match.
+            || (saved.state == previous_without_first_manifest
                 && !previous.state.skill_manifest_hash.is_empty()))
 }
 

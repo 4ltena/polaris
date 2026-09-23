@@ -366,7 +366,7 @@ mod tests {
             ));
         }
         for (key, value) in [
-            ("version", serde_json::json!(2)),
+            ("version", serde_json::json!(3)),
             ("run_id", serde_json::json!("")),
             ("request_id", serde_json::json!("x".repeat(129))),
             ("payload_hash", serde_json::json!("A".repeat(64))),

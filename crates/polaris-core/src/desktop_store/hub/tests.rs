@@ -40,6 +40,7 @@ fn empty() -> Sidecar {
         unresolved_approvals: Vec::new(),
         approval_records: Vec::new(),
         workflow: None,
+        workflow_artifacts: Default::default(),
     }
 }
 
@@ -74,6 +75,7 @@ fn run(id: &str, state: RunState) -> crate::desktop_store::RunRecord {
             state,
             task_ids: vec![TaskId::new("t1").unwrap()],
         },
+        admission: None,
         configuration: configuration(),
         role_bindings: None,
         tier_bindings: None,

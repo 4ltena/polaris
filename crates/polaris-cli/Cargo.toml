@@ -17,11 +17,14 @@ polaris-mcp = { path = "../polaris-mcp" }
 polaris-provider = { path = "../polaris-provider" }
 polaris-sandbox = { path = "../polaris-sandbox" }
 polaris-skills = { path = "../polaris-skills" }
+polaris-tools = { path = "../polaris-tools" }
 polaris-tui = { path = "../polaris-tui" }
 async-trait = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 tokio = { workspace = true }
@@ -29,5 +32,4 @@ tokio = { workspace = true }
 [dev-dependencies]
 # 本物のバイナリを本物のプロファイルの下でヘルパとして起動する統合テスト
 # （tests/confined_helper.rs）が、ツール層をそのまま通すために要る。
-polaris-tools = { path = "../polaris-tools" }
 tempfile = { workspace = true }

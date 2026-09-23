@@ -20,8 +20,10 @@ mod time;
 pub mod tool_memory;
 
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,8 +33,14 @@ use polaris_core::agent::{self, ToolContext};
 use polaris_core::approval::{ApprovalPolicy, Gate};
 use polaris_core::audit::AuditLog;
 use polaris_core::prompt::AlwaysOn;
+use polaris_core::session::{RootDelegationConfigV1, RootDelegationControlV1};
 use polaris_core::stop::StopTracker;
+use polaris_core::subagent_control::{
+    ApprovalCapabilityV1, CapabilitySnapshotV1, McpCapabilityV1, RootAttemptId, RootRunId,
+    SandboxCapabilityV1, TaskId,
+};
 use polaris_provider::Provider;
+use polaris_provider::local::{Capability, Endpoint, LocalAdapter, ModelMetadata, Runtime};
 use polaris_sandbox::SandboxPolicy;
 use polaris_skills::Skill;
 
@@ -40,12 +48,16 @@ use approver::{CrosstermKeyReader, TuiApprover};
 use input::{InputAction, apply_key};
 use render::Status;
 
+const UNDECIDED_EFFORT: &str = "undecided";
+
 /// CLI-owned constructor, invoked only when a selected strict session needs it.
 pub type HistoryBackend = (
     Arc<polaris_core::conversation_memory::StrictHistory>,
     polaris_provider::UsageMeter,
 );
 pub type HistoryBackendFactory = Arc<dyn Fn() -> Result<HistoryBackend, String> + Send + Sync>;
+pub type TurnAuthorityInstaller =
+    Arc<dyn Fn(&mut polaris_core::session::Session, &str) -> Result<(), String> + Send + Sync>;
 
 /// Everything `run()` needs, already built by `polaris-cli::main()` the
 /// same way the one-shot path builds it. `polaris-tui` never constructs a
@@ -57,12 +69,27 @@ pub struct RunArgs<'a> {
     pub provider: Arc<dyn Provider>,
     /// A fixed independent selector; model-picker changes affect only the primary.
     pub mcp_selection_provider: Option<Arc<dyn Provider>>,
+    /// The same typed judge and tier selector used by one-shot runs. TUI
+    /// sessions retain them across `/new`, `/fork`, and `/resume`.
+    pub decider: Option<Arc<dyn polaris_provider::decision::Decider>>,
+    pub tier_decider: Option<Arc<dyn polaris_core::tier::TierDecider>>,
+    /// Non-authoritative final-answer observer. It runs only after the
+    /// canonical assistant message is durable and can never replace output.
+    pub answer_finalizer: Option<Arc<polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner>>,
+    pub sidechat_auto: bool,
+    /// Host-visible root tool capability names. The TUI does not discover a
+    /// second catalogue; the CLI passes the same fixed list as one-shot runs.
+    pub tool_names: Vec<String>,
+    /// Optional host-issued authority bound to the first ordinary TUI input.
+    /// The installer owns validation and single-use semantics; model text
+    /// cannot construct or retain it.
+    pub turn_authority: Option<TurnAuthorityInstaller>,
     pub provider_name: String,
     pub model_name: String,
     /// Seeds the footer with the caller's selected effort, as a wire token
     /// (`--effort`'s own spelling); it is translated to the matching
-    /// catalog row by `render::effort_display_name`. Absent means
-    /// `render::DEFAULT_EFFORT`.
+    /// catalog row by `render::effort_display_name`. Absent means Jev judges
+    /// effort for each hosted turn and the footer starts as `undecided`.
     pub initial_effort_name: Option<String>,
     pub cwd: PathBuf,
     pub state_dir: PathBuf,
@@ -263,7 +290,7 @@ async fn new_workflow_session(
         )
         .await?;
     } else if config.enabled {
-        let workflow = polaris_core::workflow::SessionWorkflow::new(config.clone());
+        let workflow = polaris_core::workflow::SessionWorkflow::try_new(config.clone())?;
         if let Some(phase) = initial_phase {
             workflow.request_phase(phase)?;
         }
@@ -299,6 +326,687 @@ async fn new_workflow_session(
             .map_err(|error| error.to_string())?;
     }
     Ok(session)
+}
+
+fn delegation_capabilities(
+    sandbox: &SandboxPolicy,
+    approval: ApprovalPolicy,
+    mcp_available: bool,
+    tool_names: &[String],
+) -> CapabilitySnapshotV1 {
+    let sandbox_capability = match sandbox.mode() {
+        polaris_sandbox::SandboxMode::ReadOnly => SandboxCapabilityV1::ReadOnly,
+        polaris_sandbox::SandboxMode::WorkspaceWrite => SandboxCapabilityV1::WorkspaceWrite,
+        polaris_sandbox::SandboxMode::FullAccess => SandboxCapabilityV1::FullAccess,
+    };
+    let approval = match approval {
+        ApprovalPolicy::Never => ApprovalCapabilityV1::Never,
+        ApprovalPolicy::OnRequest => ApprovalCapabilityV1::OnRequest,
+        ApprovalPolicy::Always => ApprovalCapabilityV1::TrustedOwnerOnly,
+    };
+    CapabilitySnapshotV1 {
+        sandbox: sandbox_capability,
+        write_roots: sandbox
+            .writable_roots()
+            .iter()
+            .filter_map(|path| path.to_str().map(str::to_owned))
+            .collect(),
+        tool_names: tool_names.to_vec(),
+        approval,
+        mcp: if mcp_available {
+            McpCapabilityV1::ReadSnapshotsOnly
+        } else {
+            McpCapabilityV1::None
+        },
+    }
+}
+
+struct TuiAdmissionTurn {
+    store: polaris_core::desktop_store::SessionManagerStore,
+    manager: polaris_core::session_manager::SessionManagerV1,
+    admission_id: polaris_core::session_manager::AdmissionId,
+}
+
+#[derive(Debug)]
+enum TuiAdmissionFailure {
+    Retryable(String),
+    Consumed(String),
+}
+
+impl TuiAdmissionFailure {
+    fn consumed(message: impl Into<String>) -> Self {
+        Self::Consumed(message.into())
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Retryable(message) | Self::Consumed(message) => message,
+        }
+    }
+}
+
+impl From<String> for TuiAdmissionFailure {
+    fn from(message: String) -> Self {
+        Self::Retryable(message)
+    }
+}
+
+impl From<&str> for TuiAdmissionFailure {
+    fn from(message: &str) -> Self {
+        Self::Retryable(message.to_owned())
+    }
+}
+
+impl TuiAdmissionTurn {
+    fn finish(
+        mut self,
+        status: polaris_core::session_manager::TerminalStatus,
+    ) -> Result<(), String> {
+        let admission = self
+            .manager
+            .status(&self.admission_id)
+            .map_err(|error| error.to_string())?
+            .clone();
+        let before = self.manager.revision;
+        self.manager
+            .terminal(&self.admission_id, before, admission.revision, status)
+            .map_err(|error| error.to_string())?;
+        self.store
+            .persist(before, &self.manager)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn bounded_routing_text(text: &str, maximum: usize) -> String {
+    if text.len() <= maximum {
+        return text.to_owned();
+    }
+    let mut end = maximum;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+fn tui_routing_context(
+    session: &polaris_core::session::Session,
+) -> Result<polaris_core::session_manager::RoutingContextV1, String> {
+    use polaris_core::session_manager::{CompletedUserTurnV1, RoutingContextV1};
+    use polaris_provider::Role;
+
+    let goal = session.workflow.as_ref().map_or_else(
+        || "none".to_owned(),
+        |workflow| {
+            let state = workflow.state();
+            if let Some(task) = &state.active_task {
+                format!("active task {}", task.task_id)
+            } else if let Some(contract) = &state.active_change_contract {
+                format!("active change contract {}", contract.id)
+            } else if let Some(feature) = &state.active_feature {
+                format!("active feature {}", feature.id)
+            } else {
+                format!("workflow phase {}", state.phase)
+            }
+        },
+    );
+    let users = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == Role::User && message.tool_call_id.is_none())
+        .collect::<Vec<_>>();
+    let skip = users
+        .len()
+        .saturating_sub(polaris_core::session_manager::MAX_COMPLETED_TURNS);
+    let turns = users
+        .into_iter()
+        .skip(skip)
+        .map(|(index, message)| {
+            CompletedUserTurnV1::new(
+                format!("turn-{index}"),
+                bounded_routing_text(
+                    &message.content,
+                    polaris_core::session_manager::MAX_TURN_BYTES,
+                ),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RoutingContextV1::new(
+        bounded_routing_text(&goal, polaris_core::session_manager::MAX_GOAL_BYTES),
+        turns,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn ensure_private_directory(path: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(path).map_err(|error| error.to_string())?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    fs::canonicalize(path).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn open_tui_admission_owner(
+    state_dir: &Path,
+    current: &polaris_core::session_manager::SessionId,
+) -> Result<
+    (
+        polaris_core::desktop_store::SessionManagerStore,
+        polaris_core::session_manager::SessionManagerV1,
+    ),
+    String,
+> {
+    use polaris_core::desktop_store::SessionManagerStore;
+    use polaris_core::session_manager::SessionManagerV1;
+
+    let root = ensure_private_directory(&state_dir.join("tui-admissions-v1"))?;
+    let mut found = None;
+    for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() {
+            return Err("TUI admission保存先にsymlinkがあります".into());
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = fs::canonicalize(entry.path()).map_err(|error| error.to_string())?;
+        let store = SessionManagerStore::open_owned(&path).map_err(|error| error.to_string())?;
+        let Some(manager) = store.load().map_err(|error| error.to_string())? else {
+            continue;
+        };
+        if manager.sessions.contains_key(current) {
+            if found.is_some() {
+                return Err("conversationが複数のTUI admission ownerに属しています".into());
+            }
+            found = Some((store, manager));
+        }
+    }
+    if let Some(found) = found {
+        return Ok(found);
+    }
+
+    let family = ensure_private_directory(&root.join(current.as_str()))?;
+    let store = SessionManagerStore::open_owned(&family).map_err(|error| error.to_string())?;
+    let manager = SessionManagerV1::new(current.clone());
+    store
+        .initialize(&manager)
+        .map_err(|error| error.to_string())?;
+    Ok((store, manager))
+}
+
+#[cfg(not(unix))]
+fn open_tui_admission_owner(
+    _state_dir: &Path,
+    _current: &polaris_core::session_manager::SessionId,
+) -> Result<
+    (
+        polaris_core::desktop_store::SessionManagerStore,
+        polaris_core::session_manager::SessionManagerV1,
+    ),
+    String,
+> {
+    Err("TUI sidechat admissionはこのplatformでは利用できません".into())
+}
+
+fn persist_manager_transition(
+    store: &polaris_core::desktop_store::SessionManagerStore,
+    expected: u64,
+    manager: &polaris_core::session_manager::SessionManagerV1,
+) -> Result<(), String> {
+    store
+        .persist(expected, manager)
+        .map_err(|error| error.to_string())
+}
+
+fn recover_tui_admission_owner(
+    store: &polaris_core::desktop_store::SessionManagerStore,
+    manager: &mut polaris_core::session_manager::SessionManagerV1,
+    data_root: &Path,
+    database: &Path,
+    project_id: &str,
+) -> Result<(), String> {
+    use polaris_core::session_manager::{AdmissionState, TerminalStatus};
+
+    let before = manager.revision;
+    if manager
+        .recover_classifying()
+        .map_err(|error| error.to_string())?
+        != 0
+    {
+        persist_manager_transition(store, before, manager)?;
+    }
+    let pending = manager
+        .admissions
+        .values()
+        .filter(|admission| !matches!(admission.state, AdmissionState::Terminal { .. }))
+        .map(|admission| admission.id.clone())
+        .collect::<Vec<_>>();
+    for id in pending {
+        let mut admission = manager
+            .status(&id)
+            .map_err(|error| error.to_string())?
+            .clone();
+        if let AdmissionState::DestinationReady { session_id, .. } = &admission.state {
+            let committed = match polaris_core::session_store::PersistedSession::open(
+                data_root,
+                database,
+                project_id,
+                session_id.as_str(),
+            ) {
+                Ok(saved) => {
+                    let snapshot = saved.snapshot().map_err(|error| error.to_string())?;
+                    match snapshot.state.admission_receipts.get(id.as_str()) {
+                        Some(receipt) if receipt.payload_hash == admission.payload_hash => true,
+                        Some(_) => {
+                            return Err("保存済みadmission receiptがpayloadと不一致です".into());
+                        }
+                        None => false,
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.to_string()),
+            };
+            if committed {
+                let before = manager.revision;
+                admission = manager
+                    .recover_input_appended(&id, before, admission.revision, session_id)
+                    .map_err(|error| error.to_string())?;
+                persist_manager_transition(store, before, manager)?;
+            }
+        }
+        let before = manager.revision;
+        if matches!(admission.state, AdmissionState::Running { .. }) {
+            manager
+                .terminal(
+                    &id,
+                    before,
+                    admission.revision,
+                    TerminalStatus::OutcomeUnknown,
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            manager
+                .cancel(&id, before, admission.revision)
+                .map_err(|error| error.to_string())?;
+        }
+        persist_manager_transition(store, before, manager)?;
+    }
+    Ok(())
+}
+
+fn empty_sidechat_session(
+    parent: &polaris_core::session::Session,
+    destination: &polaris_core::session_manager::SessionId,
+) -> Result<polaris_core::session::Session, String> {
+    let previous = parent
+        .persistence
+        .as_ref()
+        .ok_or("sidechatにはv2セッションが必要です")?;
+    let snapshot = previous.snapshot().map_err(|error| error.to_string())?;
+    let mut next = polaris_core::session::Session::new();
+    next.disable_files_md_auto_regenerate = parent.disable_files_md_auto_regenerate;
+    next.input_preparation = parent.input_preparation;
+    next.strict_history = parent.strict_history.clone();
+    next.summary_usage = parent.summary_usage.clone();
+    next.examples = parent.examples.clone();
+    if let Some(workflow) = &parent.workflow {
+        next.workflow = Some(
+            polaris_core::workflow::SessionWorkflow::try_new(workflow.config.clone())
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let persistence = polaris_core::session_store::PersistedSession::create_with_id(
+        &previous.data_root,
+        &previous.database,
+        &snapshot.state.project_id,
+        destination.as_str(),
+        snapshot.state.history_mode,
+        next.workflow.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
+    next.attach(persistence)
+        .map_err(|error| error.to_string())?;
+    Ok(next)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_tui_input(
+    session: &mut polaris_core::session::Session,
+    text: &str,
+    decider: Option<&dyn polaris_provider::decision::Decider>,
+    state_dir: &Path,
+    sessions_dir: &Path,
+    session_path: &mut PathBuf,
+    meta_path: &mut PathBuf,
+    session_started_at_millis: &mut u128,
+    local_lines: &mut Vec<ratatui::text::Line<'static>>,
+    turn_authority: Option<&TurnAuthorityInstaller>,
+) -> Result<(TuiAdmissionTurn, Option<String>), TuiAdmissionFailure> {
+    use polaris_core::session_manager::{
+        AdmissionState, DestinationMode, NextRunnableV1, SessionId, SubmissionPayloadV1,
+        SubmitOutcomeV1, SubmitRequestV1,
+    };
+
+    let persistence = session
+        .persistence
+        .as_ref()
+        .ok_or("sidechat自動振り分けにはv2セッションが必要です")?;
+    let snapshot = persistence.snapshot().map_err(|error| error.to_string())?;
+    let current =
+        SessionId::new(snapshot.state.session_id.clone()).map_err(|error| error.to_string())?;
+    let session_revision = snapshot.state.generation;
+    let goal_revision = session
+        .workflow
+        .as_ref()
+        .map_or(0, |workflow| workflow.state().revision);
+    let (store, mut manager) = open_tui_admission_owner(state_dir, &current)?;
+    recover_tui_admission_owner(
+        &store,
+        &mut manager,
+        &persistence.data_root,
+        &persistence.database,
+        &snapshot.state.project_id,
+    )?;
+    let before = manager.revision;
+    manager
+        .observe_session_revisions(&current, before, session_revision, goal_revision)
+        .map_err(|error| error.to_string())?;
+    persist_manager_transition(&store, before, &manager)?;
+
+    let request = SubmitRequestV1 {
+        parent_session: current.clone(),
+        payload: SubmissionPayloadV1 {
+            text: text.to_owned(),
+            attachment_ids: Vec::new(),
+            route: DestinationMode::Auto,
+            expected_session_revision: session_revision,
+            expected_goal_revision: goal_revision,
+        },
+        admission_id: None,
+    };
+    let before = manager.revision;
+    let SubmitOutcomeV1::Accepted { admission, .. } = manager
+        .submit(request, before)
+        .map_err(|error| error.to_string())?;
+    persist_manager_transition(&store, before, &manager)?;
+
+    let before = manager.revision;
+    let classifying = manager
+        .begin_classification(&admission.id, before, admission.revision)
+        .map_err(|error| error.to_string())?;
+    persist_manager_transition(&store, before, &manager)?;
+    let approval_reply = !session.clarification.unanswered().is_empty();
+    let judgement = if approval_reply {
+        None
+    } else if let Some(decider) = decider {
+        let context = tui_routing_context(session)?;
+        polaris_core::session_manager::classify_context(decider, &context, text).await
+    } else {
+        None
+    };
+    let before = manager.revision;
+    let decided = manager
+        .decide(
+            &admission.id,
+            before,
+            classifying.revision,
+            judgement,
+            approval_reply,
+            false,
+        )
+        .map_err(|error| error.to_string())?;
+    persist_manager_transition(&store, before, &manager)?;
+    let before = manager.revision;
+    let prepared = manager
+        .prepare_destination(&admission.id, before, decided.revision)
+        .map_err(|error| error.to_string())?;
+    persist_manager_transition(&store, before, &manager)?;
+    let (destination, reason) = match &prepared.state {
+        AdmissionState::DestinationReady { session_id, reason } => (session_id.clone(), *reason),
+        _ => return Err("sidechat destinationが確定しませんでした".into()),
+    };
+    let switched = destination != current;
+    let mut sidechat = if switched {
+        Some(empty_sidechat_session(session, &destination)?)
+    } else {
+        None
+    };
+    let destination_session = sidechat.as_mut().unwrap_or(session);
+    if let Some(installer) = turn_authority
+        && let Err(error) = installer(destination_session, text)
+    {
+        let before = manager.revision;
+        let saved = manager
+            .status(&admission.id)
+            .map_err(|status_error| status_error.to_string())?
+            .clone();
+        manager
+            .cancel(&admission.id, before, saved.revision)
+            .map_err(|cancel_error| cancel_error.to_string())?;
+        persist_manager_transition(&store, before, &manager)?;
+        return Err(format!("routine authorityを接続できません: {error}").into());
+    }
+    let appended_now = destination_session
+        .push_admitted_user(text, &admission.id, &prepared.payload_hash)
+        .map_err(|error| TuiAdmissionFailure::consumed(error.to_string()))?;
+    let before = manager.revision;
+    let appended = if appended_now {
+        manager
+            .record_input_appended(&admission.id, before, prepared.revision, &destination)
+            .map_err(|error| TuiAdmissionFailure::consumed(error.to_string()))?
+    } else {
+        manager
+            .recover_input_appended(&admission.id, before, prepared.revision, &destination)
+            .map_err(|error| TuiAdmissionFailure::consumed(error.to_string()))?
+    };
+    persist_manager_transition(&store, before, &manager).map_err(TuiAdmissionFailure::consumed)?;
+    let before = manager.revision;
+    let queued = manager
+        .queue_run(&admission.id, before, appended.revision)
+        .map_err(|error| TuiAdmissionFailure::consumed(error.to_string()))?;
+    persist_manager_transition(&store, before, &manager).map_err(TuiAdmissionFailure::consumed)?;
+    let before = manager.revision;
+    let started = manager
+        .start_next(before)
+        .map_err(|error| TuiAdmissionFailure::consumed(error.to_string()))?;
+    persist_manager_transition(&store, before, &manager).map_err(TuiAdmissionFailure::consumed)?;
+    if !matches!(
+        started,
+        NextRunnableV1::Start {
+            ref admission_id,
+            ref session_id,
+            ..
+        } if admission_id == &admission.id && session_id == &destination
+    ) {
+        return Err(TuiAdmissionFailure::consumed(format!(
+            "sidechat runを開始できません: {:?}",
+            queued.state
+        )));
+    }
+    if let Some(next) = sidechat {
+        *session = next;
+        *session_path = sessions_dir.join(format!("{}.jsonl", destination.as_str()));
+        *meta_path = session_path.with_extension("meta.json");
+        *session_started_at_millis = now_millis();
+        local_lines.clear();
+    }
+    Ok((
+        TuiAdmissionTurn {
+            store,
+            manager,
+            admission_id: admission.id,
+        },
+        switched.then(|| {
+            format!(
+                "sidechat {} に切り替えました ({reason:?}, running)",
+                destination.as_str()
+            )
+        }),
+    ))
+}
+
+struct TuiRootControlArgs<'a> {
+    session_id: &'a str,
+    turn: u64,
+    sandbox: &'a SandboxPolicy,
+    approval: ApprovalPolicy,
+    mcp_available: bool,
+    tool_names: &'a [String],
+    model: &'a str,
+    effort: &'a str,
+}
+
+fn install_tui_root_control(
+    session: &mut polaris_core::session::Session,
+    args: TuiRootControlArgs<'_>,
+) -> Result<Arc<RootDelegationControlV1>, String> {
+    let active_task = session
+        .workflow
+        .as_ref()
+        .and_then(|workflow| workflow.state().active_task.map(|task| task.task_id))
+        .unwrap_or_else(|| format!("tui-task-{}", args.turn));
+    let capabilities = delegation_capabilities(
+        args.sandbox,
+        args.approval,
+        args.mcp_available,
+        args.tool_names,
+    );
+    let control = RootDelegationControlV1::new(RootDelegationConfigV1 {
+        session_id: args.session_id.to_owned(),
+        root_run_id: RootRunId::new(format!("tui-root-run-{}", args.turn))
+            .map_err(|error| error.to_string())?,
+        root_attempt_id: RootAttemptId::new(format!("tui-root-attempt-{}", args.turn))
+            .map_err(|error| error.to_string())?,
+        active_task_id: TaskId::new(active_task).map_err(|error| error.to_string())?,
+        parent_capabilities: capabilities,
+        model: args.model.to_owned(),
+        effort: args.effort.to_owned(),
+    })?;
+    session.install_root_delegation_control(control.clone())?;
+    Ok(control)
+}
+
+fn tui_shadow_input(
+    session: &polaris_core::session::Session,
+    prompt: &str,
+    control: &RootDelegationControlV1,
+) -> Result<Option<polaris_core::answer_finalizer::shadow::ShadowInputV1>, String> {
+    use polaris_provider::Role;
+
+    let Some(persistence) = session.persistence.as_ref() else {
+        return Ok(None);
+    };
+    let snapshot = persistence.snapshot().map_err(|error| error.to_string())?;
+    let Some(assistant) = snapshot.events.iter().rev().find(|event| {
+        event.message.role == Role::Assistant
+            && event.message.tool_calls.is_empty()
+            && !event.message.content.is_empty()
+    }) else {
+        return Ok(None);
+    };
+    let Some(user) = snapshot.events.iter().rev().find(|event| {
+        event.sequence < assistant.sequence
+            && event.starts_turn
+            && event.message.role == Role::User
+            && event.message.content == prompt
+    }) else {
+        return Ok(None);
+    };
+    let turn_entries = snapshot
+        .events
+        .iter()
+        .filter(|event| event.sequence > user.sequence && event.sequence < assistant.sequence);
+    let mut called = std::collections::BTreeSet::new();
+    let mut returned = std::collections::BTreeSet::new();
+    let mut closed_evidence = Vec::new();
+    let mut evidence_complete = true;
+    for entry in turn_entries {
+        for call in &entry.message.tool_calls {
+            evidence_complete &= !call.id.is_empty() && called.insert(call.id.clone());
+        }
+        if entry.message.role == Role::Tool {
+            let Some(id) = entry.message.tool_call_id.as_ref() else {
+                evidence_complete = false;
+                continue;
+            };
+            evidence_complete &= returned.insert(id.clone());
+            closed_evidence.push(entry.message.content.clone());
+        }
+        for hosted in &entry.message.hosted_web_search {
+            evidence_complete &= matches!(
+                hosted.status,
+                polaris_provider::web_search::HostedItemStatus::Completed
+            );
+            match serde_json::to_string(hosted) {
+                Ok(value) => closed_evidence.push(value),
+                Err(_) => evidence_complete = false,
+            }
+        }
+    }
+    evidence_complete &= called == returned;
+    evidence_complete &= closed_evidence
+        .iter()
+        .try_fold(0_usize, |total, value| total.checked_add(value.len()))
+        .is_some_and(|total| total <= 256 * 1024);
+    let mut input_receipt_ids = snapshot
+        .state
+        .admission_receipts
+        .iter()
+        .filter(|(_, receipt)| receipt.sequence == user.sequence)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    if input_receipt_ids.is_empty() {
+        input_receipt_ids.push(format!("event-{}", user.sequence));
+    }
+    let binding = control.host_binding();
+    let workflow_revision = session
+        .workflow
+        .as_ref()
+        .map(|workflow| workflow.state().revision.to_string())
+        .unwrap_or_else(|| "0".to_owned());
+    let subject = polaris_core::answer_finalizer::FinalizationSubjectV1 {
+        schema_version: polaris_core::answer_finalizer::FINALIZATION_SCHEMA_VERSION,
+        project_id: snapshot.state.project_id,
+        session_id: snapshot.state.session_id.clone(),
+        session_epoch: snapshot.state.epoch.saturating_add(1),
+        lane_id: snapshot.state.session_id,
+        root_run_id: binding.root_run_id.0,
+        attempt_id: binding.root_attempt_id.0,
+        turn_sequence: assistant.sequence,
+        input_receipt_ids,
+        attachment_hashes: vec![],
+        workflow_revision,
+        exact_prompt_hash: polaris_core::conversation_state::content_hash(prompt.as_bytes()),
+    };
+    Ok(Some(
+        polaris_core::answer_finalizer::shadow::ShadowInputV1 {
+            subject,
+            source_message_id: format!("event-{}", assistant.sequence),
+            prompt: prompt.to_owned(),
+            source_body: assistant.message.content.clone(),
+            closed_evidence,
+            evidence_complete,
+        },
+    ))
+}
+
+fn schedule_tui_shadow(
+    finalizer: &Arc<polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner>,
+    session: &polaris_core::session::Session,
+    prompt: &str,
+    control: &RootDelegationControlV1,
+) -> Result<bool, String> {
+    let Some(input) = tui_shadow_input(session, prompt, control)? else {
+        return Ok(false);
+    };
+    finalizer
+        .schedule(input)
+        .map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 // Ancestors are read-only and must form an explicit, bounded same-project chain.
@@ -400,6 +1108,76 @@ const MOUSE_SCROLL_LINES: usize = 3;
 /// that it doesn't look stuck once the user has seen it.
 const MID_TURN_NOTICE_DURATION: Duration = Duration::from_millis(1500);
 
+#[derive(Debug, Default)]
+struct ExitConfirmation {
+    armed: bool,
+}
+
+impl ExitConfirmation {
+    fn press(&mut self) -> bool {
+        if self.armed {
+            self.armed = false;
+            return true;
+        }
+        self.armed = true;
+        false
+    }
+
+    fn cancel(&mut self) {
+        self.armed = false;
+    }
+}
+
+fn is_local_provider(provider_name: &str) -> bool {
+    matches!(provider_name, "ollama" | "lmstudio" | "llamacpp")
+}
+
+fn update_effort_from_event(event: &polaris_core::AgentEvent, effort_name: &mut String) {
+    match event {
+        polaris_core::AgentEvent::EffortJudging => *effort_name = "judging".to_string(),
+        polaris_core::AgentEvent::EffortJudged { effort } => {
+            *effort_name = render::effort_display_name(effort).to_string();
+        }
+        _ => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InflightInputAction {
+    Continue,
+    Queued,
+    Interrupt,
+}
+
+fn apply_inflight_key(
+    input_buffer: &mut String,
+    input_cursor: &mut usize,
+    input_history: &mut input::History,
+    queued_inputs: &mut VecDeque<String>,
+    key: ratatui::crossterm::event::KeyEvent,
+) -> InflightInputAction {
+    match apply_key(input_buffer, input_cursor, key) {
+        InputAction::Continue => InflightInputAction::Continue,
+        InputAction::Submit(text) if text.trim().is_empty() => InflightInputAction::Continue,
+        InputAction::Submit(text) => {
+            input_history.record(&text);
+            queued_inputs.push_back(text);
+            InflightInputAction::Queued
+        }
+        InputAction::Quit => InflightInputAction::Interrupt,
+    }
+}
+
+fn record_submission(
+    input_history: &mut input::History,
+    text: &str,
+    dispatching_queued_input: bool,
+) {
+    if !dispatching_queued_input {
+        input_history.record(text);
+    }
+}
+
 /// Appends every `session.messages` entry and every `local_lines` entry
 /// added since the last call to `history`, once each — the in-memory
 /// analogue of the old `insert_before`-based one-shot terminal print.
@@ -429,7 +1207,8 @@ fn append_new_history(
     printed_messages: &mut usize,
     printed_local_lines: &mut usize,
     history: &mut Vec<render::HistoryLine>,
-) {
+) -> bool {
+    let mut changed = false;
     // A session that's now *shorter* than what's already been printed
     // (`/clear`, `/new`) can only mean it was reset out from under us —
     // reprint from scratch. This alone doesn't catch `/resume` loading a
@@ -438,15 +1217,18 @@ fn append_new_history(
     if *printed_messages > session.messages.len() {
         *printed_messages = 0;
         history.clear();
+        changed = true;
     }
     if *printed_local_lines > local_lines.len() {
         *printed_local_lines = 0;
         history.clear();
+        changed = true;
     }
     if session.messages.len() > *printed_messages {
         let lines = render::history_lines_for(&session.messages[*printed_messages..]);
         history.extend(lines);
         *printed_messages = session.messages.len();
+        changed = true;
     }
     if local_lines.len() > *printed_local_lines {
         let new_lines = &local_lines[*printed_local_lines..];
@@ -455,7 +1237,9 @@ fn append_new_history(
             shaded: false,
         }));
         *printed_local_lines = local_lines.len();
+        changed = true;
     }
+    changed
 }
 
 /// Clears `history` and immediately re-seeds it with the header box,
@@ -471,6 +1255,8 @@ fn append_new_history(
 /// `append_new_history` reads.
 fn reset_conversation_view(
     history: &mut Vec<render::HistoryLine>,
+    history_wrap_cache: &mut render::HistoryWrapCache,
+    activity_rows: &mut AgentActivityRows,
     scroll_offset: &mut usize,
     selection: &mut Option<selection::Selection>,
     header: &render::HeaderInfo,
@@ -478,6 +1264,8 @@ fn reset_conversation_view(
 ) {
     history.clear();
     history.extend(render::header_history_lines(header, width));
+    history_wrap_cache.invalidate();
+    activity_rows.rows.clear();
     *scroll_offset = 0;
     *selection = None;
 }
@@ -509,12 +1297,69 @@ fn keep_or_roll_back(
     Ok(())
 }
 
+#[derive(Default)]
+struct AgentActivityRows {
+    rows: HashMap<(String, String), usize>,
+}
+
 fn append_live_event(
     event: &polaris_core::AgentEvent,
     history: &mut Vec<render::HistoryLine>,
+    activity_rows: &mut AgentActivityRows,
 ) -> usize {
+    let key = match event {
+        polaris_core::AgentEvent::SpawnStarted {
+            display_name,
+            agent_type,
+            ..
+        }
+        | polaris_core::AgentEvent::SpawnActivity {
+            display_name,
+            agent_type,
+            ..
+        }
+        | polaris_core::AgentEvent::SpawnFinished {
+            display_name,
+            agent_type,
+            ..
+        } => Some((display_name.clone(), agent_type.clone())),
+        _ => None,
+    };
+
+    if matches!(event, polaris_core::AgentEvent::SpawnActivity { .. }) {
+        if let Some(row) = key
+            .as_ref()
+            .and_then(|key| activity_rows.rows.get(key))
+            .copied()
+            && let Some(line) = render::format_event_for_live_print(event)
+                .into_iter()
+                .next()
+            && let Some(slot) = history.get_mut(row)
+        {
+            *slot = line;
+        }
+        // An activity without a preceding SpawnStarted is stale or malformed;
+        // never append it as a second unowned progress row.
+        return 0;
+    }
+
     let before = history.len();
     history.extend(render::format_event_for_live_print(event));
+    match event {
+        polaris_core::AgentEvent::SpawnStarted { .. } => {
+            if let Some(key) = key {
+                // SpawnStarted always renders the agent row followed by its
+                // one replaceable, dimmed activity row.
+                activity_rows.rows.insert(key, before + 1);
+            }
+        }
+        polaris_core::AgentEvent::SpawnFinished { .. } => {
+            if let Some(key) = key {
+                activity_rows.rows.remove(&key);
+            }
+        }
+        _ => {}
+    }
     history.len() - before
 }
 
@@ -535,6 +1380,45 @@ fn new_session_id() -> String {
     format!("{:013}-{}-{n:04}", now_millis(), std::process::id())
 }
 
+fn current_resume_id(
+    session: &polaris_core::session::Session,
+    session_path: &Path,
+) -> Option<String> {
+    if let Some(id) = session
+        .persistence
+        .as_ref()
+        .and_then(|saved| saved.snapshot().ok())
+        .map(|snapshot| snapshot.state.session_id)
+    {
+        return Some(id);
+    }
+
+    let meta_path = session_path.with_extension("meta.json");
+    if !session_path.is_file() && !meta_path.is_file() {
+        return None;
+    }
+    session_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn resume_hint(session_id: &str) -> String {
+    format!("\nResume this session with:\npolaris --resume {session_id}\n")
+}
+
+fn print_resume_hint(session_id: &str) {
+    use ratatui::crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        SetForegroundColor(Color::DarkGrey),
+        Print(resume_hint(session_id)),
+        ResetColor
+    );
+}
+
 /// Splits `frame.area()` into the scrollable history region (top) and the
 /// footer region (bottom, `render::footer_height(suggestions.len())` rows —
 /// sized fresh each frame for exactly what this frame's footer content
@@ -548,6 +1432,7 @@ fn new_session_id() -> String {
 fn draw_frame(
     frame: &mut ratatui::Frame,
     history: &[render::HistoryLine],
+    history_wrap_cache: &mut render::HistoryWrapCache,
     scroll_offset: usize,
     input: &str,
     cursor: usize,
@@ -565,16 +1450,15 @@ fn draw_frame(
     ])
     .areas(area);
 
-    // Reflowed fresh every frame from the current width — a narrow window
-    // (or one just resized) always gets a wrap matching its actual size,
-    // rather than clipping any line wider than `history_area.width`. See
-    // `wrap_history_lines`'s own doc comment for why this isn't cached.
-    let wrapped = render::wrap_history_lines(history, history_area.width);
+    // Width/source changes invalidate the cached reflow. Scroll, input and
+    // status-only redraws reuse it, so navigation cost follows the visible
+    // window rather than the full conversation.
+    let wrapped = history_wrap_cache.lines(history, history_area.width);
     let window =
         render::visible_history_window(wrapped.len(), scroll_offset, history_area.height as usize);
     render::render_history_into(frame.buffer_mut(), history_area, &wrapped[window.clone()]);
     if let Some(sel) = selection {
-        render::apply_selection_highlight(frame.buffer_mut(), history_area, window, &wrapped, sel);
+        render::apply_selection_highlight(frame.buffer_mut(), history_area, window, wrapped, sel);
     }
 
     render::render_footer(
@@ -626,6 +1510,10 @@ fn area_height_for_history(footer_height: u16, terminal_height: u16) -> u16 {
 pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     let usage_meter = polaris_provider::UsageMeter::default();
     args.provider = Arc::new(usage_meter.wrap(args.provider.clone()));
+    let cloud_provider = args.provider.clone();
+    let cloud_provider_name = args.provider_name.clone();
+    let mut provider_name = cloud_provider_name.clone();
+    let local_router = polaris_core::local_execution::LocalRouter::new(args.spawn_concurrency);
     args.mcp_selection_provider = args
         .mcp_selection_provider
         .map(|provider| Arc::new(usage_meter.wrap(provider)) as Arc<dyn Provider>);
@@ -767,6 +1655,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // via `insert_before`. Rendered every frame by `draw_frame`, which
     // slices it down to `render::visible_history_window`'s current window.
     let mut history: Vec<render::HistoryLine> = Vec::new();
+    let mut history_wrap_cache = render::HistoryWrapCache::default();
+    let mut agent_activity_rows = AgentActivityRows::default();
     // How far back the user has scrolled the history region — 0 always
     // means "following the tail" (see `render::visible_history_window`).
     let mut scroll_offset: usize = 0;
@@ -776,7 +1666,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     let startup_width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
     history.extend(render::header_history_lines(
         &render::HeaderInfo {
-            provider_name: &args.provider_name,
+            provider_name: &provider_name,
             model_name: &args.model_name,
             usage: polaris_provider::Usage::default(),
             cwd: &args.cwd.display().to_string(),
@@ -798,6 +1688,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // Session-local Up/Down recall of previously submitted input. Not
     // persisted — see `input::History`.
     let mut input_history = input::History::new();
+    // Submitted while another turn is running. These are dispatched in order
+    // through the ordinary input path after that turn finishes; the in-flight
+    // turn is never mutated concurrently.
+    let mut queued_inputs = VecDeque::new();
     // A local copy, not `args.approval_policy` directly — `/permissions`
     // needs to be able to change it for the rest of the session, and
     // `args` isn't mutable (nor should adding one slash command make it
@@ -809,17 +1703,20 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // that actually changes what gets sent; this is only the display copy
     // shown in the header/footer/notices.
     let mut model_name = args.model_name.clone();
-    // Use the caller's selection or the same default marked in the
-    // picker. The caller passes a wire token (`--effort`'s own spelling);
-    // from here on everything is display names, so `xhigh` becomes the row
-    // it belongs to instead of a label no catalog row matches.
-    let mut effort_name = args
+    // An explicit caller selection remains fixed. Otherwise hosted turns
+    // begin undecided and Jev publishes the selected effort during the turn.
+    // The caller passes a wire token (`--effort`'s own spelling); from here
+    // on everything is display names, so `xhigh` becomes the row it belongs
+    // to instead of a label no catalog row matches.
+    let cloud_effort_name = args
         .initial_effort_name
         .as_deref()
         .map(render::effort_display_name)
-        .unwrap_or(render::DEFAULT_EFFORT)
+        .unwrap_or(UNDECIDED_EFFORT)
         .to_string();
+    let mut effort_name = cloud_effort_name.clone();
     let mut status = Status::Idle;
+    let mut exit_confirmation = ExitConfirmation::default();
     let mut key_reader = CrosstermKeyReader;
     // Each turn gets its own MCP runtime; connections and grants never carry over.
     let mcp_ceiling =
@@ -828,6 +1725,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     let mcp_setup = mcp_host
         .as_ref()
         .map(|host| Arc::new(host.setup_tool(mcp_ceiling)));
+    let setting = Arc::new(polaris_core::recipe::tool::SettingTool::new(
+        polaris_core::project::resolve_root(&args.cwd),
+    ));
+    let computer = polaris_core::computer::ComputerTool::available().map(Arc::new);
     let mut mcp_turns = 0u64;
     let mut fatal_message: Option<String> = None;
     // Set when a `HistoryCompacted` event is drained mid-turn (see the
@@ -854,6 +1755,28 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
 
     let mut tool_memory_path: Option<PathBuf> = None;
     let exit_code = 'outer: loop {
+        // `/new`, `/fork`, and `/resume` replace the conversation owner.
+        // Reattach process-owned services and selectors before accepting the
+        // next input; none of these belong to durable conversation state.
+        session.decider = args.decider.clone();
+        session.tier_decider = args.tier_decider.clone();
+        session.light_model = args.mcp_selection_provider.clone();
+        session.approval_auto = args.approval_auto;
+        session.setting = Some(setting.clone());
+        session.computer = computer.clone();
+        // A queued submission uses the same slash-command/prompt path as an
+        // idle Enter press. Preserve anything the user has started typing
+        // since queueing it, then restore that draft before the queued item
+        // begins its turn.
+        let mut draft_after_queued_dispatch = None;
+        let dispatching_queued_input = if let Some(queued) = queued_inputs.pop_front() {
+            draft_after_queued_dispatch = Some((std::mem::take(&mut input_buffer), input_cursor));
+            input_buffer = queued;
+            input_cursor = input_buffer.len();
+            true
+        } else {
+            false
+        };
         if tool_memory_path.as_ref() != Some(&session_path)
             || (args.tool_memory.is_some()
                 && session.tool_memory.is_none()
@@ -897,9 +1820,16 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         }
         // Recomputed every draw from the live buffer, so the popup tracks
         // each keystroke — not just the moment `/` was first typed.
-        let suggestions = match input_buffer.strip_prefix('/') {
-            Some(prefix) => slash::matching(prefix),
-            None => Vec::new(),
+        let suggestions = if dispatching_queued_input {
+            // Let the full command reach `slash::parse` below. The picker is
+            // for interactive completion and would otherwise reinterpret a
+            // queued exact command as its first highlighted prefix match.
+            Vec::new()
+        } else {
+            match input_buffer.strip_prefix('/') {
+                Some(prefix) => slash::matching(prefix),
+                None => Vec::new(),
+            }
         };
         if selected_suggestion >= suggestions.len() {
             selected_suggestion = 0;
@@ -909,25 +1839,28 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // reset) before redrawing the small footer viewport — printing is
         // one-shot and must happen before the footer draw so the newly
         // printed lines appear above it, not interleaved mid-frame.
-        append_new_history(
+        if append_new_history(
             &session,
             &local_lines,
             &mut printed_messages,
             &mut printed_local_lines,
             &mut history,
-        );
+        ) {
+            history_wrap_cache.invalidate();
+        }
         if terminal
             .borrow_mut()
             .draw(|f| {
                 draw_frame(
                     f,
                     &history,
+                    &mut history_wrap_cache,
                     scroll_offset,
                     &input_buffer,
                     input_cursor,
                     &status,
                     &render::HeaderInfo {
-                        provider_name: &args.provider_name,
+                        provider_name: &provider_name,
                         model_name: &model_name,
                         usage: cumulative_usage,
                         cwd: &cwd_display,
@@ -952,98 +1885,106 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // redraw. Every other mouse kind still falls through to `continue
         // 'outer` exactly as before, so the redraw timing for
         // scroll/select/copy is unchanged.
-        let event = loop {
-            let candidate = match ratatui::crossterm::event::read() {
-                Ok(e) => e,
-                Err(_) => break 'outer ExitCode::FAILURE,
-            };
-            if let ratatui::crossterm::event::Event::Mouse(mouse) = &candidate {
-                use ratatui::crossterm::event::MouseEventKind;
-                match mouse.kind {
-                    MouseEventKind::Moved => continue,
-                    MouseEventKind::ScrollUp => {
-                        scroll_offset = scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
-                    }
-                    MouseEventKind::ScrollDown => {
-                        scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
-                    }
-                    MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
-                        let history_area_height = area_height_for_history(
-                            render::footer_height(suggestions.len()),
-                            terminal_height(&terminal),
-                        );
-                        if mouse.row < history_area_height {
-                            let width = terminal_width(&terminal);
-                            let wrapped = render::wrap_history_lines(&history, width);
-                            let window = render::visible_history_window(
-                                wrapped.len(),
-                                scroll_offset,
-                                history_area_height as usize,
-                            );
-                            let pos = selection::text_pos_from_screen(
-                                &wrapped,
-                                window,
-                                ratatui::layout::Rect::new(0, 0, width, history_area_height),
-                                mouse.row,
-                                mouse.column,
-                            );
-                            selection = Some(selection::Selection {
-                                anchor: pos,
-                                cursor: pos,
-                                dragging: true,
-                            });
+        let event = if dispatching_queued_input {
+            ratatui::crossterm::event::Event::Key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Enter,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ))
+        } else {
+            loop {
+                let candidate = match ratatui::crossterm::event::read() {
+                    Ok(e) => e,
+                    Err(_) => break 'outer ExitCode::FAILURE,
+                };
+                if let ratatui::crossterm::event::Event::Mouse(mouse) = &candidate {
+                    exit_confirmation.cancel();
+                    use ratatui::crossterm::event::MouseEventKind;
+                    match mouse.kind {
+                        MouseEventKind::Moved => continue,
+                        MouseEventKind::ScrollUp => {
+                            scroll_offset = scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
                         }
-                    }
-                    MouseEventKind::Drag(ratatui::crossterm::event::MouseButton::Left) => {
-                        if let Some(sel) = selection.as_mut()
-                            && sel.dragging
-                        {
+                        MouseEventKind::ScrollDown => {
+                            scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                        }
+                        MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
                             let history_area_height = area_height_for_history(
                                 render::footer_height(suggestions.len()),
                                 terminal_height(&terminal),
                             );
-                            let width = terminal_width(&terminal);
-                            let wrapped = render::wrap_history_lines(&history, width);
-                            let window = render::visible_history_window(
-                                wrapped.len(),
-                                scroll_offset,
-                                history_area_height as usize,
-                            );
-                            sel.cursor = selection::text_pos_from_screen(
-                                &wrapped,
-                                window,
-                                ratatui::layout::Rect::new(0, 0, width, history_area_height),
-                                mouse.row,
-                                mouse.column,
-                            );
-                            if mouse.row == 0 {
-                                scroll_offset = scroll_offset.saturating_add(1);
-                            } else if mouse.row.saturating_add(1) >= history_area_height {
-                                scroll_offset = scroll_offset.saturating_sub(1);
+                            if mouse.row < history_area_height {
+                                let width = terminal_width(&terminal);
+                                let wrapped = render::wrap_history_lines(&history, width);
+                                let window = render::visible_history_window(
+                                    wrapped.len(),
+                                    scroll_offset,
+                                    history_area_height as usize,
+                                );
+                                let pos = selection::text_pos_from_screen(
+                                    &wrapped,
+                                    window,
+                                    ratatui::layout::Rect::new(0, 0, width, history_area_height),
+                                    mouse.row,
+                                    mouse.column,
+                                );
+                                selection = Some(selection::Selection {
+                                    anchor: pos,
+                                    cursor: pos,
+                                    dragging: true,
+                                });
                             }
                         }
-                    }
-                    MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left) => {
-                        if let Some(sel) = selection.as_mut()
-                            && sel.dragging
-                        {
-                            sel.dragging = false;
-                            let width = terminal_width(&terminal);
-                            let wrapped = render::wrap_history_lines(&history, width);
-                            let text = selection::extract_text(&wrapped, sel);
-                            if !text.is_empty() {
-                                status = Status::Notice(apply_selection_copy(
-                                    &text,
-                                    clipboard::copy_to_clipboard,
-                                ));
+                        MouseEventKind::Drag(ratatui::crossterm::event::MouseButton::Left) => {
+                            if let Some(sel) = selection.as_mut()
+                                && sel.dragging
+                            {
+                                let history_area_height = area_height_for_history(
+                                    render::footer_height(suggestions.len()),
+                                    terminal_height(&terminal),
+                                );
+                                let width = terminal_width(&terminal);
+                                let wrapped = render::wrap_history_lines(&history, width);
+                                let window = render::visible_history_window(
+                                    wrapped.len(),
+                                    scroll_offset,
+                                    history_area_height as usize,
+                                );
+                                sel.cursor = selection::text_pos_from_screen(
+                                    &wrapped,
+                                    window,
+                                    ratatui::layout::Rect::new(0, 0, width, history_area_height),
+                                    mouse.row,
+                                    mouse.column,
+                                );
+                                if mouse.row == 0 {
+                                    scroll_offset = scroll_offset.saturating_add(1);
+                                } else if mouse.row.saturating_add(1) >= history_area_height {
+                                    scroll_offset = scroll_offset.saturating_sub(1);
+                                }
                             }
                         }
+                        MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left) => {
+                            if let Some(sel) = selection.as_mut()
+                                && sel.dragging
+                            {
+                                sel.dragging = false;
+                                let width = terminal_width(&terminal);
+                                let wrapped = render::wrap_history_lines(&history, width);
+                                let text = selection::extract_text(&wrapped, sel);
+                                if !text.is_empty() {
+                                    status = Status::Notice(apply_selection_copy(
+                                        &text,
+                                        clipboard::copy_to_clipboard,
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    continue 'outer;
                 }
-                continue 'outer;
+                break candidate;
             }
-            break candidate;
         };
         if let ratatui::crossterm::event::Event::Resize(_, _) = &event {
             selection = None;
@@ -1051,6 +1992,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         let ratatui::crossterm::event::Event::Key(key) = event else {
             continue;
         };
+        if key.kind == ratatui::crossterm::event::KeyEventKind::Press
+            && !(key.code == ratatui::crossterm::event::KeyCode::Char('c')
+                && key
+                    .modifiers
+                    .contains(ratatui::crossterm::event::KeyModifiers::CONTROL))
+        {
+            exit_confirmation.cancel();
+        }
 
         // `/review` isn't a local command like the others — it expands
         // into a real user message and falls through to the normal model
@@ -1112,10 +2061,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                             reset_conversation_view(
                                 &mut history,
+                                &mut history_wrap_cache,
+                                &mut agent_activity_rows,
                                 &mut scroll_offset,
                                 &mut selection,
                                 &render::HeaderInfo {
-                                    provider_name: &args.provider_name,
+                                    provider_name: &provider_name,
                                     model_name: &model_name,
                                     usage: cumulative_usage,
                                     cwd: &cwd_display,
@@ -1141,10 +2092,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                             reset_conversation_view(
                                 &mut history,
+                                &mut history_wrap_cache,
+                                &mut agent_activity_rows,
                                 &mut scroll_offset,
                                 &mut selection,
                                 &render::HeaderInfo {
-                                    provider_name: &args.provider_name,
+                                    provider_name: &provider_name,
                                     model_name: &model_name,
                                     usage: cumulative_usage,
                                     cwd: &cwd_display,
@@ -1170,10 +2123,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                             reset_conversation_view(
                                 &mut history,
+                                &mut history_wrap_cache,
+                                &mut agent_activity_rows,
                                 &mut scroll_offset,
                                 &mut selection,
                                 &render::HeaderInfo {
-                                    provider_name: &args.provider_name,
+                                    provider_name: &provider_name,
                                     model_name: &model_name,
                                     usage: cumulative_usage,
                                     cwd: &cwd_display,
@@ -1199,11 +2154,18 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             handle_model(
                                 &terminal,
                                 &mut key_reader,
-                                args.provider.as_ref(),
+                                &mut args.provider,
+                                &cloud_provider,
+                                &usage_meter,
+                                &local_router,
+                                &mut provider_name,
+                                &cloud_provider_name,
                                 &mut model_name,
+                                &cloud_effort_name,
                                 &mut effort_name,
                                 &mut status,
-                            );
+                            )
+                            .await;
                             continue;
                         }
                         slash::Action::Skills => {
@@ -1226,12 +2188,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     draw_frame(
                                         f,
                                         &history,
+                                        &mut history_wrap_cache,
                                         scroll_offset,
                                         &input_buffer,
                                         input_cursor,
                                         &status,
                                         &render::HeaderInfo {
-                                            provider_name: &args.provider_name,
+                                            provider_name: &provider_name,
                                             model_name: &model_name,
                                             usage: cumulative_usage,
                                             cwd: &cwd_display,
@@ -1272,7 +2235,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &mut session,
                                 &session_path,
                                 &mut status,
-                                &args.provider_name,
+                                &provider_name,
                                 &model_name,
                                 usage_meter.snapshot(),
                                 args.skills,
@@ -1285,10 +2248,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                                         reset_conversation_view(
                                             &mut history,
+                                            &mut history_wrap_cache,
+                                            &mut agent_activity_rows,
                                             &mut scroll_offset,
                                             &mut selection,
                                             &render::HeaderInfo {
-                                                provider_name: &args.provider_name,
+                                                provider_name: &provider_name,
                                                 model_name: &model_name,
                                                 usage: cumulative_usage,
                                                 cwd: &cwd_display,
@@ -1380,17 +2345,35 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         } else {
             let typed = match apply_key(&mut input_buffer, &mut input_cursor, key) {
                 InputAction::Continue => {
+                    exit_confirmation.cancel();
                     selected_suggestion = 0;
                     continue;
                 }
-                InputAction::Quit => break ExitCode::SUCCESS,
-                InputAction::Submit(text) if text.trim().is_empty() => continue,
+                InputAction::Quit => {
+                    if exit_confirmation.press() {
+                        break ExitCode::SUCCESS;
+                    }
+                    status = Status::Notice("Press Ctrl+C again to exit".to_string());
+                    continue;
+                }
+                InputAction::Submit(text) if text.trim().is_empty() => {
+                    exit_confirmation.cancel();
+                    continue;
+                }
                 InputAction::Submit(text) => {
-                    input_history.record(&text);
+                    exit_confirmation.cancel();
+                    // In-flight submissions were recorded when Enter queued
+                    // them. Recording the synthetic Enter again would add a
+                    // second copy after any later queued entry.
+                    record_submission(&mut input_history, &text, dispatching_queued_input);
                     scroll_offset = 0;
                     text
                 }
             };
+            if let Some((draft, cursor)) = draft_after_queued_dispatch.take() {
+                input_buffer = draft;
+                input_cursor = cursor;
+            }
             // Slash commands are local: handled here and never reach
             // `session.messages`, the model, or the persisted session
             // file. Reached only for text the popup didn't already
@@ -1425,10 +2408,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                     reset_conversation_view(
                         &mut history,
+                        &mut history_wrap_cache,
+                        &mut agent_activity_rows,
                         &mut scroll_offset,
                         &mut selection,
                         &render::HeaderInfo {
-                            provider_name: &args.provider_name,
+                            provider_name: &provider_name,
                             model_name: &model_name,
                             usage: cumulative_usage,
                             cwd: &cwd_display,
@@ -1454,10 +2439,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                     reset_conversation_view(
                         &mut history,
+                        &mut history_wrap_cache,
+                        &mut agent_activity_rows,
                         &mut scroll_offset,
                         &mut selection,
                         &render::HeaderInfo {
-                            provider_name: &args.provider_name,
+                            provider_name: &provider_name,
                             model_name: &model_name,
                             usage: cumulative_usage,
                             cwd: &cwd_display,
@@ -1483,10 +2470,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                     reset_conversation_view(
                         &mut history,
+                        &mut history_wrap_cache,
+                        &mut agent_activity_rows,
                         &mut scroll_offset,
                         &mut selection,
                         &render::HeaderInfo {
-                            provider_name: &args.provider_name,
+                            provider_name: &provider_name,
                             model_name: &model_name,
                             usage: cumulative_usage,
                             cwd: &cwd_display,
@@ -1512,11 +2501,18 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     handle_model(
                         &terminal,
                         &mut key_reader,
-                        args.provider.as_ref(),
+                        &mut args.provider,
+                        &cloud_provider,
+                        &usage_meter,
+                        &local_router,
+                        &mut provider_name,
+                        &cloud_provider_name,
                         &mut model_name,
+                        &cloud_effort_name,
                         &mut effort_name,
                         &mut status,
-                    );
+                    )
+                    .await;
                     continue;
                 }
                 Some(slash::Action::Skills) => {
@@ -1536,12 +2532,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             draw_frame(
                                 f,
                                 &history,
+                                &mut history_wrap_cache,
                                 scroll_offset,
                                 &input_buffer,
                                 input_cursor,
                                 &status,
                                 &render::HeaderInfo {
-                                    provider_name: &args.provider_name,
+                                    provider_name: &provider_name,
                                     model_name: &model_name,
                                     usage: cumulative_usage,
                                     cwd: &cwd_display,
@@ -1578,7 +2575,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut session,
                         &session_path,
                         &mut status,
-                        &args.provider_name,
+                        &provider_name,
                         &model_name,
                         usage_meter.snapshot(),
                         args.skills,
@@ -1590,10 +2587,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                                 reset_conversation_view(
                                     &mut history,
+                                    &mut history_wrap_cache,
+                                    &mut agent_activity_rows,
                                     &mut scroll_offset,
                                     &mut selection,
                                     &render::HeaderInfo {
-                                        provider_name: &args.provider_name,
+                                        provider_name: &provider_name,
                                         model_name: &model_name,
                                         usage: cumulative_usage,
                                         cwd: &cwd_display,
@@ -1618,7 +2617,72 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             }
         };
 
-        session.push_user(&text);
+        session.automatic_effort =
+            args.initial_effort_name.is_none() && !is_local_provider(&provider_name);
+        if session.automatic_effort {
+            effort_name = UNDECIDED_EFFORT.to_string();
+        }
+        let mut tui_admission = None;
+        if args.sidechat_auto && session.persistence.is_some() {
+            match admit_tui_input(
+                &mut session,
+                &text,
+                args.decider.as_deref(),
+                &args.state_dir,
+                &args.sessions_dir,
+                &mut session_path,
+                &mut meta_path,
+                &mut session_started_at_millis,
+                &mut local_lines,
+                args.turn_authority.as_ref(),
+            )
+            .await
+            {
+                Ok((admission, notice)) => {
+                    tui_admission = Some(admission);
+                    if let Some(notice) = notice {
+                        local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                            notice,
+                            ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+                        )));
+                        tool_memory_path = None;
+                    }
+                }
+                Err(TuiAdmissionFailure::Retryable(error)) => {
+                    input_buffer = text;
+                    input_cursor = input_buffer.len();
+                    status = Status::Error(format!("入力を振り分けできません: {error}"));
+                    continue;
+                }
+                Err(error @ TuiAdmissionFailure::Consumed(_)) => {
+                    fatal_message = Some(format!(
+                        "入力は保存済みですが、実行開始を確認できません: {}。再起動後に回復状態を確認してください。",
+                        error.message()
+                    ));
+                    break 'outer ExitCode::FAILURE;
+                }
+            }
+        } else {
+            if let Some(installer) = &args.turn_authority
+                && let Err(error) = installer(&mut session, &text)
+            {
+                input_buffer = text;
+                input_cursor = input_buffer.len();
+                status = Status::Error(format!("routine authorityを接続できません: {error}"));
+                continue;
+            }
+            session.push_user(&text);
+        }
+        // A distinct input can replace `session` with an empty sidechat
+        // after the loop-top attachment. Reinstall only process-owned
+        // capabilities; conversation history, approval replies, tool state,
+        // and memory are deliberately not copied from the parent.
+        session.decider = args.decider.clone();
+        session.tier_decider = args.tier_decider.clone();
+        session.light_model = args.mcp_selection_provider.clone();
+        session.approval_auto = args.approval_auto;
+        session.setting = Some(setting.clone());
+        session.computer = computer.clone();
         // `mut`: mid-turn compaction (see `history_compacted_this_turn`
         // below) can shrink `session.messages` after this point but within
         // the same turn, which would otherwise leave `checkpoint` pointing
@@ -1661,25 +2725,28 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // appear until the *next* top-of-loop print, which only happens
         // after the assistant's reply finishes too, making the user's own
         // input look laggy instead of showing up the instant it's sent.
-        append_new_history(
+        if append_new_history(
             &session,
             &local_lines,
             &mut printed_messages,
             &mut printed_local_lines,
             &mut history,
-        );
+        ) {
+            history_wrap_cache.invalidate();
+        }
         if terminal
             .borrow_mut()
             .draw(|f| {
                 draw_frame(
                     f,
                     &history,
+                    &mut history_wrap_cache,
                     scroll_offset,
                     &input_buffer,
                     input_cursor,
                     &status,
                     &render::HeaderInfo {
-                        provider_name: &args.provider_name,
+                        provider_name: &provider_name,
                         model_name: &model_name,
                         usage: cumulative_usage,
                         cwd: &cwd_display,
@@ -1723,6 +2790,37 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     runtime
                 })
         });
+        let durable_session_id = session
+            .persistence
+            .as_ref()
+            .and_then(|store| store.snapshot().ok())
+            .map(|snapshot| snapshot.state.session_id)
+            .or_else(|| {
+                session_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| format!("tui-session-{}", std::process::id()));
+        let turn_control = match install_tui_root_control(
+            &mut session,
+            TuiRootControlArgs {
+                session_id: &durable_session_id,
+                turn: mcp_turns,
+                sandbox: &args.sandbox,
+                approval: approval_policy,
+                mcp_available: mcp_runtime.is_some(),
+                tool_names: &args.tool_names,
+                model: &model_name,
+                effort: args.initial_effort_name.as_deref().unwrap_or("automatic"),
+            },
+        ) {
+            Ok(control) => control,
+            Err(error) => {
+                status = Status::Error(format!("subagent controlを準備できません: {error}"));
+                continue 'outer;
+            }
+        };
         let outcome = {
             let mut stop = StopTracker::new(args.max_turns);
             let mut gate = Gate::new(approval_policy);
@@ -1810,7 +2908,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     // display work. Anything still queued when the turn
                     // finishes is drained right after this loop.
                     Some(event) = events_rx.recv() => {
-                        let appended = append_live_event(&event, &mut history);
+                        update_effort_from_event(&event, &mut effort_name);
+                        let appended = append_live_event(
+                            &event,
+                            &mut history,
+                            &mut agent_activity_rows,
+                        );
+                        history_wrap_cache.invalidate();
                         // The user is scrolled back, not following the
                         // tail — advance `scroll_offset` by however many
                         // lines just landed so the *viewed content* stays
@@ -1870,12 +2974,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 draw_frame(
                                     f,
                                     &history,
+                                    &mut history_wrap_cache,
                                     scroll_offset,
                                     &input_buffer,
                                     input_cursor,
                                     &status,
                                     &render::HeaderInfo {
-                                        provider_name: &args.provider_name,
+                                        provider_name: &provider_name,
                                         model_name: &model_name,
                                         usage: cumulative_usage,
                                         cwd: &cwd_display,
@@ -1936,12 +3041,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                 draw_frame(
                                                     f,
                                                     &history,
+                                                    &mut history_wrap_cache,
                                                     scroll_offset,
                                                     &input_buffer,
                                                     input_cursor,
                                                     &status,
                                                     &render::HeaderInfo {
-                                                        provider_name: &args.provider_name,
+                                                        provider_name: &provider_name,
                                                         model_name: &model_name,
                                                         usage: cumulative_usage,
                                                         cwd: &cwd_display,
@@ -1958,7 +3064,27 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             break TurnOutcome::Fatal;
                                         }
                                     }
-                                    _ => {}
+                                    _ => match apply_inflight_key(
+                                        &mut input_buffer,
+                                        &mut input_cursor,
+                                        &mut input_history,
+                                        &mut queued_inputs,
+                                        key,
+                                    ) {
+                                        InflightInputAction::Continue => {}
+                                        InflightInputAction::Queued => {
+                                            status = Status::Notice(format!(
+                                                "queued input ({})",
+                                                queued_inputs.len()
+                                            ));
+                                            mid_turn_notice_until = Some(
+                                                Instant::now() + MID_TURN_NOTICE_DURATION,
+                                            );
+                                        }
+                                        InflightInputAction::Interrupt => {
+                                            break TurnOutcome::Interrupted;
+                                        }
+                                    },
                                 }
                             }
                             Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
@@ -2070,12 +3196,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                     draw_frame(
                                                         f,
                                                         &history,
+                                                        &mut history_wrap_cache,
                                                         scroll_offset,
                                                         &input_buffer,
                                                         input_cursor,
                                                         &status,
                                                         &render::HeaderInfo {
-                                                            provider_name: &args.provider_name,
+                                                            provider_name: &provider_name,
                                                             model_name: &model_name,
                                                             usage: cumulative_usage,
                                                             cwd: &cwd_display,
@@ -2112,7 +3239,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             // print them rather than silently dropping the final tool's
             // result marker.
             while let Ok(event) = events_rx.try_recv() {
-                let appended = append_live_event(&event, &mut history);
+                update_effort_from_event(&event, &mut effort_name);
+                let appended = append_live_event(&event, &mut history, &mut agent_activity_rows);
+                history_wrap_cache.invalidate();
                 if scroll_offset > 0 {
                     scroll_offset += appended;
                 }
@@ -2134,6 +3263,41 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         if let Some(runtime) = mcp_runtime.as_mut() {
             // An unconfirmed stop parks the child with the shared cleanup owner.
             let _ = runtime.shutdown().await;
+        }
+        // Only a normally completed root turn can prove that every child
+        // reached a terminal state.  Provider/tool errors can abandon a
+        // spawn wave just as interruption can, so fail closed and mark any
+        // still-running child outcome unknown before releasing the owner.
+        let cancel_children = !matches!(&outcome, TurnOutcome::Done(Ok(_)));
+        let mut control_cleanup_error = session
+            .finish_root_delegation_control(cancel_children)
+            .await
+            .err();
+        if let Some(admission) = tui_admission.take() {
+            let terminal = match &outcome {
+                TurnOutcome::Done(Ok(_)) => {
+                    polaris_core::session_manager::TerminalStatus::Completed
+                }
+                TurnOutcome::Done(Err(_)) => polaris_core::session_manager::TerminalStatus::Failed,
+                TurnOutcome::Interrupted => {
+                    polaris_core::session_manager::TerminalStatus::Cancelled
+                }
+                TurnOutcome::Fatal => polaris_core::session_manager::TerminalStatus::OutcomeUnknown,
+            };
+            if let Err(error) = admission.finish(terminal) {
+                control_cleanup_error = Some(format!("sidechat runを終了できません: {error}"));
+            }
+        }
+        if matches!(&outcome, TurnOutcome::Done(Ok(_)))
+            && let Some(finalizer) = args.answer_finalizer.as_ref()
+        {
+            let scheduled = schedule_tui_shadow(finalizer, &session, &text, &turn_control);
+            if let Err(error) = scheduled {
+                local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!("回答達成判定を記録できません: {error}"),
+                    ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+                )));
+            }
         }
 
         match outcome {
@@ -2178,6 +3342,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             }
             TurnOutcome::Fatal => break ExitCode::FAILURE,
         }
+        if let Some(error) = control_cleanup_error {
+            status = Status::Error(format!("subagent controlを終了できません: {error}"));
+        }
     };
 
     // Already leaves the alternate screen entered above, on its own
@@ -2201,6 +3368,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     );
     if let Some(msg) = fatal_message {
         eprintln!("{msg}");
+    }
+    if let Some(session_id) = current_resume_id(&session, &session_path) {
+        print_resume_hint(&session_id);
     }
     exit_code
 }
@@ -2703,29 +3873,101 @@ fn handle_permissions<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
-/// Runs the `/model` picker — same small blocking loop shape as
-/// `run_permissions_picker`, navigating `render::MODEL_CATALOG` instead
-/// of a fixed 3-option enum.
+#[derive(Clone, Copy)]
+enum ModelMenuChoice {
+    Hosted(&'static str),
+    Local,
+}
+
+struct ConnectedLocalModel {
+    runtime: Runtime,
+    adapter: Arc<LocalAdapter>,
+    observed: ModelMetadata,
+}
+
+impl ConnectedLocalModel {
+    fn provider_name(&self) -> &'static str {
+        match self.runtime {
+            Runtime::Ollama => "ollama",
+            Runtime::LmStudio => "lmstudio",
+            Runtime::LlamaCpp => "llamacpp",
+        }
+    }
+
+    fn runtime_label(&self) -> &'static str {
+        match self.runtime {
+            Runtime::Ollama => "Ollama",
+            Runtime::LmStudio => "LM Studio",
+            Runtime::LlamaCpp => "llama.cpp",
+        }
+    }
+
+    fn display_name(&self) -> String {
+        format!("{} · {}", self.runtime_label(), self.observed.id())
+    }
+}
+
+async fn discover_local_runtime(runtime: Runtime, endpoint: &str) -> Vec<ConnectedLocalModel> {
+    let Ok(endpoint) = Endpoint::parse(endpoint) else {
+        return Vec::new();
+    };
+    let Ok(adapter) = LocalAdapter::new(runtime, endpoint) else {
+        return Vec::new();
+    };
+    let adapter = Arc::new(adapter);
+    let Ok(models) = adapter.inventory().await else {
+        return Vec::new();
+    };
+    models
+        .into_iter()
+        .filter(|model| model.capabilities().completion != Capability::Unsupported)
+        .map(|observed| ConnectedLocalModel {
+            runtime,
+            adapter: adapter.clone(),
+            observed,
+        })
+        .collect()
+}
+
+async fn discover_connected_local_models() -> Vec<ConnectedLocalModel> {
+    let (ollama, lmstudio) = tokio::join!(
+        discover_local_runtime(Runtime::Ollama, "http://127.0.0.1:11434/"),
+        discover_local_runtime(Runtime::LmStudio, "http://127.0.0.1:1234/"),
+    );
+    ollama.into_iter().chain(lmstudio).collect()
+}
+
+/// Runs the `/model` picker — four hosted choices plus one local-runtime
+/// entry. Reasoning effort is intentionally absent because routing owns it.
 fn run_model_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
     current: &str,
-) -> Option<&'static str> {
+    current_is_local: bool,
+) -> Option<ModelMenuChoice> {
     let catalog = render::MODEL_CATALOG;
-    let mut selected = catalog.iter().position(|m| *m == current).unwrap_or(0);
+    let mut selected = if current_is_local {
+        catalog.len()
+    } else {
+        catalog.iter().position(|m| *m == current).unwrap_or(0)
+    };
+    let count = catalog.len() + 1;
     loop {
         if terminal
             .borrow_mut()
-            .draw(|f| render::render_model_picker(f, current, selected))
+            .draw(|f| render::render_model_picker(f, current, current_is_local, selected))
             .is_err()
         {
             return None;
         }
         use ratatui::crossterm::event::KeyCode;
         match reader.read_key() {
-            Ok(KeyCode::Down) => selected = (selected + 1) % catalog.len(),
-            Ok(KeyCode::Up) => selected = (selected + catalog.len() - 1) % catalog.len(),
-            Ok(KeyCode::Enter) => return Some(catalog[selected]),
+            Ok(KeyCode::Down) => selected = (selected + 1) % count,
+            Ok(KeyCode::Up) => selected = (selected + count - 1) % count,
+            Ok(KeyCode::Enter) if selected == catalog.len() => {
+                return Some(ModelMenuChoice::Local);
+            }
+            Ok(KeyCode::Enter) => return Some(ModelMenuChoice::Hosted(catalog[selected])),
             Ok(KeyCode::Esc) => return None,
             Ok(_) => continue,
             Err(_) => return None,
@@ -2733,35 +3975,38 @@ fn run_model_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
-/// Runs the `/model` wizard's second step — same shape as
-/// `run_model_picker`, navigating `render::EFFORT_CATALOG`. `Esc` here
-/// means "go back to the model list" (matching the picker's own
-/// "esc to go back" hint), not "cancel the whole wizard" — the caller
-/// (`handle_model`) is what turns that into an actual step-back.
-fn run_effort_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
+fn run_local_model_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
-    model: &str,
-    current: &str,
-) -> Option<&'static str> {
-    let catalog = render::EFFORT_CATALOG;
-    let mut selected = catalog
+    models: &[ConnectedLocalModel],
+    current_provider: &str,
+    current_model: &str,
+) -> Option<usize> {
+    if models.is_empty() {
+        return None;
+    }
+    let labels: Vec<String> = models
         .iter()
-        .position(|(name, _)| *name == current)
-        .unwrap_or(0);
+        .map(ConnectedLocalModel::display_name)
+        .collect();
+    let current = models.iter().position(|model| {
+        model.provider_name() == current_provider && model.observed.id() == current_model
+    });
+    let current_label = current.map(|index| labels[index].as_str());
+    let mut selected = current.unwrap_or(0);
     loop {
         if terminal
             .borrow_mut()
-            .draw(|f| render::render_effort_picker(f, model, current, selected))
+            .draw(|f| render::render_local_model_picker(f, &labels, current_label, selected))
             .is_err()
         {
             return None;
         }
         use ratatui::crossterm::event::KeyCode;
         match reader.read_key() {
-            Ok(KeyCode::Down) => selected = (selected + 1) % catalog.len(),
-            Ok(KeyCode::Up) => selected = (selected + catalog.len() - 1) % catalog.len(),
-            Ok(KeyCode::Enter) => return Some(catalog[selected].0),
+            Ok(KeyCode::Down) => selected = (selected + 1) % models.len(),
+            Ok(KeyCode::Up) => selected = (selected + models.len() - 1) % models.len(),
+            Ok(KeyCode::Enter) => return Some(selected),
             Ok(KeyCode::Esc) => return None,
             Ok(_) => continue,
             Err(_) => return None,
@@ -2769,47 +4014,91 @@ fn run_effort_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
-/// Handles `/model`: a two-step wizard — pick the model, then pick its
-/// reasoning effort (both catalogs shown as one flat list each; codex's
-/// own screen splits `Max`/`Ultra` onto a second "Advanced Reasoning"
-/// page, but that split was explicitly not wanted here) — mirroring the
-/// two screens in codex's real `/model` (verified against two
-/// screenshots of it). Esc on the effort step goes back to the model
-/// list rather than cancelling outright, matching that screen's own
-/// "esc to go back" hint; Esc on the model list cancels the whole thing.
-/// On confirming both steps, switches what the provider actually sends
-/// (`provider.set_model`/`set_effort`, through interior mutability —
-/// see their docs) and updates the local display copies (`model_name`,
-/// `effort_name`) the header/footer/notices read.
+/// Handles `/model`. Hosted choices reuse the authenticated provider. The
+/// local row discovers only the same two loopback runtimes as the desktop,
+/// then installs an immutable local binding for the chosen observed model.
 #[allow(clippy::too_many_arguments)]
-fn handle_model<B: ratatui::backend::Backend, R: approver::KeyReader>(
+async fn handle_model<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
-    provider: &dyn Provider,
+    provider: &mut Arc<dyn Provider>,
+    cloud_provider: &Arc<dyn Provider>,
+    usage_meter: &polaris_provider::UsageMeter,
+    local_router: &polaris_core::local_execution::LocalRouter,
+    provider_name: &mut String,
+    cloud_provider_name: &str,
     model_name: &mut String,
+    cloud_effort_name: &str,
     effort_name: &mut String,
     status: &mut Status,
 ) {
     loop {
-        let Some(picked_model) = run_model_picker(terminal, reader, model_name) else {
+        let current_is_local = is_local_provider(provider_name);
+        let Some(choice) = run_model_picker(terminal, reader, model_name, current_is_local) else {
             return;
         };
-        let Some(picked_effort) = run_effort_picker(terminal, reader, picked_model, effort_name)
-        else {
-            continue;
-        };
-        provider.set_model(picked_model);
-        // `picked_effort` is the picker's display name — what actually
-        // reaches the provider is `effort_wire_value`'s translation of
-        // it (see that function's docs on the real `400 Invalid value:
-        // 'extra high'` this exists to prevent). `effort_name` still
-        // stores the display name, since that's what the footer/notice
-        // should keep showing the user picked.
-        provider.set_effort(Some(render::effort_wire_value(picked_effort)));
-        *model_name = picked_model.to_string();
-        *effort_name = picked_effort.to_string();
-        *status = Status::Notice(format!("model set to {picked_model} ({picked_effort})"));
-        return;
+        match choice {
+            ModelMenuChoice::Hosted(picked_model) => {
+                if !matches!(cloud_provider_name, "codex" | "openai") {
+                    *status = Status::Error(
+                        "hosted models are unavailable for this launch; restart with a hosted provider"
+                            .to_string(),
+                    );
+                    return;
+                }
+                cloud_provider.set_model(picked_model);
+                *provider = cloud_provider.clone();
+                *provider_name = cloud_provider_name.to_string();
+                *model_name = picked_model.to_string();
+                *effort_name = cloud_effort_name.to_string();
+                *status = Status::Notice(format!("model set to {picked_model}"));
+                return;
+            }
+            ModelMenuChoice::Local => {
+                let models = discover_connected_local_models().await;
+                let Some(index) =
+                    run_local_model_picker(terminal, reader, &models, provider_name, model_name)
+                else {
+                    if models.is_empty() {
+                        *status = Status::Notice("no connected local models".to_string());
+                        return;
+                    }
+                    continue;
+                };
+                let picked = &models[index];
+                let selection = match picked.adapter.select(&picked.observed).await {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        *status = Status::Error(format!("local model is unavailable: {error}"));
+                        return;
+                    }
+                };
+                if selection.model().capabilities().tools != Capability::Supported {
+                    *status = Status::Error(
+                        "local model does not report the tool support required by polaris"
+                            .to_string(),
+                    );
+                    return;
+                }
+                let binding = match local_router.bind(selection) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        *status = Status::Error(format!("local model cannot be used: {error}"));
+                        return;
+                    }
+                };
+                *provider = Arc::new(usage_meter.wrap(binding));
+                *provider_name = picked.provider_name().to_string();
+                *model_name = picked.observed.id().to_string();
+                effort_name.clear();
+                *status = Status::Notice(format!(
+                    "local model set to {} · {}",
+                    picked.runtime_label(),
+                    picked.observed.id()
+                ));
+                return;
+            }
+        }
     }
 }
 
@@ -3393,6 +4682,378 @@ fn apply_slash_action(
 
 #[cfg(test)]
 mod tests {
+    struct DistinctContextJudge;
+
+    #[async_trait::async_trait]
+    impl polaris_provider::decision::Decider for DistinctContextJudge {
+        async fn decide(
+            &self,
+            _state: &serde_json::Value,
+            _questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+        ) -> Result<polaris_provider::decision::Decision, polaris_provider::decision::DecisionError>
+        {
+            Ok(polaris_provider::decision::Decision {
+                answers: std::collections::BTreeMap::from([(
+                    "context_relation".into(),
+                    polaris_provider::decision::Answer {
+                        choice: Some("distinct_context".into()),
+                        probabilities: std::collections::BTreeMap::from([(
+                            "distinct_context".into(),
+                            0.97,
+                        )]),
+                        confidence: Some(0.96),
+                        ..Default::default()
+                    },
+                )]),
+                input_tokens: Some(8),
+                output_tokens: Some(1),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn distinct_tui_input_uses_an_empty_durable_sidechat_and_terminal_receipt() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            session_manager::{AdmissionState, TerminalStatus},
+            session_store::PersistedSession,
+            workflow::{SessionWorkflow, WorkflowConfig},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        let sessions_dir = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let database = root.path().join("memory.sqlite3");
+        let workflow = SessionWorkflow::new(WorkflowConfig::default());
+        let parent = PersistedSession::create(
+            root.path(),
+            &database,
+            "project",
+            HistoryMode::Legacy,
+            Some(&workflow),
+        )
+        .unwrap();
+        let parent_id = parent.snapshot().unwrap().state.session_id;
+        let mut session = polaris_core::session::Session::new();
+        session.workflow = Some(workflow);
+        session.attach(parent.clone()).unwrap();
+        let mut session_path = sessions_dir.join(format!("{parent_id}.jsonl"));
+        let mut meta_path = session_path.with_extension("meta.json");
+        let mut started = 1;
+        let mut local_lines = Vec::new();
+
+        let (turn, notice) = admit_tui_input(
+            &mut session,
+            "unrelated isolated task",
+            Some(&DistinctContextJudge),
+            &state_dir,
+            &sessions_dir,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut local_lines,
+            None,
+        )
+        .await
+        .unwrap();
+        let admission_id = turn.admission_id.clone();
+        let sidechat = session.persistence.as_ref().unwrap().snapshot().unwrap();
+        assert_ne!(sidechat.state.session_id, parent_id);
+        assert_eq!(sidechat.events.len(), 1);
+        assert_eq!(
+            sidechat.events[0].message.content,
+            "unrelated isolated task"
+        );
+        assert_eq!(parent.snapshot().unwrap().events.len(), 0);
+        assert_eq!(turn.manager.sessions.len(), 2);
+        assert!(notice.unwrap().contains("running"));
+        turn.finish(TerminalStatus::Completed).unwrap();
+
+        let current =
+            polaris_core::session_manager::SessionId::new(sidechat.state.session_id).unwrap();
+        let (_store, restored) = open_tui_admission_owner(&state_dir, &current).unwrap();
+        assert!(matches!(
+            restored.status(&admission_id).unwrap().state,
+            AdmissionState::Terminal {
+                status: TerminalStatus::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_proves_a_committed_input_before_cancelling_an_unstarted_run() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            session_manager::{
+                AdmissionState, DestinationMode, SessionId, SubmissionPayloadV1, SubmitOutcomeV1,
+                SubmitRequestV1, TerminalStatus,
+            },
+            session_store::PersistedSession,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        let database = root.path().join("memory.sqlite3");
+        let parent =
+            PersistedSession::create(root.path(), &database, "project", HistoryMode::Legacy, None)
+                .unwrap();
+        let parent_id = parent.snapshot().unwrap().state.session_id;
+        let current = SessionId::new(parent_id).unwrap();
+        let (store, mut manager) = open_tui_admission_owner(&state_dir, &current).unwrap();
+        let before = manager.revision;
+        let SubmitOutcomeV1::Accepted { admission, .. } = manager
+            .submit(
+                SubmitRequestV1 {
+                    parent_session: current,
+                    payload: SubmissionPayloadV1 {
+                        text: "durable input".into(),
+                        attachment_ids: vec![],
+                        route: DestinationMode::New,
+                        expected_session_revision: 0,
+                        expected_goal_revision: 0,
+                    },
+                    admission_id: None,
+                },
+                before,
+            )
+            .unwrap();
+        persist_manager_transition(&store, before, &manager).unwrap();
+        let before = manager.revision;
+        let decided = manager
+            .decide(
+                &admission.id,
+                before,
+                admission.revision,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        persist_manager_transition(&store, before, &manager).unwrap();
+        let before = manager.revision;
+        let prepared = manager
+            .prepare_destination(&admission.id, before, decided.revision)
+            .unwrap();
+        persist_manager_transition(&store, before, &manager).unwrap();
+        let AdmissionState::DestinationReady { session_id, .. } = &prepared.state else {
+            panic!("destination should be ready");
+        };
+        let mut parent_session = polaris_core::session::Session::new();
+        parent_session.attach(parent).unwrap();
+        let mut sidechat = empty_sidechat_session(&parent_session, session_id).unwrap();
+        assert!(
+            sidechat
+                .push_admitted_user("durable input", &admission.id, &prepared.payload_hash)
+                .unwrap()
+        );
+
+        recover_tui_admission_owner(&store, &mut manager, root.path(), &database, "project")
+            .unwrap();
+        assert!(matches!(
+            manager.status(&admission.id).unwrap().state,
+            AdmissionState::Terminal {
+                status: TerminalStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(
+            sidechat
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_reply_builds_a_bound_shadow_finalization_input() {
+        use polaris_core::{conversation_state::HistoryMode, session_store::PersistedSession};
+
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("memory.sqlite3");
+        let persistence =
+            PersistedSession::create(root.path(), &database, "project", HistoryMode::Legacy, None)
+                .unwrap();
+        let session_id = persistence.snapshot().unwrap().state.session_id;
+        let mut session = polaris_core::session::Session::new();
+        session.attach(persistence).unwrap();
+        session.push_user("summarize this");
+        session.push_assistant("done", vec![]);
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                .unwrap();
+        let control = install_tui_root_control(
+            &mut session,
+            TuiRootControlArgs {
+                session_id: &session_id,
+                turn: 1,
+                sandbox: &sandbox,
+                approval: ApprovalPolicy::OnRequest,
+                mcp_available: false,
+                tool_names: &[],
+                model: "gpt-6-astra",
+                effort: "xhigh",
+            },
+        )
+        .unwrap();
+
+        let input = tui_shadow_input(&session, "summarize this", &control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(input.prompt, "summarize this");
+        assert_eq!(input.source_body, "done");
+        assert!(input.closed_evidence.is_empty());
+        assert!(input.evidence_complete);
+        assert_eq!(input.subject.session_id, session_id);
+        assert_eq!(input.subject.root_run_id, "tui-root-run-1");
+        assert_eq!(input.subject.attempt_id, "tui-root-attempt-1");
+        assert_eq!(input.subject.turn_sequence, 2);
+        input.subject.validate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_tui_turn_schedules_the_shared_shadow_owner() {
+        use polaris_core::{
+            config::{
+                AnswerFinalizerConfig, AnswerFinalizerMode, JudgeProfile, PresentationConfig,
+                PresentationLanguage,
+            },
+            conversation_state::HistoryMode,
+            session_store::PersistedSession,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("memory.sqlite3");
+        let persistence =
+            PersistedSession::create(root.path(), &database, "project", HistoryMode::Legacy, None)
+                .unwrap();
+        let session_id = persistence.snapshot().unwrap().state.session_id;
+        let mut session = polaris_core::session::Session::new();
+        session.attach(persistence).unwrap();
+        session.push_user("answer this");
+        session.push_assistant("answer", vec![]);
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                .unwrap();
+        let control = install_tui_root_control(
+            &mut session,
+            TuiRootControlArgs {
+                session_id: &session_id,
+                turn: 2,
+                sandbox: &sandbox,
+                approval: ApprovalPolicy::OnRequest,
+                mcp_available: false,
+                tool_names: &[],
+                model: "gpt-6-astra",
+                effort: "xhigh",
+            },
+        )
+        .unwrap();
+        let owner = polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner::open_configured(
+            root.path().join("shadow.json"),
+            PresentationConfig {
+                language: PresentationLanguage::Ja,
+            },
+            AnswerFinalizerConfig {
+                mode: AnswerFinalizerMode::Shadow,
+                judge_profile: Some(JudgeProfile::FulfillmentV1),
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(schedule_tui_shadow(&owner, &session, "answer this", &control).unwrap());
+        assert_eq!(owner.records().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn idle_ctrl_c_exits_only_on_the_second_consecutive_press() {
+        let mut confirmation = ExitConfirmation::default();
+
+        assert!(!confirmation.press());
+        assert!(confirmation.press());
+    }
+
+    #[test]
+    fn other_input_cancels_an_armed_idle_ctrl_c() {
+        let mut confirmation = ExitConfirmation::default();
+
+        assert!(!confirmation.press());
+        confirmation.cancel();
+        assert!(!confirmation.press());
+    }
+
+    #[test]
+    fn resume_hint_uses_the_current_persisted_legacy_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("resume-me.jsonl");
+        std::fs::write(&session_path, b"{}\n").unwrap();
+        let session = polaris_core::session::Session::new();
+
+        let id = current_resume_id(&session, &session_path).unwrap();
+        assert_eq!(id, "resume-me");
+        assert_eq!(
+            resume_hint(&id),
+            "\nResume this session with:\npolaris --resume resume-me\n"
+        );
+    }
+
+    #[test]
+    fn empty_unpersisted_session_has_no_resume_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("not-created.jsonl");
+        let session = polaris_core::session::Session::new();
+
+        assert_eq!(current_resume_id(&session, &session_path), None);
+    }
+
+    #[tokio::test]
+    async fn tui_turn_installs_fresh_root_control_with_host_capabilities() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .unwrap();
+        let mut session = polaris_core::session::Session::new();
+        let control = install_tui_root_control(
+            &mut session,
+            TuiRootControlArgs {
+                session_id: "session-1",
+                turn: 7,
+                sandbox: &sandbox,
+                approval: ApprovalPolicy::OnRequest,
+                mcp_available: true,
+                tool_names: &["read".into(), "spawn".into()],
+                model: "gpt-6-astra",
+                effort: "automatic",
+            },
+        )
+        .unwrap();
+
+        let projection = control.snapshot().await;
+        assert_eq!(projection.session_id, "session-1");
+        assert_eq!(projection.root_run_id.0, "tui-root-run-7");
+        assert_eq!(projection.active_task_id.0, "tui-task-7");
+        assert!(session.delegation_control.is_some());
+        session.finish_root_delegation_control(false).await.unwrap();
+        assert!(session.delegation_control.is_none());
+    }
+
     #[test]
     fn a_failed_turn_keeps_possible_mcp_sends_as_unknown_and_rolls_back_others() {
         use polaris_provider::{Message, ToolCall};
@@ -3463,9 +5124,89 @@ mod tests {
     }
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::text::Line;
     use std::collections::VecDeque;
+
+    #[test]
+    fn judged_effort_replaces_the_undecided_footer_value() {
+        let mut effort = UNDECIDED_EFFORT.to_string();
+        update_effort_from_event(&polaris_core::AgentEvent::EffortJudging, &mut effort);
+        assert_eq!(effort, "judging");
+        update_effort_from_event(
+            &polaris_core::AgentEvent::EffortJudged {
+                effort: "xhigh".into(),
+            },
+            &mut effort,
+        );
+        assert_eq!(effort, "extra high");
+    }
+
+    #[test]
+    fn working_turn_accepts_and_queues_prompts_and_commands_in_order() {
+        let mut buffer = String::new();
+        let mut cursor = 0;
+        let mut history = input::History::new();
+        let mut queued = VecDeque::new();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        for character in "next prompt".chars() {
+            assert_eq!(
+                apply_inflight_key(
+                    &mut buffer,
+                    &mut cursor,
+                    &mut history,
+                    &mut queued,
+                    key(KeyCode::Char(character)),
+                ),
+                InflightInputAction::Continue
+            );
+        }
+        assert_eq!(
+            apply_inflight_key(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                &mut queued,
+                key(KeyCode::Enter),
+            ),
+            InflightInputAction::Queued
+        );
+        for character in "/model".chars() {
+            apply_inflight_key(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                &mut queued,
+                key(KeyCode::Char(character)),
+            );
+        }
+        assert_eq!(
+            apply_inflight_key(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                &mut queued,
+                key(KeyCode::Enter),
+            ),
+            InflightInputAction::Queued
+        );
+
+        assert_eq!(
+            queued.into_iter().collect::<Vec<_>>(),
+            ["next prompt", "/model"]
+        );
+        assert!(buffer.is_empty());
+        assert_eq!(cursor, 0);
+
+        // Synthetic Enter presses must not record those same two entries a
+        // second time when they are dispatched after the current turn.
+        record_submission(&mut history, "next prompt", true);
+        record_submission(&mut history, "/model", true);
+        assert_eq!(history.older(""), Some("/model"));
+        assert_eq!(history.older(""), Some("next prompt"));
+        assert_eq!(history.older(""), None);
+    }
 
     struct Summarizer;
 
@@ -3616,6 +5357,7 @@ mod tests {
     fn draw_frame_puts_the_footer_in_the_bottom_inline_viewport_height_rows() {
         let backend = ratatui::backend::TestBackend::new(60, 30);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut wrap_cache = render::HistoryWrapCache::default();
         let history = vec![render::HistoryLine {
             line: ratatui::text::Line::from("line from history"),
             shaded: false,
@@ -3625,6 +5367,7 @@ mod tests {
                 draw_frame(
                     f,
                     &history,
+                    &mut wrap_cache,
                     0,
                     "",
                     0,
@@ -3675,6 +5418,7 @@ mod tests {
         // than clipping it at the window's right edge.
         let backend = ratatui::backend::TestBackend::new(30, 20);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut wrap_cache = render::HistoryWrapCache::default();
         let long_text = "one two three four five six seven eight nine ten";
         let history = vec![render::HistoryLine {
             line: ratatui::text::Line::from(long_text),
@@ -3685,6 +5429,7 @@ mod tests {
                 draw_frame(
                     f,
                     &history,
+                    &mut wrap_cache,
                     0,
                     "",
                     0,
@@ -3731,6 +5476,7 @@ mod tests {
         // height the other `draw_frame` tests in this module use).
         let backend = ratatui::backend::TestBackend::new(40, 20);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut wrap_cache = render::HistoryWrapCache::default();
         // `HistoryLine::plain` is private to `render.rs` — this test lives in
         // `lib.rs`'s own test module, a different module, so it must build
         // `HistoryLine` via its public fields directly (both `line` and
@@ -3751,6 +5497,7 @@ mod tests {
                 draw_frame(
                     f,
                     &history,
+                    &mut wrap_cache,
                     0,
                     "",
                     0,
@@ -3804,6 +5551,7 @@ mod tests {
     fn draw_frame_leaves_no_blank_gap_between_history_and_the_footer() {
         let backend = ratatui::backend::TestBackend::new(60, 20);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut wrap_cache = render::HistoryWrapCache::default();
         let history: Vec<render::HistoryLine> = (0..20)
             .map(|i| render::HistoryLine {
                 line: ratatui::text::Line::from(format!("history line {i}")),
@@ -3815,6 +5563,7 @@ mod tests {
                 draw_frame(
                     f,
                     &history,
+                    &mut wrap_cache,
                     0,
                     "",
                     0,
@@ -3887,6 +5636,7 @@ mod tests {
             );
             let backend = ratatui::backend::TestBackend::new(60, terminal_height);
             let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            let mut wrap_cache = render::HistoryWrapCache::default();
             let history: Vec<render::HistoryLine> = (0..terminal_height)
                 .map(|_| render::HistoryLine {
                     line: ratatui::text::Line::from("H"),
@@ -3898,6 +5648,7 @@ mod tests {
                     draw_frame(
                         f,
                         &history,
+                        &mut wrap_cache,
                         0,
                         "",
                         0,
@@ -4221,12 +5972,59 @@ mod tests {
     #[test]
     fn append_live_event_appends_formatted_lines() {
         let mut history = Vec::new();
+        let mut activity_rows = AgentActivityRows::default();
         let event = polaris_core::AgentEvent::ToolStarted {
             name: "read".to_string(),
             detail: "Cargo.toml".to_string(),
         };
-        append_live_event(&event, &mut history);
+        append_live_event(&event, &mut history, &mut activity_rows);
         assert!(!history.is_empty());
+    }
+
+    #[test]
+    fn child_tool_activity_replaces_only_that_agents_single_progress_row() {
+        let mut history = Vec::new();
+        let mut activity_rows = AgentActivityRows::default();
+        for (display_name, agent_type) in [("Sirius", "file-reader"), ("Antares", "file-reader")] {
+            append_live_event(
+                &polaris_core::AgentEvent::SpawnStarted {
+                    display_name: display_name.to_string(),
+                    agent_type: agent_type.to_string(),
+                    task: "private".to_string(),
+                },
+                &mut history,
+                &mut activity_rows,
+            );
+        }
+
+        let activity =
+            |display_name: &str, name: &str, path: &str| polaris_core::AgentEvent::SpawnActivity {
+                display_name: display_name.to_string(),
+                agent_type: "file-reader".to_string(),
+                name: name.to_string(),
+                detail: serde_json::json!({"path": path}).to_string(),
+            };
+        append_live_event(
+            &activity("Sirius", "read", "first.md"),
+            &mut history,
+            &mut activity_rows,
+        );
+        append_live_event(
+            &activity("Antares", "write", "notes.md"),
+            &mut history,
+            &mut activity_rows,
+        );
+        append_live_event(
+            &activity("Sirius", "read", "second.md"),
+            &mut history,
+            &mut activity_rows,
+        );
+
+        assert_eq!(history.len(), 4, "activity must update instead of append");
+        assert_eq!(history[0].line.to_string(), "⏺ Sirius (file-reader)");
+        assert_eq!(history[1].line.to_string(), "  → read(second.md)");
+        assert_eq!(history[2].line.to_string(), "⏺ Antares (file-reader)");
+        assert_eq!(history[3].line.to_string(), "  → write(notes.md)");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4940,163 +6738,91 @@ mod tests {
         }
     }
 
-    #[test]
-    fn handle_model_switches_the_provider_and_the_display_copies() {
+    #[tokio::test]
+    async fn handle_model_switches_the_hosted_provider_without_an_effort_step() {
         let backend = TestBackend::new(70, 14);
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
-        // Down from gpt-5.4 moves to gpt-5.4-mini,
-        // Enter advances to the effort step. "max" is index 4 in
-        // EFFORT_CATALOG; Down once from the default "extra high"
-        // reaches it, then Enter confirms the whole wizard. `max` also
-        // has to arrive at the provider as itself — it is a real effort
-        // on `/responses` and used to be rewritten to `xhigh` on the way.
-        let mut reader = ScriptedReader(VecDeque::from([
-            KeyCode::Down,
-            KeyCode::Enter,
-            KeyCode::Down,
-            KeyCode::Enter,
-        ]));
-        let provider = RecordingProvider::new();
-        let mut model_name = "gpt-5.4".to_string();
+        let mut reader = ScriptedReader(VecDeque::from([KeyCode::Down, KeyCode::Enter]));
+        let cloud = Arc::new(RecordingProvider::new());
+        let cloud_dyn: Arc<dyn Provider> = cloud.clone();
+        let mut provider = cloud_dyn.clone();
+        let usage_meter = polaris_provider::UsageMeter::default();
+        let local_router = polaris_core::local_execution::LocalRouter::new(1);
+        let mut provider_name = "codex".to_string();
+        let mut model_name = "gpt-5.6-sol".to_string();
         let mut effort_name = render::DEFAULT_EFFORT.to_string();
         let mut status = Status::Idle;
 
         handle_model(
             &terminal,
             &mut reader,
-            &provider,
+            &mut provider,
+            &cloud_dyn,
+            &usage_meter,
+            &local_router,
+            &mut provider_name,
+            "codex",
             &mut model_name,
+            render::DEFAULT_EFFORT,
             &mut effort_name,
             &mut status,
-        );
+        )
+        .await;
 
-        assert_eq!(model_name, "gpt-5.4-mini");
-        assert_eq!(effort_name, "max");
+        assert_eq!(model_name, "gpt-5.6-terra");
+        assert_eq!(provider_name, "codex");
+        assert_eq!(effort_name, render::DEFAULT_EFFORT);
+        assert!(Arc::ptr_eq(&provider, &cloud_dyn));
         assert_eq!(
-            *provider.model.lock().expect("lock"),
-            Some("gpt-5.4-mini".to_string()),
+            *cloud.model.lock().expect("lock"),
+            Some("gpt-5.6-terra".to_string()),
             "the provider itself must be switched, not just the display copy"
         );
-        assert_eq!(
-            *provider.effort.lock().expect("lock"),
-            Some("max".to_string())
-        );
+        assert_eq!(*cloud.effort.lock().expect("lock"), None);
         match status {
             Status::Notice(n) => {
-                assert!(n.contains("gpt-5.4-mini"));
-                assert!(n.contains("max"));
+                assert!(n.contains("gpt-5.6-terra"));
             }
             _ => panic!("expected a Notice"),
         }
     }
 
-    #[test]
-    fn handle_model_sends_the_wire_value_not_the_display_name_for_extra_high() {
-        // Regression test: picking "extra high" used to reach the
-        // provider as the literal string "extra high" (with a space),
-        // which a real provider rejected with `400 Invalid value:
-        // 'extra high'`. It must reach `provider.set_effort` as
-        // `render::effort_wire_value("extra high")` (`"xhigh"`) while
-        // `effort_name` (what the footer/notice show) keeps the
-        // human-readable display name.
-        let backend = TestBackend::new(70, 14);
-        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
-        // Starting from "low", "extra high" is three rows down.
-        let mut reader = ScriptedReader(VecDeque::from([
-            KeyCode::Enter,
-            KeyCode::Down,
-            KeyCode::Down,
-            KeyCode::Down,
-            KeyCode::Enter,
-        ]));
-        let provider = RecordingProvider::new();
-        let mut model_name = "gpt-5.6-sol".to_string();
-        let mut effort_name = "low".to_string();
-        let mut status = Status::Idle;
-
-        handle_model(
-            &terminal,
-            &mut reader,
-            &provider,
-            &mut model_name,
-            &mut effort_name,
-            &mut status,
-        );
-
-        assert_eq!(
-            effort_name, "extra high",
-            "the display copy keeps the label"
-        );
-        assert_eq!(
-            *provider.effort.lock().expect("lock"),
-            Some("xhigh".to_string()),
-            "the provider must receive the space-free wire value, not the display label"
-        );
-    }
-
-    #[test]
-    fn handle_model_cancelled_with_esc_on_the_model_step_leaves_everything_untouched() {
+    #[tokio::test]
+    async fn handle_model_cancelled_with_esc_leaves_everything_untouched() {
         let backend = TestBackend::new(70, 14);
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
         let mut reader = ScriptedReader(VecDeque::from([KeyCode::Down, KeyCode::Esc]));
-        let provider = RecordingProvider::new();
-        let mut model_name = "gpt-5.4".to_string();
+        let cloud = Arc::new(RecordingProvider::new());
+        let cloud_dyn: Arc<dyn Provider> = cloud.clone();
+        let mut provider = cloud_dyn.clone();
+        let usage_meter = polaris_provider::UsageMeter::default();
+        let local_router = polaris_core::local_execution::LocalRouter::new(1);
+        let mut provider_name = "codex".to_string();
+        let mut model_name = "gpt-5.6-sol".to_string();
         let mut effort_name = render::DEFAULT_EFFORT.to_string();
         let mut status = Status::Idle;
 
         handle_model(
             &terminal,
             &mut reader,
-            &provider,
+            &mut provider,
+            &cloud_dyn,
+            &usage_meter,
+            &local_router,
+            &mut provider_name,
+            "codex",
             &mut model_name,
+            render::DEFAULT_EFFORT,
             &mut effort_name,
             &mut status,
-        );
+        )
+        .await;
 
-        assert_eq!(model_name, "gpt-5.4");
+        assert_eq!(model_name, "gpt-5.6-sol");
         assert_eq!(effort_name, render::DEFAULT_EFFORT);
-        assert_eq!(*provider.model.lock().expect("lock"), None);
-        assert_eq!(*provider.effort.lock().expect("lock"), None);
+        assert_eq!(*cloud.model.lock().expect("lock"), None);
+        assert_eq!(*cloud.effort.lock().expect("lock"), None);
         assert!(matches!(status, Status::Idle));
-    }
-
-    #[test]
-    fn handle_model_esc_on_the_effort_step_goes_back_to_the_model_list_not_the_whole_wizard() {
-        let backend = TestBackend::new(70, 14);
-        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
-        // Enter the effort step, back out with Esc, then confirm the
-        // (unchanged) model with a plain Enter, then confirm the
-        // (unchanged) default effort with another Enter.
-        let mut reader = ScriptedReader(VecDeque::from([
-            KeyCode::Enter,
-            KeyCode::Esc,
-            KeyCode::Enter,
-            KeyCode::Enter,
-        ]));
-        let provider = RecordingProvider::new();
-        let mut model_name = "gpt-5.4".to_string();
-        let mut effort_name = render::DEFAULT_EFFORT.to_string();
-        let mut status = Status::Idle;
-
-        handle_model(
-            &terminal,
-            &mut reader,
-            &provider,
-            &mut model_name,
-            &mut effort_name,
-            &mut status,
-        );
-
-        // The wizard completed (not cancelled) — Esc only backed out of
-        // the effort step, so a final Notice with both values should
-        // still be there.
-        assert_eq!(model_name, "gpt-5.4");
-        assert_eq!(effort_name, render::DEFAULT_EFFORT);
-        assert_eq!(
-            *provider.model.lock().expect("lock"),
-            Some("gpt-5.4".to_string())
-        );
-        assert!(matches!(status, Status::Notice(_)));
     }
 
     #[test]
@@ -5174,7 +6900,21 @@ mod tests {
         );
         assert_eq!(
             session.workflow.as_ref().unwrap().state().phase,
-            polaris_core::workflow::Phase::Implement
+            polaris_core::workflow::Phase::General,
+            "a manual phase command must not bypass M27's approved change-contract gate"
+        );
+        call(
+            slash::Action::Phase("review".into()),
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+        assert_eq!(
+            session.workflow.as_ref().unwrap().state().phase,
+            polaris_core::workflow::Phase::Review
         );
         assert_eq!(
             session
@@ -5186,7 +6926,7 @@ mod tests {
                 .state
                 .workflow
                 .phase,
-            polaris_core::workflow::Phase::Implement,
+            polaris_core::workflow::Phase::Review,
             "an idle /phase change must be durable before the next restart"
         );
         call(
@@ -5200,7 +6940,7 @@ mod tests {
         );
         assert_eq!(
             session.workflow.as_ref().unwrap().state().phase,
-            polaris_core::workflow::Phase::Implement
+            polaris_core::workflow::Phase::Review
         );
     }
 

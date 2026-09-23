@@ -657,7 +657,7 @@ fn workflow_configure_uses_cas_preserves_disabled_and_snapshot_phase() {
                         expected_session_revision: DecimalU64::new(0),
                         enabled: false,
                         mode: WorkflowMode::Adaptive,
-                        initial_phase: WorkflowPhase::Review,
+                        initial_phase: WorkflowPhase::Specify,
                     },
                 ),
             ),
@@ -670,11 +670,11 @@ fn workflow_configure_uses_cas_preserves_disabled_and_snapshot_phase() {
     let status = status.workflow.unwrap();
     assert!(!status.enabled);
     assert_eq!(status.mode, WorkflowMode::Adaptive);
-    assert_eq!(status.phase, WorkflowPhase::Review);
+    assert_eq!(status.phase, WorkflowPhase::Specify);
     let saved = engine.store.snapshot().unwrap();
     let workflow = saved.state.workflow.as_ref().unwrap();
     assert!(!workflow.config.enabled);
-    assert_eq!(workflow.state.phase, polaris_core::workflow::Phase::Review);
+    assert_eq!(workflow.state.phase, polaris_core::workflow::Phase::Specify);
     assert!(matches!(
         engine.handle(
             &request(
@@ -694,7 +694,7 @@ fn workflow_configure_uses_cas_preserves_disabled_and_snapshot_phase() {
         Err(error) if error.code == ErrorCode::RevisionConflict
     ));
     let snapshot = engine.snapshot(false).unwrap();
-    assert_eq!(snapshot.workflow.unwrap().phase, WorkflowPhase::Review);
+    assert_eq!(snapshot.workflow.unwrap().phase, WorkflowPhase::Specify);
     engine
         .handle(
             &request(
@@ -2076,6 +2076,7 @@ fn real_child_spawn_saved_before_update_and_snapshot_count_is_distinct() {
             parent_run_id: child.child.parent_run_id.clone(),
         }),
         event: AgentEvent::SpawnStarted {
+            display_name: "Sirius".into(),
             agent_type: child.agent_type.clone(),
             task: child.task.clone(),
         },
@@ -2195,6 +2196,7 @@ fn real_child_update_is_returned_only_after_persistence_and_rejects_reversal() {
         &mut engine.store,
         &target,
         event(AgentEvent::SpawnStarted {
+            display_name: "Sirius".into(),
             agent_type: "worker".into(),
             task: "purpose".into(),
         }),
@@ -2212,6 +2214,7 @@ fn real_child_update_is_returned_only_after_persistence_and_rejects_reversal() {
         &mut engine.store,
         &target,
         event(AgentEvent::SpawnFinished {
+            display_name: "Sirius".into(),
             agent_type: "worker".into(),
             ok: true,
         }),
@@ -2229,6 +2232,7 @@ fn real_child_update_is_returned_only_after_persistence_and_rejects_reversal() {
             &mut engine.store,
             &target,
             event(AgentEvent::SpawnFinished {
+                display_name: "Sirius".into(),
                 agent_type: "worker".into(),
                 ok: false
             })

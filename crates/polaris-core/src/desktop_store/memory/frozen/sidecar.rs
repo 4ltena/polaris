@@ -23,6 +23,8 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         let mut seen = BTreeSet::new();
+        let mut saved_workflow = None;
+        let mut workflow_artifacts = None;
         while let Some(name) = key(&mut map, self.budget)? {
             if !seen.insert(name.clone()) {
                 return Err(serde::de::Error::custom("固定記憶の付随field重複"));
@@ -66,7 +68,14 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
                     let workflow: Option<SavedWorkflow> = value(&mut map, self.budget, RECORD)?;
                     if let Some(workflow) = workflow {
                         workflow.validate().map_err(serde::de::Error::custom)?;
+                        saved_workflow = Some(workflow);
                     }
+                }
+                "workflow_artifacts" => {
+                    let graph: crate::workflow::WorkflowArtifactGraphV1 =
+                        value(&mut map, self.budget, RECORD)?;
+                    graph.validate().map_err(serde::de::Error::custom)?;
+                    workflow_artifacts = Some(graph);
                 }
                 "tasks" => sequence(&mut map, self.budget, RECORD, COUNT, |_: Task| Ok(()))?,
                 "children" => {
@@ -105,6 +114,17 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
                 )?,
                 _ => return Err(serde::de::Error::custom("固定記憶の未知の付随field")),
             }
+        }
+        if let Some(reference) = saved_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.state.active_change_contract.as_ref())
+        {
+            let graph = workflow_artifacts
+                .as_ref()
+                .ok_or_else(|| serde::de::Error::custom("固定記憶のactive artifact graph不在"))?;
+            graph
+                .approved_routine_contract(reference)
+                .map_err(serde::de::Error::custom)?;
         }
         for required in [
             "session_revision",

@@ -5,12 +5,15 @@
 //! SQLite tombstones are owned by the memory layer: its transaction must enclose
 //! `publish` when publishing indexed summaries. This module does not authorize reads.
 
-use crate::workflow::{WORKFLOW_SCHEMA_VERSION, WorkflowConfig, WorkflowGatesV1, WorkflowStateV1};
+use crate::workflow::{
+    WORKFLOW_SCHEMA_VERSION, WorkflowArtifactGraphV1, WorkflowConfig, WorkflowGatesV1,
+    WorkflowStateV1,
+};
 use polaris_provider::{Message, Role};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -19,6 +22,18 @@ use std::{
 pub const SCHEMA_VERSION: u32 = 2;
 pub const REAL_TURN_WINDOW: usize = 10;
 pub const SAVED_WORKFLOW_CONFIG_SCHEMA_VERSION: u32 = 1;
+const MAX_ADMISSION_RECEIPTS: usize = 4096;
+
+/// Proof that one admission was committed with one raw user event. The
+/// session-manager ledger owns routing and scheduling; this marker-owned
+/// receipt closes the crash window between its decision and the raw append.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionReceiptV1 {
+    pub payload_hash: String,
+    pub sequence: u64,
+    pub turn_id: u64,
+}
 
 pub(crate) mod structured_attempt;
 
@@ -98,6 +113,18 @@ pub struct ConversationStateV2 {
     pub workflow_config: Option<SavedWorkflowConfigV1>,
     pub workflow: WorkflowStateV1,
     pub gates: WorkflowGatesV1,
+    /// M27 metadata only. Immutable artifact bodies live in the adjacent
+    /// project-scoped object store. Legacy sessions deserialize an empty graph.
+    #[serde(default)]
+    pub workflow_artifacts: WorkflowArtifactGraphV1,
+    /// Reference-only verification state. Older markers have no checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_checkpoint:
+        Option<crate::verification::checkpoint::SavedVerificationCheckpointV1>,
+    /// Admission IDs are retained for the life of the conversation so a
+    /// retry after a lost response cannot append the same accepted input.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub admission_receipts: BTreeMap<String, AdmissionReceiptV1>,
     pub ancestors: Vec<AncestorRange>,
 }
 
@@ -119,6 +146,9 @@ impl ConversationStateV2 {
             workflow_config: None,
             workflow: WorkflowStateV1::default(),
             gates: WorkflowGatesV1::default(),
+            workflow_artifacts: WorkflowArtifactGraphV1::default(),
+            verification_checkpoint: None,
+            admission_receipts: BTreeMap::new(),
             ancestors: Vec::new(),
         };
         state.validate()?;
@@ -134,6 +164,29 @@ impl ConversationStateV2 {
                 .is_some_and(|config| config.validate().is_err())
         {
             return Err(invalid("未対応のセッション保存形式です"));
+        }
+        self.workflow_artifacts
+            .validate()
+            .map_err(|_| invalid("workflow artifact graphが不正です"))?;
+        if let Some(checkpoint) = &self.verification_checkpoint {
+            checkpoint
+                .validate()
+                .map_err(|_| invalid("verification checkpointが不正です"))?;
+        }
+        if self.admission_receipts.len() > MAX_ADMISSION_RECEIPTS
+            || self.admission_receipts.iter().any(|(id, receipt)| {
+                crate::session_manager::AdmissionId::new(id.clone()).is_err()
+                    || !valid_hash(&receipt.payload_hash)
+                    || receipt.sequence == 0
+                    || receipt.turn_id == 0
+            })
+        {
+            return Err(invalid("admission receiptが不正です"));
+        }
+        if let Some(reference) = &self.workflow.active_change_contract {
+            self.workflow_artifacts
+                .approved_routine_contract(reference)
+                .map_err(|_| invalid("active change contractが不正です"))?;
         }
         if self.project_id.is_empty()
             || !valid_session_id(&self.session_id)
@@ -248,6 +301,20 @@ impl ConversationSnapshot {
                 .iter()
                 .filter(|event| event.epoch == self.state.epoch && event.turn_id == turn_id),
         )
+    }
+
+    fn validate_admission_receipts(&self) -> io::Result<()> {
+        for receipt in self.state.admission_receipts.values() {
+            let event = self
+                .events
+                .iter()
+                .find(|event| event.sequence == receipt.sequence)
+                .ok_or_else(|| invalid("admission receiptの原文がありません"))?;
+            if !event.starts_turn || event.turn_id != receipt.turn_id {
+                return Err(invalid("admission receiptの原文境界が不正です"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -452,6 +519,7 @@ impl LockedConversation<'_> {
         next.workflow_config = snapshot.state.workflow_config.clone();
         next.workflow = snapshot.state.workflow.clone();
         next.gates = snapshot.state.gates.for_fork(artifact_hash);
+        next.workflow_artifacts = snapshot.state.workflow_artifacts.clone();
         next.ancestors = snapshot.state.ancestors.clone();
         next.ancestors.push(AncestorRange {
             session_id: snapshot.state.session_id.clone(),
@@ -519,6 +587,7 @@ impl LockedConversation<'_> {
             raw_offset: bytes.len() as u64,
             events,
         };
+        snapshot.validate_admission_receipts()?;
         if let Some(coverage) = &snapshot.state.structured_coverage {
             validate_coverage_boundary(
                 &bytes,

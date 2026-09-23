@@ -34,6 +34,16 @@ pub enum AgentEvent {
     /// never relabels the main model request or a local deterministic step.
     DecisionStarted,
     DecisionFinished,
+    /// The root turn's typed judge is selecting the reasoning effort. Kept
+    /// separate from general decision events so the TUI can update the footer
+    /// without treating every typed decision as effort routing.
+    EffortJudging,
+    /// The root turn's typed judge finished selecting reasoning effort. A
+    /// failed/unavailable judge publishes the conservative fallback; a
+    /// successful result is applied to the provider before this event is sent.
+    EffortJudged {
+        effort: String,
+    },
     ToolStarted {
         name: String,
         detail: String,
@@ -49,10 +59,23 @@ pub enum AgentEvent {
         diff: Option<Diff>,
     },
     SpawnStarted {
+        display_name: String,
         agent_type: String,
         task: String,
     },
+    /// A legacy TUI child is currently running one tool. Desktop keeps the
+    /// same association in `EventEnvelope::child`; the flat TUI event stream
+    /// needs the display identity carried in-band so concurrent children can
+    /// update their own single progress row instead of appending root-like
+    /// tool rows.
+    SpawnActivity {
+        display_name: String,
+        agent_type: String,
+        name: String,
+        detail: String,
+    },
     SpawnFinished {
+        display_name: String,
         agent_type: String,
         ok: bool,
     },
@@ -112,7 +135,9 @@ impl AgentEvent {
             Self::ModelRequestStarted { .. }
             | Self::ModelRequestFinished { .. }
             | Self::DecisionStarted
-            | Self::DecisionFinished => true,
+            | Self::DecisionFinished
+            | Self::EffortJudging => true,
+            Self::EffortJudged { effort } => budget.string(effort),
             Self::MemoryPrepared(observation) => budget.strings(&observation.source_uris),
             Self::TextDelta { text, .. } => budget.string(text),
             Self::WorkflowResolved {
@@ -139,10 +164,27 @@ impl AgentEvent {
                     && budget.string(result)
                     && diff.as_ref().is_none_or(|diff| budget.diff(diff))
             }
-            Self::SpawnStarted { agent_type, task } => {
-                budget.string(agent_type) && budget.string(task)
+            Self::SpawnStarted {
+                display_name,
+                agent_type,
+                task,
+            } => budget.string(display_name) && budget.string(agent_type) && budget.string(task),
+            Self::SpawnActivity {
+                display_name,
+                agent_type,
+                name,
+                detail,
+            } => {
+                budget.string(display_name)
+                    && budget.string(agent_type)
+                    && budget.string(name)
+                    && budget.string(detail)
             }
-            Self::SpawnFinished { agent_type, .. } => budget.string(agent_type),
+            Self::SpawnFinished {
+                display_name,
+                agent_type,
+                ..
+            } => budget.string(display_name) && budget.string(agent_type),
             Self::HistoryCompacted { .. } => true,
         }
     }
@@ -229,6 +271,7 @@ mod tests {
     #[test]
     fn queue_budget_checks_exact_boundary_and_nested_allocations() {
         let event = AgentEvent::SpawnStarted {
+            display_name: String::new(),
             agent_type: String::new(),
             task: "abc".into(),
         };

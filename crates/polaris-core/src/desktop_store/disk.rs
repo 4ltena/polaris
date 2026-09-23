@@ -140,6 +140,25 @@ impl Directory {
         child.verify()?;
         Ok(child)
     }
+    /// Open an existing child or create it as a private directory.  Unlike
+    /// `child(_, true)`, an existing directory is an idempotent success.
+    #[cfg(unix)]
+    pub(super) fn ensure_child(&self, name: &str) -> StoreResult<Self> {
+        use std::os::fd::AsRawFd;
+        self.verify()?;
+        let component = component(name)?;
+        if unsafe { libc::mkdirat(self.file.as_raw_fd(), component.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+        }
+        self.child(name, false)
+    }
+    #[cfg(not(unix))]
+    pub(super) fn ensure_child(&self, _: &str) -> StoreResult<Self> {
+        Err(StoreError::UnsupportedPlatform)
+    }
     #[cfg(not(unix))]
     pub(super) fn child(&self, _: &str, _: bool) -> StoreResult<Self> {
         Err(StoreError::UnsupportedPlatform)
@@ -173,7 +192,7 @@ impl Directory {
         Err(StoreError::UnsupportedPlatform)
     }
     #[cfg(unix)]
-    fn remove_next(&self) -> StoreResult<()> {
+    pub(super) fn remove_next(&self) -> StoreResult<()> {
         use std::os::fd::AsRawFd;
         match self.open("state.next", false, false) {
             Ok(_) => (),
@@ -186,11 +205,11 @@ impl Directory {
         Ok(())
     }
     #[cfg(not(unix))]
-    fn remove_next(&self) -> StoreResult<()> {
+    pub(super) fn remove_next(&self) -> StoreResult<()> {
         Err(StoreError::UnsupportedPlatform)
     }
     #[cfg(unix)]
-    fn publish_next(&self) -> StoreResult<()> {
+    pub(super) fn publish_next(&self) -> StoreResult<()> {
         use std::os::fd::AsRawFd;
         self.verify()?;
         if unsafe {
@@ -207,13 +226,63 @@ impl Directory {
         self.verify()
     }
     #[cfg(not(unix))]
-    fn publish_next(&self) -> StoreResult<()> {
+    pub(super) fn publish_next(&self) -> StoreResult<()> {
         Err(StoreError::UnsupportedPlatform)
     }
     pub(super) fn sync(&self) -> StoreResult<()> {
         self.verify()?;
         self.file.sync_all()?;
         self.verify()
+    }
+
+    /// Publish a hard link only when the destination does not already exist.
+    /// The caller verifies an existing object before treating EEXIST as an
+    /// idempotent success.
+    #[cfg(unix)]
+    pub(super) fn link_no_replace(&self, source: &str, target: &str) -> StoreResult<bool> {
+        use std::os::fd::AsRawFd;
+        self.verify()?;
+        let source = component(source)?;
+        let target = component(target)?;
+        if unsafe {
+            libc::linkat(
+                self.file.as_raw_fd(),
+                source.as_ptr(),
+                self.file.as_raw_fd(),
+                target.as_ptr(),
+                0,
+            )
+        } == 0
+        {
+            self.verify()?;
+            Ok(true)
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(false)
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    pub(super) fn link_no_replace(&self, _: &str, _: &str) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn unlink_file(&self, name: &str) -> StoreResult<()> {
+        use std::os::fd::AsRawFd;
+        self.verify()?;
+        let name = component(name)?;
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.verify()
+    }
+    #[cfg(not(unix))]
+    pub(super) fn unlink_file(&self, _: &str) -> StoreResult<()> {
+        Err(StoreError::UnsupportedPlatform)
     }
 }
 #[cfg(unix)]
@@ -343,8 +412,12 @@ pub(super) fn load(
             roles.validate()?;
         }
         super::goal::validate(state.goal.as_ref(), &state.instructions)?;
+        state
+            .workflow_artifacts
+            .validate()
+            .map_err(|_| StoreError::Corrupt("workflow artifact graph"))?;
         if let Some(workflow) = &state.workflow {
-            workflow.validate()?;
+            workflow.validate_with_artifacts(&state.workflow_artifacts)?;
         }
         for run in &state.runs {
             if let Some(roles) = &run.role_bindings {
@@ -354,7 +427,7 @@ pub(super) fn load(
                 account.validate()?;
             }
             if let Some(workflow) = &run.workflow {
-                workflow.validate()?;
+                workflow.validate_with_artifacts(&state.workflow_artifacts)?;
             }
         }
         if state.session_revision.get() != revision as u64 {

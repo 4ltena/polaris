@@ -34,19 +34,48 @@ impl OwnerRequestHistory {
 }
 
 impl Writer {
+    fn request_run_index(&self, target: &RunTarget) -> StoreResult<usize> {
+        let p = &self.published;
+        let index = self.run_index(target)?;
+        let record = &p.state.runs[index];
+        if !record.run.state.permits_start()
+            || record.policy_revision != p.state.policy_revision
+            || record.configuration != p.state.configuration
+            || p.state.runs[index + 1..]
+                .iter()
+                .any(|later| later.run.state != RunState::Queued || !later.operations.is_empty())
+        {
+            return Err(StoreError::RunConflict);
+        }
+        Ok(index)
+    }
+
+    /// Exact durable raw prefix for this run. Inputs admitted later may
+    /// already be queued in the same writer, but must never enter this run's
+    /// transcript or completion publication.
+    pub fn raw_request_prefix(&self, target: &RunTarget) -> StoreResult<Vec<Message>> {
+        self.ready()?;
+        let p = &self.published;
+        let index = self.request_run_index(target)?;
+        let input = p
+            .raw
+            .iter()
+            .filter(|event| event.starts_turn)
+            .nth(p.raw_run_index(index)?)
+            .ok_or(StoreError::RunConflict)?;
+        Ok(p.raw
+            .iter()
+            .take_while(|event| event.turn_id <= input.turn_id)
+            .map(|event| event.message.clone())
+            .collect())
+    }
+
     /// Never accepts worker-supplied history, selection or replacement query.
     pub fn project_request_history(&self, target: &RunTarget) -> StoreResult<OwnerRequestHistory> {
         self.ready()?;
         let p = &self.published;
-        let index = self.run_index(target)?;
+        let index = self.request_run_index(target)?;
         let record = &p.state.runs[index];
-        if index + 1 != p.state.runs.len()
-            || !record.run.state.permits_start()
-            || record.policy_revision != p.state.policy_revision
-            || record.configuration != p.state.configuration
-        {
-            return Err(StoreError::RunConflict);
-        }
         prompt::validate(p)?;
         let selected = prompt::validate_record(record)?;
         if record.mcp_prompt.is_some()
@@ -67,7 +96,7 @@ impl Writer {
             return Err(StoreError::Corrupt("要求履歴の実入力不一致"));
         }
         super::super::memory::with_inherited_prompt_attachments(self, p, |mut attachments| {
-            for index in 0..p.state.runs.len() {
+            for index in 0..=index {
                 if let Some(event) = prompt::attachment(p, index)? {
                     attachments.insert(event.sequence);
                 }
@@ -76,7 +105,7 @@ impl Writer {
                 .state
                 .inherited_turn_count
                 .get()
-                .checked_add(p.state.runs.len() as u64)
+                .checked_add(index as u64 + 1)
                 .ok_or(StoreError::Overflow)?;
             let first = match record.configuration.history_mode {
                 HistoryMode::Legacy => 1,
@@ -89,7 +118,9 @@ impl Writer {
                 input,
             );
             let (messages, input_source) = project(
-                p.raw.iter().filter(|event| event.turn_id >= first),
+                p.raw
+                    .iter()
+                    .filter(|event| event.turn_id >= first && event.turn_id <= input.turn_id),
                 &attachments,
                 p.marker.session_id.as_str(),
                 source.as_ref(),

@@ -63,7 +63,10 @@ ids!(
     SnapshotId,
     HistoryCursor,
     OperationId,
-    ResultId
+    ResultId,
+    AdmissionId,
+    LogicalChildId,
+    ChildAttemptId
 );
 
 /// revision、連番、offset、期限、件数のwire表現。加算はoverflowを明示する。

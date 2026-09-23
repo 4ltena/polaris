@@ -703,8 +703,8 @@ impl CodexProvider {
     /// determination, but keeping the correspondence "this attempt's body
     /// uses the effort of the token this attempt used" is less error-prone
     /// than having the caller reuse a body across attempts) — but an
-    /// explicit `set_effort` call (via `/model`) always wins over the
-    /// token's plan-derived value when one has been made.
+    /// explicit `set_effort` call (from a fixed CLI run or the turn judge)
+    /// always wins over the token's plan-derived value when one has been made.
     /// One round trip over the open socket, or `None` to use HTTP instead.
     ///
     /// `None` means "this transport could not answer" and is not a failure:

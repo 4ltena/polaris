@@ -115,15 +115,36 @@ pub(crate) fn prepare(
     home: &Path,
     store: &Path,
     source: &Path,
+    runtime: Option<std::sync::Arc<polaris_core::managed_runtime::ManagedRuntimeLease>>,
 ) -> Result<Option<TrustedMemoryIndex>, ResourceError> {
-    prepare_with(mode, provider, home, store, source, |embedder| {
-        tokio::runtime::Handle::try_current()
-            .map_err(|_| ResourceError::Readiness)?
-            .block_on(embedder.preflight())
-            .map_err(|_| ResourceError::Readiness)
-    })
+    if mode == HistoryMode::Legacy {
+        return Ok(None);
+    }
+    let runtime = runtime.ok_or(ResourceError::Runtime)?;
+    let mut config = load_config(home)?;
+    // A writable Python path from either legacy managed-resources.toml or the
+    // user's config is never a fallback for the package-trusted runtime image.
+    if config.runtime.is_some() {
+        return Err(ResourceError::Runtime);
+    }
+    config.runtime = Some(runtime.python_path());
+    prepare_with_config(
+        mode,
+        provider,
+        config,
+        store,
+        source,
+        |embedder| {
+            tokio::runtime::Handle::try_current()
+                .map_err(|_| ResourceError::Readiness)?
+                .block_on(embedder.preflight())
+                .map_err(|_| ResourceError::Readiness)
+        },
+        Some(runtime),
+    )
 }
 
+#[cfg(test)]
 fn prepare_with(
     mode: HistoryMode,
     provider: BootstrapProvider,
@@ -147,6 +168,32 @@ fn prepare_with(
         return Err(ResourceError::Provider);
     }
     let config = load_config(home)?;
+    prepare_with_config(mode, provider, config, store, source, probe, None)
+}
+
+fn prepare_with_config(
+    mode: HistoryMode,
+    provider: BootstrapProvider,
+    config: EmbeddingConfig,
+    store: &Path,
+    source: &Path,
+    probe: impl FnOnce(
+        &polaris_core::conversation_memory::LocalStdioEmbedder,
+    ) -> Result<serde_json::Value, ResourceError>,
+    runtime: Option<std::sync::Arc<polaris_core::managed_runtime::ManagedRuntimeLease>>,
+) -> Result<Option<TrustedMemoryIndex>, ResourceError> {
+    if mode.is_structured() {
+        return Err(ResourceError::StructuredUnavailable);
+    }
+    if mode == HistoryMode::Legacy {
+        return Ok(None);
+    }
+    if !matches!(
+        provider,
+        BootstrapProvider::Codex | BootstrapProvider::Openai
+    ) {
+        return Err(ResourceError::Provider);
+    }
     let verified = verify(config, source)?;
     protected_open(store, true)?;
     let database = store.join("conversation-memory.sqlite3");
@@ -164,8 +211,15 @@ fn prepare_with(
             Err(_) => return Err(ResourceError::Path),
         }
     }
-    let embedder = polaris_core::strict_provider::local_embedder(&verified.config, store)
+    let mut embedder = polaris_core::strict_provider::local_embedder(&verified.config, store)
         .map_err(|_| ResourceError::Helper)?;
+    if let Some(runtime) = runtime {
+        embedder = embedder.with_pre_spawn_guard(std::sync::Arc::new(move || {
+            runtime
+                .validate_before_spawn()
+                .map_err(std::io::Error::other)
+        }));
+    }
     let helper_hash = file_hash(&embedder.helper, 256 * 1024)?.0;
     let receipt = probe(&embedder)?;
     validate_receipt(&receipt, verified.config.revision.as_deref().unwrap())?;
@@ -252,8 +306,7 @@ fn load_config(home: &Path) -> Result<EmbeddingConfig, ResourceError> {
                 .map_err(|_| ResourceError::Configuration)?;
         merge_embedding(&mut embedding, config.embedding);
     }
-    if embedding.runtime.is_none()
-        || embedding.model_path.is_none()
+    if embedding.model_path.is_none()
         || embedding
             .revision
             .as_ref()

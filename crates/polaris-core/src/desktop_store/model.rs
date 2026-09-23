@@ -93,6 +93,12 @@ pub struct Operation {
 #[serde(deny_unknown_fields)]
 pub struct RunRecord {
     pub run: Run,
+    /// Durable identity of an `input.submit` admission.  The destination is
+    /// repeated even though it equals the containing marker so a recovered
+    /// root owner can prove which session accepted the payload without
+    /// re-appending it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<SavedAdmissionBinding>,
     pub configuration: Configuration,
     /// Accepted choices and past observations only; never runtime authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +130,20 @@ pub struct RunRecord {
     /// Some received output could not be retained; never report a complete transcript.
     #[serde(default)]
     pub history_gap: Option<HistoryGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedAdmissionBinding {
+    pub admission_id: String,
+    pub payload_hash: String,
+    pub destination_session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedRun {
+    pub run: RunRecord,
+    pub newly_appended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +235,9 @@ pub struct Sidecar {
     pub approval_records: Vec<ApprovalRecord>,
     #[serde(default)]
     pub workflow: Option<super::SavedWorkflow>,
+    /// Metadata only; immutable bodies remain in the root-owned artifact CAS.
+    #[serde(default)]
+    pub workflow_artifacts: crate::workflow::WorkflowArtifactGraphV1,
 }
 
 #[derive(Debug, Clone)]

@@ -7,6 +7,13 @@ use serde::Deserialize;
 /// The merged configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// User-owned presentation preferences. Project configuration is not
+    /// allowed to change these values for a shared checkout.
+    pub presentation: PresentationConfig,
+    /// User-owned final answer policy. `Enforce` is only a request here; the
+    /// runtime must still prove the benchmark activation lock for the exact
+    /// turn snapshot before it may publish through that path.
+    pub answer_finalizer: AnswerFinalizerConfig,
     /// Strict history is opt-in and requires a pinned local embedding backend.
     pub history_mode: crate::conversation_state::HistoryMode,
     /// Reversible preparation for eligible new root inputs. Off unless explicitly set.
@@ -51,6 +58,10 @@ pub struct Config {
     /// same kind of question and a run that trusts it for one has no reason
     /// to withhold the other.
     pub decision: DecisionConfig,
+    /// Route a high-confidence distinct input into one empty sidechat when a
+    /// typed decider is configured. The classifier-unavailable path always
+    /// remains in the current conversation.
+    pub sidechat_auto: bool,
     /// How large this project's build output may grow before the oldest of
     /// it is removed. TOML keys: `[build_cache] max_bytes`,
     /// `[build_cache] max_percent`. Unset means nothing is ever removed.
@@ -71,6 +82,126 @@ pub struct Config {
     /// `None` starts nothing. There is no default path and no search:
     /// which binary to execute is the one thing this must never guess.
     pub llama_cpp: Option<crate::llama_server::LlamaCppConfig>,
+}
+
+/// The language Polaris should use when presenting final answers. Absence is
+/// distinct from automatic detection: it means no translation suggestion may
+/// be derived from the OS locale or from message contents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PresentationLanguage {
+    #[default]
+    Unspecified,
+    Ja,
+    En,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresentationConfig {
+    pub language: PresentationLanguage,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerFinalizerMode {
+    #[default]
+    Off,
+    Shadow,
+    Enforce,
+}
+
+impl AnswerFinalizerMode {
+    /// Configuration never constitutes benchmark approval. This explicit
+    /// predicate prevents a downstream owner from treating a decoded
+    /// `enforce` spelling as an activation decision.
+    pub fn requires_benchmark_lock(self) -> bool {
+        self == Self::Enforce
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum JudgeProfile {
+    #[serde(rename = "fulfillment-v1")]
+    FulfillmentV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum TranslationProfile {
+    #[serde(rename = "cat-translate-3.3b")]
+    CatTranslate3_3b,
+}
+
+impl TranslationProfile {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::CatTranslate3_3b => "cat-translate-3.3b",
+        }
+    }
+
+    /// The path is owned by the managed installer/runtime contract. Config
+    /// selects this named profile and cannot supply an arbitrary project path.
+    pub fn managed_model_path(self, home: &Path) -> PathBuf {
+        match self {
+            Self::CatTranslate3_3b => home
+                .join(".polaris/models/cat-translate-3.3b")
+                .join(crate::translation::CAT_TRANSLATE_REVISION),
+        }
+    }
+}
+
+/// A saved request to use translation. It is not proof that the model,
+/// licence, identity, privacy receipt, or benchmark decision is valid.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TranslationActivation {
+    #[default]
+    Disabled,
+    Requested,
+}
+
+impl TranslationActivation {
+    pub fn is_requested(self) -> bool {
+        self == Self::Requested
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranslationConfig {
+    pub activation: TranslationActivation,
+    pub profile: Option<TranslationProfile>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnswerFinalizerConfig {
+    pub mode: AnswerFinalizerMode,
+    pub judge_profile: Option<JudgeProfile>,
+    /// Explicit user consent to disclose the current prompt, candidate, and
+    /// closed tool evidence to the remote finalization judge.  A shadow
+    /// finalizer is inert without this separate opt-in.
+    pub external_disclosure: bool,
+    pub translation: TranslationConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizerActivationRequirement {
+    None,
+    JudgeBenchmark,
+    TranslationBenchmark,
+    CompositeBenchmark,
+}
+
+impl AnswerFinalizerConfig {
+    /// Describes evidence a runtime owner must validate. The user config only
+    /// requests a path; it cannot manufacture a passed benchmark decision.
+    pub fn activation_requirement(&self) -> FinalizerActivationRequirement {
+        match (
+            self.mode.requires_benchmark_lock(),
+            self.translation.activation.is_requested(),
+        ) {
+            (false, false) => FinalizerActivationRequirement::None,
+            (true, false) => FinalizerActivationRequirement::JudgeBenchmark,
+            (false, true) => FinalizerActivationRequirement::TranslationBenchmark,
+            (true, true) => FinalizerActivationRequirement::CompositeBenchmark,
+        }
+    }
 }
 
 /// The API key is deliberately not here. A project's configuration file is
@@ -149,6 +280,8 @@ impl TierConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            presentation: PresentationConfig::default(),
+            answer_finalizer: AnswerFinalizerConfig::default(),
             history_mode: crate::conversation_state::HistoryMode::Legacy,
             input_preparation: crate::input_preparation::InputPreparationMode::Off,
             embedding: EmbeddingConfig::default(),
@@ -169,6 +302,7 @@ impl Default for Config {
             spawn_write_concurrency: crate::spawn::DEFAULT_WRITE_CONCURRENCY,
             tiers: TierConfig::default(),
             decision: DecisionConfig::default(),
+            sidechat_auto: true,
             build_cache: crate::build_cache::Cap::default(),
             build_cache_path: None,
             approval_auto: crate::approval::AutoApproval::default(),
@@ -179,6 +313,10 @@ impl Default for Config {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
+    #[serde(default)]
+    presentation: Option<RawPresentation>,
+    #[serde(default)]
+    answer_finalizer: Option<RawAnswerFinalizer>,
     history_mode: Option<crate::conversation_state::HistoryMode>,
     input_preparation: Option<crate::input_preparation::InputPreparationMode>,
     #[serde(default)]
@@ -198,11 +336,97 @@ struct RawConfig {
     #[serde(default)]
     decision: RawDecision,
     #[serde(default)]
+    sidechat: RawSidechat,
+    #[serde(default)]
     build_cache: RawBuildCache,
     #[serde(default)]
     approval: RawApproval,
     #[serde(default)]
     llama_cpp: RawLlamaCpp,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPresentation {
+    #[serde(default)]
+    language: Option<RawPresentationLanguage>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawPresentationLanguage {
+    Ja,
+    En,
+}
+
+impl From<RawPresentationLanguage> for PresentationLanguage {
+    fn from(value: RawPresentationLanguage) -> Self {
+        match value {
+            RawPresentationLanguage::Ja => Self::Ja,
+            RawPresentationLanguage::En => Self::En,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAnswerFinalizer {
+    #[serde(default)]
+    mode: Option<AnswerFinalizerMode>,
+    #[serde(default)]
+    judge_profile: Option<JudgeProfile>,
+    #[serde(default)]
+    external_disclosure: Option<bool>,
+    #[serde(default)]
+    translation: Option<RawTranslation>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranslation {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    profile: Option<TranslationProfile>,
+}
+
+impl RawAnswerFinalizer {
+    fn apply_to(self, merged: &mut AnswerFinalizerConfig) {
+        if let Some(mode) = self.mode {
+            merged.mode = mode;
+        }
+        if let Some(profile) = self.judge_profile {
+            merged.judge_profile = Some(profile);
+        }
+        if let Some(external_disclosure) = self.external_disclosure {
+            merged.external_disclosure = external_disclosure;
+        }
+        if let Some(translation) = self.translation {
+            if let Some(enabled) = translation.enabled {
+                merged.translation.activation = if enabled {
+                    TranslationActivation::Requested
+                } else {
+                    TranslationActivation::Disabled
+                };
+            }
+            if let Some(profile) = translation.profile {
+                merged.translation.profile = Some(profile);
+            }
+        }
+    }
+
+    fn settled(merged: &AnswerFinalizerConfig) -> Result<(), ConfigError> {
+        if merged.mode != AnswerFinalizerMode::Off && merged.judge_profile.is_none() {
+            return Err(ConfigError::MissingFinalizerJudgeProfile);
+        }
+        if merged.translation.activation.is_requested() && merged.translation.profile.is_none() {
+            return Err(ConfigError::MissingTranslationProfile);
+        }
+        if merged.external_disclosure && merged.mode != AnswerFinalizerMode::Shadow {
+            return Err(ConfigError::ExternalFinalizerDisclosureMode);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -400,6 +624,13 @@ struct RawDecision {
     helper: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSidechat {
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
 impl RawDecision {
     fn apply_to(self, merged: &mut DecisionConfig) -> Result<(), ConfigError> {
         if let Some(enabled) = self.enabled {
@@ -543,6 +774,22 @@ pub enum ConfigError {
     BuildCacheShare,
     #[error("[llama_cpp] には server・models_dir・build の3つすべてが要ります")]
     IncompleteLlamaCpp,
+    #[error(
+        "[presentation] と [answer_finalizer] はOSユーザーの ~/.polaris/config.toml にだけ保存できます"
+    )]
+    UserOnlyFinalizerSetting,
+    #[error("answer_finalizer.mode = \"shadow\" または \"enforce\" には judge_profile が必要です")]
+    MissingFinalizerJudgeProfile,
+    #[error("answer_finalizer.translation.enabled = true には固定profileが必要です")]
+    MissingTranslationProfile,
+    #[error("managed-preferences.toml の answer_finalizer.mode は off か shadow だけです")]
+    ManagedFinalizerMode,
+    #[error("answer_finalizer.external_disclosure = true は shadow モードでのみ指定できます")]
+    ExternalFinalizerDisclosureMode,
+    #[error(
+        "managed-preferences.toml の translation は enabled=true と固定CAT profileを同時に指定します"
+    )]
+    ManagedTranslation,
 }
 
 fn read_one<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, ConfigError> {
@@ -564,6 +811,35 @@ fn read_one<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Co
         })
 }
 
+/// Reads the app-owned preferences file without following aliases. The file
+/// is an input to the production answer path, so an unexpected object or an
+/// unbounded document is a startup error rather than an absent preference.
+fn read_managed_preferences<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, ConfigError> {
+    const MAX_BYTES: u64 = 64 * 1024;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ConfigError::Io {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() > MAX_BYTES
+    {
+        return Err(ConfigError::Io {
+            path: path.display().to_string(),
+            source: std::io::Error::other("managed preferences must be a bounded regular file"),
+        });
+    }
+    read_one(path)
+}
+
 /// Reads the global and project configs, letting the latter override the
 /// former. Not existing is not a failure. Being unreadable or malformed is.
 ///
@@ -577,8 +853,24 @@ pub fn try_load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Co
 
 fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
     let mut merged = Config::default();
-    for path in paths.iter().copied().flatten() {
+    let user_index = paths.len().checked_sub(2);
+    for (index, path) in paths.iter().copied().enumerate() {
+        let Some(path) = path else { continue };
         if let Some(raw) = read_one::<RawConfig>(path)? {
+            let has_user_only = raw.presentation.is_some() || raw.answer_finalizer.is_some();
+            if has_user_only && Some(index) != user_index {
+                return Err(ConfigError::UserOnlyFinalizerSetting);
+            }
+            if Some(index) == user_index {
+                if let Some(presentation) = raw.presentation
+                    && let Some(language) = presentation.language
+                {
+                    merged.presentation.language = language.into();
+                }
+                if let Some(answer_finalizer) = raw.answer_finalizer {
+                    answer_finalizer.apply_to(&mut merged.answer_finalizer);
+                }
+            }
             if let Some(mode) = raw.history_mode {
                 merged.history_mode = mode;
             }
@@ -637,9 +929,13 @@ fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
                 merged.llama_cpp = Some(llama_cpp);
             }
             raw.decision.apply_to(&mut merged.decision)?;
+            if let Some(enabled) = raw.sidechat.enabled {
+                merged.sidechat_auto = enabled;
+            }
         }
     }
     RawDecision::settled(&merged.decision)?;
+    RawAnswerFinalizer::settled(&merged.answer_finalizer)?;
     Ok(merged)
 }
 
@@ -707,6 +1003,105 @@ pub fn try_load_decision_from(
     Ok(merged)
 }
 
+/// Reads only the user-owned presentation/finalizer settings. Project files
+/// are inspected solely to reject an attempted override; their values are
+/// never merged into the returned turn policy.
+pub fn try_load_answer_finalizer_from(
+    user: Option<&Path>,
+    project: Option<&Path>,
+) -> Result<(PresentationConfig, AnswerFinalizerConfig), ConfigError> {
+    try_load_answer_finalizer_with_managed_from(None, user, project)
+}
+
+/// Reads the app-generated preferences first, then lets the explicit user
+/// config override individual values. A checkout is never allowed to set
+/// presentation or finalizer policy.
+pub fn try_load_answer_finalizer_with_managed_from(
+    managed: Option<&Path>,
+    user: Option<&Path>,
+    project: Option<&Path>,
+) -> Result<(PresentationConfig, AnswerFinalizerConfig), ConfigError> {
+    #[derive(Default, Deserialize)]
+    struct FinalizerOnly {
+        #[serde(default)]
+        presentation: Option<RawPresentation>,
+        #[serde(default)]
+        answer_finalizer: Option<RawAnswerFinalizer>,
+    }
+    #[derive(Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ManagedFinalizerOnly {
+        #[serde(default)]
+        presentation: Option<RawPresentation>,
+        #[serde(default)]
+        answer_finalizer: Option<RawAnswerFinalizer>,
+    }
+
+    fn apply(
+        raw_presentation: Option<RawPresentation>,
+        raw_finalizer: Option<RawAnswerFinalizer>,
+        presentation: &mut PresentationConfig,
+        answer_finalizer: &mut AnswerFinalizerConfig,
+    ) {
+        if let Some(raw) = raw_presentation
+            && let Some(language) = raw.language
+        {
+            presentation.language = language.into();
+        }
+        if let Some(raw) = raw_finalizer {
+            raw.apply_to(answer_finalizer);
+        }
+    }
+
+    let mut presentation = PresentationConfig::default();
+    let mut answer_finalizer = AnswerFinalizerConfig::default();
+    if let Some(path) = managed
+        && let Some(raw) = read_managed_preferences::<ManagedFinalizerOnly>(path)?
+    {
+        if raw
+            .answer_finalizer
+            .as_ref()
+            .and_then(|finalizer| finalizer.mode)
+            == Some(AnswerFinalizerMode::Enforce)
+        {
+            return Err(ConfigError::ManagedFinalizerMode);
+        }
+        if let Some(translation) = raw
+            .answer_finalizer
+            .as_ref()
+            .and_then(|finalizer| finalizer.translation.as_ref())
+            && (translation.enabled != Some(true)
+                || translation.profile != Some(TranslationProfile::CatTranslate3_3b))
+        {
+            return Err(ConfigError::ManagedTranslation);
+        }
+        apply(
+            raw.presentation,
+            raw.answer_finalizer,
+            &mut presentation,
+            &mut answer_finalizer,
+        );
+    }
+    if let Some(path) = user
+        && let Some(raw) = read_one::<FinalizerOnly>(path)?
+    {
+        apply(
+            raw.presentation,
+            raw.answer_finalizer,
+            &mut presentation,
+            &mut answer_finalizer,
+        );
+    }
+    if let Some(path) = project
+        && let Some(raw) = read_one::<FinalizerOnly>(path)?
+        && (raw.presentation.is_some() || raw.answer_finalizer.is_some())
+    {
+        return Err(ConfigError::UserOnlyFinalizerSetting);
+    }
+    RawAnswerFinalizer::settled(&answer_finalizer)?;
+    Ok((presentation, answer_finalizer))
+}
+
 /// Resolves the installer-managed resource pins, then the user and project
 /// configs. Explicit user configuration remains authoritative.
 pub fn load(project_root: &Path) -> Result<Config, ConfigError> {
@@ -724,6 +1119,206 @@ pub fn load(project_root: &Path) -> Result<Config, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalizer_preferences_default_off_and_legacy_config_stays_compatible() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = write(directory.path(), "[workflow]\nenabled = false\n");
+        let config = try_load_from(Some(&global), None).unwrap();
+
+        assert_eq!(
+            config.presentation.language,
+            PresentationLanguage::Unspecified
+        );
+        assert_eq!(config.answer_finalizer, AnswerFinalizerConfig::default());
+        assert_eq!(
+            config.answer_finalizer.activation_requirement(),
+            FinalizerActivationRequirement::None
+        );
+    }
+
+    #[test]
+    fn user_finalizer_preferences_decode_to_named_profiles_and_managed_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = write(
+            directory.path(),
+            "[presentation]\nlanguage = 'ja'\n\
+             [answer_finalizer]\nmode = 'enforce'\njudge_profile = 'fulfillment-v1'\n\
+             [answer_finalizer.translation]\nenabled = true\nprofile = 'cat-translate-3.3b'\n",
+        );
+        let config = try_load_from(Some(&global), None).unwrap();
+
+        assert_eq!(config.presentation.language, PresentationLanguage::Ja);
+        assert_eq!(config.answer_finalizer.mode, AnswerFinalizerMode::Enforce);
+        assert_eq!(
+            config.answer_finalizer.judge_profile,
+            Some(JudgeProfile::FulfillmentV1)
+        );
+        assert_eq!(
+            config.answer_finalizer.translation.activation,
+            TranslationActivation::Requested
+        );
+        let profile = config.answer_finalizer.translation.profile.unwrap();
+        assert_eq!(profile.id(), "cat-translate-3.3b");
+        assert_eq!(
+            profile.managed_model_path(Path::new("/Users/example")),
+            PathBuf::from("/Users/example/.polaris/models/cat-translate-3.3b")
+                .join(crate::translation::CAT_TRANSLATE_REVISION)
+        );
+        assert_eq!(
+            config.answer_finalizer.activation_requirement(),
+            FinalizerActivationRequirement::CompositeBenchmark
+        );
+    }
+
+    #[test]
+    fn project_cannot_set_or_override_user_finalizer_preferences() {
+        let user = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let global = write(
+            user.path(),
+            "[presentation]\nlanguage = 'ja'\n[answer_finalizer]\nmode = 'off'\n",
+        );
+
+        for body in [
+            "[presentation]\nlanguage = 'en'\n",
+            "[answer_finalizer]\nmode = 'shadow'\njudge_profile = 'fulfillment-v1'\n",
+            "[answer_finalizer.translation]\nprofile = 'cat-translate-3.3b'\n",
+        ] {
+            let project_path = write(project.path(), body);
+            assert!(matches!(
+                try_load_from(Some(&global), Some(&project_path)),
+                Err(ConfigError::UserOnlyFinalizerSetting)
+            ));
+            assert!(matches!(
+                try_load_answer_finalizer_from(Some(&global), Some(&project_path)),
+                Err(ConfigError::UserOnlyFinalizerSetting)
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_finalizer_preferences_are_defaults_below_explicit_user_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed-preferences.toml");
+        std::fs::write(
+            &managed,
+            "[presentation]\nlanguage='ja'\n[answer_finalizer]\nmode='shadow'\njudge_profile='fulfillment-v1'\n[answer_finalizer.translation]\nenabled=true\nprofile='cat-translate-3.3b'\n",
+        )
+        .unwrap();
+        let user = directory.path().join("config.toml");
+        std::fs::write(
+            &user,
+            "[presentation]\nlanguage='en'\n[answer_finalizer]\nmode='off'\n[answer_finalizer.translation]\nenabled=false\n",
+        )
+        .unwrap();
+        let (presentation, finalizer) =
+            try_load_answer_finalizer_with_managed_from(Some(&managed), Some(&user), None).unwrap();
+        assert_eq!(presentation.language, PresentationLanguage::En);
+        assert_eq!(finalizer.mode, AnswerFinalizerMode::Off);
+        assert_eq!(
+            finalizer.translation.activation,
+            TranslationActivation::Disabled
+        );
+    }
+
+    #[test]
+    fn managed_finalizer_preferences_fail_closed_on_unsafe_or_invalid_files() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed-preferences.toml");
+        let target = directory.path().join("target.toml");
+        std::fs::write(&target, "[presentation]\nlanguage='ja'\n").unwrap();
+        symlink(&target, &managed).unwrap();
+        assert!(try_load_answer_finalizer_with_managed_from(Some(&managed), None, None).is_err());
+
+        std::fs::remove_file(&managed).unwrap();
+        std::fs::create_dir(&managed).unwrap();
+        assert!(try_load_answer_finalizer_with_managed_from(Some(&managed), None, None).is_err());
+
+        std::fs::remove_dir(&managed).unwrap();
+        std::fs::write(&managed, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(try_load_answer_finalizer_with_managed_from(Some(&managed), None, None).is_err());
+
+        std::fs::write(&managed, "[presentation]\nlanguage='ja'\nunknown=true\n").unwrap();
+        assert!(try_load_answer_finalizer_with_managed_from(Some(&managed), None, None).is_err());
+
+        for body in [
+            "[answer_finalizer]\nmode='enforce'\njudge_profile='fulfillment-v1'\n",
+            "[answer_finalizer.translation]\nenabled=false\nprofile='cat-translate-3.3b'\n",
+            "[answer_finalizer.translation]\nenabled=true\n",
+        ] {
+            std::fs::write(&managed, body).unwrap();
+            assert!(
+                try_load_answer_finalizer_with_managed_from(Some(&managed), None, None).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalizer_config_rejects_unknown_or_incomplete_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        for body in [
+            "[presentation]\nlanguage = 'auto'\n",
+            "[presentation]\nlanguage = 'unspecified'\n",
+            "[answer_finalizer]\nmode = 'observe'\n",
+            "[answer_finalizer]\nmode = 'shadow'\n",
+            "[answer_finalizer]\nmode = 'off'\nexternal_disclosure = true\n",
+            "[answer_finalizer]\nmode = 'enforce'\njudge_profile = 'fulfillment-v1'\nexternal_disclosure = true\n",
+            "[answer_finalizer]\nmode = 'off'\njudge_profile = 'fulfillment-v2'\n",
+            "[answer_finalizer.translation]\nenabled = true\n",
+            "[answer_finalizer.translation]\nprofile = 'project-model'\n",
+            "[answer_finalizer.translation]\nprofile = 'cat-translate-3.3b'\npath = './weights'\n",
+        ] {
+            let global = write(directory.path(), body);
+            assert!(try_load_from(Some(&global), None).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn external_finalizer_disclosure_is_user_only_shadow_opt_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = write(
+            directory.path(),
+            "[answer_finalizer]\nmode = 'shadow'\njudge_profile = 'fulfillment-v1'\nexternal_disclosure = true\n",
+        );
+        let (_, finalizer) = try_load_answer_finalizer_from(Some(&user), None).unwrap();
+        assert!(finalizer.external_disclosure);
+
+        let project = tempfile::tempdir().unwrap();
+        let project_path = write(
+            project.path(),
+            "[answer_finalizer]\nmode = 'shadow'\njudge_profile = 'fulfillment-v1'\nexternal_disclosure = true\n",
+        );
+        assert!(matches!(
+            try_load_answer_finalizer_from(Some(&user), Some(&project_path)),
+            Err(ConfigError::UserOnlyFinalizerSetting)
+        ));
+    }
+
+    #[test]
+    fn enforce_is_a_request_that_retains_a_typed_benchmark_requirement() {
+        let mut config = AnswerFinalizerConfig {
+            mode: AnswerFinalizerMode::Enforce,
+            judge_profile: Some(JudgeProfile::FulfillmentV1),
+            ..AnswerFinalizerConfig::default()
+        };
+        assert!(config.mode.requires_benchmark_lock());
+        assert_eq!(
+            config.activation_requirement(),
+            FinalizerActivationRequirement::JudgeBenchmark
+        );
+        config.translation = TranslationConfig {
+            activation: TranslationActivation::Requested,
+            profile: Some(TranslationProfile::CatTranslate3_3b),
+        };
+        assert_eq!(
+            config.activation_requirement(),
+            FinalizerActivationRequirement::CompositeBenchmark
+        );
+    }
 
     #[test]
     fn managed_resource_pins_are_defaults_below_user_and_project_config() {
@@ -927,7 +1522,9 @@ mod tests {
 
     #[test]
     fn workflow_defaults_resolve_builtin_skills_for_every_phase() {
-        use crate::workflow::{Phase, SessionWorkflow, WORKFLOW_TOKEN_LIMIT};
+        use crate::workflow::{
+            Phase, SessionWorkflow, WORKFLOW_TOKEN_LIMIT, WorkflowGatesV1, WorkflowStateV1,
+        };
         let config = try_load_from(None, None).unwrap();
         assert!(config.workflow.enabled);
         assert_eq!(
@@ -936,7 +1533,15 @@ mod tests {
         );
         assert_eq!(config.embedding, EmbeddingConfig::default());
         assert_eq!(config.workflow.initial_phase, Phase::General);
-        let runtime = SessionWorkflow::new(config.workflow);
+        let runtime = SessionWorkflow::restore(
+            config.workflow,
+            WorkflowGatesV1 {
+                phase_gate_schema_version: None,
+                ..WorkflowGatesV1::default()
+            },
+            WorkflowStateV1::default(),
+        )
+        .unwrap();
         for phase in Phase::ALL {
             runtime.request_phase(phase).unwrap();
             let turn = runtime.begin_turn(&[]).unwrap();
@@ -1232,6 +1837,14 @@ mod tests {
             try_load_from(None, Some(&path)),
             Err(ConfigError::EmptyDecisionValue)
         ));
+    }
+
+    #[test]
+    fn sidechat_auto_defaults_on_and_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[sidechat]\nenabled = false\n");
+        assert!(Config::default().sidechat_auto);
+        assert!(!try_load_from(None, Some(&path)).unwrap().sidechat_auto);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! 実会話移行は呼び出さない。呼出側は要求・台帳照会の前に対象を認可すること。
 
 mod account;
+mod artifacts;
 mod bootstrap;
 mod children;
 mod disk;
@@ -12,12 +13,15 @@ pub mod hub;
 mod memory;
 mod model;
 mod roles;
+mod session_manager;
 mod source_apply;
 mod star_names;
+mod subagent_control;
 mod workflow;
 mod writer;
 
 pub use account::SavedAccount;
+pub use artifacts::WorkflowArtifactStore;
 pub use bootstrap::{
     BootstrapIdentity, BootstrapProvider, BootstrapTier, ExpectedBootstrapFile,
     ExpectedBootstrapStore, MAX_OWNER_BOOTSTRAP_BYTES, OwnerBootstrapDocument,
@@ -33,18 +37,25 @@ pub use memory::{
     MemoryResources, MemorySnapshot, SavedMemory, SavedStructuredResponse, SummaryWork,
 };
 pub use model::{
-    Acceptance, HistoryGap, InitialState, IntentReceipt, Marker, Operation, Published,
-    RequestRecord, RequestResult, RunRecord, Sidecar, StoreError, StoreResult,
+    Acceptance, AdmittedRun, HistoryGap, InitialState, IntentReceipt, Marker, Operation, Published,
+    RequestRecord, RequestResult, RunRecord, SavedAdmissionBinding, Sidecar, StoreError,
+    StoreResult,
 };
 pub use roles::{
     EFFORTS, SavedRoleBinding, SavedRoleBindings, SavedRuntime, SavedTier, SavedTierBinding,
     SavedTierBindings, ToolSupport,
+};
+pub use session_manager::{
+    MAX_SESSION_MANAGER_COMMITS, MAX_SESSION_MANAGER_STATE_BYTES, SessionManagerStore,
 };
 pub use source_apply::{
     MAX_SOURCE_APPLY_BYTES, MAX_SOURCE_APPLY_ENTRIES, MAX_SOURCE_APPLY_LEDGER_BYTES,
     MAX_SOURCE_APPLY_RECORDS, SavedSourceApply, SourceApplyCandidate, SourceApplyEntry,
     SourceApplyGuard, SourceApplyIdentity, SourceApplyIdentityProof, SourceApplyPayload,
     SourceApplyResult, SourceApplyVersion,
+};
+pub use subagent_control::{
+    SubagentControlBindingV1, SubagentControlOwner, SubagentControlSnapshotV1,
 };
 pub use workflow::SavedWorkflow;
 pub use writer::mcp::{
@@ -60,6 +71,11 @@ pub use writer::recipe::{
 pub(crate) use writer::validate_turn_suffix;
 pub use writer::{DesktopRoot, PrototypeRoot, Writer};
 pub use writer::{OwnerRequestHistory, RunDetailEntry, RunDetails};
+
+/// Presentation label shared by the native desktop and terminal child list.
+pub fn child_display_name(index: usize) -> &'static str {
+    star_names::at(index)
+}
 
 #[cfg(all(test, unix))]
 mod tests;

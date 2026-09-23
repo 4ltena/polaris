@@ -14,6 +14,193 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_polaris")
 }
 
+#[test]
+fn common_tests_runs_a_valid_bounded_plan_or_reports_unavailable() {
+    let workspace = tempfile::tempdir().expect("temp directory");
+    let plan = workspace.path().join("common-tests.json");
+    std::fs::write(
+        &plan,
+        serde_json::json!({
+            "version": 1,
+            "argv": ["/usr/bin/true"],
+            "cases": [{"case": "exits_with", "status": 0}]
+        })
+        .to_string(),
+    )
+    .expect("write plan");
+
+    let out = Command::new(bin())
+        .current_dir(workspace.path())
+        .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
+        .output()
+        .expect("could not launch common-tests");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"result\": \"passed\"") || stdout.contains("\"result\": \"unavailable\""),
+        "common-tests did not return a typed execution result: {stdout}; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.success(),
+        stdout.contains("\"result\": \"passed\""),
+        "only a passed report may exit successfully"
+    );
+}
+
+#[test]
+fn common_tests_rejects_a_plan_larger_than_the_decode_limit() {
+    let workspace = tempfile::tempdir().expect("temp directory");
+    let plan = workspace.path().join("oversized-common-tests.json");
+    std::fs::write(
+        &plan,
+        vec![b'x'; polaris_core::common_tests::MAX_PLAN_BYTES + 1],
+    )
+    .expect("write plan");
+    let out = Command::new(bin())
+        .current_dir(workspace.path())
+        .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
+        .output()
+        .expect("could not launch common-tests");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("計画を読めません"));
+}
+
+#[test]
+fn common_tests_never_returns_a_host_home_sentinel() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("host home");
+    let sentinel = home.path().join("credential-sentinel");
+    std::fs::write(&sentinel, "HOST_HOME_SECRET").expect("write sentinel");
+    let plan = workspace.path().join("read-home.json");
+    std::fs::write(
+        &plan,
+        serde_json::json!({
+            "version": 1,
+            "argv": ["/bin/cat", sentinel],
+            "cases": [{"case": "exits_with", "status": 0}]
+        })
+        .to_string(),
+    )
+    .expect("write plan");
+    let out = Command::new(bin())
+        .current_dir(workspace.path())
+        .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
+        .output()
+        .expect("could not launch common-tests");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("HOST_HOME_SECRET"),
+        "host HOME was readable: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"result\": \"failed\"") || stdout.contains("\"result\": \"unavailable\""),
+        "host HOME read unexpectedly passed: {stdout}"
+    );
+}
+
+#[test]
+fn common_tests_never_exposes_workspace_secrets_to_a_case_program() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let secret = workspace.path().join(".env");
+    std::fs::write(&secret, "WORKSPACE_SECRET_SENTINEL=never-visible").expect("write secret");
+    let plan = workspace.path().join("read-workspace-secret.json");
+    std::fs::write(
+        &plan,
+        serde_json::json!({
+            "version": 1,
+            "argv": ["/bin/cat", secret],
+            "cases": [{"case": "exits_with", "status": 0}]
+        })
+        .to_string(),
+    )
+    .expect("write plan");
+
+    let out = Command::new(bin())
+        .current_dir(workspace.path())
+        .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
+        .output()
+        .expect("could not launch common-tests");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("WORKSPACE_SECRET_SENTINEL")
+            && !stderr.contains("WORKSPACE_SECRET_SENTINEL"),
+        "case program read the real workspace secret: {stdout}; {stderr}"
+    );
+    assert!(
+        !out.status.success(),
+        "a plan that targets the real workspace must not pass: {stdout}"
+    );
+}
+
+#[test]
+fn common_tests_rejects_an_invalid_plan_before_execution() {
+    let workspace = tempfile::tempdir().expect("temp directory");
+    let plan = workspace.path().join("invalid-common-tests.json");
+    std::fs::write(
+        &plan,
+        r#"{"version":1,"argv":["/usr/bin/true"],"cases":[],"extra":true}"#,
+    )
+    .expect("write invalid plan");
+
+    let out = Command::new(bin())
+        .current_dir(workspace.path())
+        .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
+        .output()
+        .expect("could not launch common-tests");
+    assert!(!out.status.success(), "invalid plan unexpectedly succeeded");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("計画の形式が不正です"),
+        "invalid schema was not rejected explicitly: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn hidden_static_component_manifest_returns_only_the_typed_fixed_contract() {
+    let component = tempfile::tempdir().expect("component");
+    std::fs::write(
+        component.path().join("Cargo.toml"),
+        "[package]\nname = \"static-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+    let clean = Command::new(bin())
+        .current_dir(component.path())
+        .arg("static-component-manifest")
+        .output()
+        .expect("launch static checker");
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    let clean: serde_json::Value = serde_json::from_slice(&clean.stdout).expect("typed JSON");
+    assert_eq!(clean["schema_version"], 1);
+    assert_eq!(clean["state"], "satisfied");
+    assert_eq!(clean["findings"], serde_json::json!([]));
+
+    std::fs::write(component.path().join("Cargo.toml"), "[workspace]\n").expect("replace manifest");
+    let violated = Command::new(bin())
+        .current_dir(component.path())
+        .arg("static-component-manifest")
+        .output()
+        .expect("launch static checker");
+    assert_eq!(violated.status.code(), Some(1));
+    let violated: serde_json::Value = serde_json::from_slice(&violated.stdout).expect("typed JSON");
+    assert_eq!(violated["state"], "violated");
+    assert_eq!(
+        violated["findings"][0]["rule_id"],
+        "component-cargo-manifest-v1"
+    );
+
+    let widened = Command::new(bin())
+        .current_dir(component.path())
+        .args(["static-component-manifest", "--path", "/tmp/other"])
+        .output()
+        .expect("launch widened static checker");
+    assert!(!widened.status.success());
+}
+
 /// `login` parses successfully without `--prompt`. Stopping at `--help`
 /// means it never opens a browser or reaches the network.
 #[test]

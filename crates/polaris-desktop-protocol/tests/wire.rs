@@ -513,7 +513,7 @@ fn all_requests_enforce_session_scope_and_hello_gate() {
         }
         assert!(codec::from_json::<Request>(&serde_json::to_vec(&wrong_scope).unwrap()).is_err());
         let mut version = wire.clone();
-        version["protocol_version"] = json!(2);
+        version["protocol_version"] = json!(3);
         assert_eq!(
             codec::from_json::<Request>(&serde_json::to_vec(&version).unwrap()),
             Err(CodecError::UnsupportedVersion)

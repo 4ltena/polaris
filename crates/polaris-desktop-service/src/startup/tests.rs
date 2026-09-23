@@ -65,6 +65,91 @@ async fn configured_mcp_corruption_stops_startup_but_unsafe_stdio_is_only_quaran
 }
 
 #[test]
+fn finalizer_defaults_off_enforce_is_locked_and_shadow_missing_model_is_observational() {
+    for (config, expected) in [
+        ("", "off"),
+        (
+            "[presentation]\nlanguage='ja'\n[answer_finalizer]\nmode='enforce'\njudge_profile='fulfillment-v1'\n",
+            "locked",
+        ),
+        (
+            "[presentation]\nlanguage='ja'\n[answer_finalizer]\nmode='shadow'\njudge_profile='fulfillment-v1'\n[answer_finalizer.translation]\nenabled=true\nprofile='cat-translate-3.3b'\n",
+            "shadow",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let store = temp.path().join("store");
+        fs::create_dir_all(home.join(".polaris")).unwrap();
+        fs::create_dir(&store).unwrap();
+        fs::write(home.join(".polaris/config.toml"), config).unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let result = answer_finalizer_resource(
+            &home,
+            &store,
+            &project,
+            &temp.path().join("Polaris.app/Contents/MacOS/polaris"),
+            None,
+        );
+        match expected {
+            "off" => assert!(result.unwrap().is_none()),
+            "locked" => assert!(matches!(result, Err(StartupError::Generic))),
+            "shadow" => {
+                let owner = result.unwrap().expect("shadow owner");
+                assert!(owner.records().unwrap().is_empty());
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn app_preferences_enable_shadow_but_explicit_user_config_wins_and_unsafe_input_stops() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let store = temp.path().join("store");
+    let project = temp.path().join("project");
+    fs::create_dir_all(home.join(".polaris")).unwrap();
+    fs::create_dir(&store).unwrap();
+    fs::create_dir(&project).unwrap();
+    let managed = home.join(".polaris/managed-preferences.toml");
+    fs::write(
+        &managed,
+        "[presentation]\nlanguage='ja'\n[answer_finalizer]\nmode='shadow'\njudge_profile='fulfillment-v1'\n",
+    )
+    .unwrap();
+    let executable = temp.path().join("Polaris.app/Contents/MacOS/polaris");
+    assert!(
+        answer_finalizer_resource(&home, &store, &project, &executable, None)
+            .unwrap()
+            .is_some()
+    );
+
+    fs::write(
+        home.join(".polaris/config.toml"),
+        "[answer_finalizer]\nmode='off'\n",
+    )
+    .unwrap();
+    assert!(
+        answer_finalizer_resource(&home, &store, &project, &executable, None)
+            .unwrap()
+            .is_none()
+    );
+
+    fs::remove_file(&managed).unwrap();
+    let alias_target = home.join("managed-target.toml");
+    fs::write(&alias_target, "[answer_finalizer]\nmode='off'\n").unwrap();
+    symlink(&alias_target, &managed).unwrap();
+    assert!(matches!(
+        answer_finalizer_resource(&home, &store, &project, &executable, None),
+        Err(StartupError::Generic)
+    ));
+}
+
+#[test]
 fn launchservices_fixed_alias_resolves_to_verified_package() {
     let base = tempfile::tempdir_in("/private/tmp").unwrap();
     let (_, _, executable) = fixture(base.path());
@@ -526,7 +611,10 @@ async fn owner_reconnect_uses_saved_workflow_even_when_global_config_becomes_inv
         polaris_core::workflow::Phase::Implement,
         vec!["builtin:missing-old-phase".into()],
     );
-    let workflow = polaris_core::workflow::SessionWorkflow::new(config);
+    let mut workflow = polaris_core::workflow::SessionWorkflow::new(config);
+    // This fixture represents a pre-M27 saved session whose phase behavior is
+    // retained until an explicit durable-contract migration.
+    workflow.gates.phase_gate_schema_version = None;
     workflow
         .request_phase(polaris_core::workflow::Phase::Verify)
         .unwrap();

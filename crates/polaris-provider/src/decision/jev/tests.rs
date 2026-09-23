@@ -144,6 +144,33 @@ async fn a_service_that_could_not_answer_now_is_asked_again() {
 }
 
 #[tokio::test]
+async fn finalizer_client_never_retries_an_unavailable_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = JevDecider::new_finalizer(&server.uri(), "test-key".into(), "jev-latest".into())
+        .expect("one-shot client");
+    assert_eq!(
+        client.decide(&state(), &one_question()).await,
+        Err(DecisionError::Unavailable)
+    );
+}
+
+#[test]
+fn finalizer_client_has_a_fixed_single_attempt_policy() {
+    let client = JevDecider::new_finalizer(
+        "https://api.example.invalid/v1",
+        "test-key".into(),
+        "jev-latest".into(),
+    )
+    .expect("one-shot client");
+    assert_eq!(client.max_attempts, 1);
+}
+
+#[tokio::test]
 async fn a_retry_that_succeeds_returns_the_answer() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

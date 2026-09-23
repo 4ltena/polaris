@@ -112,6 +112,35 @@ pub fn local_embedder(
     )
 }
 
+/// Creates the strict10 helper only from a package-trusted, mounted runtime.
+/// A configured Python path is a legacy v1 resource and is deliberately not
+/// treated as a fallback, even when it points at an otherwise usable file.
+#[cfg(target_os = "macos")]
+pub fn managed_local_embedder(
+    config: &crate::config::EmbeddingConfig,
+    private_root: &Path,
+    runtime: std::sync::Arc<crate::managed_runtime::ManagedRuntimeLease>,
+) -> io::Result<LocalStdioEmbedder> {
+    reject_legacy_runtime(config)?;
+    let mut trusted = config.clone();
+    trusted.runtime = Some(runtime.python_path());
+    Ok(
+        local_embedder(&trusted, private_root)?.with_pre_spawn_guard(std::sync::Arc::new(
+            move || runtime.validate_before_spawn().map_err(io::Error::other),
+        )),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn reject_legacy_runtime(config: &crate::config::EmbeddingConfig) -> io::Result<()> {
+    if config.runtime.is_some() {
+        return Err(io::Error::other(
+            "legacy embedding.runtimeは実行できません。読取専用runtime imageの修復が必要です",
+        ));
+    }
+    Ok(())
+}
+
 /// The same helper against the preselection model (M10 L2).
 ///
 /// A separate snapshot and revision, because it is a different model.
@@ -230,6 +259,17 @@ mod tests {
         std::fs::create_dir_all(&model).expect("mkdir");
         std::fs::write(model.join("config.json"), "{}").expect("write");
         (python, model)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_cli_path_refuses_legacy_runtime_before_execution() {
+        let config = crate::config::EmbeddingConfig {
+            runtime: Some(std::path::PathBuf::from("/tmp/legacy-python")),
+            ..Default::default()
+        };
+        let error = reject_legacy_runtime(&config).unwrap_err();
+        assert!(error.to_string().contains("legacy embedding.runtime"));
     }
 
     /// The two snapshots are two models. A project that configures only

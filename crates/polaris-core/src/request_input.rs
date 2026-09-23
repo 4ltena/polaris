@@ -66,6 +66,34 @@ impl BoundInput {
         (content_hash(raw.as_bytes()) == self.source.hash).then_some(raw)
     }
 
+    /// Relocate an already verified input after a trusted compactor rewrites
+    /// only a history prefix. Identity still comes from the durable raw event;
+    /// the suffix offset and hash merely prove that the same bound message was
+    /// retained. Ambiguity or any suffix change invalidates the capability.
+    pub(crate) fn relocated_after_prefix_rewrite(
+        &self,
+        before_len: usize,
+        messages: &[Message],
+    ) -> Option<Self> {
+        if self.index >= before_len {
+            return None;
+        }
+        let suffix = before_len.checked_sub(self.index)?;
+        let index = messages.len().checked_sub(suffix)?;
+        let message = messages.get(index)?;
+        if message.role != Role::User
+            || !message.tool_calls.is_empty()
+            || message.tool_call_id.is_some()
+            || content_hash(message.content.as_bytes()) != self.source.hash
+        {
+            return None;
+        }
+        let mut relocated = self.clone();
+        relocated.index = index;
+        relocated.range = 0..message.content.len();
+        Some(relocated)
+    }
+
     pub(crate) fn take_fresh(&mut self) -> bool {
         self.fresh.swap(false, Ordering::AcqRel)
     }

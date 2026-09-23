@@ -106,23 +106,43 @@ fn label(role: Role) -> &'static str {
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
-/// Turns a tool call's JSON `arguments` string into a call-style preview —
-/// `key=value, key2=value2` — instead of showing raw JSON (braces, quoted
-/// keys, colons). Falls back to the raw text unchanged when `detail` isn't
-/// a JSON object (parse failure, or a bare array/string/number), so nothing
-/// is ever hidden. Key order follows `serde_json::Value`'s own iteration
-/// order (alphabetical — the default `Map` has no order-preserving
-/// feature enabled), which is stable but not necessarily the call's
-/// original argument order.
-fn format_tool_call_args(detail: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(detail) {
-        Ok(serde_json::Value::Object(map)) => map
-            .iter()
-            .map(|(k, v)| format!("{k}={}", serde_json::to_string(v).unwrap_or_default()))
-            .collect::<Vec<_>>()
-            .join(", "),
-        _ => detail.to_string(),
+/// Turns a tool call's JSON `arguments` string into a compact activity label.
+/// File operations expose only their target path; their ranges and contents
+/// belong in the result/diff, not in the activity heading. `spawn` similarly
+/// exposes only declared agent types and never repeats model-authored task
+/// prose. Other tools retain the stable `key=value` preview.
+fn format_tool_call_args(name: &str, detail: &str) -> String {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str(detail) else {
+        return detail.to_string();
+    };
+    if matches!(name, "read" | "write" | "edit")
+        && let Some(path) = map.get("path").and_then(serde_json::Value::as_str)
+    {
+        return path.to_string();
     }
+    if name == "spawn"
+        && let Some(tasks) = map.get("tasks").and_then(serde_json::Value::as_array)
+    {
+        return tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| {
+                let agent_type = task
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("auto");
+                format!(
+                    "{} ({agent_type})",
+                    polaris_core::desktop_store::child_display_name(index)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    map.iter()
+        .map(|(k, v)| format!("{k}={}", serde_json::to_string(v).unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The color code (tool result previews, markdown-fenced code blocks in
@@ -148,9 +168,8 @@ pub(crate) const SELECTION_HIGHLIGHT_COLOR: Color = Color::Rgb(0x2b, 0x4a, 0x71)
 /// can claim mid-turn.
 const MAX_DIFF_LINES_SHOWN: usize = 40;
 
-/// How many rows one spawned subagent's task preview may claim at most,
-/// before the rest is elided with a `...` row.
-const SPAWN_TASK_PREVIEW_LINES: usize = 5;
+/// How many rows one tool-result preview may claim at most.
+const TOOL_RESULT_PREVIEW_LINES: usize = 5;
 
 /// A tool result's live preview, already sanitized and split into rows.
 /// Empty when the result carries nothing worth a row (an empty body, or a
@@ -159,7 +178,7 @@ const SPAWN_TASK_PREVIEW_LINES: usize = 5;
 /// The truncation matches the batch-print era's `format_tool_result`: tabs
 /// expanded first so the budget is spent on what is actually rendered, then
 /// `TOOL_RESULT_PREVIEW_CHARS` characters, then `...` if anything was cut.
-/// Rows are capped at `SPAWN_TASK_PREVIEW_LINES` for the same reason they
+/// Rows are capped at `TOOL_RESULT_PREVIEW_LINES` for the same reason they
 /// are there — the character budget alone still lets 200 newlines through.
 fn format_tool_result_preview(result: &str) -> Vec<String> {
     if result.trim().is_empty() {
@@ -174,7 +193,7 @@ fn format_tool_result_preview(result: &str) -> Vec<String> {
     };
     let sanitized = sanitize(&body);
     let all: Vec<&str> = sanitized.split('\n').collect();
-    let shown = all.len().min(SPAWN_TASK_PREVIEW_LINES);
+    let shown = all.len().min(TOOL_RESULT_PREVIEW_LINES);
     let mut rows: Vec<String> = all[..shown]
         .iter()
         .enumerate()
@@ -217,7 +236,9 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
         | AgentEvent::ModelRequestStarted { .. }
         | AgentEvent::ModelRequestFinished { .. }
         | AgentEvent::DecisionStarted
-        | AgentEvent::DecisionFinished => Vec::new(),
+        | AgentEvent::DecisionFinished
+        | AgentEvent::EffortJudging
+        | AgentEvent::EffortJudged { .. } => Vec::new(),
         AgentEvent::WorkflowResolved {
             phase,
             skill_ids,
@@ -240,7 +261,7 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
             )))]
         }
         AgentEvent::ToolStarted { name, detail } => {
-            let args = format_tool_call_args(detail);
+            let args = format_tool_call_args(name, detail);
             let preview: String = args.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
             vec![HistoryLine::plain(Line::from(Span::raw(sanitize(
                 &format!("⏺ {name}({preview})"),
@@ -304,52 +325,41 @@ pub fn format_event_for_live_print(event: &AgentEvent) -> Vec<HistoryLine> {
             }
             lines
         }
-        AgentEvent::SpawnStarted { agent_type, task } => {
-            // `task` is free-form, model-supplied prose (`spawn`'s
-            // `tasks[].task` argument) and is routinely multi-line, unlike
-            // a tool call's `detail`, which is compact JSON and so has its
-            // newlines escaped. `sanitize` deliberately keeps a real `\n`,
-            // and `render_history_into` reserves exactly one terminal row
-            // per `HistoryLine`, so a newline left inside one line would be
-            // written into the middle of a single-row slot. Split it.
-            //
-            // Truncated to the same preview budget as everything else here
-            // *before* splitting, which also bounds the row count; the
-            // explicit line cap then covers the pathological all-newlines
-            // case that the character budget alone would still let through.
-            let preview: String = task.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
-            let sanitized = sanitize(&format!("⏺ Agent({agent_type}: {preview})"));
-            let all: Vec<&str> = sanitized.split('\n').collect();
-            let shown = all.len().min(SPAWN_TASK_PREVIEW_LINES);
-            let mut lines: Vec<HistoryLine> = all[..shown]
-                .iter()
-                .enumerate()
-                .map(|(i, line)| {
-                    // Continuation lines are indented under the first,
-                    // which carries the `⏺ Agent(...)` prefix.
-                    let text = if i == 0 {
-                        (*line).to_string()
-                    } else {
-                        format!("    {line}")
-                    };
-                    HistoryLine::plain(Line::from(Span::raw(text)))
-                })
-                .collect();
-            if all.len() > shown {
-                lines.push(HistoryLine::plain(Line::from(Span::raw("    ..."))));
-            }
-            lines.push(HistoryLine::plain(Line::from(Span::styled(
-                "  Backgrounded agent",
+        AgentEvent::SpawnStarted {
+            display_name,
+            agent_type,
+            task: _,
+        } => vec![
+            HistoryLine::plain(Line::from(Span::raw(sanitize(&format!(
+                "⏺ {display_name} ({agent_type})"
+            ))))),
+            HistoryLine::plain(Line::from(Span::styled(
+                "  → starting",
                 Style::default().add_modifier(Modifier::DIM),
-            ))));
-            lines
-        }
-        AgentEvent::SpawnFinished { agent_type, ok } => {
-            let marker = if *ok { "done" } else { "failed" };
+            ))),
+        ],
+        AgentEvent::SpawnActivity { name, detail, .. } => {
+            let args = format_tool_call_args(name, detail);
+            let preview: String = args.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
             vec![HistoryLine::plain(Line::from(Span::styled(
-                sanitize(&format!("  {agent_type}: {marker}")),
+                sanitize(&format!("  → {name}({preview})")),
                 Style::default().add_modifier(Modifier::DIM),
             )))]
+        }
+        AgentEvent::SpawnFinished {
+            display_name,
+            agent_type,
+            ok,
+        } => {
+            let marker = if *ok { "done" } else { "failed" };
+            let marker_color = if *ok { Color::Green } else { Color::Red };
+            vec![HistoryLine::plain(Line::from(vec![
+                Span::styled("⏺ ", Style::default().fg(marker_color)),
+                Span::styled(
+                    sanitize(&format!("{display_name} ({agent_type}): {marker}")),
+                    Style::default().fg(Color::White),
+                ),
+            ]))]
         }
         AgentEvent::HistoryCompacted {
             messages_before,
@@ -610,14 +620,10 @@ fn push_row_trimmed(rows: &mut Vec<Vec<(char, Style)>>, current: &mut Vec<(char,
 /// exactly, split at wherever a row boundary lands inside it, and every
 /// wrapped row inherits the original line's `shaded` flag.
 ///
-/// Called fresh every frame from the current `history_area.width` (see
-/// `lib.rs`'s `draw_frame`) rather than cached, since the width can
-/// change between frames (a terminal resize). This re-walks the whole
-/// `history` buffer each time, which is fine at the scale a single
-/// interactive session actually reaches — there is no windowing here
-/// (unlike `visible_history_window`, which only looks at the *result*'s
-/// length) because a line's wrapped row count isn't known until it's
-/// wrapped, so the scroll math downstream needs the full reflowed list.
+/// `HistoryWrapCache` keeps this result between redraws and invalidates it
+/// when the width, source length, or an in-place activity row changes. The
+/// full result is still needed because a line's wrapped row count is not
+/// known until reflow, but scrolling no longer repeats that work.
 ///
 /// `width` of `0` is a no-op (nothing can fit) — callers should not call
 /// this with a zero-width area to begin with.
@@ -729,6 +735,44 @@ pub fn wrap_history_lines(history: &[HistoryLine], width: u16) -> Vec<HistoryLin
         }
     }
     out
+}
+
+/// Cached full-history reflow. Most TUI redraws change only the scroll offset,
+/// input buffer, or status animation, so rebuilding every wrapped row on each
+/// frame makes navigation cost grow with the entire conversation.
+#[derive(Default)]
+pub struct HistoryWrapCache {
+    width: u16,
+    source_len: usize,
+    valid: bool,
+    wrapped: Vec<HistoryLine>,
+    #[cfg(test)]
+    rebuilds: usize,
+}
+
+impl HistoryWrapCache {
+    pub fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    pub fn lines<'a>(&'a mut self, history: &[HistoryLine], width: u16) -> &'a [HistoryLine] {
+        if !self.valid || self.width != width || self.source_len != history.len() {
+            self.wrapped = wrap_history_lines(history, width);
+            self.width = width;
+            self.source_len = history.len();
+            self.valid = true;
+            #[cfg(test)]
+            {
+                self.rebuilds += 1;
+            }
+        }
+        &self.wrapped
+    }
+
+    #[cfg(test)]
+    fn rebuilds(&self) -> usize {
+        self.rebuilds
+    }
 }
 
 /// Which `history` indices are currently visible, given how far the user
@@ -865,9 +909,8 @@ pub struct HeaderInfo<'a> {
     pub model_name: &'a str,
     /// Shown next to `model_name` in the footer only (`gpt-5.6-sol high
     /// · ~/...`, per the same screenshot `cwd_short` cites) — the header
-    /// box's `model:` row doesn't carry it, since it already has its own
-    /// `/model to change` hint and adding effort there would duplicate
-    /// what `/model`'s own picker screens already show.
+    /// box's `model:` row doesn't carry it. `/model` changes the model only;
+    /// this value is informational and comes from the launch configuration.
     pub effort_name: &'a str,
     pub usage: polaris_provider::Usage,
     pub cwd: &'a str,
@@ -1165,22 +1208,27 @@ pub fn render_footer(
             Span::raw(sanitize(input)),
         ])
     };
-    // One blank shaded row directly above and below the input line —
-    // widens the input box's visual weight beyond a single thin text row,
-    // without adding any text of their own.
-    let pad_style = Style::default().bg(Color::DarkGray);
-    frame.render_widget(
-        Paragraph::new(Line::raw("")).style(pad_style),
-        input_pad_top_area,
+    // Paint the composer as one solid three-row surface before adding its
+    // text. Rendering three independent paragraphs allowed a terminal's
+    // incremental redraw to retain the default background across the unused
+    // suffix of the middle row while typing, visually shortening the field.
+    let composer_area = ratatui::layout::Rect::new(
+        input_area.x,
+        input_pad_top_area.y,
+        input_area.width,
+        input_pad_top_area
+            .height
+            .saturating_add(input_area.height)
+            .saturating_add(input_pad_bottom_area.height),
     );
-    frame.render_widget(
-        Paragraph::new(input_line).style(Style::default().bg(Color::DarkGray)),
-        input_area,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::raw("")).style(pad_style),
-        input_pad_bottom_area,
-    );
+    let composer_style = Style::default().bg(Color::DarkGray);
+    frame.render_widget(Block::default().style(composer_style), composer_area);
+    frame.render_widget(Paragraph::new(input_line).style(composer_style), input_area);
+    // A few terminal backends clear the unused suffix of a redrawn Paragraph
+    // even though its base style has a background. Patch the final frame
+    // buffer after text rendering so typing cannot punch a default-background
+    // gap into the right side of the composer.
+    frame.buffer_mut().set_style(composer_area, composer_style);
 
     // Places the real terminal cursor at `cursor`'s position within the
     // typed text, right after the "\u{203a} " prompt. Terminal emulators
@@ -1207,13 +1255,18 @@ pub fn render_footer(
     // Two-tone footer matching codex's own status line: the model name in
     // a warm tan, the working directory in a soft green, separated by a
     // dim middle dot.
+    let model_and_effort = if header.effort_name.is_empty() {
+        sanitize(header.model_name)
+    } else {
+        format!(
+            "{} {}",
+            sanitize(header.model_name),
+            sanitize(header.effort_name)
+        )
+    };
     let footer_line = Line::from(vec![
         Span::styled(
-            format!(
-                "{} {}",
-                sanitize(header.model_name),
-                sanitize(header.effort_name)
-            ),
+            model_and_effort,
             Style::default().fg(Color::Rgb(246, 226, 183)),
         ),
         Span::styled(" \u{b7} ", dim),
@@ -1298,25 +1351,20 @@ pub fn render_resume_picker(
     );
 }
 
-/// Fixed model choices for the `/model` picker. Not a live catalog query
-/// (polaris has no models-list endpoint integration) — this is the same
-/// name set shown in a real codex `/model` picker screenshot, minus
-/// `gpt-daybreak-blue-latest` (a specialized variant not representative
-/// of general use) and minus reasoning effort (a dimension polaris's
-/// `CompletionRequest` doesn't carry at all). `pub` so `lib.rs`'s
-/// `run_model_picker` can navigate it without duplicating the list.
+/// Fixed hosted choices for `/model`. Local runtimes are discovered only
+/// after the separate local-model row is chosen.
 pub const MODEL_CATALOG: &[&str] = &[
     "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
 ];
+pub const RECOMMENDED_MODEL: &str = "gpt-6-astra";
+pub const LOCAL_MODEL_LABEL: &str = "Local model";
 
 /// The `/model` picker: numbered options, arrow-key navigable, the
-/// currently-active one marked `(current)` — the same layout
+/// currently-active one marked `(current)` and Astra marked
+/// `(recommended)` — the same layout
 /// `render_permissions_picker` uses, both modeled on a screenshot of
 /// codex's real `/model` picker. Unlike codex's, this carries no
 /// per-model description text: codex's descriptions ("Latest frontier
@@ -1324,7 +1372,12 @@ pub const MODEL_CATALOG: &[&str] = &[
 /// that polaris has no way to verify for whatever endpoint
 /// `POLARIS_BASE_URL` actually points at, so making the same claims here
 /// would be asserting something unverified.
-pub fn render_model_picker(frame: &mut Frame, current: &str, selected: usize) {
+pub fn render_model_picker(
+    frame: &mut Frame,
+    current: &str,
+    current_is_local: bool,
+    selected: usize,
+) {
     let area = frame.area();
     let mut lines: Vec<Line> = vec![
         Line::styled(
@@ -1336,7 +1389,14 @@ pub fn render_model_picker(frame: &mut Frame, current: &str, selected: usize) {
     for (i, name) in MODEL_CATALOG.iter().enumerate() {
         let is_selected = i == selected;
         let marker = if is_selected { "\u{276f} " } else { "  " };
-        let suffix = if *name == current { " (current)" } else { "" };
+        let recommended = *name == RECOMMENDED_MODEL;
+        let is_current = !current_is_local && *name == current;
+        let suffix = match (recommended, is_current) {
+            (true, true) => " (recommended, current)",
+            (true, false) => " (recommended)",
+            (false, true) => " (current)",
+            (false, false) => "",
+        };
         let style = if is_selected {
             Style::default()
                 .fg(Color::Cyan)
@@ -1350,6 +1410,25 @@ pub fn render_model_picker(frame: &mut Frame, current: &str, selected: usize) {
         ]));
     }
     lines.push(Line::from(""));
+    let local_index = MODEL_CATALOG.len();
+    let local_selected = selected == local_index;
+    let local_marker = if local_selected { "\u{276f} " } else { "  " };
+    let local_suffix = if current_is_local { " (current)" } else { "" };
+    let local_style = if local_selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    lines.push(Line::from(vec![
+        Span::raw(local_marker),
+        Span::styled(
+            format!("{}. {}{local_suffix}", local_index + 1, LOCAL_MODEL_LABEL),
+            local_style,
+        ),
+    ]));
+    lines.push(Line::from(""));
     lines.push(Line::styled(
         "enter to confirm \u{b7} esc to cancel",
         Style::default().add_modifier(Modifier::DIM),
@@ -1361,59 +1440,65 @@ pub fn render_model_picker(frame: &mut Frame, current: &str, selected: usize) {
     );
 }
 
-/// Reasoning-effort choices for the `/model` wizard's second step, in
-/// the order codex's real "Select Reasoning Level" screen lists them —
-/// verified against two screenshots of it. codex splits this into two
-/// screens (`Low`..`Extra high` on the main list, then a `More
-/// reasoning...` row that opens a second "Advanced Reasoning" screen,
-/// carrying a "consumes usage limits faster" warning); explicit
-/// instruction here was to list everything in one flat picker instead,
-/// so all five are just rows 1-5 of the same list.
-///
-/// One row per value the API actually accepts, and no more. `ultra` used
-/// to be a sixth row: it is not an effort the API has, so picking it was
-/// silently rewritten to `xhigh` and the user was shown a choice that did
-/// not exist. `max` is real — Responses-API only, which is the endpoint
-/// polaris talks to — so it is sent as itself.
-pub const EFFORT_CATALOG: &[(&str, &str)] = &[
-    ("low", "fast responses with lighter reasoning"),
-    (
-        "medium",
-        "balances speed and reasoning depth for everyday tasks",
-    ),
-    ("high", "greater reasoning depth for complex problems"),
-    (
-        "extra high",
-        "extra reasoning depth for complex problems \u{b7} consumes usage limits faster",
-    ),
-    (
-        "max",
-        "for difficult problems when quality matters more than speed \u{b7} consumes usage limits faster",
-    ),
-];
+/// Second-level picker populated only from connected loopback runtimes.
+pub fn render_local_model_picker(
+    frame: &mut Frame,
+    models: &[String],
+    current: Option<&str>,
+    selected: usize,
+) {
+    let area = frame.area();
+    let mut lines: Vec<Line> = vec![
+        Line::styled(
+            "choose a connected local model",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+    ];
+    if models.is_empty() {
+        lines.push(Line::styled(
+            "no connected local models",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    } else {
+        for (i, model) in models.iter().enumerate() {
+            let is_selected = i == selected;
+            let marker = if is_selected { "\u{276f} " } else { "  " };
+            let suffix = if current == Some(model.as_str()) {
+                " (current)"
+            } else {
+                ""
+            };
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("{}. {}{suffix}", i + 1, sanitize(model)), style),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "enter to confirm \u{b7} esc to go back",
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
+        area,
+    );
+}
 
-/// The catalog row matching the CLI default; the current selection may
-/// override it. This is a *display* name, so it is the row whose
-/// [`effort_wire_value`] is what `--effort` defaults to (`xhigh`), not
-/// that token spelled out. `defaults_and_explicit_model_effort_have_the_documented_precedence`
-/// in `polaris-cli` pins the two to each other.
+/// Human-readable form of the CLI default. `/model` no longer exposes an
+/// effort picker: automatic routing owns effort, while `--effort` remains
+/// available for fixed noninteractive measurements.
 pub const DEFAULT_EFFORT: &str = "extra high";
 
-/// Maps a picker-level effort name to the literal token actually sent
-/// over the wire. Real reasoning-effort APIs only accept a handful of
-/// space-free values — `polaris_auth::effort_for_plan_type` is
-/// first-party evidence for exactly which ones (`"low"`/`"xhigh"`, with
-/// `"medium"`/`"high"` filling the gap between, and `"max"` above them on
-/// the Responses API). Sending `EFFORT_CATALOG`'s display name directly,
-/// `"extra high"` included, is what produced a real `400 Invalid value:
-/// 'extra high'` from the API — this exists so that bug can't recur for
-/// any entry.
-///
-/// `"extra high"` is the only row whose label differs from its token, and
-/// so the only rewrite left here. `"max"` used to be folded into `xhigh`
-/// alongside it; it is a real value on `/responses`, which is polaris's
-/// own endpoint, and collapsing it made the top two rows of the picker
-/// send the same thing.
+/// Maps the footer's human-readable default to the literal CLI/API token.
 pub fn effort_wire_value(name: &str) -> &str {
     match name {
         "extra high" => "xhigh",
@@ -1421,73 +1506,12 @@ pub fn effort_wire_value(name: &str) -> &str {
     }
 }
 
-/// The inverse of [`effort_wire_value`]: the catalog row a wire token
-/// belongs to. `--effort` is given in wire tokens, and the footer and the
-/// picker's highlight are keyed on display names, so the one token that
-/// is spelled differently has to be translated back before it reaches
-/// them — otherwise `--effort xhigh` shows `xhigh` in the footer and
-/// leaves the picker highlighting row 1.
+/// The inverse of [`effort_wire_value`] for the footer.
 pub fn effort_display_name(wire: &str) -> &str {
     match wire {
         "xhigh" => "extra high",
         other => other,
     }
-}
-
-/// The `/model` wizard's second step — picking the reasoning effort for
-/// whichever model was just picked in `render_model_picker`. Same
-/// numbered/highlighted layout, plus a `(default)`/`(current)` suffix
-/// (both, space-separated, when a row is both — `low` starts out as
-/// both at once).
-pub fn render_effort_picker(frame: &mut Frame, model: &str, current: &str, selected: usize) {
-    let area = frame.area();
-    let mut lines: Vec<Line> = vec![
-        Line::styled(
-            format!("choose the reasoning effort for {}", sanitize(model)),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-    ];
-    for (i, (name, description)) in EFFORT_CATALOG.iter().enumerate() {
-        let is_selected = i == selected;
-        let marker = if is_selected { "\u{276f} " } else { "  " };
-        let is_default = *name == DEFAULT_EFFORT;
-        let is_current = *name == current;
-        let suffix = match (is_default, is_current) {
-            (true, true) => " (default, current)",
-            (true, false) => " (default)",
-            (false, true) => " (current)",
-            (false, false) => "",
-        };
-        let name_style = if is_selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().add_modifier(Modifier::BOLD)
-        };
-        let desc_style = if is_selected {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().add_modifier(Modifier::DIM)
-        };
-        lines.push(Line::from(vec![
-            Span::raw(marker),
-            Span::styled(format!("{}. {}{suffix}", i + 1, sanitize(name)), name_style),
-            Span::raw("  "),
-            Span::styled(sanitize(description), desc_style),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "enter to confirm \u{b7} esc to go back",
-        Style::default().add_modifier(Modifier::DIM),
-    ));
-
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
-        area,
-    );
 }
 
 /// The `/skills` picker: every skill discovered in this project, browsable
@@ -1879,6 +1903,41 @@ mod tests {
     }
 
     #[test]
+    fn typing_does_not_shorten_the_composer_background_on_redraw() {
+        let backend = TestBackend::new(60, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_footer(f, f.area(), "", 0, &Status::Idle, &test_header(), &[], 0))
+            .expect("empty draw");
+        terminal
+            .draw(|f| {
+                render_footer(
+                    f,
+                    f.area(),
+                    "typing",
+                    6,
+                    &Status::Thinking {
+                        elapsed: Duration::from_secs(138),
+                    },
+                    &test_header(),
+                    &[],
+                    0,
+                )
+            })
+            .expect("typed draw");
+        let buffer = terminal.backend().buffer();
+        for y in 3..=5 {
+            for x in 0..60 {
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    Color::DarkGray,
+                    "composer background changed at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_input_row_has_a_shaded_blank_row_above_and_below_it() {
         // Widens the visual weight of the input box — a single text row of
         // shading read as too thin. The blank rows carry no text, just
@@ -2037,6 +2096,24 @@ mod tests {
         let wrapped = wrap_history_lines(&history, 20);
         assert_eq!(wrapped.len(), 1);
         assert_eq!(wrapped[0].line.to_string(), "short");
+    }
+
+    #[test]
+    fn history_wrap_cache_reuses_reflow_while_only_the_view_moves() {
+        let mut cache = HistoryWrapCache::default();
+        let mut history = vec![plain_history_line(
+            "one two three four five six seven eight nine ten",
+        )];
+
+        for _ in 0..100 {
+            let _ = cache.lines(&history, 12);
+        }
+        assert_eq!(cache.rebuilds(), 1);
+
+        history[0] = plain_history_line("changed activity row");
+        cache.invalidate();
+        assert_eq!(cache.lines(&history, 12)[0].line.to_string(), "changed");
+        assert_eq!(cache.rebuilds(), 2);
     }
 
     #[test]
@@ -2225,52 +2302,7 @@ mod tests {
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_model_picker(f, "gpt-5.4", 4))
-            .expect("draw");
-
-        let buffer = terminal.backend().buffer();
-        let rows: Vec<String> = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect();
-        assert!(rows.iter().any(|r| r.contains("gpt-5.4 (current)")));
-        assert!(!rows.iter().any(|r| r.contains("gpt-5.5 (current)")));
-        assert!(rows.iter().any(|r| r.contains("enter to confirm")));
-    }
-
-    #[test]
-    fn the_effort_picker_lists_every_level_in_one_flat_list() {
-        // The explicit instruction was "don't split max/ultra onto a
-        // separate page" — this just confirms all six still show up on
-        // one screen, since a regression here would silently drop that.
-        let backend = TestBackend::new(100, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_effort_picker(f, "gpt-5.6-sol", "low", 0))
-            .expect("draw");
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
-        for (name, _) in EFFORT_CATALOG {
-            assert!(content.contains(name), "{name} should be listed");
-        }
-        assert!(content.contains("gpt-5.6-sol"));
-    }
-
-    #[test]
-    fn the_effort_picker_marks_default_and_current_distinctly() {
-        let backend = TestBackend::new(100, 14);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| render_effort_picker(f, "gpt-5.6-sol", "high", 0))
+            .draw(|f| render_model_picker(f, "gpt-6-astra", false, 0))
             .expect("draw");
 
         let buffer = terminal.backend().buffer();
@@ -2283,45 +2315,51 @@ mod tests {
             .collect();
         assert!(
             rows.iter()
-                .any(|r| r.contains(&format!("{DEFAULT_EFFORT} (default)")))
+                .any(|r| r.contains("gpt-6-astra (recommended, current)"))
         );
-        assert!(rows.iter().any(|r| r.contains("high (current)")));
-        // Neither row is both at once here, so the combined suffix must
-        // not appear.
-        assert!(!rows.iter().any(|r| r.contains("(default, current)")));
+        assert!(rows.iter().any(|r| r.contains("Local model")));
+        assert!(!rows.iter().any(|r| r.contains("gpt-5.5")));
+        assert!(rows.iter().any(|r| r.contains("enter to confirm")));
     }
 
     #[test]
-    fn the_effort_picker_combines_default_and_current_on_the_same_row() {
-        let backend = TestBackend::new(100, 14);
+    fn the_model_picker_marks_a_local_selection_separately() {
+        let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_effort_picker(f, "gpt-6-astra", DEFAULT_EFFORT, 3))
+            .draw(|f| render_model_picker(f, "qwen3", true, MODEL_CATALOG.len()))
             .expect("draw");
-
         let content = terminal
             .backend()
             .buffer()
             .content
             .iter()
-            .map(|c| c.symbol())
+            .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains(&format!("{DEFAULT_EFFORT} (default, current)")));
+        assert!(content.contains("gpt-6-astra (recommended)"));
+        assert!(content.contains("Local model (current)"));
     }
 
     #[test]
-    fn effort_wire_value_maps_every_catalog_entry_to_something_space_free() {
-        // The regression this guards: `EFFORT_CATALOG`'s display name
-        // ("extra high") used to be sent to the API directly and got a
-        // real `400 Invalid value: 'extra high'` back. No entry's wire
-        // value may contain a space, ever again.
-        for (name, _) in EFFORT_CATALOG {
-            let wire = effort_wire_value(name);
-            assert!(
-                !wire.contains(' '),
-                "{name} maps to {wire:?}, which contains a space"
-            );
-        }
+    fn the_local_model_picker_lists_connected_runtime_models() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let models = vec![
+            "Ollama · qwen3:4b".to_string(),
+            "LM Studio · gemma".to_string(),
+        ];
+        terminal
+            .draw(|f| render_local_model_picker(f, &models, Some("Ollama · qwen3:4b"), 1))
+            .expect("draw");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Ollama · qwen3:4b (current)"));
+        assert!(content.contains("LM Studio · gemma"));
     }
 
     #[test]
@@ -2341,24 +2379,8 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_offers_exactly_the_efforts_the_api_accepts() {
-        // The catalog is what a user can pick, so a row the API has no
-        // value for is a choice that cannot be honoured — `ultra` was
-        // one, and it was quietly answered with `xhigh` instead.
-        assert_eq!(
-            EFFORT_CATALOG
-                .iter()
-                .map(|(name, _)| effort_wire_value(name))
-                .collect::<Vec<_>>(),
-            ["low", "medium", "high", "xhigh", "max"]
-        );
-    }
-
-    #[test]
-    fn effort_display_name_is_the_inverse_of_effort_wire_value() {
-        for (name, _) in EFFORT_CATALOG {
-            assert_eq!(effort_display_name(effort_wire_value(name)), *name);
-        }
+    fn effort_display_name_keeps_the_cli_default_human_readable() {
+        assert_eq!(effort_display_name("xhigh"), DEFAULT_EFFORT);
     }
 
     #[test]
@@ -2557,10 +2579,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_started_events_json_arguments_render_as_key_equals_value() {
-        // The bug this pins down: raw JSON like `{"limit":50,"path":"a.txt"}`
-        // showed up verbatim — braces, quoted keys, colons — instead of a
-        // readable call-style preview.
+    fn file_tool_activity_shows_only_the_target_path() {
         let lines = format_event_for_live_print(&AgentEvent::ToolStarted {
             name: "read".to_string(),
             detail: "{\"path\":\"a.txt\",\"limit\":50}".to_string(),
@@ -2571,7 +2590,33 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(text, "⏺ read(limit=50, path=\"a.txt\")");
+        assert_eq!(text, "⏺ read(a.txt)");
+
+        for name in ["write", "edit"] {
+            let text = live_print_text(&AgentEvent::ToolStarted {
+                name: name.to_string(),
+                detail: r#"{"path":"src/main.rs","content":"hidden","old":"also hidden"}"#
+                    .to_string(),
+            });
+            assert_eq!(text, format!("⏺ {name}(src/main.rs)"));
+            assert!(!text.contains("hidden"));
+        }
+    }
+
+    #[test]
+    fn spawn_tool_activity_pairs_stable_names_with_declared_agent_types() {
+        let text = live_print_text(&AgentEvent::ToolStarted {
+            name: "spawn".to_string(),
+            detail: serde_json::json!({
+                "tasks": [
+                    {"type": "file-reader", "task": "private long prompt"},
+                    {"task": "another private prompt"}
+                ]
+            })
+            .to_string(),
+        });
+        assert_eq!(text, "⏺ spawn(Sirius (file-reader), Canopus (auto))");
+        assert!(!text.contains("prompt"));
     }
 
     #[test]
@@ -2727,7 +2772,7 @@ mod tests {
             assert!(!text.contains('\n'), "a row still carries a newline");
         }
         // done行 + プレビュー(最大SPAWN_TASK_PREVIEW_LINES行 + 省略行)
-        assert!(lines.len() <= 1 + SPAWN_TASK_PREVIEW_LINES + 1);
+        assert!(lines.len() <= 1 + TOOL_RESULT_PREVIEW_LINES + 1);
     }
 
     #[test]
@@ -2787,21 +2832,19 @@ mod tests {
     #[test]
     fn a_spawn_started_event_mentions_backgrounded_agent() {
         let joined = live_print_text(&AgentEvent::SpawnStarted {
+            display_name: "Sirius".to_string(),
             agent_type: "file-inspector".to_string(),
             task: "inspect agent.rs".to_string(),
         });
-        assert!(joined.contains("Agent"));
+        assert!(joined.contains("Sirius"));
         assert!(joined.contains("file-inspector"));
-        assert!(joined.contains("Backgrounded agent"));
+        assert!(joined.contains("starting"));
     }
 
     #[test]
-    fn a_multi_line_spawn_task_is_split_across_rows_not_left_in_one_line() {
-        // `render_history_into` reserves exactly one terminal row per
-        // `HistoryLine`, so a raw `\n` surviving inside one line would be
-        // written into the middle of a single-row slot. Every physical
-        // line of the task must get its own `HistoryLine` instead.
+    fn a_spawn_started_event_never_exposes_its_task_prompt() {
         let lines = format_event_for_live_print(&AgentEvent::SpawnStarted {
+            display_name: "Sirius".to_string(),
             agent_type: "file-inspector".to_string(),
             task: "first line\nsecond line\nthird line".to_string(),
         });
@@ -2811,42 +2854,50 @@ mod tests {
             .collect();
 
         assert!(rows.iter().all(|r| !r.contains('\n')), "{rows:?}");
-        assert!(rows.iter().any(|r| r.contains("first line")));
-        assert!(rows.iter().any(|r| r.contains("second line")));
-        assert!(rows.iter().any(|r| r.contains("third line")));
-        // The three task lines land on three distinct rows, and the
-        // "Backgrounded agent" follow-up is still its own row after them.
-        assert_eq!(rows.len(), 4);
-        assert!(rows[0].contains("⏺ Agent(file-inspector: first line"));
-        assert!(rows[3].contains("Backgrounded agent"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "⏺ Sirius (file-inspector)");
+        assert_eq!(rows[1], "  → starting");
+        assert!(!rows.join(" ").contains("first line"));
     }
 
     #[test]
-    fn a_pathologically_multi_line_spawn_task_is_capped_at_a_few_rows() {
-        let lines = format_event_for_live_print(&AgentEvent::SpawnStarted {
-            agent_type: "file-inspector".to_string(),
-            task: "x\n".repeat(80),
+    fn a_spawn_activity_is_a_single_dimmed_tool_row() {
+        let lines = format_event_for_live_print(&AgentEvent::SpawnActivity {
+            display_name: "Sirius".to_string(),
+            agent_type: "file-reader".to_string(),
+            name: "read".to_string(),
+            detail: r#"{"path":"docs/filemap.md","limit":20}"#.to_string(),
         });
-        // At most the capped task rows, one `...` elision row, and the
-        // "Backgrounded agent" row — never one row per task line.
-        assert_eq!(lines.len(), SPAWN_TASK_PREVIEW_LINES + 2);
-        let last_task_rows: String = lines[SPAWN_TASK_PREVIEW_LINES]
-            .line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(last_task_rows.contains("..."));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line.to_string(), "  → read(docs/filemap.md)");
+        assert!(
+            lines[0]
+                .line
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::DIM))
+        );
     }
 
     #[test]
     fn a_spawn_finished_event_names_the_agent_type_and_its_outcome() {
-        let joined = live_print_text(&AgentEvent::SpawnFinished {
+        let lines = format_event_for_live_print(&AgentEvent::SpawnFinished {
+            display_name: "Sirius".to_string(),
             agent_type: "file-inspector".to_string(),
             ok: true,
         });
+        let joined: String = lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
         assert!(joined.contains("file-inspector"));
+        assert!(joined.contains("Sirius"));
         assert!(joined.contains("done"));
+        assert_eq!(joined, "⏺ Sirius (file-inspector): done");
+        assert_eq!(lines[0].line.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(lines[0].line.spans[1].style.fg, Some(Color::White));
     }
 
     #[test]

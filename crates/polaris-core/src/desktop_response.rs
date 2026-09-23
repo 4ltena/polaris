@@ -20,7 +20,7 @@ impl EventSink {
     /// provider要求ごとに作成する。子も同じBounded sinkのcloneを用いる。
     pub fn response_observer(&self) -> Result<Option<DesktopResponseObserver>, EventFailure> {
         match self {
-            Self::Legacy(_) => Ok(None),
+            Self::Legacy(_) | Self::LegacyChild { .. } => Ok(None),
             Self::Bounded(sink) => Ok(Some(DesktopResponseObserver {
                 request_id: sink.next_request_id()?,
                 sink: sink.clone(),

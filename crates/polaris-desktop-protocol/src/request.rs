@@ -21,6 +21,20 @@ pub enum Method {
     Hello,
     #[serde(rename = "session.open")]
     SessionOpen,
+    #[serde(rename = "session.list")]
+    SessionList,
+    #[serde(rename = "session.select")]
+    SessionSelect,
+    #[serde(rename = "input.submit")]
+    InputSubmit,
+    #[serde(rename = "input.status")]
+    InputStatus,
+    #[serde(rename = "input.cancel")]
+    InputCancel,
+    #[serde(rename = "subagent.wait")]
+    SubagentWait,
+    #[serde(rename = "subagent.cancel")]
+    SubagentCancel,
     #[serde(rename = "session.roles.configure")]
     SessionRolesConfigure,
     #[serde(rename = "session.snapshot")]
@@ -322,6 +336,106 @@ crate::object_wire! {
 pub struct AttachmentRead { pub path: String }
 }
 
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputSubmit {
+    Text {
+        expected_manager_revision: DecimalU64,
+        expected_session_revision: DecimalU64,
+        expected_goal_revision: DecimalU64,
+        route: InputRoute,
+        #[serde(default, deserialize_with = "bounded_attachments")]
+        attachment_ids: Vec<AttachmentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+        admission_id: Option<AdmissionId>,
+        text: String,
+    },
+    Reference {
+        expected_manager_revision: DecimalU64,
+        expected_session_revision: DecimalU64,
+        expected_goal_revision: DecimalU64,
+        route: InputRoute,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+        admission_id: Option<AdmissionId>,
+        input_ref: ResultId,
+    },
+}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRoute {
+    Current,
+    New,
+    Auto,
+}
+
+impl InputSubmit {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Self::Text {
+            text,
+            attachment_ids,
+            ..
+        } = self
+            && (text.is_empty() || text.len() > 32 * 1024 || attachment_ids.len() > 16)
+        {
+            return Err("input text/attachments exceed their bound");
+        }
+        Ok(())
+    }
+}
+
+fn bounded_attachments<'de, D>(deserializer: D) -> Result<Vec<AttachmentId>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<AttachmentId>::deserialize(deserializer)?;
+    if values.len() > 16 {
+        return Err(de::Error::custom("attachment IDs exceed 16"));
+    }
+    Ok(values)
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputStatus { pub admission_id: AdmissionId }
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputCancel {
+    pub expected_manager_revision: DecimalU64,
+    pub admission_id: AdmissionId,
+}
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentWait {
+    pub root_run_id: RunId,
+    pub root_attempt_id: AttemptId,
+    pub expected_revision: DecimalU64,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub after_cursor: Option<DecimalU64>,
+}
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentCancel {
+    pub root_run_id: RunId,
+    pub root_attempt_id: AttemptId,
+    pub logical_child_id: LogicalChildId,
+    pub child_attempt_id: ChildAttemptId,
+    pub expected_revision: DecimalU64,
+}
+}
+
 /// sessionの要否をenumの形で固定し、無関係なsessionの黙殺を防ぐ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestBody {
@@ -330,6 +444,13 @@ pub enum RequestBody {
     AttachmentRead(SessionId, AttachmentRead),
     Hello,
     SessionOpen(SessionId),
+    SessionList,
+    SessionSelect(SessionId),
+    InputSubmit(SessionId, InputSubmit),
+    InputStatus(SessionId, InputStatus),
+    InputCancel(SessionId, InputCancel),
+    SubagentWait(SessionId, SubagentWait),
+    SubagentCancel(SessionId, SubagentCancel),
     SessionRolesConfigure(SessionId, crate::role_bindings::ConfigureRoleBindings),
     SessionSnapshot(SessionId),
     SessionSubscribe(SessionId, Subscribe),
@@ -361,6 +482,19 @@ pub enum RequestBody {
 }
 
 impl RequestBody {
+    pub fn requires_v2(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionList
+                | Self::SessionSelect(..)
+                | Self::InputSubmit(..)
+                | Self::InputStatus(..)
+                | Self::InputCancel(..)
+                | Self::SubagentWait(..)
+                | Self::SubagentCancel(..)
+        )
+    }
+
     pub fn method(&self) -> Method {
         match self {
             Self::Hello => Method::Hello,
@@ -368,6 +502,13 @@ impl RequestBody {
             Self::WorkspaceRead(..) => Method::WorkspaceRead,
             Self::AttachmentRead(..) => Method::AttachmentRead,
             Self::SessionOpen(..) => Method::SessionOpen,
+            Self::SessionList => Method::SessionList,
+            Self::SessionSelect(..) => Method::SessionSelect,
+            Self::InputSubmit(..) => Method::InputSubmit,
+            Self::InputStatus(..) => Method::InputStatus,
+            Self::InputCancel(..) => Method::InputCancel,
+            Self::SubagentWait(..) => Method::SubagentWait,
+            Self::SubagentCancel(..) => Method::SubagentCancel,
             Self::SessionRolesConfigure(..) => Method::SessionRolesConfigure,
             Self::SessionSnapshot(..) => Method::SessionSnapshot,
             Self::SessionSubscribe(..) => Method::SessionSubscribe,
@@ -401,6 +542,7 @@ impl RequestBody {
     pub fn session_id(&self) -> Option<&SessionId> {
         match self {
             Self::Hello
+            | Self::SessionList
             | Self::ShutdownRequest(..)
             | Self::BrowseList(..)
             | Self::BrowseRead(..) => None,
@@ -408,6 +550,12 @@ impl RequestBody {
             | Self::AttachmentRead(s, _)
             | Self::LocalModels(s, _)
             | Self::SessionOpen(s)
+            | Self::SessionSelect(s)
+            | Self::InputSubmit(s, _)
+            | Self::InputStatus(s, _)
+            | Self::InputCancel(s, _)
+            | Self::SubagentWait(s, _)
+            | Self::SubagentCancel(s, _)
             | Self::SessionRolesConfigure(s, _)
             | Self::SessionSnapshot(s)
             | Self::SessionSubscribe(s, _)
@@ -478,7 +626,11 @@ impl<'de> Deserialize<'de> for Request {
         let session = wire.session_id;
         let needs_session = !matches!(
             wire.method,
-            Method::Hello | Method::ShutdownRequest | Method::BrowseList | Method::BrowseRead
+            Method::Hello
+                | Method::SessionList
+                | Method::ShutdownRequest
+                | Method::BrowseList
+                | Method::BrowseRead
         );
         if needs_session != session.is_some() {
             return Err(de::Error::custom("method/session target mismatch"));
@@ -505,6 +657,26 @@ impl<'de> Deserialize<'de> for Request {
                 let _: Empty = params!();
                 RequestBody::SessionOpen(session.unwrap())
             }
+            Method::SessionList => {
+                let _: Empty = params!();
+                RequestBody::SessionList
+            }
+            Method::SessionSelect => {
+                let _: Empty = params!();
+                RequestBody::SessionSelect(session.unwrap())
+            }
+            Method::InputSubmit => {
+                let params: InputSubmit = params!();
+                params.validate().map_err(de::Error::custom)?;
+                RequestBody::InputSubmit(
+                    session.ok_or_else(|| de::Error::custom("missing session"))?,
+                    params,
+                )
+            }
+            Method::InputStatus => scoped!(InputStatus),
+            Method::InputCancel => scoped!(InputCancel),
+            Method::SubagentWait => scoped!(SubagentWait),
+            Method::SubagentCancel => scoped!(SubagentCancel),
             Method::SessionRolesConfigure => scoped!(SessionRolesConfigure),
             Method::GoalUpdate => scoped!(GoalUpdate),
             Method::InstructionSend => scoped!(InstructionSend),
@@ -556,6 +728,20 @@ impl<'de> Deserialize<'de> for Request {
                 )
             }
         };
+        if wire.protocol_version == ProtocolVersion::V1
+            && matches!(
+                wire.method,
+                Method::SessionList
+                    | Method::SessionSelect
+                    | Method::InputSubmit
+                    | Method::InputStatus
+                    | Method::InputCancel
+                    | Method::SubagentWait
+                    | Method::SubagentCancel
+            )
+        {
+            return Err(de::Error::custom("protocol v2 method on v1 frame"));
+        }
         Ok(Self {
             protocol_version: wire.protocol_version,
             client_id: wire.client_id,
@@ -586,11 +772,18 @@ impl Serialize for Request {
         }
         match &self.body {
             RequestBody::Hello
+            | RequestBody::SessionList
             | RequestBody::SessionOpen(_)
+            | RequestBody::SessionSelect(_)
             | RequestBody::SessionSnapshot(_)
             | RequestBody::McpRegistryRead(_)
             | RequestBody::McpSetupDetect(_) => wire.serialize_field("params", &Empty {})?,
             RequestBody::SessionSubscribe(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::InputSubmit(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::InputStatus(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::InputCancel(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::SubagentWait(_, p) => wire.serialize_field("params", p)?,
+            RequestBody::SubagentCancel(_, p) => wire.serialize_field("params", p)?,
             RequestBody::HistoryPage(_, p) => wire.serialize_field("params", p)?,
             RequestBody::DraftUpdate(_, p) => wire.serialize_field("params", p)?,
             RequestBody::SessionConfigure(_, p) => wire.serialize_field("params", p)?,

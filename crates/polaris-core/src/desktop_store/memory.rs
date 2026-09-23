@@ -291,6 +291,11 @@ fn project(
                 .as_ref()
                 .map(|w| w.gates.clone())
                 .unwrap_or_default(),
+            workflow_artifacts: p.state.workflow_artifacts.clone(),
+            verification_checkpoint: None,
+            // Desktop admissions are bound in the desktop sidecar/marker;
+            // this v2 memory projection never owns those receipts.
+            admission_receipts: Default::default(),
             ancestors: m
                 .ancestors
                 .iter()

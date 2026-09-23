@@ -4,6 +4,8 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use polaris_core::{
@@ -18,6 +20,7 @@ use polaris_core::{
 };
 use polaris_provider::openai::OpenAiProvider;
 use polaris_sandbox::{SandboxMode, SandboxPolicy};
+use serde::Deserialize;
 
 mod account;
 mod benchmark_report;
@@ -42,7 +45,7 @@ Environment variables:
   POLARIS_PROVIDER  openai (default) or codex. codex uses the credentials from `polaris login`.
   POLARIS_API_KEY   Required when provider=openai. API key for an OpenAI-compatible endpoint.
   POLARIS_BASE_URL  Used when provider=openai; defaults to https://api.openai.com/v1
-  POLARIS_MODEL     Defaults to gpt-6-astra; reasoning effort defaults to xhigh (--effort)
+  POLARIS_MODEL     Defaults to gpt-6-astra; interactive effort is judged automatically
 "
 )]
 struct Args {
@@ -72,13 +75,13 @@ struct Args {
     #[arg(long)]
     account: Option<String>,
 
-    /// 推論強度。既定はxhigh。明示した値が優先する。
+    /// 推論強度。対話TUIでは省略時に自動判定し、`-p`ではxhighを使う。
     ///
     /// この既定はorchestrator——rootの実行自身——の強度である。委譲先の
     /// 強度は`[tier.*]`が決め、そこで強度を書かなかった段だけがこの値を
     /// 引き継ぐ。`max`はResponses API限定だが、polarisの主経路は
     /// `/responses`なので送れる。`ultra`はAPIに無いので受け付けない。
-    #[arg(long, default_value = "xhigh", value_parser = ["low", "medium", "high", "xhigh", "max"])]
+    #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
     effort: Option<String>,
 
     /// 圧縮前の履歴をローカル保存し、プロジェクト別の検索索引を作る。
@@ -108,6 +111,14 @@ struct Args {
     /// workflowを有効にしたセッションの作業段階。
     #[arg(long, value_enum, conflicts_with_all = ["resume", "fork"])]
     phase: Option<PhaseArg>,
+
+    /// Host-authored routine-change authority for this exact prompt.
+    #[arg(long, value_name = "JSON")]
+    routine_authority: Option<String>,
+
+    /// Host-authored review for the exact published verification checkpoint.
+    #[arg(long, value_name = "JSON", requires = "routine_authority")]
+    review_authority: Option<String>,
 
     /// 保存済みworkflowの実行方式を明示的に変更する。resume/forkでは保存後に反映する。
     #[arg(long, value_enum)]
@@ -158,6 +169,121 @@ struct Args {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineAuthorityWireV1 {
+    schema_version: u32,
+    component_root: PathBuf,
+    security: bool,
+    migration: bool,
+    public_api: bool,
+    dependency: bool,
+    distribution: bool,
+    major_user_contract: bool,
+    unknown_impact: bool,
+    criteria: Vec<RoutineCriterionWireV1>,
+    #[serde(default)]
+    existing_test: Option<ExistingTestAuthorityWireV1>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineCriterionWireV1 {
+    description: String,
+    observable_failure: String,
+    evidence_kind: RoutineCriterionEvidenceWireV1,
+    #[serde(default)]
+    common_runner_plan: Option<polaris_core::common_tests::Plan>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RoutineCriterionEvidenceWireV1 {
+    Static,
+    CommonCase,
+    ExistingTest,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExistingTestAuthorityWireV1 {
+    cargo_program: PathBuf,
+    timeout_secs: u64,
+    inventory: polaris_core::verification::TestInventoryV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewAuthorityWireV1 {
+    schema_version: u32,
+    expected_workflow_revision: u64,
+    checkpoint_id: String,
+    reviewer_id: String,
+    findings: Vec<polaris_core::workflow::ReviewFindingV1>,
+}
+
+#[derive(Clone)]
+struct PreparedRoutineAuthorityV1 {
+    eligibility: polaris_core::workflow::RoutineEligibilityV1,
+    verification: Vec<polaris_core::workflow::VerificationCriterionV1>,
+    runners: Vec<polaris_core::verification::FixedCommonRunnerV1>,
+    existing_test_executor: Option<polaris_core::verification::FixedRustTestExecutorV1>,
+    static_adapters: Vec<polaris_core::verification::FixedStaticAdapterV1>,
+    verification_preparation: polaris_core::verification::HostVerificationPreparationV1,
+    component_root: PathBuf,
+    subject_hash: String,
+}
+
+struct CliVerificationObserverV1 {
+    project_root: PathBuf,
+    component_root: PathBuf,
+    subject_hash: String,
+    cargo_program: PathBuf,
+}
+
+impl polaris_core::verification::VerificationObserverV1 for CliVerificationObserverV1 {
+    fn observe(&self) -> Result<polaris_core::verification::HostObservedVerificationV1, String> {
+        let (source_hash, project_graph_hash) = cargo_closure_hashes(
+            &self.project_root,
+            &self.component_root,
+            &self.cargo_program,
+        )?;
+        Ok(polaris_core::verification::HostObservedVerificationV1 {
+            subject_hash: self.subject_hash.clone(),
+            source_hash: source_hash.clone(),
+            diff_hash: source_hash,
+            project_graph_hash,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataBindingV1 {
+    packages: Vec<CargoMetadataPackageV1>,
+    resolve: Option<CargoMetadataResolveV1>,
+    workspace_root: String,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataPackageV1 {
+    id: String,
+    manifest_path: String,
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataResolveV1 {
+    nodes: Vec<CargoMetadataNodeV1>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataNodeV1 {
+    id: String,
+    dependencies: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -242,6 +368,819 @@ impl From<PhaseArg> for Phase {
     }
 }
 
+fn prepare_routine_authority(
+    raw: &str,
+    prompt: &str,
+    project_root: &Path,
+    sandbox: &SandboxPolicy,
+    static_state_root: &Path,
+) -> Result<PreparedRoutineAuthorityV1, String> {
+    let wire: RoutineAuthorityWireV1 = serde_json::from_str(raw)
+        .map_err(|error| format!("--routine-authorityが不正です: {error}"))?;
+    if wire.schema_version != 1 {
+        return Err("--routine-authorityのschema_versionは1だけを受け付けます".into());
+    }
+    if sandbox.mode() != SandboxMode::WorkspaceWrite {
+        return Err("--routine-authorityにはworkspace-write sandboxが必要です".into());
+    }
+    if wire.component_root.as_os_str().is_empty()
+        || wire.component_root.is_absolute()
+        || wire.component_root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err("component_rootはproject内の相対pathで指定してください".into());
+    }
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| format!("project rootを確認できません: {error}"))?;
+    let component_root = project_root
+        .join(&wire.component_root)
+        .canonicalize()
+        .map_err(|error| format!("component_rootを確認できません: {error}"))?;
+    if component_root == project_root || !component_root.starts_with(&project_root) {
+        return Err("component_rootには単一packageのrootが必要です".into());
+    }
+    if !sandbox
+        .writable_roots()
+        .iter()
+        .any(|root| component_root.starts_with(root))
+    {
+        return Err("component_rootがsandboxのwrite root外です".into());
+    }
+    let manifest_path = component_root.join("Cargo.toml");
+    let manifest_text = std::fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("component manifestを読めません: {error}"))?;
+    let manifest: toml::Value = toml::from_str(&manifest_text)
+        .map_err(|error| format!("component manifestが不正です: {error}"))?;
+    let package_name = manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .ok_or("component_rootには単一Cargo packageが必要です")?
+        .to_owned();
+
+    let component = wire
+        .component_root
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    let eligibility = polaris_core::workflow::RoutineEligibilityV1 {
+        affected_components: vec![component],
+        security: wire.security,
+        migration: wire.migration,
+        public_api: wire.public_api,
+        dependency: wire.dependency,
+        distribution: wire.distribution,
+        major_user_contract: wire.major_user_contract,
+        unknown_impact: wire.unknown_impact,
+    };
+    eligibility.validate()?;
+    if eligibility.blocker().is_some() {
+        return Err("--routine-authorityはroutine変更だけに使えます".into());
+    }
+    if wire.criteria.is_empty() || wire.criteria.len() > 32 {
+        return Err("--routine-authorityのcriteria件数が不正です".into());
+    }
+    let mut verification = Vec::with_capacity(wire.criteria.len());
+    let mut runner_inputs = Vec::with_capacity(wire.criteria.len());
+    let mut static_criteria = Vec::new();
+    let mut has_existing_test = false;
+    for criterion in wire.criteria {
+        let (evidence_kind, common_runner) = match criterion.evidence_kind {
+            RoutineCriterionEvidenceWireV1::Static => {
+                if criterion.description != STATIC_COMPONENT_MANIFEST_DESCRIPTION
+                    || criterion.observable_failure != STATIC_COMPONENT_MANIFEST_FAILURE
+                    || criterion.common_runner_plan.is_some()
+                    || criterion.timeout_secs.is_some()
+                {
+                    return Err(
+                        "static criterionは登録済みcomponent manifest契約だけを受け付けます".into(),
+                    );
+                }
+                (
+                    polaris_core::workflow::CriterionEvidenceKindV1::Static,
+                    None,
+                )
+            }
+            RoutineCriterionEvidenceWireV1::CommonCase => {
+                let plan = criterion
+                    .common_runner_plan
+                    .ok_or("common_case criterionにはcommon_runner_planが必要です")?;
+                plan.check()
+                    .map_err(|error| format!("common runner planが不正です: {error:?}"))?;
+                let timeout_secs = criterion
+                    .timeout_secs
+                    .filter(|seconds| (1..=300).contains(seconds))
+                    .ok_or("common runner timeoutは1..=300秒で指定してください")?;
+                (
+                    polaris_core::workflow::CriterionEvidenceKindV1::CommonCase,
+                    Some((plan, timeout_secs)),
+                )
+            }
+            RoutineCriterionEvidenceWireV1::ExistingTest => {
+                if criterion.common_runner_plan.is_some() || criterion.timeout_secs.is_some() {
+                    return Err(
+                        "existing_test criterionにはcommon runner設定を指定できません".into(),
+                    );
+                }
+                has_existing_test = true;
+                (
+                    polaris_core::workflow::CriterionEvidenceKindV1::ExistingTest,
+                    None,
+                )
+            }
+        };
+        let typed = polaris_core::workflow::VerificationCriterionV1::typed(
+            criterion.description,
+            criterion.observable_failure,
+            true,
+            [evidence_kind].into_iter().collect(),
+        )?;
+        if let Some((plan, timeout_secs)) = common_runner {
+            runner_inputs.push((typed.id.clone(), plan, timeout_secs));
+        }
+        if matches!(
+            criterion.evidence_kind,
+            RoutineCriterionEvidenceWireV1::Static
+        ) {
+            static_criteria.push(typed.id.clone());
+        }
+        verification.push(typed);
+    }
+    let (existing_test_executor, verification_preparation) =
+        match (has_existing_test, wire.existing_test) {
+            (false, None) => (
+                None,
+                polaris_core::verification::HostVerificationPreparationV1::default(),
+            ),
+            (false, Some(_)) => {
+                return Err("existing_test criterionなしでexecutorは登録できません".into());
+            }
+            (true, None) => {
+                return Err("existing_test criterionにはhost executorが必要です".into());
+            }
+            (true, Some(config)) => {
+                if !config.cargo_program.is_absolute() || !(1..=300).contains(&config.timeout_secs)
+                {
+                    return Err("existing-test executor設定が不正です".into());
+                }
+                config
+                    .inventory
+                    .validate()
+                    .map_err(|_| "existing-test inventoryが不正です")?;
+                if !config.inventory.complete
+                    || config.inventory.framework != "rust"
+                    || config
+                        .inventory
+                        .entries
+                        .iter()
+                        .any(|entry| entry.package != package_name)
+                {
+                    return Err(
+                        "existing-test inventoryは単一componentの完全Rust目録が必要です".into(),
+                    );
+                }
+                let mut candidate_hints = polaris_core::verification::CandidateHintsV1::default();
+                candidate_hints.packages.insert(package_name.clone());
+                let preparation = polaris_core::verification::HostVerificationPreparationV1 {
+                    inventory: Some(config.inventory),
+                    candidate_hints,
+                    all_tests_scope: polaris_core::verification::AllTestsScopeV1::Package,
+                    ..Default::default()
+                };
+                let executor = polaris_core::verification::FixedRustTestExecutorV1 {
+                    runner_id: format!("rust-tests-{package_name}"),
+                    cargo_program: config.cargo_program,
+                    policy: sandbox.clone(),
+                    cwd: project_root.clone(),
+                    write_root: project_root.clone(),
+                    timeout: Duration::from_secs(config.timeout_secs),
+                };
+                (Some(executor), preparation)
+            }
+        };
+    let authorization = polaris_core::session::RoutineChangeAuthorizationV1::new(
+        prompt,
+        eligibility.clone(),
+        verification.clone(),
+    )?;
+    drop(authorization);
+
+    let runners = runner_inputs
+        .into_iter()
+        .map(
+            |(criterion_id, plan, timeout_secs)| polaris_core::verification::FixedCommonRunnerV1 {
+                runner_id: format!("common-{criterion_id}"),
+                criterion_id,
+                evidence_kind: polaris_core::verification::EvidenceKindV1::CommonCase,
+                plan,
+                policy: sandbox.clone(),
+                cwd: component_root.clone(),
+                write_root: component_root.clone(),
+                timeout: Duration::from_secs(timeout_secs),
+            },
+        )
+        .collect::<Vec<_>>();
+    let static_adapters = build_component_manifest_static_adapters(
+        &static_criteria,
+        &component_root,
+        static_state_root,
+    )?;
+    let subject_hash = polaris_core::conversation_state::content_hash(
+        serde_json::to_string(&serde_json::json!({
+            "eligibility": eligibility,
+            "verification": verification,
+        }))
+        .map_err(|_| "routine authorityをhash化できません")?
+        .as_bytes(),
+    );
+    Ok(PreparedRoutineAuthorityV1 {
+        eligibility,
+        verification,
+        runners,
+        existing_test_executor,
+        static_adapters,
+        verification_preparation,
+        component_root,
+        subject_hash,
+    })
+}
+
+fn build_component_manifest_static_adapters(
+    criteria: &[String],
+    component_root: &Path,
+    static_state_root: &Path,
+) -> Result<Vec<polaris_core::verification::FixedStaticAdapterV1>, String> {
+    if criteria.is_empty() {
+        return Ok(Vec::new());
+    }
+    let program = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("static analyzer実体を確認できません: {error}"))?;
+    let program_bytes = std::fs::read(&program)
+        .map_err(|error| format!("static analyzer実体を読めません: {error}"))?;
+    let executable_hash = polaris_core::conversation_state::content_hash(&program_bytes);
+    let mut runtime_roots = Vec::new();
+    if let Some(parent) = program.parent() {
+        runtime_roots.push(parent.to_path_buf());
+    }
+    for candidate in ["/usr/bin", "/bin", "/usr/lib", "/System/Library"] {
+        let path = Path::new(candidate);
+        if path.is_dir() {
+            let canonical = path
+                .canonicalize()
+                .map_err(|error| format!("static analyzer runtimeを確認できません: {error}"))?;
+            if !runtime_roots.contains(&canonical) {
+                runtime_roots.push(canonical);
+            }
+        }
+    }
+    let state_root = static_state_root
+        .canonicalize()
+        .map_err(|error| format!("static analyzer state rootを確認できません: {error}"))?;
+    let component_key =
+        polaris_core::conversation_state::content_hash(component_root.to_string_lossy().as_bytes());
+    let container = state_root.join(format!("static-adapter-{}", &component_key[..16]));
+    let home = container.join("home");
+    let tmpdir = container.join("tmp");
+    prepare_static_private_directory(&container)?;
+    prepare_static_private_directory(&home)?;
+    prepare_static_private_directory(&tmpdir)?;
+    let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, component_root, &runtime_roots)
+        .and_then(|policy| policy.with_isolated_private_environment(&container, &home, &tmpdir))
+        .and_then(SandboxPolicy::require_process_containment)
+        .map_err(|error| format!("static analyzer sandboxを準備できません: {error}"))?;
+    criteria
+        .iter()
+        .map(|criterion_id| {
+            let analyzer_id = format!("component-manifest-{criterion_id}");
+            let capability = polaris_core::verification::StaticCapabilityV1 {
+                schema_version: polaris_core::verification::SCHEMA_VERSION,
+                analyzer_id,
+                executable_hash: executable_hash.clone(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                output_schema_hash:
+                    polaris_core::verification::static_adapter_output_schema_hash_v1(),
+                rules: vec![polaris_core::verification::StaticRuleCapabilityV1 {
+                    rule_id: STATIC_COMPONENT_MANIFEST_RULE.into(),
+                    obligation_kinds: ["criterion".into()].into_iter().collect(),
+                    maximum_scope: polaris_core::verification::AnalysisScopeV1::Package,
+                    clean_proves_satisfied: true,
+                    requires_project_graph: false,
+                }],
+            };
+            Ok(polaris_core::verification::FixedStaticAdapterV1 {
+                criterion_id: criterion_id.clone(),
+                runner_id: format!("static-component-manifest-{criterion_id}"),
+                capability,
+                rule_id: STATIC_COMPONENT_MANIFEST_RULE.into(),
+                program: program.clone(),
+                argv: vec!["static-component-manifest".into()],
+                policy: policy.clone(),
+                cwd: component_root.to_path_buf(),
+                timeout: Duration::from_secs(10),
+                maximum_output_bytes: 8 * 1024,
+            })
+        })
+        .collect()
+}
+
+fn prepare_static_private_directory(path: &Path) -> Result<(), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Err("static analyzer private scratchはこのplatformで利用できません".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        match std::fs::create_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "static analyzer private scratchを作成できません: {error}"
+                ));
+            }
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("static analyzer private scratchを保護できません: {error}"))?;
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|error| format!("static analyzer private scratchを確認できません: {error}"))?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("static analyzer private scratchを確認できません: {error}"))?;
+        if !metadata.is_dir() || metadata.mode() & 0o7077 != 0 || canonical != path {
+            return Err("static analyzer private scratchのidentityが不正です".into());
+        }
+        Ok(())
+    }
+}
+
+fn prepare_review_authority(raw: &str) -> Result<ReviewAuthorityWireV1, String> {
+    let wire: ReviewAuthorityWireV1 = serde_json::from_str(raw)
+        .map_err(|error| format!("--review-authorityが不正です: {error}"))?;
+    let valid_id = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    };
+    if wire.schema_version != 1 {
+        return Err("--review-authorityのschema_versionは1だけを受け付けます".into());
+    }
+    if !valid_id(&wire.checkpoint_id) || !valid_id(&wire.reviewer_id) {
+        return Err("--review-authorityのidentityが不正です".into());
+    }
+    if wire.findings.iter().any(|finding| {
+        finding.disposition == polaris_core::workflow::ReviewFindingDispositionV1::Open
+    }) {
+        return Err("--review-authorityはopen findingを受け付けません".into());
+    }
+    let validation_record = polaris_core::workflow::ReviewRecordV1 {
+        schema_version: polaris_core::workflow::EVIDENCE_SCHEMA_VERSION,
+        record_id: "review-authority-validation".into(),
+        binding: polaris_core::workflow::EvidenceBindingV1 {
+            task_id: "validation-task".into(),
+            task_definition_hash: "0".repeat(64),
+            subject_hash: "1".repeat(64),
+            source_hash: "2".repeat(64),
+            diff_hash: "3".repeat(64),
+            artifact_graph_basis_hash: "4".repeat(64),
+        },
+        findings: wire.findings.clone(),
+    };
+    validation_record
+        .validate()
+        .map_err(|error| format!("--review-authorityのfindingが不正です: {error}"))?;
+    Ok(wire)
+}
+
+fn install_routine_authority(
+    session: &mut Session,
+    prompt: &str,
+    prepared: PreparedRoutineAuthorityV1,
+    project_root: &Path,
+) -> Result<Arc<polaris_core::verification::SessionVerificationToolOwnerV1>, String> {
+    let persistence = session
+        .persistence
+        .clone()
+        .ok_or("--routine-authorityには永続sessionが必要です")?;
+    let active_reference = session
+        .workflow
+        .as_ref()
+        .and_then(|workflow| workflow.state().active_change_contract.clone());
+    if active_reference.is_none() {
+        let workflow = session
+            .workflow
+            .as_ref()
+            .ok_or("--routine-authorityには有効なworkflowが必要です")?;
+        if workflow.state().phase != Phase::Specify {
+            workflow.request_phase(Phase::Specify)?;
+            session.checkpoint().map_err(|error| error.to_string())?;
+        }
+    }
+    let authorization = if let Some(reference) = active_reference {
+        let contract = persistence
+            .load_change_contract(&reference)
+            .map_err(|error| format!("active change contractを読めません: {error}"))?;
+        if contract.eligibility != prepared.eligibility
+            || contract.verification != prepared.verification
+        {
+            return Err("保存済みcontractが--routine-authorityと一致しません".into());
+        }
+        None
+    } else {
+        Some(polaris_core::session::RoutineChangeAuthorizationV1::new(
+            prompt,
+            prepared.eligibility.clone(),
+            prepared.verification.clone(),
+        )?)
+    };
+    let cargo_program = resolve_cargo_program()?;
+    let observer = Arc::new(CliVerificationObserverV1 {
+        project_root: project_root.to_path_buf(),
+        component_root: prepared.component_root,
+        subject_hash: prepared.subject_hash,
+        cargo_program,
+    });
+    let mut owner = polaris_core::verification::SessionVerificationToolOwnerV1::new(
+        persistence,
+        observer,
+        prepared.runners,
+    )?
+    .with_preparation(prepared.verification_preparation)?;
+    if let Some(executor) = prepared.existing_test_executor {
+        owner = owner.with_existing_test_executor(Arc::new(executor))?;
+    }
+    owner = owner.with_static_adapters(prepared.static_adapters)?;
+    let owner = Arc::new(owner);
+    session.routine_change_authorization = authorization;
+    session.verification_owner = Some(owner.clone());
+    Ok(owner)
+}
+
+fn apply_review_authority(
+    session: &mut Session,
+    owner: &polaris_core::verification::SessionVerificationToolOwnerV1,
+    authority: ReviewAuthorityWireV1,
+) -> Result<(), String> {
+    let (workflow, checkpoint) = owner.publish_host_review(
+        authority.expected_workflow_revision,
+        &authority.checkpoint_id,
+        &authority.reviewer_id,
+        authority.findings,
+    )?;
+    session.workflow = Some(workflow);
+    session.verification_checkpoint = Some(checkpoint);
+    Ok(())
+}
+
+fn resolve_cargo_program() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Some(configured) = std::env::var_os("CARGO") {
+        let configured = PathBuf::from(configured);
+        if configured.is_absolute() {
+            candidates.push(configured);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|directory| directory.join("cargo")));
+    }
+    for candidate in candidates {
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        let Ok(metadata) = canonical.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        return Ok(canonical);
+    }
+    Err("cargo metadata用の固定cargo実体を確認できません".into())
+}
+
+fn cargo_closure_hashes(
+    project_root: &Path,
+    component_root: &Path,
+    cargo_program: &Path,
+) -> Result<(String, String), String> {
+    const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_LOCAL_PACKAGES: usize = 256;
+
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| format!("workspace rootを確認できません: {error}"))?;
+    let component_manifest = component_root
+        .join("Cargo.toml")
+        .canonicalize()
+        .map_err(|error| format!("component manifestを確認できません: {error}"))?;
+    let cargo_program = cargo_program
+        .canonicalize()
+        .map_err(|error| format!("cargo実体を確認できません: {error}"))?;
+    let cargo_bytes = read_regular_resolution_input(&cargo_program, "cargo実体")?;
+    let output = std::process::Command::new(&cargo_program)
+        .current_dir(&project_root)
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(project_root.join("Cargo.toml"))
+        .output()
+        .map_err(|error| format!("cargo metadataを実行できません: {error}"))?;
+    if !output.status.success() {
+        return Err("cargo metadataが完全なlocked/offline closureを返しませんでした".into());
+    }
+    if output.stdout.is_empty() || output.stdout.len() > MAX_METADATA_BYTES {
+        return Err("cargo metadata出力が検証上限外です".into());
+    }
+    let metadata: CargoMetadataBindingV1 =
+        serde_json::from_slice(&output.stdout).map_err(|_| "cargo metadata出力を解釈できません")?;
+    let workspace_root = PathBuf::from(&metadata.workspace_root)
+        .canonicalize()
+        .map_err(|error| format!("cargo workspace rootを確認できません: {error}"))?;
+    if workspace_root != project_root {
+        return Err("cargo metadataのworkspace rootがproject rootと一致しません".into());
+    }
+    let resolve = metadata
+        .resolve
+        .ok_or("cargo metadataに完全なresolve graphがありません")?;
+    let packages = metadata
+        .packages
+        .into_iter()
+        .map(|package| (package.id.clone(), package))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let nodes = resolve
+        .nodes
+        .into_iter()
+        .map(|node| (node.id.clone(), node.dependencies))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if packages.is_empty() || nodes.is_empty() || packages.keys().any(|id| !nodes.contains_key(id))
+    {
+        return Err("cargo metadataのpackage/resolve graphが不完全です".into());
+    }
+    let component_id = packages
+        .values()
+        .filter_map(|package| {
+            let path = PathBuf::from(&package.manifest_path);
+            (path.canonicalize().ok().as_ref() == Some(&component_manifest))
+                .then_some(package.id.clone())
+        })
+        .collect::<Vec<_>>();
+    let [component_id] = component_id.as_slice() else {
+        return Err("component packageをcargo metadataで一意に解決できません".into());
+    };
+    let mut pending = vec![component_id.clone()];
+    let mut reachable = std::collections::BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !reachable.insert(id.clone()) {
+            continue;
+        }
+        let dependencies = nodes
+            .get(&id)
+            .ok_or("cargo metadataのdependency nodeが不足しています")?;
+        for dependency in dependencies {
+            if !packages.contains_key(dependency) {
+                return Err("cargo metadataのdependency packageが不足しています".into());
+            }
+            pending.push(dependency.clone());
+        }
+    }
+    let local = reachable
+        .iter()
+        .filter_map(|id| packages.get(id).filter(|package| package.source.is_none()))
+        .collect::<Vec<_>>();
+    if local.is_empty() || local.len() > MAX_LOCAL_PACKAGES {
+        return Err("local Cargo dependency closureが検証上限外です".into());
+    }
+
+    let mut resolution_inputs = Vec::new();
+    resolution_inputs.push(hash_resolution_input(
+        &cargo_program,
+        &cargo_bytes,
+        "cargo-program",
+    ));
+    let root_manifest = project_root.join("Cargo.toml");
+    resolution_inputs.push(hash_file_resolution_input(
+        &root_manifest,
+        "workspace manifest",
+    )?);
+    let lockfile = project_root.join("Cargo.lock");
+    resolution_inputs.push(hash_file_resolution_input(&lockfile, "Cargo.lock")?);
+    for directory in cargo_config_search_directories(&project_root)? {
+        resolution_inputs.push((
+            "Cargo configuration search root".into(),
+            directory.to_string_lossy().into_owned(),
+            if directory.exists() {
+                "present"
+            } else {
+                "absent"
+            }
+            .into(),
+        ));
+        for name in ["config", "config.toml"] {
+            let candidate = directory.join(name);
+            if candidate.exists() {
+                let canonical = candidate
+                    .canonicalize()
+                    .map_err(|error| format!("Cargo configurationを確認できません: {error}"))?;
+                resolution_inputs.push(hash_file_resolution_input(
+                    &canonical,
+                    "Cargo configuration",
+                )?);
+            }
+        }
+    }
+    resolution_inputs.sort();
+    resolution_inputs.dedup();
+
+    let mut local_sources = Vec::with_capacity(local.len());
+    for package in local {
+        let manifest = PathBuf::from(&package.manifest_path);
+        let canonical_manifest = manifest
+            .canonicalize()
+            .map_err(|error| format!("local dependency manifestを確認できません: {error}"))?;
+        if canonical_manifest != manifest
+            || canonical_manifest
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("Cargo.toml")
+        {
+            return Err("local dependency manifestのidentityが不正です".into());
+        }
+        let root = canonical_manifest
+            .parent()
+            .ok_or("local dependency rootがありません")?;
+        local_sources.push((
+            package.id.clone(),
+            canonical_manifest.to_string_lossy().into_owned(),
+            bounded_tree_hash(root)?,
+        ));
+    }
+    local_sources.sort();
+    let metadata_hash = polaris_core::conversation_state::content_hash(&output.stdout);
+    let graph_bytes = serde_json::to_vec(&(
+        "polaris.cargo-closure.graph.v1",
+        &metadata_hash,
+        &resolution_inputs,
+        &reachable,
+    ))
+    .map_err(|_| "Cargo dependency graphをhash化できません")?;
+    let project_graph_hash = polaris_core::conversation_state::content_hash(&graph_bytes);
+    let source_bytes = serde_json::to_vec(&(
+        "polaris.cargo-closure.source.v1",
+        &project_graph_hash,
+        &local_sources,
+    ))
+    .map_err(|_| "Cargo dependency sourceをhash化できません")?;
+    Ok((
+        polaris_core::conversation_state::content_hash(&source_bytes),
+        project_graph_hash,
+    ))
+}
+
+fn cargo_config_search_directories(project_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut directories = project_root
+        .ancestors()
+        .map(|directory| directory.join(".cargo"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let cargo_home = if let Some(configured) = std::env::var_os("CARGO_HOME") {
+        let configured = PathBuf::from(configured);
+        if !configured.is_absolute() {
+            return Err("CARGO_HOMEはabsolute pathである必要があります".into());
+        }
+        configured
+    } else {
+        let home = std::env::var_os("HOME").ok_or("Cargo homeを解決できません")?;
+        let home = PathBuf::from(home);
+        if !home.is_absolute() {
+            return Err("HOMEはabsolute pathである必要があります".into());
+        }
+        home.join(".cargo")
+    };
+    directories.insert(if cargo_home.exists() {
+        cargo_home
+            .canonicalize()
+            .map_err(|error| format!("Cargo homeを確認できません: {error}"))?
+    } else {
+        cargo_home
+    });
+    Ok(directories.into_iter().collect())
+}
+
+fn read_regular_resolution_input(path: &Path, label: &str) -> Result<Vec<u8>, String> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("{label}を確認できません: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("{label}はregular fileである必要があります"));
+    }
+    std::fs::read(path).map_err(|error| format!("{label}を読めません: {error}"))
+}
+
+fn hash_resolution_input(path: &Path, bytes: &[u8], kind: &str) -> (String, String, String) {
+    (
+        kind.into(),
+        path.to_string_lossy().into_owned(),
+        polaris_core::conversation_state::content_hash(bytes),
+    )
+}
+
+fn hash_file_resolution_input(
+    path: &Path,
+    label: &str,
+) -> Result<(String, String, String), String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("{label}を確認できません: {error}"))?;
+    if canonical != path {
+        return Err(format!("{label}のaliasは受け付けません"));
+    }
+    let bytes = read_regular_resolution_input(&canonical, label)?;
+    Ok(hash_resolution_input(&canonical, &bytes, label))
+}
+
+fn bounded_tree_hash(root: &Path) -> Result<String, String> {
+    const MAX_FILES: usize = 4096;
+    const MAX_BYTES: u64 = 128 * 1024 * 1024;
+    fn visit(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        let mut entries = std::fs::read_dir(directory)
+            .map_err(|error| format!("component treeを読めません: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("component treeを読めません: {error}"))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(name.as_ref(), "target" | ".git" | ".polaris") {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("component treeを確認できません: {error}"))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "component treeのsymlinkは検証できません: {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                visit(root, &path, files)?;
+            } else if metadata.is_file() {
+                files.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+                if files.len() > MAX_FILES {
+                    return Err("component treeのfile数が検証上限を超えました".into());
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(root, root, &mut files)?;
+    files.sort();
+    let mut total = 0_u64;
+    let mut records = Vec::with_capacity(files.len());
+    for relative in files {
+        let bytes = std::fs::read(root.join(&relative))
+            .map_err(|error| format!("component sourceを読めません: {error}"))?;
+        total = total
+            .checked_add(bytes.len() as u64)
+            .ok_or("component tree size overflow")?;
+        if total > MAX_BYTES {
+            return Err("component treeが検証上限を超えました".into());
+        }
+        records.push((
+            relative.to_string_lossy().into_owned(),
+            polaris_core::conversation_state::content_hash(&bytes),
+        ));
+    }
+    let encoded = serde_json::to_vec(&records).map_err(|_| "component treeをhash化できません")?;
+    Ok(polaris_core::conversation_state::content_hash(&encoded))
+}
+
 impl ToolMemoryArg {
     fn retention(self) -> Option<polaris_core::tool_memory::RetentionMode> {
         use polaris_core::tool_memory::RetentionMode;
@@ -319,12 +1258,14 @@ enum Command {
     /// saved, which provider would be picked with no `POLARIS_PROVIDER`
     /// set, and whether this platform's sandbox backend is available.
     Doctor,
-    /// Check a shared black-box test plan: the argv and the cases an
-    /// implementer selected instead of writing a test program.
+    /// Run a shared black-box test plan inside the selected sandbox.
     CommonTests {
         /// The plan, as JSON. `-` reads it from stdin.
         plan: String,
     },
+    /// Internal host-owned static check. It accepts no path or command.
+    #[command(hide = true)]
+    StaticComponentManifest,
     /// Generate a shell completion script and print it to stdout.
     Completion {
         /// The shell to generate completions for.
@@ -433,6 +1374,13 @@ fn selected_model(explicit: Option<String>, environment: Option<String>) -> Stri
     explicit
         .or(environment)
         .unwrap_or_else(|| polaris_provider::codex::DEFAULT_MODEL.to_string())
+}
+
+/// Interactive turns let Jev choose effort. One-shot runs keep the historical
+/// xhigh default so benchmarks and automation remain fixed unless explicitly
+/// overridden.
+fn selected_effort(explicit: Option<&str>, has_prompt: bool) -> Option<&str> {
+    explicit.or(has_prompt.then_some("xhigh"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -669,6 +1617,7 @@ fn prepare_continuation(
 
 fn strict_history(
     config: &polaris_core::config::EmbeddingConfig,
+    runtime_home: &Path,
     provider_name: &str,
     private_root: &Path,
     attempt_ledger: polaris_provider::attempts::AttemptLedger,
@@ -730,13 +1679,32 @@ fn strict_history(
         provider,
     ));
     let usage = summary.usage.clone();
-    let mut embedder = polaris_core::strict_provider::local_embedder(config, private_root)
-        .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    let mut embedder = {
+        let runtime = std::sync::Arc::new(
+            polaris_core::managed_runtime::ManagedRuntimeLease::acquire(runtime_home).map_err(
+                |error| format!("読取専用runtime imageを利用できません。修復が必要です: {error}"),
+            )?,
+        );
+        polaris_core::strict_provider::managed_local_embedder(config, private_root, runtime)
+            .map_err(|error| error.to_string())?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut embedder = {
+        let _ = runtime_home;
+        return Err("strict10の読取専用runtime imageはこの環境で利用できません".into());
+    };
     embedder.attempt_ledger = Some(attempt_ledger);
     Ok((
         build_strict_history(summary, std::sync::Arc::new(embedder), decider),
         usage,
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn managed_runtime_home() -> Result<PathBuf, String> {
+    polaris_core::os_home::trusted_user_home()
+        .map_err(|error| format!("管理runtimeのOSユーザホームを特定できません: {error}"))
 }
 
 fn build_strict_history(
@@ -928,6 +1896,101 @@ fn build_decider(
     Some(decider)
 }
 
+/// Final-answer observation has a separate one-shot disclosure boundary. The
+/// normal Jev client may retry transient failures, so it cannot be reused for
+/// this path.
+fn build_finalizer_decider(
+    config: &polaris_core::config::DecisionConfig,
+) -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
+    use polaris_core::config::DecisionBackend;
+
+    if !config.enabled || config.backend != DecisionBackend::Jev {
+        return None;
+    }
+    let key = std::env::var("POLARIS_JEV_API_KEY").ok()?;
+    let base = config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://api.typesafe.ai/v1".to_owned());
+    let model = config
+        .model
+        .clone()
+        .unwrap_or_else(|| "jev-latest".to_owned());
+    polaris_provider::decision::jev::JevDecider::new_finalizer(&base, key, model)
+        .ok()
+        .map(|judge| {
+            std::sync::Arc::new(judge) as std::sync::Arc<dyn polaris_provider::decision::Decider>
+        })
+}
+
+async fn build_tui_answer_finalizer(
+    config: &polaris_core::config::Config,
+    state_dir: &Path,
+    managed_home: Option<&Path>,
+) -> Result<
+    Option<std::sync::Arc<polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner>>,
+    String,
+> {
+    use polaris_core::config::{AnswerFinalizerMode, PresentationLanguage, TranslationProfile};
+
+    let decider = build_finalizer_decider(&config.decision);
+    let translation_requested = config
+        .answer_finalizer
+        .translation
+        .activation
+        .is_requested();
+    let (translator, unavailable) = if config.answer_finalizer.mode != AnswerFinalizerMode::Shadow
+        || !translation_requested
+    {
+        (None, None)
+    } else if config.presentation.language != PresentationLanguage::Ja {
+        (
+            None,
+            Some(
+                polaris_core::answer_finalizer::shadow::ShadowFailureV1::PresentationLanguageNotJa,
+            ),
+        )
+    } else if config.answer_finalizer.translation.profile
+        != Some(TranslationProfile::CatTranslate3_3b)
+    {
+        (
+            None,
+            Some(polaris_core::answer_finalizer::shadow::ShadowFailureV1::ModelUnavailable),
+        )
+    } else {
+        let resolved_home;
+        let home = if let Some(home) = managed_home {
+            home
+        } else {
+            resolved_home = polaris_core::os_home::trusted_user_home()
+                .map_err(|error| format!("管理モデルのOSユーザホームを特定できません: {error}"))?;
+            &resolved_home
+        };
+        match polaris_core::translation::ManagedCatTranslate::open(home) {
+            Ok(translator) if translator.preflight().await.is_ok() => (
+                Some(std::sync::Arc::new(translator)
+                    as std::sync::Arc<
+                        dyn polaris_core::translation::TranslationBackendV1,
+                    >),
+                None,
+            ),
+            _ => (
+                None,
+                Some(polaris_core::answer_finalizer::shadow::ShadowFailureV1::ModelUnavailable),
+            ),
+        }
+    };
+    polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner::open_configured(
+        state_dir.join("answer-finalizer-shadow-v1.json"),
+        config.presentation.clone(),
+        config.answer_finalizer.clone(),
+        decider,
+        translator,
+        unavailable,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// The provider handle everything downstream holds. Named so the three
 /// that come out of the construction below read as what they are.
 type Shared = std::sync::Arc<dyn polaris_provider::Provider>;
@@ -1096,7 +2159,10 @@ async fn main() -> ExitCode {
             };
         }
         Some(Command::Doctor) => return run_doctor().await,
-        Some(Command::CommonTests { plan }) => return run_common_tests(&plan),
+        Some(Command::CommonTests { plan }) => {
+            return run_common_tests(&plan, args.sandbox.into());
+        }
+        Some(Command::StaticComponentManifest) => return run_static_component_manifest(),
         Some(Command::Completion { shell }) => {
             clap_complete::generate(
                 shell,
@@ -1210,8 +2276,11 @@ async fn main() -> ExitCode {
     });
 
     let model_name: String;
-    // Mirror the CLI effort in the TUI footer.
-    let mut initial_effort_name: Option<String> = None;
+    // A supplied `--effort` is fixed in both modes. One-shot runs retain the
+    // historical xhigh default; an interactive TUI leaves this absent so Jev
+    // can decide every turn and the footer can begin at `undecided`.
+    let initial_effort_name =
+        selected_effort(args.effort.as_deref(), args.prompt.is_some()).map(str::to_owned);
     let attempt_parent_id = match polaris_core::session_store::new_session_id() {
         Ok(id) => id,
         Err(error) => {
@@ -1303,8 +2372,11 @@ async fn main() -> ExitCode {
                     std::sync::Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
                         as std::sync::Arc<dyn polaris_provider::Provider>
                 });
-                let weights =
-                    tier_providers(&config.tiers, &model, args.effort.as_deref(), |named| {
+                let weights = tier_providers(
+                    &config.tiers,
+                    &model,
+                    initial_effort_name.as_deref(),
+                    |named| {
                         OpenAiProvider::new(base.clone(), key.clone(), named.to_owned())
                             .map(|provider| {
                                 std::sync::Arc::new(
@@ -1313,7 +2385,8 @@ async fn main() -> ExitCode {
                                     as std::sync::Arc<dyn polaris_provider::Provider>
                             })
                             .map_err(|error| error.to_string())
-                    });
+                    },
+                );
                 let weights = match weights {
                     Ok(weights) => weights,
                     Err(message) => {
@@ -1360,11 +2433,28 @@ async fn main() -> ExitCode {
                 )
                 .ok()
                 .map(|provider| {
-                    std::sync::Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
-                        as std::sync::Arc<dyn polaris_provider::Provider>
+                    let provider = provider.with_attempt_ledger(attempt_ledger.clone());
+                    // This picks which of nine catalogue entries to offer
+                    // and nothing else, and it runs at whatever effort the
+                    // account's plan implies — `xhigh` on a pro plan, which
+                    // spent 605.7 of the 649.3 tokens it produced per run on
+                    // reasoning, most often to arrive at `{"skills":[]}`.
+                    //
+                    // Setting it to `low` does cut that: output fell 29%,
+                    // from 1,298 tokens a run to 926. It also cost more,
+                    // $0.1371 against $0.1322 over n=12 each, because the
+                    // run took 0.9 more astra requests and one of those is
+                    // worth $0.013. A cheaper selector that picks worse
+                    // skills is not cheaper. Measured 2026-09-21; not
+                    // repeated without separating it from the block change
+                    // it was measured beside.
+                    std::sync::Arc::new(provider) as std::sync::Arc<dyn polaris_provider::Provider>
                 });
-                let weights =
-                    tier_providers(&config.tiers, &model, args.effort.as_deref(), |named| {
+                let weights = tier_providers(
+                    &config.tiers,
+                    &model,
+                    initial_effort_name.as_deref(),
+                    |named| {
                         polaris_provider::codex::CodexProvider::new(
                             polaris_provider::codex::ENDPOINT_BASE.to_string(),
                             named.to_owned(),
@@ -1377,7 +2467,8 @@ async fn main() -> ExitCode {
                                 as std::sync::Arc<dyn polaris_provider::Provider>
                         })
                         .map_err(|error| error.to_string())
-                    });
+                    },
+                );
                 let weights = match weights {
                     Ok(weights) => weights,
                     Err(message) => {
@@ -1472,9 +2563,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Some(effort) = args.effort.as_deref() {
+    if let Some(effort) = initial_effort_name.as_deref() {
         provider.set_effort(Some(effort));
-        initial_effort_name = Some(effort.to_string());
     }
 
     // Wrapped before anything takes a handle, so every consultation is
@@ -1524,6 +2614,17 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let answer_finalizer = if args.prompt.is_none() {
+        match build_tui_answer_finalizer(&config, &state_dir, None).await {
+            Ok(finalizer) => finalizer,
+            Err(error) => {
+                eprintln!("回答達成判定を準備できません: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let sessions_dir = match polaris_core::project::sessions_dir() {
         Ok(directory) => directory,
         Err(error) => {
@@ -1553,6 +2654,46 @@ async fn main() -> ExitCode {
             eprintln!("Can't build the sandbox policy: {e}");
             return ExitCode::FAILURE;
         }
+    };
+    let mut deferred_routine_authority = None;
+    let prepared_routine_authority = match args.routine_authority.as_deref() {
+        Some(raw) => {
+            if !config.workflow.enabled {
+                eprintln!("--routine-authorityには有効なworkflowが必要です");
+                return ExitCode::FAILURE;
+            }
+            let validation_prompt = args
+                .prompt
+                .as_deref()
+                .unwrap_or("tui deferred routine authority validation");
+            match prepare_routine_authority(
+                raw,
+                validation_prompt,
+                &project_root,
+                &sandbox,
+                &state_dir,
+            ) {
+                Ok(authority) => Some(authority),
+                Err(error) => {
+                    eprintln!("routine authorityを準備できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+    if args.prompt.is_none() {
+        deferred_routine_authority = args.routine_authority.clone();
+    }
+    let prepared_review_authority = match args.review_authority.as_deref() {
+        Some(raw) => match prepare_review_authority(raw) {
+            Ok(authority) => Some(authority),
+            Err(error) => {
+                eprintln!("review authorityを準備できません: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
     };
 
     // The binary that gets re-executed is staged outside the writable root.
@@ -1602,22 +2743,30 @@ async fn main() -> ExitCode {
 
     let history_backend_factory: polaris_tui::HistoryBackendFactory = {
         let embedding = config.embedding.clone();
+        #[cfg(target_os = "macos")]
+        let runtime_home = match managed_runtime_home() {
+            Ok(home) => home,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let runtime_home = PathBuf::new();
         let provider_name = provider_name.clone();
         let private_root = data_root.to_path_buf();
         let ledger = attempt_ledger.clone();
         let parent_id = attempt_parent_id.clone();
         let decider = decider.clone();
         std::sync::Arc::new(move || {
-            if embedding.runtime.is_none()
-                || embedding.model_path.is_none()
-                || embedding.revision.is_none()
-            {
+            if embedding.model_path.is_none() || embedding.revision.is_none() {
                 return Err(
-                    "strict10 には [embedding] の runtime、model_path、revision が必要です".into(),
+                    "strict10 には [embedding] の model_path、revision と検証済み読取専用runtime imageが必要です".into(),
                 );
             }
             strict_history(
                 &embedding,
+                &runtime_home,
                 &provider_name,
                 &private_root,
                 ledger.clone(),
@@ -1691,6 +2840,48 @@ async fn main() -> ExitCode {
         }
     };
 
+    let tui_turn_authority: Option<polaris_tui::TurnAuthorityInstaller> =
+        deferred_routine_authority.map(|raw| {
+            let pending = std::sync::Arc::new(std::sync::Mutex::new(Some((
+                raw,
+                prepared_review_authority.clone(),
+            ))));
+            let project_root = project_root.clone();
+            let sandbox = sandbox.clone();
+            let state_dir = state_dir.clone();
+            std::sync::Arc::new(move |session: &mut Session, prompt: &str| {
+                let plan = pending
+                    .lock()
+                    .map_err(|_| "routine authority stateを取得できません".to_owned())?
+                    .take();
+                let Some(plan) = plan else {
+                    return Ok(());
+                };
+                let result = (|| {
+                    let prepared = prepare_routine_authority(
+                        &plan.0,
+                        prompt,
+                        &project_root,
+                        &sandbox,
+                        &state_dir,
+                    )?;
+                    let owner =
+                        install_routine_authority(session, prompt, prepared, &project_root)?;
+                    if let Some(review) = plan.1.clone() {
+                        apply_review_authority(session, &owner, review)?;
+                    }
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let mut slot = pending
+                        .lock()
+                        .map_err(|_| "routine authority stateを復元できません".to_owned())?;
+                    *slot = Some(plan);
+                }
+                result
+            }) as polaris_tui::TurnAuthorityInstaller
+        });
+
     match args.prompt.clone() {
         Some(prompt) => {
             let usage_meter = polaris_provider::UsageMeter::default();
@@ -1711,9 +2902,15 @@ async fn main() -> ExitCode {
             // one.
             session.light_model = mcp_selection_provider.clone();
             if config.workflow.enabled {
-                session.workflow = Some(polaris_core::workflow::SessionWorkflow::new(
-                    config.workflow.clone(),
-                ));
+                session.workflow =
+                    match polaris_core::workflow::SessionWorkflow::try_new(config.workflow.clone())
+                    {
+                        Ok(workflow) => Some(workflow),
+                        Err(error) => {
+                            eprintln!("ワークフローを開始できません: {error}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
             }
             if let Some(phase) = args.phase.map(Phase::from) {
                 let Some(workflow) = session
@@ -1799,6 +2996,30 @@ async fn main() -> ExitCode {
             {
                 eprintln!("v2セッションを接続できません: {error}");
                 return ExitCode::FAILURE;
+            }
+            if let Err(error) = session.restore_verification_checkpoint() {
+                eprintln!("verification checkpointを復元できません: {error}");
+                return ExitCode::FAILURE;
+            }
+            if let Some(authority) = prepared_routine_authority.clone() {
+                let owner = match install_routine_authority(
+                    &mut session,
+                    &prompt,
+                    authority,
+                    &project_root,
+                ) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        eprintln!("routine authorityを接続できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if let Some(review) = prepared_review_authority.clone()
+                    && let Err(error) = apply_review_authority(&mut session, &owner, review)
+                {
+                    eprintln!("review authorityを適用できません: {error}");
+                    return ExitCode::FAILURE;
+                }
             }
             let benchmark = benchmark_report::BenchmarkReport::from_environment();
             let root_effort = initial_effort_name.as_deref().unwrap_or("default");
@@ -1980,6 +3201,93 @@ async fn main() -> ExitCode {
                     &cwd,
                 )),
             ));
+            // Driving an application, where the machine allows it. Absent
+            // without the accessibility permission, and the `computer`
+            // tool is absent with it rather than advertised and refused.
+            session.computer =
+                polaris_core::computer::ComputerTool::available().map(std::sync::Arc::new);
+
+            // The root owns every child coordinate and capability snapshot.
+            // None of these values come from `spawn` text.  The CLI has no
+            // durable Desktop projection hook, so this owner is intentionally
+            // in-memory for this root run while still routing every spawn
+            // through the controlled path.
+            let durable_session_id = session
+                .persistence
+                .as_ref()
+                .and_then(|store| store.snapshot().ok())
+                .map(|snapshot| snapshot.state.session_id)
+                .unwrap_or_else(|| session_id.clone());
+            let active_task = session
+                .workflow
+                .as_ref()
+                .and_then(|workflow| workflow.state().active_task.map(|task| task.task_id))
+                .unwrap_or_else(|| format!("run-task-{session_id}"));
+            let sandbox_capability = match sandbox.mode() {
+                SandboxMode::ReadOnly => {
+                    polaris_core::subagent_control::SandboxCapabilityV1::ReadOnly
+                }
+                SandboxMode::WorkspaceWrite => {
+                    polaris_core::subagent_control::SandboxCapabilityV1::WorkspaceWrite
+                }
+                SandboxMode::FullAccess => {
+                    polaris_core::subagent_control::SandboxCapabilityV1::FullAccess
+                }
+            };
+            let approval_capability = match approval_policy {
+                ApprovalPolicy::Never => {
+                    polaris_core::subagent_control::ApprovalCapabilityV1::Never
+                }
+                ApprovalPolicy::OnRequest => {
+                    polaris_core::subagent_control::ApprovalCapabilityV1::OnRequest
+                }
+                ApprovalPolicy::Always => {
+                    polaris_core::subagent_control::ApprovalCapabilityV1::TrustedOwnerOnly
+                }
+            };
+            let parent_capabilities = polaris_core::subagent_control::CapabilitySnapshotV1 {
+                sandbox: sandbox_capability,
+                write_roots: sandbox
+                    .writable_roots()
+                    .iter()
+                    .filter_map(|path| path.to_str().map(str::to_owned))
+                    .collect(),
+                tool_names: polaris_tools::all_specs()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect(),
+                approval: approval_capability,
+                mcp: if mcp_runtime.is_some() {
+                    polaris_core::subagent_control::McpCapabilityV1::ReadSnapshotsOnly
+                } else {
+                    polaris_core::subagent_control::McpCapabilityV1::None
+                },
+            };
+            let control = polaris_core::session::RootDelegationControlV1::new(
+                polaris_core::session::RootDelegationConfigV1 {
+                    session_id: durable_session_id,
+                    root_run_id: polaris_core::subagent_control::RootRunId::new(format!(
+                        "root-run-{session_id}"
+                    ))
+                    .expect("host root run id"),
+                    root_attempt_id: polaris_core::subagent_control::RootAttemptId::new(format!(
+                        "root-attempt-{session_id}"
+                    ))
+                    .expect("host root attempt id"),
+                    active_task_id: polaris_core::subagent_control::TaskId::new(active_task)
+                        .expect("host task id"),
+                    parent_capabilities,
+                    model: model_name.clone(),
+                    effort: root_effort.to_owned(),
+                },
+            );
+            match control.and_then(|control| session.install_root_delegation_control(control)) {
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!("subagent controlを準備できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
 
             // Exactly one handle, shared with whatever subagents `spawn`
             // starts — see `agent::run`'s docs. The root never holds the
@@ -2017,6 +3325,10 @@ async fn main() -> ExitCode {
                 mcp_runtime.as_mut(),
             )
             .await;
+            // Child MCP read snapshots are in-memory, root-bound evidence.
+            // Do not let a one-shot CLI root retain them while shutdown,
+            // output formatting, or later process reuse runs.
+            let _ = session.revoke_root_mcp_leases().await;
             if let Some(runtime) = mcp_runtime.as_mut()
                 && runtime.shutdown().await.is_err()
             {
@@ -2144,6 +3456,15 @@ async fn main() -> ExitCode {
             polaris_tui::run(polaris_tui::RunArgs {
                 provider: provider.clone(),
                 mcp_selection_provider,
+                decider: decider.clone(),
+                tier_decider: tier_decider.clone(),
+                answer_finalizer,
+                sidechat_auto: config.sidechat_auto,
+                tool_names: polaris_tools::all_specs()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect(),
+                turn_authority: tui_turn_authority,
                 provider_name: provider_name.clone(),
                 model_name: model_name.clone(),
                 initial_effort_name: initial_effort_name.clone(),
@@ -2297,32 +3618,16 @@ fn build_sandbox_policy(
     SandboxPolicy::new(sandbox_mode, &writable_roots)
 }
 
-/// `polaris common-tests`. Reads a plan and says whether it is one the
-/// shared runner would accept, and which cases it names.
-///
-/// **It checks; it does not run.** The execution engine is not built yet,
-/// and a subcommand that printed a verdict without executing anything
-/// would be read as one that had. What it does do is the half that has to
-/// happen first anyway: the shapes `Plan::check` refuses — an empty argv,
-/// a shell string where an argument vector belongs, no cases at all, a
-/// created path that leaves the write root — are exactly the ones that
-/// would widen a boundary or prove nothing, and finding them costs no
-/// process.
-fn run_common_tests(plan: &str) -> ExitCode {
-    let body = if plan == "-" {
-        let mut held = String::new();
-        if let Err(error) = std::io::Read::read_to_string(&mut io::stdin(), &mut held) {
+/// `polaris common-tests`. The host fixes the project root, sandbox and
+/// timeout; the plan supplies only one executable invocation and bounded
+/// black-box assertions. Failed confinement is reported as unavailable and
+/// never retried outside the sandbox.
+fn run_common_tests(plan: &str, sandbox_mode: SandboxMode) -> ExitCode {
+    let body = match read_common_test_plan(plan) {
+        Ok(body) => body,
+        Err(error) => {
             eprintln!("計画を読めません: {error}");
             return ExitCode::FAILURE;
-        }
-        held
-    } else {
-        match std::fs::read_to_string(plan) {
-            Ok(body) => body,
-            Err(error) => {
-                eprintln!("{plan} を読めません: {error}");
-                return ExitCode::FAILURE;
-            }
         }
     };
     let plan: polaris_core::common_tests::Plan = match serde_json::from_str(&body) {
@@ -2336,14 +3641,169 @@ fn run_common_tests(plan: &str) -> ExitCode {
         eprintln!("この計画は受理できません: {refused:?}");
         return ExitCode::FAILURE;
     }
-    println!(
-        "受理: {} 件のcase（{}）",
-        plan.cases.len(),
-        plan.case_names().join(", ")
+    let cwd = match std::env::current_dir().and_then(std::fs::canonicalize) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            eprintln!("実行directoryを確定できません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let write_root = polaris_core::project::resolve_root(&cwd);
+    let policy = match build_sandbox_policy(&cwd, sandbox_mode) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("sandboxを準備できません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut outcome = polaris_core::common_tests::run(
+        &plan,
+        polaris_core::common_tests::RunConfig {
+            policy: &policy,
+            cwd: &cwd,
+            write_root: &write_root,
+            timeout: std::time::Duration::from_secs(120),
+        },
     );
-    println!("対象: {:?}", plan.argv);
-    println!("実行器は未実装のため、ここでは実行していない。");
-    ExitCode::SUCCESS
+    recover_common_test_cleanup(&mut outcome);
+    match serde_json::to_string_pretty(&outcome.report) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("共通case結果を表せません: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if matches!(
+        &outcome.report,
+        polaris_core::common_tests::RunReport::Passed { .. }
+    ) && !outcome.has_pending_cleanup()
+    {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+const STATIC_COMPONENT_MANIFEST_DESCRIPTION: &str =
+    "The component Cargo manifest is readable and declares one package.";
+const STATIC_COMPONENT_MANIFEST_FAILURE: &str =
+    "The component Cargo manifest is missing, unreadable, aliased, or lacks a package name.";
+const STATIC_COMPONENT_MANIFEST_RULE: &str = "component-cargo-manifest-v1";
+
+fn run_static_component_manifest() -> ExitCode {
+    let manifest = Path::new("Cargo.toml");
+    let satisfied = std::fs::symlink_metadata(manifest)
+        .ok()
+        .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .and_then(|_| std::fs::read_to_string(manifest).ok())
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
+        .is_some();
+    let finding = serde_json::json!({
+        "rule_id": STATIC_COMPONENT_MANIFEST_RULE,
+        "path": "Cargo.toml",
+        "line": null,
+        "symbol": null,
+        "introduced_by_current_diff": true,
+        "baseline": false
+    });
+    let response = serde_json::json!({
+        "schema_version": 1,
+        "state": if satisfied { "satisfied" } else { "violated" },
+        "findings": if satisfied { Vec::<serde_json::Value>::new() } else { vec![finding] },
+        "error_kind": null
+    });
+    println!("{response}");
+    if satisfied {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// A standalone CLI invocation has no durable process owner after it returns
+/// to the shell. Recover only the exact child reported by this run before
+/// returning; it never transfers ownership to the in-process fallback registry
+/// (which vanishes with this CLI process), drains another session's registry,
+/// or starts another case.
+fn recover_common_test_cleanup(outcome: &mut polaris_core::common_tests::RunOutcome) {
+    if !outcome.has_pending_cleanup() {
+        return;
+    }
+    // Every owner tick is nonblocking. There is deliberately no terminal
+    // deadline: after one, `park_cleanup()` would only retain the compound
+    // owner in this short-lived process, leaving its child and scratch
+    // unreachable once the CLI exits. The periodic notice makes a delayed
+    // group reap visible without claiming it has completed.
+    let started = std::time::Instant::now();
+    let mut last_notice = started;
+    let child_id = outcome.cleanup_mut().and_then(|cleanup| cleanup.child_id());
+    eprintln!(
+        "共通caseの子プロセスを回収しています{}。完了するまで終了しません。",
+        child_id
+            .map(|id| format!(" (pid {id})"))
+            .unwrap_or_default()
+    );
+    loop {
+        match outcome
+            .cleanup_mut()
+            .expect("pending cleanup remains owned")
+            .try_stop_reap_and_cleanup()
+        {
+            Ok(true) => {
+                drop(outcome.take_cleanup());
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // A signal or filesystem error is not evidence that the
+                // process group disappeared. Retain the owner and retry.
+                if last_notice.elapsed() >= std::time::Duration::from_secs(5) {
+                    eprintln!(
+                        "共通caseの回収を再試行しています ({}秒経過): {error}",
+                        started.elapsed().as_secs()
+                    );
+                    last_notice = std::time::Instant::now();
+                }
+            }
+        }
+        if last_notice.elapsed() >= std::time::Duration::from_secs(5) {
+            eprintln!(
+                "共通caseの回収を待機しています ({}秒経過)。子プロセスと作業領域は保持中です。",
+                started.elapsed().as_secs()
+            );
+            last_notice = std::time::Instant::now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn read_common_test_plan(plan: &str) -> Result<String, String> {
+    let mut bytes = Vec::with_capacity(polaris_core::common_tests::MAX_PLAN_BYTES + 1);
+    let mut input: Box<dyn Read> = if plan == "-" {
+        Box::new(io::stdin())
+    } else {
+        Box::new(std::fs::File::open(plan).map_err(|error| format!("{plan}: {error}"))?)
+    };
+    input
+        .by_ref()
+        .take((polaris_core::common_tests::MAX_PLAN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > polaris_core::common_tests::MAX_PLAN_BYTES {
+        return Err(format!(
+            "計画は {} bytes を超えられません",
+            polaris_core::common_tests::MAX_PLAN_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("UTF-8ではありません: {error}"))
 }
 
 /// `polaris doctor`. Diagnoses the local installation: read-only checks
@@ -3124,6 +4584,618 @@ mod tests {
 
     use super::*;
 
+    fn routine_project() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("crate-a/src")).unwrap();
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crate-a\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("crate-a/Cargo.toml"),
+            "[package]\nname = \"crate-a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("crate-a/src/lib.rs"),
+            "pub fn value() {}\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new(resolve_cargo_program().unwrap())
+            .current_dir(directory.path())
+            .args(["generate-lockfile", "--offline"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        directory
+    }
+
+    fn routine_path_dependency_project() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("crate-a/src")).unwrap();
+        std::fs::create_dir_all(directory.path().join("crate-b/src")).unwrap();
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\nmembers = [\"crate-a\", \"crate-b\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("crate-a/Cargo.toml"),
+            "[package]\nname = \"crate-a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ncrate-b = { path = \"../crate-b\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("crate-a/src/lib.rs"),
+            "pub fn value() -> usize { crate_b::value() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("crate-b/Cargo.toml"),
+            "[package]\nname = \"crate-b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("crate-b/src/lib.rs"),
+            "pub fn value() -> usize { 1 }\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new(resolve_cargo_program().unwrap())
+            .current_dir(directory.path())
+            .args(["generate-lockfile", "--offline"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        directory
+    }
+
+    fn static_owner_for_path_dependency_project(
+        project: &Path,
+        session_id: &str,
+    ) -> (
+        polaris_core::session_store::PersistedSession,
+        polaris_core::verification::SessionVerificationToolOwnerV1,
+    ) {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            session_store::PersistedSession,
+            workflow::{ChangeContractV1, Phase, SessionWorkflow, WorkflowConfig},
+        };
+
+        let sandbox = build_sandbox_policy(project, SandboxMode::WorkspaceWrite).unwrap();
+        let prompt = "Validate the component manifest.";
+        let prepared =
+            prepare_routine_authority(&static_authority_json(), prompt, project, &sandbox, project)
+                .unwrap();
+        let workflow = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            initial_phase: Phase::Specify,
+            ..WorkflowConfig::default()
+        });
+        let saved = PersistedSession::create(
+            project,
+            &project.join(format!("{session_id}.sqlite3")),
+            session_id,
+            HistoryMode::Legacy,
+            Some(&workflow),
+        )
+        .unwrap();
+        let contract = ChangeContractV1::draft_typed(
+            format!("change-{session_id}"),
+            prepared.eligibility.clone(),
+            prompt,
+            "The component manifest may be invalid.",
+            "The component manifest is valid.",
+            prepared.verification.clone(),
+        )
+        .unwrap();
+        saved
+            .publish_and_approve_routine_contract(workflow.state().revision, contract)
+            .unwrap();
+        let observer = Arc::new(CliVerificationObserverV1 {
+            project_root: project.canonicalize().unwrap(),
+            component_root: prepared.component_root.clone(),
+            subject_hash: prepared.subject_hash.clone(),
+            cargo_program: resolve_cargo_program().unwrap(),
+        });
+        let owner = polaris_core::verification::SessionVerificationToolOwnerV1::new(
+            saved.clone(),
+            observer,
+            prepared.runners,
+        )
+        .unwrap()
+        .with_preparation(prepared.verification_preparation)
+        .unwrap()
+        .with_static_adapters(prepared.static_adapters)
+        .unwrap();
+        (saved, owner)
+    }
+
+    fn routine_authority_json(program: &str) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "component_root": "crate-a",
+            "security": false,
+            "migration": false,
+            "public_api": false,
+            "dependency": false,
+            "distribution": false,
+            "major_user_contract": false,
+            "unknown_impact": false,
+            "criteria": [{
+                "description": "The focused case passes.",
+                "observable_failure": "The focused case fails.",
+                "evidence_kind": "common_case",
+                "common_runner_plan": {
+                    "version": 1,
+                    "argv": [program],
+                    "stdin": null,
+                    "cases": [{"case":"exits_with","status":0}]
+                },
+                "timeout_secs": 5
+            }]
+        })
+        .to_string()
+    }
+
+    fn existing_test_authority_json(program: Option<&str>) -> String {
+        use polaris_core::verification::{TestCostClassV1, TestEntryV1, TestInventoryV1};
+        let inventory = TestInventoryV1::complete_rust(vec![TestEntryV1 {
+            id: "rust-crate-a-lib-focused".into(),
+            framework: "rust".into(),
+            package: "crate-a".into(),
+            target: "lib".into(),
+            exact_name: "tests::focused".into(),
+            source_location: None,
+            dynamic_or_unknown: false,
+            cost: TestCostClassV1::Fast,
+            symbols: Default::default(),
+            common_case_ids: Default::default(),
+        }])
+        .unwrap();
+        let mut value = serde_json::json!({
+            "schema_version": 1,
+            "component_root": "crate-a",
+            "security": false,
+            "migration": false,
+            "public_api": false,
+            "dependency": false,
+            "distribution": false,
+            "major_user_contract": false,
+            "unknown_impact": false,
+            "criteria": [{
+                "description": "The registered Rust test passes.",
+                "observable_failure": "The registered Rust test fails.",
+                "evidence_kind": "existing_test"
+            }]
+        });
+        if let Some(program) = program {
+            value["existing_test"] = serde_json::json!({
+                "cargo_program": program,
+                "timeout_secs": 30,
+                "inventory": inventory
+            });
+        }
+        value.to_string()
+    }
+
+    fn static_authority_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "component_root": "crate-a",
+            "security": false,
+            "migration": false,
+            "public_api": false,
+            "dependency": false,
+            "distribution": false,
+            "major_user_contract": false,
+            "unknown_impact": false,
+            "criteria": [{
+                "description": STATIC_COMPONENT_MANIFEST_DESCRIPTION,
+                "observable_failure": STATIC_COMPONENT_MANIFEST_FAILURE,
+                "evidence_kind": "static"
+            }]
+        })
+        .to_string()
+    }
+
+    fn review_authority_json(revision: u64, checkpoint_id: &str) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "expected_workflow_revision": revision,
+            "checkpoint_id": checkpoint_id,
+            "reviewer_id": "cli-review-owner",
+            "findings": [{
+                "finding_id": "finding-1",
+                "disposition": "resolved",
+                "resolution_ref": "change:focused-fix"
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn m27_review_authority_is_strict_and_requires_closed_dispositions() {
+        let valid = review_authority_json(7, "checkpoint-1");
+        assert!(prepare_review_authority(&valid).is_ok());
+
+        let mut unknown: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        unknown["binding"] = serde_json::json!({"source_hash":"untrusted"});
+        assert!(prepare_review_authority(&unknown.to_string()).is_err());
+
+        let mut open: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        open["findings"][0]["disposition"] = serde_json::json!("open");
+        open["findings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("resolution_ref");
+        assert!(prepare_review_authority(&open.to_string()).is_err());
+
+        let mut missing_ref: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        missing_ref["findings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("resolution_ref");
+        assert!(prepare_review_authority(&missing_ref.to_string()).is_err());
+    }
+
+    #[test]
+    fn m27_routine_authority_is_strict_and_builds_one_host_fixed_component() {
+        let project = routine_project();
+        let sandbox = build_sandbox_policy(project.path(), SandboxMode::WorkspaceWrite).unwrap();
+        let prepared = prepare_routine_authority(
+            &routine_authority_json("/usr/bin/true"),
+            "Fix the focused case.",
+            project.path(),
+            &sandbox,
+            project.path(),
+        )
+        .unwrap();
+        assert_eq!(prepared.eligibility.affected_components, ["crate-a"]);
+        assert_eq!(prepared.verification.len(), 1);
+        assert_eq!(prepared.runners.len(), 1);
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&routine_authority_json("/usr/bin/true")).unwrap();
+        value["unexpected"] = serde_json::json!(true);
+        assert!(
+            prepare_routine_authority(
+                &value.to_string(),
+                "Fix the focused case.",
+                project.path(),
+                &sandbox,
+                project.path(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn m27_routine_authority_refuses_cross_component_or_non_routine_scope() {
+        let project = routine_project();
+        let sandbox = build_sandbox_policy(project.path(), SandboxMode::WorkspaceWrite).unwrap();
+        for (field, value) in [
+            ("component_root", serde_json::json!(".")),
+            ("public_api", serde_json::json!(true)),
+        ] {
+            let mut authority: serde_json::Value =
+                serde_json::from_str(&routine_authority_json("/usr/bin/true")).unwrap();
+            authority[field] = value;
+            assert!(
+                prepare_routine_authority(
+                    &authority.to_string(),
+                    "Fix the focused case.",
+                    project.path(),
+                    &sandbox,
+                    project.path(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn m27_routine_authority_fails_closed_when_fixed_runner_is_absent() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            session_store::PersistedSession,
+            workflow::{Phase, SessionWorkflow, WorkflowConfig},
+        };
+        let project = routine_project();
+        let sandbox = build_sandbox_policy(project.path(), SandboxMode::WorkspaceWrite).unwrap();
+        let prompt = "Fix the focused case.";
+        let prepared = prepare_routine_authority(
+            &routine_authority_json("/path/that/does/not/exist"),
+            prompt,
+            project.path(),
+            &sandbox,
+            project.path(),
+        )
+        .unwrap();
+        let workflow = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            initial_phase: Phase::Specify,
+            ..WorkflowConfig::default()
+        });
+        let persistence = PersistedSession::create(
+            project.path(),
+            &project.path().join("memory.sqlite3"),
+            "routine-test",
+            HistoryMode::Legacy,
+            Some(&workflow),
+        )
+        .unwrap();
+        let mut session = Session {
+            workflow: Some(workflow),
+            ..Session::default()
+        };
+        session.attach(persistence).unwrap();
+        assert!(install_routine_authority(&mut session, prompt, prepared, project.path()).is_err());
+        assert!(session.verification_owner.is_none());
+    }
+
+    #[test]
+    fn m27_routine_authority_resume_reuses_matching_durable_contract_and_owner() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            session_store::PersistedSession,
+            workflow::{ChangeContractV1, Phase, SessionWorkflow, WorkflowConfig},
+        };
+        let project = routine_project();
+        let sandbox = build_sandbox_policy(project.path(), SandboxMode::WorkspaceWrite).unwrap();
+        let prompt = "Fix the focused case.";
+        let prepared = prepare_routine_authority(
+            &routine_authority_json("/usr/bin/true"),
+            prompt,
+            project.path(),
+            &sandbox,
+            project.path(),
+        )
+        .unwrap();
+        let workflow = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            initial_phase: Phase::Specify,
+            ..WorkflowConfig::default()
+        });
+        let persistence = PersistedSession::create(
+            project.path(),
+            &project.path().join("memory.sqlite3"),
+            "routine-resume-test",
+            HistoryMode::Legacy,
+            Some(&workflow),
+        )
+        .unwrap();
+        let contract = ChangeContractV1::draft_typed(
+            "change-routine-resume",
+            prepared.eligibility.clone(),
+            prompt,
+            "A bounded defect remains.",
+            "The bounded defect is fixed.",
+            prepared.verification.clone(),
+        )
+        .unwrap();
+        let restored = persistence
+            .publish_and_approve_routine_contract(workflow.state().revision, contract)
+            .unwrap();
+        let mut session = Session {
+            workflow: Some(restored),
+            ..Session::default()
+        };
+        session.attach(persistence).unwrap();
+        install_routine_authority(&mut session, prompt, prepared, project.path()).unwrap();
+        assert!(session.routine_change_authorization.is_none());
+        assert!(session.verification_owner.is_some());
+    }
+
+    #[test]
+    fn m27_existing_test_requires_and_installs_one_host_executor() {
+        let project = routine_project();
+        let sandbox = build_sandbox_policy(project.path(), SandboxMode::WorkspaceWrite).unwrap();
+        let prompt = "Fix the registered Rust behavior.";
+        assert!(
+            prepare_routine_authority(
+                &existing_test_authority_json(None),
+                prompt,
+                project.path(),
+                &sandbox,
+                project.path(),
+            )
+            .is_err()
+        );
+        let prepared = prepare_routine_authority(
+            &existing_test_authority_json(Some("/usr/bin/true")),
+            prompt,
+            project.path(),
+            &sandbox,
+            project.path(),
+        )
+        .unwrap();
+        assert!(prepared.runners.is_empty());
+        assert!(prepared.existing_test_executor.is_some());
+        assert!(prepared.verification_preparation.inventory.is_some());
+        assert_eq!(
+            prepared.verification[0].evidence_kinds,
+            [polaris_core::workflow::CriterionEvidenceKindV1::ExistingTest]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn m26_static_authority_registers_only_the_fixed_component_manifest_adapter() {
+        let project = routine_project();
+        let sandbox = build_sandbox_policy(project.path(), SandboxMode::WorkspaceWrite).unwrap();
+        let prepared = prepare_routine_authority(
+            &static_authority_json(),
+            "Validate the component manifest.",
+            project.path(),
+            &sandbox,
+            project.path(),
+        )
+        .unwrap();
+        assert!(prepared.runners.is_empty());
+        assert!(prepared.existing_test_executor.is_none());
+        assert_eq!(prepared.static_adapters.len(), 1);
+        assert_eq!(
+            prepared.verification[0].evidence_kinds,
+            [polaris_core::workflow::CriterionEvidenceKindV1::Static]
+                .into_iter()
+                .collect()
+        );
+
+        let mut arbitrary: serde_json::Value =
+            serde_json::from_str(&static_authority_json()).unwrap();
+        arbitrary["criteria"][0]["description"] = serde_json::json!("Any arbitrary claim.");
+        assert!(
+            prepare_routine_authority(
+                &arbitrary.to_string(),
+                "Validate anything.",
+                project.path(),
+                &sandbox,
+                project.path(),
+            )
+            .is_err()
+        );
+        let mut partial: serde_json::Value =
+            serde_json::from_str(&static_authority_json()).unwrap();
+        partial["criteria"][0]["timeout_secs"] = serde_json::json!(5);
+        assert!(
+            prepare_routine_authority(
+                &partial.to_string(),
+                "Validate the manifest.",
+                project.path(),
+                &sandbox,
+                project.path(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cargo_lock_change_after_prepare_rejects_the_static_run() {
+        use polaris_core::verification::VerificationToolOwnerV1;
+
+        let project = routine_path_dependency_project();
+        let (saved, owner) =
+            static_owner_for_path_dependency_project(project.path(), "static-lock-binding");
+        let prepared = owner.prepare().unwrap();
+        let generation = saved.snapshot().unwrap().state.generation;
+        saved
+            .publish_verification_checkpoint(generation, prepared.clone())
+            .unwrap();
+        let lock = project.path().join("Cargo.lock");
+        let mut contents = std::fs::read_to_string(&lock).unwrap();
+        contents.push_str("\n# binding changed\n");
+        std::fs::write(lock, contents).unwrap();
+        assert!(owner.begin_run(&prepared.checkpoint_id).is_err());
+    }
+
+    #[test]
+    fn sibling_path_dependency_change_after_run_is_unknown_and_cannot_publish() {
+        use polaris_core::verification::{VerificationCheckpointStageV1, VerificationToolOwnerV1};
+
+        let project = routine_path_dependency_project();
+        let (saved, owner) =
+            static_owner_for_path_dependency_project(project.path(), "static-path-binding");
+        let prepared = owner.prepare().unwrap();
+        let generation = saved.snapshot().unwrap().state.generation;
+        saved
+            .publish_verification_checkpoint(generation, prepared.clone())
+            .unwrap();
+        owner.begin_run(&prepared.checkpoint_id).unwrap();
+        std::fs::write(
+            project.path().join("crate-b/src/lib.rs"),
+            "pub fn value() -> usize { 2 }\n",
+        )
+        .unwrap();
+        let observed = owner.poll_run(&prepared.checkpoint_id).unwrap();
+        assert_eq!(
+            observed.stage,
+            VerificationCheckpointStageV1::OutcomeUnknown
+        );
+        assert!(owner.publish(&prepared.checkpoint_id).is_err());
+    }
+
+    #[test]
+    fn m27_existing_test_executor_identity_change_is_rejected_after_prepare() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            session_store::PersistedSession,
+            workflow::{ChangeContractV1, Phase, SessionWorkflow, WorkflowConfig},
+        };
+        let project = routine_project();
+        let sandbox = build_sandbox_policy(project.path(), SandboxMode::WorkspaceWrite).unwrap();
+        let prompt = "Fix the registered Rust behavior.";
+        let first = prepare_routine_authority(
+            &existing_test_authority_json(Some("/usr/bin/true")),
+            prompt,
+            project.path(),
+            &sandbox,
+            project.path(),
+        )
+        .unwrap();
+        let workflow = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            initial_phase: Phase::Specify,
+            ..WorkflowConfig::default()
+        });
+        let persistence = PersistedSession::create(
+            project.path(),
+            &project.path().join("memory.sqlite3"),
+            "existing-test-identity",
+            HistoryMode::Legacy,
+            Some(&workflow),
+        )
+        .unwrap();
+        let contract = ChangeContractV1::draft_typed(
+            "change-existing-test-identity",
+            first.eligibility.clone(),
+            prompt,
+            "A registered behavior regressed.",
+            "The registered behavior is restored.",
+            first.verification.clone(),
+        )
+        .unwrap();
+        let restored = persistence
+            .publish_and_approve_routine_contract(workflow.state().revision, contract)
+            .unwrap();
+        let mut first_session = Session {
+            workflow: Some(restored.clone()),
+            ..Session::default()
+        };
+        first_session.attach(persistence.clone()).unwrap();
+        install_routine_authority(&mut first_session, prompt, first, project.path()).unwrap();
+        let checkpoint = first_session
+            .verification_owner
+            .as_ref()
+            .unwrap()
+            .prepare()
+            .unwrap();
+
+        let second = prepare_routine_authority(
+            &existing_test_authority_json(Some("/bin/echo")),
+            prompt,
+            project.path(),
+            &sandbox,
+            project.path(),
+        )
+        .unwrap();
+        let mut resumed = Session {
+            workflow: Some(restored),
+            ..Session::default()
+        };
+        resumed.attach(persistence).unwrap();
+        install_routine_authority(&mut resumed, prompt, second, project.path()).unwrap();
+        assert!(
+            resumed
+                .verification_owner
+                .as_ref()
+                .unwrap()
+                .begin_run(&checkpoint.checkpoint_id)
+                .is_err()
+        );
+    }
+
     #[test]
     fn default_provider_prefers_openai_when_its_key_is_available() {
         assert_eq!(default_provider_name(true, true), "openai");
@@ -3148,7 +5220,9 @@ mod tests {
         // Delegations are priced by `[tier.*]`, which is where the cheaper
         // models live; the root run is the one party whose own reasoning
         // nothing downstream can make up for.
-        assert_eq!(args.effort.as_deref(), Some("xhigh"));
+        assert_eq!(args.effort, None);
+        assert_eq!(selected_effort(None, true), Some("xhigh"));
+        assert_eq!(selected_effort(None, false), None);
         // The TUI marks a row "(default)" by display name, so the row it
         // marks has to be the one this default actually selects.
         assert_eq!(
@@ -3259,6 +5333,25 @@ mod tests {
     }
 
     #[test]
+    fn tui_can_defer_routine_and_review_authority_until_its_first_input() {
+        let args = Args::try_parse_from([
+            "polaris",
+            "--routine-authority",
+            "{}",
+            "--review-authority",
+            "{}",
+        ])
+        .expect("interactive authority must not require --prompt");
+        assert!(args.prompt.is_none());
+        assert_eq!(args.routine_authority.as_deref(), Some("{}"));
+        assert_eq!(args.review_authority.as_deref(), Some("{}"));
+        assert!(
+            Args::try_parse_from(["polaris", "--review-authority", "{}"]).is_err(),
+            "review authority still requires routine authority"
+        );
+    }
+
+    #[test]
     fn skipped_skills_are_reported_one_line_each_naming_directory_and_cause() {
         // Directly verifies the formatting logic that hands the skipped
         // entries discover collected to stderr one line each, without
@@ -3356,6 +5449,30 @@ mod tests {
             None => unsafe { std::env::remove_var("HOME") },
         }
         out
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_runtime_home_is_independent_from_custom_data_dir() {
+        let state = tempfile::tempdir().expect("state");
+        let fake_home = tempfile::tempdir().expect("fake home");
+        with_home(fake_home.path(), || {
+            let previous = std::env::var_os("POLARIS_DATA_DIR");
+            unsafe { std::env::set_var("POLARIS_DATA_DIR", state.path()) };
+            let resolved = managed_runtime_home().expect("runtime home");
+            match previous {
+                Some(value) => unsafe { std::env::set_var("POLARIS_DATA_DIR", value) },
+                None => unsafe { std::env::remove_var("POLARIS_DATA_DIR") },
+            }
+            let actual = polaris_core::os_home::trusted_user_home().expect("actual OS home");
+            assert_eq!(resolved, actual);
+            assert_eq!(
+                resolved.join(".polaris/runtime-images/python-e5-cat"),
+                actual.join(".polaris/runtime-images/python-e5-cat")
+            );
+            assert!(!resolved.starts_with(state.path()));
+            assert!(!resolved.starts_with(fake_home.path()));
+        });
     }
 
     #[test]
@@ -3587,5 +5704,49 @@ mod tool_memory_settings_tests {
             assert!(help.contains(flag));
         }
         assert!(help.contains("off, history, retrieval"));
+    }
+
+    #[tokio::test]
+    async fn tui_answer_finalizer_obeys_off_shadow_and_enforce_modes() {
+        use polaris_core::config::{
+            AnswerFinalizerMode, JudgeProfile, PresentationLanguage, TranslationActivation,
+            TranslationProfile,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let mut config = polaris_core::config::Config::default();
+        assert!(
+            build_tui_answer_finalizer(&config, root.path(), Some(root.path()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        config.presentation.language = PresentationLanguage::Ja;
+        config.answer_finalizer.mode = AnswerFinalizerMode::Shadow;
+        config.answer_finalizer.judge_profile = Some(JudgeProfile::FulfillmentV1);
+        assert!(
+            build_tui_answer_finalizer(&config, root.path(), Some(root.path()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        config.answer_finalizer.translation.activation = TranslationActivation::Requested;
+        config.answer_finalizer.translation.profile = Some(TranslationProfile::CatTranslate3_3b);
+        assert!(
+            build_tui_answer_finalizer(&config, root.path(), Some(root.path()))
+                .await
+                .unwrap()
+                .is_some(),
+            "a missing managed model remains an observational shadow failure"
+        );
+
+        config.answer_finalizer.mode = AnswerFinalizerMode::Enforce;
+        assert!(
+            build_tui_answer_finalizer(&config, root.path(), Some(root.path()))
+                .await
+                .is_err()
+        );
     }
 }

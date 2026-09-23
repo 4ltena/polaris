@@ -3,9 +3,18 @@
 use crate::{
     conversation_memory::published_view,
     conversation_state::{
-        ConversationSnapshot, ConversationStateV2, ConversationStore, HistoryMode,
+        AdmissionReceiptV1, ConversationSnapshot, ConversationStateV2, ConversationStore,
+        HistoryMode,
     },
-    workflow::{SessionWorkflow, WorkflowConfig, WorkflowMode},
+    workflow::{
+        ActiveEvidenceArtifactsV1, ConvergenceInputV1, ObservedEvidenceSubjectV1,
+        build_owner_convergence, validate_owner_convergence,
+    },
+    workflow::{
+        ArtifactRefV1, ArtifactStatusV1, ChangeContractV1, Phase, SessionWorkflow, WorkflowConfig,
+        WorkflowMode,
+    },
+    workflow_artifact_store::WorkflowArtifactStore,
 };
 use polaris_memory::MemoryStore;
 use polaris_provider::{Message, Role};
@@ -42,6 +51,11 @@ pub fn new_session_id() -> io::Result<String> {
 }
 
 impl PersistedSession {
+    /// Private host roots for adjacent owner stores. Conversational tools
+    /// never receive these paths; they are only passed into typed owners.
+    pub fn verification_store_root(&self) -> PathBuf {
+        self.data_root.clone()
+    }
     pub fn create(
         data_root: &Path,
         database: &Path,
@@ -49,7 +63,29 @@ impl PersistedSession {
         mode: HistoryMode,
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<Self> {
-        let mut state = ConversationStateV2::new(project_id.into(), new_session_id()?)?;
+        Self::create_with_id(
+            data_root,
+            database,
+            project_id,
+            &new_session_id()?,
+            mode,
+            workflow,
+        )
+    }
+
+    /// Create an empty durable conversation named by a host-owned admission.
+    /// Ordinary callers should use [`Self::create`]; accepting an explicit ID
+    /// lets the session-manager ledger and raw store share one recoverable
+    /// sidechat identity.
+    pub fn create_with_id(
+        data_root: &Path,
+        database: &Path,
+        project_id: &str,
+        session_id: &str,
+        mode: HistoryMode,
+        workflow: Option<&SessionWorkflow>,
+    ) -> io::Result<Self> {
+        let mut state = ConversationStateV2::new(project_id.into(), session_id.into())?;
         state.history_mode = mode;
         if let Some(workflow) = workflow {
             state.workflow_config = Some(
@@ -57,6 +93,7 @@ impl PersistedSession {
             );
             state.workflow = workflow.state();
             state.gates = workflow.gates.clone();
+            state.workflow_artifacts = workflow.artifact_graph().clone();
         }
         let mut memory = MemoryStore::open(database).map_err(io::Error::other)?;
         // A structured session is saved only after its index migration reads back.
@@ -162,7 +199,8 @@ impl PersistedSession {
         starts_turn: bool,
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<()> {
-        self.update(&[(message, starts_turn)], workflow).map(|_| ())
+        self.update(&[(message, starts_turn)], workflow, None)
+            .map(|_| ())
     }
 
     /// Return the identity produced by the same locked append/publication.
@@ -171,7 +209,24 @@ impl PersistedSession {
         message: Message,
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<Option<crate::request_input::SourceBinding>> {
-        self.update(&[(message, true)], workflow)
+        self.update(&[(message, true)], workflow, None)
+    }
+
+    /// Append one accepted user input and publish its admission receipt in
+    /// the same conversation marker generation. Exact retries return the
+    /// original input binding without writing another raw event.
+    pub(crate) fn append_admitted_input(
+        &self,
+        message: Message,
+        workflow: Option<&SessionWorkflow>,
+        admission_id: &crate::session_manager::AdmissionId,
+        payload_hash: &str,
+    ) -> io::Result<Option<crate::request_input::SourceBinding>> {
+        self.update(
+            &[(message, true)],
+            workflow,
+            Some((admission_id.as_str(), payload_hash)),
+        )
     }
 
     /// Publishes a completed assistant/tool suffix and its workflow checkpoint
@@ -187,17 +242,482 @@ impl PersistedSession {
             .cloned()
             .map(|message| (message, false))
             .collect();
-        self.update(&events, workflow).map(|_| ())
+        self.update(&events, workflow, None).map(|_| ())
     }
 
     pub fn checkpoint(&self, workflow: Option<&SessionWorkflow>) -> io::Result<()> {
-        self.update(&[], workflow).map(|_| ())
+        self.update(&[], workflow, None).map(|_| ())
+    }
+
+    /// Persist only validated, reference-only verification checkpoint state.
+    /// Normal persistence preserves `running`; only the restore path changes a
+    /// crashed run to `outcome_unknown`.
+    pub fn publish_verification_checkpoint(
+        &self,
+        expected_generation: u64,
+        checkpoint: crate::verification::checkpoint::SavedVerificationCheckpointV1,
+    ) -> io::Result<()> {
+        checkpoint.validate().map_err(io::Error::other)?;
+        self.update_workflow_artifacts(expected_generation, move |before, _store| {
+            if checkpoint.workflow_revision != before.workflow.revision {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "verification checkpoint workflow revisionが変わりました",
+                ));
+            }
+            if let Some(previous) = &before.verification_checkpoint {
+                if !previous.same_preparation_basis(&checkpoint) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "verification checkpointのCAS basisが変わりました",
+                    ));
+                }
+                if previous.stage != checkpoint.stage
+                    && !previous.stage.can_transition_to(checkpoint.stage)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "verification checkpointのCAS stageが一致しません",
+                    ));
+                }
+            } else if checkpoint.stage
+                != crate::verification::VerificationCheckpointStageV1::Prepared
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "verification checkpointはpreparedから保存します",
+                ));
+            }
+            let mut next = before.clone();
+            next.verification_checkpoint = Some(checkpoint);
+            Ok((next, ()))
+        })
+    }
+
+    /// Stores a draft or ready contract body while holding the session writer
+    /// lock, then advances only the graph marker.  A stale caller leaves at
+    /// most an unreachable immutable body, never a dangling graph reference.
+    pub fn publish_change_contract(
+        &self,
+        expected_generation: u64,
+        contract: ChangeContractV1,
+    ) -> io::Result<ArtifactRefV1> {
+        if !matches!(
+            contract.header.status,
+            ArtifactStatusV1::Draft | ArtifactStatusV1::Ready
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "change contractの承認はtrusted ownerだけが行えます",
+            ));
+        }
+        let reference = contract.reference();
+        self.update_workflow_artifacts(expected_generation, move |before, store| {
+            let mut graph = before.workflow_artifacts.clone();
+            let inserted = graph
+                .insert_change_contract(&contract)
+                .map_err(io::Error::other)?;
+            store.put_change_contract(&contract)?;
+            let mut next = before.clone();
+            if inserted {
+                next.workflow_artifacts = graph;
+            }
+            Ok((next, reference))
+        })
+    }
+
+    /// Trusted approval always creates a new immutable revision.  The approved
+    /// body is durable before its graph entry and active workflow reference are
+    /// committed in the same session marker publication.
+    pub fn approve_change_contract_trusted(
+        &self,
+        expected_generation: u64,
+        reference: ArtifactRefV1,
+    ) -> io::Result<SessionWorkflow> {
+        self.update_workflow_artifacts(expected_generation, move |before, store| {
+            let draft = store.load_change_contract(&before.workflow_artifacts, &reference)?;
+            if !matches!(
+                draft.header.status,
+                ArtifactStatusV1::Draft | ArtifactStatusV1::Ready
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "承認できるchange contract revisionではありません",
+                ));
+            }
+            let approved = draft
+                .revised(ArtifactStatusV1::Approved)
+                .map_err(io::Error::other)?;
+            let approved_reference = approved.reference();
+            let mut graph = before.workflow_artifacts.clone();
+            graph
+                .insert_change_contract(&approved)
+                .map_err(io::Error::other)?;
+            store.put_change_contract(&approved)?;
+
+            let config = before
+                .workflow_config
+                .as_ref()
+                .map(|saved| saved.config.clone())
+                .unwrap_or_else(WorkflowConfig::default);
+            let mut gates = before.gates.clone();
+            gates.phase_gate_schema_version =
+                Some(crate::workflow::WORKFLOW_ARTIFACT_SCHEMA_VERSION);
+            let restored = SessionWorkflow::restore_with_artifacts(
+                config,
+                gates,
+                before.workflow.clone(),
+                graph.clone(),
+            )
+            .map_err(io::Error::other)?;
+            let workflow = restored
+                .with_approved_change_contract(graph.clone(), approved_reference)
+                .map_err(io::Error::other)?;
+            let mut next = before.clone();
+            next.workflow = workflow.state();
+            next.gates = workflow.gates.clone();
+            next.workflow_artifacts = graph;
+            Ok((next, workflow))
+        })
+    }
+
+    /// One host-owned operation for the ordinary agent path. The model may
+    /// propose fields, but only this owner verifies routine eligibility,
+    /// creates the approved immutable revision and advances the active ref.
+    pub fn publish_and_approve_routine_contract(
+        &self,
+        expected_workflow_revision: u64,
+        contract: ChangeContractV1,
+    ) -> io::Result<SessionWorkflow> {
+        if contract.header.status != ArtifactStatusV1::Draft || !contract.eligibility.is_routine() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "routine条件を満たすdraftだけを自動承認できます",
+            ));
+        }
+        let generation = *self.cursor()?;
+        self.update_workflow_artifacts(generation, move |before, store| {
+            if before.workflow.revision != expected_workflow_revision {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "workflow revisionが変わりました",
+                ));
+            }
+            let mut graph = before.workflow_artifacts.clone();
+            graph
+                .insert_change_contract(&contract)
+                .map_err(io::Error::other)?;
+            store.put_change_contract(&contract)?;
+            let approved = contract
+                .revised(ArtifactStatusV1::Approved)
+                .map_err(io::Error::other)?;
+            let approved_reference = approved.reference();
+            graph
+                .insert_change_contract(&approved)
+                .map_err(io::Error::other)?;
+            store.put_change_contract(&approved)?;
+            let config = before
+                .workflow_config
+                .as_ref()
+                .map(|saved| saved.config.clone())
+                .unwrap_or_default();
+            let mut gates = before.gates.clone();
+            gates.phase_gate_schema_version =
+                Some(crate::workflow::WORKFLOW_ARTIFACT_SCHEMA_VERSION);
+            let restored = SessionWorkflow::restore_with_artifacts(
+                config,
+                gates,
+                before.workflow.clone(),
+                graph.clone(),
+            )
+            .map_err(io::Error::other)?;
+            let workflow = restored
+                .with_approved_change_contract(graph.clone(), approved_reference)
+                .map_err(io::Error::other)?;
+            let mut next = before.clone();
+            next.workflow = workflow.state();
+            next.gates = workflow.gates.clone();
+            next.workflow_artifacts = graph;
+            Ok((next, workflow))
+        })
+    }
+
+    /// Returns only an immutable body named by the session's current graph.
+    pub fn load_change_contract(&self, reference: &ArtifactRefV1) -> io::Result<ChangeContractV1> {
+        let snapshot = self.snapshot()?;
+        let store = WorkflowArtifactStore::open(&self.data_root, &snapshot.state.project_id)?;
+        store.load_change_contract(&snapshot.state.workflow_artifacts, reference)
+    }
+
+    pub fn load_project_principles(
+        &self,
+        reference: &ArtifactRefV1,
+    ) -> io::Result<crate::workflow::ProjectPrinciplesV1> {
+        let snapshot = self.snapshot()?;
+        let store = WorkflowArtifactStore::open(&self.data_root, &snapshot.state.project_id)?;
+        store.load_project_principles(&snapshot.state.workflow_artifacts, reference)
+    }
+
+    pub fn load_idea_decision(
+        &self,
+        reference: &ArtifactRefV1,
+    ) -> io::Result<crate::workflow::IdeaDecisionV1> {
+        let snapshot = self.snapshot()?;
+        let store = WorkflowArtifactStore::open(&self.data_root, &snapshot.state.project_id)?;
+        store.load_idea_decision(&snapshot.state.workflow_artifacts, reference)
+    }
+
+    pub fn load_feature_spec(
+        &self,
+        reference: &ArtifactRefV1,
+    ) -> io::Result<crate::workflow::FeatureSpecV1> {
+        let snapshot = self.snapshot()?;
+        let store = WorkflowArtifactStore::open(&self.data_root, &snapshot.state.project_id)?;
+        store.load_feature_spec(&snapshot.state.workflow_artifacts, reference)
+    }
+
+    pub fn load_implementation_plan(
+        &self,
+        reference: &ArtifactRefV1,
+    ) -> io::Result<crate::workflow::ImplementationPlanV1> {
+        let snapshot = self.snapshot()?;
+        let store = WorkflowArtifactStore::open(&self.data_root, &snapshot.state.project_id)?;
+        store.load_implementation_plan(&snapshot.state.workflow_artifacts, reference)
+    }
+
+    pub fn load_task_graph(
+        &self,
+        reference: &ArtifactRefV1,
+    ) -> io::Result<crate::workflow::TaskGraphV1> {
+        let snapshot = self.snapshot()?;
+        let store = WorkflowArtifactStore::open(&self.data_root, &snapshot.state.project_id)?;
+        store.load_task_graph(&snapshot.state.workflow_artifacts, reference)
+    }
+
+    /// Persist convergence only after this session owner has rebuilt its
+    /// binding and required criteria from the exact currently active immutable
+    /// artifacts. Callers provide only a sealed verification-owner bundle;
+    /// they cannot select a gate binding or criterion list.
+    pub fn publish_convergence_trusted(
+        &self,
+        expected_generation: u64,
+        expected_workflow_revision: u64,
+        bundle: crate::verification::owner::VerifiedConvergenceBundleV1,
+    ) -> io::Result<SessionWorkflow> {
+        self.update_workflow_artifacts(expected_generation, move |before, store| {
+            if before.workflow.revision != expected_workflow_revision {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "workflow revisionが変わりました",
+                ));
+            }
+            let convergence = build_owner_convergence_for_state(before, store, &bundle)?;
+            let config = before
+                .workflow_config
+                .as_ref()
+                .map(|saved| saved.config.clone())
+                .unwrap_or_else(WorkflowConfig::default);
+            let restored = SessionWorkflow::restore_with_artifacts(
+                config,
+                before.gates.clone(),
+                before.workflow.clone(),
+                before.workflow_artifacts.clone(),
+            )
+            .map_err(io::Error::other)?;
+            let workflow = restored
+                .with_convergence_trusted(convergence)
+                .map_err(io::Error::other)?;
+            let mut next = before.clone();
+            next.workflow = workflow.state();
+            next.gates = workflow.gates.clone();
+            Ok((next, workflow))
+        })
+    }
+
+    /// Publish a sealed convergence bundle and its terminal verification
+    /// checkpoint through one marker commit.  The exact active artifacts and
+    /// observed binding are rechecked while holding the session writer lock;
+    /// no old-revision checkpoint can be appended afterwards.
+    pub fn publish_verification_convergence(
+        &self,
+        expected_generation: u64,
+        checkpoint: crate::verification::SavedVerificationCheckpointV1,
+        bundle: crate::verification::owner::VerifiedConvergenceBundleV1,
+    ) -> io::Result<(
+        SessionWorkflow,
+        crate::verification::SavedVerificationCheckpointV1,
+    )> {
+        checkpoint.validate().map_err(io::Error::other)?;
+        self.update_workflow_artifacts(expected_generation, move |before, store| {
+            let Some(previous) = &before.verification_checkpoint else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "verification checkpointがありません",
+                ));
+            };
+            if previous != &checkpoint
+                || checkpoint.stage != crate::verification::VerificationCheckpointStageV1::Terminal
+                || checkpoint.workflow_revision != before.workflow.revision
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "verification checkpointのCASが一致しません",
+                ));
+            }
+            let convergence = build_owner_convergence_for_state(before, store, &bundle)?;
+            let config = before
+                .workflow_config
+                .as_ref()
+                .map(|saved| saved.config.clone())
+                .unwrap_or_else(WorkflowConfig::default);
+            let restored = SessionWorkflow::restore_with_artifacts(
+                config,
+                before.gates.clone(),
+                before.workflow.clone(),
+                before.workflow_artifacts.clone(),
+            )
+            .map_err(io::Error::other)?;
+            let workflow = restored
+                .with_convergence_trusted(convergence)
+                .map_err(io::Error::other)?;
+            let mut published = checkpoint.clone();
+            published.workflow_revision = workflow.state().revision;
+            published
+                .transition(crate::verification::VerificationCheckpointStageV1::Published)
+                .map_err(io::Error::other)?;
+            let mut next = before.clone();
+            next.workflow = workflow.state();
+            next.gates = workflow.gates.clone();
+            next.verification_checkpoint = Some(published.clone());
+            Ok((next, (workflow, published)))
+        })
+    }
+
+    /// Add one host-authored review to an already published verification and
+    /// advance the real Review -> Verify gate in the same session marker CAS.
+    /// The caller cannot replace the checkpoint body: this method starts from
+    /// the exact published checkpoint currently held by the durable session.
+    pub fn publish_review_convergence(
+        &self,
+        expected_generation: u64,
+        expected_workflow_revision: u64,
+        checkpoint_id: String,
+        review_ref: crate::verification::store::VerificationRecordRefV1,
+        bundle: crate::verification::owner::VerifiedConvergenceBundleV1,
+    ) -> io::Result<(
+        SessionWorkflow,
+        crate::verification::SavedVerificationCheckpointV1,
+    )> {
+        review_ref.validate()?;
+        self.update_workflow_artifacts(expected_generation, move |before, store| {
+            if before.workflow.revision != expected_workflow_revision {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "review workflow revisionが変わりました",
+                ));
+            }
+            if !matches!(before.workflow.phase, Phase::Implement | Phase::Review) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "review publicationはImplementまたはReview phaseだけで実行できます",
+                ));
+            }
+            let previous = before.verification_checkpoint.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "verification checkpointがありません",
+                )
+            })?;
+            previous.validate().map_err(io::Error::other)?;
+            if previous.checkpoint_id != checkpoint_id
+                || previous.stage != crate::verification::VerificationCheckpointStageV1::Published
+                || !previous.review_refs.is_empty()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "published verification checkpointのCASが一致しません",
+                ));
+            }
+
+            let convergence = build_owner_convergence_for_state(before, store, &bundle)?;
+            let config = before
+                .workflow_config
+                .as_ref()
+                .map(|saved| saved.config.clone())
+                .unwrap_or_else(WorkflowConfig::default);
+            let restored = SessionWorkflow::restore_with_artifacts(
+                config,
+                before.gates.clone(),
+                before.workflow.clone(),
+                before.workflow_artifacts.clone(),
+            )
+            .map_err(io::Error::other)?;
+            let workflow = restored
+                .with_convergence_trusted(convergence)
+                .map_err(io::Error::other)?;
+            if workflow.state().phase == Phase::Implement {
+                workflow
+                    .request_phase(Phase::Review)
+                    .map_err(io::Error::other)?;
+            }
+            workflow
+                .request_phase(Phase::Verify)
+                .map_err(io::Error::other)?;
+
+            let mut published = previous.clone();
+            published.review_refs.push(review_ref);
+            published.workflow_revision = workflow.state().revision;
+            published.validate().map_err(io::Error::other)?;
+            let mut next = before.clone();
+            next.workflow = workflow.state();
+            next.gates = workflow.gates.clone();
+            next.verification_checkpoint = Some(published.clone());
+            Ok((next, (workflow, published)))
+        })
+    }
+
+    fn update_workflow_artifacts<T>(
+        &self,
+        expected_generation: u64,
+        update: impl FnOnce(
+            &ConversationStateV2,
+            &WorkflowArtifactStore,
+        ) -> io::Result<(ConversationStateV2, T)>,
+    ) -> io::Result<T> {
+        let mut cursor = self.cursor()?;
+        let mut lock = self.store.lock()?;
+        let before = lock.snapshot()?;
+        if before.state.generation != *cursor || before.state.generation != expected_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "workflow artifactの保存世代が変わりました。再開し直してください",
+            ));
+        }
+        let store = WorkflowArtifactStore::open(&self.data_root, &before.state.project_id)?;
+        let (next, output) = update(&before.state, &store)?;
+        if next == before.state {
+            return Ok(output);
+        }
+        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        memory
+            .with_conversation_marker(&published_view(&before.state)?, || {
+                lock.publish(&before, next)?;
+                Ok(())
+            })
+            .map_err(io::Error::other)?;
+        *cursor = before
+            .state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
+        Ok(output)
     }
 
     fn update(
         &self,
         events: &[(Message, bool)],
         workflow: Option<&SessionWorkflow>,
+        admission: Option<(&str, &str)>,
     ) -> io::Result<Option<crate::request_input::SourceBinding>> {
         let mut cursor = self.cursor()?;
         let mut lock = self.store.lock()?;
@@ -207,12 +727,90 @@ impl PersistedSession {
                 "保存世代が変わりました。原文を保持して停止しました",
             ));
         }
-        if events.is_empty()
+        if let Some((admission_id, payload_hash)) = admission {
+            crate::session_manager::AdmissionId::new(admission_id.to_owned())
+                .map_err(io::Error::other)?;
+            if payload_hash.len() != 64
+                || !payload_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(io::Error::other("admission payload hashが不正です"));
+            }
+            if events.len() != 1 || !events[0].1 || events[0].0.role != Role::User {
+                return Err(io::Error::other(
+                    "admission inputは単一のuser turnが必要です",
+                ));
+            }
+            if let Some(receipt) = before.state.admission_receipts.get(admission_id) {
+                if receipt.payload_hash != payload_hash {
+                    return Err(io::Error::other(
+                        "admission receiptが既存入力と衝突しました",
+                    ));
+                }
+                let event = before
+                    .events
+                    .iter()
+                    .find(|event| event.sequence == receipt.sequence)
+                    .ok_or_else(|| io::Error::other("admission receiptの原文がありません"))?;
+                return Ok(crate::request_input::SourceBinding::from_event(
+                    &before.state.session_id,
+                    event,
+                ));
+            }
+        }
+        if let Some(candidate) = workflow {
+            if before.state.workflow_artifacts != *candidate.artifact_graph()
+                || before.state.gates.phase_gate_schema_version
+                    != candidate.gates.phase_gate_schema_version
+                || before.state.gates.convergence != candidate.gates.convergence
+                || before.state.workflow.active_change_contract
+                    != candidate.state().active_change_contract
+            {
+                return Err(io::Error::other(
+                    "workflow artifactまたはphase gateを通常checkpointでは変更できません",
+                ));
+            }
+            if before.state.workflow.phase != candidate.state().phase {
+                let artifact_store =
+                    WorkflowArtifactStore::open(&self.data_root, &before.state.project_id)?;
+                if let Some(reference) = &before.state.workflow.active_change_contract {
+                    artifact_store
+                        .load_change_contract(&before.state.workflow_artifacts, reference)?;
+                }
+                if let Some(reference) = &before.state.workflow.active_feature {
+                    artifact_store
+                        .load_feature_spec(&before.state.workflow_artifacts, reference)?;
+                }
+                if let Some(reference) = &before.state.workflow.active_task {
+                    let task_graph = artifact_store
+                        .load_task_graph(&before.state.workflow_artifacts, &reference.task_graph)?;
+                    reference
+                        .validate_against(&task_graph)
+                        .map_err(io::Error::other)?;
+                }
+                if let Some(convergence) = &before.state.gates.convergence {
+                    validate_owner_convergence_for_state(
+                        &before.state,
+                        &artifact_store,
+                        convergence,
+                    )?;
+                }
+                crate::workflow::evaluate_phase_transition(
+                    &before.state.workflow,
+                    candidate.state().phase,
+                    &before.state.gates,
+                    &before.state.workflow_artifacts,
+                )
+                .map_err(io::Error::other)?;
+            }
+        }
+        if admission.is_none()
+            && events.is_empty()
             && before.state.raw_commit_hash == before.raw_hash
             && before.state.raw_commit_offset == before.raw_offset
             && workflow.is_none_or(|workflow| {
                 before.state.workflow == workflow.state()
                     && before.state.gates == workflow.gates
+                    && before.state.workflow_artifacts == *workflow.artifact_graph()
                     && before
                         .state
                         .workflow_config
@@ -246,6 +844,21 @@ impl PersistedSession {
                     );
                     next.workflow = workflow.state();
                     next.gates = workflow.gates.clone();
+                    next.workflow_artifacts = workflow.artifact_graph().clone();
+                }
+                if let Some((admission_id, payload_hash)) = admission {
+                    let event = snapshot
+                        .events
+                        .last()
+                        .ok_or_else(|| io::Error::other("admission inputを保存できません"))?;
+                    next.admission_receipts.insert(
+                        admission_id.to_owned(),
+                        AdmissionReceiptV1 {
+                            payload_hash: payload_hash.to_owned(),
+                            sequence: event.sequence,
+                            turn_id: event.turn_id,
+                        },
+                    );
                 }
                 lock.publish(&snapshot, next)?;
                 source = events
@@ -327,16 +940,41 @@ impl PersistedSession {
                 (message, starts_turn)
             })
             .collect();
-        this.update(&events, workflow)?;
+        this.update(&events, workflow, None)?;
         Ok(this)
     }
 
     pub fn restore_workflow(&self, config: WorkflowConfig) -> io::Result<SessionWorkflow> {
         let (workflow, needs_checkpoint) = self.prepare_workflow(config)?;
         if needs_checkpoint {
-            self.checkpoint(Some(&workflow))?;
+            // Evidence is bound to observed source/diff hashes. A restart has
+            // no current observation, so remove it through the same durable
+            // owner before exposing the restored workflow.
+            if self.snapshot()?.state.gates.convergence.is_some() {
+                self.clear_convergence_on_resume(&workflow)?;
+            } else {
+                self.checkpoint(Some(&workflow))?;
+            }
         }
         Ok(workflow)
+    }
+
+    fn clear_convergence_on_resume(&self, workflow: &SessionWorkflow) -> io::Result<()> {
+        let expected_generation = self.snapshot()?.state.generation;
+        let workflow = workflow.clone();
+        self.update_workflow_artifacts(expected_generation, move |before, _| {
+            if before.gates.convergence.is_none() {
+                return Ok((before.clone(), ()));
+            }
+            let mut next = before.clone();
+            next.workflow_config = Some(crate::conversation_state::SavedWorkflowConfigV1::capture(
+                &workflow.config,
+            ));
+            next.workflow = workflow.state();
+            next.gates = workflow.gates.clone();
+            next.workflow_artifacts = workflow.artifact_graph().clone();
+            Ok((next, ()))
+        })
     }
 
     /// Restore without writing so callers can validate explicit overrides first.
@@ -346,13 +984,18 @@ impl PersistedSession {
         mut config: WorkflowConfig,
     ) -> io::Result<(SessionWorkflow, bool)> {
         let state = self.snapshot()?.state;
+        if let Some(reference) = &state.workflow.active_change_contract {
+            let store = WorkflowArtifactStore::open(&self.data_root, &state.project_id)?;
+            store.load_change_contract(&state.workflow_artifacts, reference)?;
+        }
         let mut gates = state.gates;
         // Resume has not verified that the working files still match evidence.
         // A new explicit verification can replace this conservative stale flag.
         if let Some(verification) = &mut gates.verification {
             verification.stale = true;
         }
-        let needs_checkpoint = state.workflow_config.is_none();
+        let invalidated_convergence = gates.convergence.take().is_some();
+        let needs_checkpoint = state.workflow_config.is_none() || invalidated_convergence;
         let config = match state.workflow_config {
             Some(saved) => saved.config,
             None => {
@@ -360,16 +1003,140 @@ impl PersistedSession {
                 config
             }
         };
-        let workflow =
-            SessionWorkflow::restore(config, gates, state.workflow).map_err(io::Error::other)?;
+        let workflow = SessionWorkflow::restore_with_artifacts(
+            config,
+            gates,
+            state.workflow,
+            state.workflow_artifacts,
+        )
+        .map_err(io::Error::other)?;
         Ok((workflow, needs_checkpoint))
     }
+}
+
+fn build_owner_convergence_for_state(
+    state: &ConversationStateV2,
+    store: &WorkflowArtifactStore,
+    bundle: &crate::verification::owner::VerifiedConvergenceBundleV1,
+) -> io::Result<ConvergenceInputV1> {
+    let observed = ObservedEvidenceSubjectV1 {
+        subject_hash: bundle.binding().subject_hash.clone(),
+        source_hash: bundle.binding().source_hash.clone(),
+        diff_hash: bundle.binding().diff_hash.clone(),
+    };
+    let graph = &state.workflow_artifacts;
+    if let Some(reference) = &state.workflow.active_change_contract {
+        let contract = store.load_change_contract(graph, reference)?;
+        return build_owner_convergence(
+            ActiveEvidenceArtifactsV1::RoutineContract {
+                artifact_graph: graph,
+                active_contract: reference,
+                contract: &contract,
+            },
+            &observed,
+            bundle.implementation_receipts().to_vec(),
+            bundle.reviews().to_vec(),
+            bundle.evidence().to_vec(),
+        )
+        .and_then(|convergence| verify_bundle_binding(bundle, convergence))
+        .map_err(io::Error::other);
+    }
+    let (feature_reference, active_task) = match (
+        state.workflow.active_feature.as_ref(),
+        state.workflow.active_task.as_ref(),
+    ) {
+        (Some(feature), Some(task)) => (feature, task),
+        _ => {
+            return Err(io::Error::other(
+                "convergenceにはcurrent active contractまたはtaskが必要です",
+            ));
+        }
+    };
+    let feature = store.load_feature_spec(graph, feature_reference)?;
+    let task_graph = store.load_task_graph(graph, &active_task.task_graph)?;
+    build_owner_convergence(
+        ActiveEvidenceArtifactsV1::PlannedTask {
+            artifact_graph: graph,
+            active_feature: feature_reference,
+            active_task,
+            feature: &feature,
+            task_graph: &task_graph,
+        },
+        &observed,
+        bundle.implementation_receipts().to_vec(),
+        bundle.reviews().to_vec(),
+        bundle.evidence().to_vec(),
+    )
+    .and_then(|convergence| verify_bundle_binding(bundle, convergence))
+    .map_err(io::Error::other)
+}
+
+fn verify_bundle_binding(
+    bundle: &crate::verification::owner::VerifiedConvergenceBundleV1,
+    convergence: ConvergenceInputV1,
+) -> Result<ConvergenceInputV1, String> {
+    if convergence.binding != *bundle.binding() {
+        return Err(
+            "verification bundle binding is not current for active workflow artifacts".into(),
+        );
+    }
+    Ok(convergence)
+}
+
+fn validate_owner_convergence_for_state(
+    state: &ConversationStateV2,
+    store: &WorkflowArtifactStore,
+    convergence: &ConvergenceInputV1,
+) -> io::Result<()> {
+    let observed = ObservedEvidenceSubjectV1 {
+        subject_hash: convergence.binding.subject_hash.clone(),
+        source_hash: convergence.binding.source_hash.clone(),
+        diff_hash: convergence.binding.diff_hash.clone(),
+    };
+    let graph = &state.workflow_artifacts;
+    if let Some(reference) = &state.workflow.active_change_contract {
+        let contract = store.load_change_contract(graph, reference)?;
+        validate_owner_convergence(
+            ActiveEvidenceArtifactsV1::RoutineContract {
+                artifact_graph: graph,
+                active_contract: reference,
+                contract: &contract,
+            },
+            &observed,
+            convergence.clone(),
+        )
+        .map_err(io::Error::other)?;
+        return Ok(());
+    }
+    let (feature_reference, active_task) = match (
+        state.workflow.active_feature.as_ref(),
+        state.workflow.active_task.as_ref(),
+    ) {
+        (Some(feature), Some(task)) => (feature, task),
+        _ => return Err(io::Error::other("convergenceにactive artifactがありません")),
+    };
+    let feature = store.load_feature_spec(graph, feature_reference)?;
+    let task_graph = store.load_task_graph(graph, &active_task.task_graph)?;
+    validate_owner_convergence(
+        ActiveEvidenceArtifactsV1::PlannedTask {
+            artifact_graph: graph,
+            active_feature: feature_reference,
+            active_task,
+            feature: &feature,
+            task_graph: &task_graph,
+        },
+        &observed,
+        convergence.clone(),
+    )
+    .map_err(io::Error::other)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::Session;
+    use crate::workflow::RoutineEligibilityV1;
 
     fn workflow(config: WorkflowConfig) -> SessionWorkflow {
         SessionWorkflow::new(config)
@@ -384,6 +1151,237 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    fn change_contract(id: &str) -> ChangeContractV1 {
+        ChangeContractV1::draft(
+            id,
+            RoutineEligibilityV1::local_component("polaris-core"),
+            "a routine workflow change",
+            "the previous behavior did not retain a contract",
+            "the approved immutable contract is active",
+            vec!["focused persistence test passes".into()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn m27_review_publication_is_one_cas_and_crosses_the_real_review_gate() {
+        use crate::verification::{
+            CriterionRunV1, EvidenceKindV1, RunnerProvenanceV1, SavedVerificationCheckpointV1,
+            VerificationCheckpointStageV1,
+            owner::VerificationOwnerV1,
+            store::{VerificationBindingV1, VerificationStore},
+        };
+        use crate::workflow::{
+            EVIDENCE_SCHEMA_VERSION, EvidenceBindingV1, EvidenceProvenanceV1, EvidenceRecordV1,
+            EvidenceResultV1, EvidenceSourceKindV1, ReviewRecordV1, VerificationCriterionV1,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let initial = SessionWorkflow::new(WorkflowConfig {
+            enabled: true,
+            initial_phase: Phase::Specify,
+            ..WorkflowConfig::default()
+        });
+        let saved = PersistedSession::create(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "review-cas",
+            HistoryMode::Legacy,
+            Some(&initial),
+        )
+        .unwrap();
+        let criterion =
+            VerificationCriterionV1::stable("The focused behavior passes.", true).unwrap();
+        let criterion_id = criterion.id.clone();
+        let contract = ChangeContractV1::draft_typed(
+            "change-review-cas",
+            RoutineEligibilityV1::local_component("polaris-core"),
+            "fix the focused behavior",
+            "the focused behavior fails",
+            "the focused behavior passes",
+            vec![criterion],
+        )
+        .unwrap();
+        let implemented = saved
+            .publish_and_approve_routine_contract(initial.state().revision, contract)
+            .unwrap();
+        implemented.request_phase(Phase::Implement).unwrap();
+        saved.checkpoint(Some(&implemented)).unwrap();
+        let snapshot = saved.snapshot().unwrap();
+        let active = snapshot
+            .state
+            .workflow
+            .active_change_contract
+            .clone()
+            .unwrap();
+        let hash = |byte: char| std::iter::repeat_n(byte, 64).collect::<String>();
+        let binding = EvidenceBindingV1 {
+            task_id: active.id.clone(),
+            task_definition_hash: active.content_hash.clone(),
+            subject_hash: hash('a'),
+            source_hash: hash('b'),
+            diff_hash: hash('c'),
+            artifact_graph_basis_hash: snapshot.state.workflow_artifacts.basis_hash().unwrap(),
+        };
+        let verification_binding = VerificationBindingV1 {
+            project_graph_hash: hash('1'),
+            analyzer_hash: hash('2'),
+            tool_hash: hash('3'),
+            source_hash: binding.source_hash.clone(),
+            diff_hash: binding.diff_hash.clone(),
+            config_hash: hash('4'),
+            analysis_request_hash: hash('5'),
+        };
+        let evidence = EvidenceRecordV1 {
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            record_id: "evidence-review-cas".into(),
+            binding: binding.clone(),
+            criterion_id: criterion_id.clone(),
+            result: EvidenceResultV1::Passed,
+            provenance: EvidenceProvenanceV1 {
+                source_kind: EvidenceSourceKindV1::TestExecution,
+                source_ref: "test:review-cas".into(),
+                observed_at_unix_secs: 1,
+            },
+        };
+        let store =
+            VerificationStore::open(&saved.verification_store_root(), "review-cas").unwrap();
+        let evidence_ref = store
+            .put_final_evidence_record(&verification_binding, &evidence)
+            .unwrap();
+        let catalog = crate::verification::StaticCapabilityCatalogV1::default();
+        let owner = VerificationOwnerV1::new(&store, &catalog);
+        let terminal_bundle = owner
+            .bundle_from_final_evidence_records(&binding, std::slice::from_ref(&evidence), 2)
+            .unwrap();
+        let mut checkpoint = SavedVerificationCheckpointV1::new(
+            "checkpoint-review-cas".into(),
+            "idempotency-review-cas".into(),
+            snapshot.state.workflow.revision,
+            vec![active],
+            binding.clone(),
+        )
+        .unwrap();
+        checkpoint.criterion_runs = vec![CriterionRunV1 {
+            criterion_id,
+            evidence_kind: EvidenceKindV1::ExistingTest,
+            runner_id: "runner-review-cas".into(),
+            provenance: Some(RunnerProvenanceV1 {
+                plan_hash: hash('6'),
+                program_hash: hash('7'),
+                report_hash: hash('8'),
+                cleanup_complete: true,
+                execution_available: true,
+            }),
+        }];
+        checkpoint.evidence_refs = vec![evidence_ref];
+        saved
+            .publish_verification_checkpoint(snapshot.state.generation, checkpoint.clone())
+            .unwrap();
+        checkpoint
+            .transition(VerificationCheckpointStageV1::Running)
+            .unwrap();
+        let generation = saved.snapshot().unwrap().state.generation;
+        saved
+            .publish_verification_checkpoint(generation, checkpoint.clone())
+            .unwrap();
+        checkpoint
+            .transition(VerificationCheckpointStageV1::Terminal)
+            .unwrap();
+        let generation = saved.snapshot().unwrap().state.generation;
+        saved
+            .publish_verification_checkpoint(generation, checkpoint.clone())
+            .unwrap();
+        let generation = saved.snapshot().unwrap().state.generation;
+        let (workflow, published) = saved
+            .publish_verification_convergence(generation, checkpoint, terminal_bundle)
+            .unwrap();
+
+        let review = ReviewRecordV1 {
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            record_id: "review-cas".into(),
+            binding: binding.clone(),
+            findings: Vec::new(),
+        };
+        let review_ref = store
+            .put_review_record(&verification_binding, &binding, &review)
+            .unwrap();
+        let bundle = || {
+            let bundle = owner
+                .bundle_from_final_evidence_records(&binding, std::slice::from_ref(&evidence), 3)
+                .unwrap();
+            owner
+                .add_review_reference(bundle, &verification_binding, &review_ref)
+                .unwrap()
+        };
+        let generation = saved.snapshot().unwrap().state.generation;
+        assert!(
+            saved
+                .publish_review_convergence(
+                    generation,
+                    workflow.state().revision + 1,
+                    published.checkpoint_id.clone(),
+                    review_ref.clone(),
+                    bundle(),
+                )
+                .is_err()
+        );
+        assert!(
+            saved
+                .publish_review_convergence(
+                    generation,
+                    workflow.state().revision,
+                    "tampered-checkpoint".into(),
+                    review_ref.clone(),
+                    bundle(),
+                )
+                .is_err()
+        );
+        let mut stale_binding = binding.clone();
+        stale_binding.task_definition_hash = hash('9');
+        let mut stale_evidence = evidence.clone();
+        stale_evidence.binding = stale_binding.clone();
+        let stale_bundle = owner
+            .bundle_from_final_evidence_records(&stale_binding, &[stale_evidence], 3)
+            .unwrap();
+        assert!(
+            saved
+                .publish_review_convergence(
+                    generation,
+                    workflow.state().revision,
+                    published.checkpoint_id.clone(),
+                    review_ref.clone(),
+                    stale_bundle,
+                )
+                .is_err()
+        );
+        let (verified, reviewed) = saved
+            .publish_review_convergence(
+                generation,
+                workflow.state().revision,
+                published.checkpoint_id.clone(),
+                review_ref.clone(),
+                bundle(),
+            )
+            .unwrap();
+        assert_eq!(verified.state().phase, Phase::Verify);
+        assert_eq!(reviewed.review_refs, std::slice::from_ref(&review_ref));
+        let snapshot = saved.snapshot().unwrap();
+        assert_eq!(snapshot.state.workflow.phase, Phase::Verify);
+        assert_eq!(snapshot.state.gates.convergence.unwrap().reviews, [review]);
+        assert!(
+            saved
+                .publish_review_convergence(
+                    snapshot.state.generation,
+                    verified.state().revision,
+                    published.checkpoint_id,
+                    review_ref.clone(),
+                    bundle(),
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -579,6 +1577,148 @@ mod tests {
     }
 
     #[test]
+    fn change_contract_resumes_and_trusted_approval_creates_a_revision_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = create(dir.path());
+        let draft = change_contract("routine-contract");
+        let draft_reference = saved.publish_change_contract(0, draft.clone()).unwrap();
+        assert_eq!(saved.snapshot().unwrap().state.generation, 1);
+        assert_eq!(saved.load_change_contract(&draft_reference).unwrap(), draft);
+
+        let approved = saved
+            .approve_change_contract_trusted(1, draft_reference.clone())
+            .unwrap();
+        let approved_reference = approved.state().active_change_contract.unwrap();
+        assert_eq!(approved_reference.revision, 2);
+        let approved_body = saved.load_change_contract(&approved_reference).unwrap();
+        assert_eq!(approved_body.header.supersedes, Some(draft_reference));
+        assert_eq!(approved_body.header.status, ArtifactStatusV1::Approved);
+
+        let id = saved.snapshot().unwrap().state.session_id;
+        let reopened = PersistedSession::open(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            &id,
+        )
+        .unwrap();
+        let restored = reopened
+            .restore_workflow(WorkflowConfig::default())
+            .unwrap();
+        assert_eq!(
+            restored.state().active_change_contract,
+            Some(approved_reference)
+        );
+    }
+
+    #[test]
+    fn restart_rejects_an_active_contract_when_its_immutable_body_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = create(dir.path());
+        let draft_reference = saved
+            .publish_change_contract(0, change_contract("missing-body-contract"))
+            .unwrap();
+        let approved = saved
+            .approve_change_contract_trusted(1, draft_reference)
+            .unwrap();
+        let approved_reference = approved.state().active_change_contract.unwrap();
+        let id = saved.snapshot().unwrap().state.session_id;
+        let object = dir
+            .path()
+            .join("workflow-artifacts-v1")
+            .join(crate::conversation_state::content_hash(b"project"))
+            .join(format!("{}.json", approved_reference.content_hash));
+        std::fs::remove_file(object).unwrap();
+
+        let reopened = PersistedSession::open(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            &id,
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .restore_workflow(WorkflowConfig::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn change_contract_rejects_stale_generation_without_a_graph_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = create(dir.path());
+        let id = saved.snapshot().unwrap().state.session_id;
+        let competing = PersistedSession::open(
+            dir.path(),
+            &dir.path().join("memory.sqlite3"),
+            "project",
+            &id,
+        )
+        .unwrap();
+        saved
+            .publish_change_contract(0, change_contract("first-contract"))
+            .unwrap();
+        assert!(
+            competing
+                .publish_change_contract(0, change_contract("stale-contract"))
+                .is_err()
+        );
+        assert_eq!(
+            saved
+                .snapshot()
+                .unwrap()
+                .state
+                .workflow_artifacts
+                .artifacts
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fork_shares_immutable_bodies_but_not_its_artifact_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = create(dir.path());
+        let parent_reference = saved
+            .publish_change_contract(0, change_contract("parent-contract"))
+            .unwrap();
+        let child = saved.fork(&"a".repeat(64)).unwrap();
+        assert_eq!(
+            child
+                .load_change_contract(&parent_reference)
+                .unwrap()
+                .reference(),
+            parent_reference
+        );
+
+        let child_generation = child.snapshot().unwrap().state.generation;
+        child
+            .publish_change_contract(child_generation, change_contract("child-contract"))
+            .unwrap();
+        assert_eq!(
+            saved
+                .snapshot()
+                .unwrap()
+                .state
+                .workflow_artifacts
+                .artifacts
+                .len(),
+            1
+        );
+        assert_eq!(
+            child
+                .snapshot()
+                .unwrap()
+                .state
+                .workflow_artifacts
+                .artifacts
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn append_batch_publishes_suffix_and_workflow_once() {
         let dir = tempfile::tempdir().unwrap();
         let config = WorkflowConfig::default();
@@ -648,5 +1788,51 @@ mod tests {
         .unwrap();
         assert_eq!(saved.snapshot().unwrap().events.len(), 2);
         assert_eq!(std::fs::read(&path).unwrap(), source);
+    }
+
+    #[test]
+    fn admitted_input_and_receipt_commit_once_under_the_host_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("memory.sqlite3");
+        let persistence = PersistedSession::create_with_id(
+            dir.path(),
+            &database,
+            "project",
+            "00112233-4455-4677-8899-aabbccddeeff",
+            HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.attach(persistence.clone()).unwrap();
+        let admission = crate::session_manager::AdmissionId::new("adm-test").unwrap();
+        let payload_hash = "a".repeat(64);
+
+        assert!(
+            session
+                .push_admitted_user("isolated task", &admission, &payload_hash)
+                .unwrap()
+        );
+        assert!(
+            !session
+                .push_admitted_user("isolated task", &admission, &payload_hash)
+                .unwrap()
+        );
+        assert_eq!(session.messages.len(), 1);
+        let snapshot = persistence.snapshot().unwrap();
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(
+            snapshot.state.session_id,
+            "00112233-4455-4677-8899-aabbccddeeff"
+        );
+        assert_eq!(
+            snapshot
+                .state
+                .admission_receipts
+                .get(admission.as_str())
+                .unwrap()
+                .payload_hash,
+            payload_hash
+        );
     }
 }

@@ -258,6 +258,7 @@ pub(in crate::desktop_store) fn fork_seed(
             source_applies: vec![],
             children: vec![],
             workflow,
+            workflow_artifacts: parent.state.workflow_artifacts.clone(),
         },
         raw,
     ))

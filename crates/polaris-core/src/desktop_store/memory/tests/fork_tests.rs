@@ -11,6 +11,11 @@ fn workflow() -> SavedWorkflow {
         always: vec!["builtin:workflow-core".into()],
         ..Default::default()
     }));
+    // This fixture exercises forked raw-prefix and checkpoint replay. M27
+    // phase-gate enforcement has dedicated tests with an approved contract
+    // and a matching gate basis, so retain the legacy checkpoint protocol
+    // here rather than smuggling an unrelated phase transition through it.
+    saved.gates.phase_gate_schema_version = None;
     saved.gates.external_grants.push(ExternalGrant {
         operation: "push".into(),
         target: "main".into(),
@@ -172,10 +177,18 @@ fn fork_first_child_checkpoint_finish_and_replay_preserve_inherited_prefix() {
             previous.clone(),
             candidate.clone(),
             None,
+            None,
         )
         .unwrap();
     child
-        .checkpoint_workflow(&target, suffix.clone(), previous, candidate.clone(), None)
+        .checkpoint_workflow(
+            &target,
+            suffix.clone(),
+            previous,
+            candidate.clone(),
+            None,
+            None,
+        )
         .unwrap();
     // Confirmation performs disk reconciliation; it must use the inherited offset too.
     child

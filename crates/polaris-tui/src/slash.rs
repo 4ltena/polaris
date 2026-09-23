@@ -21,10 +21,9 @@
 //! lifecycle concept `/resume`'s picker doesn't have yet). `/model` now
 //! does switch the model mid-session — `polaris_provider::Provider`
 //! grew a `set_model(&self, ...)` method using interior mutability, so
-//! it can be called through the same shared `&dyn Provider` reference
-//! `RunArgs` already holds without `RunArgs` needing to own (and
-//! rebuild) its provider. It still has no reasoning-effort dimension,
-//! since `CompletionRequest` doesn't carry one at all.
+//! it can be called through the same shared provider reference. The
+//! interactive picker deliberately leaves reasoning effort to automatic
+//! routing; fixed noninteractive measurements can still use `--effort`.
 
 pub struct SlashCommand {
     pub name: &'static str,
@@ -377,6 +376,12 @@ mod tests {
         assert!(matches!(parse("/compact"), Some(Action::Compact)));
         assert!(matches!(action_for("compact"), Action::Compact));
         assert!(COMMANDS.iter().any(|c| c.name == "compact"));
+    }
+
+    #[test]
+    fn effort_is_not_an_interactive_command() {
+        assert!(!COMMANDS.iter().any(|command| command.name == "effort"));
+        assert!(matches!(parse("/effort"), Some(Action::Unknown(name)) if name == "effort"));
     }
 
     #[test]

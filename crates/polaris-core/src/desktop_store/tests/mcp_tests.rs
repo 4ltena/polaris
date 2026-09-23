@@ -735,7 +735,14 @@ fn mcp_suffix_reconciliation_rejects_conflicts_unconfirmed_and_non_mcp_truncatio
     candidate.state.revision = 1;
     // Unrelated workflow history still requires the worker's complete suffix.
     ordinary
-        .checkpoint_workflow(&target(), desktop_tool_turn(), previous, candidate, None)
+        .checkpoint_workflow(
+            &target(),
+            desktop_tool_turn(),
+            previous,
+            candidate,
+            None,
+            None,
+        )
         .unwrap();
     assert!(
         ordinary
@@ -785,7 +792,14 @@ fn mcp_suffix_reconciliation_does_not_absorb_later_workflow_checkpoints() {
     candidate.state.phase = crate::workflow::Phase::Review;
     candidate.state.revision = 1;
     writer
-        .checkpoint_workflow(&target(), suffix.clone(), previous, candidate.clone(), None)
+        .checkpoint_workflow(
+            &target(),
+            suffix.clone(),
+            previous,
+            candidate.clone(),
+            None,
+            None,
+        )
         .unwrap();
     // Even without new raw messages, an ACK-lost state transition cannot be
     // replaced by the stale worker's workflow in the subsequent finish.
@@ -803,6 +817,7 @@ fn mcp_suffix_reconciliation_does_not_absorb_later_workflow_checkpoints() {
             suffix.clone(),
             candidate.clone(),
             candidate.clone(),
+            None,
             None,
         )
         .unwrap();

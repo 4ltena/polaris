@@ -14,6 +14,187 @@ use polaris_core::{
 };
 use polaris_provider::{Message, Provider, Role};
 
+fn delegation_projection_from(
+    binding: &polaris_core::desktop_store::SubagentControlBindingV1,
+    snapshot: &polaris_core::desktop_store::SubagentControlSnapshotV1,
+) -> polaris_core::session::RootDelegationProjectionV1 {
+    let children = snapshot
+        .control_plane
+        .children
+        .iter()
+        .filter_map(|child| {
+            child
+                .attempts
+                .last()
+                .map(|attempt| polaris_core::session::ChildControlProjectionV1 {
+                    logical_child_id: child.logical_child_id.clone(),
+                    attempt_id: attempt.attempt_id.clone(),
+                    display_name: child.display_name.clone(),
+                    role: child.role.clone(),
+                    tier: child.tier.clone(),
+                    model: child.model.clone(),
+                    effort: child.effort.clone(),
+                    state: attempt.state.clone(),
+                    activity: attempt.activity.clone(),
+                })
+        })
+        .collect();
+    polaris_core::session::RootDelegationProjectionV1 {
+        revision: snapshot.revision,
+        session_id: binding.session_id.as_str().to_owned(),
+        root_run_id: binding.root_run_id.clone(),
+        root_attempt_id: binding.root_attempt_id.clone(),
+        active_task_id: binding.active_task_id.clone(),
+        children,
+        // MCP snapshot leases are in-memory capabilities and are deliberately
+        // never restored after a process boundary.
+        mcp_leases: Vec::new(),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runtime setup keeps independently persisted desktop inputs explicit"
+)]
+fn create_delegation_runtime(
+    root: &DesktopRoot,
+    project_id: &ProjectId,
+    published: &Published,
+    target: &RunTarget,
+    configuration: &Configuration,
+    workflow: Option<&polaris_core::workflow::SessionWorkflow>,
+    prepared: &PreparedWorkspace,
+    has_mcp: bool,
+) -> Result<DelegationRuntime, ServiceError> {
+    use polaris_core::{
+        session::{RootDelegationConfigV1, RootDelegationControlV1},
+        subagent_control::{
+            ApprovalCapabilityV1, CapabilitySnapshotV1, McpCapabilityV1, RootAttemptId, RootRunId,
+            SandboxCapabilityV1, TaskId,
+        },
+    };
+    let active_task = workflow
+        .and_then(|workflow| workflow.state().active_task)
+        .map(|task| task.task_id)
+        .unwrap_or_else(|| format!("task-{}", target.run_id.as_str()));
+    let root_run_id = RootRunId::new(target.run_id.as_str()).map_err(|_| ServiceError::Worker)?;
+    let root_attempt_id =
+        RootAttemptId::new(target.attempt_id.as_str()).map_err(|_| ServiceError::Worker)?;
+    let active_task_id = TaskId::new(active_task).map_err(|_| ServiceError::Worker)?;
+    let binding = polaris_core::desktop_store::SubagentControlBindingV1 {
+        project_id: project_id.clone(),
+        session_id: published.marker.session_id.clone(),
+        root_run_id: root_run_id.clone(),
+        root_attempt_id: root_attempt_id.clone(),
+        active_task_id: active_task_id.clone(),
+    };
+    let owner = root.subagent_control(binding.clone())?;
+    let owner_snapshot = owner.snapshot()?;
+    let initial_projection = delegation_projection_from(&binding, &owner_snapshot);
+    let owner = Arc::new(std::sync::Mutex::new(owner));
+    let owner_for_hook = owner.clone();
+    let binding_for_hook = binding.clone();
+    let persistence_hook = Arc::new(
+        move |checkpoint: polaris_core::session::RootDelegationCheckpointV1| {
+            if checkpoint.binding.session_id != binding_for_hook.session_id.as_str()
+                || checkpoint.binding.root_run_id != binding_for_hook.root_run_id
+                || checkpoint.binding.root_attempt_id != binding_for_hook.root_attempt_id
+                || checkpoint.binding.active_task_id != binding_for_hook.active_task_id
+                || checkpoint.revision != checkpoint.expected_revision.saturating_add(1)
+            {
+                return Err("delegation checkpoint binding mismatch".to_owned());
+            }
+            let mut owner = owner_for_hook
+                .lock()
+                .map_err(|_| "delegation store owner unavailable".to_owned())?;
+            let saved = owner
+                .replace(checkpoint.expected_revision, checkpoint.control_plane)
+                .map_err(|error| error.to_string())?;
+            if saved.revision != checkpoint.revision || saved.binding != binding_for_hook {
+                return Err("delegation checkpoint publication mismatch".to_owned());
+            }
+            Ok(())
+        },
+    );
+    let policy = prepared.policy();
+    let sandbox = match policy.mode() {
+        polaris_sandbox::SandboxMode::ReadOnly => SandboxCapabilityV1::ReadOnly,
+        polaris_sandbox::SandboxMode::WorkspaceWrite => SandboxCapabilityV1::WorkspaceWrite,
+        polaris_sandbox::SandboxMode::FullAccess => SandboxCapabilityV1::FullAccess,
+    };
+    let mut tool_names = polaris_tools::all_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    tool_names.sort();
+    tool_names.dedup();
+    let config = RootDelegationConfigV1 {
+        session_id: published.marker.session_id.as_str().to_owned(),
+        root_run_id,
+        root_attempt_id,
+        active_task_id,
+        parent_capabilities: CapabilitySnapshotV1 {
+            sandbox,
+            write_roots: policy
+                .writable_roots()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            tool_names,
+            approval: ApprovalCapabilityV1::TrustedOwnerOnly,
+            mcp: if has_mcp {
+                McpCapabilityV1::ReadSnapshotsOnly
+            } else {
+                McpCapabilityV1::None
+            },
+        },
+        model: configuration.model.clone(),
+        effort: configuration.effort.clone(),
+    };
+    let control = RootDelegationControlV1::restore_with_persistence_hook(
+        config,
+        owner_snapshot.control_plane,
+        owner_snapshot.revision,
+        persistence_hook,
+    )
+    .map_err(|_| ServiceError::Worker)?;
+    let projection = Arc::new(std::sync::RwLock::new(initial_projection));
+    let projection_for_hook = projection.clone();
+    let (updates, receiver) = std::sync::mpsc::sync_channel(1);
+    control.set_projection_hook(Some(Arc::new(move |next| {
+        if let Ok(mut current) = projection_for_hook.write()
+            && *current != next
+        {
+            *current = next;
+            let _ = updates.try_send(());
+        }
+    })));
+    Ok(DelegationRuntime {
+        control,
+        projection,
+        updates: receiver,
+    })
+}
+
+fn revoke_root_delegation(
+    control: Arc<polaris_core::session::RootDelegationControlV1>,
+) -> Result<(), ServiceError> {
+    std::thread::Builder::new()
+        .name("polaris-delegation-revoke".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| ServiceError::Worker)?;
+            runtime.block_on(control.revoke_root_terminal());
+            Ok::<(), ServiceError>(())
+        })
+        .map_err(|_| ServiceError::Worker)?
+        .join()
+        .map_err(|_| ServiceError::Worker)??;
+    Ok(())
+}
+
 /// Trusted owner only. Called after the accepted input and run intent are durable.
 /// Runs on the single owned prepare thread, never the reactor or Writer owner.
 /// Must not start providers/tools. Own cleanup of partial preparation on error
@@ -36,6 +217,13 @@ pub trait TrustedRunFactory: Send + Sync {
     /// so a factory that has no opinion keeps the behaviour every run had
     /// before the judge existed.
     fn decider(&self) -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
+        None
+    }
+
+    /// Startup-owned shadow finalizer. Wire and project data cannot provide it.
+    fn answer_finalizer(
+        &self,
+    ) -> Option<std::sync::Arc<crate::shadow_finalizer::ShadowFinalizerOwner>> {
         None
     }
 
@@ -200,6 +388,7 @@ impl DesktopService {
                     phase: config.initial_phase,
                     ..Default::default()
                 },
+                saved.state.workflow_artifacts.clone(),
                 runs.workflow_skills(),
             )
             .map_err(|_| ServiceError::Options)?;
@@ -724,7 +913,9 @@ fn persist_child_event(
         None => return Ok(None),
     };
     let receipt = match envelope.event {
-        AgentEvent::SpawnStarted { agent_type, task } => {
+        AgentEvent::SpawnStarted {
+            agent_type, task, ..
+        } => {
             let published = store.snapshot()?;
             let parent_tasks = if identity.parent_run_id == target.run_id {
                 &published
@@ -761,7 +952,7 @@ fn persist_child_event(
                 task,
             )?
         }
-        AgentEvent::SpawnFinished { agent_type, ok } => {
+        AgentEvent::SpawnFinished { agent_type, ok, .. } => {
             let published = store.snapshot()?;
             let child = published
                 .state
@@ -851,6 +1042,8 @@ impl Engine {
             .trusted_runs
             .as_ref()
             .and_then(|trusted| trusted.factory.decider());
+        let delegation_root = self.root.clone();
+        let delegation_project = self.project.clone();
         let Some(active) = &mut self.active else {
             return Ok(());
         };
@@ -884,7 +1077,7 @@ impl Engine {
                     return Err(StoreError::RunConflict.into());
                 }
                 active.started = true;
-                real.prefix = published.raw.iter().map(|r| r.message.clone()).collect();
+                real.prefix = self.store.raw_request_prefix(&active.target)?;
                 real.workflow = state.workflow.clone();
                 let trusted = self.trusted_runs.as_ref().ok_or(ServiceError::Options)?;
                 real.prepare_policy_revision = Some(published.state.policy_revision);
@@ -982,7 +1175,12 @@ impl Engine {
                     let workflow = real
                         .workflow
                         .as_ref()
-                        .map(|saved| saved.restore(None))
+                        .map(|saved| {
+                            saved.restore_with_artifacts(
+                                None,
+                                current.state.workflow_artifacts.clone(),
+                            )
+                        })
                         .transpose()?;
                     if self.disconnected.load(Ordering::Acquire) {
                         real.cancelled = true;
@@ -998,6 +1196,7 @@ impl Engine {
                             .prepared_inputs
                             .take()
                             .expect("validated retained inputs");
+                        let has_mcp = inputs.mcp.is_some();
                         let desktop_memory = real.prepare_memory(
                             inputs.history.take(),
                             &active.target,
@@ -1084,6 +1283,31 @@ impl Engine {
                             )))
                         });
                         if let Ok(request_context) = request_context {
+                            let delegation = create_delegation_runtime(
+                                delegation_root.as_ref().ok_or(ServiceError::Worker)?,
+                                &delegation_project,
+                                &current,
+                                &active.target,
+                                &target.configuration,
+                                workflow.as_ref(),
+                                &inputs.prepared,
+                                has_mcp,
+                            )?;
+                            let mut session = Session {
+                                messages: real.prefix.clone(),
+                                tool_memory: inputs.tool_memory,
+                                workflow,
+                                desktop_memory: desktop_memory.unwrap_or(None),
+                                desktop_workflow,
+                                mcp_setup,
+                                decider: judge.clone(),
+                                input_preparation,
+                                ..Session::new()
+                            };
+                            session
+                                .install_root_delegation_control(delegation.control.clone())
+                                .map_err(|_| ServiceError::Worker)?;
+                            active.delegation = Some(delegation);
                             let input =
                                 DesktopRunInput {
                                     target: active.target.clone(),
@@ -1097,17 +1321,7 @@ impl Engine {
                                     provider_pool: Arc::new(active.usage.wrap(Arc::new(
                                         real.main_usage.wrap(inputs.provider_pool),
                                     ))),
-                                    session: Session {
-                                        messages: real.prefix.clone(),
-                                        tool_memory: inputs.tool_memory,
-                                        workflow,
-                                        desktop_memory: desktop_memory.unwrap_or(None),
-                                        desktop_workflow,
-                                        mcp_setup,
-                                        decider: judge.clone(),
-                                        input_preparation,
-                                        ..Session::new()
-                                    },
+                                    session,
                                     request_context,
                                     always_on: inputs.always_on,
                                     audit: inputs.audit,
@@ -1203,32 +1417,75 @@ impl Engine {
         if active.started {
             // MCP may have published its canonical result after the caller
             // future was dropped. Reconcile only after owner cleanup completes.
+            let checkpointed_workflow = self
+                .store
+                .snapshot()?
+                .state
+                .runs
+                .iter()
+                .find(|record| {
+                    record.run.run_id == active.target.run_id
+                        && record.run.attempt_id == active.target.attempt_id
+                })
+                .ok_or(StoreError::NotFound)?
+                .workflow
+                .clone();
             let suffix = self.store.reconcile_mcp_turn_suffix(
                 &active.target,
                 real.suffix.clone(),
-                real.workflow.as_ref(),
+                checkpointed_workflow.as_ref(),
             )?;
             if real.output_rejected {
                 self.store
                     .record_history_gap(&active.target, HistoryGap::OutputRejected)
                     .map_err(|_| StoreError::RecoveryRequired)?;
             }
-            self.store.finish_with_messages_and_workflow(
+            self.store.finish_with_messages(
                 &active.target,
                 &active.operation,
                 outcome,
                 result,
                 suffix,
-                real.workflow.clone(),
             )?;
         } else if !state.run.state.is_terminal() {
             self.store
                 .finish(&active.target, Observation::Cancelled, result)?;
         }
         active.execution.saved = true;
+        if let Some(delegation) = &active.delegation {
+            revoke_root_delegation(delegation.control.clone())?;
+        }
         // A cancelled run can still be saved as failed (its last checkpoint is
         // refused), so the continuation is told about the cancel directly.
         let stopped_by_person = cancel || active.real.as_ref().is_some_and(|real| real.cancelled);
+        let admission_terminal = active.admission.clone().map(|id| {
+            let status = if !active.started || outcome == Observation::Cancelled {
+                polaris_core::session_manager::TerminalStatus::Cancelled
+            } else if outcome == Observation::Succeeded {
+                polaris_core::session_manager::TerminalStatus::Completed
+            } else if outcome == Observation::OutcomeUnknown {
+                polaris_core::session_manager::TerminalStatus::OutcomeUnknown
+            } else {
+                polaris_core::session_manager::TerminalStatus::Failed
+            };
+            (id, status)
+        });
+        if let (Some(owner), Some((admission, status))) =
+            (self.admission.as_mut(), admission_terminal)
+        {
+            owner.terminal(&admission, status)?;
+            if let Some(out) = out {
+                let published = self.store.snapshot()?;
+                self.emit(
+                    EventBody::OrchestrationUpdated(super::orchestration_summary(
+                        &published,
+                        self.admission.as_ref(),
+                        self.delegation_projection().as_ref(),
+                    )),
+                    out,
+                )?;
+            }
+        }
         let active = self.active.take().ok_or(ServiceError::Worker)?;
         let saved = self.store.snapshot()?;
         if let Some(prepared) = active
@@ -1320,6 +1577,104 @@ impl Engine {
                 .ok_or(StoreError::NotFound)?
                 .run;
             self.emit(EventBody::RunState(run), out)?;
+        }
+        // Start the non-authoritative copy only after the canonical assistant
+        // bytes are durable and their saved deltas have been handed to the UI.
+        // Shadow failure cannot change either output or run state.
+        if out.is_some()
+            && active.started
+            && outcome == Observation::Succeeded
+            && let Some(finalizer) = self
+                .trusted_runs
+                .as_ref()
+                .and_then(|trusted| trusted.factory.answer_finalizer())
+            && let Some(raw) = saved
+                .raw
+                .iter()
+                .skip(
+                    active
+                        .real
+                        .as_ref()
+                        .ok_or(ServiceError::Worker)?
+                        .prefix
+                        .len(),
+                )
+                .rev()
+                .find(|raw| raw.message.role == Role::Assistant)
+        {
+            let prompt = saved
+                .raw
+                .iter()
+                .rev()
+                .find(|entry| entry.sequence < raw.sequence && entry.message.role == Role::User)
+                .map(|entry| (entry.sequence, entry.message.content.clone()));
+            let (prompt_sequence, prompt) = prompt.unwrap_or((0, String::new()));
+            let turn_entries = saved
+                .raw
+                .iter()
+                .filter(|entry| entry.sequence > prompt_sequence && entry.sequence < raw.sequence);
+            let mut called = std::collections::BTreeSet::new();
+            let mut returned = std::collections::BTreeSet::new();
+            let mut closed_evidence = Vec::new();
+            let mut evidence_complete = true;
+            for entry in turn_entries {
+                for call in &entry.message.tool_calls {
+                    evidence_complete &= !call.id.is_empty() && called.insert(call.id.clone());
+                }
+                if entry.message.role == Role::Tool {
+                    let Some(id) = entry.message.tool_call_id.as_ref() else {
+                        evidence_complete = false;
+                        continue;
+                    };
+                    evidence_complete &= returned.insert(id.clone());
+                    closed_evidence.push(entry.message.content.clone());
+                }
+                for hosted in &entry.message.hosted_web_search {
+                    evidence_complete &= matches!(
+                        hosted.status,
+                        polaris_provider::web_search::HostedItemStatus::Completed
+                    );
+                    match serde_json::to_string(hosted) {
+                        Ok(value) => closed_evidence.push(value),
+                        Err(_) => evidence_complete = false,
+                    }
+                }
+            }
+            evidence_complete &= called == returned;
+            evidence_complete &= closed_evidence
+                .iter()
+                .try_fold(0_usize, |total, value| total.checked_add(value.len()))
+                .is_some_and(|total| total <= 256 * 1024);
+            let workflow_revision = active
+                .real
+                .as_ref()
+                .and_then(|real| real.workflow.as_ref())
+                .map(|workflow| workflow.state.revision.to_string())
+                .unwrap_or_else(|| "0".into());
+            let subject = polaris_core::answer_finalizer::FinalizationSubjectV1 {
+                schema_version: polaris_core::answer_finalizer::FINALIZATION_SCHEMA_VERSION,
+                project_id: saved.marker.project_id.as_str().into(),
+                session_id: saved.marker.session_id.as_str().into(),
+                session_epoch: saved.marker.epoch.get(),
+                lane_id: saved.marker.session_id.as_str().into(),
+                root_run_id: active.target.run_id.as_str().into(),
+                attempt_id: active.target.attempt_id.as_str().into(),
+                turn_sequence: raw.sequence,
+                input_receipt_ids: vec![active.message.as_str().into()],
+                attachment_hashes: vec![],
+                workflow_revision,
+                exact_prompt_hash: polaris_core::conversation_state::content_hash(
+                    prompt.as_bytes(),
+                ),
+            };
+            let _ = finalizer.schedule(crate::shadow_finalizer::ShadowInputV1 {
+                subject,
+                source_message_id: message_id(raw.sequence).as_str().into(),
+                prompt,
+                source_body: raw.message.content.clone(),
+                closed_evidence,
+                evidence_complete,
+            });
         }
         self.continue_goal(out, stopped_by_person)
     }

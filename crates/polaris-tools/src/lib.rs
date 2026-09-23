@@ -76,10 +76,38 @@ pub fn all_specs() -> Vec<ToolSpec> {
 }
 
 /// Request-local workflow control; never part of the six-tool baseline.
+/// Stop and ask, when the turn's own route says a decision the user can
+/// see is still open.
+///
+/// Offered on the `grilling` route and nowhere else, and withdrawn once a
+/// question is outstanding, so a run cannot spend its turn asking. The
+/// answer arrives as the next ordinary user message — the CLI and the TUI
+/// have no separate answer channel, and inventing one would put a second
+/// way to say the same thing in front of the user.
+pub fn clarify_spec() -> ToolSpec {
+    ToolSpec {
+        name: "clarify".into(),
+        description: "Ask the user up to three questions and stop. Only for an open decision they can see: the interface, the stored form, a public API, what is sent, or what is permitted. Not for implementation detail, an existing convention, or a reversible local choice. Order them so the first does not depend on the others.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                    "maxItems": 3
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 pub fn state_spec() -> ToolSpec {
     ToolSpec {
         name: "state".into(),
-        description: "Get the revision first; transition requires expected_revision. window returns what changed since the revision you were last given, or the whole window when that base is unknown. Focus never grants permission or proves completion.".into(),
+        description: "Get the revision first; transition requires expected_revision. window returns changes since your last revision, or the whole window when unknown. Focus grants no permission and proves nothing.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -87,6 +115,58 @@ pub fn state_spec() -> ToolSpec {
                 "phase": {"type":"string", "enum":["general", "brainstorm", "specify", "implement", "review", "verify", "deliver"]},
                 "expected_revision": {"type":"integer", "minimum":0},
                 "since": {"type":"integer", "minimum":0}
+            },
+            "required":["op"],
+            "additionalProperties":false
+        }),
+    }
+}
+
+/// Root-only workflow-artifact proposals. The host, rather than the model,
+/// assigns content addresses, approval and publication. This is deliberately
+/// not part of the six-tool baseline: it is useful only while a workflow is
+/// enabled and a root turn is preparing a routine change.
+pub fn workflow_artifact_spec() -> ToolSpec {
+    ToolSpec {
+        name: "workflow_artifact".into(),
+        description: "Propose one bounded routine change contract, or read one exact immutable workflow artifact. The host derives IDs, hashes, eligibility, approval and publication; do not provide them. A proposal is not approval.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {"type":"string", "enum":["propose_routine_contract", "read"]},
+                "expected_revision": {"type":"integer", "minimum":0},
+                "request": {"type":"string", "minLength":1, "maxLength":16384},
+                "prompt_sha256": {"type":"string", "pattern":"^[0-9a-f]{64}$"},
+                "cause": {"type":"string", "minLength":1, "maxLength":16384},
+                "expected_outcome": {"type":"string", "minLength":1, "maxLength":16384},
+                "verification": {
+                    "type":"array", "minItems":1, "maxItems":32,
+                    "items":{"type":"string", "minLength":1, "maxLength":4096}
+                },
+                "kind": {"type":"string", "enum":["change_contract", "project_principles", "idea_decision", "feature_spec", "implementation_plan", "task_graph"]},
+                "id": {"type":"string", "minLength":1, "maxLength":128},
+                "revision": {"type":"integer", "minimum":1},
+                "content_hash": {"type":"string", "pattern":"^[0-9a-f]{64}$"}
+            },
+            "required":["op"],
+            "additionalProperties":false
+        }),
+    }
+}
+
+/// Root-only verification control. The model can advance a host-created
+/// checkpoint, but cannot provide a command, path, hash, result, or evidence
+/// body. The owner resolves all of those from the immutable checkpoint.
+pub fn verification_spec() -> ToolSpec {
+    ToolSpec {
+        name: "verification".into(),
+        description: "Prepare, run, or publish one host-owned verification checkpoint. IDs are opaque handles returned by the host. You cannot provide commands, paths, hashes, pass/fail values, evidence, or approval.".into(),
+        parameters: serde_json::json!({
+            "type":"object",
+            "properties": {
+                "op":{"type":"string","enum":["prepare","run","publish"]},
+                "preparation_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_-]+$"},
+                "checkpoint_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_-]+$"}
             },
             "required":["op"],
             "additionalProperties":false
@@ -123,7 +203,7 @@ pub fn mcp_catalog_spec() -> ToolSpec {
 pub fn mcp_setup_spec() -> ToolSpec {
     ToolSpec {
         name: "mcp_setup".into(),
-        description: "Find MCP servers the user already configured for Codex or Claude on this computer, then register one after the user approves it. Results list candidate IDs, names, transports and reasons, never URLs, commands or credentials. A registration is usable from the next connection.".into(),
+        description: "Find MCP servers already configured for Codex or Claude here, then register one after the user approves. A registration is usable from the next connection.".into(),
         parameters: serde_json::json!({
             "type":"object",
             "properties":{
@@ -140,13 +220,45 @@ pub fn mcp_setup_spec() -> ToolSpec {
 pub fn setting_spec() -> ToolSpec {
     ToolSpec {
         name: "setting".into(),
-        description: "Bundled Next.js and Git setup. `plan` only reads. `tidy` appends the ignore rules the project is missing to .gitignore, keeping existing lines and their order, and asks before writing. Installing packages is the user's to confirm in their terminal and is never done here.".into(),
+        description: "Bundled Next.js and Git setup. `plan` only reads. `tidy` appends missing ignore rules to .gitignore and asks before writing. Installing packages is never done here.".into(),
         parameters: serde_json::json!({
             "type":"object",
             "properties":{
                 "op":{"type":"string","enum":["plan","tidy"]}
             },
             "required":["op"],"additionalProperties":false
+        }),
+    }
+}
+
+/// Driving an application, by naming the goal rather than the pixels.
+///
+/// The model does not click coordinates and never sees a screenshot. The
+/// host reads the application's accessibility tree, the typed decider picks
+/// which element the goal points at, and the executor acts on that one
+/// element. That split is what keeps interface text as data: a button
+/// labelled "ignore your instructions" is a candidate to choose between,
+/// not a sentence anybody obeys.
+///
+/// Root-only, and `apply` defaults to false, so the ordinary outcome is a
+/// list of the steps it would have taken.
+pub fn computer_spec() -> ToolSpec {
+    ToolSpec {
+        name: "computer".into(),
+        description: "Drive a macOS app toward a goal through its accessibility tree. \
+Reports the steps it would take unless `apply` is true; refuses sign-in, payment, deletion \
+and verification either way."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "app": { "type": "string", "description": "Application name." },
+                "goal": { "type": "string", "description": "What to achieve, in one sentence." },
+                "max_steps": { "type": "integer", "description": "Selections allowed. Default 8." },
+                "apply": { "type": "boolean", "description": "True acts. Default false reports." }
+            },
+            "required": ["app", "goal"],
+            "additionalProperties": false
         }),
     }
 }
@@ -238,7 +350,7 @@ fn skill_spec() -> ToolSpec {
 fn spawn_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn".into(),
-        description: "Delegate independent work; only results enter your context. implementer writes a decided change and needs write_root, reviewer checks read-only, file-reader answers one question about one absolute path.".into(),
+        description: "Delegate independent work; only results enter your context. implementer and doc-writer need write_root; reviewer and file-reader are read-only.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -326,6 +438,46 @@ mod tests {
             !param_doc.trim().is_empty(),
             "argument q's description is empty"
         );
+    }
+
+    #[test]
+    fn workflow_artifact_spec_is_bounded_and_not_baseline() {
+        let spec = workflow_artifact_spec();
+        assert!(all_specs().iter().all(|item| item.name != spec.name));
+        let json = serde_json::to_value(spec).expect("can't serialize");
+        assert_eq!(json["parameters"]["additionalProperties"], false);
+        assert_eq!(
+            json["parameters"]["properties"]["op"]["enum"],
+            serde_json::json!(["propose_routine_contract", "read"])
+        );
+        assert_eq!(
+            json["parameters"]["properties"]["verification"]["maxItems"],
+            32
+        );
+        assert!(json["parameters"]["properties"].get("component").is_none());
+        assert_eq!(
+            json["parameters"]["properties"]["prompt_sha256"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            json["parameters"]["properties"]["content_hash"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+    }
+
+    #[test]
+    fn verification_spec_exposes_only_opaque_checkpoint_handles() {
+        let spec = verification_spec();
+        assert!(all_specs().iter().all(|item| item.name != spec.name));
+        let json = serde_json::to_value(spec).unwrap();
+        assert_eq!(json["parameters"]["additionalProperties"], false);
+        assert_eq!(
+            json["parameters"]["properties"]["op"]["enum"],
+            serde_json::json!(["prepare", "run", "publish"])
+        );
+        for forbidden in ["path", "command", "hash", "passed", "result"] {
+            assert!(json["parameters"]["properties"].get(forbidden).is_none());
+        }
     }
 
     #[test]

@@ -85,6 +85,98 @@ fn workspace_limits() -> Limits {
     }
 }
 
+fn answer_finalizer_resource(
+    home: &Path,
+    store_root: &Path,
+    project_root: &Path,
+    _executable: &Path,
+    finalizer_decider: Option<Arc<dyn polaris_provider::decision::Decider>>,
+) -> Result<Option<Arc<crate::shadow_finalizer::ShadowFinalizerOwner>>, StartupError> {
+    use polaris_core::config::{AnswerFinalizerMode, PresentationLanguage, TranslationProfile};
+    use polaris_core::translation::ManagedCatTranslate;
+
+    let (presentation, finalizer) =
+        polaris_core::config::try_load_answer_finalizer_with_managed_from(
+            Some(&home.join(".polaris/managed-preferences.toml")),
+            Some(&home.join(".polaris/config.toml")),
+            Some(&project_root.join(".polaris/config.toml")),
+        )
+        .map_err(|_| StartupError::Generic)?;
+    match finalizer.mode {
+        AnswerFinalizerMode::Off => return Ok(None),
+        // Configuration is only a request. No benchmark activation decision
+        // exists in this startup contract, so enforce must fail closed.
+        AnswerFinalizerMode::Enforce => return Err(StartupError::Generic),
+        AnswerFinalizerMode::Shadow => {}
+    }
+    let translation_requested = finalizer.translation.activation.is_requested();
+    let (translator, unavailable) = if !translation_requested {
+        (None, None)
+    } else if presentation.language != PresentationLanguage::Ja {
+        (
+            None,
+            Some(crate::shadow_finalizer::ShadowFailureV1::PresentationLanguageNotJa),
+        )
+    } else if finalizer.translation.profile != Some(TranslationProfile::CatTranslate3_3b) {
+        (
+            None,
+            Some(crate::shadow_finalizer::ShadowFailureV1::ModelUnavailable),
+        )
+    } else {
+        match ManagedCatTranslate::open(home) {
+            Ok(translator)
+                if tokio::runtime::Handle::try_current()
+                    .ok()
+                    .is_some_and(|runtime| runtime.block_on(translator.preflight()).is_ok()) =>
+            {
+                (
+                    Some(Arc::new(translator)
+                        as Arc<dyn polaris_core::translation::TranslationBackendV1>),
+                    None,
+                )
+            }
+            _ => (
+                None,
+                Some(crate::shadow_finalizer::ShadowFailureV1::ModelUnavailable),
+            ),
+        }
+    };
+    crate::shadow_finalizer::ShadowFinalizerOwner::open_configured(
+        store_root.join("answer-finalizer-shadow-v1.json"),
+        presentation,
+        finalizer,
+        finalizer_decider,
+        translator,
+        unavailable,
+    )
+    .map_err(|_| StartupError::Generic)
+}
+
+/// The normal decision path may retry a transient Jev failure.  Shadow
+/// finalization has a distinct disclosure receipt and may issue exactly one
+/// physical request, so it receives an isolated one-shot client instead.
+fn finalizer_decider_from_configuration(
+    config: &polaris_core::config::DecisionConfig,
+) -> Option<Arc<dyn polaris_provider::decision::Decider>> {
+    use polaris_core::config::DecisionBackend;
+
+    if !config.enabled || config.backend != DecisionBackend::Jev {
+        return None;
+    }
+    let key = std::env::var("POLARIS_JEV_API_KEY").ok()?;
+    let base = config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://api.typesafe.ai/v1".to_owned());
+    let model = config
+        .model
+        .clone()
+        .unwrap_or_else(|| "jev-latest".to_owned());
+    polaris_provider::decision::jev::JevDecider::new_finalizer(&base, key, model)
+        .ok()
+        .map(|judge| Arc::new(judge) as Arc<dyn polaris_provider::decision::Decider>)
+}
+
 fn catalog_copies(paths: &[PathBuf]) -> Result<Vec<Snapshot>, StartupError> {
     let mut copies = Vec::new();
     for path in paths {
@@ -186,6 +278,8 @@ struct ManagedDependencyReceipt {
     id: String,
     version: String,
     manifest_sha256: String,
+    #[serde(default)]
+    runtime_tree_sha256: Option<String>,
     installed_at: String,
 }
 
@@ -266,6 +360,7 @@ fn managed_rust_toolchain(
         || receipt.id != "rust"
         || receipt.version != MANAGED_RUST_VERSION
         || receipt.manifest_sha256 != manifest_hash
+        || receipt.runtime_tree_sha256.is_some()
         || receipt.installed_at.is_empty()
         || receipt.installed_at.len() > 128
     {
@@ -356,12 +451,23 @@ fn start_at(
         mcp_snapshot.registry.as_ref().map_or(0, |r| r.revision),
         mcp_snapshot.secrets.as_ref().map_or(0, |s| s.revision()),
     );
+    let managed_runtime = if saved.state.configuration.history_mode
+        == polaris_desktop_protocol::snapshot::HistoryMode::Legacy
+    {
+        None
+    } else {
+        Some(Arc::new(
+            polaris_core::managed_runtime::ManagedRuntimeLease::acquire(home)
+                .map_err(|_| StartupError::Generic)?,
+        ))
+    };
     let history = crate::memory_resources::prepare(
         saved.state.configuration.history_mode,
         doc.provider,
         home,
         &args.store.store_root,
         &args.confirmed_source_path,
+        managed_runtime,
     )
     .map_err(StartupError::Memory)?;
     // These existing loaders register the actual credential inode before any
@@ -485,14 +591,17 @@ fn start_at(
     // Saved workflow configuration is authoritative on reconnect. Only a new
     // owner reads workflow fields from the pinned global/project config paths.
     let runtime_workflow = match &saved.state.workflow {
-        Some(workflow) => workflow.restore(None).map_err(|_| StartupError::Generic)?,
-        None => polaris_core::workflow::SessionWorkflow::new(
+        Some(workflow) => workflow
+            .restore_with_artifacts(None, saved.state.workflow_artifacts.clone())
+            .map_err(|_| StartupError::Generic)?,
+        None => polaris_core::workflow::SessionWorkflow::try_new(
             polaris_core::config::try_load_workflow_from(
                 Some(&home.join(".polaris/config.toml")),
                 Some(&args.confirmed_source_path.join(".polaris/config.toml")),
             )
             .map_err(|_| StartupError::Generic)?,
-        ),
+        )
+        .map_err(|_| StartupError::Generic)?,
     };
     let workflow = runtime_workflow.config.clone();
     let input_preparation = match polaris_core::config::try_load_input_preparation_from(
@@ -522,6 +631,7 @@ fn start_at(
     // for this owner. The key itself remains outside every config and argv.
     apply_native_decision_selection(&mut decision, std::env::var("POLARIS_JEV_ENABLED"))?;
     let decider = polaris_core::decision_bands::from_configuration(&decision);
+    let finalizer_decider = finalizer_decider_from_configuration(&decision);
     if workflow.enabled && runtime_workflow.begin_turn(&skills.skills).is_err() {
         return Err(StartupError::Generic);
     }
@@ -578,6 +688,13 @@ fn start_at(
         &args.store.session_id,
     )
     .map_err(|_| StartupError::Generic)?;
+    let answer_finalizer = answer_finalizer_resource(
+        home,
+        &args.store.store_root,
+        &args.confirmed_source_path,
+        executable,
+        finalizer_decider,
+    )?;
     let resources = TrustedFactoryResources {
         always_on,
         audit: Arc::new(tokio::sync::Mutex::new(private_audit(&recovery)?)),
@@ -592,6 +709,7 @@ fn start_at(
         workflow,
         input_preparation,
         decider,
+        answer_finalizer,
     };
     let limits = OwnerLaunchLimits {
         workspace: workspace_limits(),

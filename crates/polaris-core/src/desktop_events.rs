@@ -81,10 +81,32 @@ pub struct DesktopEventSink {
     tx: mpsc::Sender<EventEnvelope>,
     control: EventControl,
     execution: Option<crate::desktop_execution::ExecutionPort>,
+    /// Child-local observation is deliberately not inherited by a nested
+    /// child. A controlled attempt must never receive its grandchild's tool
+    /// activity under the parent's logical identity.
+    child_activity: Option<watch::Sender<Option<ChildToolActivity>>>,
+}
+
+/// A bounded, presentation-safe description of one child tool start. The
+/// control-plane owner assigns the durable sequence; this adapter only keeps
+/// the current tool's fixed fields outside model-visible result text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildToolActivity {
+    pub name: String,
+    pub detail: String,
 }
 #[derive(Clone)]
 pub enum EventSink {
     Legacy(mpsc::UnboundedSender<AgentEvent>),
+    /// The legacy TUI channel has no envelope metadata. Carry the current
+    /// child's public display identity here and convert its tool starts into
+    /// `SpawnActivity` before they enter the flat stream.
+    LegacyChild {
+        tx: mpsc::UnboundedSender<AgentEvent>,
+        display_name: String,
+        agent_type: String,
+        child_activity: Option<watch::Sender<Option<ChildToolActivity>>>,
+    },
     Bounded(DesktopEventSink),
 }
 
@@ -137,7 +159,16 @@ impl DesktopEventSink {
                 .map_or(&self.run_id, |child| &child.run_id)
                 .clone(),
         });
+        sink.child_activity = None;
         Ok(sink)
+    }
+
+    pub(crate) fn with_child_activity_observer(
+        mut self,
+        observer: watch::Sender<Option<ChildToolActivity>>,
+    ) -> Self {
+        self.child_activity = Some(observer);
+        self
     }
 
     pub fn with_execution(
@@ -210,6 +241,7 @@ impl DesktopEventSink {
                 tx,
                 control: control.clone(),
                 execution: None,
+                child_activity: None,
             },
             DesktopEventReceiver {
                 rx,
@@ -229,13 +261,111 @@ impl EventSink {
         let (sink, receiver, control) = DesktopEventSink::channel(run_id);
         (Self::Bounded(sink), receiver, control)
     }
+    pub(crate) fn child(&self, display_name: &str, agent_type: &str) -> Result<Self, EventFailure> {
+        match self {
+            Self::Bounded(sink) => Ok(Self::Bounded(sink.child()?)),
+            Self::Legacy(tx) | Self::LegacyChild { tx, .. } => Ok(Self::LegacyChild {
+                tx: tx.clone(),
+                display_name: display_name.to_owned(),
+                agent_type: agent_type.to_owned(),
+                child_activity: None,
+            }),
+        }
+    }
+
+    pub(crate) fn without_child_activity_observer(&self) -> Self {
+        match self {
+            Self::Legacy(tx) => Self::Legacy(tx.clone()),
+            Self::LegacyChild {
+                tx,
+                display_name,
+                agent_type,
+                ..
+            } => Self::LegacyChild {
+                tx: tx.clone(),
+                display_name: display_name.clone(),
+                agent_type: agent_type.clone(),
+                child_activity: None,
+            },
+            Self::Bounded(sink) => {
+                let mut sink = sink.clone();
+                sink.child_activity = None;
+                Self::Bounded(sink)
+            }
+        }
+    }
+
+    /// Observe only direct `ToolStarted` events for this child. The watch
+    /// channel keeps one latest bounded record rather than accumulating an
+    /// unbounded activity backlog.
+    pub(crate) fn with_child_activity_observer(
+        self,
+        observer: watch::Sender<Option<ChildToolActivity>>,
+    ) -> Self {
+        match self {
+            Self::Legacy(tx) => Self::LegacyChild {
+                tx,
+                display_name: "child".to_owned(),
+                agent_type: "unknown".to_owned(),
+                child_activity: Some(observer),
+            },
+            Self::LegacyChild {
+                tx,
+                display_name,
+                agent_type,
+                ..
+            } => Self::LegacyChild {
+                tx,
+                display_name,
+                agent_type,
+                child_activity: Some(observer),
+            },
+            Self::Bounded(sink) => Self::Bounded(sink.with_child_activity_observer(observer)),
+        }
+    }
     /// キュー空きを待たない。最初の失敗以後はenqueueしない。
     pub fn send(&self, event: AgentEvent) -> Result<(), EventFailure> {
-        let Self::Bounded(sink) = self else {
-            let Self::Legacy(tx) = self else {
-                unreachable!()
-            };
-            return tx.send(event).map_err(|_| EventFailure::ReceiverDropped);
+        let sink = match self {
+            Self::Legacy(tx) => {
+                return tx.send(event).map_err(|_| EventFailure::ReceiverDropped);
+            }
+            Self::LegacyChild {
+                tx,
+                display_name,
+                agent_type,
+                child_activity,
+            } => {
+                if let AgentEvent::ToolStarted { name, detail } = &event
+                    && let Some(observer) = child_activity
+                {
+                    observer.send_replace(Some(ChildToolActivity {
+                        name: name.clone(),
+                        detail: detail.clone(),
+                    }));
+                }
+                let visible = match event {
+                    AgentEvent::ToolStarted { name, detail } => AgentEvent::SpawnActivity {
+                        display_name: display_name.clone(),
+                        agent_type: agent_type.clone(),
+                        name,
+                        detail,
+                    },
+                    AgentEvent::SpawnStarted { .. } | AgentEvent::SpawnFinished { .. } => event,
+                    _ => return Ok(()),
+                };
+                return tx.send(visible).map_err(|_| EventFailure::ReceiverDropped);
+            }
+            Self::Bounded(sink) => {
+                if let AgentEvent::ToolStarted { name, detail } = &event
+                    && let Some(observer) = &sink.child_activity
+                {
+                    observer.send_replace(Some(ChildToolActivity {
+                        name: name.clone(),
+                        detail: detail.clone(),
+                    }));
+                }
+                sink
+            }
         };
         let shared = &sink.control.0;
         let mut state = shared.state.lock().unwrap();
@@ -390,6 +520,7 @@ mod tests {
         let (sink, mut rx, control) = DesktopEventSink::channel(RunId::new("root").unwrap());
         let sink = EventSink::from(sink.child().unwrap());
         let event = AgentEvent::SpawnFinished {
+            display_name: String::new(),
             agent_type: "x".repeat(MAX_EVENT_BYTES - std::mem::size_of::<AgentEvent>()),
             ok: true,
         };
@@ -401,6 +532,7 @@ mod tests {
 
     fn event() -> AgentEvent {
         AgentEvent::SpawnFinished {
+            display_name: "Sirius".into(),
             agent_type: "test".into(),
             ok: true,
         }
@@ -553,6 +685,7 @@ mod tests {
             let (tx, _rx, control) = channel();
             let failure = if oversized {
                 tx.send(AgentEvent::SpawnFinished {
+                    display_name: "Sirius".into(),
                     agent_type: "x".repeat(MAX_EVENT_BYTES + 1),
                     ok: true,
                 })
@@ -580,6 +713,7 @@ mod tests {
     fn oversized_spare_capacity_rejected_without_enqueue() {
         let (tx, mut rx, control) = channel();
         let huge = AgentEvent::SpawnFinished {
+            display_name: String::new(),
             agent_type: String::with_capacity(MAX_EVENT_BYTES + 1),
             ok: true,
         };
@@ -629,5 +763,80 @@ mod tests {
         }
         drop(rx);
         assert_eq!(tx.send(event()), Err(EventFailure::ReceiverDropped));
+    }
+
+    #[test]
+    fn legacy_child_exposes_only_named_tool_starts_to_the_tui() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let child = EventSink::Legacy(tx)
+            .child("Sirius", "file-reader")
+            .unwrap();
+        child
+            .send(AgentEvent::ToolStarted {
+                name: "read".to_string(),
+                detail: r#"{"path":"CURRENT.md"}"#.to_string(),
+            })
+            .unwrap();
+        child
+            .send(AgentEvent::ToolFinished {
+                name: "read".to_string(),
+                detail: String::new(),
+                ok: true,
+                result: String::new(),
+                diff: None,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::SpawnActivity {
+                display_name,
+                agent_type,
+                name,
+                ..
+            } if display_name == "Sirius" && agent_type == "file-reader" && name == "read"
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "tool finish must not add another row"
+        );
+    }
+
+    #[test]
+    fn child_activity_observer_keeps_only_the_direct_tool_start() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let child = EventSink::Legacy(tx)
+            .child("Sirius", "file-reader")
+            .unwrap();
+        let (activity_tx, activity_rx) = watch::channel(None);
+        let child = child.with_child_activity_observer(activity_tx);
+        child
+            .send(AgentEvent::ToolStarted {
+                name: "read".into(),
+                detail: "CURRENT.md".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            activity_rx.borrow().clone(),
+            Some(ChildToolActivity {
+                name: "read".into(),
+                detail: "CURRENT.md".into(),
+            })
+        );
+
+        let nested = child.child("Canopus", "file-reader").unwrap();
+        nested
+            .send(AgentEvent::ToolStarted {
+                name: "write".into(),
+                detail: "ignored".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            activity_rx.borrow().clone(),
+            Some(ChildToolActivity {
+                name: "read".into(),
+                detail: "CURRENT.md".into(),
+            })
+        );
     }
 }

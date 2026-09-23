@@ -20,6 +20,7 @@ enum Request {
         previous: Box<SavedWorkflow>,
         candidate: SavedWorkflow,
         tool_call_id: Option<String>,
+        gate_basis_hash: Option<String>,
         reply: Reply<()>,
     },
     /// M6-1: read the state window. Read-only, so a cancelled run may still
@@ -32,6 +33,21 @@ enum Request {
     /// marking are one commit, so the same instruction cannot be applied
     /// twice by the same attempt.
     TakeInstructions { reply: Reply<Vec<String>> },
+    PublishRoutineContract {
+        expected_workflow_revision: u64,
+        contract: crate::workflow::ChangeContractV1,
+        reply: Reply<crate::workflow::SessionWorkflow>,
+    },
+    PublishConvergence {
+        expected_workflow_revision: u64,
+        bundle: crate::verification::owner::VerifiedConvergenceBundleV1,
+        reply: Reply<crate::workflow::SessionWorkflow>,
+    },
+    ReadArtifact {
+        kind: crate::workflow::WorkflowArtifactKindV1,
+        reference: crate::workflow::ArtifactRefV1,
+        reply: Reply<serde_json::Value>,
+    },
 }
 
 impl Request {
@@ -40,6 +56,9 @@ impl Request {
             Self::Checkpoint { reply, .. } | Self::Confirm { reply, .. } => reply.is_closed(),
             Self::Window { reply, .. } => reply.is_closed(),
             Self::TakeInstructions { reply } => reply.is_closed(),
+            Self::PublishRoutineContract { reply, .. } => reply.is_closed(),
+            Self::PublishConvergence { reply, .. } => reply.is_closed(),
+            Self::ReadArtifact { reply, .. } => reply.is_closed(),
         }
     }
 
@@ -53,6 +72,15 @@ impl Request {
                 let _ = reply.send(Err(unavailable()));
             }
             Self::TakeInstructions { reply } => {
+                let _ = reply.send(Err(unavailable()));
+            }
+            Self::PublishRoutineContract { reply, .. } => {
+                let _ = reply.send(Err(unavailable()));
+            }
+            Self::PublishConvergence { reply, .. } => {
+                let _ = reply.send(Err(unavailable()));
+            }
+            Self::ReadArtifact { reply, .. } => {
                 let _ = reply.send(Err(unavailable()));
             }
         }
@@ -98,6 +126,7 @@ impl DesktopWorkflow {
         previous: SavedWorkflow,
         candidate: SavedWorkflow,
         tool_call_id: Option<String>,
+        gate_basis_hash: Option<String>,
     ) -> io::Result<()> {
         let (reply, response) = oneshot::channel();
         self.requests
@@ -106,6 +135,7 @@ impl DesktopWorkflow {
                 previous: Box::new(previous),
                 candidate: candidate.clone(),
                 tool_call_id,
+                gate_basis_hash,
                 reply,
             })
             .await
@@ -154,6 +184,63 @@ impl DesktopWorkflow {
         response
             .await
             .map_err(|_| io::Error::other("状態窓口の応答を確認できません"))?
+    }
+
+    pub async fn publish_and_approve_routine_contract(
+        &self,
+        expected_workflow_revision: u64,
+        contract: crate::workflow::ChangeContractV1,
+    ) -> io::Result<crate::workflow::SessionWorkflow> {
+        let (reply, response) = oneshot::channel();
+        self.requests
+            .send(Request::PublishRoutineContract {
+                expected_workflow_revision,
+                contract,
+                reply,
+            })
+            .await
+            .map_err(|_| io::Error::other("workflow artifactの所有者が終了しました"))?;
+        response
+            .await
+            .map_err(|_| io::Error::other("workflow artifactの保存状態が不明です"))?
+    }
+
+    pub async fn publish_convergence_trusted(
+        &self,
+        expected_workflow_revision: u64,
+        bundle: crate::verification::owner::VerifiedConvergenceBundleV1,
+    ) -> io::Result<crate::workflow::SessionWorkflow> {
+        let (reply, response) = oneshot::channel();
+        self.requests
+            .send(Request::PublishConvergence {
+                expected_workflow_revision,
+                bundle,
+                reply,
+            })
+            .await
+            .map_err(|_| io::Error::other("convergenceの保存所有者が終了しました"))?;
+        response
+            .await
+            .map_err(|_| io::Error::other("convergenceの保存状態が不明です"))?
+    }
+
+    pub async fn read_workflow_artifact(
+        &self,
+        kind: crate::workflow::WorkflowArtifactKindV1,
+        reference: crate::workflow::ArtifactRefV1,
+    ) -> io::Result<serde_json::Value> {
+        let (reply, response) = oneshot::channel();
+        self.requests
+            .send(Request::ReadArtifact {
+                kind,
+                reference,
+                reply,
+            })
+            .await
+            .map_err(|_| io::Error::other("workflow artifactの所有者が終了しました"))?;
+        response
+            .await
+            .map_err(|_| io::Error::other("workflow artifactの読取り結果を確認できません"))?
     }
 }
 
@@ -224,7 +311,10 @@ impl DesktopWorkflowOwner {
             if cancelled
                 && matches!(
                     &request,
-                    Request::Checkpoint { .. } | Request::TakeInstructions { .. }
+                    Request::Checkpoint { .. }
+                        | Request::TakeInstructions { .. }
+                        | Request::PublishRoutineContract { .. }
+                        | Request::PublishConvergence { .. }
                 )
             {
                 request.refuse();
@@ -248,6 +338,47 @@ impl DesktopWorkflowOwner {
                 Request::TakeInstructions { reply } => {
                     let _ = reply.send(self.take(store));
                 }
+                Request::PublishRoutineContract {
+                    expected_workflow_revision,
+                    contract,
+                    reply,
+                } => {
+                    let _ = reply.send(
+                        store
+                            .publish_and_approve_routine_contract(
+                                &self.target,
+                                expected_workflow_revision,
+                                contract,
+                            )
+                            .map_err(io::Error::other),
+                    );
+                }
+                Request::PublishConvergence {
+                    expected_workflow_revision,
+                    bundle,
+                    reply,
+                } => {
+                    let _ = reply.send(
+                        store
+                            .publish_convergence_trusted(
+                                &self.target,
+                                expected_workflow_revision,
+                                bundle,
+                            )
+                            .map_err(io::Error::other),
+                    );
+                }
+                Request::ReadArtifact {
+                    kind,
+                    reference,
+                    reply,
+                } => {
+                    let _ = reply.send(
+                        store
+                            .read_workflow_artifact(kind, &reference)
+                            .map_err(io::Error::other),
+                    );
+                }
                 Request::Confirm {
                     full_turn_suffix,
                     candidate,
@@ -268,6 +399,7 @@ impl DesktopWorkflowOwner {
                     previous,
                     candidate,
                     tool_call_id,
+                    gate_basis_hash,
                     reply,
                 } => {
                     let outcome = store
@@ -277,6 +409,7 @@ impl DesktopWorkflowOwner {
                             *previous,
                             candidate,
                             tool_call_id.as_deref(),
+                            gate_basis_hash.as_deref(),
                         )
                         .map_err(io::Error::other);
                     #[cfg(test)]

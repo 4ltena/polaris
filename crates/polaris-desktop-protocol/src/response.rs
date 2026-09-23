@@ -24,6 +24,7 @@ pub enum ErrorCode {
     RevisionConflict,
     SessionBusy,
     CapabilityUnavailable,
+    ReferenceUnavailable,
     StorageFailed,
     RecoveryRequired,
 }
@@ -46,12 +47,15 @@ pub enum Capability {
     AttachmentRead,
     RoleConfigure,
     SessionRead,
+    SessionManage,
     HistoryRead,
     DraftUpdate,
     SessionConfigure,
     WorkflowConfigure,
     RunStart,
     RunCancel,
+    InputCancel,
+    SubagentControl,
     ApprovalResolve,
     SourceApplyRead,
     SourceApplyResolve,
@@ -188,6 +192,197 @@ pub struct InstructionReceived {
 }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputAdmissionState {
+    Reserved,
+    Classifying,
+    Decided,
+    DestinationReady,
+    InputAppended,
+    RunQueued,
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRouteReason {
+    ExplicitCurrent,
+    ExplicitNew,
+    SameContext,
+    DistinctContext,
+    Ambiguous,
+    ClassifierUnavailable,
+    ClassifierInvalid,
+    Cancelled,
+    ApprovalReply,
+    ContextChanged,
+    CrashRecovery,
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputSubmitted {
+    pub manager_revision: DecimalU64,
+    pub session_revision: DecimalU64,
+    pub admission_id: AdmissionId,
+    pub input_hash: String,
+    pub route: crate::request::InputRoute,
+    pub state: InputAdmissionState,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub route_reason: Option<InputRouteReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub destination_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub run: Option<RunTarget>,
+}
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputStatusResult {
+    pub manager_revision: DecimalU64,
+    pub admission_id: AdmissionId,
+    pub source_session_id: SessionId,
+    pub state: InputAdmissionState,
+    pub session_revision: DecimalU64,
+    pub route: crate::request::InputRoute,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub route_reason: Option<InputRouteReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub destination_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub run: Option<RunTarget>,
+}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentWaitStateV2 {
+    Unchanged,
+    Updated,
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentWaitResult {
+    pub root_run_id: RunId,
+    pub root_attempt_id: AttemptId,
+    pub revision: DecimalU64,
+    pub cursor: DecimalU64,
+    pub state: SubagentWaitStateV2,
+    pub child_total: DecimalU64,
+    pub child_omitted: bool,
+    #[serde(deserialize_with = "bounded_subagent_attempts")]
+    pub children: Vec<crate::orchestration::SubagentAttemptSummaryV2>,
+}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentCancelDispositionV2 {
+    Requested,
+    AlreadyRequested,
+    AlreadyTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentRuntimeEffectV2 {
+    Unavailable,
+    Requested,
+    OutcomeUnknown,
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentCancelResult {
+    pub root_run_id: RunId,
+    pub root_attempt_id: AttemptId,
+    pub logical_child_id: LogicalChildId,
+    pub child_attempt_id: ChildAttemptId,
+    pub revision: DecimalU64,
+    pub cursor: DecimalU64,
+    pub disposition: SubagentCancelDispositionV2,
+    pub state: crate::orchestration::ChildControlStateV2,
+    pub runtime_effect: SubagentRuntimeEffectV2,
+}
+}
+
+fn bounded_subagent_attempts<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::orchestration::SubagentAttemptSummaryV2>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<crate::orchestration::SubagentAttemptSummaryV2>::deserialize(deserializer)?;
+    if values.len() > 32
+        || values.iter().any(|value| {
+            value.logical_child_id.is_empty()
+                || value.logical_child_id.len() > 128
+                || value.attempt_id.is_empty()
+                || value.attempt_id.len() > 128
+                || value.display_name.is_empty()
+                || value.display_name.len() > 128
+                || value.role.is_empty()
+                || value.role.len() > 128
+                || value.activity.as_ref().is_some_and(|text| text.len() > 512)
+        })
+    {
+        return Err(de::Error::custom(
+            "subagent wait projection exceeds its bound",
+        ));
+    }
+    Ok(values)
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionListEntry {
+    pub session_id: SessionId,
+    pub kind: crate::orchestration::ManagedSessionKindV2,
+    pub session_revision: DecimalU64,
+    pub goal_revision: DecimalU64,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub source_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub active_run: Option<RunTarget>,
+}
+}
+
+crate::object_wire! {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionListResult {
+    pub manager_revision: DecimalU64,
+    pub session_total: DecimalU64,
+    pub session_omitted: bool,
+    #[serde(deserialize_with = "bounded_session_entries")]
+    pub sessions: Vec<SessionListEntry>,
+}
+}
+
+fn bounded_session_entries<'de, D>(deserializer: D) -> Result<Vec<SessionListEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<SessionListEntry>::deserialize(deserializer)?;
+    if values.len() > 2 {
+        return Err(de::Error::custom("session entries exceed 2"));
+    }
+    Ok(values)
+}
+
 crate::object_wire! {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -288,6 +483,20 @@ pub enum SuccessResult {
     Hello(Hello),
     #[serde(rename = "session.open")]
     SessionOpen(Box<Snapshot>),
+    #[serde(rename = "session.list")]
+    SessionList(SessionListResult),
+    #[serde(rename = "session.select")]
+    SessionSelect(Box<Snapshot>),
+    #[serde(rename = "input.submit")]
+    InputSubmit(InputSubmitted),
+    #[serde(rename = "input.status")]
+    InputStatus(InputStatusResult),
+    #[serde(rename = "input.cancel")]
+    InputCancel(InputStatusResult),
+    #[serde(rename = "subagent.wait")]
+    SubagentWait(SubagentWaitResult),
+    #[serde(rename = "subagent.cancel")]
+    SubagentCancel(SubagentCancelResult),
     #[serde(rename = "session.snapshot")]
     SessionSnapshot(Box<Snapshot>),
     #[serde(rename = "session.subscribe")]
@@ -354,6 +563,13 @@ impl SuccessResult {
             Self::AttachmentRead(_) => Method::AttachmentRead,
             Self::SessionRolesConfigure(_) => Method::SessionRolesConfigure,
             Self::SessionOpen(_) => Method::SessionOpen,
+            Self::SessionList(_) => Method::SessionList,
+            Self::SessionSelect(_) => Method::SessionSelect,
+            Self::InputSubmit(_) => Method::InputSubmit,
+            Self::InputStatus(_) => Method::InputStatus,
+            Self::InputCancel(_) => Method::InputCancel,
+            Self::SubagentWait(_) => Method::SubagentWait,
+            Self::SubagentCancel(_) => Method::SubagentCancel,
             Self::SessionSnapshot(_) => Method::SessionSnapshot,
             Self::SessionSubscribe(_) => Method::SessionSubscribe,
             Self::HistoryPage(_) => Method::HistoryPage,
@@ -383,6 +599,21 @@ impl SuccessResult {
             Self::BrowseRead(_) => Method::BrowseRead,
         }
     }
+
+    fn requires_v2(&self) -> bool {
+        match self {
+            Self::SessionList(_)
+            | Self::SessionSelect(_)
+            | Self::InputSubmit(_)
+            | Self::InputStatus(_)
+            | Self::InputCancel(_) => true,
+            Self::SubagentWait(_) | Self::SubagentCancel(_) => true,
+            Self::SessionOpen(snapshot)
+            | Self::SessionSnapshot(snapshot)
+            | Self::SessionSubscribe(snapshot) => snapshot.orchestration.is_some(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,6 +626,7 @@ pub struct Response {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorrelationError {
+    ProtocolVersion,
     ClientId,
     RequestId,
     Method,
@@ -403,11 +635,19 @@ pub enum CorrelationError {
 impl Response {
     /// resultのtypeは元要求のmethodと一致する。失敗応答にも相関IDを要求する。
     pub fn validate_for(&self, request: &Request) -> Result<(), CorrelationError> {
+        if self.protocol_version != request.protocol_version {
+            return Err(CorrelationError::ProtocolVersion);
+        }
         if self.client_id != request.client_id {
             return Err(CorrelationError::ClientId);
         }
         if self.request_id != request.request_id {
             return Err(CorrelationError::RequestId);
+        }
+        if request.protocol_version == ProtocolVersion::V1
+            && self.outcome.as_ref().is_ok_and(SuccessResult::requires_v2)
+        {
+            return Err(CorrelationError::ProtocolVersion);
         }
         if let Ok(result) = &self.outcome
             && result.method() != request.body.method()
@@ -464,6 +704,49 @@ impl Response {
             return Err(CorrelationError::Method);
         }
         if let (
+            Ok(SuccessResult::SubagentWait(result)),
+            crate::request::RequestBody::SubagentWait(_, params),
+        ) = (&self.outcome, &request.body)
+            && (result.root_run_id != params.root_run_id
+                || result.root_attempt_id != params.root_attempt_id
+                || result.revision != params.expected_revision
+                || result.child_total.get() < result.children.len() as u64
+                || result.child_omitted
+                    != (result.child_total.get() != result.children.len() as u64)
+                || matches!(result.state, SubagentWaitStateV2::Unchanged)
+                    && !result.children.is_empty()
+                || result.children.iter().any(|child| {
+                    child.root_run_id != result.root_run_id
+                        || child.root_attempt_id != result.root_attempt_id
+                        || child.control_revision != result.revision
+                }))
+        {
+            return Err(CorrelationError::Method);
+        }
+        if let (
+            Ok(SuccessResult::SubagentCancel(result)),
+            crate::request::RequestBody::SubagentCancel(_, params),
+        ) = (&self.outcome, &request.body)
+            && (result.root_run_id != params.root_run_id
+                || result.root_attempt_id != params.root_attempt_id
+                || result.logical_child_id != params.logical_child_id
+                || result.child_attempt_id != params.child_attempt_id
+                || match result.disposition {
+                    SubagentCancelDispositionV2::Requested => {
+                        match params.expected_revision.checked_add(1) {
+                            Ok(expected) => result.revision != expected,
+                            Err(_) => true,
+                        }
+                    }
+                    SubagentCancelDispositionV2::AlreadyRequested
+                    | SubagentCancelDispositionV2::AlreadyTerminal => {
+                        result.revision != params.expected_revision
+                    }
+                })
+        {
+            return Err(CorrelationError::Method);
+        }
+        if let (
             Ok(
                 SuccessResult::McpCatalogCheck(crate::mcp_settings::McpCatalogChecked {
                     server_id,
@@ -488,7 +771,7 @@ impl Response {
         outcome: Result<SuccessResult, ProtocolError>,
     ) -> Result<Self, CorrelationError> {
         let response = Self {
-            protocol_version: ProtocolVersion,
+            protocol_version: request.protocol_version,
             client_id: request.client_id.clone(),
             request_id: request.request_id.clone(),
             outcome,
@@ -525,7 +808,12 @@ impl<'de> Deserialize<'de> for Response {
             serde_json::from_value(StrictValue::deserialize(d)?.0).map_err(de::Error::custom)?;
         let ResponseKind::Response = wire.kind;
         let outcome = match (wire.result, wire.error) {
-            (Some(result), None) => Ok(result),
+            (Some(result), None) => {
+                if wire.protocol_version == ProtocolVersion::V1 && result.requires_v2() {
+                    return Err(de::Error::custom("protocol v2 result on v1 frame"));
+                }
+                Ok(result)
+            }
             (None, Some(error)) => Err(error),
             _ => return Err(de::Error::custom("exactly one of result/error is required")),
         };

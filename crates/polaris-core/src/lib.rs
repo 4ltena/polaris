@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod agent;
+pub mod answer_finalizer;
 pub mod approval;
 pub mod audit;
 pub mod budget;
@@ -32,12 +33,15 @@ pub mod filemap;
 mod files_md;
 mod gitignore;
 pub mod input_preparation;
+#[cfg(target_os = "macos")]
+pub mod managed_runtime;
 pub mod measurement;
 #[cfg(unix)]
 pub mod os_home;
 pub mod preselect;
 pub mod preselection_corpus;
 pub mod project;
+pub mod project_analysis;
 /// Unix only: the call binds to an open directory FD and spawns a child.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod project_git;
@@ -48,16 +52,22 @@ pub mod resume;
 pub mod scratch_registry;
 pub mod secret_screen;
 pub mod session;
+pub mod session_manager;
 pub mod session_store;
 pub mod similarity;
 pub mod spare;
 pub mod spawn;
 pub mod stop;
 pub mod strict_provider;
+pub mod subagent_control;
 pub mod sync;
 pub mod tier;
 pub mod tool_memory;
+pub mod translation;
+pub mod turn_intent;
+pub mod verification;
 pub mod workflow;
+pub mod workflow_artifact_store;
 
 pub use events::{AgentEvent, Diff, DiffHunk, DiffLine, compute_diff};
 #[cfg(target_os = "macos")]

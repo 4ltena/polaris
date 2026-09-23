@@ -166,7 +166,9 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `audit.rs` — Append-only audit log. Not signed: in-process, the entity signing and the
 - `budget.rs` — Measurement of the always-on context. Numbers are backed by measurement,
 - `build_cache.rs` — What a project's build output may grow to, and what goes when it does.
+- `common_tests.rs` — A small, bounded black-box test schema and its confined runner.
 - `compaction.rs` — Automatic history summarization. Fires when the conversation's measured
+- `computer.rs` — Driving an application by naming the goal, not the pixels.
 - `config.rs` — Loads config files. Not existing is normal; being malformed is not.
 - `constitution.rs` — The part of the always-on context that the harness does not own. The
 - `conversation_memory.rs` — Publication boundary between the raw session marker and conversation indexes.
@@ -194,11 +196,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `lib.rs` — Entry point for polaris-core. Ties together the budget, constitution, and prompt modules.
 - `llama_server.rs` — Supervising the bundled `llama-server`.
 - `local_execution.rs` — Fixed local selections with endpoint-wide physical inference admission.
+- `managed_runtime.rs` — Package-trusted, read-only Python runtime image.
 - `mcp.rs` — Run-owned MCP connections, request context and local result retention.
 - `measurement.rs` — M8: what one comparison measurement leaves behind. Nothing here sends
+- `os_home.rs` — Trusted OS account home lookup. Never consults or changes the environment.
 - `preselect.rs` — Ranking candidates by embedding similarity — M10's second route.
 - `preselection_corpus.rs` — The fixed corpus every preselection comparison is measured against, and
 - `project.rs` — Resolves the project root.
+- `project_analysis.rs` — Minimal, state-driven bootstrap for a first-turn project analysis.
 - `project_git.rs` — A read-only git call against the user's own repository.
 - `prompt.rs` — The single place that assembles the set of things loaded every turn.
 - `recipe.rs` — M7c: the build recipes Polaris ships. A recipe is a fixed definition, not
@@ -206,16 +211,21 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `resume.rs` — M6-2b: whether a finished run should be continued without being asked.
 - `scratch_registry.rs` — M6-5: the private copies Polaris created, recorded so that a later start
 - `session.rs` — Request history with optional durable v2 storage or a v3 desktop owner port.
+- `session_manager.rs` — Durable, side-effect-free admission and multi-session scheduling state.
 - `session_store.rs` — Durable session attachment, generation checks, and tombstone-serialized writes.
 - `similarity.rs` — M7a-2: which registered project folders look like one another, and what
 - `spare.rs` — M7a-3: whether spare quota may be spent on refactoring nobody asked for.
 - `spawn.rs` — The `spawn` tool's implementation. Type discovery reuses
 - `stop.rs` — Stop conditions. No automatic recovery is attempted. Continuing to spin
 - `strict_provider.rs` — Dedicated summary-provider adapter and installation of the fixed local helper.
+- `subagent_control.rs` — Durable, side-effect-free control state for delegated agents.
 - `sync.rs` — M7b: sharing one project across devices. The project's own repository is
 - `tier.rs` — Deciding how much a delegated task is worth spending on.
 - `tool_memory.rs` — Opt-in recoverable tool-result retention; original output lives outside history.
+- `translation.rs` — Offline-only adapter for the pinned CAT-Translate 3.3B helper.
+- `turn_intent.rs` — What one user turn is, along several axes at once.
 - `workflow.rs` — Explicit workflow focus, independent of tool permissions and completion evidence.
+- `workflow_artifact_store.rs` — Private immutable bodies for the durable workflow artifact graph.
 - `workspace_apply.rs` — macOS file-only apply-back with retained originals and a durable intent journal.
 
 ## `crates/polaris-core/src/activity`
@@ -227,11 +237,25 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `input_preparation_tests.rs` — Request-boundary regressions for source-bound, host-only input preparation.
 - `mcp_dispatch.rs` — Borrow the run owner; model operations cannot construct settings or grants.
 - `skill_catalog.rs` — Request-local metadata-only optional skill catalog.
+- `verification.rs` — Parser boundary for the root-only verification tool.
+- `workflow_artifact.rs` — Parsing boundary for root workflow-artifact calls.
+- `workflow_context.rs` — Request-only projection of exact active workflow artifacts.
 - `workflow_control.rs` — Bounded model proposals; authority and publication stay with the host.
+
+## `crates/polaris-core/src/answer_finalizer`
+
+- `mod.rs` — Pure contracts for final-answer observation and, once separately activated,
+- `protected.rs` — Deterministic protected-span extraction and restoration.
+- `shadow.rs` — Host-owned shadow finalization journal and bounded worker.
+- `tests.rs` — Regression tests for answer finalization identities, evidence, and delivery policy.
 
 ## `crates/polaris-core/src/build_cache`
 
 - `tests.rs` — Each test names one thing that must hold before this is allowed to delete
+
+## `crates/polaris-core/src/computer`
+
+- `macos.rs` — The accessibility driver for macOS, through System Events.
 
 ## `crates/polaris-core/src/constitution`
 
@@ -308,6 +332,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/desktop_store`
 
 - `account.rs` — The registration a run was bound to when it was accepted. Evidence only:
+- `artifacts.rs` — Root-scoped immutable bodies for workflow artifacts.
 - `bootstrap.rs` — Bounded native-owner bootstrap reader. Validated metadata is not a runtime
 - `children.rs` — Bounded child ownership ledger. Child completion never accepts a task.
 - `disk.rs` — 公開prefixだけの検証と、両log同期後の単一marker置換。失敗注入は試験内に閉じる。
@@ -317,8 +342,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `mod.rs` — v3保存。単一writer、世代公開、要求台帳と復旧を提供する。
 - `model.rs` — P1値を共用する保存marker、付随状態、要求結果と明示的な保存エラー。
 - `roles.rs` — Durable role choices and past metadata observations, never runtime authorization.
+- `session_manager.rs` — Root-owned durable state for the two-session admission manager.
 - `source_apply.rs` — Controller-only evidence ledger. No filesystem authorization or dispatch.
 - `star_names.rs` — Stable display names for child runs.
+- `subagent_control.rs` — Durable, private owner storage for the typed subagent control plane.
 - `tests.rs` — S01〜S08の公開境界、要求台帳、復旧と実OS lockの回帰試験。
 - `workflow.rs` — Durable workflow evidence; never an execution grant or a disk skill loader.
 - `writer.rs` — TempDirの所有、writerのOS lock、対象別CASと実行意図・終端の公開をまとめる。
@@ -384,6 +411,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/desktop_store/tests`
 
+- `admission_tests.rs` — Admission append is one durable, replay-safe publication and isolates a
 - `details_tests.rs` — Run details show the saved turn of exactly the accepted run.
 - `mcp_tests.rs` — Durable MCP evidence, raw-call binding and uncertain-ACK recovery.
 - `prompt_tests.rs` — Host prompt acceptance, raw provenance and confirm-only recovery.
@@ -465,6 +493,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/mcp`
 
 - `apps.rs` — Built-in creative-app definitions (M2b). Every entry is unverified until a
+- `lease.rs` — Fail-closed leases for parent-captured MCP read evidence.
 - `local.rs` — CLI and TUI hosts: the same store, startup admission and setup tool as the
 - `operation.rs` — Host-bound MCP operation evidence.
 - `preselection.rs` — Host-owned tool preselection for one root run. BM25 narrows indexed
@@ -660,6 +689,22 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `tests.rs` — A local stub stands in for the service. No real endpoint is contacted.
 
+## `crates/polaris-core/src/verification`
+
+- `adapters.rs` — Fixed-shape adapters for registered static checks and Rust test listing.
+- `checkpoint.rs` — Durable, host-owned verification checkpoint metadata.
+- `mod.rs` — Pure, durable verification inputs and decisions.
+- `owner.rs` — Host-owned production port for the verification pipeline.
+- `pipeline.rs` — Bounded production bridge from immutable workflow artifacts to verification
+- `store.rs` — Private immutable verification records.
+- `tests.rs` — Regression tests for verification selection, execution, evidence, and convergence.
+
+## `crates/polaris-core/src/workflow`
+
+- `artifacts.rs` — Versioned workflow artifacts. Bodies are immutable; stores publish only
+- `context.rs` — Pure, bounded projection of the currently active workflow task.
+- `evidence.rs` — Deterministic evidence and convergence records for durable workflow gates.
+
 ## `crates/polaris-core/src/workspace_apply`
 
 - `tests.rs` — Conflict-safe apply-back, durable recovery artifacts, and failure injection tests.
@@ -683,6 +728,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `lib.rs` — Desktop IPCの値、有限byte列のcodec、純粋な受付・run遷移を定義する。I/Oや認可は行わない。
 - `local_models.rs` — Bounded inventory observations, never model availability or execution authority.
 - `mcp_settings.rs` — Host MCP registry and write-only secrets. Registry objects are validated by
+- `orchestration.rs` — Bounded, secret-free V2 desktop projection of orchestration state.
 - `request.rs` — M1の要求を専用paramsで表し、methodとsession対象の組合せをwire境界で検査する。
 - `response.rs` — 成功resultと9種のエラーを排他的に表し、要求IDとmethodへの対応を検査する。
 - `role_bindings.rs` — Durable local role choices. Values are metadata, never endpoint authority.
@@ -699,6 +745,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `boundaries.rs` — ID・u64の値境界、有限frameの全分割とEOF、不正UTF-8・JSON・深さ上限を検査する。
 - `browse.rs` — Home browsing wire: home-relative paths only and responses bound to the request.
 - `mcp_settings.rs` — Host MCP settings: registry objects pass through, secret values stay write-only.
+- `orchestration_v2.rs` — Wire compatibility tests for desktop orchestration snapshots and requests.
 - `run_details.rs` — run.details pages: bounded fragments and run correlation.
 - `run_transitions.rs` — 制御×状態の全表と取消・成功の両順序を検査し、同attemptの終端を保持する。
 - `source_apply.rs` — Source application wire contracts, correlation and bounded pagination tests.
@@ -719,13 +766,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `launch_arguments.rs` — Strict native launch metadata. Parsing performs no I/O or authorization.
 - `lib.rs` — Durable storage IPC and explicitly configured native-owner execution.
 - `memory_resources.rs` — Trusted-owner strict10 preflight. No project configuration or provider requests.
-- `os_home.rs` — Trusted OS account home lookup. Never consults or changes the environment.
 - `owner_launch.rs` — Trusted existing-store composition. No discovery, provisioning or replay.
 - `package_manifest.rs` — Fixed packaged execution-helper metadata, read only by the trusted launcher.
 - `production_source_factory.rs` — Trusted source recovery preparation; never source dispatch authority.
 - `recovery_base.rs` — Trusted startup-only recovery placement; never a source-write grant.
 - `recovery_socket.rs` — Fixed inherited endpoint setup, before runtime initialization or diagnostics.
 - `recovery_transport.rs` — Bounded result-only framing. Closing this transport does not stop its owner.
+- `shadow_finalizer.rs` — Compatibility surface for the shared answer-finalization owner.
 - `source_apply.rs` — Trusted, single-operation source-apply owner. No RPC or model authorization.
 - `source_apply_io.rs` — One owned source-I/O thread, without Writer access or dispatch authorization.
 - `startup.rs` — Production composition, owned until both IPC channels and engine have drained.
@@ -752,6 +799,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `real.rs` — Explicit trusted production integration; no provider discovery or source apply.
 - `role_bindings.rs` — Trusted next-run role metadata configuration. Runtime binding happens only
 - `run_details.rs` — `run.details`: one immutable details snapshot, paged by UTF-8-safe fragments.
+- `session_admission.rs` — Durable admission adapter for the existing desktop `run.start` surface.
 - `source_owner.rs` — Engine-owned source lifecycle. Only the I/O Job leaves the blocking owner;
 - `source_recovery.rs` — Trusted result-only ingress. The reactor holds a sender, never the Writer.
 - `source_view.rs` — Bounded saved source-apply pages; never a live job state or dispatch authority.
@@ -932,6 +980,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-provider/src/decision`
 
 - `jev.rs` — J-4: the HTTP client for a System One decider.
+- `semif.rs` — The local typed decider, over a pinned SemIf helper.
 - `tests.rs` — Types and checking only; nothing is sent.
 
 ## `crates/polaris-provider/src/decision/jev`
@@ -1065,7 +1114,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-tui/src`
 
 - `approver.rs` — The `Approver` that runs inside the TUI: draws a modal over the current
-- `clipboard.rs` — Copies text to the system clipboard via the OSC 52 terminal escape
+- `clipboard.rs` — Copies text to the system clipboard. macOS uses `/usr/bin/pbcopy`, whose
 - `continuation_tests.rs` — Shared continuation recovery through real raw/receipt owners and fake backends.
 - `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from
 - `input_preparation_tests.rs` — TUI initialization and cloned run ownership preserve request-only input preparation.

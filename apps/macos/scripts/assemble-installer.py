@@ -85,6 +85,7 @@ def main():
     parser.add_argument("--payload-app", type=Path)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--bundle-id", default="com.polaris.installer.local")
+    parser.add_argument("--disable-swiftpm-sandbox", action="store_true")
     arguments = parser.parse_args()
     if arguments.payload_app is None and arguments.service_helper is None:
         raise RuntimeError("service helperまたは組立て済みPolaris.appが必要です。")
@@ -103,6 +104,8 @@ def main():
                             "--destination", str(payload)]
                 if arguments.execution_helper is not None:
                     sys.argv.extend(["--execution-helper", str(arguments.execution_helper)])
+                if arguments.disable_swiftpm_sandbox:
+                    sys.argv.append("--disable-swiftpm-sandbox")
                 assembler.main()
             finally:
                 sys.argv = original

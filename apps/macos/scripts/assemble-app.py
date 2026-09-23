@@ -71,6 +71,7 @@ def main():
     parser.add_argument("--service-helper", type=Path, required=True)
     parser.add_argument("--execution-helper", type=Path)
     parser.add_argument("--destination", type=Path)
+    parser.add_argument("--disable-swiftpm-sandbox", action="store_true")
     arguments = parser.parse_args()
     # Validate before spending the Swift build slot. No Cargo build or discovery.
     validate_helper_argument(arguments.service_helper)
@@ -86,6 +87,8 @@ def main():
 
     command = ["swift", "build", "--package-path", str(package),
                "--scratch-path", str(scratch), "--configuration", "debug"]
+    if arguments.disable_swiftpm_sandbox:
+        command.append("--disable-sandbox")
     subprocess.run(command + ["--product", "PolarisDesktop"], check=True)
     binary_directory = Path(subprocess.check_output(command + ["--show-bin-path"], text=True).strip())
     executable = binary_directory / "PolarisDesktop"

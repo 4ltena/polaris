@@ -40,6 +40,7 @@ fn list_files(root: &Path) -> Vec<String> {
     let mut files: Vec<String> = stdout
         .lines()
         .map(str::to_string)
+        .filter(|path| root.join(path).is_file())
         .filter(|p| p.ends_with(".rs") || p.ends_with(".toml") || p.ends_with(".md"))
         .collect();
     files.sort();

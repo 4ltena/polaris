@@ -33,6 +33,8 @@ mod files_md;
 mod gitignore;
 pub mod input_preparation;
 pub mod measurement;
+#[cfg(unix)]
+pub mod os_home;
 pub mod preselect;
 pub mod preselection_corpus;
 pub mod project;

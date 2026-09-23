@@ -7,9 +7,7 @@ pub use startup::{StartedOwner, StartupError, start_owner};
 
 mod engine;
 #[cfg(unix)]
-mod os_home;
-#[cfg(unix)]
-pub use os_home::{TrustedHomeError, trusted_user_home};
+pub use polaris_core::os_home::{TrustedHomeError, trusted_user_home};
 #[cfg(target_os = "macos")]
 mod owner_launch;
 #[cfg(target_os = "macos")]

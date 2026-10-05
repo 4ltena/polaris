@@ -545,7 +545,9 @@ mod native {
         loop {
             let now = Instant::now();
             let owned = owner.owned.as_mut().expect("owner");
-            if !exited && owned.status.is_none() {
+            // The existing deferred-reap test hook also covers this probe,
+            // which now consumes status through the sole owning Child.
+            if !timing.defer_reap && !exited && owned.status.is_none() {
                 match exited_without_reap(owned) {
                     Ok(true) => {
                         exited = true;

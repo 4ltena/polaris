@@ -8,8 +8,7 @@ AGENTS.md
 /scripts/__pycache__/
 
 # Local planning and handoff documents
-/docs/superpowers/
-/.superpowers/
+/.project-notes/
 
 # Credentials. Never committed, never shared, never read by a tool:
 # `path_policy` denies `.env` and any `.env.*`, and the sync manifest
@@ -17,3 +16,7 @@ AGENTS.md
 .env
 .env.*
 !.env.example
+
+/docs/superpowers/
+
+/.superpowers/

@@ -42,7 +42,7 @@ impl ProjectAnalysisState {
             return Self::Repository;
         };
         for candidate in [
-            "docs/superpowers/CURRENT.md",
+            ".project-notes/CURRENT.md",
             "CURRENT.md",
             ".polaris/notes/CURRENT.md",
         ] {
@@ -181,13 +181,14 @@ mod tests {
     #[test]
     fn a_first_project_analysis_uses_current_before_filemap() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("docs/superpowers")).unwrap();
-        std::fs::write(root.path().join("docs/superpowers/CURRENT.md"), "current").unwrap();
+        std::fs::create_dir_all(root.path().join(".project-notes")).unwrap();
+        std::fs::write(root.path().join(".project-notes/CURRENT.md"), "current").unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
         std::fs::write(root.path().join("docs/filemap.md"), "filemap").unwrap();
         assert_eq!(
             ProjectAnalysisState::resolve(Some(root.path()), "このプロジェクトを分析する", true),
             ProjectAnalysisState::Current {
-                source: "docs/superpowers/CURRENT.md".into()
+                source: ".project-notes/CURRENT.md".into()
             }
         );
     }

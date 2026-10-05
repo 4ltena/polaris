@@ -701,7 +701,6 @@ impl RunRuntime {
 }
 
 #[cfg(test)]
-#[path = "runtime/tests/fixture.rs"]
-pub(crate) mod test_fixture;
+pub(crate) use polaris_mcp::test_support as test_fixture;
 #[cfg(test)]
 mod tests;

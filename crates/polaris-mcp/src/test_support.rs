@@ -1,5 +1,5 @@
 //! Loopback-only, scripted MCP server. No credentials or production endpoint.
-use polaris_mcp::registration::*;
+use crate::registration::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::{
@@ -11,7 +11,7 @@ use tokio::{
     net::TcpListener,
 };
 
-pub(crate) async fn server_fixture(
+pub async fn server_fixture(
     delay_method: &'static str,
 ) -> (Server, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     server_fixture_with_tool_reply(
@@ -21,7 +21,7 @@ pub(crate) async fn server_fixture(
     .await
 }
 
-pub(crate) async fn server_fixture_with_tool_reply(
+pub async fn server_fixture_with_tool_reply(
     delay_method: &'static str,
     tool_reply: Value,
 ) -> (Server, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
@@ -33,7 +33,7 @@ pub(crate) async fn server_fixture_with_tool_reply(
     .await
 }
 
-pub(crate) async fn server_fixture_with_replies(
+pub async fn server_fixture_with_replies(
     delay_method: &'static str,
     tool_reply: Value,
     tools: Value,
@@ -41,7 +41,7 @@ pub(crate) async fn server_fixture_with_replies(
     server_fixture_with_failures(delay_method, tool_reply, tools, "", Vec::new()).await
 }
 
-pub(crate) async fn server_fixture_with_failures(
+pub async fn server_fixture_with_failures(
     delay_method: &'static str,
     tool_reply: Value,
     tools: Value,

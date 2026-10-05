@@ -8,6 +8,8 @@ pub mod content;
 pub mod registration;
 pub mod store;
 mod template;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod transport;
 pub use transport::{
     BoundOperation, Connection, OperationBinding, OperationFailure, OperationProgress,

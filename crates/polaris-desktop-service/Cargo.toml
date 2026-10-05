@@ -24,6 +24,7 @@ thiserror.workspace = true
 libc = "=0.2.189"
 
 [dev-dependencies]
+polaris-mcp = { path = "../polaris-mcp", features = ["test-support"] }
 polaris-core = { path = "../polaris-core", features = ["execution-test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

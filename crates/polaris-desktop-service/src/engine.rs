@@ -5,8 +5,7 @@ pub use local_models::probe_local_models;
 #[cfg(target_os = "macos")]
 mod mcp_catalog;
 #[cfg(all(test, target_os = "macos"))]
-#[path = "../../polaris-core/src/mcp/runtime/tests/fixture.rs"]
-mod mcp_fixture;
+use polaris_mcp::test_support as mcp_fixture;
 #[cfg(target_os = "macos")]
 mod mcp_settings;
 #[cfg(target_os = "macos")]

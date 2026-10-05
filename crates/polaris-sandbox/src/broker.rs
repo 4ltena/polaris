@@ -287,6 +287,7 @@ mod tests {
     fn serializes_a_correlated_request_and_returns_the_outcome() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = config(&dir);
+        let expected_program = std::fs::canonicalize("/bin/sh").expect("canonical fixture program");
         let listener = UnixListener::bind(&config.socket_path).expect("listener");
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
@@ -296,7 +297,10 @@ mod tests {
             let request: serde_json::Value = serde_json::from_str(&line).expect("json");
             assert_eq!(request["version"], 1);
             assert_eq!(request["mode"], "read-only");
-            assert_eq!(request["program"], "/bin/sh");
+            assert_eq!(
+                request["program"],
+                expected_program.to_str().expect("fixture path")
+            );
             assert_eq!(request["args"], serde_json::json!(["-c", "echo brokered"]));
             let request_id = request["request_id"].as_str().expect("request id");
             let reply = serde_json::json!({

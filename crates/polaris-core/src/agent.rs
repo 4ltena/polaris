@@ -1933,6 +1933,7 @@ pub(crate) async fn run_loop(
                     && let Some(verification) = &mut workflow.gates.verification
                 {
                     verification.stale = true;
+                    workflow_control::publish_observed_gates(session).await?;
                 }
                 mcp_dispatch::event(events.as_ref(), call, None);
                 check_event_delivery(events.as_ref())?;
@@ -2424,6 +2425,7 @@ pub(crate) async fn run_loop(
                 && let Some(verification) = &mut workflow.gates.verification
             {
                 verification.stale = true;
+                workflow_control::publish_observed_gates(session).await?;
             }
             let result: &str = match &outcome {
                 Ok(body) => body.as_str(),

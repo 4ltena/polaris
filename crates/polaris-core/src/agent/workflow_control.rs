@@ -121,6 +121,18 @@ pub(super) fn get(session: &Session) -> String {
     snapshot(session, "current")
 }
 
+/// Observed proof invalidation is acknowledged by the same owner as phase
+/// transitions, including when the tool later fails or its outcome is unknown.
+pub(super) async fn publish_observed_gates(session: &mut Session) -> Result<(), AgentError> {
+    if session.desktop_workflow.is_some()
+        && let Some(workflow) = session.workflow.as_ref().filter(|w| w.config.enabled)
+    {
+        let state = workflow.state();
+        session.publish_workflow(&state, None).await?;
+    }
+    Ok(())
+}
+
 /// Answered by the run owner from the published state; the worker holds no
 /// store and keeps only the revision it was last given.
 pub(super) async fn window(session: &Session, since: Option<u64>) -> Result<String, String> {

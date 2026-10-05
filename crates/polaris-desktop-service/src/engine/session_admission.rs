@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 pub(super) struct AdmissionOwner {
     store: SessionManagerStore,
     state: SessionManagerV1,
+    deferred_observation: Option<(SessionId, u64, u64)>,
     #[cfg(test)]
     current: SessionId,
 }
@@ -90,6 +91,8 @@ impl AdmissionOwner {
         }
 
         let expected = state.revision;
+        let mut deferred_observation = None;
+        let before_observation = state.clone();
         state
             .observe_session_revisions(
                 &current,
@@ -99,11 +102,26 @@ impl AdmissionOwner {
             )
             .map_err(admission_restore_error)?;
         if state.revision != expected {
-            store.persist(expected, &state)?;
+            match store.persist_observed(
+                expected,
+                &state,
+                &current,
+                session_revision.get(),
+                goal_revision.get(),
+            ) {
+                Ok(()) => {}
+                Err(StoreError::Capacity(_)) => {
+                    state = before_observation;
+                    deferred_observation =
+                        Some((current.clone(), session_revision.get(), goal_revision.get()));
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(Self {
             store,
             state,
+            deferred_observation,
             #[cfg(test)]
             current,
         })
@@ -148,7 +166,11 @@ impl AdmissionOwner {
             .submit(request, before)
             .map_err(admission_store_error)?;
         if !idempotent {
-            self.store.persist(before, &self.state)?;
+            self.store.persist_submission(
+                before,
+                &self.state,
+                &std::collections::BTreeMap::from([(self.current.clone(), 0)]),
+            )?;
         }
         self.route_current_fallback(&admission.id)?;
         Ok(admission.id)
@@ -170,6 +192,7 @@ impl AdmissionOwner {
         attachment_ids: &[polaris_desktop_protocol::ids::AttachmentId],
         admission_id: Option<&WireAdmissionId>,
         text: &str,
+        receipt_counts: &std::collections::BTreeMap<SessionId, usize>,
     ) -> Result<(AdmissionId, bool), StoreError> {
         let parent = SessionId::new(parent.as_str()).map_err(admission_store_error)?;
         let request = SubmitRequestV1 {
@@ -212,33 +235,54 @@ impl AdmissionOwner {
             return Err(StoreError::CasConflict("submission context"));
         }
         let before = expected_manager_revision.get();
-        let SubmitOutcomeV1::Accepted {
-            admission,
-            idempotent,
-        } = self
-            .state
-            .submit(request, before)
-            .map_err(admission_store_error)?;
-        if !idempotent {
-            self.store.persist(before, &self.state)?;
+        if self.state.revision != before {
+            return Err(StoreError::CasConflict("session manager"));
         }
+        let original = self.state.clone();
+        let accepted = (|| {
+            self.state
+                .observe_session_revisions(
+                    &parent,
+                    before,
+                    expected_session_revision.get(),
+                    expected_goal_revision.get(),
+                )
+                .map_err(admission_store_error)?;
+            let SubmitOutcomeV1::Accepted {
+                admission,
+                idempotent,
+            } = self
+                .state
+                .submit(request, self.state.revision)
+                .map_err(admission_store_error)?;
+            if !idempotent {
+                self.store.persist_observed_submission(
+                    before,
+                    &self.state,
+                    receipt_counts,
+                    &parent,
+                    expected_session_revision.get(),
+                    expected_goal_revision.get(),
+                )?;
+            }
+            Ok::<_, StoreError>((admission, idempotent))
+        })();
+        let (admission, idempotent) = match accepted {
+            Ok(result) => result,
+            Err(error) => {
+                self.state = original;
+                return Err(error);
+            }
+        };
         if idempotent {
             return Ok((admission.id, false));
         }
-        // The client-provided manager revision guards the admission ACK above.
-        // After that commit, publish the writer revisions observed in the same
-        // request before any route decision checks its submission context.
-        let before = self.state.revision;
-        self.state
-            .observe_session_revisions(
-                &parent,
-                before,
-                expected_session_revision.get(),
-                expected_goal_revision.get(),
-            )
-            .map_err(admission_store_error)?;
-        if self.state.revision != before {
-            self.store.persist(before, &self.state)?;
+        if self
+            .deferred_observation
+            .as_ref()
+            .is_some_and(|(session, _, _)| session == &parent)
+        {
+            self.deferred_observation = None;
         }
         if route == InputRoute::Auto {
             let saved = self
@@ -347,7 +391,13 @@ impl AdmissionOwner {
             .observe_session_revisions(session, before, session_revision.get(), goal_revision.get())
             .map_err(admission_restore_error)?;
         if self.state.revision != before {
-            self.store.persist(before, &self.state)?;
+            self.store.persist_observed(
+                before,
+                &self.state,
+                session,
+                session_revision.get(),
+                goal_revision.get(),
+            )?;
         }
         Ok(())
     }
@@ -362,6 +412,67 @@ impl AdmissionOwner {
             .clone();
         if !matches!(admission.state, AdmissionState::Reserved) {
             return Ok(false);
+        }
+        if let Some((session, session_revision, goal_revision)) = self
+            .deferred_observation
+            .clone()
+            .filter(|(session, _, _)| session == &admission.parent_session)
+        {
+            let before = self.state.revision;
+            let original = self.state.clone();
+            let resumed = (|| {
+                self.state
+                    .observe_session_revisions(&session, before, session_revision, goal_revision)
+                    .map_err(admission_store_error)?;
+                let before_transition = self.state.revision;
+                if session_revision != admission.payload.expected_session_revision
+                    || goal_revision != admission.payload.expected_goal_revision
+                {
+                    self.state
+                        .decide_context_changed(id, before_transition, admission.revision)
+                        .map_err(admission_store_error)?;
+                } else if admission.payload.route == DestinationMode::Auto {
+                    self.state
+                        .begin_classification(id, before_transition, admission.revision)
+                        .map_err(admission_store_error)?;
+                } else {
+                    self.state
+                        .decide(
+                            id,
+                            before_transition,
+                            admission.revision,
+                            None,
+                            false,
+                            false,
+                        )
+                        .map_err(admission_store_error)?;
+                }
+                self.store.persist_observed(
+                    before,
+                    &self.state,
+                    &session,
+                    session_revision,
+                    goal_revision,
+                )
+            })();
+            if let Err(error) = resumed {
+                self.state = original;
+                return Err(error);
+            }
+            self.deferred_observation = None;
+            let saved = self
+                .state
+                .status(id)
+                .map_err(admission_store_error)?
+                .clone();
+            if matches!(saved.state, AdmissionState::Decided { .. }) {
+                let before = self.state.revision;
+                self.state
+                    .prepare_destination(id, before, saved.revision)
+                    .map_err(admission_store_error)?;
+                self.store.persist(before, &self.state)?;
+            }
+            return Ok(matches!(saved.state, AdmissionState::Classifying));
         }
         if admission.payload.route == DestinationMode::Auto {
             let before = self.state.revision;
@@ -432,7 +543,11 @@ impl AdmissionOwner {
             .submit(request, before)
             .map_err(admission_store_error)?;
         if !idempotent {
-            self.store.persist(before, &self.state)?;
+            self.store.persist_submission(
+                before,
+                &self.state,
+                &std::collections::BTreeMap::from([(self.current.clone(), 0)]),
+            )?;
         }
         self.route(&admission.id, Some(judgement))?;
         Ok(admission.id)
@@ -563,6 +678,11 @@ impl AdmissionOwner {
             .terminal(id, before, admission.revision, status)
             .map_err(admission_store_error)?;
         self.store.persist(before, &self.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn persisted_state(&self) -> Result<Option<SessionManagerV1>, StoreError> {
+        self.store.load()
     }
 
     pub(super) fn summary(&self) -> SessionManagerSummaryV2 {
@@ -754,7 +874,13 @@ impl AdmissionOwner {
             )
             .map_err(admission_store_error)?;
         if self.state.revision != before {
-            self.store.persist(before, &self.state)?;
+            self.store.persist_observed(
+                before,
+                &self.state,
+                &self.current,
+                session_revision.get(),
+                goal_revision.get(),
+            )?;
         }
         Ok(())
     }
@@ -894,6 +1020,8 @@ fn admission_store_error(error: AdmissionError) -> StoreError {
         }
         AdmissionError::UnknownSession | AdmissionError::UnknownAdmission => StoreError::NotFound,
         AdmissionError::AdmissionCollision => StoreError::RequestConflict,
+        AdmissionError::Capacity(kind) => StoreError::Capacity(kind),
+        AdmissionError::OutcomeUnknown => StoreError::RecoveryRequired,
         _ => StoreError::Corrupt("session manager transition"),
     }
 }
@@ -995,7 +1123,8 @@ mod tests {
         assert_eq!(summary.session_count.get(), 2);
         assert_eq!(summary.sidechat, SidechatStateV2::Full);
         assert_eq!(summary.active_runs.get(), 0);
-        assert_eq!(summary.queued_admissions.get(), 0);
+        // Submission stays queued until it starts or is cancelled.
+        assert_eq!(summary.queued_admissions.get(), 1);
     }
 
     #[test]

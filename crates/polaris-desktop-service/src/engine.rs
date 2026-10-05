@@ -2341,6 +2341,30 @@ impl Engine {
             .goal
             .as_ref()
             .map_or(DecimalU64::new(0), |goal| goal.revision);
+        let mut receipt_counts = std::collections::BTreeMap::new();
+        receipt_counts.insert(
+            polaris_core::session_manager::SessionId::new(source.as_str())
+                .map_err(|_| error(ErrorCode::StorageFailed))?,
+            source_snapshot
+                .state
+                .runs
+                .iter()
+                .filter(|run| run.admission.is_some())
+                .count(),
+        );
+        if let Some(other) = self.other_lane.as_ref() {
+            let saved = other.store.snapshot().map_err(store_error)?;
+            receipt_counts.insert(
+                polaris_core::session_manager::SessionId::new(other.session.as_str())
+                    .map_err(|_| error(ErrorCode::StorageFailed))?,
+                saved
+                    .state
+                    .runs
+                    .iter()
+                    .filter(|run| run.admission.is_some())
+                    .count(),
+            );
+        }
         let (id, needs_classification) = self
             .admission
             .as_mut()
@@ -2356,6 +2380,7 @@ impl Engine {
                 attachment_ids,
                 admission_id,
                 text,
+                &receipt_counts,
             )
             .map_err(store_error)?;
         if needs_classification {
@@ -3678,6 +3703,7 @@ fn error(code: ErrorCode) -> ProtocolError {
             ErrorCode::CapabilityUnavailable => "このserviceでは利用できません",
             ErrorCode::ReferenceUnavailable => "参照入力はこのserviceでは利用できません",
             ErrorCode::StorageFailed | ErrorCode::RecoveryRequired => "保存状態を確認できません",
+            ErrorCode::Capacity => "保存容量が不足しています。新しい入力は受け付けていません",
             ErrorCode::NotFound => "対象がありません",
             _ => "要求を受け付けられません",
         }
@@ -3694,6 +3720,7 @@ fn store_error(error_value: StoreError) -> ProtocolError {
         StoreError::TargetMismatch => ErrorCode::PermissionDenied,
         StoreError::UnsupportedMethod => ErrorCode::CapabilityUnavailable,
         StoreError::RecoveryRequired => ErrorCode::RecoveryRequired,
+        StoreError::Capacity(_) => ErrorCode::Capacity,
         _ => ErrorCode::StorageFailed,
     })
 }

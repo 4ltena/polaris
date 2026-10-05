@@ -27,6 +27,7 @@ pub enum ErrorCode {
     ReferenceUnavailable,
     StorageFailed,
     RecoveryRequired,
+    Capacity,
 }
 
 crate::object_wire! {

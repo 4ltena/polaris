@@ -358,21 +358,24 @@ mod tests {
             .unwrap();
         e.store.finish(&t, Observation::Succeeded, result).unwrap();
         let source = SourceApplyIdentity {
-            device: DecimalU64::new(1),
-            inode: DecimalU64::new(2),
+            device: DecimalU64::new(11),
+            inode: DecimalU64::new(13),
         };
         let recovery = SourceApplyIdentity {
-            device: DecimalU64::new(1),
-            inode: DecimalU64::new(3),
+            device: DecimalU64::new(11),
+            inode: DecimalU64::new(16),
         };
         let payload = SourceApplyPayload {
-            source_path: "/synthetic-source".into(),
+            source_path: "/legacy/source".into(),
             source_identity: source,
-            recovery_parent_path: "/synthetic-recovery".into(),
+            recovery_parent_path: "/legacy/recovery".into(),
             recovery_parent_identity: recovery,
             entries: vec![SourceApplyEntry {
                 relative_path: "file.txt".into(),
-                before: None,
+                before: Some(SourceApplyVersion {
+                    hash: "b".repeat(64),
+                    mode: 0o600,
+                }),
                 after: Some(SourceApplyVersion {
                     hash: "a".repeat(64),
                     mode: 0o600,
@@ -417,6 +420,15 @@ mod tests {
             relative_path: "file.txt".into(),
             before: before.then(version),
             after: after.then(version),
+        }
+    }
+
+    fn source_guard(engine: &Engine) -> SourceApplyGuard {
+        let snapshot = engine.store.snapshot().unwrap();
+        SourceApplyGuard {
+            expected_session_revision: snapshot.marker.session_revision,
+            expected_policy_revision: snapshot.state.policy_revision,
+            now_ms: 1,
         }
     }
 
@@ -471,6 +483,100 @@ mod tests {
             result.status,
             source_apply::SourceApplyResultStatus::Applied
         );
+        assert_eq!(result.installed_count, DecimalU64::new(1));
+        assert_eq!(result.deleted_count, DecimalU64::new(0));
+        assert_eq!(result.restored_count, DecimalU64::new(0));
+    }
+
+    #[test]
+    fn source_apply_v1_fixture_survives_store_reopen_and_service_list() {
+        let report: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../polaris-core/tests/fixtures/workspace-apply-report-v1.json"
+        ))
+        .unwrap();
+        let saved = saved_report(report);
+        let expected_report_bytes = serde_json::to_vec(&saved.report).unwrap();
+        let (root, mut engine, candidate) = fixture();
+        let target = RunTarget {
+            run_id: candidate.run_id.clone(),
+            attempt_id: candidate.attempt_id.clone(),
+        };
+        let proof = SourceApplyIdentityProof {
+            source: candidate.payload.source_identity,
+            recovery_parent: candidate.payload.recovery_parent_identity,
+        };
+        let guard = source_guard(&engine);
+        engine
+            .store
+            .resolve_source_apply(
+                &target,
+                &candidate.approval_id,
+                ApprovalDecision::Allow,
+                guard,
+            )
+            .unwrap();
+        let guard = source_guard(&engine);
+        engine
+            .store
+            .consume_source_apply_intent(
+                &target,
+                &candidate.approval_id,
+                &candidate.payload_hash,
+                guard,
+                proof,
+            )
+            .unwrap();
+        let revision = engine.store.snapshot().unwrap().marker.session_revision;
+        engine
+            .store
+            .record_source_apply_result(&target, &candidate.operation_id, revision, saved.clone())
+            .unwrap();
+        drop(engine);
+
+        let mut reopened = Engine::reopen(&root, Options::default()).unwrap();
+        let persisted = reopened.store.snapshot().unwrap();
+        let persisted_result = persisted.state.source_applies[0].result.as_ref().unwrap();
+        assert_eq!(persisted_result.result_id, saved.result_id);
+        assert_eq!(
+            serde_json::to_vec(&persisted_result.report).unwrap(),
+            expected_report_bytes
+        );
+        reopened
+            .handle(&req("reopen-hello", RequestBody::Hello), &mut vec![])
+            .unwrap();
+        let session = reopened.session.clone();
+        let list_revision = reopened.store.snapshot().unwrap().marker.session_revision;
+        let list = reopened
+            .handle(
+                &req(
+                    "legacy-list",
+                    RequestBody::SourceApplyList(
+                        session,
+                        request::SourceApplyList {
+                            expected_session_revision: list_revision,
+                            offset: DecimalU64::new(0),
+                            limit: request::PageLimit::new(32).unwrap(),
+                        },
+                    ),
+                ),
+                &mut vec![],
+            )
+            .unwrap();
+        let SuccessResult::SourceApplyList(list) = list else {
+            panic!("wrong result")
+        };
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].approval_id, candidate.approval_id);
+        assert_eq!(list.items[0].entry_count, DecimalU64::new(1));
+        assert!(list.items[0].intent_committed);
+        assert!(list.items[0].result_saved);
+        let result = list.items[0].result.as_ref().unwrap();
+        assert_eq!(result.result_id, saved.result_id);
+        assert_eq!(
+            result.status,
+            source_apply::SourceApplyResultStatus::Applied
+        );
+        assert_eq!(result.failure_kind, None);
         assert_eq!(result.installed_count, DecimalU64::new(1));
         assert_eq!(result.deleted_count, DecimalU64::new(0));
         assert_eq!(result.restored_count, DecimalU64::new(0));

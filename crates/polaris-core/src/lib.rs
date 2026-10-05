@@ -45,6 +45,8 @@ pub mod project_analysis;
 /// Unix only: the call binds to an open directory FD and spawns a child.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod project_git;
+#[cfg(unix)]
+pub mod project_mutation;
 pub mod prompt;
 pub mod recipe;
 pub mod request_input;

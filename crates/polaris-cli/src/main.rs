@@ -1615,6 +1615,7 @@ fn prepare_continuation(
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 fn strict_history(
     config: &polaris_core::config::EmbeddingConfig,
     runtime_home: &Path,
@@ -1700,6 +1701,24 @@ fn strict_history(
         usage,
     ))
 }
+#[cfg(target_os = "linux")]
+fn strict_history(
+    _config: &polaris_core::config::EmbeddingConfig,
+    _runtime_home: &Path,
+    _provider_name: &str,
+    _private_root: &Path,
+    _attempt_ledger: polaris_provider::attempts::AttemptLedger,
+    _parent_id: &str,
+    _decider: Option<std::sync::Arc<dyn polaris_provider::decision::Decider>>,
+) -> Result<
+    (
+        std::sync::Arc<polaris_core::conversation_memory::StrictHistory>,
+        polaris_provider::UsageMeter,
+    ),
+    String,
+> {
+    Err("strict10の読取専用runtime imageはこの環境で利用できません".into())
+}
 
 #[cfg(target_os = "macos")]
 fn managed_runtime_home() -> Result<PathBuf, String> {
@@ -1707,6 +1726,7 @@ fn managed_runtime_home() -> Result<PathBuf, String> {
         .map_err(|error| format!("管理runtimeのOSユーザホームを特定できません: {error}"))
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
 fn build_strict_history(
     summary: std::sync::Arc<dyn polaris_core::conversation_memory::StrictSummaryProvider>,
     embedder: std::sync::Arc<dyn polaris_core::conversation_memory::StrictEmbedder>,

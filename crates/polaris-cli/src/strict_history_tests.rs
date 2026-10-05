@@ -234,3 +234,33 @@ async fn cli_strict_history_passes_its_decider_to_related_summary_ranking() {
         "related candidates were not judged"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_strict_history_refuses_before_provider_or_runtime_state() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime_home = root.path().join("runtime-home");
+    let private_root = root.path().join("private-state");
+    let config = polaris_core::config::EmbeddingConfig {
+        model_path: Some(root.path().join("model")),
+        revision: Some("fixture-revision".into()),
+        ..Default::default()
+    };
+    let error = super::strict_history(
+        &config,
+        &runtime_home,
+        "never-provider-fixture",
+        &private_root,
+        polaris_provider::attempts::AttemptLedger::default(),
+        "fixture-parent",
+        None,
+    )
+    .err()
+    .expect("Linux has no verified runtime image");
+    assert_eq!(
+        error,
+        "strict10の読取専用runtime imageはこの環境で利用できません"
+    );
+    assert!(!runtime_home.exists());
+    assert!(!private_root.exists());
+}

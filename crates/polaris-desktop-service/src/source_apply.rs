@@ -4,14 +4,16 @@
 //! Retain this controller on every ambiguous save; never drop its receipt/copy or
 //! recovery FDs merely because a request/future disappeared. Recovery is explicit.
 use crate::TrustedRunCompletion;
+#[cfg(not(target_os = "linux"))]
+use polaris_core::{desktop_store::SourceApplyResult, workspace_apply::protected_apply_pinned};
 use polaris_core::{
     desktop_store::{
         Acceptance, IntentReceipt, SourceApplyCandidate, SourceApplyEntry, SourceApplyGuard,
-        SourceApplyIdentity, SourceApplyIdentityProof, SourceApplyPayload, SourceApplyResult,
-        SourceApplyVersion, StoreError, Writer,
+        SourceApplyIdentity, SourceApplyIdentityProof, SourceApplyPayload, SourceApplyVersion,
+        StoreError, Writer,
     },
     isolated_workspace::{ChangeSet, Limits, ManifestEntry, protected_collect_changes},
-    workspace_apply::{ApplyReport, RecoveryParent, protected_apply_pinned},
+    workspace_apply::{ApplyReport, RecoveryParent},
 };
 use polaris_desktop_protocol::{
     ids::*,
@@ -28,6 +30,13 @@ pub struct CurrentSourcePolicy {
     pub policy_revision: DecimalU64,
     pub read_allowed: bool,
     pub write_allowed: bool,
+}
+
+/// Trusted owner-confirmed source capability, separate from bootstrap metadata.
+/// Tier is a ceiling; it neither adds approvals nor grants arbitrary shell/build.
+pub struct ConfirmedSourceGrant {
+    pub policy: CurrentSourcePolicy,
+    pub tier: polaris_core::desktop_store::BootstrapTier,
 }
 
 /// The trusted controller samples time at each permission boundary.
@@ -65,6 +74,9 @@ pub enum SourceApplyError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    Shared(#[from] polaris_core::apply_owner::ApplyOwnerError),
 }
 type Result<T> = std::result::Result<T, SourceApplyError>;
 
@@ -108,6 +120,8 @@ pub struct SourceApplyController {
     candidate: Option<SourceApplyCandidate>,
     result_id: Option<ResultId>,
     report: Option<ApplyReport>,
+    #[cfg(target_os = "linux")]
+    shared_apply: Option<polaris_core::apply_owner::D27ApplyOperationV1>,
 }
 
 impl SourceApplyController {
@@ -133,6 +147,8 @@ impl SourceApplyController {
             candidate: None,
             result_id: None,
             report: None,
+            #[cfg(target_os = "linux")]
+            shared_apply: None,
         }
     }
 
@@ -382,6 +398,23 @@ impl SourceApplyController {
         if candidate.payload_hash != payload_hash {
             return Err(SourceApplyError::Candidate);
         }
+        #[cfg(target_os = "linux")]
+        if writer
+            .snapshot()?
+            .state
+            .source_applies
+            .iter()
+            .any(|record| {
+                record.candidate.run_id == candidate.run_id
+                    && record.candidate.attempt_id == candidate.attempt_id
+                    && record.candidate.approval_id == candidate.approval_id
+                    && record.intent_revision.is_some()
+            })
+        {
+            self.state = SourceApplyState::RecoveryRequired;
+            return Ok(IntentReceipt::AlreadyRecorded);
+        }
+        #[cfg(not(target_os = "linux"))]
         let result = writer.consume_source_apply_intent(
             self.completion.target(),
             &candidate.approval_id,
@@ -389,7 +422,45 @@ impl SourceApplyController {
             guard,
             proof,
         );
+        #[cfg(not(target_os = "linux"))]
         let receipt = self.saved(result)?;
+        #[cfg(target_os = "linux")]
+        let receipt = {
+            use polaris_core::apply_owner::{ApplyOwnerV1, D27ApplyAdmissionV1};
+            let operation = (|| {
+                let owner = ApplyOwnerV1::acquire(&self.policy.source_path)?;
+                owner.begin_d27(
+                    writer,
+                    D27ApplyAdmissionV1 {
+                        target: self.completion.target().clone(),
+                        approval_id: candidate.approval_id.clone(),
+                        result_id: self
+                            .result_id
+                            .clone()
+                            .ok_or(polaris_core::apply_owner::ApplyOwnerError::EvidenceMismatch)?,
+                        payload_hash: payload_hash.into(),
+                        guard,
+                        proof,
+                    },
+                    self.completion.prepared().snapshot(),
+                    self.changes
+                        .as_ref()
+                        .ok_or(polaris_core::apply_owner::ApplyOwnerError::EvidenceMismatch)?,
+                    self.limits,
+                    &self
+                        .recovery
+                        .as_ref()
+                        .ok_or(polaris_core::apply_owner::ApplyOwnerError::EvidenceMismatch)?
+                        .parent,
+                )
+            })()
+            .map_err(|error| {
+                self.state = SourceApplyState::RecoveryRequired;
+                SourceApplyError::Shared(error)
+            })?;
+            self.shared_apply = Some(operation);
+            IntentReceipt::NewlyPublished
+        };
         self.state = if receipt == IntentReceipt::NewlyPublished {
             SourceApplyState::IntentCommitted
         } else {
@@ -409,12 +480,34 @@ impl SourceApplyController {
         let recovery = self.recovery.as_ref().ok_or(SourceApplyError::State)?;
         // Also blocks replay if an unexpected unwind interrupts the apply call.
         self.state = SourceApplyState::Dispatched;
-        self.report = Some(protected_apply_pinned(
+        #[cfg(not(target_os = "linux"))]
+        let report = protected_apply_pinned(
             self.completion.prepared().snapshot(),
             changes,
             self.limits,
             &recovery.parent,
-        ));
+        );
+        #[cfg(target_os = "linux")]
+        let report = self
+            .shared_apply
+            .as_mut()
+            .ok_or(SourceApplyError::State)?
+            .apply(
+                self.completion.prepared().snapshot(),
+                changes,
+                self.limits,
+                &recovery.parent,
+            )
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    polaris_core::apply_owner::ApplyOwnerError::ResourceUnavailableBeforeEffect
+                ) {
+                    self.state = SourceApplyState::IntentCommitted;
+                }
+                SourceApplyError::Shared(error)
+            })?;
+        self.report = Some(report);
         self.state = SourceApplyState::ResultPendingSave;
         Ok(self.report.as_ref().expect("report retained"))
     }
@@ -444,9 +537,42 @@ impl SourceApplyController {
             return Err(SourceApplyError::State);
         }
         self.check_binding(writer)?;
+        #[cfg(not(target_os = "linux"))]
         writer.recover()?;
+        #[cfg(target_os = "linux")]
+        {
+            // Shared recovery must exact-join marker/report evidence. The
+            // legacy reconcile path cannot authorize a Linux retry.
+            self.shared_apply
+                .as_mut()
+                .ok_or(SourceApplyError::State)?
+                .recover_result_save(writer)?;
+        }
         let revision = writer.snapshot()?.marker.session_revision;
         self.save_report(writer, revision)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recover_pending_result(&mut self, writer: &mut Writer) -> Result<()> {
+        self.check_binding(writer)?;
+        if self.state != SourceApplyState::ResultPendingSave || self.report.is_none() {
+            return Err(SourceApplyError::State);
+        }
+        self.shared_apply
+            .as_mut()
+            .ok_or(SourceApplyError::State)?
+            .recover_result_save(writer)?;
+        let revision = writer.snapshot()?.marker.session_revision;
+        self.save_report(writer, revision)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_completed_result(&self) -> bool {
+        self.state == SourceApplyState::Saved
+            && self
+                .shared_apply
+                .as_ref()
+                .is_some_and(|operation| operation.is_completed())
     }
 
     /// Returns the actual stage, not a claim that committed effects were undone.
@@ -514,18 +640,33 @@ impl SourceApplyController {
         // All failures preserve the report and prevent implicit retries.
         let result = (|| {
             self.check_store(writer, revision)?;
-            let report = self.report.as_ref().ok_or(SourceApplyError::State)?;
-            let candidate = self.candidate.as_ref().ok_or(SourceApplyError::State)?;
-            writer.record_source_apply_result(
-                self.completion.target(),
-                &candidate.operation_id,
-                revision,
-                SourceApplyResult {
-                    result_id: self.result_id.clone().ok_or(SourceApplyError::State)?,
-                    report: serde_json::to_value(report)?,
-                },
-            )?;
-            Ok(())
+            #[cfg(target_os = "linux")]
+            {
+                if !self
+                    .shared_apply
+                    .as_mut()
+                    .ok_or(SourceApplyError::State)?
+                    .save_result(writer)?
+                {
+                    return Err(SourceApplyError::RecoveryRequired);
+                }
+                return Ok(());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let report = self.report.as_ref().ok_or(SourceApplyError::State)?;
+                let candidate = self.candidate.as_ref().ok_or(SourceApplyError::State)?;
+                writer.record_source_apply_result(
+                    self.completion.target(),
+                    &candidate.operation_id,
+                    revision,
+                    SourceApplyResult {
+                        result_id: self.result_id.clone().ok_or(SourceApplyError::State)?,
+                        report: serde_json::to_value(report)?,
+                    },
+                )?;
+                Ok(())
+            }
         })();
         if result.is_err() {
             self.state = SourceApplyState::RecoveryRequired;

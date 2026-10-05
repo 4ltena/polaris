@@ -33,19 +33,19 @@ pub use auth_tokens::DesktopAuthTokens;
 mod configured_factory;
 #[cfg(target_os = "macos")]
 mod memory_resources;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod shadow_finalizer;
 #[cfg(target_os = "macos")]
 pub use configured_factory::{
-    ConfiguredRunFactory, ConfirmedSourceGrant, FactoryError, TrustedBackend,
-    TrustedFactoryResources, TrustedMemoryIndex, WorkspacePreparationRecipe,
+    ConfiguredRunFactory, FactoryError, TrustedBackend, TrustedFactoryResources,
+    TrustedMemoryIndex, WorkspacePreparationRecipe,
 };
 #[cfg(target_os = "macos")]
 pub use memory_resources::ResourceError as MemoryResourceError;
 mod recovery_transport;
 mod transport;
 pub use recovery_transport::{RecoveryTransport, RecoveryTransportError};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use recovery_transport::{serve_source_recovery, serve_source_recovery_draining};
 #[cfg(unix)]
 mod recovery_socket;
@@ -57,32 +57,33 @@ mod core_integration_tests;
 
 pub use engine::probe_local_models;
 pub use engine::{DesktopService, FakeService, Options, ServiceConfig, project_id, session_id};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use engine::{
     SourceApplyRuntime, SourceRecoveryHandle, TrustedHistoryResources, TrustedMcpResources,
     TrustedRunCompletion, TrustedRunFactory, TrustedRunInputs, TrustedSourceFactory,
 };
 pub use transport::{Exit, ServiceError};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod production_source_factory;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod source_apply;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod source_apply_io;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use production_source_factory::ProductionSourceFactory;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use source_apply::{
-    CurrentSourcePolicy, PreparedSourceRecovery, SourceApplyClock, SourceApplyController,
-    SourceApplyError, SourceApplyRequest, SourceApplyState, SourceDecisionReceipt,
+    ConfirmedSourceGrant, CurrentSourcePolicy, PreparedSourceRecovery, SourceApplyClock,
+    SourceApplyController, SourceApplyError, SourceApplyRequest, SourceApplyState,
+    SourceDecisionReceipt,
 };
 
 #[cfg(target_os = "macos")]
 mod home_browse;
 #[cfg(target_os = "macos")]
 pub use home_browse::serve_home_browser;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 mod workspace_view;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub use workspace_view::{WorkspaceSourceIdentity, WorkspaceViewReader};

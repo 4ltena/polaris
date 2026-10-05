@@ -443,6 +443,57 @@ impl DesktopService {
             .as_ref()
             .is_some_and(|engine| engine.source_enabled())
     }
+
+    /// Linux frontend entry. Recover the source-bound store before attaching
+    /// runtime resources; an unresolved effect retains inspection only.
+    #[cfg(target_os = "linux")]
+    pub fn open_source_bound_with_trusted_runs(
+        config: ServiceConfig,
+        source_path: std::path::PathBuf,
+        source_identity: (u64, u64),
+        configuration: Configuration,
+        runs: Arc<dyn TrustedRunFactory>,
+        source: SourceApplyRuntime,
+    ) -> Result<Self, ServiceError> {
+        let owner = source_owner::SourceOwner::new(source)?;
+        let mut service = Self::open_storage_bound(
+            config,
+            configuration.clone(),
+            Some((source_path, source_identity)),
+        )?;
+        let engine = service.engine.as_mut().ok_or(ServiceError::Worker)?;
+        let saved = engine.store.snapshot()?;
+        if saved.state.configuration != configuration || engine.management_owner.is_none() {
+            // Inspect retained results even when startup cannot authorize new
+            // work. Do not rewrite workflow or attach a dispatch factory.
+            engine.source = Some(owner);
+            return Ok(service);
+        }
+        if saved.state.workflow.is_none()
+            && let Some(config) = runs.workflow_config()
+        {
+            let workflow = super::validated_workflow(
+                config.clone(),
+                polaris_core::workflow::WorkflowGatesV1::default(),
+                polaris_core::workflow::WorkflowStateV1 {
+                    phase: config.initial_phase,
+                    ..Default::default()
+                },
+                saved.state.workflow_artifacts.clone(),
+                runs.workflow_skills(),
+            )
+            .map_err(|_| ServiceError::Options)?;
+            engine
+                .store
+                .configure_workflow(saved.marker.session_revision, Some(workflow))?;
+        }
+        engine.trusted_runs = Some(TrustedRuns {
+            configuration,
+            factory: runs,
+        });
+        engine.source = Some(owner);
+        Ok(service)
+    }
 }
 
 enum PrepareOutcome {
@@ -1230,6 +1281,7 @@ impl Engine {
                                     .map(|port| {
                                         // Read at root run start; a busy or damaged
                                         // cache only disables preselection.
+                                        #[cfg(target_os = "macos")]
                                         let index = self.mcp_settings.as_ref().map_or(
                                             Ok(None),
                                             |settings| {
@@ -1244,6 +1296,8 @@ impl Engine {
                                                     .map_err(polaris_core::mcp::preselection::index_status)
                                             },
                                         );
+                                        #[cfg(target_os = "linux")]
+                                        let index = Ok(None);
                                         let selector = mcp.selection_provider.map(|provider| {
                                             Arc::new(active.usage.wrap(provider))
                                                 as Arc<dyn Provider>
@@ -1268,6 +1322,7 @@ impl Engine {
                         };
                         // Detection and approved registration only; a store
                         // failure leaves the run without the tool.
+                        #[cfg(target_os = "macos")]
                         let mcp_setup = self.mcp_settings.as_ref().and_then(|settings| {
                             let port = active
                                 .execution
@@ -1282,6 +1337,8 @@ impl Engine {
                                 polaris_core::mcp::setup::Authorization::Owner(port),
                             )))
                         });
+                        #[cfg(target_os = "linux")]
+                        let mcp_setup = None;
                         if let Ok(request_context) = request_context {
                             let delegation = create_delegation_runtime(
                                 delegation_root.as_ref().ok_or(ServiceError::Worker)?,

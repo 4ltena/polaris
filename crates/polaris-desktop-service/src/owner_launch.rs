@@ -100,6 +100,11 @@ pub fn compose_existing(
         },
     )
     .map_err(|_| OwnerLaunchError)?;
+    let management_project = policy.source_path.clone();
+    let management_identity = (
+        policy.source_identity.device.get(),
+        policy.source_identity.inode.get(),
+    );
     let source = ProductionSourceFactory::new(
         Arc::new(ConfirmedSourceGrant {
             policy: policy.clone(),
@@ -144,6 +149,7 @@ pub fn compose_existing(
             approval_ttl_ms: limits.approval_ttl_ms,
         },
     )
+    .and_then(|service| service.with_management_project(management_project, management_identity))
     .map(|service| service.with_workspace_reader(workspace_reader))
     .map_err(|_| OwnerLaunchError)
 }

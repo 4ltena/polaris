@@ -42,9 +42,12 @@ fn initial() -> InitialState {
 }
 fn terminal_writer(root: &PrototypeRoot, session: &str) -> Writer {
     let sid = SessionId::new(session).unwrap();
-    let mut w = root
+    let w = root
         .create(ProjectId::new("project").unwrap(), sid.clone(), initial())
         .unwrap();
+    terminal_state(w, sid)
+}
+fn terminal_state(mut w: Writer, sid: SessionId) -> Writer {
     let target = RunTarget {
         run_id: RunId::new("run").unwrap(),
         attempt_id: AttemptId::new("attempt").unwrap(),
@@ -88,7 +91,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        Self::new_in(None)
+    }
+    fn new_in(parent: Option<&std::path::Path>) -> Self {
+        let temp = match parent {
+            Some(parent) => tempfile::Builder::new()
+                .prefix("d27-source-")
+                .tempdir_in(parent)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
         let base = temp.path().canonicalize().unwrap();
         let source = base.join("source");
         fs::create_dir(&source).unwrap();
@@ -270,9 +282,25 @@ fn source_apply_wrong_session_rejected_before_cancel_and_recovery() {
     ));
     assert_eq!(f.c.state(), SourceApplyState::RecoveryRequired);
     fs::write(f.c.policy.source_path.join("ordinary"), "external later").unwrap();
-    f.c.retry_result_save(&mut f.w).unwrap();
+    #[cfg(not(target_os = "linux"))]
+    {
+        f.c.retry_result_save(&mut f.w).unwrap();
+        assert_eq!(f.c.state(), SourceApplyState::Saved);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Shared completion requires a fresh source readback. A later external
+        // edit cannot be converted into a successful result or redispatch.
+        assert!(f.c.retry_result_save(&mut f.w).is_err());
+        assert_eq!(f.c.state(), SourceApplyState::RecoveryRequired);
+        assert!(
+            f.w.snapshot().unwrap().state.source_applies[0]
+                .result
+                .is_none()
+        );
+        assert!(f.c.apply().is_err());
+    }
     assert_eq!(f.source(), "external later");
-    assert_eq!(f.c.state(), SourceApplyState::Saved);
 }
 
 #[test]
@@ -697,4 +725,677 @@ fn source_apply_typed_deny_and_conflicting_replay_never_allow_dispatch() {
     assert!(f.c.apply().is_err());
     assert!(f.c.recovery_parent().is_some());
     assert_eq!(f.source(), "before");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn source_apply_linux_shared_owner_completes_archives_and_releases_lease() {
+    use polaris_core::{
+        apply_intent::{ApplyPhaseV1, d27_operation_binding, d27_operation_key},
+        apply_owner::ApplyOwnerV1,
+        management_effect::ManagementEffectHashV1 as Hash,
+    };
+    let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let mut f = Fixture::new_in(target.as_deref());
+    if let Some(target) = &target {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(target).unwrap().dev(),
+            fs::metadata(&f.c.policy.source_path).unwrap().dev()
+        );
+    }
+    f.prepare();
+    f.allow();
+    f.commit();
+    assert!(ApplyOwnerV1::acquire(&f.c.policy.source_path).is_err());
+    assert!(f.c.apply().unwrap().failure.is_none());
+    let revision = f.rev();
+    f.c.save_result(&mut f.w, revision).unwrap();
+    let owner = ApplyOwnerV1::acquire(&f.c.policy.source_path).unwrap();
+    assert!(owner.active().unwrap().is_none());
+    let saved = f.w.snapshot().unwrap();
+    let record = &saved.state.source_applies[0];
+    assert_eq!(
+        record.result.as_ref().unwrap().result_id,
+        ResultId::new("apply-result").unwrap()
+    );
+    let key = d27_operation_key(
+        Hash::digest(f.c.policy.source_path.as_os_str().as_encoded_bytes()),
+        d27_operation_binding(record.candidate.operation_id.as_str()).unwrap(),
+    )
+    .unwrap();
+    let state = polaris_core::project::state_dir(&f.c.policy.source_path).unwrap();
+    let sealed = state
+        .join("apply-intents-v1/archive")
+        .join(key.as_hex())
+        .join("archive-seal.v1.json");
+    let seal: serde_json::Value = serde_json::from_slice(&fs::read(sealed).unwrap()).unwrap();
+    assert_eq!(
+        seal["terminal_phase"],
+        serde_json::to_value(ApplyPhaseV1::Completed).unwrap()
+    );
+    assert_eq!(f.source(), "after");
+    assert!(f.c.apply().is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn source_apply_linux_live_shortage_preserves_report_and_result_only_retry() {
+    use polaris_core::apply_owner::ApplyOwnerV1;
+    struct ResetCapacity;
+    impl Drop for ResetCapacity {
+        fn drop(&mut self) {
+            ApplyOwnerV1::test_available_limit(None);
+        }
+    }
+    let _reset = ResetCapacity;
+    let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let mut f = Fixture::new_in(target.as_deref());
+    f.prepare();
+    f.allow();
+    f.commit();
+    let state = polaris_core::project::state_dir(&f.c.policy.source_path).unwrap();
+    let before = d27_process_tests::fixture_bytes(&state);
+    let source_before =
+        d27_process_tests::source_fingerprint(&f.c.policy.source_path.join("ordinary"));
+    let saved = serde_json::to_vec(&f.w.snapshot().unwrap().state).unwrap();
+    ApplyOwnerV1::test_available_limit(Some(0));
+    assert!(f.c.apply().is_err());
+    assert_eq!(f.c.state(), SourceApplyState::IntentCommitted);
+    assert_eq!(d27_process_tests::fixture_bytes(&state), before);
+    assert_eq!(
+        serde_json::to_vec(&f.w.snapshot().unwrap().state).unwrap(),
+        saved
+    );
+    assert_eq!(
+        d27_process_tests::source_fingerprint(&f.c.policy.source_path.join("ordinary")),
+        source_before
+    );
+    ApplyOwnerV1::test_available_limit(None);
+    assert!(f.c.apply().unwrap().failure.is_none());
+    let before = d27_process_tests::fixture_bytes(&state);
+    let source_before =
+        d27_process_tests::source_fingerprint(&f.c.policy.source_path.join("ordinary"));
+    let saved = serde_json::to_vec(&f.w.snapshot().unwrap().state).unwrap();
+    ApplyOwnerV1::test_available_limit(Some(0));
+    let revision = f.rev();
+    assert!(f.c.save_result(&mut f.w, revision).is_err());
+    assert_eq!(d27_process_tests::fixture_bytes(&state), before);
+    assert_eq!(
+        serde_json::to_vec(&f.w.snapshot().unwrap().state).unwrap(),
+        saved
+    );
+    assert_eq!(
+        d27_process_tests::source_fingerprint(&f.c.policy.source_path.join("ordinary")),
+        source_before
+    );
+    assert!(f.c.apply().is_err(), "shortage must never regrant dispatch");
+    ApplyOwnerV1::test_available_limit(None);
+    f.c.retry_result_save(&mut f.w).unwrap();
+    assert_eq!(f.c.state(), SourceApplyState::Saved);
+    assert_eq!(
+        d27_process_tests::source_fingerprint(&f.c.policy.source_path.join("ordinary")),
+        source_before
+    );
+    assert!(
+        ApplyOwnerV1::acquire(&f.c.policy.source_path)
+            .unwrap()
+            .active()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(target_os = "linux")]
+mod d27_process_tests {
+    use super::*;
+    use polaris_core::{
+        apply_intent::{
+            ApplyIntentEnvelopeV1, ApplyPhaseV1, ArchiveSealV1, CanonicalApplyEvidence,
+        },
+        apply_owner::{ApplyOwnerRecoveryV1, ApplyOwnerV1},
+        desktop_store::DesktopRoot,
+        management_effect::ManagementEffectHashV1,
+    };
+    use std::{collections::BTreeMap, os::unix::fs::MetadataExt, path::Path, process::Command};
+
+    fn private_directory(path: &Path) {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        File::open(path).unwrap().sync_all().unwrap();
+        File::open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+
+    fn pinned_parent(path: &Path) -> RecoveryParent {
+        let fd = File::open(path).unwrap();
+        let meta = fd.metadata().unwrap();
+        RecoveryParent::pin(&fd, (meta.dev(), meta.ino()), path).unwrap()
+    }
+
+    pub(super) fn fixture_bytes(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                assert!(!meta.file_type().is_symlink());
+                let bytes = if meta.is_dir() {
+                    None
+                } else {
+                    Some(fs::read(&path).unwrap())
+                };
+                assert!(
+                    entries
+                        .insert(path.strip_prefix(root).unwrap().to_owned(), bytes)
+                        .is_none()
+                );
+                assert!(entries.len() <= 512, "bounded recovery fixture inventory");
+                if meta.is_dir() {
+                    visit(root, &path, entries);
+                }
+            }
+        }
+        let mut entries = BTreeMap::new();
+        visit(root, root, &mut entries);
+        assert!(entries.values().flatten().map(Vec::len).sum::<usize>() <= 8 * 1024 * 1024);
+        entries
+    }
+
+    pub(super) fn source_fingerprint(path: &Path) -> serde_json::Value {
+        let meta = fs::metadata(path).unwrap();
+        serde_json::json!({
+            "device": meta.dev(), "inode": meta.ino(), "mode": meta.mode(),
+            "mtime": [meta.mtime(), meta.mtime_nsec()], "ctime": [meta.ctime(), meta.ctime_nsec()],
+            "bytes": fs::read(path).unwrap()
+        })
+    }
+
+    fn phase(name: &str) -> ApplyPhaseV1 {
+        match name {
+            "started" => ApplyPhaseV1::EffectStarted,
+            "reported" => ApplyPhaseV1::ApplyReported,
+            "committed" => ApplyPhaseV1::ParticipationCommitted,
+            "completed" => ApplyPhaseV1::Completed,
+            _ => panic!("unknown fixture boundary"),
+        }
+    }
+
+    fn create_boundary(base: &Path, boundary: &str) {
+        let source = base.join("source");
+        private_directory(&source);
+        fs::write(source.join("ordinary"), b"before").unwrap();
+        let helper = base.join("helper");
+        fs::write(&helper, b"never launched").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let limits = Limits {
+            max_entries: 16,
+            max_files: 8,
+            max_file_bytes: 1024,
+            max_total_bytes: 4096,
+            max_depth: 4,
+        };
+        let prepared = Arc::new(
+            PreparedWorkspace::prepare(&source, &helper, SandboxMode::WorkspaceWrite, &[], limits)
+                .unwrap(),
+        );
+        let identity = prepared.snapshot().source_identity;
+        let store_path = base.join("desktop");
+        private_directory(&store_path);
+        let root = DesktopRoot::open_owned(&store_path).unwrap();
+        let session = SessionId::new("session").unwrap();
+        let mut writer = terminal_state(
+            root.create(
+                ProjectId::new("project").unwrap(),
+                session.clone(),
+                initial(),
+            )
+            .unwrap(),
+            session,
+        );
+        let receipt =
+            TrustedRunCompletion::for_source_apply_test(prepared, &writer.snapshot().unwrap());
+        fs::write(
+            receipt.prepared().snapshot().path().join("ordinary"),
+            b"after",
+        )
+        .unwrap();
+        let mut controller = SourceApplyController::new(
+            receipt,
+            CurrentSourcePolicy {
+                source_path: source.clone(),
+                source_identity: source_identity((identity.device, identity.inode)),
+                policy_revision: DecimalU64::new(7),
+                read_allowed: true,
+                write_allowed: true,
+            },
+            Arc::new(Clock(AtomicU64::new(10))),
+            limits,
+        );
+        let recovery = base.join("recovery");
+        private_directory(&recovery);
+        let prepared_revision = writer.snapshot().unwrap().marker.session_revision;
+        controller
+            .prepare(
+                &mut writer,
+                SourceApplyRequest {
+                    approval_id: ApprovalId::new("apply-approval").unwrap(),
+                    operation_id: OperationId::new("apply-operation").unwrap(),
+                    result_id: ResultId::new("apply-result").unwrap(),
+                    expected_session_revision: prepared_revision,
+                    expires_at_unix_ms: DecimalU64::new(100),
+                },
+                PreparedSourceRecovery {
+                    parent: pinned_parent(&recovery),
+                    path: recovery.clone(),
+                },
+            )
+            .unwrap();
+        let revision = writer.snapshot().unwrap().marker.session_revision;
+        controller
+            .resolve(&mut writer, ApprovalDecision::Allow, revision)
+            .unwrap();
+        let revision = writer.snapshot().unwrap().marker.session_revision;
+        let hash = controller.candidate().unwrap().payload_hash.clone();
+        assert_eq!(
+            controller
+                .commit_intent(&mut writer, revision, &hash)
+                .unwrap(),
+            IntentReceipt::NewlyPublished
+        );
+        ApplyOwnerV1::test_stop_after(Some(phase(boundary)));
+        let stopped = if boundary == "reported" || boundary == "started" {
+            controller.apply().map(|_| ())
+        } else {
+            assert!(controller.apply().unwrap().failure.is_none());
+            let revision = writer.snapshot().unwrap().marker.session_revision;
+            controller.save_result(&mut writer, revision)
+        };
+        assert!(stopped.is_err(), "durable-boundary error must fire");
+        assert_eq!(
+            fs::read(source.join("ordinary")).unwrap(),
+            if boundary == "started" {
+                &b"before"[..]
+            } else {
+                &b"after"[..]
+            }
+        );
+        drop(controller);
+        let owner = ApplyOwnerV1::acquire(&source).unwrap();
+        let intent = owner.active().unwrap().unwrap();
+        assert_eq!(intent.latest().phase, phase(boundary));
+        let report = if boundary == "started" {
+            serde_json::Value::Null
+        } else {
+            let report_bytes = fs::read(
+                recovery
+                    .join(&intent.descriptor().recovery_child)
+                    .join("apply-report.v1.json"),
+            )
+            .unwrap();
+            let report = polaris_core::workspace_apply::decode_apply_report(&report_bytes).unwrap();
+            assert!(report.failure.is_none());
+            assert_eq!(report.entries.len(), 1);
+            assert_eq!(report.entries[0].relative_path, PathBuf::from("ordinary"));
+            assert!(report.entries[0].installed);
+            serde_json::to_value(report).unwrap()
+        };
+        let record = serde_json::json!({
+            "creator_pid": std::process::id(),
+            "key": intent.descriptor().operation_key,
+            "source": source_fingerprint(&source.join("ordinary")),
+            "report": report
+        });
+        drop(owner);
+        fs::write(
+            base.join("published.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        File::open(base.join("published.json"))
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        File::open(base).unwrap().sync_all().unwrap();
+    }
+
+    fn verify_archive(state: &Path, key: ManagementEffectHashV1) {
+        let archive = state.join("apply-intents-v1/archive").join(key.as_hex());
+        let mut names = fs::read_dir(&archive)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with('g'))
+            .collect::<Vec<_>>();
+        names.sort();
+        assert!(!names.is_empty());
+        let generations = names
+            .iter()
+            .map(|name| {
+                ApplyIntentEnvelopeV1::from_canonical_bytes(&fs::read(archive.join(name)).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for pair in generations.windows(2) {
+            pair[1]
+                .generation
+                .verify_successor(&pair[0].generation)
+                .unwrap();
+        }
+        let terminal = &generations.last().unwrap().generation;
+        assert_eq!(terminal.phase, ApplyPhaseV1::Completed);
+        let seal = ArchiveSealV1::from_canonical_bytes(
+            &fs::read(archive.join("archive-seal.v1.json")).unwrap(),
+        )
+        .unwrap();
+        seal.verify_terminal(generations[0].descriptor.as_ref().unwrap(), terminal)
+            .unwrap();
+    }
+
+    fn service_result_page(base: &Path, source: &Path, session: &SessionId, completed: bool) {
+        use crate::{DesktopService, ServiceConfig};
+        use polaris_desktop_protocol::{
+            codec,
+            request::{PageLimit, Request, RequestBody, SourceApplyList},
+            response::{Response, SuccessResult},
+            source_apply::SourceApplyResultStatus,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+        async fn request(client: &mut DuplexStream, id: &str, body: RequestBody) -> SuccessResult {
+            let request = Request {
+                protocol_version: Default::default(),
+                client_id: ClientId::new("d27-restart-client").unwrap(),
+                request_id: RequestId::new(id).unwrap(),
+                body,
+            };
+            client
+                .write_all(&codec::encode(&request).unwrap())
+                .await
+                .unwrap();
+            loop {
+                let size = client.read_u32().await.unwrap() as usize;
+                assert!(size <= codec::MAX_FRAME_BYTES);
+                let mut bytes = vec![0; size];
+                client.read_exact(&mut bytes).await.unwrap();
+                let frame: serde_json::Value = codec::from_json(&bytes).unwrap();
+                if frame["kind"] == "response" {
+                    let response: Response = serde_json::from_value(frame).unwrap();
+                    response.validate_for(&request).unwrap();
+                    return response.outcome.unwrap();
+                }
+            }
+        }
+        let metadata = fs::metadata(source).unwrap();
+        let mut service = DesktopService::open_source_bound(
+            ServiceConfig {
+                store_root: base.join("desktop"),
+                project_id: ProjectId::new("project").unwrap(),
+                session_id: session.clone(),
+            },
+            source.to_owned(),
+            (metadata.dev(), metadata.ino()),
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let (mut client, server) = tokio::io::duplex(128 * 1024);
+                let (reader, writer) = tokio::io::split(server);
+                let service_work = service.serve(reader, writer);
+                let client_work = async {
+                    assert!(matches!(
+                        request(&mut client, "hello", RequestBody::Hello).await,
+                        SuccessResult::Hello(_)
+                    ));
+                    let SuccessResult::SessionSnapshot(snapshot) = request(
+                        &mut client,
+                        "snapshot",
+                        RequestBody::SessionSnapshot(session.clone()),
+                    )
+                    .await
+                    else {
+                        panic!("snapshot");
+                    };
+                    let SuccessResult::SourceApplyList(page) = request(
+                        &mut client,
+                        "results",
+                        RequestBody::SourceApplyList(
+                            session.clone(),
+                            SourceApplyList {
+                                expected_session_revision: snapshot.session_revision,
+                                offset: DecimalU64::new(0),
+                                limit: PageLimit::new(32).unwrap(),
+                            },
+                        ),
+                    )
+                    .await
+                    else {
+                        panic!("result page");
+                    };
+                    assert_eq!(page.items.len(), 1);
+                    if completed {
+                        let result = page.items[0].result.as_ref().unwrap();
+                        assert_eq!(result.result_id, ResultId::new("apply-result").unwrap());
+                        assert_eq!(result.status, SourceApplyResultStatus::Applied);
+                        assert_eq!(result.installed_count.get(), 1);
+                    } else {
+                        assert!(page.items[0].intent_committed);
+                        assert!(!page.items[0].result_saved);
+                        assert!(page.items[0].result.is_none());
+                    }
+                    client.shutdown().await.unwrap();
+                };
+                let (served, _) = tokio::join!(service_work, client_work);
+                assert!(served.is_ok());
+            })
+            .await
+            .expect("bounded service result IPC");
+        });
+    }
+
+    fn recover_boundary(base: &Path, role: &str) {
+        let published: serde_json::Value =
+            serde_json::from_slice(&fs::read(base.join("published.json")).unwrap()).unwrap();
+        assert_ne!(
+            published["creator_pid"].as_u64().unwrap(),
+            u64::from(std::process::id())
+        );
+        let key: ManagementEffectHashV1 = serde_json::from_value(published["key"].clone()).unwrap();
+        let completed = !published["report"].is_null();
+        let source = base.join("source");
+        let source_before = source_fingerprint(&source.join("ordinary"));
+        let state = polaris_core::project::state_dir(&source).unwrap();
+        let root = DesktopRoot::open_owned(&base.join("desktop")).unwrap();
+        let parent = pinned_parent(&base.join("recovery"));
+        let before = fixture_bytes(base);
+        let owner = ApplyOwnerV1::acquire(&source).unwrap();
+        let project = ProjectId::new("project").unwrap();
+        let session = SessionId::new("session").unwrap();
+        let writer = match role {
+            "refuse" => {
+                assert_eq!(
+                    fs::read(source.join("ordinary")).unwrap(),
+                    b"external later"
+                );
+                assert!(
+                    owner
+                        .recover_d27_result(&root, &project, &session, &parent)
+                        .is_err()
+                );
+                let metadata = fs::metadata(&source).unwrap();
+                assert!(
+                    crate::DesktopService::open_source_bound(
+                        crate::ServiceConfig {
+                            store_root: base.join("desktop"),
+                            project_id: project.clone(),
+                            session_id: session.clone(),
+                        },
+                        source.clone(),
+                        (metadata.dev(), metadata.ino())
+                    )
+                    .is_err()
+                );
+                assert_eq!(fixture_bytes(base), before, "refusal changed old evidence");
+                assert_eq!(source_fingerprint(&source.join("ordinary")), source_before);
+                let owner = ApplyOwnerV1::acquire(&source).unwrap();
+                assert!(owner.active().unwrap().is_some());
+                return;
+            }
+            "recover" => {
+                assert_eq!(source_before, published["source"]);
+                if owner
+                    .active()
+                    .unwrap()
+                    .is_some_and(|intent| intent.latest().phase == ApplyPhaseV1::ApplyReported)
+                {
+                    ApplyOwnerV1::test_available_limit(Some(0));
+                    let refused = owner.recover_d27_result(&root, &project, &session, &parent);
+                    ApplyOwnerV1::test_available_limit(None);
+                    assert!(refused.is_err());
+                    assert_eq!(
+                        fixture_bytes(base),
+                        before,
+                        "live shortage repaired old evidence"
+                    );
+                    assert_eq!(source_fingerprint(&source.join("ordinary")), source_before);
+                } else {
+                    drop(owner);
+                }
+                service_result_page(base, &source, &session, completed);
+                root.open(&project, &session).unwrap()
+            }
+            "repeat" => {
+                assert_eq!(owner.active().unwrap().is_none(), completed);
+                assert!(
+                    owner
+                        .recover_d27_result(&root, &project, &session, &parent)
+                        .is_err()
+                );
+                service_result_page(base, &source, &session, completed);
+                root.open(&project, &session).unwrap()
+            }
+            _ => panic!("unknown fixture role"),
+        };
+        let saved = writer.snapshot().unwrap();
+        assert_eq!(saved.state.source_applies.len(), 1);
+        if completed {
+            let result = saved.state.source_applies[0].result.as_ref().unwrap();
+            assert_eq!(result.result_id, ResultId::new("apply-result").unwrap());
+            assert_eq!(result.report, published["report"]);
+            verify_archive(&state, key);
+        } else {
+            assert!(saved.state.source_applies[0].result.is_none());
+        }
+        drop(writer);
+        assert_eq!(source_fingerprint(&source.join("ordinary")), source_before);
+        let owner = ApplyOwnerV1::acquire(&source).unwrap();
+        if completed {
+            assert!(owner.active().unwrap().is_none());
+            assert!(matches!(
+                owner.recover_current(&parent).unwrap(),
+                ApplyOwnerRecoveryV1::Idle
+            ));
+        } else {
+            assert_eq!(
+                owner.active().unwrap().unwrap().latest().phase,
+                ApplyPhaseV1::OutcomeUnknown
+            );
+            assert!(matches!(
+                owner.recover_current(&parent).unwrap(),
+                ApplyOwnerRecoveryV1::OutcomeUnknown(_)
+            ));
+        }
+        if role == "repeat" {
+            assert_eq!(
+                fixture_bytes(base),
+                before,
+                "repeated recovery grew old evidence"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "exact child role invoked by the parent recovery test"]
+    fn d27_result_process_fixture() {
+        let base = PathBuf::from(
+            std::env::var_os("POLARIS_D27_PROCESS_ROOT").expect("parent fixture root"),
+        )
+        .canonicalize()
+        .unwrap();
+        assert_eq!(
+            PathBuf::from(std::env::var_os("POLARIS_DATA_DIR").unwrap()),
+            base.join("data")
+        );
+        let role = std::env::var("POLARIS_D27_PROCESS_ROLE").unwrap();
+        let boundary = std::env::var("POLARIS_D27_PROCESS_PHASE").unwrap();
+        if role == "create" {
+            create_boundary(&base, &boundary);
+        } else {
+            recover_boundary(&base, &role);
+        }
+    }
+
+    #[test]
+    fn source_apply_linux_d27_new_process_result_recovery() {
+        let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+        let suite = match target.as_deref() {
+            Some(target) => tempfile::Builder::new()
+                .prefix("d27-process-")
+                .tempdir_in(target)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let suite_path = suite.path().canonicalize().unwrap();
+        let binary = std::env::current_exe().unwrap();
+        for (boundary, changed) in [
+            ("started", false),
+            ("reported", false),
+            ("committed", false),
+            ("completed", false),
+            ("reported", true),
+        ] {
+            let base = suite_path.join(format!("{boundary}-{changed}"));
+            private_directory(&base);
+            private_directory(&base.join("data"));
+            for role in [
+                "create",
+                if changed { "refuse" } else { "recover" },
+                if changed { "refuse" } else { "repeat" },
+            ] {
+                if changed && role == "refuse" {
+                    if fs::read(base.join("source/ordinary")).unwrap() != b"external later" {
+                        fs::write(base.join("source/ordinary"), b"external later").unwrap();
+                    }
+                }
+                let output = Command::new(&binary)
+                    .args([
+                        "--exact",
+                        "source_apply::tests::d27_process_tests::d27_result_process_fixture",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("POLARIS_D27_PROCESS_ROOT", &base)
+                    .env("POLARIS_D27_PROCESS_ROLE", role)
+                    .env("POLARIS_D27_PROCESS_PHASE", boundary)
+                    .env("POLARIS_DATA_DIR", base.join("data"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{boundary}/{role}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("1 passed; 0 failed; 0 ignored"),
+                    "exact child selector must execute one test"
+                );
+            }
+        }
+    }
 }

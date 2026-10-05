@@ -133,6 +133,24 @@ impl SourceOwner {
     pub(super) fn io_active(&self) -> bool {
         self.job.is_some()
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn completed_result(
+        &self,
+        saved: &polaris_core::desktop_store::SavedSourceApply,
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.controller.as_ref().is_some_and(|controller| {
+                controller.has_completed_result()
+                    && controller.candidate() == Some(&saved.candidate)
+                    && saved.result.as_ref().is_some_and(|result| {
+                        controller.report().is_some_and(|report| {
+                            serde_json::to_value(report).ok().as_ref() == Some(&result.report)
+                        })
+                    })
+            })
+        })
+    }
+
     pub(super) fn recovery_target(
         &self,
     ) -> Option<polaris_desktop_protocol::source_recovery::RetryTarget> {
@@ -265,15 +283,22 @@ impl SourceOwner {
             SourceApplyState::ResultPendingSave => {
                 // The engine may have failed before handing the joined report to
                 // save_result. Explicit recovery is permitted only after the gates above.
-                writer.recover().map_err(|_| RecoveryError::StorageFailed)?;
-                let revision = writer
-                    .snapshot()
-                    .map_err(|_| RecoveryError::StorageFailed)?
-                    .marker
-                    .session_revision;
+                #[cfg(target_os = "linux")]
                 controller
-                    .save_result(writer, revision)
+                    .recover_pending_result(writer)
                     .map_err(|_| RecoveryError::StorageFailed)?;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    writer.recover().map_err(|_| RecoveryError::StorageFailed)?;
+                    let revision = writer
+                        .snapshot()
+                        .map_err(|_| RecoveryError::StorageFailed)?
+                        .marker
+                        .session_revision;
+                    controller
+                        .save_result(writer, revision)
+                        .map_err(|_| RecoveryError::StorageFailed)?;
+                }
             }
             SourceApplyState::Saved => {}
             _ => unreachable!("checked state"),

@@ -4,7 +4,9 @@
 mod recipe;
 pub use recipe::WorkspacePreparationRecipe;
 
-use crate::{CurrentSourcePolicy, ServiceError, TrustedRunFactory, TrustedRunInputs};
+use crate::{
+    ConfirmedSourceGrant, CurrentSourcePolicy, ServiceError, TrustedRunFactory, TrustedRunInputs,
+};
 use polaris_core::{
     audit::AuditLog,
     desktop_execution::{SandboxMode, SandboxPolicy},
@@ -27,13 +29,6 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
-
-/// Trusted owner-confirmed source capability, separate from bootstrap metadata.
-/// Tier is a ceiling; it neither adds approvals nor grants arbitrary shell/build.
-pub struct ConfirmedSourceGrant {
-    pub policy: CurrentSourcePolicy,
-    pub tier: BootstrapTier,
-}
 
 /// Credential values must already have been loaded/registered by the trusted
 /// owner. Never implement Debug or serialize these inputs. No token method is

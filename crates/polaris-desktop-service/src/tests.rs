@@ -2436,18 +2436,219 @@ fn run_details_pages_rebuild_every_byte_and_refuse_foreign_or_expired_cursors() 
 }
 
 fn production_engine() -> (tempfile::TempDir, ServiceConfig, Engine) {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let root = tempfile::tempdir().unwrap();
     let store_root = root.path().canonicalize().unwrap();
     std::fs::set_permissions(&store_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let project = store_root.join("source");
+    std::fs::create_dir(&project).unwrap();
     let config = ServiceConfig {
         store_root,
         project_id: project_id(),
         session_id: session_id(),
     };
-    let mut service = DesktopService::open(config.clone()).unwrap();
+    let identity = std::fs::metadata(&project).unwrap();
+    let mut service = DesktopService::open(config.clone())
+        .unwrap()
+        .with_management_project(project, (identity.dev(), identity.ino()))
+        .unwrap();
     (root, config, service.engine.take().unwrap())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_production_workflow_configure_refuses_before_lane_or_store_mutation() {
+    let (_root, _config, mut engine) = production_engine();
+    let SuccessResult::Hello(hello) =
+        direct(&mut engine, &request("hello", RequestBody::Hello)).unwrap()
+    else {
+        panic!("hello result")
+    };
+    assert!(!hello.capabilities.contains(&Capability::WorkflowConfigure));
+    direct(
+        &mut engine,
+        &request(
+            "subscribe",
+            RequestBody::SessionSubscribe(session_id(), Subscribe::default()),
+        ),
+    )
+    .unwrap();
+    assert!(engine.subscription.is_some());
+
+    let before = engine.store.snapshot().unwrap();
+    let current_session = engine.session.clone();
+    let current_subscription = engine.subscription.clone();
+    let other_session = engine.other_lane.as_ref().map(|lane| lane.session.clone());
+    let mut events = Vec::new();
+    let denied = engine
+        .handle(
+            &request(
+                "workflow-unavailable",
+                RequestBody::WorkflowConfigure(
+                    SessionId::new("missing-session").unwrap(),
+                    WorkflowConfigure {
+                        expected_session_revision: DecimalU64::new(0),
+                        enabled: true,
+                        mode: WorkflowMode::Manual,
+                        initial_phase: WorkflowPhase::General,
+                    },
+                ),
+            ),
+            &mut events,
+        )
+        .unwrap_err();
+    assert_eq!(denied.code, ErrorCode::CapabilityUnavailable);
+    assert!(events.is_empty());
+    assert_eq!(engine.session, current_session);
+    assert_eq!(engine.subscription, current_subscription);
+    assert_eq!(
+        engine.other_lane.as_ref().map(|lane| lane.session.clone()),
+        other_session
+    );
+    let after = engine.store.snapshot().unwrap();
+    assert_eq!(after.marker, before.marker);
+    assert_eq!(after.state, before.state);
+    assert_eq!(
+        serde_json::to_vec(&after.raw).unwrap(),
+        serde_json::to_vec(&before.raw).unwrap()
+    );
+}
+
+#[test]
+fn production_input_refuses_project_management_blocker_before_admission() {
+    use polaris_core::{
+        management_effect::{
+            ManagementEffectHashV1, ManagementEffectScopeV1, ManagementEffectStoreV1,
+            ManagementInventoryIdV1, ManagementOperationIdV1, ManagementPermissionScopeV1,
+            ManagementRewindDispositionV1, PrepareManagementEffectV1,
+        },
+        project_mutation::ProjectMutationOwnerV1,
+    };
+
+    let (root, _config, mut engine) = production_engine();
+    hello(&mut engine);
+    let project = root.path().join("source");
+    let owner = ProjectMutationOwnerV1::for_project(&project).unwrap();
+    let mutation = owner.try_mutation().unwrap();
+    let effects = ManagementEffectStoreV1::open(&project, &mutation).unwrap();
+    effects
+        .prepare(
+            &mutation,
+            effects.cursor().unwrap(),
+            PrepareManagementEffectV1 {
+                operation_id: ManagementOperationIdV1::random().unwrap(),
+                inventory: ManagementInventoryIdV1::parse("C12").unwrap(),
+                scope: ManagementEffectScopeV1 {
+                    project: effects.project_scope_hash(),
+                    session: None,
+                    generation: 0,
+                    revision: 0,
+                    permission: ManagementPermissionScopeV1::Project,
+                    account_binding: None,
+                },
+                request_hash: ManagementEffectHashV1::digest(b"blocked desktop input"),
+                rewind: ManagementRewindDispositionV1::IrreversibleLocal,
+            },
+        )
+        .unwrap();
+    drop(mutation);
+
+    let before = engine.store.snapshot().unwrap();
+    let manager_before = engine
+        .admission
+        .as_ref()
+        .unwrap()
+        .persisted_state()
+        .unwrap();
+    let result = direct(
+        &mut engine,
+        &submit_input(
+            "blocked-input",
+            session_id(),
+            0,
+            0,
+            InputRoute::Current,
+            "blocked-admission",
+            "must remain unsaved",
+        ),
+    );
+    assert_eq!(result.unwrap_err().code, ErrorCode::RecoveryRequired);
+    let after = engine.store.snapshot().unwrap();
+    assert_eq!(after.marker, before.marker);
+    assert_eq!(
+        serde_json::to_vec(&after.raw).unwrap(),
+        serde_json::to_vec(&before.raw).unwrap()
+    );
+    let manager_after = engine
+        .admission
+        .as_ref()
+        .unwrap()
+        .persisted_state()
+        .unwrap();
+    assert_eq!(manager_after, manager_before);
+}
+
+#[test]
+fn production_input_guard_allows_an_existing_project_activity() {
+    use polaris_core::project_mutation::ProjectMutationOwnerV1;
+
+    let (root, _config, engine) = production_engine();
+    let owner = ProjectMutationOwnerV1::for_project(&root.path().join("source")).unwrap();
+    let _active_run = owner.try_activity().unwrap();
+    assert!(engine.input_management_guard().unwrap().is_some());
+}
+
+#[test]
+fn production_input_refuses_replaced_source_identity_before_admission() {
+    use std::os::unix::fs::symlink;
+
+    let (root, _config, mut engine) = production_engine();
+    hello(&mut engine);
+    let source = root.path().join("source");
+    let original = root.path().join("source-original");
+    let replacement = root.path().join("replacement");
+    std::fs::rename(&source, &original).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    symlink(&replacement, &source).unwrap();
+
+    let before = engine.store.snapshot().unwrap();
+    let manager_before = engine
+        .admission
+        .as_ref()
+        .unwrap()
+        .persisted_state()
+        .unwrap();
+    let result = direct(
+        &mut engine,
+        &submit_input(
+            "replaced-source-input",
+            session_id(),
+            0,
+            0,
+            InputRoute::Current,
+            "replaced-source-admission",
+            "must remain unsaved",
+        ),
+    );
+    assert_eq!(result.unwrap_err().code, ErrorCode::RecoveryRequired);
+    let after = engine.store.snapshot().unwrap();
+    assert_eq!(after.marker, before.marker);
+    assert_eq!(
+        serde_json::to_vec(&after.raw).unwrap(),
+        serde_json::to_vec(&before.raw).unwrap()
+    );
+    let manager_after = engine
+        .admission
+        .as_ref()
+        .unwrap()
+        .persisted_state()
+        .unwrap();
+    assert_eq!(manager_after, manager_before);
+
+    std::fs::remove_file(&source).unwrap();
+    std::fs::rename(&original, &source).unwrap();
+    assert!(engine.input_management_guard().unwrap().is_some());
 }
 
 fn submit_input(

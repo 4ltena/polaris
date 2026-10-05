@@ -378,6 +378,8 @@ fn fixture_with_history_and_workflow(
     provider_override: Option<Arc<dyn Provider>>,
     workflow: polaris_core::workflow::WorkflowConfig,
 ) -> Fixture {
+    use std::os::unix::fs::MetadataExt;
+
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
     let source = base.join("source");
@@ -451,6 +453,7 @@ fn fixture_with_history_and_workflow(
         project_id: project_id(),
         session_id: session_id(),
     };
+    let source_metadata = std::fs::metadata(&source).unwrap();
     let service = DesktopService::open_with_trusted_runs(
         config.clone(),
         Configuration {
@@ -462,6 +465,8 @@ fn fixture_with_history_and_workflow(
         },
         factory,
     )
+    .unwrap()
+    .with_management_project(source, (source_metadata.dev(), source_metadata.ino()))
     .unwrap();
     Fixture {
         _temp: temp,
@@ -475,6 +480,7 @@ fn fixture_with_history_and_workflow(
     }
 }
 
+#[cfg(target_os = "macos")]
 mod mcp_tests;
 mod project_routes;
 mod structured_tests;

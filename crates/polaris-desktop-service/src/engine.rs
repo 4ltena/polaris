@@ -12,24 +12,24 @@ mod mcp_settings;
 mod mcp_setup;
 #[cfg(target_os = "macos")]
 pub(crate) use mcp_settings::McpSettings;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod real;
 mod role_bindings;
 mod run_details;
 mod session_admission;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod source_owner;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod source_recovery;
 mod source_view;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use real::{
     TrustedHistoryResources, TrustedMcpResources, TrustedRunCompletion, TrustedRunFactory,
     TrustedRunInputs,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use source_owner::{SourceApplyRuntime, TrustedSourceFactory};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use source_recovery::SourceRecoveryHandle;
 
 use crate::transport::{self, Exit, Outbox, ServiceError, WorkerExit};
@@ -155,6 +155,7 @@ fn admission_target(id: &polaris_core::session_manager::AdmissionId) -> RunTarge
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workflow_phase(
     phase: polaris_desktop_protocol::request::WorkflowPhase,
 ) -> polaris_core::workflow::Phase {
@@ -542,6 +543,7 @@ fn orchestration_summary(
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn validated_workflow(
     config: polaris_core::workflow::WorkflowConfig,
     gates: polaris_core::workflow::WorkflowGatesV1,
@@ -614,7 +616,7 @@ impl Options {
 }
 
 struct Active {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     real: Option<real::RealRun>,
     usage: polaris_provider::UsageMeter,
     target: RunTarget,
@@ -625,12 +627,12 @@ struct Active {
     started: bool,
     execution: crate::execution::RunExecution,
     admission: Option<polaris_core::session_manager::AdmissionId>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     delegation: Option<DelegationRuntime>,
 }
 impl Active {
     fn cancel(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(real) = &mut self.real {
             real.cancel();
         }
@@ -638,14 +640,14 @@ impl Active {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct DelegationRuntime {
     control: Arc<polaris_core::session::RootDelegationControlV1>,
     projection: Arc<std::sync::RwLock<polaris_core::session::RootDelegationProjectionV1>>,
     updates: std::sync::mpsc::Receiver<()>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl DelegationRuntime {
     fn projection(&self) -> Option<polaris_core::session::RootDelegationProjectionV1> {
         self.projection.read().ok().map(|value| value.clone())
@@ -757,6 +759,82 @@ pub struct DesktopService {
     engine: Option<Engine>,
 }
 impl DesktopService {
+    /// The trusted startup owner has already checked this project's source
+    /// identity. An unbound production owner cannot accept new input.
+    #[cfg(unix)]
+    pub(crate) fn with_management_project(
+        mut self,
+        project: PathBuf,
+        identity: (u64, u64),
+    ) -> Result<Self, ServiceError> {
+        use polaris_core::{
+            management_effect::ManagementEffectStoreV1, project_mutation::ProjectMutationOwnerV1,
+        };
+        let source_path = project;
+        let project = std::fs::canonicalize(&source_path).map_err(|_| ServiceError::Options)?;
+        if !management_project_matches(&source_path, identity)
+            || !management_project_matches(&project, identity)
+        {
+            return Err(ServiceError::Options);
+        }
+        let owner = ProjectMutationOwnerV1::for_project(&project)
+            .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?;
+        #[cfg(target_os = "linux")]
+        let completed = {
+            let apply = polaris_core::apply_owner::ApplyOwnerV1::acquire(&project)
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?;
+            if apply
+                .active()
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?
+                .is_some()
+            {
+                return Err(ServiceError::Store(StoreError::RecoveryRequired));
+            }
+            let saved = self
+                .engine
+                .as_ref()
+                .ok_or(ServiceError::Worker)?
+                .store
+                .snapshot()?;
+            let mut completed = Vec::new();
+            for row in &saved.state.source_applies {
+                if row.reserved_result_id.is_some()
+                    && row.result.is_some()
+                    && apply
+                        .d27_result_is_completed(&saved, row)
+                        .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?
+                {
+                    completed.push(row.clone());
+                }
+            }
+            completed
+        };
+        let effects = {
+            let mutation = owner
+                .try_mutation()
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?;
+            ManagementEffectStoreV1::open(&project, &mutation)
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?
+        };
+        if !management_project_matches(&source_path, identity)
+            || !management_project_matches(&project, identity)
+        {
+            return Err(ServiceError::Options);
+        }
+        let engine = self.engine.as_mut().ok_or(ServiceError::Worker)?;
+        engine.management_source_path = Some(source_path);
+        engine.management_project = Some(project);
+        engine.management_identity = Some(identity);
+        engine.management_owner = Some(owner);
+        engine.management_effects = Some(effects);
+        #[cfg(target_os = "linux")]
+        {
+            engine.saved_source_completed = completed;
+        }
+
+        Ok(self)
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn with_workspace_reader(mut self, reader: crate::WorkspaceViewReader) -> Self {
         if let Some(engine) = self.engine.as_mut() {
@@ -781,20 +859,103 @@ impl DesktopService {
         config: ServiceConfig,
         configuration: Configuration,
     ) -> Result<Self, ServiceError> {
-        let root = DesktopRoot::open_owned(&config.store_root)?;
-        let store = root.open_or_create(
-            config.project_id,
-            config.session_id.clone(),
-            InitialState {
-                draft: Draft {
-                    draft_revision: DecimalU64::new(0),
-                    text: String::new(),
-                    attachment_ids: vec![],
-                },
-                configuration,
-                policy_revision: DecimalU64::new(0),
+        Self::open_storage_bound(config, configuration, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn open_source_bound(
+        config: ServiceConfig,
+        source: PathBuf,
+        identity: (u64, u64),
+    ) -> Result<Self, ServiceError> {
+        if !management_project_matches(&source, identity) {
+            return Err(ServiceError::Options);
+        }
+        Self::open_storage_bound(
+            config,
+            Configuration {
+                history_mode: Default::default(),
+                configuration_revision: DecimalU64::new(0),
+                provider: "unconfigured".into(),
+                model: String::new(),
+                effort: "none".into(),
             },
-        )?;
+            Some((source, identity)),
+        )
+    }
+
+    fn open_storage_bound(
+        config: ServiceConfig,
+        configuration: Configuration,
+        source: Option<(PathBuf, (u64, u64))>,
+    ) -> Result<Self, ServiceError> {
+        let root = DesktopRoot::open_owned(&config.store_root)?;
+        #[cfg(target_os = "linux")]
+        let recovered = if let Some((path, identity)) = &source {
+            use polaris_core::{
+                apply_intent::ApplyInventoryV1, apply_owner::ApplyOwnerV1,
+                project_mutation::open_directory_nofollow, workspace_apply::RecoveryParent,
+            };
+            if !management_project_matches(path, *identity) {
+                return Err(ServiceError::Options);
+            }
+            let owner = ApplyOwnerV1::acquire(path)
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?;
+            if let Some(intent) = owner
+                .active()
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?
+            {
+                if intent.descriptor().inventory_id != ApplyInventoryV1::D27 {
+                    return Err(ServiceError::Store(StoreError::RecoveryRequired));
+                }
+                let parent_path = PathBuf::from(
+                    &intent
+                        .d27_source_binding
+                        .as_ref()
+                        .ok_or(ServiceError::Store(StoreError::RecoveryRequired))?
+                        .manifest
+                        .recovery_parent_path,
+                );
+                let parent_fd = open_directory_nofollow(&parent_path)
+                    .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?;
+                let expected = intent.descriptor().recovery_parent_identity;
+                let parent = RecoveryParent::pin(
+                    &parent_fd,
+                    (expected.device, expected.inode),
+                    &parent_path,
+                )
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?;
+                Some(
+                    owner
+                        .recover_d27_session(&root, &config.project_id, &config.session_id, &parent)
+                        .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?
+                        .0,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let recovered: Option<Writer> = None;
+        let store = if let Some(store) = recovered {
+            store
+        } else {
+            root.open_or_create(
+                config.project_id,
+                config.session_id.clone(),
+                InitialState {
+                    draft: Draft {
+                        draft_revision: DecimalU64::new(0),
+                        text: String::new(),
+                        attachment_ids: vec![],
+                    },
+                    configuration,
+                    policy_revision: DecimalU64::new(0),
+                },
+            )?
+        };
         let saved = store.snapshot()?;
         let admission = session_admission::AdmissionOwner::open(
             &root,
@@ -818,6 +979,26 @@ impl DesktopService {
             .as_mut()
             .ok_or(ServiceError::Worker)?
             .restore_admission_lanes()?;
+        #[cfg(target_os = "linux")]
+        if let Some((path, identity)) = source {
+            let unresolved = polaris_core::apply_owner::ApplyOwnerV1::acquire(&path)
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?
+                .active()
+                .map_err(|_| ServiceError::Store(StoreError::RecoveryRequired))?
+                .is_some();
+            if unresolved {
+                // Keep saved inspection available. Missing management binding
+                // makes the existing production input guard refuse new work.
+                let engine = service.engine.as_mut().ok_or(ServiceError::Worker)?;
+                engine.management_source_path = Some(path.clone());
+                engine.management_project = Some(path);
+                engine.management_identity = Some(identity);
+            } else {
+                service = service.with_management_project(path, identity)?;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = source;
         Ok(service)
     }
     fn from_production_store(store: Writer, session: SessionId) -> Result<Self, ServiceError> {
@@ -1051,7 +1232,7 @@ where
         };
         engine.subscription = None;
         engine.history = None;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         engine.close_source_recovery();
         (engine, settled)
     });
@@ -1213,11 +1394,23 @@ struct Engine {
     other_lane: Option<SessionLane>,
     routing_jobs: Vec<RoutingJob>,
     production: bool,
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
+    management_source_path: Option<PathBuf>,
+    #[cfg(unix)]
+    management_project: Option<PathBuf>,
+    #[cfg(unix)]
+    management_identity: Option<(u64, u64)>,
+    #[cfg(unix)]
+    management_owner: Option<polaris_core::project_mutation::ProjectMutationOwnerV1>,
+    #[cfg(unix)]
+    management_effects: Option<polaris_core::management_effect::ManagementEffectStoreV1>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     trusted_runs: Option<real::TrustedRuns>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     source: Option<source_owner::SourceOwner>,
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "linux")]
+    saved_source_completed: Vec<polaris_core::desktop_store::SavedSourceApply>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     source_recovery: Option<source_recovery::Ingress>,
     options: Options,
     epoch: EngineEpoch,
@@ -1293,15 +1486,27 @@ impl Engine {
             other_lane: None,
             routing_jobs: Vec::new(),
             production: false,
+            #[cfg(unix)]
+            management_source_path: None,
+            #[cfg(unix)]
+            management_project: None,
+            #[cfg(unix)]
+            management_identity: None,
+            #[cfg(unix)]
+            management_owner: None,
+            #[cfg(unix)]
+            management_effects: None,
             #[cfg(target_os = "macos")]
             workspace_reader: None,
             local_models: None,
             inventory_generation: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             trusted_runs: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             source: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(target_os = "linux")]
+            saved_source_completed: Vec::new(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             source_recovery: None,
             options,
             disconnected: Arc::new(AtomicBool::new(false)),
@@ -1332,31 +1537,31 @@ impl Engine {
         }
     }
     fn source_enabled(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             self.source.is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             false
         }
     }
     fn source_unsettled(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             self.source
                 .as_ref()
                 .is_some_and(|source| source.unsettled())
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             false
         }
     }
     fn poll_source(&mut self, stopping: bool) -> Result<(), ServiceError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.poll_source_recovery();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(source) = &mut self.source {
             let result = source.poll(
                 &mut self.store,
@@ -1373,7 +1578,7 @@ impl Engine {
         Ok(())
     }
     fn resolve_source(&mut self, request: &Request) -> Result<SuccessResult, ProtocolError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(source) = &mut self.source {
             return source.resolve(&mut self.store, request, &self.draining, &self.disconnected);
         }
@@ -1381,31 +1586,31 @@ impl Engine {
         Err(error(ErrorCode::CapabilityUnavailable))
     }
     fn real_enabled(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             self.production && self.trusted_runs.is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             false
         }
     }
 
     fn delegation_projection(&self) -> Option<polaris_core::session::RootDelegationProjectionV1> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             self.active
                 .as_ref()
                 .and_then(|active| active.delegation.as_ref())
                 .and_then(DelegationRuntime::projection)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             None
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn delegation_for(
         &self,
         root_run_id: &RunId,
@@ -1446,7 +1651,7 @@ impl Engine {
         Ok((runtime, binding))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn emit_delegation_update(&mut self, out: &Outbox) -> Result<(), ServiceError> {
         let changed = self
             .active
@@ -1467,7 +1672,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn record_root_cancel_plan(&self, target: &RunTarget) -> Result<(), ProtocolError> {
         let Some(active) = self
             .active
@@ -1733,6 +1938,10 @@ impl Engine {
         {
             return Err(error(ErrorCode::PermissionDenied));
         }
+        #[cfg(target_os = "linux")]
+        if matches!(request.body, RequestBody::WorkflowConfigure(..)) && !self.real_enabled() {
+            return Err(error(ErrorCode::CapabilityUnavailable));
+        }
         // The root owns at most two exact session lanes. Select the addressed
         // writer before reading its ledger; unrelated sessions still fail
         // without revealing whether a directory exists.
@@ -1793,7 +2002,7 @@ impl Engine {
             if request.protocol_version == ProtocolVersion::V2 && self.admission.is_some() {
                 capabilities.extend([Capability::SessionManage, Capability::InputCancel]);
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             if request.protocol_version == ProtocolVersion::V2 && self.real_enabled() {
                 capabilities.push(Capability::SubagentControl);
             }
@@ -1923,7 +2132,10 @@ impl Engine {
             RequestBody::HistoryPage(_, params) => {
                 Ok(SuccessResult::HistoryPage(self.history_page(params)?))
             }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             RequestBody::WorkflowConfigure(_, params) => self.configure_workflow(params, events),
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            RequestBody::WorkflowConfigure(..) => Err(error(ErrorCode::CapabilityUnavailable)),
             RequestBody::SourceApplyList(_, params) => self.source_list(params),
             RequestBody::SourceApplyPage(_, params) => self.source_page(params),
             RequestBody::ApprovalResolve(..) => self.resolve_approval(request, events),
@@ -2040,7 +2252,7 @@ impl Engine {
         &self,
         params: &polaris_desktop_protocol::request::SubagentWait,
     ) -> Result<SuccessResult, ProtocolError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let (runtime, binding) =
                 self.delegation_for(&params.root_run_id, &params.root_attempt_id)?;
@@ -2103,7 +2315,7 @@ impl Engine {
                 children,
             }))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = params;
             Err(error(ErrorCode::CapabilityUnavailable))
@@ -2115,7 +2327,7 @@ impl Engine {
         params: &polaris_desktop_protocol::request::SubagentCancel,
         events: &mut Vec<EventBody>,
     ) -> Result<SuccessResult, ProtocolError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let (runtime, binding) =
                 self.delegation_for(&params.root_run_id, &params.root_attempt_id)?;
@@ -2178,7 +2390,7 @@ impl Engine {
                 runtime_effect,
             }))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (params, events);
             Err(error(ErrorCode::CapabilityUnavailable))
@@ -2302,6 +2514,8 @@ impl Engine {
             .session_id()
             .cloned()
             .ok_or_else(|| error(ErrorCode::InvalidRequest))?;
+        #[cfg(unix)]
+        let _project_activity = self.input_management_guard()?;
         self.select_lane(&source)?;
         let (
             expected_manager_revision,
@@ -2415,6 +2629,58 @@ impl Engine {
         Ok(SuccessResult::InputSubmit(submitted))
     }
 
+    #[cfg(unix)]
+    fn input_management_guard(
+        &self,
+    ) -> Result<Option<polaris_core::project_mutation::ProjectActivityLeaseV1>, ProtocolError> {
+        use polaris_core::project_mutation::ProjectMutationError;
+
+        if !self.production {
+            return Ok(None);
+        }
+        let project = self
+            .management_project
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::RecoveryRequired))?;
+        let source_path = self
+            .management_source_path
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::RecoveryRequired))?;
+        let identity = self
+            .management_identity
+            .ok_or_else(|| error(ErrorCode::RecoveryRequired))?;
+        let owner = self
+            .management_owner
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::RecoveryRequired))?;
+        let effects = self
+            .management_effects
+            .as_ref()
+            .ok_or_else(|| error(ErrorCode::RecoveryRequired))?;
+        if !management_project_matches(source_path, identity)
+            || !management_project_matches(project, identity)
+        {
+            return Err(error(ErrorCode::RecoveryRequired));
+        }
+        let activity = owner.try_activity().map_err(|failure| match failure {
+            ProjectMutationError::Busy => error(ErrorCode::SessionBusy),
+            _ => error(ErrorCode::RecoveryRequired),
+        })?;
+        if !management_project_matches(source_path, identity)
+            || !management_project_matches(project, identity)
+        {
+            return Err(error(ErrorCode::RecoveryRequired));
+        }
+        if effects
+            .blocker()
+            .map_err(|_| error(ErrorCode::RecoveryRequired))?
+            .is_some()
+        {
+            return Err(error(ErrorCode::RecoveryRequired));
+        }
+        Ok(Some(activity))
+    }
+
     fn start_routing(
         &mut self,
         admission: polaris_core::session_manager::AdmissionId,
@@ -2426,12 +2692,12 @@ impl Engine {
         {
             return Ok(());
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let decider = self
             .trusted_runs
             .as_ref()
             .and_then(|runs| runs.factory.decider());
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let decider: Option<Arc<dyn polaris_provider::decision::Decider>> = None;
         let Some(decider) = decider else {
             self.admission
@@ -2645,7 +2911,7 @@ impl Engine {
         self.select_lane(&destination)?;
         let target = admission_target(id);
         let existing = self.store.admitted_run(id.as_str()).map_err(store_error)?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let account = if existing.is_none() {
             self.trusted_runs
                 .as_ref()
@@ -2656,7 +2922,7 @@ impl Engine {
         } else {
             None
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let account = None;
         let appended = self
             .store
@@ -2786,7 +3052,7 @@ impl Engine {
                 attempt_id: run.run.attempt_id,
             };
             self.active = Some(Active {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 real: self.real_enabled().then(real::RealRun::queued),
                 usage: polaris_provider::UsageMeter::default(),
                 execution: crate::execution::RunExecution::new(&target, self.disconnected.clone()),
@@ -2800,7 +3066,7 @@ impl Engine {
                 text: String::new(),
                 started: false,
                 admission: Some(id),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 delegation: None,
             });
             self.select_lane(&source)?;
@@ -2864,6 +3130,7 @@ impl Engine {
 
     /// GUI configuration has only three selections. The profile text, skill
     /// IDs and paths remain the startup owner's validated catalog.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn configure_workflow(
         &mut self,
         params: &polaris_desktop_protocol::request::WorkflowConfigure,
@@ -2955,6 +3222,7 @@ impl Engine {
 
     /// New/legacy desktop sessions must have a durable configuration before a
     /// RunStart is admitted. Failure leaves the request unaccepted.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn initialize_workflow(&mut self, expected: DecimalU64) -> Result<(), ProtocolError> {
         let factory = self
             .trusted_runs
@@ -3007,6 +3275,7 @@ impl Engine {
                 return Err(error(ErrorCode::CapabilityUnavailable));
             }
             match &request.body {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 RequestBody::RunStart(..)
                     if self.real_enabled() && before.state.workflow.is_none() =>
                 {
@@ -3064,7 +3333,7 @@ impl Engine {
             events.push(EventBody::RunState(record.run.clone()));
             self.active = None;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.real_enabled()
             && existing.is_none()
             && matches!(request.body, RequestBody::RunStart(..))
@@ -3082,7 +3351,7 @@ impl Engine {
             run_id: RunId::new(self.id("run")).unwrap(),
             attempt_id: AttemptId::new(self.id("attempt")).unwrap(),
         });
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if existing.is_none()
             && let RequestBody::RunCancel(_, target) = &request.body
         {
@@ -3091,7 +3360,7 @@ impl Engine {
             // observable.
             self.record_root_cancel_plan(target)?;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if existing.is_none()
             && let (Some(source), Some(target)) = (&mut self.source, &target)
         {
@@ -3100,12 +3369,13 @@ impl Engine {
         // The binding is decided before the acceptance writes it, so a run is
         // never saved without the registration its sends must use. A re-sent
         // request keeps the binding its acceptance already saved.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let account = match (&target, existing.is_none(), self.trusted_runs.as_ref()) {
             (Some(_), true, Some(runs)) => match runs.factory.bind_account() {
                 Ok(account) => account,
                 Err(_) => {
                     // Nothing was accepted, so the placeholder goes back too.
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     if let (Some(source), Some(target)) = (&mut self.source, &target) {
                         source.release_unused(target);
                     }
@@ -3114,6 +3384,8 @@ impl Engine {
             },
             _ => None,
         };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let account = None;
         // Legacy `run.start` remains an explicit current-session operation.
         // It is not auto-routed and therefore never consumes an admission ID.
         let admission_id = None;
@@ -3122,7 +3394,7 @@ impl Engine {
             Err(e) => {
                 // A definitely rejected start releases its placeholder. Ambiguous
                 // storage retains it; no new run can silently replace ownership.
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if existing.is_none()
                     && self.store.snapshot().is_ok()
                     && let (Some(source), Some(target)) = (&mut self.source, &target)
@@ -3182,7 +3454,7 @@ impl Engine {
                         self.store.snapshot().map_err(store_error)?.state.draft,
                     ));
                     self.active = Some(Active {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                         real: self.real_enabled().then(real::RealRun::queued),
                         usage: polaris_provider::UsageMeter::default(),
                         execution: crate::execution::RunExecution::new(
@@ -3202,7 +3474,7 @@ impl Engine {
                         text: String::new(),
                         started: false,
                         admission: admission_id,
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                         delegation: None,
                     });
                     if self.admission.is_some() {
@@ -3222,7 +3494,7 @@ impl Engine {
                 }))
             }
             RequestResult::CancelRequested { run_id, attempt_id } => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if let Some(source) = &mut self.source {
                     source.cancel_target(&RunTarget {
                         run_id: run_id.clone(),
@@ -3380,7 +3652,7 @@ impl Engine {
     fn cancel_and_poll_core(&mut self) {
         if let Some(active) = &mut self.active {
             active.cancel();
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Some(real) = &mut active.real
                 && real.poll(&active.target, None).is_err()
             {
@@ -3436,7 +3708,7 @@ impl Engine {
             Vec::new()
         };
         self.emit_all(approval_events, out)?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self
             .active
             .as_ref()
@@ -3513,7 +3785,7 @@ impl Engine {
     }
 
     fn complete(&mut self, outcome: Observation, out: Option<&Outbox>) -> Result<(), ServiceError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self
             .active
             .as_ref()
@@ -3692,6 +3964,13 @@ fn message_id(sequence: u64) -> MessageId {
 }
 fn cursor(id: &SnapshotId, offset: usize) -> HistoryCursor {
     HistoryCursor::new(format!("{}:{offset}", id.as_str())).unwrap()
+}
+#[cfg(unix)]
+fn management_project_matches(project: &std::path::Path, identity: (u64, u64)) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::symlink_metadata(project)
+        .is_ok_and(|metadata| metadata.is_dir() && (metadata.dev(), metadata.ino()) == identity)
 }
 fn error(code: ErrorCode) -> ProtocolError {
     ProtocolError {

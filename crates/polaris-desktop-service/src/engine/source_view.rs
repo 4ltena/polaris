@@ -244,7 +244,27 @@ impl Engine {
                     invalidated: r.invalidated,
                     intent_committed: r.intent_revision.is_some(),
                     result_saved: r.result.is_some(),
-                    result: projected_result(r.result.as_ref(), &c.payload.entries),
+                    result: {
+                        let mut result = projected_result(r.result.as_ref(), &c.payload.entries);
+                        #[cfg(target_os = "linux")]
+                        if r.reserved_result_id.is_some()
+                            && !self.saved_source_completed.contains(r)
+                            && !self
+                                .source
+                                .as_ref()
+                                .is_some_and(|owner| owner.completed_result(r))
+                        {
+                            if let Some(result) = &mut result {
+                                if result.status == source_apply::SourceApplyResultStatus::Applied {
+                                    result.status = source_apply::SourceApplyResultStatus::Unknown;
+                                    result.installed_count = DecimalU64::new(0);
+                                    result.deleted_count = DecimalU64::new(0);
+                                    result.restored_count = DecimalU64::new(0);
+                                }
+                            }
+                        }
+                        result
+                    },
                 }
             })
             .collect::<Vec<_>>();

@@ -22,7 +22,7 @@ pub enum RecoveryTransportError {
 /// Runs only this channel. An error never cancels, drops or terminates the
 /// engine. Once enqueued, a result save belongs to the engine even if this
 /// future is cancelled while waiting for its acknowledgement.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn serve_source_recovery<S>(
     stream: S,
     owner: crate::SourceRecoveryHandle,
@@ -36,7 +36,7 @@ where
 /// Stop accepting on `stop`, but finish the one accepted owner operation and
 /// its bounded response write. The caller closes the owner's ingress when the
 /// engine ends so an unanswered queued request cannot wait forever.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn serve_source_recovery_draining<S, F>(
     stream: S,
     owner: crate::SourceRecoveryHandle,

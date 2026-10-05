@@ -1,14 +1,17 @@
 //! Trusted next-run role metadata configuration. Runtime binding happens only
 //! during preparation of an already accepted run.
 use super::*;
+#[cfg(target_os = "macos")]
 use polaris_core::desktop_store::{
-    SavedRoleBinding, SavedRoleBindings, SavedRuntime, SavedTier, SavedTierBinding,
-    SavedTierBindings, ToolSupport,
+    SavedRoleBinding, SavedTier, SavedTierBinding, SavedTierBindings,
 };
+use polaris_core::desktop_store::{SavedRoleBindings, SavedRuntime, ToolSupport};
 use polaris_desktop_protocol::role_bindings::{
-    BoundRuntime, BoundTier, ObservedToolSupport, RoleBinding, RoleBindingsConfigured,
-    RoleDescriptor, TierBinding,
+    BoundRuntime, ObservedToolSupport, RoleBinding, RoleDescriptor,
 };
+#[cfg(target_os = "macos")]
+use polaris_desktop_protocol::role_bindings::{BoundTier, RoleBindingsConfigured, TierBinding};
+#[cfg(target_os = "macos")]
 use polaris_provider::local::Endpoint;
 
 pub(super) fn to_wire(saved: Option<&SavedRoleBindings>) -> Vec<RoleBinding> {
@@ -43,6 +46,7 @@ fn to_wire_runtime(runtime: SavedRuntime) -> BoundRuntime {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn from_wire_runtime(runtime: BoundRuntime) -> SavedRuntime {
     match runtime {
         BoundRuntime::Ollama => SavedRuntime::Ollama,
@@ -52,6 +56,7 @@ fn from_wire_runtime(runtime: BoundRuntime) -> SavedRuntime {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn to_wire_tier(tier: SavedTier) -> BoundTier {
     match tier {
         SavedTier::Dwarf => BoundTier::Dwarf,
@@ -61,6 +66,7 @@ fn to_wire_tier(tier: SavedTier) -> BoundTier {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn from_wire_tier(tier: BoundTier) -> SavedTier {
     match tier {
         BoundTier::Dwarf => SavedTier::Dwarf,
@@ -70,6 +76,7 @@ fn from_wire_tier(tier: BoundTier) -> SavedTier {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn tiers_to_wire(saved: Option<&SavedTierBindings>) -> Vec<TierBinding> {
     saved
         .map(|saved| {
@@ -88,6 +95,7 @@ pub(super) fn tiers_to_wire(saved: Option<&SavedTierBindings>) -> Vec<TierBindin
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn catalog_to_wire(catalog: &[polaris_skills::AgentType]) -> Vec<RoleDescriptor> {
     catalog
         .iter()

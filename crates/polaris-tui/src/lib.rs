@@ -34,6 +34,8 @@ pub mod sessions;
 #[doc(hidden)]
 pub mod signal;
 pub mod slash;
+#[cfg(target_os = "linux")]
+mod source_apply;
 mod time;
 pub mod tool_memory;
 
@@ -2836,6 +2838,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         return code;
     }
 
+    #[cfg(target_os = "linux")]
+    if let Err(error) = source_apply::prepare_state(&args.cwd, &args.state_dir) {
+        eprintln!("保存先を準備できません: {error}");
+        return ExitCode::FAILURE;
+    }
 
     // These catalogs are process-owned. A successful rewind rebuilds them
     // from the restored project tree before its branch becomes active.
@@ -3133,6 +3140,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         }
     };
 
+    #[cfg(target_os = "linux")]
+    let mut source_frontend = source_apply::Frontend::open(&args, audit.clone());
 
     // Shared via `RefCell`, not held exclusively — the agent-turn loop
     // below redraws the screen concurrently with `agent::run` (to animate
@@ -4338,6 +4347,23 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             );
                             continue;
                         }
+                        #[cfg(target_os = "linux")]
+                        slash::Action::Apply(requested) => {
+                            handle_source_apply_action(
+                                &terminal,
+                                &mut key_reader,
+                                &args,
+                                audit.clone(),
+                                &mut source_frontend,
+                                &requested,
+                                has_pending_inputs || dispatching_queued_input,
+                                &session,
+                                &mut status,
+                                &mut local_lines,
+                            )
+                            .await;
+                            continue;
+                        }
                         slash::Action::Compact => {
                             // A real summarization call can take tens of
                             // seconds — show something before awaiting it
@@ -5012,6 +5038,23 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         has_pending_inputs || dispatching_queued_input,
                         &mut status,
                     );
+                    continue;
+                }
+                #[cfg(target_os = "linux")]
+                Some(slash::Action::Apply(requested)) => {
+                    handle_source_apply_action(
+                        &terminal,
+                        &mut key_reader,
+                        &args,
+                        audit.clone(),
+                        &mut source_frontend,
+                        &requested,
+                        has_pending_inputs || dispatching_queued_input,
+                        &session,
+                        &mut status,
+                        &mut local_lines,
+                    )
+                    .await;
                     continue;
                 }
                 Some(slash::Action::Compact) => {
@@ -6948,6 +6991,44 @@ fn confirm_rewind_preview<B: ratatui::backend::Backend, R: approver::KeyReader>(
 
 
 
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_source_apply_action<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    args: &RunArgs<'_>,
+    audit: Arc<tokio::sync::Mutex<AuditLog>>,
+    frontend: &mut Result<source_apply::Frontend, String>,
+    requested: &str,
+    queued: bool,
+    session: &polaris_core::session::Session,
+    status: &mut Status,
+    lines: &mut Vec<ratatui::text::Line<'static>>,
+) {
+    let mutating = requested.starts_with("run ") || requested.starts_with("resolve ");
+    if mutating && (queued || session.check_persistence().is_err()) {
+        *status =
+            Status::Error("送信待ちまたは保存エラーを解消してからD27を操作してください".into());
+        return;
+    }
+    if frontend.is_err() {
+        *frontend = source_apply::Frontend::open(args, audit);
+    }
+    let result = match frontend {
+        Ok(owner) => owner.action(requested, terminal, reader).await,
+        Err(error) => Err(error.clone()),
+    };
+    match result {
+        Ok(text) => {
+            lines.extend(
+                text.lines()
+                    .map(|line| ratatui::text::Line::from(render::sanitize(line))),
+            );
+            *status = Status::Notice("D27の状態を表示しました".into());
+        }
+        Err(error) => *status = Status::Error(render::sanitize(&error)),
+    }
+}
 
 fn confirm_workflow_change<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,

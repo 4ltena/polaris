@@ -91,6 +91,11 @@ pub const COMMANDS: &[SlashCommand] = &[
         name: "compare",
         description: "compare folder names and sizes without opening file contents",
     },
+    #[cfg(target_os = "linux")]
+    SlashCommand {
+        name: "apply",
+        description: "run in an isolated copy, inspect changes, and confirm source apply",
+    },
     SlashCommand {
         name: "phase",
         description: "show or set the explicit workflow phase",
@@ -358,6 +363,8 @@ pub fn parse(line: &str) -> Option<Action> {
         }
         "decided" => Action::Decided(extra),
         "compare" => Action::Compare(extra),
+        #[cfg(target_os = "linux")]
+        "apply" => Action::Apply(extra),
         "phase" => Action::Phase(extra),
         "workflow" => Action::Workflow(extra),
         "skills" => Action::Skills,

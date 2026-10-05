@@ -33,3 +33,7 @@ polaris-mcp = { path = "../polaris-mcp", features = ["test-support"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+polaris-desktop-service = { path = "../polaris-desktop-service" }
+polaris-desktop-protocol = { path = "../polaris-desktop-protocol" }

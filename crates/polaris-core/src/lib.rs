@@ -63,6 +63,8 @@ pub mod session;
 pub mod session_manager;
 pub mod session_settings;
 pub mod session_store;
+#[cfg(unix)]
+pub mod session_switch;
 pub mod similarity;
 pub mod spare;
 pub mod spawn;

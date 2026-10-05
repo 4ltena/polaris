@@ -37,7 +37,7 @@ pub mod filemap;
 mod files_md;
 mod gitignore;
 pub mod input_preparation;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod managed_runtime;
 pub mod measurement;
 #[cfg(unix)]

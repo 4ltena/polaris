@@ -9,18 +9,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    ffi::{CString, OsStr},
     fs::{File, OpenOptions},
-    os::{
-        fd::AsRawFd,
-        unix::{ffi::OsStrExt, fs::FileExt, fs::MetadataExt, fs::OpenOptionsExt},
-    },
+    os::unix::{fs::FileExt, fs::MetadataExt, fs::OpenOptionsExt},
     path::{Component, Path, PathBuf},
-    process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+use std::{
+    ffi::{CString, OsStr},
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    process::{Command, Output, Stdio},
+    sync::Mutex,
+};
+
+#[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
 
 const EMBEDDED_LOCK: &[u8] = include_bytes!(
@@ -30,8 +33,11 @@ const IMAGE_ID: &str = "python-e5-cat";
 const MAX_LOCK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 100_000;
 const MAX_TREE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+#[cfg(target_os = "macos")]
 const MAX_PLIST_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "macos")]
 const CHILD_IMAGE_FD: libc::c_int = 198;
+#[cfg(target_os = "macos")]
 static CHILD_IMAGE_FD_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -99,11 +105,18 @@ trait MountBackend: Send + Sync {
     fn detach(&self, device: &str);
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct HdiutilBackend;
 
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+struct UnsupportedMountBackend;
+
+#[cfg(target_os = "macos")]
 struct ReservedChildFd(libc::c_int);
 
+#[cfg(target_os = "macos")]
 impl Drop for ReservedChildFd {
     fn drop(&mut self) {
         // SAFETY: this descriptor is created and exclusively owned below.
@@ -111,6 +124,7 @@ impl Drop for ReservedChildFd {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn attach_arguments() -> Vec<String> {
     vec![
         "attach".into(),
@@ -122,6 +136,7 @@ fn attach_arguments() -> Vec<String> {
     ]
 }
 
+#[cfg(target_os = "macos")]
 fn run_with_inherited_image_fd(
     program: &Path,
     args: &[impl AsRef<OsStr>],
@@ -171,6 +186,7 @@ fn run_with_inherited_image_fd(
         .map_err(|_| ManagedRuntimeError::Mount)
 }
 
+#[cfg(target_os = "macos")]
 impl MountBackend for HdiutilBackend {
     fn attach(&self, image: &File) -> Result<AttachedMount, ManagedRuntimeError> {
         // The already-open descriptor, rather than the mutable installation
@@ -201,11 +217,28 @@ impl MountBackend for HdiutilBackend {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+impl MountBackend for UnsupportedMountBackend {
+    fn attach(&self, _image: &File) -> Result<AttachedMount, ManagedRuntimeError> {
+        Err(ManagedRuntimeError::Unavailable)
+    }
+
+    fn validate_mount(&self, _mount_point: &Path, _device_number: u64) -> bool {
+        false
+    }
+
+    fn detach(&self, _device: &str) {}
+}
+
 struct RuntimeInner {
     image_path: PathBuf,
     image_identity: (u64, u64),
+    image_size: u64,
+    image_sha256: String,
     image: File,
+    mount_root_identity: (u64, u64),
     mount_root: File,
+    python_identity: (u64, u64),
     python: File,
     mount_point: PathBuf,
     device: String,
@@ -227,7 +260,11 @@ pub struct ManagedRuntimeLease(Arc<RuntimeInner>);
 
 impl ManagedRuntimeLease {
     pub fn acquire(home: &Path) -> Result<Self, ManagedRuntimeError> {
-        Self::acquire_with(EMBEDDED_LOCK, home, Arc::new(HdiutilBackend))
+        #[cfg(target_os = "macos")]
+        let backend: Arc<dyn MountBackend> = Arc::new(HdiutilBackend);
+        #[cfg(not(target_os = "macos"))]
+        let backend: Arc<dyn MountBackend> = Arc::new(UnsupportedMountBackend);
+        Self::acquire_with(EMBEDDED_LOCK, home, backend)
     }
 
     fn acquire_with(
@@ -273,6 +310,7 @@ impl ManagedRuntimeLease {
             backend.detach(&attached.device);
             return Err(ManagedRuntimeError::Mount);
         }
+        let mount_root_identity = (root_metadata.dev(), root_metadata.ino());
         if verify_tree(&attached.mount_point, &image.tree_manifest).is_err() {
             backend.detach(&attached.device);
             return Err(ManagedRuntimeError::Integrity);
@@ -296,11 +334,16 @@ impl ManagedRuntimeLease {
             backend.detach(&attached.device);
             return Err(ManagedRuntimeError::Integrity);
         }
+        let python_identity = (python_metadata.dev(), python_metadata.ino());
         let lease = Self(Arc::new(RuntimeInner {
             image_path,
             image_identity,
+            image_size: image.image_size,
+            image_sha256: image.image_sha256,
             image: image_file,
+            mount_root_identity,
             mount_root,
+            python_identity,
             python,
             mount_point: attached.mount_point,
             device: attached.device,
@@ -326,12 +369,18 @@ impl ManagedRuntimeLease {
         if (image.dev(), image.ino()) != self.0.image_identity {
             return Err(ManagedRuntimeError::Integrity);
         }
+        if image.len() != self.0.image_size || sha256_reader(&self.0.image)? != self.0.image_sha256
+        {
+            return Err(ManagedRuntimeError::Integrity);
+        }
         let root = self
             .0
             .mount_root
             .metadata()
             .map_err(|_| ManagedRuntimeError::Mount)?;
-        if root.dev() != self.0.device_number
+        if (root.dev(), root.ino()) != self.0.mount_root_identity
+            || root.dev() != self.0.device_number
+            || !path_has_directory_identity(&self.0.mount_point, self.0.mount_root_identity)
             || !self
                 .0
                 .backend
@@ -344,7 +393,11 @@ impl ManagedRuntimeLease {
             .python
             .metadata()
             .map_err(|_| ManagedRuntimeError::Integrity)?;
-        if python.dev() != self.0.device_number || python.mode() & 0o111 == 0 {
+        if (python.dev(), python.ino()) != self.0.python_identity
+            || python.dev() != self.0.device_number
+            || python.mode() & 0o111 == 0
+            || check_path_identity(&self.python_path(), self.0.python_identity).is_err()
+        {
             return Err(ManagedRuntimeError::Integrity);
         }
         verify_tree(&self.0.mount_point, &self.0.manifest)
@@ -360,19 +413,15 @@ fn select_image(bytes: &[u8]) -> Result<RuntimeImageV2, ManagedRuntimeError> {
     if lock.schema_version != 2 {
         return Err(ManagedRuntimeError::Integrity);
     }
-    let architecture = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else {
-        return Err(ManagedRuntimeError::Unavailable);
-    };
+    let (platform, architecture) = current_platform_architecture()?;
     let mut matches = lock.images.into_iter().filter(|entry| {
-        entry.id == IMAGE_ID && entry.platform == "macos" && entry.architecture == architecture
+        entry.id == IMAGE_ID && entry.platform == platform && entry.architecture == architecture
     });
     let entry = matches.next().ok_or(ManagedRuntimeError::Unavailable)?;
-    if matches.next().is_some()
-        || !valid_component(&entry.version)
+    if matches.next().is_some() {
+        return Err(ManagedRuntimeError::Unavailable);
+    }
+    if !valid_component(&entry.version)
         || !valid_component(&entry.image_filename)
         || entry.image_size == 0
         || !valid_hash(&entry.image_sha256)
@@ -390,6 +439,24 @@ fn select_image(bytes: &[u8]) -> Result<RuntimeImageV2, ManagedRuntimeError> {
     }
     validate_manifest(&entry.tree_manifest)?;
     Ok(entry)
+}
+
+fn current_platform_architecture() -> Result<(&'static str, &'static str), ManagedRuntimeError> {
+    let platform = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return Err(ManagedRuntimeError::Unavailable);
+    };
+    let architecture = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        return Err(ManagedRuntimeError::Unavailable);
+    };
+    Ok((platform, architecture))
 }
 
 fn validate_manifest(manifest: &RuntimeTreeManifestV2) -> Result<(), ManagedRuntimeError> {
@@ -537,6 +604,16 @@ fn check_path_identity(path: &Path, expected: (u64, u64)) -> Result<(), ManagedR
     Ok(())
 }
 
+fn path_has_directory_identity(path: &Path, expected: (u64, u64)) -> bool {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| {
+            !metadata.file_type().is_symlink()
+                && metadata.file_type().is_dir()
+                && (metadata.dev(), metadata.ino()) == expected
+        })
+}
+
 fn sha256_reader(file: &File) -> Result<String, ManagedRuntimeError> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
@@ -578,6 +655,7 @@ fn valid_component(value: &str) -> bool {
         && !value.bytes().any(|byte| byte == b'/' || byte == 0)
 }
 
+#[cfg(target_os = "macos")]
 fn parse_attach_plist(bytes: &[u8]) -> Result<(String, PathBuf), ManagedRuntimeError> {
     let text = std::str::from_utf8(bytes).map_err(|_| ManagedRuntimeError::Mount)?;
     let mount_marker = "<key>mount-point</key>";
@@ -604,6 +682,7 @@ fn parse_attach_plist(bytes: &[u8]) -> Result<(String, PathBuf), ManagedRuntimeE
     Ok((device, PathBuf::from(mount)))
 }
 
+#[cfg(target_os = "macos")]
 fn plist_string(text: &str, key: &str) -> Result<String, ManagedRuntimeError> {
     let marker = format!("<key>{key}</key>");
     let (_, tail) = text.split_once(&marker).ok_or(ManagedRuntimeError::Mount)?;
@@ -622,6 +701,7 @@ fn plist_string(text: &str, key: &str) -> Result<String, ManagedRuntimeError> {
     Ok(raw.to_owned())
 }
 
+#[cfg(target_os = "macos")]
 fn inspect_mount(device: &str, mount_point: &Path) -> Result<AttachedMount, ManagedRuntimeError> {
     let device_c = CString::new(device).map_err(|_| ManagedRuntimeError::Mount)?;
     // SAFETY: fixed NUL-terminated path and initialized stat buffer.
@@ -638,6 +718,7 @@ fn inspect_mount(device: &str, mount_point: &Path) -> Result<AttachedMount, Mana
     })
 }
 
+#[cfg(target_os = "macos")]
 fn mount_is_readonly(path: &Path) -> Result<bool, ManagedRuntimeError> {
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| ManagedRuntimeError::Mount)?;
     // SAFETY: valid C path and initialized statfs buffer.
@@ -714,15 +795,11 @@ mod tests {
             files,
         };
         let tree_hash = sha256_bytes(&serde_json::to_vec(&tree).unwrap());
-        let arch = if cfg!(target_arch = "aarch64") {
-            "arm64"
-        } else {
-            "x86_64"
-        };
+        let (platform, arch) = current_platform_architecture().unwrap();
         serde_json::to_vec(&serde_json::json!({
             "schema_version":2,
             "images":[{
-                "id":IMAGE_ID,"version":"fixture","platform":"macos","architecture":arch,
+                "id":IMAGE_ID,"version":"fixture","platform":platform,"architecture":arch,
                 "image_filename":"runtime.dmg","image_size":image.len(),
                 "image_sha256":sha256_bytes(image),"tree_manifest_sha256":tree_hash,
                 "tree_manifest":tree,"bundled_resource":"runtime.dmg"
@@ -739,6 +816,35 @@ mod tests {
         );
     }
 
+    struct NoSpawnBackend;
+
+    impl MountBackend for NoSpawnBackend {
+        fn attach(&self, _image: &File) -> Result<AttachedMount, ManagedRuntimeError> {
+            panic!("an unavailable lock must not invoke a mount helper")
+        }
+
+        fn validate_mount(&self, _mount_point: &Path, _device_number: u64) -> bool {
+            false
+        }
+
+        fn detach(&self, _device: &str) {}
+    }
+
+    #[test]
+    fn empty_lock_is_unavailable_before_any_helper_can_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ManagedRuntimeLease::acquire_with(
+                br#"{"schema_version":2,"images":[]}"#,
+                temp.path(),
+                Arc::new(NoSpawnBackend),
+            )
+            .err(),
+            Some(ManagedRuntimeError::Unavailable)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn attach_argv_uses_fixed_inherited_fd_and_child_can_read_it() {
         assert_eq!(
@@ -779,6 +885,23 @@ mod tests {
         assert_eq!(
             select_image(&serde_json::to_vec(&value).unwrap()).unwrap_err(),
             ManagedRuntimeError::Integrity
+        );
+    }
+
+    #[test]
+    fn wrong_platform_image_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fixture_lock(temp.path(), b"image")).unwrap();
+        let other_platform = if cfg!(target_os = "linux") {
+            "macos"
+        } else {
+            "linux"
+        };
+        value["images"][0]["platform"] = serde_json::Value::String(other_platform.into());
+        assert_eq!(
+            select_image(&serde_json::to_vec(&value).unwrap()).unwrap_err(),
+            ManagedRuntimeError::Unavailable
         );
     }
 
@@ -856,6 +979,121 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn duplicate_current_platform_image_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fixture_lock(temp.path(), b"image")).unwrap();
+        let duplicate = value["images"][0].clone();
+        value["images"].as_array_mut().unwrap().push(duplicate);
+        assert_eq!(
+            select_image(&serde_json::to_vec(&value).unwrap()).unwrap_err(),
+            ManagedRuntimeError::Unavailable
+        );
+    }
+
+    #[test]
+    fn pre_spawn_rechecks_held_image_mount_python_and_tree_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("image-home");
+        let mount = temp.path().join("image-mount");
+        let image = b"fixture image";
+        let lock = fixture_lock(&mount, image);
+        let image_path = home.join(".polaris/runtime-images/python-e5-cat/fixture/runtime.dmg");
+        put(&image_path, image, false);
+        let backend = Arc::new(FakeMount {
+            root: mount.clone(),
+            readonly: true,
+            device_offset: 0,
+            detached: Arc::new(Mutex::new(Vec::new())),
+        });
+        let lease = ManagedRuntimeLease::acquire_with(&lock, &home, backend).unwrap();
+        fs::set_permissions(&image_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&image_path, b"tampered image").unwrap();
+        assert_eq!(
+            lease.validate_before_spawn().unwrap_err(),
+            ManagedRuntimeError::Integrity
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("python-home");
+        let mount = temp.path().join("python-mount");
+        let lock = fixture_lock(&mount, image);
+        let image_path = home.join(".polaris/runtime-images/python-e5-cat/fixture/runtime.dmg");
+        put(&image_path, image, false);
+        let lease = ManagedRuntimeLease::acquire_with(
+            &lock,
+            &home,
+            Arc::new(FakeMount {
+                root: mount.clone(),
+                readonly: true,
+                device_offset: 0,
+                detached: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .unwrap();
+        let python = mount.join("runtime/bin/python3.11");
+        let replacement = python.with_extension("replacement");
+        put(&replacement, b"python", true);
+        fs::rename(replacement, python).unwrap();
+        assert_eq!(
+            lease.validate_before_spawn().unwrap_err(),
+            ManagedRuntimeError::Integrity
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("mount-home");
+        let mount = temp.path().join("mount-root");
+        let replacement_mount = temp.path().join("replacement-root");
+        let lock = fixture_lock(&mount, image);
+        fixture_lock(&replacement_mount, image);
+        let image_path = home.join(".polaris/runtime-images/python-e5-cat/fixture/runtime.dmg");
+        put(&image_path, image, false);
+        let lease = ManagedRuntimeLease::acquire_with(
+            &lock,
+            &home,
+            Arc::new(FakeMount {
+                root: mount.clone(),
+                readonly: true,
+                device_offset: 0,
+                detached: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .unwrap();
+        fs::rename(&mount, temp.path().join("old-root")).unwrap();
+        fs::rename(&replacement_mount, &mount).unwrap();
+        assert_eq!(
+            lease.validate_before_spawn().unwrap_err(),
+            ManagedRuntimeError::Mount
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("tree-home");
+        let mount = temp.path().join("tree-mount");
+        let lock = fixture_lock(&mount, image);
+        let image_path = home.join(".polaris/runtime-images/python-e5-cat/fixture/runtime.dmg");
+        put(&image_path, image, false);
+        let lease = ManagedRuntimeLease::acquire_with(
+            &lock,
+            &home,
+            Arc::new(FakeMount {
+                root: mount.clone(),
+                readonly: true,
+                device_offset: 0,
+                detached: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .unwrap();
+        let module = mount.join("runtime/lib/module.py");
+        fs::set_permissions(&module, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(module, b"tamper").unwrap();
+        assert_eq!(
+            lease.validate_before_spawn().unwrap_err(),
+            ManagedRuntimeError::Integrity
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn wrong_arch_and_plist_identity_are_rejected_and_detach_has_no_force() {
         let wrong = br#"{"schema_version":2,"images":[{"id":"python-e5-cat","version":"v","platform":"macos","architecture":"wrong","image_filename":"r.dmg","image_size":1,"image_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tree_manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tree_manifest":{"schema_version":1,"files":[]}}]}"#;

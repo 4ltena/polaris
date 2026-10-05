@@ -6,6 +6,25 @@
 
 ## 組立て
 
+CLIだけを試す場合は、ビルド済み実行ファイルからプレビューパッケージを作れる。取得したパッケージの導入は1コマンドで、導入後は`polaris`でTUIを起動する。利用者側にRustは不要である。このパッケージはPolaris本体だけを配置し、e5・Qwenなどの追加資源は取得しない。現在はローカル検証用で、署名・公証・公開は未実施である。
+
+```sh
+cargo build --locked --offline --release -p polaris-cli
+python3 apps/macos/scripts/assemble-cli-pkg.py \
+  --binary "$PWD/target/release/polaris" \
+  --output /absolute/path/polaris-cli-preview-0.12.0-arm64.pkg
+python3 apps/macos/scripts/verify-cli-pkg.py \
+  --package /absolute/path/polaris-cli-preview-0.12.0-arm64.pkg \
+  --expected-cli "$PWD/target/release/polaris"
+```
+
+```sh
+sudo installer -pkg /absolute/path/polaris-cli-preview-0.12.0-arm64.pkg -target /
+polaris
+```
+
+`/usr/local/bin`がPATHに含まれていることを確認する。別の`polaris`コマンドが既にその場所にある場合、パッケージは上書きを拒否する。CLIの依存資源を必要とする機能は、別途明示して導入するまで利用できない。
+
 macOS 13以降、Swift 6、現在のcheckoutでビルドしたservice helperが必要である。モデル実行を確認する場合は、実行helperも明示する。いずれも絶対パスで渡す。
 
 ```sh
@@ -15,15 +34,17 @@ cargo build -p polaris-cli --bin polaris
 python3 apps/macos/scripts/assemble-app.py \
   --service-helper "$PWD/target/debug/polaris-desktop-service" \
   --execution-helper "$PWD/target/debug/polaris" \
+  --polaris-executable "$PWD/target/debug/polaris" \
   --destination /absolute/path/PolarisDesktop.app
 
 python3 apps/macos/scripts/assemble-installer.py \
   --service-helper "$PWD/target/debug/polaris-desktop-service" \
   --execution-helper "$PWD/target/debug/polaris" \
+  --polaris-executable "$PWD/target/debug/polaris" \
   --destination "/absolute/path/Polaris Installer.app"
 ```
 
-`--execution-helper`を省略すると、実行helperを同梱しないアプリになる。Rustツールチェーン、llama.cpp、e5用の隔離Python実行環境、strict10用multilingual-e5-small、事前選定用multilingual-e5-baseはアプリへ同梱しない。独立インストーラが、選択したフォルダへの`Polaris.app`配置と、固定manifestから`~/.polaris`配下への資源取得を行う。隔離Pythonにはtorch、transformers、tokenizers、safetensorsと、アーキテクチャに合うNumPyを固定して導入する。検証済みの絶対パスは`~/.polaris/managed-resources.toml`へ保存し、利用者が`config.toml`で明示した値を優先する。システムのRust・Python・PATHは変更しない。組立てスクリプトは既存の出力先を上書きせず、起動や署名も行わない。
+`--execution-helper`を省略すると、実行helperを同梱しないアプリになる。`--polaris-executable`は必須で、CLIをアプリ内に同梱し、組立て時にSHA-256とアーキテクチャを検証する。`/usr/local/bin/polaris`への安全なリンク作成はまだ未実装である。Rustツールチェーン、llama.cpp、e5用の隔離Python実行環境、strict10用multilingual-e5-small、事前選定用multilingual-e5-baseはアプリへ同梱しない。独立インストーラが、選択したフォルダへの`Polaris.app`配置と、固定manifestから`~/.polaris`配下への資源取得を行う。隔離Pythonにはtorch、transformers、tokenizers、safetensorsと、アーキテクチャに合うNumPyを固定して導入する。検証済みの絶対パスは`~/.polaris/managed-resources.toml`へ保存し、利用者が`config.toml`で明示した値を優先する。システムのRust・Python・PATHは変更しない。組立てスクリプトは既存の出力先を上書きせず、起動や署名も行わない。
 
 インストーラは6段階で、インストール先、GPT・Jev、Ollama・LM Studio・llama.cpp、任意のGGUF、作業フォルダ、権限の希望、テーマを保存する。既存の`Polaris.app`を置き換える場合は実行直前に確認し、一時退避から復旧できる形で更新する。Polaris本体に旧初回セットアップ画面はなく、完成済み設定がない場合はインストーラの実行を案内する。
 

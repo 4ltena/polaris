@@ -1569,6 +1569,57 @@ fn resolve_continuation(
     Ok(Some(continuation))
 }
 
+#[cfg(unix)]
+fn resolve_pending_workspace_before_execution(
+    project_root: &Path,
+    state_dir: &Path,
+) -> std::io::Result<()> {
+    let store_root = state_dir.join("rewind-workspace");
+    match std::fs::symlink_metadata(&store_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let owner = polaris_core::rewind_workspace::WorkspaceOwner::open(
+        project_root,
+        &store_root,
+        polaris_core::rewind_workspace::RewindLimits::default(),
+    )
+    .map_err(std::io::Error::other)?;
+    match owner.resolve_pending().map_err(std::io::Error::other)? {
+        polaris_core::rewind_workspace::ResolveOutcome::Clean => Ok(()),
+        polaris_core::rewind_workspace::ResolveOutcome::RolledBack(_) => {
+            Err(std::io::Error::other(
+                "巻き戻し途中のファイルを復旧しました。再起動してから会話を再開してください",
+            ))
+        }
+    }
+}
+#[cfg(unix)]
+fn validate_resolved_continuation_workspace(
+    resolved: &ResolvedContinuation,
+    project_root: &Path,
+    state_dir: &Path,
+    data_root: &Path,
+    project_id: &str,
+) -> std::io::Result<()> {
+    let ContinuationSource::V2(target) = &resolved.source else {
+        return Ok(());
+    };
+    let owner = polaris_core::rewind_workspace::WorkspaceOwner::open(
+        project_root,
+        &state_dir.join("rewind-workspace"),
+        polaris_core::rewind_workspace::RewindLimits::default(),
+    )
+    .map_err(std::io::Error::other)?;
+    let persistence = polaris_core::session_store::PersistedSession::open(
+        data_root,
+        &state_dir.join("memory.sqlite3"),
+        project_id,
+        &target.id,
+    )?;
+    polaris_core::rewind_admission::validate_execution(&owner, &persistence)
+}
 /// Fork/import only after provider, helper, and strict-history preconditions
 /// have succeeded. Resume merely carries its earlier validated attachment.
 fn prepare_continuation(
@@ -3907,10 +3958,28 @@ async fn run_doctor() -> ExitCode {
         }
     }
 
+    let project_root = polaris_core::project::resolve_root(&cwd);
+    let storage_paths = preflight_storage_paths(&cwd);
     println!("\nState:");
-    match polaris_core::project::state_dir(&cwd) {
-        Ok(d) => println!("  state directory: {}", d.display()),
-        Err(e) => println!("  Can't determine the state directory: {e}"),
+    match &storage_paths {
+        Ok((state_dir, _)) => println!("  state directory: {}", state_dir.display()),
+        Err(error) => println!("  Can't determine the state directory: {error}"),
+    }
+
+    #[cfg(unix)]
+    {
+        println!("\n巻き戻し候補:");
+        match &storage_paths {
+            Ok((state_dir, sessions_dir)) => match sessions_dir.parent() {
+                Some(data_root) => {
+                    for line in doctor_rewind_candidate_lines(&project_root, state_dir, data_root) {
+                        println!("  {line}");
+                    }
+                }
+                None => println!("  保存先を特定できません"),
+            },
+            Err(error) => println!("  保存先を特定できません: {error}"),
+        }
     }
 
     // Which project rules actually reach the model. The ceiling truncates
@@ -3918,7 +3987,6 @@ async fn run_doctor() -> ExitCode {
     // share, so "I wrote the rule down" and "the model was told" are two
     // different facts. This prints the second one.
     println!("\nAGENTS.md (always-on):");
-    let project_root = polaris_core::project::resolve_root(&cwd);
     let reached = polaris_core::constitution::reach(&project_root);
     if reached.is_empty() {
         println!("  no always-on section anywhere. polaris reads only a `## Always on`");
@@ -3952,6 +4020,131 @@ async fn run_doctor() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[cfg(unix)]
+fn doctor_rewind_candidate_lines(
+    project_root: &Path,
+    state_dir: &Path,
+    data_root: &Path,
+) -> Vec<String> {
+    use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+
+    let project_id = match polaris_tui::persist::project_identity(project_root) {
+        Ok(id) => id,
+        Err(error) => return vec![format!("projectを確認できません: {error}")],
+    };
+    let store_root = state_dir.join("rewind-workspace");
+    let mut lines = Vec::new();
+    let owner = match WorkspaceOwner::open_existing_read_only(
+        project_root,
+        &store_root,
+        RewindLimits::default(),
+    ) {
+        Ok(Some(owner)) => Some(owner),
+        Ok(None) => {
+            lines.push("保存先未作成（候補の公開証拠を確認できません）".into());
+            None
+        }
+        Err(error) => {
+            lines.push(format!(
+                "保存先を検証できません: {}",
+                error.to_string().escape_debug()
+            ));
+            None
+        }
+    };
+    let diagnostics = if let Some(owner) = owner.as_ref() {
+        polaris_core::rewind_admission::candidate_diagnostics(owner, data_root, &project_id)
+    } else {
+        polaris_core::rewind_admission::candidate_diagnostics_without_workspace(
+            data_root,
+            &project_id,
+        )
+    };
+    if diagnostics.is_empty() {
+        if owner.is_some() {
+            lines.push("拒否・判定不能なし".into());
+        }
+        return lines;
+    }
+    lines.push(format!("拒否・判定不能 {}件", diagnostics.len()));
+    for diagnostic in diagnostics.iter().take(128) {
+        lines.push(format!(
+            "{}: {}",
+            diagnostic.id.escape_debug(),
+            diagnostic.reason.escape_debug()
+        ));
+    }
+    if diagnostics.len() > 128 {
+        lines.push(format!(
+            "他 {}件。保存領域を停止状態で確認してください",
+            diagnostics.len() - 128
+        ));
+    }
+    lines
+}
+#[cfg(all(test, unix))]
+mod doctor_rewind_candidate_tests {
+    use super::doctor_rewind_candidate_lines;
+    use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+
+    #[test]
+    fn absent_store_is_reported_without_creating_state() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state = root.path().join("state");
+        let data = root.path().join("data");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir_all(data.join("sessions-v2").join("broken")).unwrap();
+
+        let lines = doctor_rewind_candidate_lines(&project, &state, &data);
+
+        assert!(lines[0].contains("保存先未作成"));
+        assert!(lines.iter().any(|line| line.contains("broken")));
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn rejected_candidate_id_and_reason_are_visible_without_terminal_controls() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state = root.path().join("state");
+        let data = root.path().join("data");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        WorkspaceOwner::open(
+            &project,
+            &state.join("rewind-workspace"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(data.join("sessions-v2").join("broken\ncandidate")).unwrap();
+
+        let lines = doctor_rewind_candidate_lines(&project, &state, &data);
+
+        assert!(lines[0].contains("拒否・判定不能 1件"));
+        assert!(lines[1].contains("broken\\ncandidate: state.jsonがありません"));
+        assert!(lines.iter().all(|line| !line.contains('\n')));
+    }
+
+    #[test]
+    fn malformed_store_keeps_candidate_ids_visible() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state = root.path().join("state");
+        let data = root.path().join("data");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let store = state.join("rewind-workspace");
+        std::fs::write(&store, b"keep").unwrap();
+        std::fs::create_dir_all(data.join("sessions-v2").join("broken")).unwrap();
+
+        let lines = doctor_rewind_candidate_lines(&project, &state, &data);
+
+        assert!(lines[0].contains("保存先を検証できません"));
+        assert!(lines.iter().any(|line| line.contains("broken")));
+        assert_eq!(std::fs::read(store).unwrap(), b"keep");
+    }
+}
 /// When `POLARIS_PROVIDER` isn't set, decides which provider arm to try
 /// first. Prefers `openai` if a key is available (env var or the saved
 /// `api_key.json`), since that's the arm onboarding itself lives on. If no
@@ -4023,6 +4216,37 @@ mod prompt_choice_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_cli_startup_resolves_pending_rewind_before_execution() {
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir(&project).unwrap();
+        assert!(resolve_pending_workspace_before_execution(&project, &state_dir).is_ok());
+        let owner = WorkspaceOwner::open(
+            &project,
+            &state_dir.join("rewind-workspace"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[project.clone()]).unwrap();
+        std::fs::write(project.join("file.txt"), b"before").unwrap();
+        let pre = owner.capture(&policy).unwrap();
+        std::fs::write(project.join("file.txt"), b"after").unwrap();
+        let post = owner.capture(&policy).unwrap();
+        owner
+            .restore_for_branch(&post, &pre, "candidate-session-1234")
+            .unwrap();
+
+        let result = resolve_pending_workspace_before_execution(&project, &state_dir);
+        assert!(result.unwrap_err().to_string().contains("復旧しました"));
+        assert_eq!(std::fs::read(project.join("file.txt")).unwrap(), b"after");
+        assert!(resolve_pending_workspace_before_execution(&project, &state_dir).is_ok());
+    }
     #[tokio::test]
     async fn resume_and_fork_restore_saved_focus_without_resetting_runtime_settings() {
         use polaris_core::{

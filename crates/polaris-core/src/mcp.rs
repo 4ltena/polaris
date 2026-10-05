@@ -2,6 +2,7 @@
 //! Registration and durable operation authority remain with the trusted host.
 
 pub mod apps;
+pub mod credentials;
 pub mod lease;
 pub mod local;
 pub mod operation;

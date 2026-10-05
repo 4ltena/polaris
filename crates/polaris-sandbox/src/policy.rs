@@ -239,6 +239,7 @@ impl SandboxPolicy {
         Ok(self)
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn requires_process_containment(&self) -> bool {
         self.require_process_containment
     }

@@ -436,6 +436,7 @@ pub(super) struct PythonStdio {
     policy: polaris_sandbox::SandboxPolicy,
 }
 
+#[cfg(target_os = "macos")]
 impl PythonStdio {
     pub fn connect(&self) -> Connection {
         Connection::prepare(
@@ -449,6 +450,7 @@ impl PythonStdio {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn python_stdio(fixture: &str, extra: &[&str], profile: ProtocolProfile) -> PythonStdio {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().canonicalize().unwrap();
@@ -524,6 +526,7 @@ pub(super) fn python_stdio(fixture: &str, extra: &[&str], profile: ProtocolProfi
     }
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn native_stdio_discovers_the_same_catalog_and_confirms_shutdown() {
     // Only the explicit stdio profile accepts a server that speaks 2024-11-05.

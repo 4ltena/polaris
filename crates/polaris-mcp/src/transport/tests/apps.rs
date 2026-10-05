@@ -1,10 +1,9 @@
 //! M2b synthetic app servers: research-shaped tool names, results and
 //! protocol profiles pass through unchanged. Real apps are a separate gate.
 use super::*;
-use crate::{
-    catalog::Kind,
-    content::{Part, Reply},
-};
+#[cfg(target_os = "macos")]
+use crate::content::Part;
+use crate::{catalog::Kind, content::Reply};
 use std::future::pending;
 
 fn names(connection: &Connection) -> Vec<String> {
@@ -39,6 +38,7 @@ async fn call(
         .await
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn blender_resolve_and_unity_shapes_pass_through_unchanged() {
     for (app, profile) in [

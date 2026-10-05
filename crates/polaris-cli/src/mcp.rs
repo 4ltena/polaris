@@ -105,7 +105,7 @@ pub async fn run(args: Args) -> ExitCode {
         .project
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let result = match LocalHost::open(&cwd, true) {
-        Ok(host) => command(&host, args.command).await,
+        Ok(host) => command(&host, &cwd, args.command).await,
         Err(error) => Err(message(error).to_owned()),
     };
     match result {
@@ -117,7 +117,7 @@ pub async fn run(args: Args) -> ExitCode {
     }
 }
 
-async fn command(host: &LocalHost, command: Command) -> Result<(), String> {
+async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> Result<(), String> {
     let fail = |error: Error| message(error).to_owned();
     let store = host.store().ok_or_else(|| fail(Error::Storage))?;
     match command {
@@ -165,8 +165,8 @@ async fn command(host: &LocalHost, command: Command) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Enable { server } => toggle(host, &server, true),
-        Command::Disable { server } => toggle(host, &server, false),
+        Command::Enable { server } => toggle(host, cwd, &server, true),
+        Command::Disable { server } => toggle(host, cwd, &server, false),
         Command::SecretSet { reference } => {
             if io::stdin().is_terminal() {
                 return Err("端末に入力すると値が表示されるため、パイプで渡してください。".into());
@@ -339,32 +339,64 @@ pub async fn check_unchecked(host: &LocalHost) {
     }
 }
 
-fn toggle(host: &LocalHost, server_id: &str, enable: bool) -> Result<(), String> {
-    let fail = |error: Error| message(error).to_owned();
-    let store = host.store().ok_or_else(|| fail(Error::Storage))?;
-    let mut registry = store
-        .load_registry()
-        .map_err(fail)?
-        .ok_or("登録済みのサーバーはありません。")?;
-    let server = registry
-        .servers
-        .iter_mut()
-        .find(|server| server.server_id == server_id)
-        .ok_or("そのサーバーは登録されていません。")?;
-    if enable {
-        server.enabled_projects.insert(host.project().to_owned());
-        host.validate(server).map_err(fail)?;
-    } else {
-        server.enabled_projects.remove(host.project());
+fn toggle(
+    host: &LocalHost,
+    cwd: &std::path::Path,
+    server_id: &str,
+    enable: bool,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use polaris_core::{
+            management_effect::{ManagementEffectStoreV1, mcp_change::McpRegistryChangeOwnerV1},
+            project_mutation::ProjectMutationOwnerV1,
+        };
+        let root = polaris_core::project::resolve_root(cwd)
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        let project = root.as_path();
+        let state = polaris_core::project::state_dir(project).map_err(|e| e.to_string())?;
+        let mutation = ProjectMutationOwnerV1::for_project(project).map_err(|e| e.to_string())?;
+        let lease = mutation.try_mutation().map_err(|e| e.to_string())?;
+        let effects = ManagementEffectStoreV1::open_at_state_dir(project, &state, &lease)
+            .map_err(|e| e.to_string())?;
+        let owner = McpRegistryChangeOwnerV1::new(host, &effects, &lease, project)?;
+        let prepared = owner.prepare(server_id, enable)?;
+        owner.apply(&prepared, true)?;
+        println!(
+            "{server_id} をこのプロジェクトで{}にしました。次の実行から反映します。",
+            if enable { "有効" } else { "無効" }
+        );
+        Ok(())
     }
-    let expected = registry.revision;
-    registry.revision += 1;
-    store.save_registry(expected, &registry).map_err(fail)?;
-    println!(
-        "{server_id} をこのプロジェクトで{}にしました。次の実行から反映します。",
-        if enable { "有効" } else { "無効" }
-    );
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let fail = |error: Error| message(error).to_owned();
+        let store = host.store().ok_or_else(|| fail(Error::Storage))?;
+        let mut registry = store
+            .load_registry()
+            .map_err(fail)?
+            .ok_or("登録済みのサーバーはありません。")?;
+        let server = registry
+            .servers
+            .iter_mut()
+            .find(|server| server.server_id == server_id)
+            .ok_or("そのサーバーは登録されていません。")?;
+        if enable {
+            server.enabled_projects.insert(host.project().to_owned());
+            host.validate(server).map_err(fail)?;
+        } else {
+            server.enabled_projects.remove(host.project());
+        }
+        let expected = registry.revision;
+        registry.revision += 1;
+        store.save_registry(expected, &registry).map_err(fail)?;
+        println!(
+            "{server_id} をこのプロジェクトで{}にしました。次の実行から反映します。",
+            if enable { "有効" } else { "無効" }
+        );
+        Ok(())
+    }
 }
 
 /// Why a registration that was approved did not happen. The tool hands back

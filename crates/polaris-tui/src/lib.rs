@@ -14,6 +14,8 @@ pub mod input;
 mod input_preparation_tests;
 #[cfg(unix)]
 mod instruction_commands;
+#[cfg(unix)]
+mod mcp_commands;
 mod memory;
 #[cfg(unix)]
 mod memory_commands;
@@ -4042,6 +4044,36 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         #[cfg(unix)]
+                        slash::Action::Mcp(request)
+                            if request.split_whitespace().next() != Some("prompt") =>
+                        {
+                            let result = mcp_commands::handle(
+                                &request,
+                                &terminal,
+                                &mut key_reader,
+                                rewind_workspace.as_ref().expect("startup owner"),
+                                &management_effects,
+                                &args.cwd,
+                                args.mcp_external,
+                                has_pending_inputs,
+                            );
+                            match result {
+                                Ok(lines) => {
+                                    local_lines.extend(lines);
+                                    if matches!(
+                                        request.split_whitespace().next(),
+                                        Some("enable" | "disable")
+                                    ) {
+                                        pending_mcp_prompt = None;
+                                        mcp_prompt_requires_reselect = false;
+                                    }
+                                    status = Status::Notice("MCP操作の結果を表示しました".into());
+                                }
+                                Err(error) => status = Status::Error(error),
+                            }
+                            continue;
+                        }
+                        #[cfg(unix)]
                         slash::Action::RuntimeControl(request) => {
                             if let Some(result) = handle_queued_control(
                                 &request,
@@ -4780,6 +4812,36 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         Ok(lines) => {
                             local_lines.extend(lines);
                             status = Status::Notice("メモリ操作の結果を表示しました".into());
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
+                #[cfg(unix)]
+                Some(slash::Action::Mcp(request))
+                    if request.split_whitespace().next() != Some("prompt") =>
+                {
+                    let result = mcp_commands::handle(
+                        &request,
+                        &terminal,
+                        &mut key_reader,
+                        rewind_workspace.as_ref().expect("startup owner"),
+                        &management_effects,
+                        &args.cwd,
+                        args.mcp_external,
+                        has_pending_inputs,
+                    );
+                    match result {
+                        Ok(lines) => {
+                            local_lines.extend(lines);
+                            if matches!(
+                                request.split_whitespace().next(),
+                                Some("enable" | "disable")
+                            ) {
+                                pending_mcp_prompt = None;
+                                mcp_prompt_requires_reselect = false;
+                            }
+                            status = Status::Notice("MCP操作の結果を表示しました".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }

@@ -70,15 +70,60 @@ impl SyncRepository {
             .env("GIT_AUTHOR_EMAIL", "polaris@localhost")
             .env("GIT_COMMITTER_NAME", "Polaris")
             .env("GIT_COMMITTER_EMAIL", "polaris@localhost");
-        let output = command.output()?;
-        if !output.status.success() {
+        // A remote must not keep a TUI confirmation alive indefinitely.
+        // Drain a bounded stdout concurrently; stderr is never displayed.
+        use std::io::Read;
+        use std::process::Stdio;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > 4 * 1024 * 1024 {
+                return Err(io::Error::other("git output limit"));
+            }
+            Ok(bytes)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "git timeout"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let stdout = reader
+            .join()
+            .map_err(|_| io::Error::other("git reader"))??;
+        if !status.success() {
             // The message can name paths, so it stays a fixed category here.
             return Err(io::Error::other(format!(
                 "git {} failed",
                 arguments.first().copied().unwrap_or("call")
             )));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        Ok(String::from_utf8_lossy(&stdout).trim().to_owned())
     }
 
     /// Rebuilds the staging copy from the project, sharing only what the

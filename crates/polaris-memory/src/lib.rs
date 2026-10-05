@@ -8,6 +8,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 pub mod conversation;
+pub mod management;
 pub mod structured;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
@@ -38,6 +39,12 @@ pub enum Error {
     AmbiguousRecordId,
     #[error("record does not exist in the requested project and session")]
     RecordNotFound,
+    #[error("memory project scope does not match")]
+    WrongProject,
+    #[error("memory revision changed")]
+    StaleRevision,
+    #[error("memory operation ID is already bound to another request")]
+    OperationConflict,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -201,8 +208,9 @@ impl MemoryStore {
                 PRIMARY KEY (project_id, session_id)
             );",
         )?;
+        conversation::initialize(&transaction)?;
+        management::initialize(&transaction)?;
         transaction.commit()?;
-        conversation::initialize(&connection)?;
         Ok(Self { connection })
     }
 

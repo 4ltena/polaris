@@ -28,6 +28,17 @@ fn a_decision_containing_commas_quotes_and_newlines_survives_the_round_trip() {
     assert_eq!(read[0].at, "2026-09-19T10:00:00+09:00");
 }
 
+#[test]
+fn a_decision_preserves_leading_and_trailing_whitespace() {
+    let dir = tempfile::tempdir().expect("dir");
+    let exact = " \t判定器は既定offのまま　 ";
+    append(dir.path(), "2026-09-19", exact).expect("append");
+
+    let read = load(dir.path());
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(read[0].what, exact);
+}
+
 /// Hand-editing is expected. One bad line must not take the ledger with it.
 #[test]
 fn a_malformed_row_is_skipped_rather_than_failing_the_whole_ledger() {
@@ -69,8 +80,16 @@ fn appending_keeps_every_earlier_line() {
 #[test]
 fn an_empty_decision_is_refused_rather_than_stored() {
     let dir = tempfile::tempdir().expect("dir");
-    assert!(append(dir.path(), "2026-09-19", "   ").is_err());
+    for blank in ["   ", "\t \n　"] {
+        assert_eq!(
+            append(dir.path(), "2026-09-19", blank)
+                .expect_err("whitespace-only decision must be rejected")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
     assert!(load(dir.path()).is_empty());
+    assert!(!dir.path().join(PATH).exists());
 }
 
 struct Picks {

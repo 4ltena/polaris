@@ -94,24 +94,222 @@ fn covers(rule: &str, negated: &str) -> bool {
 /// a newline gets one first, so the last existing rule is not merged with
 /// the first new one.
 pub fn append(project_root: &std::path::Path, rules: &[&str]) -> std::io::Result<()> {
+    #[cfg(not(unix))]
     use std::io::Write;
     if rules.is_empty() {
         return Ok(());
     }
-    let path = project_root.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        writeln!(file)?;
+    #[cfg(unix)]
+    {
+        let existing = read(project_root)?;
+        return append_checked(
+            project_root,
+            rules,
+            &crate::conversation_state::content_hash(existing.as_bytes()),
+            None,
+        )
+        .map(|_| ());
     }
-    for rule in rules {
-        writeln!(file, "{rule}")?;
+    #[cfg(not(unix))]
+    {
+        let path = project_root.join(".gitignore");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            writeln!(file)?;
+        }
+        for rule in rules {
+            writeln!(file, "{rule}")?;
+        }
+        file.sync_all()
     }
-    file.sync_all()
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(unix)]
+pub fn read(project_root: &std::path::Path) -> std::io::Result<String> {
+    use std::{
+        fs::File,
+        io::Read,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::fs::MetadataExt,
+        },
+    };
+    let root = crate::project_mutation::open_directory_nofollow(project_root)?;
+    polaris_auth::protection::with_protected_paths(|registry| {
+        let path = project_root.join(".gitignore");
+        let denied = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "protected ignore file",
+            )
+        };
+        if registry.paths().iter().any(|p| path.starts_with(p)) {
+            return Err(denied());
+        }
+        let name = std::ffi::CString::new(".gitignore").unwrap();
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(String::new())
+            } else {
+                Err(error)
+            };
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() > 1024 * 1024
+            || registry
+                .identities()
+                .iter()
+                .any(|p| p.dev == metadata.dev() && p.ino == metadata.ino())
+        {
+            return Err(denied());
+        }
+        let mut bytes = Vec::new();
+        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(denied());
+        }
+        String::from_utf8(bytes).map_err(|_| denied())
+    })
+    .map_err(|_| std::io::Error::other("authentication protection unavailable"))?
+}
+
+#[cfg(unix)]
+pub fn append_checked(
+    project_root: &std::path::Path,
+    rules: &[&str],
+    expected: &str,
+    expected_source: Option<(u64, u64)>,
+) -> std::io::Result<String> {
+    use std::{
+        fs::File,
+        io::{Read, Seek, SeekFrom, Write},
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::fs::MetadataExt,
+        },
+    };
+    let root = crate::project_mutation::open_directory_nofollow(project_root)?;
+    let root_identity = root.metadata()?;
+    if expected_source
+        .is_some_and(|identity| identity != (root_identity.dev(), root_identity.ino()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "source changed",
+        ));
+    }
+    polaris_auth::protection::with_protected_paths(|registry| {
+        let path = project_root.join(".gitignore");
+        let denied = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe or stale ignore file",
+            )
+        };
+        if registry.paths().iter().any(|p| path.starts_with(p)) {
+            return Err(denied());
+        }
+        let name = std::ffi::CString::new(".gitignore").unwrap();
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_APPEND
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() > 1024 * 1024
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o7022 != 0
+            || registry
+                .identities()
+                .iter()
+                .any(|p| p.dev == metadata.dev() && p.ino == metadata.ino())
+        {
+            return Err(denied());
+        }
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut bytes = Vec::new();
+        (&mut file).take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 || crate::conversation_state::content_hash(&bytes) != expected
+        {
+            return Err(denied());
+        }
+        let existing = String::from_utf8(bytes).map_err(|_| denied())?;
+        let mut addition = String::new();
+        if !rules.is_empty() && !existing.is_empty() && !existing.ends_with('\n') {
+            addition.push('\n');
+        }
+        for rule in rules {
+            if rule.is_empty() || rule.len() > 4096 || rule.chars().any(char::is_control) {
+                return Err(denied());
+            }
+            addition.push_str(rule);
+            addition.push('\n');
+        }
+        if existing.len().saturating_add(addition.len()) > 1024 * 1024 {
+            return Err(denied());
+        }
+        let check = || -> std::io::Result<()> {
+            let named_root = std::fs::symlink_metadata(project_root)?;
+            let named = std::fs::symlink_metadata(&path)?;
+            if !named_root.is_dir()
+                || !named.is_file()
+                || named.nlink() != 1
+                || (named_root.dev(), named_root.ino())
+                    != (root_identity.dev(), root_identity.ino())
+                || (named.dev(), named.ino()) != (metadata.dev(), metadata.ino())
+            {
+                return Err(denied());
+            }
+            Ok(())
+        };
+        check()?;
+        file.write_all(addition.as_bytes())?;
+        file.sync_all()?;
+        root.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut after = String::new();
+        (&mut file)
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut after)?;
+        if after != format!("{existing}{addition}") {
+            return Err(denied());
+        }
+        check()?;
+        Ok(after)
+    })
+    .map_err(|_| std::io::Error::other("authentication protection unavailable"))?
+}

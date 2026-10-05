@@ -135,26 +135,165 @@ fn escape(field: &str) -> String {
 /// correction as its own line.
 pub fn append(root: &Path, at: &str, what: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let what = what.trim();
-    if what.is_empty() {
+    if what.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "決めたことが空です",
         ));
     }
-    let path = root.join(PATH);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            fs::File,
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::MetadataExt,
+            },
+        };
+        if what.len() > 8192 || at.len() > 64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "決定事項が上限を超えています",
+            ));
+        }
+        let denied = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "決定台帳を安全に開けません",
+            )
+        };
+        let root = std::fs::canonicalize(root)?;
+        let opened = crate::project_mutation::open_directory_nofollow(&root)?;
+        let root_identity = opened.metadata()?;
+        polaris_auth::protection::with_protected_paths(|registry| -> std::io::Result<()> {
+            let path = root.join(PATH);
+            if registry
+                .paths()
+                .iter()
+                .any(|protected| path.starts_with(protected))
+            {
+                return Err(denied());
+            }
+            let directory_name = CString::new(".polaris").unwrap();
+            if unsafe { libc::mkdirat(opened.as_raw_fd(), directory_name.as_ptr(), 0o700) } != 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let directory_fd = unsafe {
+                libc::openat(
+                    opened.as_raw_fd(),
+                    directory_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if directory_fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let directory = unsafe { File::from_raw_fd(directory_fd) };
+            let directory_identity = directory.metadata()?;
+            if directory_identity.uid() != unsafe { libc::geteuid() }
+                || directory_identity.mode() & 0o7022 != 0
+                || registry
+                    .identities()
+                    .iter()
+                    .any(|p| p.dev == directory_identity.dev() && p.ino == directory_identity.ino())
+            {
+                return Err(denied());
+            }
+            let name = CString::new("decisions.csv").unwrap();
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_APPEND
+                        | libc::O_CREAT
+                        | libc::O_NOFOLLOW
+                        | libc::O_NONBLOCK
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o7022 != 0
+                || registry
+                    .identities()
+                    .iter()
+                    .any(|p| p.dev == metadata.dev() && p.ino == metadata.ino())
+            {
+                return Err(denied());
+            }
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let fresh = file.metadata()?.len() == 0;
+            let record = format!(
+                "{}{},{}\n",
+                if fresh { "at,what\n" } else { "" },
+                escape(at),
+                escape(what)
+            );
+            if file.metadata()?.len().saturating_add(record.len() as u64) > 1024 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "決定台帳が1MiBを超えます",
+                ));
+            }
+            // Verify every named binding immediately before mutation and after
+            // durable acknowledgement; an external editor can still replace it.
+            let check = || -> std::io::Result<()> {
+                let named_root = std::fs::symlink_metadata(&root)?;
+                let named_directory = std::fs::symlink_metadata(root.join(".polaris"))?;
+                let named_file = std::fs::symlink_metadata(&path)?;
+                if !named_root.is_dir()
+                    || !named_directory.is_dir()
+                    || !named_file.is_file()
+                    || (named_root.dev(), named_root.ino())
+                        != (root_identity.dev(), root_identity.ino())
+                    || (named_directory.dev(), named_directory.ino())
+                        != (directory_identity.dev(), directory_identity.ino())
+                    || (named_file.dev(), named_file.ino()) != (metadata.dev(), metadata.ino())
+                    || named_file.nlink() != 1
+                {
+                    return Err(denied());
+                }
+                Ok(())
+            };
+            check()?;
+            file.write_all(record.as_bytes())?;
+            file.sync_all()?;
+            directory.sync_all()?;
+            opened.sync_all()?;
+            check()
+        })
+        .map_err(|_| denied())?
     }
-    let fresh = !path.exists();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    if fresh {
-        writeln!(file, "at,what")?;
+    #[cfg(not(unix))]
+    {
+        let path = root.join(PATH);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let fresh = !path.exists();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        if fresh {
+            writeln!(file, "at,what")?;
+        }
+        writeln!(file, "{},{}", escape(at), escape(what))?;
+        Ok(())
     }
-    writeln!(file, "{},{}", escape(at), escape(what))
 }
 
 /// The section put in front of the model, or `None` when nothing matched.

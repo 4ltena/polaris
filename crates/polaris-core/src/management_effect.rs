@@ -11,6 +11,7 @@ pub mod mcp_change;
 pub mod memory_change;
 mod store;
 pub mod workflow_change;
+pub mod workspace_change;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

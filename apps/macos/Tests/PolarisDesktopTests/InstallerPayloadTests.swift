@@ -56,4 +56,24 @@ final class InstallerPayloadTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: installed.appendingPathComponent("Contents/MacOS/PolarisDesktop")), "new")
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: destination.path).contains { $0.contains("backup") })
     }
+
+    func testPolarisOnlyPreflightDoesNotRequireDependencySpace() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("polaris-only-\(UUID())")
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let destination = root.appendingPathComponent("destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = try makePayload(in: source)
+        let manager = InstallerPayloadManager(payload: payload, availableCapacity: { _ in 1_000_000 })
+
+        _ = try await manager.preflight(destination: destination, additionalBytes: 0)
+        do {
+            _ = try await manager.preflight(destination: destination, additionalBytes: 4_100_000_000)
+            XCTFail("dependency selection should check the additional space")
+        } catch {
+            XCTAssertEqual(error as? InstallerPayloadError, .insufficientSpace)
+        }
+        _ = try await manager.install(destination: destination, replaceExisting: false)
+    }
 }

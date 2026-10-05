@@ -46,8 +46,25 @@ final class InstallerCoordinator: ObservableObject {
     @Published private(set) var preflight: InstallerPreflight?
     @Published private(set) var runState: InstallerRunState = .idle
     @Published var replacementPending = false
+    @Published var dependencyConsentPending = false
     @Published var launchAfterInstall = true
     @Published var installCATTranslate = false
+    @Published var installRust = false
+    private var replacementApproved = false
+    private var pendingDependencySelection: DependencySelection?
+
+    private struct DependencySelection: Equatable {
+        let destination: URL
+        let catTranslate: Bool
+        let rust: Bool
+        let ggufSource: String
+    }
+
+    private func dependencySelection(model: DesktopModel) -> DependencySelection {
+        DependencySelection(destination: destination.standardizedFileURL,
+                            catTranslate: installCATTranslate, rust: installRust,
+                            ggufSource: model.ggufSourceURL.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
 
     private let payload: InstallerPayloadManager
     private var task: Task<Void, Never>?
@@ -59,7 +76,7 @@ final class InstallerCoordinator: ObservableObject {
     func checkDestination() {
         let destination = destination
         Task {
-            do { preflight = try await payload.preflight(destination: destination) }
+            do { preflight = try await payload.preflight(destination: destination, additionalBytes: 0) }
             catch { preflight = nil }
         }
     }
@@ -80,7 +97,8 @@ final class InstallerCoordinator: ObservableObject {
         }
     }
 
-    func begin(model: DesktopModel, replaceExisting: Bool = false) {
+    func begin(model: DesktopModel, replaceExisting: Bool = false,
+               installDependencies: Bool? = nil) {
         guard task == nil else { return }
         let destination = destination
         task = Task { [weak self, weak model] in
@@ -88,7 +106,7 @@ final class InstallerCoordinator: ObservableObject {
             defer { task = nil }
             do {
                 runState = .running(detail: "インストール先を確認しています", progress: 0.04)
-                let check = try await payload.preflight(destination: destination)
+                let check = try await payload.preflight(destination: destination, additionalBytes: 0)
                 preflight = check
                 if check.replacesExistingApplication,
                    !NSRunningApplication.runningApplications(withBundleIdentifier: "com.polaris.desktop.local").isEmpty {
@@ -100,27 +118,41 @@ final class InstallerCoordinator: ObservableObject {
                     return
                 }
 
-                model.startPresetInstallation()
-                while model.presetInstallationStatus.isBusy {
-                    try Task.checkCancellation()
-                    let progress: Double
-                    let detail: String
-                    switch model.presetInstallationStatus {
-                    case .installing(let completed, let total):
-                        progress = 0.08 + 0.62 * Double(completed) / Double(max(total, 1))
-                        detail = "必要な資源を導入中（\(completed) / \(total)）"
-                    default:
-                        progress = 0.08; detail = "必要な資源を準備しています"
-                    }
-                    runState = .running(detail: detail, progress: progress)
-                    try await Task.sleep(for: .milliseconds(80))
-                }
-                guard model.presetInstallationReady else {
-                    if case .failed(let message) = model.presetInstallationStatus { throw InstallFailure.message(message) }
-                    throw InstallFailure.message("必要な資源を導入できませんでした。")
+                if installDependencies == nil {
+                    replacementApproved = replaceExisting
+                    pendingDependencySelection = dependencySelection(model: model)
+                    runState = .idle
+                    dependencyConsentPending = true
+                    return
                 }
 
-                if installCATTranslate {
+                if installDependencies == true {
+                    _ = try await payload.preflight(destination: destination, additionalBytes: 4_100_000_000)
+                }
+
+                if installDependencies == true {
+                    model.startPresetInstallation()
+                    while model.presetInstallationStatus.isBusy {
+                        try Task.checkCancellation()
+                        let progress: Double
+                        let detail: String
+                        switch model.presetInstallationStatus {
+                        case .installing(let completed, let total):
+                            progress = 0.08 + 0.62 * Double(completed) / Double(max(total, 1))
+                            detail = "必要な資源を導入中（\(completed) / \(total)）"
+                        default:
+                            progress = 0.08; detail = "必要な資源を準備しています"
+                        }
+                        runState = .running(detail: detail, progress: progress)
+                        try await Task.sleep(for: .milliseconds(80))
+                    }
+                    guard model.presetInstallationReady else {
+                        if case .failed(let message) = model.presetInstallationStatus { throw InstallFailure.message(message) }
+                        throw InstallFailure.message("必要な資源を導入できませんでした。")
+                    }
+                }
+
+                if installCATTranslate && installDependencies == true {
                     runState = .running(detail: "CAT-Translate 3.3Bを導入しています", progress: 0.72)
                     guard try await model.installOptionalDependencyAndWait(.catTranslate3B) else {
                         if case .failed(let message) = model.dependencyStatus(.catTranslate3B) {
@@ -130,7 +162,17 @@ final class InstallerCoordinator: ObservableObject {
                     }
                 }
 
-                if !model.ggufSourceURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if installRust && installDependencies == true {
+                    runState = .running(detail: "開発用Rustを導入しています", progress: 0.75)
+                    guard try await model.installOptionalDependencyAndWait(.rust) else {
+                        if case .failed(let message) = model.dependencyStatus(.rust) {
+                            throw InstallFailure.message("Rust：\(message)")
+                        }
+                        throw InstallFailure.message("開発用Rustを導入できませんでした。")
+                    }
+                }
+
+                if installDependencies == true && !model.ggufSourceURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     runState = .running(detail: "指定した端末内モデルを導入しています", progress: 0.78)
                     guard await model.installQueuedGGUFIfNeeded() else {
                         if case .failed(let message) = model.ggufStatus { throw InstallFailure.message(message) }
@@ -161,6 +203,27 @@ final class InstallerCoordinator: ObservableObject {
 
     func cancel(model: DesktopModel) {
         task?.cancel(); model.cancelPresetInstallation(); model.cancelGGUFInstall()
+    }
+
+    func confirmDependencies(model: DesktopModel, install: Bool) {
+        guard let pendingDependencySelection else { return }
+        self.pendingDependencySelection = nil
+        let replaceExisting = replacementApproved
+        replacementApproved = false
+        guard pendingDependencySelection == dependencySelection(model: model) else {
+            begin(model: model)
+            return
+        }
+        begin(model: model, replaceExisting: replaceExisting, installDependencies: install)
+    }
+
+    func dependencySummary(model: DesktopModel) -> String {
+        var names = ["llama.cpp", "埋め込み実行環境", "multilingual-e5-small/base"]
+        if installCATTranslate { names.append("CAT-Translate 3.3B") }
+        if installRust { names.append("Rust 1.96.0") }
+        let ggufSource = model.ggufSourceURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ggufSource.isEmpty { names.append("指定したGGUF（\(ggufSource)）") }
+        return names.joined(separator: "、") + "を検証して ~/.polaris へ導入します。いいえを選ぶとPolaris本体だけを配置します。"
     }
 
     private enum InstallFailure: Error, LocalizedError {
@@ -209,6 +272,13 @@ struct InstallerRootView: View {
         } message: {
             Text("同じインストール先にあるPolaris.appを退避してから置き換えます。失敗した場合は元へ戻します。")
         }
+        .confirmationDialog("Polaris以外の資源を取得しますか？", isPresented: $installer.dependencyConsentPending) {
+            Button("はい、取得する") { installer.confirmDependencies(model: model, install: true) }
+            Button("いいえ、Polarisのみ") { installer.confirmDependencies(model: model, install: false) }
+            Button("キャンセル", role: .cancel) {}
+        } message: {
+            Text(installer.dependencySummary(model: model))
+        }
     }
 
     @ViewBuilder private var installerContent: some View {
@@ -237,8 +307,8 @@ struct InstallerRootView: View {
                 .foregroundStyle(.secondary).lineSpacing(5)
             HStack(spacing: 26) {
                 Label("macOS 13以降", systemImage: "laptopcomputer")
-                Label("約4.1 GB", systemImage: "internaldrive")
-                Label("ネット接続が必要", systemImage: "network")
+                Label("依存資源の容量は選択後に確認", systemImage: "internaldrive")
+                Label("依存資源の取得にはネット接続が必要", systemImage: "network")
             }.font(.caption).foregroundStyle(.secondary).padding(.top, 16)
         }
     }
@@ -259,7 +329,7 @@ struct InstallerRootView: View {
                          ? "既存のPolaris.appは確認後に安全に置き換えます。"
                          : "この場所へインストールできます。")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("必要：\(installer.installCATTranslate ? "CAT導入時は\(capacity(ManagedDependencyInstaller.catTranslateRequiredSpaceBytes))以上" : "約4.1 GB")　利用可能：\(capacity(preflight.availableBytes))")
+                    Text("Polaris本体：\(capacity(preflight.payloadBytes))　利用可能：\(capacity(preflight.availableBytes))")
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 } else {
                     Label("この場所へ書き込めないか、空き容量が不足しています。", systemImage: "exclamationmark.triangle")
@@ -268,7 +338,7 @@ struct InstallerRootView: View {
             }
             VStack(alignment: .leading, spacing: 8) {
                 Text("個人用資源").fontWeight(.medium)
-                Text("~/.polaris  ·  Rust、llama.cpp、multilingual-e5、設定とモデル")
+                Text("~/.polaris  ·  選択した依存資源、設定とモデル")
                     .font(.callout).foregroundStyle(.secondary)
                 Text("システムのRust・Python・PATHは変更しません。")
                     .font(.caption).foregroundStyle(.secondary)
@@ -326,6 +396,11 @@ struct InstallerRootView: View {
                 Text(installer.installCATTranslate
                      ? "取得サイズは約6.7 GBです。展開・検証を含め、導入時には\(capacity(ManagedDependencyInstaller.catTranslateRequiredSpaceBytes))以上の空き容量が必要です。固定した版を ~/.polaris/models/cat-translate-3.3b/\(ManagedDependencyInstaller.catTranslateRevision) へ保存し、導入後も自動では有効化しません。"
                      : "既定では導入しません。必要になった場合だけ、このインストールで追加できます。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            installerSection("開発用ツール（任意）") {
+                Toggle("Rust 1.96.0を導入する", isOn: $installer.installRust)
+                Text("配布済みPolarisの実行には不要です。ソースからのビルドに使う場合だけ ~/.polaris/toolchains に導入します。システムのRustは変更しません。")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -410,7 +485,7 @@ struct InstallerRootView: View {
                 summary("プロジェクト", model.document.draft.preferences.projectPath ?? "後で選択")
                 summary("自動許可", model.document.draft.preferences.permission?.title ?? "未選択")
                 summary("テーマ", model.document.draft.preferences.theme.title)
-                summary("自動取得", "Rust・llama.cpp・multilingual-e5 small/base")
+                summary("取得候補", "llama.cpp・multilingual-e5 small/base・埋め込み実行環境")
             }
             Toggle("完了後にPolarisを開く", isOn: $installer.launchAfterInstall).padding(.top, 10)
         }

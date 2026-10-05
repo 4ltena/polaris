@@ -11,7 +11,7 @@ enum ManagedDependencyID: String, CaseIterable, Sendable {
   case catTranslate3B = "cat_translate_3_3b"
 
   static let preset: [ManagedDependencyID] = [
-    .embeddingRuntime, .multilingualE5Small, .multilingualE5Base, .llamaCpp, .rust,
+    .embeddingRuntime, .multilingualE5Small, .multilingualE5Base, .llamaCpp,
   ]
 
   var title: String {

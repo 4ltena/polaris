@@ -458,7 +458,8 @@ final class DesktopModel: ObservableObject {
     /// Installs an explicitly selected optional resource as part of the installer flow.
     /// Unlike the preset, this never changes the managed-resource activation file.
     func installOptionalDependencyAndWait(_ id: ManagedDependencyID) async throws -> Bool {
-        guard !ManagedDependencyID.preset.contains(id), presetInstallationReady else { return false }
+        guard !ManagedDependencyID.preset.contains(id),
+              id == .rust || presetInstallationReady else { return false }
         do {
             let current = try await dependencyInstaller.status(id)
             if case .installed = current {

@@ -4079,6 +4079,12 @@ async fn main_with_args(mut args: Args) -> ExitCode {
         }
         None => {
             polaris_tui::run(polaris_tui::RunArgs {
+                #[cfg(unix)]
+                account_binding: if provider_name == "codex" {
+                    account::binding_control()
+                } else {
+                    None
+                },
                 provider: provider.clone(),
                 mcp_selection_provider,
                 decider: decider.clone(),

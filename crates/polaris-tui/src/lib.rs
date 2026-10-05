@@ -603,6 +603,8 @@ fn handle_queued_control<B: ratatui::backend::Backend, R: approver::KeyReader>(
 /// same way the one-shot path builds it. `polaris-tui` never constructs a
 /// provider or a sandbox policy itself.
 pub struct RunArgs<'a> {
+    #[cfg(unix)]
+    pub account_binding: Option<Arc<dyn account::BindingControl>>,
     /// Shared rather than borrowed: `agent::run` needs both a `&dyn
     /// Provider` for the root's own turns and an owned handle it can hand
     /// to a wave of subagents (see `agent::run`'s `provider_pool`).
@@ -4057,6 +4059,41 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             }
                             continue;
                         }
+                        #[cfg(unix)]
+                        slash::Action::Account(_) | slash::Action::Logout => {
+                            let request = match &action {
+                                slash::Action::Account(request) => request.as_str(),
+                                _ => "logout",
+                            };
+                            let result = if request.is_empty() || request == "list" {
+                                Ok(())
+                            } else {
+                                session.check_persistence().map_err(|e| e.to_string())
+                            };
+                            let result = match result {
+                                Ok(()) => {
+                                    account::handle(
+                                        request,
+                                        &terminal,
+                                        &mut key_reader,
+                                        rewind_workspace.as_ref().expect("startup owner"),
+                                        &management_effects,
+                                        args.account_binding.as_ref(),
+                                        has_pending_inputs,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            match result {
+                                Ok(lines) => {
+                                    local_lines.extend(lines);
+                                    status = Status::Notice("認証操作の結果を表示しました".into());
+                                }
+                                Err(error) => status = Status::Error(error),
+                            }
+                            continue;
+                        }
                         slash::Action::Status => {
                             local_lines.extend(status_lines(StatusSnapshot {
                                 session: &session,
@@ -4727,6 +4764,41 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         Ok(lines) => {
                             local_lines.extend(lines.into_iter().map(ratatui::text::Line::from));
                             status = Status::Notice("実行状態を表示しました".into());
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
+                #[cfg(unix)]
+                Some(slash::Action::Account(_)) | Some(slash::Action::Logout) => {
+                    let request = match parsed_action.as_ref().expect("matched action") {
+                        slash::Action::Account(request) => request.as_str(),
+                        _ => "logout",
+                    };
+                    let result = if request.is_empty() || request == "list" {
+                        Ok(())
+                    } else {
+                        session.check_persistence().map_err(|e| e.to_string())
+                    };
+                    let result = match result {
+                        Ok(()) => {
+                            account::handle(
+                                request,
+                                &terminal,
+                                &mut key_reader,
+                                rewind_workspace.as_ref().expect("startup owner"),
+                                &management_effects,
+                                args.account_binding.as_ref(),
+                                has_pending_inputs,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(lines) => {
+                            local_lines.extend(lines);
+                            status = Status::Notice("認証操作の結果を表示しました".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }

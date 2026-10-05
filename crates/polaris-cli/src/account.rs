@@ -14,7 +14,42 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// このprocessのrunが使う登録。`None`は単一認証のまま。
-static BOUND: OnceLock<Option<BoundTokenSource>> = OnceLock::new();
+static BOUND: OnceLock<Arc<Binding>> = OnceLock::new();
+
+pub struct Binding {
+    current: std::sync::RwLock<Option<BoundTokenSource>>,
+}
+
+#[cfg(unix)]
+impl polaris_tui::account::BindingControl for Binding {
+    fn current(&self) -> Option<(String, u64)> {
+        self.current
+            .read()
+            .ok()?
+            .as_ref()
+            .map(|bound| (bound.registration_id().to_owned(), bound.generation()))
+    }
+
+    fn bind(&self, registration: &str) -> Result<String, String> {
+        let owner = owner()?;
+        let (id, generation) = owner
+            .bind(&[], Some(registration))
+            .map_err(|_| "その登録へ切り替えられません".to_owned())?;
+        *self
+            .current
+            .write()
+            .map_err(|_| "束縛状態を更新できません")? =
+            Some(BoundTokenSource::new(owner, id.clone(), generation));
+        Ok(id)
+    }
+}
+
+#[cfg(unix)]
+pub fn binding_control() -> Option<Arc<dyn polaris_tui::account::BindingControl>> {
+    BOUND
+        .get()
+        .map(|bound| bound.clone() as Arc<dyn polaris_tui::account::BindingControl>)
+}
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -221,7 +256,9 @@ pub fn bind(model: &str, explicit: Option<&str>) -> Result<(), String> {
                     .into(),
             );
         }
-        let _ = BOUND.set(None);
+        let _ = BOUND.set(Arc::new(Binding {
+            current: std::sync::RwLock::new(None),
+        }));
         return Ok(());
     };
     // 要約とMCP選定も同じ登録へ送るため、選択の対象に含める。
@@ -240,11 +277,13 @@ pub fn bind(model: &str, explicit: Option<&str>) -> Result<(), String> {
         other => format!("アカウントを選べません: {other}"),
     }
         })?;
-    let _ = BOUND.set(Some(BoundTokenSource::new(
-        owner,
-        registration_id,
-        generation,
-    )));
+    let _ = BOUND.set(Arc::new(Binding {
+        current: std::sync::RwLock::new(Some(BoundTokenSource::new(
+            owner,
+            registration_id,
+            generation,
+        ))),
+    }));
     Ok(())
 }
 
@@ -253,56 +292,173 @@ pub fn bind(model: &str, explicit: Option<&str>) -> Result<(), String> {
 pub fn require(
     store: std::path::PathBuf,
 ) -> Result<Arc<dyn polaris_provider::TokenSource>, String> {
-    if let Some(bound) = token_source() {
-        return Ok(bound);
-    }
-    if BOUND.get().is_none() && registered_owner()?.is_some() {
-        return Err("アカウントを固定する前に送信経路を作れません。".into());
-    }
-    Ok(Arc::new(crate::AuthTokens {
-        issuer: ISSUER.to_string(),
-        store,
+    let Some(binding) = BOUND.get() else {
+        if registered_owner()?.is_some() {
+            return Err("アカウントを固定する前に送信経路を作れません。".into());
+        }
+        return Ok(Arc::new(crate::AuthTokens {
+            issuer: ISSUER.to_string(),
+            store,
+        }));
+    };
+    Ok(Arc::new(Tokens {
+        binding: binding.clone(),
+        legacy: crate::AuthTokens {
+            issuer: ISSUER.to_string(),
+            store,
+        },
+        used: std::sync::Mutex::new(None),
     }))
 }
 
-/// 束縛済みならその登録だけを使うtoken source。未束縛なら単一認証へ任せる。
-fn token_source() -> Option<Arc<dyn polaris_provider::TokenSource>> {
-    BOUND.get().and_then(Option::as_ref).map(|bound| {
-        Arc::new(Tokens(bound.clone(), std::sync::Mutex::new(None)))
-            as Arc<dyn polaris_provider::TokenSource>
-    })
-}
-
-struct Tokens(BoundTokenSource, std::sync::Mutex<Option<u64>>);
-
-#[async_trait::async_trait]
-impl polaris_provider::TokenSource for Tokens {
-    async fn token(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
-        self.convert(self.0.token().await)
-    }
-
-    async fn refreshed(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
-        // 401のときだけ呼ばれる。使った版を所有者へ渡し、再取得は所有者が決める。
-        let used = *self.1.lock().unwrap_or_else(|e| e.into_inner());
-        let token = match used {
-            Some(revision) => self.0.refresh_after_unauthorized(revision).await,
-            None => self.0.token().await,
-        };
-        self.convert(token)
-    }
+struct Tokens {
+    binding: Arc<Binding>,
+    legacy: crate::AuthTokens,
+    // A 401 belongs to the exact registration/generation used by that request.
+    used: std::sync::Mutex<Option<(String, u64, u64)>>,
 }
 
 impl Tokens {
+    fn bound(&self) -> Result<Option<BoundTokenSource>, polaris_provider::ProviderError> {
+        let current = self
+            .binding
+            .current
+            .read()
+            .map_err(|_| crate::to_provider_error(AuthError::Protection))?
+            .clone();
+        if current.is_none()
+            && registered_owner()
+                .map_err(|_| crate::to_provider_error(AuthError::Protection))?
+                .is_some()
+        {
+            return Err(crate::to_provider_error(AuthError::Denied(
+                "explicit_account_binding_required".into(),
+            )));
+        }
+        Ok(current)
+    }
+
     fn convert(
         &self,
         token: Result<polaris_auth::accounts::owner::AccessToken, AuthError>,
     ) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
         let token = token.map_err(crate::to_provider_error)?;
-        *self.1.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.token_revision);
+        *self.used.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+            token.registration_id.clone(),
+            token.generation,
+            token.token_revision,
+        ));
         Ok(polaris_provider::Token {
             effort: crate::effort_for(token.secret()),
             access_token: token.secret().to_owned(),
             account_id: token.account_id.clone(),
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl polaris_provider::TokenSource for Tokens {
+    async fn token(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
+        match self.bound()? {
+            Some(bound) => self.convert(bound.token().await),
+            None => polaris_provider::TokenSource::token(&self.legacy).await,
+        }
+    }
+
+    async fn refreshed(&self) -> Result<polaris_provider::Token, polaris_provider::ProviderError> {
+        let Some(bound) = self.bound()? else {
+            return polaris_provider::TokenSource::refreshed(&self.legacy).await;
+        };
+        let used = self.used.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let result = match used {
+            Some((id, generation, revision))
+                if id == bound.registration_id() && generation == bound.generation() =>
+            {
+                bound.refresh_after_unauthorized(revision).await
+            }
+            Some(_) => {
+                return Err(crate::to_provider_error(AuthError::Denied(
+                    "binding_changed_during_request".into(),
+                )));
+            }
+            None => bound.token().await,
+        };
+        self.convert(result)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use polaris_tui::account::BindingControl;
+
+    #[tokio::test]
+    async fn m3a_shared_binding_is_explicit_and_rejects_a_foreign_refresh() {
+        if std::env::var_os("POLARIS_M3A_BINDING_CHILD").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir(home.path().join("tmp")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "account::tests::m3a_shared_binding_is_explicit_and_rejects_a_foreign_refresh",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("POLARIS_M3A_BINDING_CHILD", "1")
+                .env("HOME", home.path())
+                .env("TMPDIR", home.path().join("tmp"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        polaris_auth::protection::use_trusted_home(&home).unwrap();
+        let store = polaris_auth::accounts::store::AccountStore::open().unwrap();
+        let mut ids = Vec::new();
+        for principal in ["fixture-a", "fixture-b"] {
+            let reservation = store.begin_registration(None).unwrap();
+            store.mark_exchange_pending(&reservation).unwrap();
+            store
+                .complete_registration(
+                    &reservation,
+                    polaris_auth::Credentials {
+                        access_token: format!("synthetic-{principal}"),
+                        refresh_token: format!("synthetic-refresh-{principal}"),
+                        account_id: principal.into(),
+                        expires_at: Some(u64::MAX),
+                    },
+                )
+                .unwrap();
+            ids.push(reservation.registration_id);
+        }
+        bind("gpt-6-astra", Some(&ids[0])).unwrap();
+        let tokens = require(polaris_auth::store::default_path().unwrap()).unwrap();
+        assert_eq!(tokens.token().await.unwrap().account_id, "fixture-a");
+        let binding = BOUND.get().unwrap();
+        assert_eq!(binding.current().unwrap().0, ids[0]);
+        assert!(binding.bind("missing-registration").is_err());
+        assert_eq!(binding.current().unwrap().0, ids[0]);
+        binding.bind(&ids[1]).unwrap();
+        assert!(tokens.refreshed().await.is_err());
+        assert_eq!(tokens.token().await.unwrap().account_id, "fixture-b");
+        let summary = store
+            .snapshot()
+            .unwrap()
+            .accounts
+            .into_iter()
+            .find(|a| a.registration_id == ids[1])
+            .unwrap();
+        store
+            .logout(&summary.registration_id, summary.generation)
+            .unwrap();
+        assert!(
+            tokens.token().await.is_err(),
+            "removed binding must never fall back to the other account"
+        );
+        assert_eq!(binding.current().unwrap().0, ids[1]);
     }
 }

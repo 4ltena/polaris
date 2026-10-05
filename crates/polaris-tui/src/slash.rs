@@ -84,6 +84,14 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "inspect local configuration and runtime availability",
     },
     SlashCommand {
+        name: "account",
+        description: "list, register, reauthenticate, unlink, label, or bind an account",
+    },
+    SlashCommand {
+        name: "login",
+        description: "register an account without changing the current binding",
+    },
+    SlashCommand {
         name: "decided",
         description: "inspect recorded project decisions",
     },
@@ -355,6 +363,8 @@ pub fn parse(line: &str) -> Option<Action> {
         "status" => Action::Status,
         "web-search" => Action::WebSearch(extra),
         "doctor" => Action::Doctor,
+        "account" => Action::Account(extra),
+        "login" => Action::Account(format!("login {extra}").trim_end().to_owned()),
         "session" | "goal" | "history" | "tool-memory" | "remember" => {
             Action::SessionControl(format!("{name} {extra}").trim_end().to_owned())
         }

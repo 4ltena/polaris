@@ -1,4 +1,6 @@
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
 import plistlib
 import tempfile
@@ -19,6 +21,17 @@ class InstallerAssemblyTests(unittest.TestCase):
         binary = app / "Contents/MacOS/PolarisDesktop"
         binary.write_bytes(b"native executable")
         binary.chmod(0o755)
+        cli = app / "Contents/Helpers/polaris"
+        cli.parent.mkdir()
+        cli.write_bytes(b"compiled polaris CLI")
+        cli.chmod(0o755)
+        (app / "Contents/Resources").mkdir()
+        (app / "Contents/Resources" / assembly.CLI_MANIFEST_NAME).write_text(json.dumps({
+            "schema_version": 1,
+            "relative_path": assembly.CLI_RELATIVE_PATH,
+            "architectures": ["arm64"],
+            "sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
+        }))
         with (app / "Contents/Info.plist").open("wb") as stream:
             plistlib.dump({
                 "CFBundlePackageType": "APPL", "CFBundleIdentifier": "com.polaris.desktop.local",
@@ -40,7 +53,17 @@ class InstallerAssemblyTests(unittest.TestCase):
             self.assertEqual(info["CFBundleShortVersionString"], "1.0.0")
             self.assertEqual((destination / "Contents/Resources/Polaris.app/Contents/MacOS/PolarisDesktop").read_bytes(),
                              b"native executable")
+            self.assertEqual((destination / "Contents/Resources/Polaris.app/Contents/Helpers/polaris").read_bytes(),
+                             b"compiled polaris CLI")
             self.assertTrue((destination / assembly.RESOURCE_BUNDLE).is_dir())
+
+    def test_rejects_modified_cli_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self.payload(root)
+            (payload / "Contents/Helpers/polaris").write_bytes(b"modified")
+            with self.assertRaises(RuntimeError):
+                assembly.assemble_installer(payload, root / "Polaris Installer.app")
 
     def test_existing_destination_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:

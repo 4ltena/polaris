@@ -14,6 +14,10 @@ import sys
 import tempfile
 
 
+CLI_MANIFEST_NAME = "polaris-cli.json"
+SUPPORTED_MACOS_ARCHITECTURES = frozenset({"arm64", "arm64e", "x86_64"})
+
+
 def copy_helper(source, destination):
     if not source.is_absolute():
         raise RuntimeError("service helperは絶対パスで指定してください。")
@@ -37,6 +41,50 @@ def package_execution_helper(source, contents):
             digest.update(chunk)
     manifest = {"schema_version": 1, "sha256": digest.hexdigest()}
     with (contents / "Resources" / "execution-helper.json").open("x", encoding="utf-8") as stream:
+        json.dump(manifest, stream, sort_keys=True)
+        stream.write("\n")
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def macho_architectures(path):
+    """Return the declared slices of a packaged macOS executable.
+
+    The check intentionally runs after copying into the temporary app.  A
+    build-path replacement therefore cannot make the manifest describe bytes
+    other than the bytes that will be published in the app.
+    """
+    result = subprocess.run(
+        ["/usr/bin/lipo", "-archs", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    architectures = tuple(result.stdout.split())
+    if result.returncode != 0 or not architectures:
+        raise RuntimeError("polaris CLIがmacOS実行物として検証できません。")
+    if any(architecture not in SUPPORTED_MACOS_ARCHITECTURES for architecture in architectures):
+        raise RuntimeError("polaris CLIに未対応のmacOSアーキテクチャが含まれています。")
+    return architectures
+
+
+def package_polaris_cli(source, contents):
+    """Package the explicit CLI build and bind its manifest to copied bytes."""
+    destination = contents / "Helpers" / "polaris"
+    copy_helper(source, destination)
+    manifest = {
+        "schema_version": 1,
+        "relative_path": "Contents/Helpers/polaris",
+        "architectures": list(macho_architectures(destination)),
+        "sha256": sha256_file(destination),
+    }
+    with (contents / "Resources" / CLI_MANIFEST_NAME).open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, sort_keys=True)
         stream.write("\n")
 
@@ -70,11 +118,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-helper", type=Path, required=True)
     parser.add_argument("--execution-helper", type=Path)
+    parser.add_argument("--polaris-executable", type=Path, required=True)
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--disable-swiftpm-sandbox", action="store_true")
     arguments = parser.parse_args()
     # Validate before spending the Swift build slot. No Cargo build or discovery.
     validate_helper_argument(arguments.service_helper)
+    validate_helper_argument(arguments.polaris_executable)
     if arguments.execution_helper is not None:
         validate_helper_argument(arguments.execution_helper)
     package = Path(__file__).resolve().parent.parent
@@ -127,6 +177,7 @@ def main():
         (contents / "Resources").mkdir()
         (contents / "Helpers").mkdir()
         copy_helper(arguments.service_helper, contents / "Helpers" / "polaris-desktop-service")
+        package_polaris_cli(arguments.polaris_executable, contents)
         if arguments.execution_helper is not None:
             package_execution_helper(arguments.execution_helper, contents)
             repository = package.parent.parent

@@ -2,7 +2,9 @@
 """Polaris.appを内包する未署名のローカル確認用インストーラを組み立てる。"""
 
 import argparse
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import plistlib
 import shutil
@@ -12,6 +14,9 @@ import tempfile
 
 
 RESOURCE_BUNDLE = "PolarisDesktop_PolarisDesktop.bundle"
+CLI_MANIFEST_NAME = "polaris-cli.json"
+CLI_RELATIVE_PATH = "Contents/Helpers/polaris"
+SUPPORTED_MACOS_ARCHITECTURES = frozenset({"arm64", "arm64e", "x86_64"})
 
 
 def load_app_assembler():
@@ -20,6 +25,38 @@ def load_app_assembler():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_cli_payload(app):
+    cli = app / CLI_RELATIVE_PATH
+    manifest_path = app / "Contents" / "Resources" / CLI_MANIFEST_NAME
+    if cli.is_symlink() or not cli.is_file() or manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RuntimeError("Polaris.appのCLI実行物または検証情報が不足しています。")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError("Polaris.appのCLI検証情報を読めません。") from error
+    architectures = manifest.get("architectures")
+    expected_hash = manifest.get("sha256")
+    if (manifest.get("schema_version") != 1
+            or manifest.get("relative_path") != CLI_RELATIVE_PATH
+            or not isinstance(architectures, list)
+            or not architectures
+            or any(not isinstance(item, str) or item not in SUPPORTED_MACOS_ARCHITECTURES for item in architectures)
+            or not isinstance(expected_hash, str)
+            or len(expected_hash) != 64
+            or any(character not in "0123456789abcdef" for character in expected_hash)
+            or sha256_file(cli) != expected_hash):
+        raise RuntimeError("Polaris.appのCLI検証に失敗しました。")
+    return cli
 
 
 def validate_payload(app):
@@ -37,11 +74,11 @@ def validate_payload(app):
     resources = app / RESOURCE_BUNDLE
     if not binary.is_file() or not resources.is_dir():
         raise RuntimeError("Polaris.appの実行物または資源が不足しています。")
-    return info, binary, resources
+    return info, binary, resources, validate_cli_payload(app)
 
 
 def assemble_installer(payload, destination, bundle_id="com.polaris.installer.local"):
-    info, binary, resource_bundle = validate_payload(payload)
+    info, binary, resource_bundle, _cli = validate_payload(payload)
     if not bundle_id.startswith("com.polaris.installer."):
         raise RuntimeError("インストーラのbundle IDを確認してください。")
     if not destination.is_absolute():
@@ -82,6 +119,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-helper", type=Path)
     parser.add_argument("--execution-helper", type=Path)
+    parser.add_argument("--polaris-executable", type=Path)
     parser.add_argument("--payload-app", type=Path)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--bundle-id", default="com.polaris.installer.local")
@@ -89,8 +127,12 @@ def main():
     arguments = parser.parse_args()
     if arguments.payload_app is None and arguments.service_helper is None:
         raise RuntimeError("service helperまたは組立て済みPolaris.appが必要です。")
-    if arguments.payload_app is not None and (arguments.service_helper is not None or arguments.execution_helper is not None):
+    if arguments.payload_app is not None and (arguments.service_helper is not None
+                                              or arguments.execution_helper is not None
+                                              or arguments.polaris_executable is not None):
         raise RuntimeError("payload-appとhelper指定は同時に使えません。")
+    if arguments.payload_app is None and arguments.polaris_executable is None:
+        raise RuntimeError("組立てるCLI実行物を絶対パスで指定してください。")
 
     if arguments.payload_app is not None:
         assemble_installer(arguments.payload_app, arguments.destination, arguments.bundle_id)
@@ -101,6 +143,7 @@ def main():
             original = sys.argv
             try:
                 sys.argv = ["assemble-app.py", "--service-helper", str(arguments.service_helper),
+                            "--polaris-executable", str(arguments.polaris_executable),
                             "--destination", str(payload)]
                 if arguments.execution_helper is not None:
                     sys.argv.extend(["--execution-helper", str(arguments.execution_helper)])

@@ -40,19 +40,22 @@ class HelperAssemblyTests(unittest.TestCase):
             self.assertFalse((repository / ".polaris").exists())
         service = root / "service-helper"
         execution = root / "execution-helper"
-        for helper in [service, execution]:
+        cli = root / "polaris"
+        for helper in [service, execution, cli]:
             helper.write_bytes(b"compiled " + helper.name.encode())
             helper.chmod(0o700)
         destination = root / "PolarisDesktop.app"
         arguments = [
             "assemble-app.py", "--service-helper", str(service),
-            "--execution-helper", str(execution), "--destination", str(destination),
+            "--execution-helper", str(execution), "--polaris-executable", str(cli),
+            "--destination", str(destination),
         ]
         # Stub compilation only. Exercise the real resource copy, manifest,
         # metadata and final publication paths against a clean source fixture.
         with patch.object(assembly, "__file__", str(package / "scripts/assemble-app.py")), \
                 patch.object(assembly.sys, "argv", arguments), \
                 patch.object(assembly.subprocess, "run"), \
+                patch.object(assembly, "macho_architectures", return_value=("arm64",)), \
                 patch.object(assembly.subprocess, "check_output", return_value=str(binary_directory)):
             assembly.main()
         return destination
@@ -81,6 +84,15 @@ class HelperAssemblyTests(unittest.TestCase):
             self.assertEqual(helper.read_bytes(), b"compiled execution-helper")
             manifest = json.loads((app / "Contents/Resources/execution-helper.json").read_text())
             self.assertEqual(manifest["sha256"], hashlib.sha256(helper.read_bytes()).hexdigest())
+            cli = app / "Contents/Helpers/polaris"
+            self.assertEqual(cli.read_bytes(), b"compiled polaris")
+            cli_manifest = json.loads((app / "Contents/Resources/polaris-cli.json").read_text())
+            self.assertEqual(cli_manifest, {
+                "architectures": ["arm64"],
+                "relative_path": "Contents/Helpers/polaris",
+                "schema_version": 1,
+                "sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
+            })
             self.assertFalse((app / "Contents/Resources/toolchains").exists())
             self.assertTrue((app / "PolarisDesktop_PolarisDesktop.bundle/runtime-dependencies.json").is_file())
 
@@ -132,6 +144,24 @@ class HelperAssemblyTests(unittest.TestCase):
             self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
             with self.assertRaises(FileExistsError):
                 assembly.copy_helper(source, destination)
+
+    def test_cli_manifest_describes_the_packaged_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "polaris"
+            source.write_bytes(b"fixed CLI")
+            source.chmod(0o700)
+            contents = root / "Contents"
+            (contents / "Helpers").mkdir(parents=True)
+            (contents / "Resources").mkdir()
+            with patch.object(assembly, "macho_architectures", return_value=("arm64", "x86_64")):
+                assembly.package_polaris_cli(source, contents)
+            source.write_bytes(b"replacement CLI")
+            packaged = contents / "Helpers/polaris"
+            manifest = json.loads((contents / "Resources/polaris-cli.json").read_text())
+            self.assertEqual(packaged.read_bytes(), b"fixed CLI")
+            self.assertEqual(manifest["architectures"], ["arm64", "x86_64"])
+            self.assertEqual(manifest["sha256"], hashlib.sha256(packaged.read_bytes()).hexdigest())
 
     def test_symlink_and_non_executable_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

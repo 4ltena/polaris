@@ -1,6 +1,6 @@
 //! One host-selected prompt per accepted input; saved proof never grants a retry.
 use super::*;
-use crate::mcp::results::MAX_VISIBLE_BYTES;
+use crate::mcp::results::{MAX_VISIBLE_BYTES, RunBinding};
 use mcp::{McpDisposition, McpTerminalInput};
 use polaris_desktop_protocol::request::McpPromptChoice;
 use polaris_mcp::{
@@ -165,6 +165,96 @@ struct Envelope {
     disposition: McpDisposition,
     reply: Option<Value>,
     failure: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalPromptIntent<'a> {
+    session: &'a str,
+    run: &'a str,
+    attempt: &'a str,
+    project: &'a str,
+    binding: &'a OperationBinding,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalPromptEnvelope<'a> {
+    schema_version: u8,
+    intent: LocalPromptIntent<'a>,
+    disposition: McpDisposition,
+    reply: Option<Value>,
+    failure: Option<String>,
+}
+
+fn local_prompt_intent<'a>(
+    run: &'a RunBinding,
+    project: &'a str,
+    binding: &'a OperationBinding,
+) -> StoreResult<LocalPromptIntent<'a>> {
+    if binding.item.kind != Kind::Prompt
+        || binding.selection_id.is_none()
+        || run.session.is_empty()
+        || run.run.is_empty()
+        || run.attempt.is_empty()
+        || project.is_empty()
+    {
+        return Err(StoreError::RunConflict);
+    }
+    Ok(LocalPromptIntent {
+        session: &run.session,
+        run: &run.run,
+        attempt: &run.attempt,
+        project,
+        binding,
+    })
+}
+
+/// Local CLI/TUI runs have no desktop writer. Reserve room for the exact
+/// provenance envelope before accepting a projected server reply.
+pub(crate) fn local_mcp_prompt_reply_budget(
+    run: &RunBinding,
+    project: &str,
+    binding: &OperationBinding,
+) -> StoreResult<usize> {
+    let envelope = LocalPromptEnvelope {
+        schema_version: 1,
+        intent: local_prompt_intent(run, project, binding)?,
+        disposition: McpDisposition::InputRequired,
+        reply: None,
+        failure: None,
+    };
+    let overhead = serde_json::to_vec(&envelope)?
+        .len()
+        .checked_sub(4)
+        .ok_or(StoreError::Overflow)?;
+    MAX_VISIBLE_BYTES
+        .checked_sub(overhead)
+        .filter(|budget| *budget > 0)
+        .ok_or(StoreError::Overflow)
+}
+
+/// The caller persists this supplemental user-role event after the accepted
+/// input and before the first provider request. It never starts a new turn.
+pub(crate) fn local_mcp_prompt_terminal(
+    run: &RunBinding,
+    project: &str,
+    binding: &OperationBinding,
+    input: McpTerminalInput<'_>,
+) -> StoreResult<McpPromptResult> {
+    let (disposition, reply, failure) = mcp::terminal_payload(input)?;
+    let envelope = LocalPromptEnvelope {
+        schema_version: 1,
+        intent: local_prompt_intent(run, project, binding)?,
+        disposition,
+        reply,
+        failure,
+    };
+    let bytes = bounded_json(&envelope, MAX_VISIBLE_BYTES).map_err(|_| StoreError::Overflow)?;
+    Ok(McpPromptResult {
+        message: Message::user(String::from_utf8(bytes).map_err(|_| StoreError::RunConflict)?),
+        disposition,
+    })
 }
 
 pub(super) fn validate_choice(choice: &McpPromptChoice) -> StoreResult<()> {

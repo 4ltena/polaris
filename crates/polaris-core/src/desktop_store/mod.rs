@@ -70,6 +70,7 @@ pub use writer::mcp::{
 };
 pub(crate) use writer::mcp::{local_mcp_terminal, mcp_reply_budget};
 pub use writer::prompt::{McpPromptIntent, McpPromptPublication, McpPromptResult, SavedMcpPrompt};
+pub(crate) use writer::prompt::{local_mcp_prompt_reply_budget, local_mcp_prompt_terminal};
 pub use writer::recipe::{
     Current as RecipeCurrent, SCHEMA_VERSION as RECIPE_SCHEMA_VERSION, SavedRecipeIntent,
     SavedRecipeStep, SavedRecipeTerminal, StepOutcome, reusable_steps,

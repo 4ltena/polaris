@@ -7,8 +7,8 @@ use crate::{
     desktop_store::{
         IntentReceipt, MCP_TOOL_OPERATION, McpDisposition, McpPromptIntent, McpPromptPublication,
         McpPromptResult, McpPublishedResult, McpTerminalInput, McpTerminalPublication,
-        OwnerRequestHistory, Published, StoreError, Writer, local_mcp_terminal, mcp_reply_budget,
-        validate_turn_suffix,
+        OwnerRequestHistory, Published, StoreError, Writer, local_mcp_prompt_reply_budget,
+        local_mcp_prompt_terminal, local_mcp_terminal, mcp_reply_budget, validate_turn_suffix,
     },
     mcp::{
         operation::{ExternalCeiling, HostOperationIdentity, McpOperation},
@@ -418,6 +418,13 @@ impl McpPort {
         {
             return Err(McpCallError::Invalid);
         }
+        if self.local_ceiling.is_some() {
+            return self
+                .perform_local_prompt(
+                    connection, operation, project, results, cancelled, authorized,
+                )
+                .await;
+        }
         match self
             .perform(
                 connection,
@@ -432,6 +439,83 @@ impl McpPort {
             PublishedResult::Prompt(result) => Ok(result),
             PublishedResult::Model(_) => Err(McpCallError::Invalid),
         }
+    }
+
+    async fn perform_local_prompt(
+        &self,
+        connection: &mut Connection,
+        operation: BoundOperation,
+        project: String,
+        results: &mut ResultStore,
+        cancelled: impl Future<Output = ()>,
+        mut authorized: impl FnMut(&OperationBinding) -> bool,
+    ) -> Result<McpPromptResult, McpCallError> {
+        tokio::pin!(cancelled);
+        if self.stop.is_set() || cancelled.as_mut().now_or_never().is_some() {
+            return Err(McpCallError::Cancelled);
+        }
+        results
+            .check_binding(&self.binding)
+            .map_err(|_| McpCallError::Invalid)?;
+        let _permit = self
+            .capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| McpCallError::Unavailable)?;
+        let binding = operation.binding().clone();
+        let selection_id = binding.selection_id.clone().ok_or(McpCallError::Invalid)?;
+        let reply_budget = local_mcp_prompt_reply_budget(&self.binding, &project, &binding)
+            .map_err(|_| McpCallError::Invalid)?;
+        let response = connection
+            .perform_once(
+                operation,
+                async {
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancelled => (),
+                        _ = self.stop.cancelled() => (),
+                    }
+                },
+                |seen| seen == &binding && !self.stop.is_set() && authorized(seen),
+            )
+            .await;
+        let terminal = match response {
+            Ok(reply) => match results.project_reply_bounded(
+                &self.binding,
+                Source {
+                    server: binding.item.server_id.clone(),
+                    origin: SourceOrigin::HostSelection {
+                        selection_id: selection_id.clone(),
+                    },
+                    result_generation: selection_id,
+                },
+                reply,
+                Instant::now(),
+                reply_budget,
+            ) {
+                Ok(reply) => Terminal::Reply(reply),
+                Err(_) => {
+                    Terminal::Failure(OperationFailure::OutcomeUnknown(polaris_mcp::Error::Limit))
+                }
+            },
+            Err(failure) => Terminal::Failure(failure),
+        };
+        let input = match &terminal {
+            Terminal::Reply(reply) => McpTerminalInput::Reply(reply),
+            Terminal::Failure(failure) => McpTerminalInput::Failure(*failure),
+        };
+        local_mcp_prompt_terminal(&self.binding, &project, &binding, input)
+            .or_else(|_| {
+                local_mcp_prompt_terminal(
+                    &self.binding,
+                    &project,
+                    &binding,
+                    McpTerminalInput::Failure(OperationFailure::OutcomeUnknown(
+                        polaris_mcp::Error::Limit,
+                    )),
+                )
+            })
+            .map_err(|_| McpCallError::Storage)
     }
 
     async fn perform(

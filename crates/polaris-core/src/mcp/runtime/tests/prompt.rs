@@ -189,3 +189,35 @@ async fn host_prompt_runtime_late_selection_has_no_network_effect() {
     fixture.abort();
     let _ = fixture.await;
 }
+
+#[tokio::test]
+async fn local_host_prompt_returns_one_bounded_supplemental_message() {
+    let (server, methods, fixture) = fixture::server_fixture("").await;
+    let port = McpPort::local(
+        "sidechat-session",
+        "admitted-run",
+        "1",
+        ExternalCeiling::Allowed,
+    );
+    let mut runtime = RunRuntime::new(config(vec![server]), port).unwrap();
+    let selected = runtime.host_prompt(&choice(), pending()).await.unwrap();
+    assert!(selected.permits_continuation());
+    assert!(selected.message.tool_call_id.is_none());
+    let envelope: serde_json::Value = serde_json::from_str(&selected.message.content).unwrap();
+    assert_eq!(envelope["intent"]["session"], "sidechat-session");
+    assert_eq!(envelope["intent"]["binding"]["item"]["key"], "prompt");
+    assert_eq!(envelope["disposition"], "completed");
+    assert_eq!(
+        methods
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| *method == "prompts/get")
+            .count(),
+        1
+    );
+    assert!(runtime.host_prompt(&choice(), pending()).await.is_err());
+    runtime.shutdown().await.unwrap();
+    fixture.abort();
+    let _ = fixture.await;
+}

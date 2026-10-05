@@ -79,6 +79,8 @@ pub mod isolated_run;
 pub mod isolated_workspace;
 pub mod llama_server;
 pub mod local_execution;
+#[cfg(unix)]
+pub mod management_effect;
 pub mod mcp;
 #[cfg(target_os = "macos")]
 pub mod workspace_apply;

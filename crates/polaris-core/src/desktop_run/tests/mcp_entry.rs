@@ -186,8 +186,9 @@ async fn prompt_ack_preserves_raw_and_query_and_checkpoint_finish_use_only_turn_
             .contains("selected prompt")
     );
     assert_eq!(writer.snapshot().unwrap().raw.len(), 2);
+    // This checks transcript publication within the acknowledged phase;
+    // typed phase transitions require their own approved artifact evidence.
     let mut candidate = previous.clone();
-    candidate.state.phase = crate::workflow::Phase::Review;
     candidate.state.revision += 1;
     // This is the old service extraction: it wrongly includes the supplement.
     assert!(

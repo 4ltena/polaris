@@ -67,6 +67,12 @@ pub enum DesktopRunError {
     PromptUnconfirmed,
     #[error("desktop MCP shutdown is unconfirmed")]
     McpShutdown,
+    #[error("project activity cannot start: {0}")]
+    ProjectActivity(#[from] crate::project_mutation::ProjectMutationError),
+    #[error("management effect state cannot be recovered: {0}")]
+    ManagementEffect(#[from] crate::management_effect::ManagementEffectStoreError),
+    #[error("an unresolved management effect blocks this run")]
+    UnresolvedManagementEffect,
     // Never copy an arbitrary panic payload into a user-visible error.
     #[error("desktop worker panicked; no automatic retry")]
     Panicked,
@@ -209,6 +215,22 @@ fn execute(mut input: DesktopRunInput, sink: DesktopEventSink) -> DesktopRunComp
     // Catch inside the owned input scope, preserving partial in-memory history.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         validate(&input)?;
+        let source_project = &input.prepared.snapshot().source_path;
+        let project_owner =
+            crate::project_mutation::ProjectMutationOwnerV1::for_project(source_project)?;
+        let management_effects = {
+            let lease = project_owner.try_mutation()?;
+            let store =
+                crate::management_effect::ManagementEffectStoreV1::open(source_project, &lease)?;
+            if store.blocker()?.is_some() {
+                return Err(DesktopRunError::UnresolvedManagementEffect);
+            }
+            store
+        };
+        let _project_activity = project_owner.try_activity()?;
+        if management_effects.blocker()?.is_some() {
+            return Err(DesktopRunError::UnresolvedManagementEffect);
+        }
         // A desktop owner may serve several runs. Bind this run's copy rather
         // than the host cwd or the intentionally host-bound AGENTS capability.
         input.always_on = input

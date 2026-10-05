@@ -261,12 +261,25 @@ async fn catalog_expiring_during_approval_publishes_before_send_without_success_
         mcp_server::server_fixture_with_tool_reply("", remote_reply("complete")).await;
     server.timeouts.catalog_ttl_seconds = 30;
     let (_temp, mut input, _unused, calls) = fixture(Behavior::Complete);
-    let mut workflow = SessionWorkflow::new(WorkflowConfig {
-        enabled: true,
-        mode: WorkflowMode::Adaptive,
-        initial_phase: Phase::Review,
-        ..Default::default()
-    });
+    // These MCP cases retain the legacy phase contract; F5 gates have separate fixtures.
+    let mut workflow = SessionWorkflow::restore(
+        WorkflowConfig {
+            enabled: true,
+            mode: WorkflowMode::Adaptive,
+            initial_phase: Phase::Review,
+            ..Default::default()
+        },
+        crate::workflow::WorkflowGatesV1 {
+            phase_gate_schema_version: None,
+            ..Default::default()
+        },
+        crate::workflow::WorkflowStateV1 {
+            phase: Phase::Review,
+            step: Phase::Review.default_step(),
+            ..Default::default()
+        },
+    )
+    .expect("legacy MCP outcome fixture");
     workflow.gates.approved_spec_hash = Some("approved-fixture".into());
     workflow.gates.verification = Some(VerificationEvidence {
         artifact_hash: "fixture-artifact".into(),
@@ -414,12 +427,25 @@ async fn remote_tool_stales_verification_and_failed_sibling_prevents_workflow_tr
         let (server, _methods, server_task) =
             mcp_server::server_fixture_with_tool_reply("", remote_reply(status)).await;
         let (_temp, mut input, _unused, calls) = fixture(Behavior::Complete);
-        let mut workflow = SessionWorkflow::new(WorkflowConfig {
-            enabled: true,
-            mode: WorkflowMode::Adaptive,
-            initial_phase: Phase::Review,
-            ..Default::default()
-        });
+        // These MCP cases retain the legacy phase contract; F5 gates have separate fixtures.
+        let mut workflow = SessionWorkflow::restore(
+            WorkflowConfig {
+                enabled: true,
+                mode: WorkflowMode::Adaptive,
+                initial_phase: Phase::Review,
+                ..Default::default()
+            },
+            crate::workflow::WorkflowGatesV1 {
+                phase_gate_schema_version: None,
+                ..Default::default()
+            },
+            crate::workflow::WorkflowStateV1 {
+                phase: Phase::Review,
+                step: Phase::Review.default_step(),
+                ..Default::default()
+            },
+        )
+        .expect("legacy MCP outcome fixture");
         workflow.gates.approved_spec_hash = Some("approved-fixture".into());
         workflow.gates.verification = Some(VerificationEvidence {
             artifact_hash: "fixture-artifact".into(),

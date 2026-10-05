@@ -2090,12 +2090,66 @@ impl Session {
         self.push_message(Message::user(content), true);
     }
 
+    /// Commit one real input and its host-selected context under the same
+    /// saved marker. The supplemental message never starts another turn.
+    pub fn push_user_with_supplement(
+        &mut self,
+        content: &str,
+        supplement: Message,
+    ) -> std::io::Result<()> {
+        self.recover_interrupted_tools()?;
+        self.check_persistence()?;
+        if self.desktop_transcript.is_some() {
+            return Err(std::io::Error::other(
+                "desktop inputはdesktop writerが所有します",
+            ));
+        }
+        let message = Message::user(content);
+        if let Some(persistence) = &self.persistence {
+            let source = persistence.append_input_with_supplement(
+                message.clone(),
+                supplement.clone(),
+                self.workflow.as_ref(),
+            )?;
+            self.input_source = source.map(|source| {
+                crate::request_input::BoundInput::new(
+                    source,
+                    self.messages.len(),
+                    message.content.len(),
+                )
+            });
+        }
+        self.messages.push(message);
+        self.messages.push(supplement);
+        Ok(())
+    }
+
     /// Commit one session-manager admission exactly once. The caller advances
     /// the manager only after this returns `true`; `false` is an exact replay
     /// whose raw input was already committed and must not start another run.
     pub fn push_admitted_user(
         &mut self,
         content: &str,
+        admission_id: &crate::session_manager::AdmissionId,
+        payload_hash: &str,
+    ) -> std::io::Result<bool> {
+        self.push_admitted_user_inner(content, None, admission_id, payload_hash)
+    }
+
+    pub fn push_admitted_user_with_supplement(
+        &mut self,
+        content: &str,
+        supplement: Message,
+        admission_id: &crate::session_manager::AdmissionId,
+        payload_hash: &str,
+    ) -> std::io::Result<bool> {
+        self.push_admitted_user_inner(content, Some(supplement), admission_id, payload_hash)
+    }
+
+    fn push_admitted_user_inner(
+        &mut self,
+        content: &str,
+        supplement: Option<Message>,
         admission_id: &crate::session_manager::AdmissionId,
         payload_hash: &str,
     ) -> std::io::Result<bool> {
@@ -2116,12 +2170,21 @@ impl Session {
             .admission_receipts
             .contains_key(admission_id.as_str());
         let message = Message::user(content);
-        let source = persistence.append_admitted_input(
-            message.clone(),
-            self.workflow.as_ref(),
-            admission_id,
-            payload_hash,
-        )?;
+        let source = match &supplement {
+            Some(supplement) => persistence.append_admitted_input_with_supplement(
+                message.clone(),
+                supplement.clone(),
+                self.workflow.as_ref(),
+                admission_id,
+                payload_hash,
+            ),
+            None => persistence.append_admitted_input(
+                message.clone(),
+                self.workflow.as_ref(),
+                admission_id,
+                payload_hash,
+            ),
+        }?;
         if already_committed {
             return Ok(false);
         }
@@ -2133,6 +2196,9 @@ impl Session {
             )
         });
         self.messages.push(message);
+        if let Some(supplement) = supplement {
+            self.messages.push(supplement);
+        }
         Ok(true)
     }
 

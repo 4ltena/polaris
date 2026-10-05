@@ -43,6 +43,8 @@ pub enum StoreError {
     NotFound,
     #[error("値の範囲超過")]
     Overflow,
+    #[error("SessionManager容量不足: {0}")]
+    Capacity(&'static str),
 }
 
 impl From<polaris_desktop_protocol::ids::ValueError> for StoreError {

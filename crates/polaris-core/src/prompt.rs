@@ -135,7 +135,9 @@ impl AlwaysOn {
         Ok(self)
     }
 
-    pub(crate) fn system_for_request(&self) -> std::io::Result<String> {
+    /// Re-read project instructions before a request or a workspace rewind
+    /// becomes active. A failed refresh must not reuse the old prompt.
+    pub fn system_for_request(&self) -> std::io::Result<String> {
         #[cfg(unix)]
         if let Some(source) = &self.agents_refresh {
             return Ok(build_system(&source.read()?, &self.environment));

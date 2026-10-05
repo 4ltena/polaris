@@ -4,7 +4,7 @@ use crate::{
     conversation_memory::published_view,
     conversation_state::{
         AdmissionReceiptV1, ConversationSnapshot, ConversationStateV2, ConversationStore,
-        HistoryMode,
+        HistoryMode, RewindBoundaryV1, RewindEffectStatusV1, RewindEligibilityV1,
     },
     workflow::{
         ActiveEvidenceArtifactsV1, ConvergenceInputV1, ObservedEvidenceSubjectV1,
@@ -85,16 +85,7 @@ impl PersistedSession {
         mode: HistoryMode,
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<Self> {
-        let mut state = ConversationStateV2::new(project_id.into(), session_id.into())?;
-        state.history_mode = mode;
-        if let Some(workflow) = workflow {
-            state.workflow_config = Some(
-                crate::conversation_state::SavedWorkflowConfigV1::capture(&workflow.config),
-            );
-            state.workflow = workflow.state();
-            state.gates = workflow.gates.clone();
-            state.workflow_artifacts = workflow.artifact_graph().clone();
-        }
+        let state = Self::new_state(project_id, session_id, mode, workflow)?;
         let mut memory = MemoryStore::open(database).map_err(io::Error::other)?;
         // A structured session is saved only after its index migration reads back.
         if mode == HistoryMode::Structured10 {
@@ -119,6 +110,26 @@ impl PersistedSession {
             data_root: data_root.into(),
             generation: Arc::new(Mutex::new(0)),
         })
+    }
+
+    /// Pure bootstrap state used by the switch owner's pre-start descriptor.
+    pub(crate) fn new_state(
+        project_id: &str,
+        session_id: &str,
+        mode: HistoryMode,
+        workflow: Option<&SessionWorkflow>,
+    ) -> io::Result<ConversationStateV2> {
+        let mut state = ConversationStateV2::new(project_id.into(), session_id.into())?;
+        state.history_mode = mode;
+        if let Some(workflow) = workflow {
+            state.workflow_config = Some(
+                crate::conversation_state::SavedWorkflowConfigV1::capture(&workflow.config),
+            );
+            state.workflow = workflow.state();
+            state.gates = workflow.gates.clone();
+            state.workflow_artifacts = workflow.artifact_graph().clone();
+        }
+        Ok(state)
     }
 
     pub fn open(data_root: &Path, database: &Path, project_id: &str, id: &str) -> io::Result<Self> {
@@ -212,6 +223,16 @@ impl PersistedSession {
         self.update(&[(message, true)], workflow, None)
     }
 
+    /// Publish a real input and its host-selected context together.
+    pub(crate) fn append_input_with_supplement(
+        &self,
+        message: Message,
+        supplement: Message,
+        workflow: Option<&SessionWorkflow>,
+    ) -> io::Result<Option<crate::request_input::SourceBinding>> {
+        self.update(&[(message, true), (supplement, false)], workflow, None)
+    }
+
     /// Append one accepted user input and publish its admission receipt in
     /// the same conversation marker generation. Exact retries return the
     /// original input binding without writing another raw event.
@@ -224,6 +245,24 @@ impl PersistedSession {
     ) -> io::Result<Option<crate::request_input::SourceBinding>> {
         self.update(
             &[(message, true)],
+            workflow,
+            Some((admission_id.as_str(), payload_hash)),
+        )
+    }
+
+    /// The receipt identifies the first event. Both events are published in
+    /// one marker generation, so recovery cannot see an input without its
+    /// selected prompt result.
+    pub(crate) fn append_admitted_input_with_supplement(
+        &self,
+        message: Message,
+        supplement: Message,
+        workflow: Option<&SessionWorkflow>,
+        admission_id: &crate::session_manager::AdmissionId,
+        payload_hash: &str,
+    ) -> io::Result<Option<crate::request_input::SourceBinding>> {
+        self.update(
+            &[(message, true), (supplement, false)],
             workflow,
             Some((admission_id.as_str(), payload_hash)),
         )
@@ -247,6 +286,157 @@ impl PersistedSession {
 
     pub fn checkpoint(&self, workflow: Option<&SessionWorkflow>) -> io::Result<()> {
         self.update(&[], workflow, None).map(|_| ())
+    }
+
+    /// Publish exactly one workflow-only marker update.  Management owners use
+    /// this instead of `checkpoint`: it compares the caller's complete
+    /// preimage while holding the session lock, rejects every non-workflow
+    /// field change, and never appends raw history.
+    pub fn publish_workflow_change(
+        &self,
+        expected_generation: u64,
+        before_state_hash: &str,
+        candidate: ConversationStateV2,
+    ) -> io::Result<ConversationSnapshot> {
+        let mut cursor = self.cursor()?;
+        let mut lock = self.store.lock()?;
+        let before = lock.snapshot()?;
+        if before.state.generation != *cursor || before.state.generation != expected_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "workflow変更の保存世代が変わりました",
+            ));
+        }
+        if crate::conversation_state::content_hash(
+            &serde_json::to_vec(&before.state).map_err(io::Error::other)?,
+        ) != before_state_hash
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "workflow変更の保存前stateが変わりました",
+            ));
+        }
+        if before.state.raw_commit_offset != before.raw_offset
+            || before.state.raw_commit_hash != before.raw_hash
+        {
+            return Err(io::Error::other("workflow変更前に未公開の原文があります"));
+        }
+        let expected_next = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
+        if candidate.generation != expected_generation
+            || candidate.raw_commit_offset != before.raw_offset
+            || candidate.raw_commit_hash != before.raw_hash
+            || !workflow_only_change(&before.state, &candidate)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow変更候補が専用保存契約に一致しません",
+            ));
+        }
+        candidate.validate()?;
+        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        memory
+            .with_conversation_marker(&published_view(&before.state)?, || {
+                lock.publish(&before, candidate)?;
+                Ok(())
+            })
+            .map_err(io::Error::other)?;
+        *cursor = expected_next;
+        let published = lock.snapshot()?;
+        if published.state.generation != expected_next
+            || published.raw_offset != before.raw_offset
+            || published.raw_hash != before.raw_hash
+        {
+            return Err(io::Error::other("workflow変更の公開結果が一致しません"));
+        }
+        memory
+            .with_conversation_marker(&published_view(&published.state)?, || Ok(()))
+            .map_err(io::Error::other)?;
+        Ok(published)
+    }
+
+    /// Publish a complete preimage CAS for settings, independent draft and
+    /// goal only. The mode exception delegates to proven-empty initialization;
+    /// ordinary `LockedConversation::publish` never migrates a live session.
+    pub fn publish_session_change(
+        &self,
+        expected_generation: u64,
+        before_state_hash: &str,
+        candidate: ConversationStateV2,
+    ) -> io::Result<ConversationSnapshot> {
+        let mut cursor = self.cursor()?;
+        let mut lock = self.store.lock()?;
+        let before = lock.snapshot()?;
+        if before.state.generation != *cursor
+            || before.state.generation != expected_generation
+            || crate::conversation_state::content_hash(
+                &serde_json::to_vec(&before.state).map_err(io::Error::other)?,
+            ) != before_state_hash
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "セッション設定の保存前stateが変わりました",
+            ));
+        }
+        if before.state.raw_commit_offset != before.raw_offset
+            || before.state.raw_commit_hash != before.raw_hash
+        {
+            return Err(io::Error::other("セッション設定前に未公開の原文があります"));
+        }
+        let changes_mode = candidate.history_mode != before.state.history_mode;
+        let mut same_mode = candidate.clone();
+        same_mode.history_mode = before.state.history_mode;
+        if !crate::session_settings::session_only_change(&before.state, &same_mode) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "セッション設定候補が専用保存契約に一致しません",
+            ));
+        }
+        candidate.validate()?;
+        if changes_mode {
+            lock.validate_history_initialization(&before)?;
+        }
+        let expected_next = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
+        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        if changes_mode && candidate.history_mode == HistoryMode::Structured10 {
+            memory
+                .enable_structured_memory()
+                .map_err(io::Error::other)?;
+            if memory
+                .structured_memory_schema_version()
+                .map_err(io::Error::other)?
+                != Some(polaris_memory::structured::STRUCTURED_MEMORY_SCHEMA_VERSION)
+            {
+                return Err(io::Error::other(
+                    "structured memory migration did not read back",
+                ));
+            }
+        }
+        memory
+            .with_conversation_marker(&published_view(&before.state)?, || {
+                if changes_mode {
+                    lock.initialize_history_mode(&before, candidate)?;
+                } else {
+                    lock.publish(&before, candidate)?;
+                }
+                Ok(())
+            })
+            .map_err(io::Error::other)?;
+        *cursor = expected_next;
+        let published = lock.snapshot()?;
+        if published.state.generation != expected_next
+            || published.raw_offset != before.raw_offset
+            || published.raw_hash != before.raw_hash
+        {
+            return Err(io::Error::other("セッション設定の公開結果が一致しません"));
+        }
+        memory
+            .with_conversation_marker(&published_view(&published.state)?, || Ok(()))
+            .map_err(io::Error::other)?;
+        Ok(published)
     }
 
     /// Persist only validated, reference-only verification checkpoint state.
@@ -735,7 +925,19 @@ impl PersistedSession {
             {
                 return Err(io::Error::other("admission payload hashが不正です"));
             }
-            if events.len() != 1 || !events[0].1 || events[0].0.role != Role::User {
+            if !matches!(events.len(), 1 | 2)
+                || !events[0].1
+                || events[0].0.role != Role::User
+                || events.get(1).is_some_and(|(message, starts_turn)| {
+                    *starts_turn
+                        || message.role != Role::User
+                        || message.tool_call_id.is_some()
+                        || !message.tool_calls.is_empty()
+                        || !message.reasoning.is_empty()
+                        || !message.hosted_web_search.is_empty()
+                        || !message.url_citations.is_empty()
+                })
+            {
                 return Err(io::Error::other(
                     "admission inputは単一のuser turnが必要です",
                 ));
@@ -746,14 +948,45 @@ impl PersistedSession {
                         "admission receiptが既存入力と衝突しました",
                     ));
                 }
-                let event = before
+                let index = before
                     .events
                     .iter()
-                    .find(|event| event.sequence == receipt.sequence)
+                    .position(|event| event.sequence == receipt.sequence)
                     .ok_or_else(|| io::Error::other("admission receiptの原文がありません"))?;
+                let event = &before.events[index];
+                if !event.starts_turn
+                    || event.turn_id != receipt.turn_id
+                    || serde_json::to_vec(&event.message).map_err(io::Error::other)?
+                        != serde_json::to_vec(&events[0].0).map_err(io::Error::other)?
+                {
+                    return Err(io::Error::other(
+                        "admission inputの原文が既存入力と不一致です",
+                    ));
+                }
+                if let Some((supplement, _)) = events.get(1) {
+                    let saved = before.events.get(index + 1).ok_or_else(|| {
+                        io::Error::other("admission prompt結果の原文がありません")
+                    })?;
+                    if saved.starts_turn
+                        || saved.turn_id != event.turn_id
+                        || serde_json::to_vec(&saved.message).map_err(io::Error::other)?
+                            != serde_json::to_vec(supplement).map_err(io::Error::other)?
+                    {
+                        return Err(io::Error::other(
+                            "admission prompt結果が既存入力と不一致です",
+                        ));
+                    }
+                }
                 return Ok(crate::request_input::SourceBinding::from_event(
                     &before.state.session_id,
                     event,
+                ));
+            }
+            if before.state.admission_receipts.len()
+                >= crate::session_manager::MAX_ADMISSION_RECEIPTS
+            {
+                return Err(io::Error::other(
+                    "admission receipt容量不足です。原文は保存していません",
                 ));
             }
         }
@@ -849,7 +1082,7 @@ impl PersistedSession {
                 if let Some((admission_id, payload_hash)) = admission {
                     let event = snapshot
                         .events
-                        .last()
+                        .get(before.events.len())
                         .ok_or_else(|| io::Error::other("admission inputを保存できません"))?;
                     next.admission_receipts.insert(
                         admission_id.to_owned(),
@@ -862,15 +1095,14 @@ impl PersistedSession {
                 }
                 lock.publish(&snapshot, next)?;
                 source = events
-                    .last()
-                    .filter(|(_, starts_turn)| *starts_turn)
-                    .and_then(|_| {
-                        snapshot.events.last().and_then(|event| {
-                            crate::request_input::SourceBinding::from_event(
-                                &snapshot.state.session_id,
-                                event,
-                            )
-                        })
+                    .iter()
+                    .position(|(_, starts_turn)| *starts_turn)
+                    .and_then(|index| snapshot.events.get(before.events.len() + index))
+                    .and_then(|event| {
+                        crate::request_input::SourceBinding::from_event(
+                            &snapshot.state.session_id,
+                            event,
+                        )
                     });
                 Ok(())
             })
@@ -898,6 +1130,12 @@ impl PersistedSession {
     }
 
     pub fn fork(&self, artifact_hash: &str) -> io::Result<Self> {
+        self.fork_with_id(&new_session_id()?, artifact_hash)
+    }
+
+    /// The management owner fixes the child identity before recording its
+    /// effect, so a restart can inspect a single target after an interruption.
+    pub fn fork_with_id(&self, child_id: &str, artifact_hash: &str) -> io::Result<Self> {
         let cursor = self.cursor()?;
         let lock = self.store.lock()?;
         let snapshot = lock.snapshot()?;
@@ -908,11 +1146,126 @@ impl PersistedSession {
         let mut child = None;
         memory
             .with_conversation_marker(&published_view(&snapshot.state)?, || {
-                child = Some(lock.fork(&self.data_root, &new_session_id()?, artifact_hash)?);
+                child = Some(lock.fork(&self.data_root, child_id, artifact_hash)?);
                 Ok(())
             })
             .map_err(io::Error::other)?;
         let store = child.ok_or_else(|| io::Error::other("分岐を保存できません"))?;
+        let generation = store.lock()?.snapshot()?.state.generation;
+        Ok(Self {
+            store: Arc::new(store),
+            database: self.database.clone(),
+            data_root: self.data_root.clone(),
+            generation: Arc::new(Mutex::new(generation)),
+        })
+    }
+
+    /// Record the durable pre-user rewind boundary. The caller supplies only
+    /// opaque workspace and tool-memory identities; their owners retain all
+    /// filesystem and object-store access.
+    pub fn begin_rewind_boundary(
+        &self,
+        workspace_pre_manifest_id: String,
+        visible_memory_raw_object_ids: Vec<String>,
+    ) -> io::Result<RewindBoundaryV1> {
+        let cursor = self.cursor()?;
+        let mut lock = self.store.lock()?;
+        let snapshot = lock.snapshot()?;
+        if snapshot.state.generation != *cursor {
+            return Err(io::Error::other("保存世代が変わりました"));
+        }
+        lock.begin_rewind_boundary(workspace_pre_manifest_id, visible_memory_raw_object_ids)
+    }
+
+    /// Mark the selected input's boundary complete after its turn and owned
+    /// writers have stopped. Ineligible boundaries remain durable diagnostics
+    /// but are intentionally absent from `list_rewind_boundaries`.
+    pub fn finish_rewind_boundary(
+        &self,
+        boundary_id: &str,
+        workspace_post_manifest_id: String,
+        eligibility: RewindEligibilityV1,
+        effect: RewindEffectStatusV1,
+    ) -> io::Result<RewindBoundaryV1> {
+        let cursor = self.cursor()?;
+        let mut lock = self.store.lock()?;
+        let snapshot = lock.snapshot()?;
+        if snapshot.state.generation != *cursor {
+            return Err(io::Error::other("保存世代が変わりました"));
+        }
+        lock.finish_rewind_boundary(boundary_id, workspace_post_manifest_id, eligibility, effect)
+    }
+
+    /// Permanently marks an interrupted or failed turn unavailable without a
+    /// post-manifest, so the next input is not blocked by a stale boundary.
+    pub fn abandon_rewind_boundary(
+        &self,
+        boundary_id: &str,
+        reason: String,
+    ) -> io::Result<RewindBoundaryV1> {
+        let cursor = self.cursor()?;
+        let mut lock = self.store.lock()?;
+        let snapshot = lock.snapshot()?;
+        if snapshot.state.generation != *cursor {
+            return Err(io::Error::other("保存世代が変わりました"));
+        }
+        lock.abandon_rewind_boundary(boundary_id, reason)
+    }
+
+    /// Recovery path for startup/resume after an interrupted process. It does
+    /// not read or alter the raw marker, so a malformed crash tail cannot keep
+    /// the next user admission blocked behind an unfinished boundary.
+    pub fn abandon_unfinished_rewind_boundaries(
+        &self,
+        reason: String,
+    ) -> io::Result<Vec<RewindBoundaryV1>> {
+        let mut lock = self.store.lock()?;
+        lock.abandon_unfinished_rewind_boundaries(reason)
+    }
+
+    pub fn list_rewind_boundaries(&self) -> io::Result<Vec<RewindBoundaryV1>> {
+        let cursor = self.cursor()?;
+        let lock = self.store.lock()?;
+        let snapshot = lock.snapshot()?;
+        if snapshot.state.generation != *cursor {
+            return Err(io::Error::other("保存世代が変わりました"));
+        }
+        lock.list_rewind_boundaries()
+    }
+
+    /// Prepare a distinct, non-active full-prefix branch. Workspace restore,
+    /// project-derived context reload, and activation remain caller-owned.
+    #[cfg(unix)]
+    pub fn prepare_rewind_branch(
+        &self,
+        workspace: &crate::rewind_workspace::WorkspaceOwner,
+        boundary_id: &str,
+    ) -> io::Result<Self> {
+        // The project lease precedes the nonblocking source writer lock.
+        let lease = workspace.try_mutation().map_err(io::Error::other)?;
+        let cursor = self.cursor()?;
+        let lock = self.store.lock()?;
+        let snapshot = lock.snapshot()?;
+        if snapshot.state.generation != *cursor {
+            return Err(io::Error::other("保存世代が変わりました"));
+        }
+        let plan = lock.plan_rewind_branch(boundary_id, &new_session_id()?)?;
+        crate::rewind_candidate_capacity::preflight_rewind_candidate_capacity(
+            workspace,
+            &lease,
+            &self.data_root,
+            &snapshot.state.project_id,
+            plan.estimated_file_bytes(),
+        )?;
+        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut child = None;
+        memory
+            .with_conversation_marker(&published_view(&snapshot.state)?, || {
+                child = Some(lock.create_rewind_branch_from_plan(&self.data_root, plan)?);
+                Ok(())
+            })
+            .map_err(io::Error::other)?;
+        let store = child.ok_or_else(|| io::Error::other("rewind分岐を保存できません"))?;
         let generation = store.lock()?.snapshot()?.state.generation;
         Ok(Self {
             store: Arc::new(store),
@@ -1081,6 +1434,16 @@ fn verify_bundle_binding(
         );
     }
     Ok(convergence)
+}
+
+fn workflow_only_change(before: &ConversationStateV2, candidate: &ConversationStateV2) -> bool {
+    let mut expected = before.clone();
+    expected.generation = candidate.generation;
+    expected.workflow_config = candidate.workflow_config.clone();
+    expected.workflow = candidate.workflow.clone();
+    expected.gates = candidate.gates.clone();
+    expected.workflow_artifacts = candidate.workflow_artifacts.clone();
+    expected == *candidate
 }
 
 fn validate_owner_convergence_for_state(
@@ -1834,5 +2197,76 @@ mod tests {
                 .payload_hash,
             payload_hash
         );
+    }
+
+    #[test]
+    fn admitted_prompt_pair_has_one_receipt_and_replay_checks_the_supplement() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("memory.sqlite3");
+        let persistence = PersistedSession::create_with_id(
+            dir.path(),
+            &database,
+            "project",
+            "00112233-4455-4677-8899-aabbccddeeff",
+            HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.attach(persistence.clone()).unwrap();
+        let admission = crate::session_manager::AdmissionId::new("adm-prompt").unwrap();
+        let payload_hash = "b".repeat(64);
+        let supplement = Message::user("selected prompt result");
+        assert!(
+            session
+                .push_admitted_user_with_supplement(
+                    "isolated task",
+                    supplement.clone(),
+                    &admission,
+                    &payload_hash,
+                )
+                .unwrap()
+        );
+        let saved = persistence.snapshot().unwrap();
+        assert_eq!(saved.state.generation, 1);
+        assert_eq!(saved.events.len(), 2);
+        assert!(saved.events[0].starts_turn);
+        assert!(!saved.events[1].starts_turn);
+        assert_eq!(saved.events[0].turn_id, saved.events[1].turn_id);
+        assert_eq!(
+            saved.state.admission_receipts[admission.as_str()].sequence,
+            saved.events[0].sequence
+        );
+        assert!(
+            !session
+                .push_admitted_user_with_supplement(
+                    "isolated task",
+                    supplement,
+                    &admission,
+                    &payload_hash,
+                )
+                .unwrap()
+        );
+        assert!(
+            session
+                .push_admitted_user_with_supplement(
+                    "isolated task",
+                    Message::user("different result"),
+                    &admission,
+                    &payload_hash,
+                )
+                .is_err()
+        );
+        assert!(
+            session
+                .push_admitted_user_with_supplement(
+                    "different input",
+                    Message::user("selected prompt result"),
+                    &admission,
+                    &payload_hash,
+                )
+                .is_err()
+        );
+        assert_eq!(persistence.snapshot().unwrap().events.len(), 2);
     }
 }

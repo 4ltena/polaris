@@ -15,6 +15,7 @@ pub const MAX_INPUT_BYTES: usize = 32 * 1024;
 pub const MAX_GOAL_BYTES: usize = 4 * 1024;
 pub const MAX_TURN_BYTES: usize = 4 * 1024;
 pub const MAX_ATTACHMENTS: usize = 16;
+pub const MAX_ADMISSION_RECEIPTS: usize = 4096;
 const MAX_ID_BYTES: usize = 128;
 const HASH_BYTES: usize = 64;
 
@@ -71,7 +72,9 @@ impl AdmissionId {
 pub struct RunId(String);
 
 impl RunId {
-    fn derive(admission: &AdmissionId) -> Self {
+    /// The run identity is fixed when an input is admitted, before any
+    /// pre-turn host selection or raw input append can take place.
+    pub fn derive(admission: &AdmissionId) -> Self {
         let mut hash = Sha256::new();
         hash.update(b"polaris-admission-run-v1\0");
         hash.update(admission.as_str().as_bytes());
@@ -480,6 +483,10 @@ pub struct ManagedSessionV1 {
 pub struct SessionManagerV1 {
     pub version: u8,
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub new_submit_closed: bool,
     pub sessions: BTreeMap<SessionId, ManagedSessionV1>,
     pub admissions: BTreeMap<AdmissionId, AdmissionV1>,
     /// FIFO non-running admission IDs. The ID is inserted at durable submit,
@@ -541,8 +548,14 @@ pub enum AdmissionError {
     SessionLimit,
     #[error("run queue is full")]
     QueueFull,
+    #[error("session manager capacity is exhausted: {0}")]
+    Capacity(&'static str),
     #[error("session already has an active run")]
     SessionBusy,
+    #[error("session has an unresolved admission outcome")]
+    OutcomeUnknown,
+    #[error("session family has unfinished work")]
+    ForkNotQuiet,
     #[error("submission session revision is stale")]
     SessionRevisionConflict,
     #[error("submission goal revision is stale")]
@@ -552,6 +565,92 @@ pub enum AdmissionError {
 }
 
 impl SessionManagerV1 {
+    /// Remaining durable transitions and maximum state growth for every
+    /// accepted admission. Terminal inputs retain their evidence but require
+    /// no further manager commits. The store checks these against its actual
+    /// serialized candidate before publishing a mutation.
+    pub fn remaining_capacity_reservation(&self) -> (usize, usize) {
+        self.admissions
+            .values()
+            .fold((0, 0), |(commits, bytes), admission| {
+                let (extra_commits, extra_bytes) = match &admission.state {
+                    AdmissionState::Reserved => (10, 8192),
+                    AdmissionState::Classifying => (9, 7168),
+                    AdmissionState::Decided {
+                        reason: RouteReason::ContextChanged,
+                        ..
+                    } => (6, 5120),
+                    AdmissionState::Decided { .. } => (8, 6144),
+                    AdmissionState::DestinationReady {
+                        reason: RouteReason::ContextChanged,
+                        ..
+                    } => (5, 3072),
+                    AdmissionState::DestinationReady { .. } => (6, 4096),
+                    AdmissionState::InputAppended { .. } => (4, 2048),
+                    AdmissionState::RunQueued { .. } => (3, 1536),
+                    AdmissionState::Running { .. } => (2, 1024),
+                    AdmissionState::Terminal { .. } => (0, 0),
+                };
+                (commits + extra_commits, bytes + extra_bytes)
+            })
+    }
+
+    /// Include every session that can still receive a receipt. A route to a
+    /// new sidechat keeps the parent reservation until its append is durable,
+    /// because context revision changes can still force the current route.
+    pub fn check_receipt_capacity(
+        &self,
+        existing: &BTreeMap<SessionId, usize>,
+    ) -> Result<(), AdmissionError> {
+        let mut reserved = BTreeMap::<SessionId, usize>::new();
+        for admission in self.admissions.values() {
+            let mut destinations = BTreeSet::new();
+            match &admission.state {
+                AdmissionState::Reserved | AdmissionState::Classifying => {
+                    destinations.insert(admission.parent_session.clone());
+                    if admission.payload.route != DestinationMode::Current {
+                        destinations.insert(sidechat_session_id(
+                            &admission.parent_session,
+                            &admission.id,
+                        ));
+                    }
+                }
+                AdmissionState::Decided { destination, .. } => {
+                    destinations.insert(admission.parent_session.clone());
+                    if *destination == AdmissionDestination::New {
+                        destinations.insert(sidechat_session_id(
+                            &admission.parent_session,
+                            &admission.id,
+                        ));
+                    }
+                }
+                AdmissionState::DestinationReady { session_id, .. } => {
+                    destinations.insert(admission.parent_session.clone());
+                    destinations.insert(session_id.clone());
+                }
+                AdmissionState::InputAppended { .. }
+                | AdmissionState::RunQueued { .. }
+                | AdmissionState::Running { .. }
+                | AdmissionState::Terminal { .. } => {}
+            }
+            for session in destinations {
+                *reserved.entry(session).or_default() += 1;
+            }
+        }
+        for (session, pending) in reserved {
+            if existing
+                .get(&session)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(pending)
+                > MAX_ADMISSION_RECEIPTS
+            {
+                return Err(AdmissionError::Capacity("admission receipts"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(current_session: SessionId) -> Self {
         let session = ManagedSessionV1 {
             id: current_session.clone(),
@@ -563,6 +662,8 @@ impl SessionManagerV1 {
         Self {
             version: 1,
             revision: 0,
+            generation: 0,
+            new_submit_closed: false,
             sessions: BTreeMap::from([(current_session, session)]),
             admissions: BTreeMap::new(),
             queue: Vec::new(),
@@ -590,6 +691,15 @@ impl SessionManagerV1 {
                 });
             }
             return Err(AdmissionError::AdmissionCollision);
+        }
+        if self.new_submit_closed {
+            return Err(AdmissionError::Capacity("family closed after rescue"));
+        }
+        if self
+            .outcome_unknown_blocker(&request.parent_session)
+            .is_some()
+        {
+            return Err(AdmissionError::OutcomeUnknown);
         }
         self.ensure_revision(expected_manager_revision)?;
         let waiting = self
@@ -792,18 +902,31 @@ impl SessionManagerV1 {
             AdmissionState::Decided {
                 destination: AdmissionDestination::Current,
                 reason: RouteReason::ContextChanged,
+            } | AdmissionState::DestinationReady {
+                reason: RouteReason::ContextChanged,
+                ..
             }
         ) {
             return Ok(self.status(id)?.clone());
         }
-        let abandoned_sidechat = match &state {
-            AdmissionState::DestinationReady { session_id, .. } => Some(session_id.clone()),
-            _ => None,
+        let (abandoned_sidechat, ready_parent) = match &state {
+            AdmissionState::DestinationReady { session_id, .. } => (
+                Some(session_id.clone()),
+                Some(self.status(id)?.parent_session.clone()),
+            ),
+            _ => (None, None),
         };
         let admission = self.admission_mut(id, expected_admission_revision)?;
-        admission.state = AdmissionState::Decided {
-            destination: AdmissionDestination::Current,
-            reason: RouteReason::ContextChanged,
+        admission.state = if let Some(session_id) = ready_parent {
+            AdmissionState::DestinationReady {
+                session_id,
+                reason: RouteReason::ContextChanged,
+            }
+        } else {
+            AdmissionState::Decided {
+                destination: AdmissionDestination::Current,
+                reason: RouteReason::ContextChanged,
+            }
         };
         admission.route_reason = Some(RouteReason::ContextChanged);
         admission.revision += 1;
@@ -845,7 +968,7 @@ impl SessionManagerV1 {
                 if self.sessions.len() >= MAX_SESSIONS {
                     return Err(AdmissionError::SessionLimit);
                 }
-                let session_id = sidechat_session_id(id);
+                let session_id = sidechat_session_id(&parent, id);
                 if let Some(existing) = self.sessions.get(&session_id) {
                     match &existing.init {
                         SessionInitV1::EmptySidechat {
@@ -1209,10 +1332,138 @@ impl SessionManagerV1 {
         })
     }
 
+    /// A host preparation failed after the destination was fixed but before
+    /// any user input was appended. Keep the payload for diagnosis and never
+    /// schedule a model run or replay the prompt automatically.
+    pub fn fail_preflight(
+        &mut self,
+        id: &AdmissionId,
+        expected_manager_revision: u64,
+        expected_admission_revision: u64,
+        status: TerminalStatus,
+    ) -> Result<AdmissionV1, AdmissionError> {
+        if !matches!(
+            status,
+            TerminalStatus::Failed | TerminalStatus::OutcomeUnknown
+        ) {
+            return Err(AdmissionError::InvalidTransition);
+        }
+        self.ensure_revision(expected_manager_revision)?;
+        let admission = self
+            .admissions
+            .get(id)
+            .ok_or(AdmissionError::UnknownAdmission)?;
+        if admission.revision != expected_admission_revision {
+            return Err(AdmissionError::AdmissionRevisionConflict);
+        }
+        let AdmissionState::DestinationReady { session_id, .. } = &admission.state else {
+            return Err(AdmissionError::InvalidTransition);
+        };
+        let destination = session_id.clone();
+        self.queue.retain(|queued| queued != id);
+        let discard = self.sidechat_is_unused_for(id, &destination);
+        let admission = self.admission_mut(id, expected_admission_revision)?;
+        admission.state = AdmissionState::Terminal {
+            session_id: None,
+            run_id: None,
+            status,
+        };
+        admission.revision += 1;
+        let result = admission.clone();
+        if discard {
+            self.remove_unused_sidechat(id, &destination);
+        }
+        self.bump();
+        Ok(result)
+    }
+
+    /// Recovery after a committed input whose model run was not confirmed.
+    /// The raw input stays visible, but its session must be reconciled before
+    /// another turn can reuse that history.
+    pub fn recover_unstarted_committed(
+        &mut self,
+        id: &AdmissionId,
+        expected_manager_revision: u64,
+        expected_admission_revision: u64,
+    ) -> Result<AdmissionV1, AdmissionError> {
+        self.ensure_revision(expected_manager_revision)?;
+        let admission = self
+            .admissions
+            .get(id)
+            .ok_or(AdmissionError::UnknownAdmission)?;
+        if admission.revision != expected_admission_revision {
+            return Err(AdmissionError::AdmissionRevisionConflict);
+        }
+        let (session_id, run_id) = match &admission.state {
+            AdmissionState::InputAppended { session_id } => (session_id.clone(), None),
+            AdmissionState::RunQueued { session_id, run_id } => {
+                (session_id.clone(), Some(run_id.clone()))
+            }
+            _ => return Err(AdmissionError::InvalidTransition),
+        };
+        self.queue.retain(|queued| queued != id);
+        let admission = self.admission_mut(id, expected_admission_revision)?;
+        admission.state = AdmissionState::Terminal {
+            session_id: Some(session_id),
+            run_id,
+            status: TerminalStatus::OutcomeUnknown,
+        };
+        admission.revision += 1;
+        let result = admission.clone();
+        self.bump();
+        Ok(result)
+    }
+
     pub fn status(&self, id: &AdmissionId) -> Result<&AdmissionV1, AdmissionError> {
         self.admissions
             .get(id)
             .ok_or(AdmissionError::UnknownAdmission)
+    }
+
+    pub fn outcome_unknown_blocker(&self, session: &SessionId) -> Option<&AdmissionV1> {
+        self.admissions.values().find(|admission| {
+            matches!(
+                &admission.state,
+                AdmissionState::Terminal {
+                    status: TerminalStatus::OutcomeUnknown,
+                    ..
+                }
+            ) && (&admission.parent_session == session
+                || admission.state.session_id() == Some(session))
+        })
+    }
+
+    /// A fork changes identity only after every admission in its source
+    /// family has settled. The caller must hold the durable family owner from
+    /// this check until the child and its family mapping are published.
+    pub fn ensure_fork_quiet(&self, source: &SessionId) -> Result<(), AdmissionError> {
+        if !self.sessions.contains_key(source) {
+            return Err(AdmissionError::UnknownSession);
+        }
+        if self.admissions.values().any(|admission| {
+            matches!(
+                admission.state,
+                AdmissionState::Terminal {
+                    status: TerminalStatus::OutcomeUnknown,
+                    ..
+                }
+            )
+        }) {
+            return Err(AdmissionError::OutcomeUnknown);
+        }
+        if !self.queue.is_empty()
+            || self
+                .sessions
+                .values()
+                .any(|session| session.active_run.is_some())
+            || self
+                .admissions
+                .values()
+                .any(|admission| !matches!(admission.state, AdmissionState::Terminal { .. }))
+        {
+            return Err(AdmissionError::ForkNotQuiet);
+        }
+        Ok(())
     }
 
     pub fn session_list(&self) -> Vec<&ManagedSessionV1> {
@@ -1222,7 +1473,12 @@ impl SessionManagerV1 {
     /// Validation for data loaded from a durable store.  It does not mutate
     /// state; callers run `recover_classifying` only after this succeeds.
     pub fn validate(&self) -> Result<(), AdmissionError> {
-        if self.version != 1 || self.sessions.is_empty() || self.sessions.len() > MAX_SESSIONS {
+        if self.version != 1
+            || self.sessions.is_empty()
+            || self.sessions.len() > MAX_SESSIONS
+            || (self.generation == 0 && self.new_submit_closed)
+            || (self.generation != 0 && !self.new_submit_closed)
+        {
             return Err(AdmissionError::InvalidRestore("manager shape"));
         }
         if self.queue.len() > MAX_QUEUED_RUNS {
@@ -1397,12 +1653,14 @@ impl SessionManagerV1 {
     }
 }
 
-fn sidechat_session_id(admission: &AdmissionId) -> SessionId {
+pub(crate) fn sidechat_session_id(parent: &SessionId, admission: &AdmissionId) -> SessionId {
     // v2 conversation storage uses UUID-shaped IDs. Deriving all 128 bits
-    // from the admission keeps retry/recovery deterministic while making the
+    // from the family parent and admission keeps retry/recovery deterministic while making the
     // sidechat directly openable by every existing resume path.
     let mut digest = Sha256::new();
     digest.update(b"polaris-sidechat-session-v1\0");
+    digest.update(parent.as_str().as_bytes());
+    digest.update(b"\0");
     digest.update(admission.as_str().as_bytes());
     let mut bytes: [u8; 16] = digest.finalize()[..16]
         .try_into()
@@ -1428,6 +1686,14 @@ fn sidechat_session_id(admission: &AdmissionId) -> SessionId {
         bytes[14],
         bytes[15]
     ))
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn validate_text(kind: &'static str, value: &str, maximum: usize) -> Result<(), AdmissionError> {
@@ -1466,6 +1732,20 @@ fn validate_probability(kind: &'static str, value: Option<f64>) -> Result<(), Ad
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_admission_id_does_not_reuse_sidechat_across_parents() {
+        let id = super::AdmissionId::new("shared-client-id").unwrap();
+        let first = super::SessionId::new("first-parent").unwrap();
+        let second = super::SessionId::new("second-parent").unwrap();
+        assert_ne!(
+            super::sidechat_session_id(&first, &id),
+            super::sidechat_session_id(&second, &id)
+        );
+        assert_eq!(
+            super::sidechat_session_id(&first, &id),
+            super::sidechat_session_id(&first, &id)
+        );
+    }
     use super::*;
     use polaris_provider::decision::{Answer, Decision, DecisionError, Question};
 
@@ -1569,6 +1849,36 @@ mod tests {
                 false,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn fork_requires_a_quiet_family_and_keeps_unknown_outcomes_blocking() {
+        let mut manager = SessionManagerV1::new(current());
+        assert_eq!(manager.ensure_fork_quiet(&current()), Ok(()));
+        assert_eq!(
+            manager.ensure_fork_quiet(&SessionId::new("missing").unwrap()),
+            Err(AdmissionError::UnknownSession)
+        );
+
+        let admission = submit(&mut manager, DestinationMode::Current, "work");
+        assert_eq!(
+            manager.ensure_fork_quiet(&current()),
+            Err(AdmissionError::ForkNotQuiet)
+        );
+        manager
+            .cancel(&admission.id, manager.revision, admission.revision)
+            .unwrap();
+        assert_eq!(manager.ensure_fork_quiet(&current()), Ok(()));
+
+        manager.admissions.get_mut(&admission.id).unwrap().state = AdmissionState::Terminal {
+            session_id: Some(current()),
+            run_id: None,
+            status: TerminalStatus::OutcomeUnknown,
+        };
+        assert_eq!(
+            manager.ensure_fork_quiet(&current()),
+            Err(AdmissionError::OutcomeUnknown)
+        );
     }
 
     #[test]
@@ -2066,5 +2376,290 @@ mod tests {
             manager.begin_classification(&fresh.id, manager.revision, fresh.revision),
             Err(AdmissionError::GoalRevisionConflict)
         );
+    }
+
+    #[test]
+    fn prepared_new_route_falls_back_once_without_an_extra_decided_commit() {
+        let mut manager = SessionManagerV1::new(current());
+        let admission = submit(&mut manager, DestinationMode::New, "pending");
+        let decided = manager
+            .decide(
+                &admission.id,
+                manager.revision,
+                admission.revision,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let prepared = manager
+            .prepare_destination(&admission.id, manager.revision, decided.revision)
+            .unwrap();
+        let sidechat = prepared.state.session_id().unwrap().clone();
+        let before = manager.revision;
+        let fallback = manager
+            .decide_context_changed(&admission.id, before, prepared.revision)
+            .unwrap();
+        assert_eq!(manager.revision, before + 1);
+        assert_eq!(
+            fallback.state,
+            AdmissionState::DestinationReady {
+                session_id: current(),
+                reason: RouteReason::ContextChanged,
+            }
+        );
+        assert!(!manager.sessions.contains_key(&sidechat));
+        let mut reopened: SessionManagerV1 =
+            serde_json::from_slice(&serde_json::to_vec(&manager).unwrap()).unwrap();
+        let same = reopened
+            .decide_context_changed(&admission.id, reopened.revision, fallback.revision)
+            .unwrap();
+        assert_eq!(same, fallback);
+        assert_eq!(reopened.revision, manager.revision);
+        reopened.validate().unwrap();
+    }
+
+    #[test]
+    fn undecided_and_new_routes_keep_the_current_receipt_reserved() {
+        let mut manager = SessionManagerV1::new(current());
+        let admission = submit(&mut manager, DestinationMode::New, "pending");
+        let mut counts = BTreeMap::from([(current(), 4095)]);
+        manager.check_receipt_capacity(&counts).unwrap();
+        counts.insert(current(), 4096);
+        assert_eq!(
+            manager.check_receipt_capacity(&counts),
+            Err(AdmissionError::Capacity("admission receipts"))
+        );
+        counts.insert(current(), 4095);
+        let decided = manager
+            .decide(
+                &admission.id,
+                manager.revision,
+                admission.revision,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let prepared = manager
+            .prepare_destination(&admission.id, manager.revision, decided.revision)
+            .unwrap();
+        let sidechat = prepared.state.session_id().unwrap().clone();
+        counts.insert(sidechat, 4096);
+        assert_eq!(
+            manager.check_receipt_capacity(&counts),
+            Err(AdmissionError::Capacity("admission receipts"))
+        );
+    }
+
+    #[test]
+    fn unknown_preflight_outcome_blocks_the_parent_even_without_a_destination() {
+        let mut manager = SessionManagerV1::new(current());
+        let admitted = submit(&mut manager, DestinationMode::Current, "first");
+        let decided = manager
+            .decide(
+                &admitted.id,
+                manager.revision,
+                admitted.revision,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let ready = manager
+            .prepare_destination(&admitted.id, manager.revision, decided.revision)
+            .unwrap();
+        manager
+            .fail_preflight(
+                &admitted.id,
+                manager.revision,
+                ready.revision,
+                TerminalStatus::OutcomeUnknown,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.outcome_unknown_blocker(&current()).unwrap().id,
+            admitted.id
+        );
+        let revision = manager.revision;
+        let new_request = SubmitRequestV1 {
+            parent_session: current(),
+            payload: SubmissionPayloadV1 {
+                text: "second".into(),
+                attachment_ids: Vec::new(),
+                route: DestinationMode::Current,
+                expected_session_revision: 0,
+                expected_goal_revision: 0,
+            },
+            admission_id: None,
+        };
+        assert_eq!(
+            manager.submit(new_request, revision),
+            Err(AdmissionError::OutcomeUnknown)
+        );
+        assert_eq!(manager.revision, revision);
+    }
+
+    #[test]
+    fn maximum_payload_forward_transitions_fit_the_state_growth_reserve() {
+        let current = SessionId::new("s".repeat(MAX_ID_BYTES)).unwrap();
+        let mut manager = SessionManagerV1::new(current.clone());
+        let request = SubmitRequestV1 {
+            parent_session: current.clone(),
+            payload: SubmissionPayloadV1 {
+                text: "\u{0001}".repeat(MAX_INPUT_BYTES),
+                attachment_ids: (0..MAX_ATTACHMENTS)
+                    .map(|number| format!("{number:02}{}", "a".repeat(MAX_ID_BYTES - 2)))
+                    .collect(),
+                route: DestinationMode::Auto,
+                expected_session_revision: 0,
+                expected_goal_revision: 0,
+            },
+            admission_id: Some(AdmissionId::new("a".repeat(MAX_ID_BYTES)).unwrap()),
+        };
+        let SubmitOutcomeV1::Accepted { admission, .. } =
+            manager.submit(request, manager.revision).unwrap();
+        let bound = |state: &SessionManagerV1| {
+            serde_json::to_vec(state).unwrap().len() + state.remaining_capacity_reservation().1
+        };
+        let mut previous = bound(&manager);
+        let classifying = manager
+            .begin_classification(&admission.id, manager.revision, admission.revision)
+            .unwrap();
+        assert!(bound(&manager) <= previous);
+        previous = bound(&manager);
+        let decided = manager
+            .decide(
+                &admission.id,
+                manager.revision,
+                classifying.revision,
+                Some(RoutingJudgementV1 {
+                    relation: ContextRelation::DistinctContext,
+                    probability: Some(0.99),
+                    confidence: Some(0.99),
+                }),
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(bound(&manager) <= previous);
+        previous = bound(&manager);
+        let prepared = manager
+            .prepare_destination(&admission.id, manager.revision, decided.revision)
+            .unwrap();
+        assert!(bound(&manager) <= previous);
+        manager
+            .observe_session_revisions(&current, manager.revision, 1, 0)
+            .unwrap();
+        previous = bound(&manager);
+        let fallback = manager
+            .decide_context_changed(&admission.id, manager.revision, prepared.revision)
+            .unwrap();
+        assert!(bound(&manager) <= previous);
+        previous = bound(&manager);
+        let appended = manager
+            .record_input_appended(&admission.id, manager.revision, fallback.revision, &current)
+            .unwrap();
+        assert!(bound(&manager) <= previous);
+        previous = bound(&manager);
+        let queued = manager
+            .queue_run(&admission.id, manager.revision, appended.revision)
+            .unwrap();
+        assert!(bound(&manager) <= previous);
+        previous = bound(&manager);
+        assert!(matches!(
+            manager.start_next(manager.revision).unwrap(),
+            NextRunnableV1::Start { .. }
+        ));
+        assert!(bound(&manager) <= previous);
+        previous = bound(&manager);
+        manager
+            .terminal(
+                &admission.id,
+                manager.revision,
+                queued.revision + 1,
+                TerminalStatus::Completed,
+            )
+            .unwrap();
+        assert!(bound(&manager) <= previous);
+    }
+
+    #[test]
+    fn prompt_preflight_failure_preserves_payload_without_a_runnable_or_session() {
+        let mut manager = SessionManagerV1::new(current());
+        let admission = submit(&mut manager, DestinationMode::New, "same text");
+        let decided = manager
+            .decide(
+                &admission.id,
+                manager.revision,
+                admission.revision,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let prepared = manager
+            .prepare_destination(&admission.id, manager.revision, decided.revision)
+            .unwrap();
+        let failed = manager
+            .fail_preflight(
+                &admission.id,
+                manager.revision,
+                prepared.revision,
+                TerminalStatus::OutcomeUnknown,
+            )
+            .unwrap();
+        assert!(matches!(
+            failed.state,
+            AdmissionState::Terminal {
+                session_id: None,
+                run_id: None,
+                status: TerminalStatus::OutcomeUnknown,
+            }
+        ));
+        assert_eq!(failed.payload.text, "same text");
+        assert_eq!(manager.sessions.len(), 1);
+        assert!(manager.queue.is_empty());
+        manager.validate().unwrap();
+    }
+
+    #[test]
+    fn committed_unstarted_input_becomes_unknown_without_requeue() {
+        let mut manager = SessionManagerV1::new(current());
+        let admission = submit(&mut manager, DestinationMode::Current, "saved text");
+        let decided = manager
+            .decide(
+                &admission.id,
+                manager.revision,
+                admission.revision,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let prepared = manager
+            .prepare_destination(&admission.id, manager.revision, decided.revision)
+            .unwrap();
+        let appended = manager
+            .record_input_appended(
+                &admission.id,
+                manager.revision,
+                prepared.revision,
+                &current(),
+            )
+            .unwrap();
+        let recovered = manager
+            .recover_unstarted_committed(&admission.id, manager.revision, appended.revision)
+            .unwrap();
+        assert!(matches!(
+            recovered.state,
+            AdmissionState::Terminal {
+                session_id: Some(ref session_id),
+                run_id: None,
+                status: TerminalStatus::OutcomeUnknown,
+            } if session_id == &current()
+        ));
+        assert!(manager.queue.is_empty());
+        manager.validate().unwrap();
     }
 }

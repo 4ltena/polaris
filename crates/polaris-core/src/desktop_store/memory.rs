@@ -263,6 +263,9 @@ fn project(
     Ok(ConversationSnapshot {
         state: ConversationStateV2 {
             workflow_config: None,
+            session_settings: None,
+            draft: Default::default(),
+            goal: None,
             schema_version: 2,
             project_id: p.marker.project_id.as_str().into(),
             session_id: p.marker.session_id.as_str().into(),

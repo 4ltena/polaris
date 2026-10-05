@@ -11,6 +11,21 @@ use std::{
     path::Path,
 };
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static M2A_MUTATION_CALLS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+fn record_m2a_mutation(kind: usize) {
+    #[cfg(test)]
+    M2A_MUTATION_CALLS.with(|calls| {
+        let mut value = calls.get();
+        value[kind] += 1;
+        calls.set(value);
+    });
+    #[cfg(not(test))]
+    let _ = kind;
+}
+
 pub(super) const RAW: &str = "raw.jsonl";
 pub(super) const SIDECAR: &str = "desktop.jsonl";
 pub(super) const MARKER: &str = "state.json";
@@ -30,7 +45,6 @@ pub(super) struct Directory {
     file: File,
 }
 impl Directory {
-    #[cfg(all(test, unix))]
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
@@ -224,6 +238,32 @@ impl Directory {
             return Err(std::io::Error::last_os_error().into());
         }
         self.verify()
+    }
+    /// Atomically replace one pinned directory entry with another. The source
+    /// must already be a fully synced private file in this directory.
+    #[cfg(unix)]
+    pub(super) fn replace(&self, source: &str, target: &str) -> StoreResult<()> {
+        record_m2a_mutation(2);
+        use std::os::fd::AsRawFd;
+        self.verify()?;
+        let source = component(source)?;
+        let target = component(target)?;
+        if unsafe {
+            libc::renameat(
+                self.file.as_raw_fd(),
+                source.as_ptr(),
+                self.file.as_raw_fd(),
+                target.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.verify()
+    }
+    #[cfg(not(unix))]
+    pub(super) fn replace(&self, _: &str, _: &str) -> StoreResult<()> {
+        Err(StoreError::UnsupportedPlatform)
     }
     #[cfg(not(unix))]
     pub(super) fn publish_next(&self) -> StoreResult<()> {

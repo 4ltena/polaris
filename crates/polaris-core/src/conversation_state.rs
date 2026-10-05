@@ -17,12 +17,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const SCHEMA_VERSION: u32 = 2;
+pub const REWIND_BOUNDARY_SCHEMA_VERSION: u32 = 1;
 pub const REAL_TURN_WINDOW: usize = 10;
 pub const SAVED_WORKFLOW_CONFIG_SCHEMA_VERSION: u32 = 1;
-const MAX_ADMISSION_RECEIPTS: usize = 4096;
+const MAX_ADMISSION_RECEIPTS: usize = crate::session_manager::MAX_ADMISSION_RECEIPTS;
 
 /// Proof that one admission was committed with one raw user event. The
 /// session-manager ledger owns routing and scheduling; this marker-owned
@@ -63,6 +65,117 @@ pub struct StructuredCoverage {
     pub prefix_hash: String,
 }
 
+/// Durable pre-user boundary. Workspace IDs are deliberately opaque: only the
+/// workspace owner can resolve them into captured files or transactions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewindBoundaryV1 {
+    pub schema_version: u32,
+    pub boundary_id: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    pub source_generation: u64,
+    pub target_turn_id: u64,
+    pub created_at_unix_ms: u64,
+    /// Set only after the target user event is durable. The picker needs no
+    /// raw-file scan to render this bounded private preview after restart.
+    pub user_message_preview: Option<String>,
+    pub raw_offset: u64,
+    pub raw_hash: String,
+    pub workspace_pre_manifest_id: String,
+    /// Opaque raw tool-memory object IDs visible before this input. The memory
+    /// owner applies this allowlist when the prepared branch becomes active.
+    pub visible_memory_raw_object_ids: Vec<String>,
+    pub source_state: ConversationStateV2,
+    pub completion: Option<RewindBoundaryCompletionV1>,
+    /// A durable diagnostic for a turn that could not reach post-capture.
+    pub abandoned_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewindBoundaryCompletionV1 {
+    pub workspace_post_manifest_id: String,
+    pub eligibility: RewindEligibilityV1,
+    pub effect: RewindEffectStatusV1,
+    pub completed_generation: u64,
+    pub completed_raw_offset: u64,
+    pub completed_raw_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RewindEligibilityV1 {
+    Eligible,
+    Ineligible { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "effect", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RewindEffectStatusV1 {
+    NoExternalMutation,
+    ExternalMutation { description: String },
+    Unknown { description: String },
+}
+
+/// Metadata retained with a prepared branch so the tool-memory owner can use
+/// the exact source visibility set after a process restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewindBranchMetadataV1 {
+    pub schema_version: u32,
+    pub boundary_id: String,
+    pub origin_session_id: String,
+    pub origin_generation: u64,
+    pub workspace_pre_manifest_id: String,
+    pub workspace_post_manifest_id: String,
+    /// The branch head immediately after importing the selected raw prefix.
+    /// A later raw head requires its own completed rewind boundary before it
+    /// can be matched to a workspace manifest.
+    pub branch_initial_raw_offset: u64,
+    pub branch_initial_raw_hash: String,
+    pub visible_memory_raw_object_ids: Vec<String>,
+}
+
+/// Immutable candidate bytes prepared while the source writer lock is held.
+/// The workspace owner uses the byte estimate for its fail-closed capacity
+/// preflight, then asks the same lock to materialize this exact plan.
+#[derive(Clone)]
+pub(crate) struct RewindCandidatePlan {
+    source_session_id: String,
+    source_generation: u64,
+    source_raw_offset: u64,
+    source_raw_hash: String,
+    expected: ConversationSnapshot,
+    metadata: RewindBranchMetadataV1,
+    state_bytes: u64,
+    metadata_bytes: u64,
+}
+
+impl RewindCandidatePlan {
+    pub(crate) fn estimated_file_bytes(&self) -> u64 {
+        self.expected
+            .raw_offset
+            .saturating_add(self.state_bytes)
+            .saturating_add(self.metadata_bytes)
+    }
+}
+
+/// Binds a resumed pre-rewind conversation head to the exact workspace tree
+/// selected by the user. Later completed turn boundaries supersede it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceHeadBindingV1 {
+    pub schema_version: u32,
+    pub project_id: String,
+    pub session_id: String,
+    pub generation: u64,
+    pub raw_commit_offset: u64,
+    pub raw_commit_hash: String,
+    pub workspace_manifest_id: String,
+}
+
 /// The whole workflow configuration is durable session state.  The wrapper
 /// version lets a newer writer reject unknown configurations rather than
 /// silently dropping fields while publishing a later state marker.
@@ -101,6 +214,15 @@ pub struct ConversationStateV2 {
     pub raw_commit_hash: String,
     #[serde(default)]
     pub history_mode: HistoryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_settings: Option<crate::session_settings::SavedSessionSettingsV1>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::session_settings::SavedSessionDraftV1::is_initial"
+    )]
+    pub draft: crate::session_settings::SavedSessionDraftV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::desktop_store::SavedGoal>,
     pub recent_turn_ids: Vec<u64>,
     pub visible_summary_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -139,6 +261,9 @@ impl ConversationStateV2 {
             raw_commit_offset: 0,
             raw_commit_hash: content_hash(&[]),
             history_mode: HistoryMode::Legacy,
+            session_settings: None,
+            draft: crate::session_settings::SavedSessionDraftV1::default(),
+            goal: None,
             recent_turn_ids: Vec::new(),
             visible_summary_ids: Vec::new(),
             visible_structured_publication_ids: Vec::new(),
@@ -155,6 +280,13 @@ impl ConversationStateV2 {
         Ok(state)
     }
     pub fn validate(&self) -> io::Result<()> {
+        if let Some(settings) = &self.session_settings {
+            settings.validate()?;
+        }
+        self.draft.validate()?;
+        if let Some(goal) = &self.goal {
+            goal.validate().map_err(io::Error::other)?;
+        }
         if self.schema_version != SCHEMA_VERSION
             || self.workflow.schema_version != WORKFLOW_SCHEMA_VERSION
             || self.gates.schema_version != WORKFLOW_SCHEMA_VERSION
@@ -396,6 +528,16 @@ impl ConversationStore {
         })
     }
     pub fn open(data_root: &Path, project_id: &str, session_id: &str) -> io::Result<Self> {
+        Self::open_with_reader(data_root, project_id, session_id, &mut |path| {
+            fs::read(path)
+        })
+    }
+    pub(crate) fn open_with_reader(
+        data_root: &Path,
+        project_id: &str,
+        session_id: &str,
+        read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Self> {
         if !valid_session_id(session_id) {
             return Err(invalid("セッションIDが不正です"));
         }
@@ -407,11 +549,127 @@ impl ConversationStore {
             project_id: project_id.into(),
             session_id: session_id.into(),
         };
-        store.lock()?.snapshot()?;
+        store.lock()?.snapshot_with_reader(read)?;
         Ok(store)
     }
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+    pub fn rewind_branch_metadata(&self) -> io::Result<Option<RewindBranchMetadataV1>> {
+        self.rewind_branch_metadata_with_reader(&mut |path| fs::read(path))
+    }
+    pub(crate) fn rewind_branch_metadata_with_reader(
+        &self,
+        read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Option<RewindBranchMetadataV1>> {
+        let path = self.directory.join("rewind-branch-v1.json");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid("セッション内のsymlinkは使用できません"));
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(invalid(
+                    "rewind branch metadataが通常ファイルではありません",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let metadata: RewindBranchMetadataV1 = serde_json::from_slice(&read(&path)?)?;
+        validate_rewind_branch_metadata(&metadata)?;
+        Ok(Some(metadata))
+    }
+    pub fn workspace_head_binding(&self) -> io::Result<Option<WorkspaceHeadBindingV1>> {
+        let path = self.directory.join("workspace-head-binding-v1.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        reject_symlink(&path)?;
+        let binding: WorkspaceHeadBindingV1 = serde_json::from_slice(&fs::read(path)?)?;
+        validate_workspace_head_binding(&binding)?;
+        if binding.project_id != self.project_id || binding.session_id != self.session_id {
+            return Err(invalid("作業ファイルの結び付け先が会話と一致しません"));
+        }
+        Ok(Some(binding))
+    }
+
+    pub fn bind_workspace_head(
+        &self,
+        expected: &ConversationSnapshot,
+        manifest_id: &str,
+    ) -> io::Result<()> {
+        self.write_workspace_head_binding(expected, manifest_id, false)
+    }
+
+    /// The workspace owner calls this only while its first-legacy-binding
+    /// reservation is held. A failed attempt may have written a sidecar before
+    /// the tree changed, so a retry for the same committed conversation head
+    /// must be able to replace that uncommitted sidecar.
+    #[cfg(unix)]
+    pub fn repair_pending_workspace_head_binding(
+        &self,
+        expected: &ConversationSnapshot,
+        manifest_id: &str,
+        permit: crate::rewind_workspace::PendingLegacyBindingPermit<'_>,
+    ) -> io::Result<()> {
+        if permit.session_id() != self.session_id {
+            return Err(invalid("旧会話の結び付け予約と会話IDが一致しません"));
+        }
+        self.write_workspace_head_binding(expected, manifest_id, true)
+    }
+
+    fn write_workspace_head_binding(
+        &self,
+        expected: &ConversationSnapshot,
+        manifest_id: &str,
+        pending_repair: bool,
+    ) -> io::Result<()> {
+        validate_opaque_id(manifest_id, "workspace manifest ID")?;
+        let lock = self.lock()?;
+        let current = lock.snapshot()?;
+        if current.state.project_id != expected.state.project_id
+            || current.state.session_id != expected.state.session_id
+            || current.state.generation != expected.state.generation
+            || current.raw_offset != expected.raw_offset
+            || current.raw_hash != expected.raw_hash
+            || current.raw_offset != current.state.raw_commit_offset
+            || current.raw_hash != current.state.raw_commit_hash
+        {
+            return Err(invalid(
+                "会話が変更されたため作業ファイルへ結び付けられません",
+            ));
+        }
+        if let Some(turn) = current.active_turns().last() {
+            current.validate_complete_turn(*turn)?;
+        }
+        let binding = WorkspaceHeadBindingV1 {
+            schema_version: 1,
+            project_id: self.project_id.clone(),
+            session_id: self.session_id.clone(),
+            generation: current.state.generation,
+            raw_commit_offset: current.raw_offset,
+            raw_commit_hash: current.raw_hash,
+            workspace_manifest_id: manifest_id.into(),
+        };
+        if let Some(existing) = self.workspace_head_binding()? {
+            if existing == binding {
+                return Ok(());
+            }
+            if !pending_repair
+                || existing.project_id != binding.project_id
+                || existing.session_id != binding.session_id
+                || existing.generation != binding.generation
+                || existing.raw_commit_offset != binding.raw_commit_offset
+                || existing.raw_commit_hash != binding.raw_commit_hash
+            {
+                return Err(invalid("会話には既に別の作業ファイルが結び付いています"));
+            }
+        }
+        atomic_write(
+            &self.directory.join("workspace-head-binding-v1.json"),
+            &serde_json::to_vec(&binding)?,
+        )
     }
     /// Reads the immutable raw snapshot named by an indexed conversation source.
     /// The caller supplies only a generation and hash already verified by the
@@ -499,6 +757,430 @@ impl Drop for LockedConversation<'_> {
     }
 }
 impl LockedConversation<'_> {
+    /// Creates a durable boundary before admitting one user input. The caller
+    /// must finish or invalidate it before accepting the following user turn.
+    pub fn begin_rewind_boundary(
+        &mut self,
+        workspace_pre_manifest_id: String,
+        visible_memory_raw_object_ids: Vec<String>,
+    ) -> io::Result<RewindBoundaryV1> {
+        validate_opaque_id(&workspace_pre_manifest_id, "workspace pre manifest ID")?;
+        validate_memory_raw_object_ids(&visible_memory_raw_object_ids)?;
+        let snapshot = self.snapshot()?;
+        if snapshot.raw_offset != snapshot.state.raw_commit_offset
+            || snapshot.raw_hash != snapshot.state.raw_commit_hash
+        {
+            return Err(invalid("rewind境界の原文markerが未確定です"));
+        }
+        if let Some(turn) = snapshot.active_turns().last() {
+            snapshot.validate_complete_turn(*turn)?;
+        }
+        let mut boundaries = self.load_rewind_boundaries()?;
+        if boundaries
+            .iter()
+            .any(|boundary| boundary.completion.is_none() && boundary.abandoned_reason.is_none())
+        {
+            return Err(invalid("未完了のrewind境界があります"));
+        }
+        let target_turn_id = snapshot.events.last().map_or(Ok(1), |event| {
+            event
+                .turn_id
+                .checked_add(1)
+                .ok_or_else(|| invalid("ターン番号が上限です"))
+        })?;
+        let boundary = RewindBoundaryV1 {
+            schema_version: REWIND_BOUNDARY_SCHEMA_VERSION,
+            boundary_id: new_rewind_boundary_id()?,
+            project_id: snapshot.state.project_id.clone(),
+            session_id: snapshot.state.session_id.clone(),
+            epoch: snapshot.state.epoch,
+            source_generation: snapshot.state.generation,
+            target_turn_id,
+            created_at_unix_ms: rewind_boundary_timestamp()?,
+            user_message_preview: None,
+            raw_offset: snapshot.raw_offset,
+            raw_hash: snapshot.raw_hash.clone(),
+            workspace_pre_manifest_id,
+            visible_memory_raw_object_ids,
+            source_state: snapshot.state,
+            completion: None,
+            abandoned_reason: None,
+        };
+        validate_rewind_boundary(&boundary)?;
+        boundaries.push(boundary.clone());
+        self.save_rewind_boundaries(&boundaries)?;
+        Ok(boundary)
+    }
+
+    /// Finishes the boundary only when its user turn is the latest completed
+    /// turn. This prevents a delayed post-capture from claiming a later state.
+    pub fn finish_rewind_boundary(
+        &mut self,
+        boundary_id: &str,
+        workspace_post_manifest_id: String,
+        eligibility: RewindEligibilityV1,
+        effect: RewindEffectStatusV1,
+    ) -> io::Result<RewindBoundaryV1> {
+        validate_opaque_id(boundary_id, "rewind boundary ID")?;
+        validate_opaque_id(&workspace_post_manifest_id, "workspace post manifest ID")?;
+        validate_rewind_completion_input(&eligibility, &effect)?;
+        let snapshot = self.snapshot()?;
+        if snapshot.raw_offset != snapshot.state.raw_commit_offset
+            || snapshot.raw_hash != snapshot.state.raw_commit_hash
+        {
+            return Err(invalid("rewind境界のpost原文markerが未確定です"));
+        }
+        let mut boundaries = self.load_rewind_boundaries()?;
+        let boundary = boundaries
+            .iter_mut()
+            .find(|boundary| boundary.boundary_id == boundary_id)
+            .ok_or_else(|| invalid("rewind境界がありません"))?;
+        validate_rewind_boundary(boundary)?;
+        if boundary.completion.is_some() {
+            return Err(invalid("rewind境界は既に完了しています"));
+        }
+        if boundary.abandoned_reason.is_some() {
+            return Err(invalid("rewind境界は破棄されています"));
+        }
+        if boundary.project_id != snapshot.state.project_id
+            || boundary.session_id != snapshot.state.session_id
+            || boundary.epoch != snapshot.state.epoch
+            || snapshot.active_turns().last() != Some(&boundary.target_turn_id)
+        {
+            return Err(invalid("rewind境界のターンが現在の終端ではありません"));
+        }
+        snapshot.validate_complete_turn(boundary.target_turn_id)?;
+        let user = snapshot
+            .events
+            .iter()
+            .find(|event| {
+                event.epoch == boundary.epoch
+                    && event.turn_id == boundary.target_turn_id
+                    && event.starts_turn
+            })
+            .ok_or_else(|| invalid("rewind境界のuser入力がありません"))?;
+        if user.message.role != Role::User {
+            return Err(invalid("rewind境界のuser入力が不正です"));
+        }
+        boundary.user_message_preview = Some(rewind_message_preview(&user.message.content));
+        boundary.completion = Some(RewindBoundaryCompletionV1 {
+            workspace_post_manifest_id,
+            eligibility,
+            effect,
+            completed_generation: snapshot.state.generation,
+            completed_raw_offset: snapshot.raw_offset,
+            completed_raw_hash: snapshot.raw_hash,
+        });
+        validate_rewind_boundary(boundary)?;
+        let completed = boundary.clone();
+        self.save_rewind_boundaries(&boundaries)?;
+        Ok(completed)
+    }
+
+    /// Permanently marks an interrupted or failed turn unavailable. This keeps
+    /// its diagnostic without preventing the following user admission.
+    pub fn abandon_rewind_boundary(
+        &mut self,
+        boundary_id: &str,
+        reason: String,
+    ) -> io::Result<RewindBoundaryV1> {
+        validate_opaque_id(boundary_id, "rewind boundary ID")?;
+        validate_rewind_reason(&reason)?;
+        let mut boundaries = self.load_rewind_boundaries()?;
+        let boundary = boundaries
+            .iter_mut()
+            .find(|boundary| boundary.boundary_id == boundary_id)
+            .ok_or_else(|| invalid("rewind境界がありません"))?;
+        validate_rewind_boundary(boundary)?;
+        if boundary.completion.is_some() || boundary.abandoned_reason.is_some() {
+            return Err(invalid("rewind境界は既に確定しています"));
+        }
+        boundary.abandoned_reason = Some(reason);
+        validate_rewind_boundary(boundary)?;
+        let abandoned = boundary.clone();
+        self.save_rewind_boundaries(&boundaries)?;
+        Ok(abandoned)
+    }
+
+    /// Startup recovery marks every still-pending boundary unavailable without
+    /// touching completed records or requiring a readable raw snapshot.
+    pub fn abandon_unfinished_rewind_boundaries(
+        &mut self,
+        reason: String,
+    ) -> io::Result<Vec<RewindBoundaryV1>> {
+        validate_rewind_reason(&reason)?;
+        let mut boundaries = self.load_rewind_boundaries()?;
+        let mut abandoned = Vec::new();
+        for boundary in &mut boundaries {
+            if boundary.completion.is_none() && boundary.abandoned_reason.is_none() {
+                boundary.abandoned_reason = Some(reason.clone());
+                validate_rewind_boundary(boundary)?;
+                abandoned.push(boundary.clone());
+            }
+        }
+        if !abandoned.is_empty() {
+            self.save_rewind_boundaries(&boundaries)?;
+        }
+        Ok(abandoned)
+    }
+
+    pub fn list_rewind_boundaries(&self) -> io::Result<Vec<RewindBoundaryV1>> {
+        let snapshot = self.snapshot()?;
+        let boundaries = self.load_rewind_boundaries()?;
+        let latest_is_current_safe = boundaries.last().is_some_and(|boundary| {
+            boundary.completion.as_ref().is_some_and(|completion| {
+                matches!(completion.eligibility, RewindEligibilityV1::Eligible)
+                    && matches!(completion.effect, RewindEffectStatusV1::NoExternalMutation)
+                    && completion.completed_raw_offset == snapshot.raw_offset
+                    && completion.completed_raw_hash == snapshot.raw_hash
+            })
+        });
+        if !latest_is_current_safe {
+            return Ok(Vec::new());
+        }
+        Ok(boundaries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, boundary)| {
+                let complete_safe_chain = boundaries[index..].iter().all(|later| {
+                    matches!(
+                        later.completion.as_ref(),
+                        Some(RewindBoundaryCompletionV1 {
+                            eligibility: RewindEligibilityV1::Eligible,
+                            effect: RewindEffectStatusV1::NoExternalMutation,
+                            ..
+                        })
+                    )
+                });
+                let selectable = boundary.project_id == snapshot.state.project_id
+                    && boundary.session_id == snapshot.state.session_id
+                    && complete_safe_chain;
+                selectable.then(|| boundary.clone())
+            })
+            .collect())
+    }
+
+    /// Builds a full raw-prefix branch from an eligible durable boundary. It
+    /// deliberately differs from `fork`, whose ten-turn behavior is retained.
+    #[cfg(test)]
+    pub fn prepare_rewind_branch(
+        &self,
+        data_root: &Path,
+        boundary_id: &str,
+        new_id: &str,
+    ) -> io::Result<ConversationStore> {
+        if !valid_session_id(new_id) {
+            return Err(invalid("分岐セッションIDが不正です"));
+        }
+        let plan = self.plan_rewind_branch(boundary_id, new_id)?;
+        self.create_rewind_branch_from_plan(data_root, plan)
+    }
+
+    pub(crate) fn plan_rewind_branch(
+        &self,
+        boundary_id: &str,
+        new_id: &str,
+    ) -> io::Result<RewindCandidatePlan> {
+        if !valid_session_id(new_id) {
+            return Err(invalid("分岐セッションIDが不正です"));
+        }
+        let current = self.snapshot()?;
+        let boundary = self
+            .list_rewind_boundaries()?
+            .into_iter()
+            .find(|boundary| boundary.boundary_id == boundary_id)
+            .ok_or_else(|| invalid("選択可能なrewind境界がありません"))?;
+        validate_rewind_boundary_for_branch(&boundary, &current)?;
+        let (expected, metadata) = rewind_branch_candidate_plan(&current, &boundary, new_id)?;
+        let state_bytes = u64::try_from(serde_json::to_vec(&expected.state)?.len())
+            .map_err(|_| invalid("rewind候補stateが上限です"))?;
+        let metadata_bytes = u64::try_from(serde_json::to_vec(&metadata)?.len())
+            .map_err(|_| invalid("rewind候補metadataが上限です"))?;
+        Ok(RewindCandidatePlan {
+            source_session_id: current.state.session_id.clone(),
+            source_generation: current.state.generation,
+            source_raw_offset: current.raw_offset,
+            source_raw_hash: current.raw_hash.clone(),
+            expected,
+            metadata,
+            state_bytes,
+            metadata_bytes,
+        })
+    }
+
+    pub(crate) fn create_rewind_branch_from_plan(
+        &self,
+        data_root: &Path,
+        plan: RewindCandidatePlan,
+    ) -> io::Result<ConversationStore> {
+        let current = self.snapshot()?;
+        if current.state.session_id != plan.source_session_id
+            || current.state.generation != plan.source_generation
+            || current.raw_offset != plan.source_raw_offset
+            || current.raw_hash != plan.source_raw_hash
+        {
+            return Err(invalid("rewind候補の分岐元が計画後に変化しました"));
+        }
+        ConversationStore::create_rewind_candidate(data_root, plan.expected, &plan.metadata)
+    }
+}
+
+impl ConversationStore {
+    /// Verify the durable evidence which makes a prepared rewind child a
+    /// candidate for activation.  This deliberately does not authorize the
+    /// child: the workspace transaction owner performs that separate check.
+    pub fn validate_rewind_branch_candidate(
+        source: &ConversationStore,
+        child: &ConversationStore,
+    ) -> io::Result<RewindBranchMetadataV1> {
+        Self::validate_rewind_branch_candidate_with_reader(source, child, &mut |path| {
+            fs::read(path)
+        })
+    }
+    pub(crate) fn validate_rewind_branch_candidate_with_reader(
+        source: &ConversationStore,
+        child: &ConversationStore,
+        read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<RewindBranchMetadataV1> {
+        let source_lock = source.lock()?;
+        let source_snapshot = source_lock.snapshot_with_reader(read)?;
+        let metadata = child
+            .rewind_branch_metadata_with_reader(read)?
+            .ok_or_else(|| invalid("rewind候補にmetadataがありません"))?;
+        if metadata.origin_session_id != source_snapshot.state.session_id {
+            return Err(invalid("rewind候補の分岐元が一致しません"));
+        }
+        let boundaries = source_lock.load_rewind_boundaries_with_reader(read)?;
+        let matches: Vec<_> = boundaries
+            .iter()
+            .filter(|boundary| boundary.boundary_id == metadata.boundary_id)
+            .collect();
+        let [boundary] = matches.as_slice() else {
+            return Err(invalid("rewind候補の分岐元境界が一意ではありません"));
+        };
+        validate_rewind_boundary_for_candidate(boundary, &source_snapshot)?;
+        let (expected, expected_metadata) =
+            rewind_branch_candidate_plan(&source_snapshot, boundary, &child.session_id)?;
+        if metadata != expected_metadata {
+            return Err(invalid("rewind候補のmetadataが分岐元証拠と一致しません"));
+        }
+
+        let child_lock = child.lock()?;
+        let child_snapshot = child_lock.snapshot_with_reader(read)?;
+        if child_snapshot.state.project_id != expected.state.project_id
+            || child_snapshot.state.session_id != expected.state.session_id
+            || child_snapshot.state.epoch != expected.state.epoch
+            || child_snapshot.state.history_mode != expected.state.history_mode
+            || child_snapshot.state.ancestors != expected.state.ancestors
+        {
+            return Err(invalid("rewind候補の会話状態が分岐証拠と一致しません"));
+        }
+        let raw_path = child.directory.join("raw.jsonl");
+        reject_symlink(&raw_path)?;
+        let raw = read(&raw_path)?;
+        let initial_len = usize::try_from(expected.raw_offset)
+            .map_err(|_| invalid("rewind候補の原文範囲が不正です"))?;
+        if raw.len() < initial_len
+            || content_hash(&raw[..initial_len]) != expected.raw_hash
+            || child_snapshot.raw_offset < expected.raw_offset
+        {
+            return Err(invalid("rewind候補の初期原文prefixが一致しません"));
+        }
+        Ok(metadata)
+    }
+
+    fn create_rewind_candidate(
+        data_root: &Path,
+        expected: ConversationSnapshot,
+        metadata: &RewindBranchMetadataV1,
+    ) -> io::Result<Self> {
+        expected.state.validate()?;
+        validate_rewind_branch_metadata(metadata)?;
+        if expected.state.generation != 1
+            || expected.raw_offset != expected.state.raw_commit_offset
+            || expected.raw_hash != expected.state.raw_commit_hash
+            || metadata.branch_initial_raw_offset != expected.raw_offset
+            || metadata.branch_initial_raw_hash != expected.raw_hash
+        {
+            return Err(invalid("rewind候補の初期状態が不正です"));
+        }
+        let root = data_root.join("sessions-v2");
+        fs::create_dir_all(&root)?;
+        reject_symlink(&root)?;
+        let directory = root.join(&expected.state.session_id);
+        // Metadata is the admission marker.  It must be durable before any
+        // valid state can make this non-empty child appear resumable.
+        private_directory(&directory)?;
+        write_rewind_branch_metadata_create_new(&directory, metadata)?;
+        fail_point("rewind_candidate_after_metadata")?;
+        private_directory(&directory.join("snapshots"))?;
+        let mut raw = private_file(&directory.join("raw.jsonl"), true)?;
+        for event in &expected.events {
+            serde_json::to_writer(&mut raw, event)?;
+            raw.write_all(b"\n")?;
+        }
+        raw.sync_all()?;
+        let lock = private_file(&directory.join("writer.lock"), true)?;
+        lock.sync_all()?;
+        atomic_write(
+            &directory.join("state.json"),
+            &serde_json::to_vec(&expected.state)?,
+        )?;
+        File::open(&directory)?.sync_all()?;
+        File::open(&root)?.sync_all()?;
+        let child = Self {
+            directory,
+            project_id: expected.state.project_id.clone(),
+            session_id: expected.state.session_id.clone(),
+        };
+        child.lock()?.check_snapshot(&expected)?;
+        Ok(child)
+    }
+}
+
+impl LockedConversation<'_> {
+    fn load_rewind_boundaries(&self) -> io::Result<Vec<RewindBoundaryV1>> {
+        self.load_rewind_boundaries_with_reader(&mut |path| fs::read(path))
+    }
+    fn load_rewind_boundaries_with_reader(
+        &self,
+        read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Vec<RewindBoundaryV1>> {
+        let path = self.store.directory.join("rewind-boundaries-v1.json");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        reject_symlink(&path)?;
+        let boundaries: Vec<RewindBoundaryV1> = serde_json::from_slice(&read(&path)?)?;
+        let mut ids = BTreeSet::new();
+        let mut previous: Option<&RewindBoundaryV1> = None;
+        for boundary in &boundaries {
+            validate_rewind_boundary(boundary)?;
+            if !ids.insert(&boundary.boundary_id) {
+                return Err(invalid("rewind境界IDが重複しています"));
+            }
+            if let Some(previous) = previous
+                && previous.project_id == boundary.project_id
+                && previous.session_id == boundary.session_id
+                && previous.source_generation > boundary.source_generation
+            {
+                return Err(invalid("rewind境界の順序が不正です"));
+            }
+            previous = Some(boundary);
+        }
+        Ok(boundaries)
+    }
+
+    fn save_rewind_boundaries(&self, boundaries: &[RewindBoundaryV1]) -> io::Result<()> {
+        for boundary in boundaries {
+            validate_rewind_boundary(boundary)?;
+        }
+        atomic_write(
+            &self.store.directory.join("rewind-boundaries-v1.json"),
+            &serde_json::to_vec(boundaries)?,
+        )
+    }
+
     /// Copies only the active real-turn window into a fresh namespace. Ancestor
     /// reads remain bounded at the parent's committed generation; the memory
     /// layer must still check its latest tombstone on every such lookup.
@@ -509,35 +1191,11 @@ impl LockedConversation<'_> {
         artifact_hash: &str,
     ) -> io::Result<ConversationStore> {
         let snapshot = self.snapshot()?;
-        let turns = snapshot.active_turns();
-        let first = turns.get(turns.len().saturating_sub(REAL_TURN_WINDOW));
-        for turn in turns.iter().rev().take(REAL_TURN_WINDOW) {
-            snapshot.validate_complete_turn(*turn)?;
-        }
-        let mut next = ConversationStateV2::new(snapshot.state.project_id.clone(), new_id.into())?;
-        next.history_mode = snapshot.state.history_mode;
-        next.workflow_config = snapshot.state.workflow_config.clone();
-        next.workflow = snapshot.state.workflow.clone();
-        next.gates = snapshot.state.gates.for_fork(artifact_hash);
-        next.workflow_artifacts = snapshot.state.workflow_artifacts.clone();
-        next.ancestors = snapshot.state.ancestors.clone();
-        next.ancestors.push(AncestorRange {
-            session_id: snapshot.state.session_id.clone(),
-            epoch: snapshot.state.epoch,
-            generation: snapshot.state.generation,
-            visible_summary_ids: snapshot.state.visible_summary_ids.clone(),
-            visible_structured_publication_ids: snapshot
-                .state
-                .visible_structured_publication_ids
-                .clone(),
-        });
+        let (next, selected) = fork_plan(&snapshot, new_id, artifact_hash)?;
         let child = ConversationStore::create(data_root, next)?;
         let mut lock = child.lock()?;
-        for event in snapshot.events.iter().filter(|event| {
-            event.epoch == snapshot.state.epoch
-                && first.is_some_and(|first| event.turn_id >= *first)
-        }) {
-            lock.append(event.message.clone(), event.starts_turn)?;
+        for (message, starts_turn) in selected {
+            lock.append(message, starts_turn)?;
         }
         let copied = lock.snapshot()?;
         lock.publish(&copied, copied.state.clone())?;
@@ -546,16 +1204,22 @@ impl LockedConversation<'_> {
     }
 
     pub fn snapshot(&self) -> io::Result<ConversationSnapshot> {
+        self.snapshot_with_reader(&mut |path| fs::read(path))
+    }
+    pub(crate) fn snapshot_with_reader(
+        &self,
+        read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<ConversationSnapshot> {
         let state_path = self.store.directory.join("state.json");
         reject_symlink(&state_path)?;
-        let state: ConversationStateV2 = serde_json::from_slice(&fs::read(state_path)?)?;
+        let state: ConversationStateV2 = serde_json::from_slice(&read(&state_path)?)?;
         state.validate()?;
         if state.project_id != self.store.project_id || state.session_id != self.store.session_id {
             return Err(invalid("セッションの所属が一致しません"));
         }
         let raw_path = self.store.directory.join("raw.jsonl");
         reject_symlink(&raw_path)?;
-        let bytes = fs::read(raw_path)?;
+        let bytes = read(&raw_path)?;
         let committed =
             usize::try_from(state.raw_commit_offset).map_err(|_| invalid("原文範囲が不正です"))?;
         if committed > bytes.len()
@@ -685,7 +1349,7 @@ impl LockedConversation<'_> {
     pub fn publish(
         &mut self,
         expected: &ConversationSnapshot,
-        mut next: ConversationStateV2,
+        next: ConversationStateV2,
     ) -> io::Result<()> {
         self.check_snapshot(expected)?;
         if next.project_id != expected.state.project_id
@@ -696,6 +1360,14 @@ impl LockedConversation<'_> {
         {
             return Err(invalid("公開対象の世代・所属が一致しません"));
         }
+        self.publish_state_marker(expected, next)
+    }
+
+    fn publish_state_marker(
+        &self,
+        expected: &ConversationSnapshot,
+        mut next: ConversationStateV2,
+    ) -> io::Result<()> {
         next.generation = next
             .generation
             .checked_add(1)
@@ -710,11 +1382,69 @@ impl LockedConversation<'_> {
             validate_coverage_boundary(&bytes, expected, expected.raw_offset, coverage)?;
         }
         next.validate()?;
+        // A metadata-only publication leaves the exact raw head and its
+        // workspace manifest unchanged. Carry only a binding of the expected
+        // committed head; stale bindings and newly appended raw stay stale.
+        let carried_binding = self
+            .store
+            .workspace_head_binding()?
+            .filter(|binding| {
+                binding.generation == expected.state.generation
+                    && binding.raw_commit_offset == expected.state.raw_commit_offset
+                    && binding.raw_commit_hash == expected.state.raw_commit_hash
+                    && binding.raw_commit_offset == expected.raw_offset
+                    && binding.raw_commit_hash == expected.raw_hash
+            })
+            .map(|mut binding| {
+                binding.generation = next.generation;
+                binding
+            });
         fail_point("marker")?;
         atomic_write(
             &self.store.directory.join("state.json"),
             &serde_json::to_vec(&next)?,
-        )
+        )?;
+        if let Some(binding) = carried_binding {
+            atomic_write(
+                &self.store.directory.join("workspace-head-binding-v1.json"),
+                &serde_json::to_vec(&binding)?,
+            )?;
+            if self.store.workspace_head_binding()?.as_ref() != Some(&binding) {
+                return Err(invalid("公開後の作業ファイル対応を確認できません"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A mode can be initialized only before this conversation has any raw
+    /// history, ancestry or rewind boundary. Ordinary publication keeps its
+    /// mode invariant, including after clear starts a new empty epoch.
+    pub(crate) fn initialize_history_mode(
+        &mut self,
+        expected: &ConversationSnapshot,
+        next: ConversationStateV2,
+    ) -> io::Result<()> {
+        self.validate_history_initialization(expected)?;
+        let mut same_mode = next.clone();
+        same_mode.history_mode = expected.state.history_mode;
+        if !crate::session_settings::session_only_change(&expected.state, &same_mode) {
+            return Err(invalid("履歴モード初期化の保存候補が不正です"));
+        }
+        self.publish_state_marker(expected, next)
+    }
+
+    pub(crate) fn validate_history_initialization(
+        &self,
+        expected: &ConversationSnapshot,
+    ) -> io::Result<()> {
+        self.check_snapshot(expected)?;
+        crate::session_settings::validate_empty_history(expected)?;
+        if !self.load_rewind_boundaries()?.is_empty() {
+            return Err(invalid(
+                "巻き戻し境界のある会話の履歴モードは変更できません",
+            ));
+        }
+        Ok(())
     }
     /// Clear starts an empty epoch; raw history is retained for explicit recovery.
     pub fn clear_epoch(&mut self) -> io::Result<()> {
@@ -809,9 +1539,424 @@ fn valid_session_id(id: &str) -> bool {
             }
         })
 }
+fn validate_opaque_id(id: &str, name: &str) -> io::Result<()> {
+    if id.is_empty() || id.len() > 256 || id.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(invalid(&format!("{name}が不正です")));
+    }
+    Ok(())
+}
+fn validate_memory_raw_object_ids(ids: &[String]) -> io::Result<()> {
+    if ids.iter().any(|id| !valid_hash(id))
+        || ids.iter().collect::<BTreeSet<_>>().len() != ids.len()
+    {
+        return Err(invalid("tool-memory raw object allowlistが不正です"));
+    }
+    Ok(())
+}
+fn validate_rewind_completion_input(
+    eligibility: &RewindEligibilityV1,
+    effect: &RewindEffectStatusV1,
+) -> io::Result<()> {
+    let detail = match effect {
+        RewindEffectStatusV1::NoExternalMutation => None,
+        RewindEffectStatusV1::ExternalMutation { description }
+        | RewindEffectStatusV1::Unknown { description } => Some(description),
+    };
+    if detail.is_some_and(|value| value.is_empty() || value.len() > 1024)
+        || matches!(eligibility, RewindEligibilityV1::Ineligible { reason } if reason.is_empty() || reason.len() > 1024)
+        || (matches!(eligibility, RewindEligibilityV1::Eligible) && detail.is_some())
+    {
+        return Err(invalid("rewind境界のeligible/effect状態が不正です"));
+    }
+    Ok(())
+}
+fn validate_rewind_reason(reason: &str) -> io::Result<()> {
+    if reason.is_empty()
+        || reason.len() > 1024
+        || reason.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(invalid("rewind境界の理由が不正です"));
+    }
+    Ok(())
+}
+fn validate_rewind_boundary(boundary: &RewindBoundaryV1) -> io::Result<()> {
+    if boundary.schema_version != REWIND_BOUNDARY_SCHEMA_VERSION
+        || !valid_session_id(&boundary.session_id)
+        || boundary.project_id.is_empty()
+        || boundary.epoch != boundary.source_state.epoch
+        || boundary.source_generation != boundary.source_state.generation
+        || boundary.session_id != boundary.source_state.session_id
+        || boundary.project_id != boundary.source_state.project_id
+        || boundary.raw_offset != boundary.source_state.raw_commit_offset
+        || boundary.raw_hash != boundary.source_state.raw_commit_hash
+        || !valid_hash(&boundary.raw_hash)
+        || boundary.target_turn_id == 0
+        || boundary.created_at_unix_ms == 0
+        || boundary
+            .user_message_preview
+            .as_ref()
+            .is_some_and(|preview| preview.is_empty() || preview.chars().count() > 512)
+        || (boundary.completion.is_some() && boundary.user_message_preview.is_none())
+        || (boundary.completion.is_some() && boundary.abandoned_reason.is_some())
+    {
+        return Err(invalid("rewind境界の保存内容が不正です"));
+    }
+    validate_opaque_id(&boundary.boundary_id, "rewind boundary ID")?;
+    validate_opaque_id(
+        &boundary.workspace_pre_manifest_id,
+        "workspace pre manifest ID",
+    )?;
+    validate_memory_raw_object_ids(&boundary.visible_memory_raw_object_ids)?;
+    boundary.source_state.validate()?;
+    if let Some(completion) = &boundary.completion {
+        validate_opaque_id(
+            &completion.workspace_post_manifest_id,
+            "workspace post manifest ID",
+        )?;
+        validate_rewind_completion_input(&completion.eligibility, &completion.effect)?;
+        if completion.completed_generation < boundary.source_generation
+            || completion.completed_raw_offset < boundary.raw_offset
+            || !valid_hash(&completion.completed_raw_hash)
+        {
+            return Err(invalid("rewind境界の完了markerが不正です"));
+        }
+    }
+    if let Some(reason) = &boundary.abandoned_reason {
+        validate_rewind_reason(reason)?;
+    }
+    Ok(())
+}
+fn validate_rewind_boundary_for_branch(
+    boundary: &RewindBoundaryV1,
+    current: &ConversationSnapshot,
+) -> io::Result<()> {
+    validate_rewind_boundary(boundary)?;
+    let completion = boundary
+        .completion
+        .as_ref()
+        .ok_or_else(|| invalid("rewind境界が未完了です"))?;
+    if !matches!(completion.eligibility, RewindEligibilityV1::Eligible)
+        || boundary.project_id != current.state.project_id
+        || boundary.session_id != current.state.session_id
+        || boundary.epoch != current.state.epoch
+        || boundary.raw_offset > current.raw_offset
+    {
+        return Err(invalid("rewind境界が現在のセッションに適用できません"));
+    }
+    Ok(())
+}
+fn validate_rewind_branch_metadata(metadata: &RewindBranchMetadataV1) -> io::Result<()> {
+    if metadata.schema_version != REWIND_BOUNDARY_SCHEMA_VERSION
+        || !valid_session_id(&metadata.origin_session_id)
+        || !valid_hash(&metadata.branch_initial_raw_hash)
+        || (metadata.branch_initial_raw_offset == 0
+            && metadata.branch_initial_raw_hash != content_hash(&[]))
+    {
+        return Err(invalid("rewind branch metadataが不正です"));
+    }
+    validate_opaque_id(&metadata.boundary_id, "rewind boundary ID")?;
+    validate_opaque_id(
+        &metadata.workspace_pre_manifest_id,
+        "workspace pre manifest ID",
+    )?;
+    validate_opaque_id(
+        &metadata.workspace_post_manifest_id,
+        "workspace post manifest ID",
+    )?;
+    validate_memory_raw_object_ids(&metadata.visible_memory_raw_object_ids)
+}
+fn validate_workspace_head_binding(binding: &WorkspaceHeadBindingV1) -> io::Result<()> {
+    if binding.schema_version != 1
+        || !valid_session_id(&binding.session_id)
+        || binding.project_id.is_empty()
+        || !valid_hash(&binding.raw_commit_hash)
+        || (binding.raw_commit_offset == 0 && binding.raw_commit_hash != content_hash(&[]))
+    {
+        return Err(invalid("作業ファイルの結び付け記録が不正です"));
+    }
+    validate_opaque_id(&binding.workspace_manifest_id, "workspace manifest ID")
+}
+fn write_rewind_branch_metadata_create_new(
+    path: &Path,
+    metadata: &RewindBranchMetadataV1,
+) -> io::Result<()> {
+    validate_rewind_branch_metadata(metadata)?;
+    let metadata_path = path.join("rewind-branch-v1.json");
+    let mut file = private_file(&metadata_path, true)?;
+    file.write_all(&serde_json::to_vec(metadata)?)?;
+    file.sync_all()?;
+    File::open(path)?.sync_all()
+}
+
+fn rewind_branch_candidate_plan(
+    source: &ConversationSnapshot,
+    boundary: &RewindBoundaryV1,
+    child_id: &str,
+) -> io::Result<(ConversationSnapshot, RewindBranchMetadataV1)> {
+    validate_rewind_boundary_for_candidate(boundary, source)?;
+    let selected = raw_prefix_events(&source.events, boundary.raw_offset, &boundary.raw_hash)?;
+    let completion = boundary
+        .completion
+        .as_ref()
+        .ok_or_else(|| invalid("rewind境界が未完了です"))?;
+    let mut state = ConversationStateV2::new(boundary.project_id.clone(), child_id.into())?;
+    state.history_mode = boundary.source_state.history_mode;
+    state.session_settings = boundary.source_state.session_settings.clone();
+    state.goal = boundary.source_state.goal.clone();
+    state.workflow_config = boundary.source_state.workflow_config.clone();
+    state.workflow = boundary.source_state.workflow.clone();
+    state.gates = boundary.source_state.gates.clone();
+    state.workflow_artifacts = boundary.source_state.workflow_artifacts.clone();
+    state.verification_checkpoint = boundary.source_state.verification_checkpoint.clone();
+    state.admission_receipts = boundary.source_state.admission_receipts.clone();
+    state.ancestors = boundary.source_state.ancestors.clone();
+    state.ancestors.push(AncestorRange {
+        session_id: boundary.session_id.clone(),
+        epoch: boundary.epoch,
+        generation: boundary.source_generation,
+        visible_summary_ids: boundary.source_state.visible_summary_ids.clone(),
+        visible_structured_publication_ids: boundary
+            .source_state
+            .visible_structured_publication_ids
+            .clone(),
+    });
+    let expected = expected_rewind_snapshot(state, selected)?;
+    let metadata = RewindBranchMetadataV1 {
+        schema_version: REWIND_BOUNDARY_SCHEMA_VERSION,
+        boundary_id: boundary.boundary_id.clone(),
+        origin_session_id: boundary.session_id.clone(),
+        origin_generation: boundary.source_generation,
+        workspace_pre_manifest_id: boundary.workspace_pre_manifest_id.clone(),
+        workspace_post_manifest_id: completion.workspace_post_manifest_id.clone(),
+        branch_initial_raw_offset: expected.raw_offset,
+        branch_initial_raw_hash: expected.raw_hash.clone(),
+        visible_memory_raw_object_ids: boundary.visible_memory_raw_object_ids.clone(),
+    };
+    validate_rewind_branch_metadata(&metadata)?;
+    Ok((expected, metadata))
+}
+
+/// Candidate provenance remains readable after the source starts a later
+/// epoch. Selection is stricter (`validate_rewind_boundary_for_branch`), but
+/// reopening an already-created child binds to its immutable source prefix.
+fn validate_rewind_boundary_for_candidate(
+    boundary: &RewindBoundaryV1,
+    source: &ConversationSnapshot,
+) -> io::Result<()> {
+    validate_rewind_boundary(boundary)?;
+    let completion = boundary
+        .completion
+        .as_ref()
+        .ok_or_else(|| invalid("rewind境界が未完了です"))?;
+    if !matches!(completion.eligibility, RewindEligibilityV1::Eligible)
+        || !matches!(completion.effect, RewindEffectStatusV1::NoExternalMutation)
+        || boundary.project_id != source.state.project_id
+        || boundary.session_id != source.state.session_id
+        || boundary.source_generation != boundary.source_state.generation
+        || boundary.raw_offset > source.raw_offset
+    {
+        return Err(invalid("rewind候補の分岐元境界が不正です"));
+    }
+    Ok(())
+}
+
+fn expected_rewind_snapshot(
+    mut state: ConversationStateV2,
+    selected: Vec<RawEventV2>,
+) -> io::Result<ConversationSnapshot> {
+    let mut events = Vec::with_capacity(selected.len());
+    let mut raw = Vec::new();
+    let mut turn_id = 0_u64;
+    for (index, source_event) in selected.into_iter().enumerate() {
+        if source_event.starts_turn {
+            turn_id = turn_id
+                .checked_add(1)
+                .ok_or_else(|| invalid("分岐先のターン番号が上限です"))?;
+        }
+        let event = RawEventV2 {
+            schema_version: SCHEMA_VERSION,
+            sequence: u64::try_from(index + 1)
+                .map_err(|_| invalid("分岐先のイベント番号が上限です"))?,
+            epoch: 0,
+            turn_id,
+            starts_turn: source_event.starts_turn,
+            message: source_event.message,
+        };
+        validate_event(&event, events.last())?;
+        serde_json::to_writer(&mut raw, &event)?;
+        raw.push(b'\n');
+        events.push(event);
+    }
+    state.generation = 1;
+    state.raw_commit_offset =
+        u64::try_from(raw.len()).map_err(|_| invalid("分岐先の原文長が上限です"))?;
+    state.raw_commit_hash = content_hash(&raw);
+    state.recent_turn_ids = events
+        .iter()
+        .filter(|event| event.starts_turn)
+        .map(|event| event.turn_id)
+        .rev()
+        .take(REAL_TURN_WINDOW)
+        .collect();
+    state.recent_turn_ids.reverse();
+    state.validate()?;
+    Ok(ConversationSnapshot {
+        raw_hash: state.raw_commit_hash.clone(),
+        raw_offset: state.raw_commit_offset,
+        state,
+        events,
+    })
+}
+fn raw_prefix_events(
+    events: &[RawEventV2],
+    expected_offset: u64,
+    expected_hash: &str,
+) -> io::Result<Vec<RawEventV2>> {
+    if expected_offset == 0 {
+        if expected_hash == content_hash(&[]) {
+            return Ok(Vec::new());
+        }
+        return Err(invalid("rewind原文prefixのhashが一致しません"));
+    }
+    let mut raw = Vec::new();
+    let mut prefix = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut raw, event)?;
+        raw.push(b'\n');
+        if raw.len() as u64 > expected_offset {
+            return Err(invalid("rewind原文prefixがイベント境界にありません"));
+        }
+        prefix.push(event.clone());
+        if raw.len() as u64 == expected_offset {
+            break;
+        }
+    }
+    if raw.len() as u64 != expected_offset || content_hash(&raw) != expected_hash {
+        return Err(invalid("rewind原文prefixのhashが一致しません"));
+    }
+    Ok(prefix)
+}
+fn new_rewind_boundary_id() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(format!(
+        "rewind-{}",
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+fn rewind_boundary_timestamp() -> io::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| invalid("rewind境界の時刻を取得できません"))
+        .and_then(|duration| {
+            u64::try_from(duration.as_millis()).map_err(|_| invalid("rewind境界の時刻が上限です"))
+        })
+}
+fn rewind_message_preview(content: &str) -> String {
+    let preview: String = content.chars().take(512).collect();
+    if preview.is_empty() {
+        "(empty user message)".into()
+    } else {
+        preview
+    }
+}
 fn valid_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+fn fork_plan(
+    source: &ConversationSnapshot,
+    child_id: &str,
+    artifact_hash: &str,
+) -> io::Result<(ConversationStateV2, Vec<(Message, bool)>)> {
+    if source.raw_hash != source.state.raw_commit_hash
+        || source.raw_offset != source.state.raw_commit_offset
+    {
+        return Err(invalid("分岐元の原文markerが未確定です"));
+    }
+    let turns = source.active_turns();
+    let first = turns.get(turns.len().saturating_sub(REAL_TURN_WINDOW));
+    for turn in turns.iter().rev().take(REAL_TURN_WINDOW) {
+        source.validate_complete_turn(*turn)?;
+    }
+    let mut initial = ConversationStateV2::new(source.state.project_id.clone(), child_id.into())?;
+    initial.history_mode = source.state.history_mode;
+    initial.session_settings = source.state.session_settings.clone();
+    initial.workflow_config = source.state.workflow_config.clone();
+    initial.workflow = source.state.workflow.clone();
+    initial.gates = source.state.gates.for_fork(artifact_hash);
+    initial.workflow_artifacts = source.state.workflow_artifacts.clone();
+    initial.ancestors = source.state.ancestors.clone();
+    initial.ancestors.push(AncestorRange {
+        session_id: source.state.session_id.clone(),
+        epoch: source.state.epoch,
+        generation: source.state.generation,
+        visible_summary_ids: source.state.visible_summary_ids.clone(),
+        visible_structured_publication_ids: source.state.visible_structured_publication_ids.clone(),
+    });
+    let selected = source
+        .events
+        .iter()
+        .filter(|event| {
+            event.epoch == source.state.epoch && first.is_some_and(|first| event.turn_id >= *first)
+        })
+        .map(|event| (event.message.clone(), event.starts_turn))
+        .collect();
+    Ok((initial, selected))
+}
+
+/// Exact post-publication state and raw hash expected from the fork writer.
+/// This is computed before its management effect starts and checked on reopen.
+pub(crate) fn expected_fork_snapshot(
+    source: &ConversationSnapshot,
+    child_id: &str,
+    artifact_hash: &str,
+) -> io::Result<ConversationSnapshot> {
+    let (mut state, selected) = fork_plan(source, child_id, artifact_hash)?;
+    let mut events = Vec::with_capacity(selected.len());
+    let mut raw = Vec::new();
+    let mut turn_id = 0_u64;
+    for (index, (message, starts_turn)) in selected.into_iter().enumerate() {
+        if starts_turn {
+            turn_id = turn_id
+                .checked_add(1)
+                .ok_or_else(|| invalid("分岐先のターン番号が上限です"))?;
+        }
+        let event = RawEventV2 {
+            schema_version: SCHEMA_VERSION,
+            sequence: u64::try_from(index + 1)
+                .map_err(|_| invalid("分岐先のイベント番号が上限です"))?,
+            epoch: 0,
+            turn_id,
+            starts_turn,
+            message,
+        };
+        validate_event(&event, events.last())?;
+        raw.extend_from_slice(&serde_json::to_vec(&event)?);
+        raw.push(b'\n');
+        events.push(event);
+    }
+    let raw_hash = content_hash(&raw);
+    state.generation = 1;
+    state.raw_commit_offset =
+        u64::try_from(raw.len()).map_err(|_| invalid("分岐先の原文長が上限です"))?;
+    state.raw_commit_hash = raw_hash.clone();
+    state.recent_turn_ids = events
+        .iter()
+        .filter(|event| event.starts_turn)
+        .map(|event| event.turn_id)
+        .collect();
+    state.validate()?;
+    Ok(ConversationSnapshot {
+        state,
+        raw_hash,
+        raw_offset: raw.len() as u64,
+        events,
+    })
+}
+
 pub fn content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -883,6 +2028,52 @@ mod tests {
         let mut state = ConversationStateV2::new("project".into(), ID.into()).unwrap();
         state.history_mode = history_mode;
         ConversationStore::create(root, state).unwrap()
+    }
+    #[test]
+    fn workspace_head_binding_is_durable_and_refuses_a_different_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let snapshot = store.lock().unwrap().snapshot().unwrap();
+        let first = "a".repeat(32);
+        store.bind_workspace_head(&snapshot, &first).unwrap();
+        assert_eq!(
+            store
+                .workspace_head_binding()
+                .unwrap()
+                .unwrap()
+                .workspace_manifest_id,
+            first
+        );
+        let reopened = ConversationStore::open(dir.path(), "project", ID).unwrap();
+        assert_eq!(
+            reopened
+                .workspace_head_binding()
+                .unwrap()
+                .unwrap()
+                .raw_commit_hash,
+            snapshot.raw_hash
+        );
+        assert!(store.bind_workspace_head(&snapshot, &first).is_ok());
+        assert!(
+            store
+                .bind_workspace_head(&snapshot, &"b".repeat(32))
+                .is_err()
+        );
+        let mut lock = store.lock().unwrap();
+        let before = lock.snapshot().unwrap();
+        lock.publish(&before, before.state.clone()).unwrap();
+        let after = lock.snapshot().unwrap();
+        let carried = store.workspace_head_binding().unwrap().unwrap();
+        assert_eq!(carried.generation, after.state.generation);
+        assert_eq!(carried.workspace_manifest_id, first);
+        assert_eq!(carried.raw_commit_hash, snapshot.raw_hash);
+        let appended = lock.append(Message::user("new raw head"), true).unwrap();
+        lock.publish(&appended, appended.state.clone()).unwrap();
+        assert_eq!(store.workspace_head_binding().unwrap().unwrap(), carried);
+        assert_ne!(
+            carried.generation,
+            lock.snapshot().unwrap().state.generation
+        );
     }
     #[test]
     fn roundtrip_publishes_gates_and_detects_stale_snapshot() {
@@ -1279,6 +2470,12 @@ mod tests {
             artifact_hash: "old".into(),
         });
         lock.publish(&snapshot, next).unwrap();
+        let expected = expected_fork_snapshot(
+            &lock.snapshot().unwrap(),
+            "00000000-0000-4000-8000-000000000002",
+            "changed",
+        )
+        .unwrap();
         let child = lock
             .fork(
                 dir.path(),
@@ -1287,6 +2484,13 @@ mod tests {
             )
             .unwrap();
         let fork = child.lock().unwrap().snapshot().unwrap();
+        assert_eq!(fork.state, expected.state);
+        assert_eq!(fork.raw_hash, expected.raw_hash);
+        assert_eq!(fork.raw_offset, expected.raw_offset);
+        assert_eq!(
+            serde_json::to_vec(&fork.events).unwrap(),
+            serde_json::to_vec(&expected.events).unwrap()
+        );
         assert_eq!(fork.events.len(), 10);
         assert_eq!(fork.state.history_mode, HistoryMode::Strict10);
         assert_eq!(fork.events[0].message.content, "turn 3");
@@ -1296,5 +2500,441 @@ mod tests {
         lock.append(Message::user("parent future"), true).unwrap();
         assert_eq!(child.lock().unwrap().snapshot().unwrap().events.len(), 10);
         assert_eq!(lock.snapshot().unwrap().events.len(), 13);
+    }
+    #[test]
+    fn rewind_branch_uses_the_saved_full_prefix_and_visibility_after_ten_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store_with_mode(dir.path(), HistoryMode::Structured10);
+        let mut lock = parent.lock().unwrap();
+        for turn in 1..=11 {
+            lock.append(Message::user(format!("turn {turn}")), true)
+                .unwrap();
+            lock.append(Message::assistant(format!("answer {turn}")), false)
+                .unwrap();
+            let snapshot = lock.snapshot().unwrap();
+            let mut next = snapshot.state.clone();
+            if turn == 11 {
+                next.visible_structured_publication_ids = vec!["publication-before".into()];
+                next.structured_coverage = Some(StructuredCoverage {
+                    epoch: 0,
+                    last_source_sequence: snapshot.events.last().unwrap().sequence,
+                    raw_offset: snapshot.raw_offset,
+                    prefix_hash: snapshot.raw_hash.clone(),
+                });
+            }
+            lock.publish(&snapshot, next).unwrap();
+        }
+        let boundary = lock
+            .begin_rewind_boundary("a".repeat(32), vec!["b".repeat(64)])
+            .unwrap();
+        lock.append(Message::user("turn 12"), true).unwrap();
+        lock.append(Message::assistant("answer 12"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &boundary.boundary_id,
+            "c".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+
+        let child = lock
+            .prepare_rewind_branch(
+                dir.path(),
+                &boundary.boundary_id,
+                "00000000-0000-4000-8000-000000000002",
+            )
+            .unwrap();
+        let child_snapshot = child.lock().unwrap().snapshot().unwrap();
+        assert_eq!(child_snapshot.active_turns(), (1..=11).collect::<Vec<_>>());
+        assert_eq!(child_snapshot.events.len(), 22);
+        assert_eq!(
+            child_snapshot.state.recent_turn_ids,
+            (2..=11).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            child_snapshot.events.last().unwrap().message.content,
+            "answer 11"
+        );
+        assert!(
+            child_snapshot
+                .state
+                .visible_structured_publication_ids
+                .is_empty()
+        );
+        assert_eq!(
+            child_snapshot
+                .state
+                .ancestors
+                .last()
+                .unwrap()
+                .visible_structured_publication_ids,
+            ["publication-before"]
+        );
+        let metadata = child.rewind_branch_metadata().unwrap().unwrap();
+        assert_eq!(metadata.visible_memory_raw_object_ids, ["b".repeat(64)]);
+        assert_eq!(
+            metadata.branch_initial_raw_offset,
+            child_snapshot.raw_offset
+        );
+        assert_eq!(metadata.branch_initial_raw_hash, child_snapshot.raw_hash);
+        let reopened = ConversationStore::open(
+            dir.path(),
+            "project",
+            "00000000-0000-4000-8000-000000000002",
+        )
+        .unwrap();
+        let reopened_metadata = reopened.rewind_branch_metadata().unwrap().unwrap();
+        assert_eq!(reopened_metadata.workspace_post_manifest_id, "c".repeat(32));
+        assert_eq!(
+            reopened_metadata.branch_initial_raw_offset,
+            child_snapshot.raw_offset
+        );
+        assert_eq!(
+            reopened_metadata.branch_initial_raw_hash,
+            child_snapshot.raw_hash
+        );
+    }
+    #[test]
+    fn strict10_rewind_keeps_older_raw_turns_without_the_later_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store_with_mode(dir.path(), HistoryMode::Strict10);
+        let mut lock = parent.lock().unwrap();
+        for turn in 1..=11 {
+            lock.append(Message::user(format!("turn {turn}")), true)
+                .unwrap();
+            lock.append(Message::assistant(format!("answer {turn}")), false)
+                .unwrap();
+            let snapshot = lock.snapshot().unwrap();
+            lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        }
+        let boundary = lock
+            .begin_rewind_boundary("a".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("turn 12"), true).unwrap();
+        lock.append(Message::assistant("answer 12"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &boundary.boundary_id,
+            "c".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+        let child = lock
+            .prepare_rewind_branch(
+                dir.path(),
+                &boundary.boundary_id,
+                "00000000-0000-4000-8000-000000000002",
+            )
+            .unwrap();
+        let restored = child.lock().unwrap().snapshot().unwrap();
+        assert_eq!(restored.state.history_mode, HistoryMode::Strict10);
+        assert_eq!(restored.active_turns(), (1..=11).collect::<Vec<_>>());
+        assert_eq!(restored.events.len(), 22);
+        assert_eq!(restored.state.recent_turn_ids, (2..=11).collect::<Vec<_>>());
+        assert_eq!(restored.events[0].message.content, "turn 1");
+        assert_eq!(restored.events.last().unwrap().message.content, "answer 11");
+    }
+    #[test]
+    fn rewind_branch_before_the_first_turn_keeps_an_empty_initial_raw_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store(dir.path());
+        let mut lock = parent.lock().unwrap();
+        let boundary = lock
+            .begin_rewind_boundary("a".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("first"), true).unwrap();
+        lock.append(Message::assistant("done"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &boundary.boundary_id,
+            "b".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+
+        let child = lock
+            .prepare_rewind_branch(
+                dir.path(),
+                &boundary.boundary_id,
+                "00000000-0000-4000-8000-000000000002",
+            )
+            .unwrap();
+        let child_snapshot = child.lock().unwrap().snapshot().unwrap();
+        assert!(child_snapshot.events.is_empty());
+        let metadata = child.rewind_branch_metadata().unwrap().unwrap();
+        assert_eq!(metadata.branch_initial_raw_offset, 0);
+        assert_eq!(metadata.branch_initial_raw_hash, content_hash(&[]));
+    }
+
+    #[test]
+    fn rewind_candidate_keeps_metadata_when_creation_stops_before_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store(dir.path());
+        let mut lock = parent.lock().unwrap();
+        let boundary = lock
+            .begin_rewind_boundary("a".repeat(32), vec!["b".repeat(64)])
+            .unwrap();
+        lock.append(Message::user("captured"), true).unwrap();
+        lock.append(Message::assistant("done"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &boundary.boundary_id,
+            "c".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+
+        FAIL_POINT.with(|point| point.set(Some("rewind_candidate_after_metadata")));
+        let result = lock.prepare_rewind_branch(
+            dir.path(),
+            &boundary.boundary_id,
+            "00000000-0000-4000-8000-000000000002",
+        );
+        FAIL_POINT.with(|point| point.set(None));
+        assert!(result.is_err());
+        let child = dir
+            .path()
+            .join("sessions-v2/00000000-0000-4000-8000-000000000002");
+        assert!(child.join("rewind-branch-v1.json").is_file());
+        assert!(!child.join("state.json").exists());
+        assert!(
+            ConversationStore::open(
+                dir.path(),
+                "project",
+                "00000000-0000-4000-8000-000000000002",
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewind_metadata_rejects_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let conversation = store(dir.path());
+        std::os::unix::fs::symlink(
+            "missing-rewind-branch-v1.json",
+            conversation.directory().join("rewind-branch-v1.json"),
+        )
+        .unwrap();
+        assert!(conversation.rewind_branch_metadata().is_err());
+    }
+
+    #[test]
+    fn rewind_candidate_rewrites_epoch_and_accepts_a_later_child_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store(dir.path());
+        let mut lock = parent.lock().unwrap();
+        lock.append(Message::user("old epoch"), true).unwrap();
+        lock.append(Message::assistant("old answer"), false)
+            .unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.clear_epoch().unwrap();
+        let boundary = lock
+            .begin_rewind_boundary("a".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("new epoch"), true).unwrap();
+        lock.append(Message::assistant("new answer"), false)
+            .unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &boundary.boundary_id,
+            "b".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+        let child = lock
+            .prepare_rewind_branch(
+                dir.path(),
+                &boundary.boundary_id,
+                "00000000-0000-4000-8000-000000000002",
+            )
+            .unwrap();
+        let child_snapshot = child.lock().unwrap().snapshot().unwrap();
+        assert!(child_snapshot.events.iter().all(|event| event.epoch == 0));
+        assert_eq!(child_snapshot.events[0].turn_id, 1);
+        assert_eq!(child_snapshot.events[0].message.content, "old epoch");
+        drop(lock);
+        ConversationStore::validate_rewind_branch_candidate(&parent, &child).unwrap();
+
+        let mut source_lock = parent.lock().unwrap();
+        source_lock.clear_epoch().unwrap();
+        drop(source_lock);
+        ConversationStore::validate_rewind_branch_candidate(&parent, &child).unwrap();
+
+        let mut child_lock = child.lock().unwrap();
+        child_lock
+            .append(Message::user("later child turn"), true)
+            .unwrap();
+        let child_snapshot = child_lock.snapshot().unwrap();
+        child_lock
+            .publish(&child_snapshot, child_snapshot.state.clone())
+            .unwrap();
+        drop(child_lock);
+        ConversationStore::validate_rewind_branch_candidate(&parent, &child).unwrap();
+    }
+    #[test]
+    fn rewind_listing_rejects_incomplete_and_later_irreversible_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store(dir.path());
+        let mut lock = parent.lock().unwrap();
+        let first = lock
+            .begin_rewind_boundary("a".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("first"), true).unwrap();
+        lock.append(Message::assistant("done"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &first.boundary_id,
+            "b".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+        assert_eq!(lock.list_rewind_boundaries().unwrap().len(), 1);
+
+        let second = lock
+            .begin_rewind_boundary("c".repeat(32), Vec::new())
+            .unwrap();
+        assert!(lock.list_rewind_boundaries().unwrap().is_empty());
+        lock.append(Message::user("second"), true).unwrap();
+        lock.append(Message::assistant("done"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &second.boundary_id,
+            "d".repeat(32),
+            RewindEligibilityV1::Ineligible {
+                reason: "external write".into(),
+            },
+            RewindEffectStatusV1::ExternalMutation {
+                description: "remote side effect".into(),
+            },
+        )
+        .unwrap();
+        assert!(lock.list_rewind_boundaries().unwrap().is_empty());
+
+        let interrupted = lock
+            .begin_rewind_boundary("e".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("interrupted"), true).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.abandon_rewind_boundary(&interrupted.boundary_id, "interrupted turn".into())
+            .unwrap();
+        let next = lock
+            .begin_rewind_boundary("f".repeat(32), Vec::new())
+            .unwrap();
+        assert!(next.completion.is_none());
+    }
+    #[test]
+    fn rewind_listing_requires_the_latest_completed_boundary_to_match_raw_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store(dir.path());
+        let mut lock = parent.lock().unwrap();
+        let boundary = lock
+            .begin_rewind_boundary("a".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("captured"), true).unwrap();
+        lock.append(Message::assistant("done"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &boundary.boundary_id,
+            "b".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+        assert_eq!(lock.list_rewind_boundaries().unwrap().len(), 1);
+
+        lock.append(Message::user("unrecorded raw tail"), true)
+            .unwrap();
+        assert!(lock.list_rewind_boundaries().unwrap().is_empty());
+    }
+    #[test]
+    fn rewind_listing_rejects_a_later_abandoned_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store(dir.path());
+        let mut lock = parent.lock().unwrap();
+        let first = lock
+            .begin_rewind_boundary("a".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("first"), true).unwrap();
+        lock.append(Message::assistant("done"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &first.boundary_id,
+            "b".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+        assert_eq!(lock.list_rewind_boundaries().unwrap().len(), 1);
+
+        let later = lock
+            .begin_rewind_boundary("c".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("interrupted"), true).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.abandon_rewind_boundary(&later.boundary_id, "interrupted turn".into())
+            .unwrap();
+        assert!(lock.list_rewind_boundaries().unwrap().is_empty());
+    }
+    #[test]
+    fn startup_recovery_abandons_only_pending_rewind_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = store(dir.path());
+        let mut lock = parent.lock().unwrap();
+        let complete = lock
+            .begin_rewind_boundary("a".repeat(32), Vec::new())
+            .unwrap();
+        lock.append(Message::user("complete"), true).unwrap();
+        lock.append(Message::assistant("done"), false).unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        lock.publish(&snapshot, snapshot.state.clone()).unwrap();
+        lock.finish_rewind_boundary(
+            &complete.boundary_id,
+            "b".repeat(32),
+            RewindEligibilityV1::Eligible,
+            RewindEffectStatusV1::NoExternalMutation,
+        )
+        .unwrap();
+        let pending = lock
+            .begin_rewind_boundary("c".repeat(32), Vec::new())
+            .unwrap();
+
+        let abandoned = lock
+            .abandon_unfinished_rewind_boundaries("process interrupted".into())
+            .unwrap();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].boundary_id, pending.boundary_id);
+        assert_eq!(
+            abandoned[0].abandoned_reason.as_deref(),
+            Some("process interrupted")
+        );
+        assert!(
+            lock.abandon_unfinished_rewind_boundaries("process interrupted".into())
+                .unwrap()
+                .is_empty()
+        );
+        let next = lock
+            .begin_rewind_boundary("d".repeat(32), Vec::new())
+            .unwrap();
+        assert!(next.completion.is_none());
     }
 }

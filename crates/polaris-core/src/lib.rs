@@ -51,10 +51,17 @@ pub mod prompt;
 pub mod recipe;
 pub mod request_input;
 pub mod resume;
+#[cfg(unix)]
+pub mod rewind_admission;
+#[cfg(unix)]
+pub mod rewind_candidate_capacity;
+#[cfg(unix)]
+pub mod rewind_workspace;
 pub mod scratch_registry;
 pub mod secret_screen;
 pub mod session;
 pub mod session_manager;
+pub mod session_settings;
 pub mod session_store;
 pub mod similarity;
 pub mod spare;

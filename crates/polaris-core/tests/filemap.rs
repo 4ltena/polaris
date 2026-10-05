@@ -41,6 +41,8 @@ fn list_files(root: &Path) -> Vec<String> {
         .lines()
         .map(str::to_string)
         .filter(|path| root.join(path).is_file())
+        // AppleDouble sidecars contain filesystem metadata, not source text.
+        .filter(|path| !file_name_of(path).starts_with("._"))
         .filter(|p| p.ends_with(".rs") || p.ends_with(".toml") || p.ends_with(".md"))
         .collect();
     files.sort();

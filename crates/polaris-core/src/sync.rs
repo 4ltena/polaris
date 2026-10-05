@@ -2,6 +2,8 @@
 //! never touched by anything here.
 pub mod apply;
 pub mod exchange;
+pub mod owner;
 pub mod participation;
+pub mod remote_intent;
 pub mod repository;
 pub mod share;

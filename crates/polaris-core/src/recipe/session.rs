@@ -83,10 +83,22 @@ pub fn start_run(
     session: &SessionId,
     request_id: &str,
 ) -> StoreResult<polaris_desktop_protocol::request::RunTarget> {
+    start_run_with_attempt(writer, session, request_id, "1")
+}
+
+/// A distinct invocation has a distinct attempt; captured revisions retain
+/// the store's CAS checks after an earlier setting consumed its empty draft.
+pub fn start_run_with_attempt(
+    writer: &mut Writer,
+    session: &SessionId,
+    request_id: &str,
+    attempt_id: &str,
+) -> StoreResult<polaris_desktop_protocol::request::RunTarget> {
     use polaris_desktop_protocol::{ids::*, request::*};
+    let captured = writer.snapshot()?;
     let target = RunTarget {
         run_id: RunId::new(request_id)?,
-        attempt_id: AttemptId::new("1")?,
+        attempt_id: AttemptId::new(attempt_id)?,
     };
     writer.apply_bound(
         &Request {
@@ -97,9 +109,12 @@ pub fn start_run(
                 session.clone(),
                 RunStart {
                     mcp_prompt: None,
-                    expected_draft_revision: DecimalU64::new(0),
-                    expected_configuration_revision: DecimalU64::new(0),
-                    expected_policy_revision: DecimalU64::new(0),
+                    expected_draft_revision: captured.state.draft.draft_revision,
+                    expected_configuration_revision: captured
+                        .state
+                        .configuration
+                        .configuration_revision,
+                    expected_policy_revision: captured.state.policy_revision,
                 },
             ),
         },

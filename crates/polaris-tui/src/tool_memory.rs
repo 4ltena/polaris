@@ -9,6 +9,7 @@ use polaris_memory::{Embedding, MemoryStore, Record, SearchMode, SearchRequest};
 use polaris_provider::ToolCall;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -48,20 +49,62 @@ pub fn configure_tool_memory_with_origins(
     mode: RetentionMode,
     embedding: Option<(String, String)>,
 ) -> io::Result<()> {
-    for id in std::iter::once(current_session_id).chain(origins.iter().map(String::as_str)) {
-        if id.is_empty()
-            || !id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-        {
-            return Err(io::Error::other("記憶セッションIDが不正です"));
-        }
-    }
+    validate_session_ids(current_session_id, origins)?;
+    configure_tool_memory_inner(
+        session,
+        project,
+        state_dir,
+        current_session_id,
+        origins,
+        None,
+        mode,
+        embedding,
+    )
+}
+
+/// Configures a rewind branch whose origin records are restricted to a durable
+/// raw-object checkpoint. New records in the branch's own session stay visible.
+#[allow(clippy::too_many_arguments)]
+pub fn configure_tool_memory_with_origin_allowlist(
+    session: &mut Session,
+    project: &Path,
+    state_dir: &Path,
+    current_session_id: &str,
+    origins: &[String],
+    visible_origin_raw_ids: &[String],
+    mode: RetentionMode,
+    embedding: Option<(String, String)>,
+) -> io::Result<()> {
+    validate_session_ids(current_session_id, origins)?;
+    configure_tool_memory_inner(
+        session,
+        project,
+        state_dir,
+        current_session_id,
+        origins,
+        Some(validate_raw_ids(visible_origin_raw_ids)?),
+        mode,
+        embedding,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn configure_tool_memory_inner(
+    session: &mut Session,
+    project: &Path,
+    state_dir: &Path,
+    current_session_id: &str,
+    origins: &[String],
+    visible_origin_raw_ids: Option<BTreeSet<String>>,
+    mode: RetentionMode,
+    embedding: Option<(String, String)>,
+) -> io::Result<()> {
     let project = polaris_core::project::resolve_root(project);
     let backend = Backend {
         project: crate::persist::project_identity(&project)?,
         session: current_session_id.into(),
         origins: origins.to_vec(),
+        visible_origin_raw_ids,
         state: state_dir.into(),
         embedding: embedding
             .map(|(url, model)| Encoder::new(&url, model))
@@ -106,6 +149,54 @@ pub fn configure_tool_memory_with_origins(
         threshold_bytes: 8192,
     });
     Ok(())
+}
+
+/// Lists only raw objects that this configuration can actually retrieve.
+///
+/// Callers persist this result in a rewind checkpoint; malformed IDs and rows
+/// outside the configured project/session provenance are excluded.
+#[allow(clippy::too_many_arguments)]
+pub fn visible_tool_memory_raw_object_ids(
+    project: &Path,
+    state_dir: &Path,
+    current_session_id: &str,
+    origins: &[String],
+    visible_origin_raw_ids: Option<&[String]>,
+) -> io::Result<Vec<String>> {
+    validate_session_ids(current_session_id, origins)?;
+    let backend = Backend {
+        project: crate::persist::project_identity(&polaris_core::project::resolve_root(project))?,
+        session: current_session_id.into(),
+        origins: origins.to_vec(),
+        visible_origin_raw_ids: visible_origin_raw_ids.map(validate_raw_ids).transpose()?,
+        state: state_dir.into(),
+        embedding: None,
+    };
+    backend.visible_raw_object_ids()
+}
+
+fn validate_session_ids(current_session_id: &str, origins: &[String]) -> io::Result<()> {
+    for id in std::iter::once(current_session_id).chain(origins.iter().map(String::as_str)) {
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err(io::Error::other("記憶セッションIDが不正です"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_raw_ids(ids: &[String]) -> io::Result<BTreeSet<String>> {
+    if ids.iter().any(|id| !is_raw_id(id)) {
+        return Err(io::Error::other("記憶原文IDが不正です"));
+    }
+    Ok(ids.iter().cloned().collect())
+}
+
+fn is_raw_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Refuse aliases and shared writable state before opening SQLite or the shared lock.
@@ -212,6 +303,9 @@ struct Backend {
     project: String,
     session: String,
     origins: Vec<String>,
+    /// `None` preserves the ordinary resume/fork visibility contract.
+    /// `Some` gates records stored in ancestor sessions by raw object ID.
+    visible_origin_raw_ids: Option<BTreeSet<String>>,
     state: PathBuf,
     embedding: Option<Encoder>,
 }
@@ -239,12 +333,71 @@ impl Backend {
     fn sessions(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.session.as_str()).chain(self.origins.iter().map(String::as_str))
     }
+    fn raw_id(record: &Record) -> Option<&str> {
+        match record.role.as_str() {
+            RAW if is_raw_id(&record.id) => Some(&record.id),
+            CHUNK => record
+                .id
+                .split_once("-c")
+                .filter(|(raw_id, suffix)| {
+                    is_raw_id(raw_id)
+                        && suffix.len() == 8
+                        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .map(|(raw_id, _)| raw_id),
+            _ => None,
+        }
+    }
+    fn record_is_visible(&self, record: &Record) -> bool {
+        if record.project_id != self.project {
+            return false;
+        }
+        Self::raw_id(record)
+            .is_some_and(|raw_id| self.raw_id_is_visible_for_session(&record.session_id, raw_id))
+    }
+    fn raw_id_is_visible_for_session(&self, session: &str, raw_id: &str) -> bool {
+        if session == self.session {
+            return true;
+        }
+        self.origins.iter().any(|origin| origin == session)
+            && self
+                .visible_origin_raw_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(raw_id))
+    }
+    fn visible_raw_object_ids(&self) -> io::Result<Vec<String>> {
+        let _lock = self.lock()?;
+        let store = self.store()?;
+        let mut ids = BTreeSet::new();
+        for session in self.sessions() {
+            let mut cursor = None;
+            loop {
+                let page = store
+                    .records_page(&self.project, session, cursor.as_deref(), 100)
+                    .map_err(io::Error::other)?;
+                if page.is_empty() {
+                    break;
+                }
+                cursor = page.last().map(|record| record.id.clone());
+                ids.extend(
+                    page.into_iter()
+                        .filter(|record| {
+                            record.role == RAW
+                                && is_raw_id(&record.id)
+                                && self.record_is_visible(record)
+                        })
+                        .map(|record| record.id),
+                );
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
     fn get(&self, store: &MemoryStore, id: &str, role: &str) -> io::Result<Record> {
         for session in self.sessions() {
             if let Some(record) = store
                 .get(&self.project, session, id)
                 .map_err(io::Error::other)?
-                .filter(|r| r.role == role)
+                .filter(|record| record.role == role && self.record_is_visible(record))
             {
                 return Ok(record);
             }
@@ -363,8 +516,8 @@ impl Backend {
                 cursor = page.last().map(|r| r.id.clone());
                 for record in page {
                     if record.role != RAW
-                        || record.id.len() != 64
-                        || !record.id.bytes().all(|b| b.is_ascii_hexdigit())
+                        || !is_raw_id(&record.id)
+                        || !self.record_is_visible(&record)
                     {
                         continue;
                     }
@@ -397,7 +550,15 @@ impl Backend {
                     .search(&request)
                     .map_err(io::Error::other)?
                     .into_iter()
-                    .filter(|h| h.role == CHUNK)
+                    .filter(|hit| {
+                        hit.role == CHUNK
+                            && hit.id.split_once("-c").is_some_and(|(raw_id, suffix)| {
+                                is_raw_id(raw_id)
+                                    && suffix.len() == 8
+                                    && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                                    && self.raw_id_is_visible_for_session(session, raw_id)
+                            })
+                    })
                     .enumerate()
                 {
                     semantic_count += 1;
@@ -850,6 +1011,7 @@ mod tests {
             project: "project".into(),
             session: "session".into(),
             origins: Vec::new(),
+            visible_origin_raw_ids: None,
             state: state.into(),
             embedding: None,
         }
@@ -1091,6 +1253,7 @@ mod tests {
             project: "foreign".into(),
             session: "session".into(),
             origins: Vec::new(),
+            visible_origin_raw_ids: None,
             state: dir.path().into(),
             embedding: None,
         };
@@ -1293,6 +1456,7 @@ mod tests {
         let child = Backend {
             session: "child".into(),
             origins: vec![parent.session.clone()],
+            visible_origin_raw_ids: None,
             ..backend(dir.path())
         };
         let uri = format!("memory://{}", original.id);
@@ -1348,6 +1512,7 @@ mod tests {
         let descendant = Backend {
             session: "descendant".into(),
             origins: vec![parent.session.clone()],
+            visible_origin_raw_ids: None,
             ..backend(dir.path())
         };
         descendant.save(&call(), "own data").await.unwrap();
@@ -1367,6 +1532,170 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_origin_configuration_keeps_all_ancestor_records_visible() {
+        let project = private_temp();
+        let state = project.path().to_path_buf();
+        let parent = Backend {
+            project: crate::persist::project_identity(&polaris_core::project::resolve_root(
+                project.path(),
+            ))
+            .unwrap(),
+            state: state.clone(),
+            ..backend(&state)
+        };
+        let before = parent.save(&call(), "first ancestor needle").await.unwrap();
+        let after = parent.save(&call(), "later ancestor needle").await.unwrap();
+        let mut session = Session::default();
+        configure_tool_memory_with_origins(
+            &mut session,
+            project.path(),
+            &state,
+            "ordinary-child",
+            std::slice::from_ref(&parent.session),
+            RetentionMode::History,
+            None,
+        )
+        .unwrap();
+        let backend = session.tool_memory.unwrap().backend;
+        assert!(
+            backend
+                .read(&format!("memory://{}", before.id), 0, 10)
+                .await
+                .unwrap()
+                .contains("first ancestor")
+        );
+        assert!(
+            backend
+                .read(&format!("memory://{}", after.id), 0, 10)
+                .await
+                .unwrap()
+                .contains("later ancestor")
+        );
+        let visible = visible_tool_memory_raw_object_ids(
+            project.path(),
+            &state,
+            "ordinary-child",
+            std::slice::from_ref(&parent.session),
+            None,
+        )
+        .unwrap();
+        assert!(visible.contains(&before.id) && visible.contains(&after.id));
+    }
+
+    #[tokio::test]
+    async fn rewind_allowlist_blocks_later_origin_records_on_every_read_path_after_restart() {
+        let dir = private_temp();
+        let parent = Backend {
+            project: crate::persist::project_identity(&polaris_core::project::resolve_root(
+                dir.path(),
+            ))
+            .unwrap(),
+            ..backend(dir.path())
+        };
+        let before = parent.save(&call(), "before rewind needle").await.unwrap();
+        let after = parent.save(&call(), "later origin needle").await.unwrap();
+        let vector = Embedding {
+            model: "rewind-fixture".into(),
+            values: vec![1.0, 0.5],
+        };
+        let mut store = parent.store().unwrap();
+        for raw_id in [&before.id, &after.id] {
+            store
+                .set_embedding(
+                    &parent.project,
+                    &parent.session,
+                    &format!("{raw_id}-c00000000"),
+                    &vector,
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let allowed = vec![before.id.clone()];
+        let child = Backend {
+            project: parent.project.clone(),
+            session: "rewind-child".into(),
+            origins: vec![parent.session.clone()],
+            visible_origin_raw_ids: Some(allowed.iter().cloned().collect()),
+            ..backend(dir.path())
+        };
+        let own = child.save(&call(), "branch-owned needle").await.unwrap();
+        assert!(
+            child
+                .read(&format!("memory://{}", before.id), 0, 10)
+                .await
+                .unwrap()
+                .contains("before rewind")
+        );
+        assert!(
+            child
+                .read(&format!("memory://{}", own.id), 0, 10)
+                .await
+                .unwrap()
+                .contains("branch-owned")
+        );
+        assert!(
+            child
+                .read(&format!("memory://{}", after.id), 0, 10)
+                .await
+                .is_err()
+        );
+        assert!(
+            child
+                .read(&format!("memory://{}/search/needle", after.id), 0, 10)
+                .await
+                .is_err()
+        );
+
+        let lexical = child.read("memory://search/needle", 0, 10).await.unwrap();
+        assert!(lexical.contains(&before.id) && lexical.contains(&own.id));
+        assert!(!lexical.contains(&after.id) && !lexical.contains("later origin"));
+        let semantic = child
+            .search("unmatched", Some(&vector), "ハイブリッド検索")
+            .unwrap();
+        assert!(semantic.contains(&before.id));
+        assert!(!semantic.contains(&after.id) && !semantic.contains("later origin"));
+
+        let visible = visible_tool_memory_raw_object_ids(
+            dir.path(),
+            dir.path(),
+            "rewind-child",
+            std::slice::from_ref(&parent.session),
+            Some(&allowed),
+        )
+        .unwrap();
+        assert!(visible.contains(&before.id) && visible.contains(&own.id));
+        assert!(!visible.contains(&after.id));
+
+        // Rebuild the backend from the persisted checkpoint inputs, as a
+        // resumed rewind branch does after process restart.
+        let restarted = Backend {
+            project: parent.project.clone(),
+            session: "rewind-child".into(),
+            origins: vec![parent.session.clone()],
+            visible_origin_raw_ids: Some(allowed.iter().cloned().collect()),
+            ..backend(dir.path())
+        };
+        assert!(
+            restarted
+                .read(&format!("memory://{}", after.id), 0, 10)
+                .await
+                .is_err()
+        );
+        let restarted_lexical = restarted
+            .read("memory://search/needle", 0, 10)
+            .await
+            .unwrap();
+        assert!(restarted_lexical.contains(&before.id));
+        assert!(!restarted_lexical.contains(&after.id));
+        let restarted_semantic = restarted
+            .search("unmatched", Some(&vector), "ハイブリッド検索")
+            .unwrap();
+        assert!(restarted_semantic.contains(&before.id));
+        assert!(!restarted_semantic.contains(&after.id));
     }
 
     #[test]
@@ -1505,6 +1834,22 @@ mod tests {
             );
             assert!(!path.exists());
         }
+        let mut session = Session::default();
+        let path = project.path().join("absent-raw-id");
+        assert!(
+            configure_tool_memory_with_origin_allowlist(
+                &mut session,
+                project.path(),
+                &path,
+                "child",
+                &["parent".into()],
+                &["a".repeat(63)],
+                RetentionMode::History,
+                None,
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
     }
 
     #[test]

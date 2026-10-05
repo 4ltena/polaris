@@ -1,18 +1,33 @@
 //! The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
 //! is omitted.
 
+#[cfg(unix)]
+pub mod account;
 pub mod approver;
 mod clipboard;
 #[cfg(test)]
 mod continuation_tests;
+#[cfg(unix)]
+mod draft;
 pub mod input;
 #[cfg(test)]
 mod input_preparation_tests;
+#[cfg(unix)]
+mod instruction_commands;
 mod memory;
 pub mod onboarding;
 pub mod persist;
+#[cfg(target_os = "linux")]
+mod resume_effect;
+#[cfg(unix)]
+mod runtime_commands;
+#[cfg(unix)]
+mod runtime_effects;
+#[cfg(unix)]
+mod session_commands;
 pub use memory::{configure_archive, configure_memory, lock_memory};
 pub mod render;
+mod rewind_ui;
 mod selection;
 pub mod sessions;
 #[cfg(target_os = "linux")]
@@ -48,13 +63,19 @@ use polaris_sandbox::SandboxPolicy;
 use polaris_skills::Skill;
 use zeroize::Zeroize;
 
-use approver::{CrosstermKeyReader, TuiApprover};
+#[cfg(not(target_os = "linux"))]
+use approver::CrosstermKeyReader;
+use approver::TuiApprover;
 use input::{InputAction, apply_key};
 use render::Status;
 
 const UNDECIDED_EFFORT: &str = "undecided";
+
 #[cfg(target_os = "linux")]
 const LINUX_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(target_os = "linux")]
+const LINUX_SHUTDOWN_DURING_RESTORE: &str = "停止要求を受信しました";
+
 #[cfg(target_os = "linux")]
 fn linux_signal_exit_code(reason: signal::LinuxProcessShutdown) -> ExitCode {
     match reason {
@@ -62,9 +83,329 @@ fn linux_signal_exit_code(reason: signal::LinuxProcessShutdown) -> ExitCode {
         signal::LinuxProcessShutdown::SigTerm => ExitCode::from(143),
     }
 }
+
 #[cfg(target_os = "linux")]
 fn linux_pending_exit_code() -> Option<ExitCode> {
     signal::pending_linux_process_shutdown().map(linux_signal_exit_code)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_exit_after_terminal_restoration(
+    requested: ExitCode,
+    restoration: std::io::Result<()>,
+    pending: Option<signal::LinuxProcessShutdown>,
+) -> (ExitCode, Option<String>) {
+    match restoration {
+        Err(error) => (
+            ExitCode::FAILURE,
+            Some(format!("terminal restoration failed: {error}")),
+        ),
+        Ok(()) if requested == ExitCode::SUCCESS => (
+            pending.map(linux_signal_exit_code).unwrap_or(requested),
+            None,
+        ),
+        Ok(()) => (requested, None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cancel_owned_children(
+    shutdown: Option<signal::LinuxProcessShutdown>,
+    turn_completed: bool,
+) -> bool {
+    shutdown.is_some() || !turn_completed
+}
+
+#[cfg(target_os = "linux")]
+fn linux_admission_status_after_cleanup(
+    status: polaris_core::session_manager::TerminalStatus,
+    shutdown: Option<signal::LinuxProcessShutdown>,
+) -> polaris_core::session_manager::TerminalStatus {
+    if shutdown.is_some() {
+        polaris_core::session_manager::TerminalStatus::OutcomeUnknown
+    } else {
+        status
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_turn_completed_without_shutdown(
+    turn_completed: bool,
+    shutdown: Option<signal::LinuxProcessShutdown>,
+) -> bool {
+    turn_completed && shutdown.is_none()
+}
+
+// Admission has already made the input durable, but no agent future or root
+// control exists yet. Close each owned component and leave an explicit
+// unknown terminal receipt before taking the signal exit.
+#[cfg(target_os = "linux")]
+async fn linux_finish_pre_turn_shutdown(
+    admission: Option<TuiAdmissionTurn>,
+    runtime: Option<polaris_core::mcp::runtime::RunRuntime>,
+    boundary: Option<polaris_core::conversation_state::RewindBoundaryV1>,
+    persistence: Option<&polaris_core::session_store::PersistedSession>,
+) -> Result<(), String> {
+    let mut first_error = None;
+    if let Some(mut runtime) = runtime
+        && let Err(error) = runtime.shutdown().await
+    {
+        first_error = Some(format!("MCP runtimeを終了できません: {error}"));
+    }
+    if let Some(admission) = admission
+        && let Err(error) =
+            admission.finish(polaris_core::session_manager::TerminalStatus::OutcomeUnknown)
+        && first_error.is_none()
+    {
+        first_error = Some(format!("sidechat runを終了できません: {error}"));
+    }
+    if let Some(boundary) = boundary {
+        let result = persistence
+            .ok_or_else(|| "巻き戻し境界の保存元が失われました".to_string())
+            .and_then(|saved| {
+                saved
+                    .abandon_rewind_boundary(
+                        &boundary.boundary_id,
+                        "停止要求を受信したためターンを開始しませんでした".into(),
+                    )
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(format!("巻き戻し境界を確定できません: {error}"));
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxTerminalStartError {
+    Shutdown(signal::LinuxProcessShutdown),
+    Failed(String),
+}
+
+// Check at the terminal boundary, before entering raw or alternate-screen
+// mode. Keeping the check outside the initializer also lets the unit test
+// prove that a pre-raw signal made no terminal call at all.
+#[cfg(target_os = "linux")]
+fn linux_start_terminal<T>(
+    observe: impl FnOnce() -> Option<signal::LinuxProcessShutdown>,
+    start: impl FnOnce() -> Result<T, String>,
+) -> Result<T, LinuxTerminalStartError> {
+    if let Some(reason) = observe() {
+        return Err(LinuxTerminalStartError::Shutdown(reason));
+    }
+    start().map_err(LinuxTerminalStartError::Failed)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxTerminalStep {
+    Cursor,
+    Mouse,
+    Raw,
+    Alternate,
+}
+
+// Each lifetime owns only the state it successfully acquired. Even if one
+// restoration fails, the other acquired states are attempted once.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct LinuxTerminalGuard {
+    alternate: bool,
+    raw: bool,
+    mouse: bool,
+    cursor: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxTerminalGuard {
+    fn enter() -> Result<(Self, ratatui::DefaultTerminal), String> {
+        let mut guard = Self::default();
+        ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::terminal::EnterAlternateScreen
+        )
+        .map_err(|error| format!("Can't enter the alternate screen: {error}"))?;
+        guard.alternate = true;
+        if let Err(error) = ratatui::crossterm::terminal::enable_raw_mode() {
+            return Err(guard.start_failed(format!("Can't enable raw mode: {error}")));
+        }
+        guard.raw = true;
+        let terminal = ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fullscreen,
+            },
+        )
+        .map_err(|error| guard.start_failed(format!("Can't initialize terminal: {error}")))?;
+        Ok((guard, terminal))
+    }
+
+    fn start_failed(&mut self, error: String) -> String {
+        match self.restore() {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; terminal restoration failed: {cleanup}"),
+        }
+    }
+
+    fn enable_mouse_and_cursor(&mut self) {
+        if ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::EnableMouseCapture
+        )
+        .is_ok()
+        {
+            self.mouse = true;
+        }
+        if ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::cursor::SetCursorStyle::BlinkingBar
+        )
+        .is_ok()
+        {
+            self.cursor = true;
+        }
+    }
+
+    fn restore_with(
+        &mut self,
+        mut restore_step: impl FnMut(LinuxTerminalStep) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut first_error = None;
+        for (step, acquired) in [
+            (LinuxTerminalStep::Cursor, &mut self.cursor),
+            (LinuxTerminalStep::Mouse, &mut self.mouse),
+            (LinuxTerminalStep::Raw, &mut self.raw),
+            (LinuxTerminalStep::Alternate, &mut self.alternate),
+        ] {
+            if std::mem::take(acquired)
+                && let Err(error) = restore_step(step)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        self.restore_with(linux_restore_terminal_step)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_restore_terminal_step(step: LinuxTerminalStep) -> std::io::Result<()> {
+    match step {
+        LinuxTerminalStep::Cursor => ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::cursor::SetCursorStyle::DefaultUserShape
+        ),
+        LinuxTerminalStep::Mouse => ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableMouseCapture
+        ),
+        LinuxTerminalStep::Raw => ratatui::crossterm::terminal::disable_raw_mode(),
+        LinuxTerminalStep::Alternate => ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::terminal::LeaveAlternateScreen
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_finish_guarded_terminal<T>(
+    operation: Result<T, String>,
+    guard: &mut LinuxTerminalGuard,
+    restore_step: impl FnMut(LinuxTerminalStep) -> std::io::Result<()>,
+) -> Result<T, String> {
+    let restoration = guard
+        .restore_with(restore_step)
+        .map_err(|error| error.to_string());
+    match (operation, restoration) {
+        (Err(error), Err(cleanup)) => {
+            Err(format!("{error}; terminal restoration failed: {cleanup}"))
+        }
+        (Err(error), _) => Err(error),
+        (_, Err(cleanup)) => Err(format!("terminal restoration failed: {cleanup}")),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxTerminalGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("terminal restoration failed: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_key_with(
+    mut poll: impl FnMut(Duration) -> std::io::Result<bool>,
+    mut read: impl FnMut() -> std::io::Result<ratatui::crossterm::event::Event>,
+    mut shutdown_pending: impl FnMut() -> bool,
+) -> std::io::Result<ratatui::crossterm::event::KeyCode> {
+    use ratatui::crossterm::event::{Event, KeyEventKind};
+    loop {
+        if shutdown_pending() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        if !poll(LINUX_SIGNAL_POLL_INTERVAL)? {
+            continue;
+        }
+        if shutdown_pending() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        if let Event::Key(key) = read()?
+            && key.kind == KeyEventKind::Press
+        {
+            if shutdown_pending() {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            return Ok(key.code);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxSignalAwareKeyReader;
+
+#[cfg(target_os = "linux")]
+impl approver::KeyReader for LinuxSignalAwareKeyReader {
+    fn read_key(&mut self) -> std::io::Result<ratatui::crossterm::event::KeyCode> {
+        linux_read_key_with(
+            ratatui::crossterm::event::poll,
+            ratatui::crossterm::event::read,
+            || signal::pending_linux_process_shutdown().is_some(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_idle_event_with(
+    mut poll: impl FnMut(Duration) -> std::io::Result<bool>,
+    mut read: impl FnMut() -> std::io::Result<ratatui::crossterm::event::Event>,
+    mut shutdown_pending: impl FnMut() -> bool,
+) -> std::io::Result<Option<ratatui::crossterm::event::Event>> {
+    loop {
+        if shutdown_pending() {
+            return Ok(None);
+        }
+        if !poll(LINUX_SIGNAL_POLL_INTERVAL)? {
+            continue;
+        }
+        if shutdown_pending() {
+            return Ok(None);
+        }
+        let event = read()?;
+        if shutdown_pending() {
+            return Ok(None);
+        }
+        return Ok(Some(event));
+    }
 }
 
 /// CLI-owned constructor, invoked only when a selected strict session needs it.
@@ -75,6 +416,186 @@ pub type HistoryBackend = (
 pub type HistoryBackendFactory = Arc<dyn Fn() -> Result<HistoryBackend, String> + Send + Sync>;
 pub type TurnAuthorityInstaller =
     Arc<dyn Fn(&mut polaris_core::session::Session, &str) -> Result<(), String> + Send + Sync>;
+
+#[cfg(unix)]
+fn active_saved_session_id(
+    session: &polaris_core::session::Session,
+) -> Result<Option<String>, String> {
+    session.check_persistence().map_err(|e| e.to_string())?;
+    session
+        .persistence
+        .as_ref()
+        .map(|p| p.snapshot().map(|snapshot| snapshot.state.session_id))
+        .transpose()
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_runtime_command(
+    request: &str,
+    control: Option<&Arc<RootDelegationControlV1>>,
+    saved: Option<&polaris_core::session_store::PersistedSession>,
+    state_dir: &Path,
+    roles: &[polaris_skills::AgentType],
+    sandbox: &SandboxPolicy,
+    approval: ApprovalPolicy,
+    next_max_turns: &mut u32,
+    startup_max_turns: u32,
+    activity: &AgentActivityRows,
+) -> Result<Vec<String>, String> {
+    let (verb, extra) = request.split_once(' ').unwrap_or((request, ""));
+    match verb {
+        "subagents" => runtime_commands::subagents(control, extra, None).await,
+        "roles" => runtime_commands::roles(roles, extra),
+        "run" if extra == "details" => {
+            runtime_commands::run_details(control)
+                .await
+                .map(|mut lines| {
+                    lines.extend(activity.tool_detail_lines());
+                    lines
+                })
+        }
+        "run" => runtime_commands::run_settings(extra, next_max_turns, startup_max_turns),
+        "sandbox" => runtime_commands::sandbox(extra, sandbox, approval),
+        "input" => {
+            let words = extra.split_whitespace().collect::<Vec<_>>();
+            let ["status", id] = words.as_slice() else {
+                return Err("/input status <受理ID>。実行中の取消はEscで行います。".into());
+            };
+            let saved = saved.ok_or("受理記録にはv2会話が必要です")?;
+            let snapshot = saved.snapshot().map_err(|e| e.to_string())?;
+            let current = polaris_core::session_manager::SessionId::new(snapshot.state.session_id)
+                .map_err(|e| e.to_string())?;
+            if !state_dir.join("tui-admissions-v1").exists() {
+                return Err("この会話に保存された受理記録はありません".into());
+            }
+            let manager = polaris_core::desktop_store::SessionManagerStore::inspect_family_owned(
+                &state_dir.join("tui-admissions-v1"),
+                &current,
+            )
+            .map_err(|e| e.to_string())?
+            .ok_or("この会話に保存された受理記録はありません")?;
+            let id =
+                polaris_core::session_manager::AdmissionId::new(*id).map_err(|e| e.to_string())?;
+            let admitted = manager.status(&id).map_err(|e| e.to_string())?;
+            use polaris_core::session_manager::AdmissionState;
+            let destination = match &admitted.state {
+                AdmissionState::DestinationReady { session_id, .. }
+                | AdmissionState::InputAppended { session_id }
+                | AdmissionState::RunQueued { session_id, .. }
+                | AdmissionState::Running { session_id, .. }
+                | AdmissionState::Terminal {
+                    session_id: Some(session_id),
+                    ..
+                } => Some(session_id),
+                _ => None,
+            };
+            if admitted.parent_session != current && destination != Some(&current) {
+                return Err("この会話の受理記録ではありません".into());
+            }
+            Ok(vec![render::sanitize(&format!(
+                "入力 {} / revision {} / 状態 {:?}",
+                admitted.id.as_str(),
+                admitted.revision,
+                admitted.state
+            ))])
+        }
+        "instruction" => {
+            Err("実行中instructionの永続ownerは接続中です。通常入力を使ってください".into())
+        }
+        _ => Err(
+            "/subagents、/roles、/run settings|details、/sandbox、/input status を指定してください"
+                .into(),
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn handle_queued_control<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    request: &str,
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    session: &polaris_core::session::Session,
+    workspace: &polaris_core::rewind_workspace::WorkspaceOwner,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    state_dir: &Path,
+    queue: &mut VecDeque<instruction_commands::QueuedInstructionV1>,
+    active: &mut Option<instruction_commands::QueuedInstructionV1>,
+) -> Option<Result<Vec<String>, String>> {
+    let receive = request.strip_prefix("instruction send ");
+    let cancel = request.strip_prefix("input cancel ");
+    if receive.is_none() && cancel.is_none() {
+        return None;
+    }
+    Some((|| {
+        let saved = session.persistence.as_ref().ok_or("v2保存会話が必要です")?;
+        let snapshot = saved.snapshot().map_err(|e| e.to_string())?;
+        let current =
+            polaris_core::session_manager::SessionId::new(snapshot.state.session_id.clone())
+                .map_err(|e| e.to_string())?;
+        let activity = workspace
+            .try_activity_quiescent()
+            .map_err(|e| e.to_string())?;
+        let (store, mut manager) = open_tui_admission_owner(state_dir, &current)?;
+        if let Some(text) = receive {
+            let handle = instruction_commands::receive(
+                &store,
+                &mut manager,
+                saved,
+                effects,
+                &activity,
+                polaris_core::management_effect::ManagementOperationIdV1::random()
+                    .map_err(|e| e.to_string())?,
+                text,
+            )?;
+            let id = handle.admission_id().as_str().to_owned();
+            queue.push_back(handle);
+            return Ok(vec![format!("指示受理ID: {id}。次のrun境界で適用します")]);
+        }
+        let id = polaris_core::session_manager::AdmissionId::new(cancel.expect("cancel"))
+            .map_err(|e| e.to_string())?;
+        let position = queue.iter().position(|item| item.admission_id() == &id);
+        let is_active = active
+            .as_ref()
+            .is_some_and(|item| item.admission_id() == &id);
+        if position.is_none() && !is_active {
+            return Err("この会話の送信待ちIDではありません".into());
+        }
+        if !account::confirm(
+            terminal,
+            reader,
+            "送信待ち入力の取消",
+            id.as_str(),
+            "このIDの未実行の指示だけを取り消します。",
+        ) {
+            let context = runtime_commands::RuntimeMutationContext {
+                effects,
+                lease: &activity,
+                session_id: &snapshot.state.session_id,
+                generation: snapshot.state.generation,
+                accepted: false,
+            };
+            runtime_effects::begin(&context, "D10", id.as_str().as_bytes())?;
+            return Ok(vec!["取消要求を取り消しました".into()]);
+        }
+        let handle = if is_active {
+            active.take().expect("active")
+        } else {
+            queue.remove(position.expect("position")).expect("queued")
+        };
+        instruction_commands::cancel_queue(
+            &store,
+            &mut manager,
+            saved,
+            effects,
+            &activity,
+            handle,
+        )?;
+        Ok(vec![format!("入力 {} を取り消しました", id.as_str())])
+    })())
+}
 
 /// Everything `run()` needs, already built by `polaris-cli::main()` the
 /// same way the one-shot path builds it. `polaris-tui` never constructs a
@@ -190,6 +711,10 @@ struct WorkflowSessionArgs<'a> {
     continuation: Option<PreparedContinuation>,
     workflow_mode_overridden: bool,
     skills: &'a [Skill],
+    #[cfg(unix)]
+    management_effects: Option<&'a polaris_core::management_effect::ManagementEffectStoreV1>,
+    #[cfg(unix)]
+    project_mutation: Option<&'a polaris_core::rewind_workspace::WorkspaceOwner>,
 }
 
 fn ensure_history_backend(
@@ -218,6 +743,55 @@ pub async fn restore_prepared_continuation(
     skills: &[Skill],
     history_backend_factory: Option<&HistoryBackendFactory>,
 ) -> Result<(), String> {
+    restore_prepared_continuation_inner(
+        session,
+        continuation,
+        config,
+        workflow_mode_overridden,
+        true,
+        skills,
+        history_backend_factory,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Restore history for an F15 candidate without an unowned workflow write.
+/// The caller confirms and records F15 through the management owner afterward.
+pub async fn restore_prepared_continuation_for_managed_override(
+    session: &mut polaris_core::session::Session,
+    continuation: &PreparedContinuation,
+    config: &polaris_core::workflow::WorkflowConfig,
+    skills: &[Skill],
+    history_backend_factory: Option<&HistoryBackendFactory>,
+) -> Result<(), String> {
+    restore_prepared_continuation_inner(
+        session,
+        continuation,
+        config,
+        false,
+        false,
+        skills,
+        history_backend_factory,
+    )
+    .await
+    .map(|_| ())
+}
+
+struct ContinuationWorkflowPublication {
+    before: polaris_core::conversation_state::ConversationSnapshot,
+    published: polaris_core::conversation_state::ConversationSnapshot,
+}
+
+async fn restore_prepared_continuation_inner(
+    session: &mut polaris_core::session::Session,
+    continuation: &PreparedContinuation,
+    config: &polaris_core::workflow::WorkflowConfig,
+    workflow_mode_overridden: bool,
+    allow_compat_checkpoint: bool,
+    skills: &[Skill],
+    history_backend_factory: Option<&HistoryBackendFactory>,
+) -> Result<Option<ContinuationWorkflowPublication>, String> {
     let mut candidate_session = session.clone();
     let mode = continuation
         .persistence
@@ -233,6 +807,14 @@ pub async fn restore_prepared_continuation(
         .recover_saved_history()
         .await
         .map_err(|error| format!("保存済みの履歴を復元できません: {error}"))?;
+    #[cfg(target_os = "linux")]
+    if signal::pending_linux_process_shutdown().is_some() {
+        return Err(LINUX_SHUTDOWN_DURING_RESTORE.into());
+    }
+    let before_workflow = continuation
+        .persistence
+        .snapshot()
+        .map_err(|error| error.to_string())?;
     let (restored, needs_checkpoint) = continuation
         .persistence
         .prepare_workflow(config.clone())
@@ -258,15 +840,41 @@ pub async fn restore_prepared_continuation(
     } else {
         restored
     };
-    if needs_checkpoint || workflow_mode_overridden {
-        continuation
-            .persistence
-            .checkpoint(Some(&workflow))
-            .map_err(|error| format!("workflow設定を保存できません: {error}"))?;
+    if workflow_mode_overridden {
+        return Err("workflow変更には管理操作の確認と記録が必要です".into());
     }
+    let publication = if needs_checkpoint {
+        #[cfg(target_os = "linux")]
+        if signal::pending_linux_process_shutdown().is_some() {
+            return Err(LINUX_SHUTDOWN_DURING_RESTORE.into());
+        }
+        if !allow_compat_checkpoint {
+            return Err("workflow互換状態の移行は管理操作の復旧後に行ってください".into());
+        }
+        let mut candidate = before_workflow.state.clone();
+        candidate.workflow_config = Some(
+            polaris_core::conversation_state::SavedWorkflowConfigV1::capture(&workflow.config),
+        );
+        candidate.workflow = workflow.state();
+        candidate.gates = workflow.gates.clone();
+        candidate.workflow_artifacts = workflow.artifact_graph().clone();
+        let before_hash = polaris_core::conversation_state::content_hash(
+            &serde_json::to_vec(&before_workflow.state).map_err(|error| error.to_string())?,
+        );
+        let published = continuation
+            .persistence
+            .publish_workflow_change(before_workflow.state.generation, &before_hash, candidate)
+            .map_err(|error| format!("workflow設定を保存できません: {error}"))?;
+        Some(ContinuationWorkflowPublication {
+            before: before_workflow,
+            published,
+        })
+    } else {
+        None
+    };
     candidate_session.workflow = Some(workflow);
     *session = candidate_session;
-    Ok(())
+    Ok(publication)
 }
 
 async fn new_workflow_session(
@@ -288,6 +896,10 @@ async fn new_workflow_session(
         continuation,
         workflow_mode_overridden,
         skills,
+        #[cfg(unix)]
+        management_effects,
+        #[cfg(unix)]
+        project_mutation,
     } = args;
     let mut session = polaris_core::session::Session::new();
     session.input_preparation = input_preparation;
@@ -297,15 +909,26 @@ async fn new_workflow_session(
     session.summary_usage = summary_usage;
     let has_continuation = continuation.is_some();
     if let Some(continuation) = continuation {
-        restore_prepared_continuation(
-            &mut session,
-            &continuation,
-            config,
-            workflow_mode_overridden,
-            skills,
-            history_backend_factory,
-        )
-        .await?;
+        if workflow_mode_overridden {
+            restore_prepared_continuation_for_managed_override(
+                &mut session,
+                &continuation,
+                config,
+                skills,
+                history_backend_factory,
+            )
+            .await?;
+        } else {
+            restore_prepared_continuation(
+                &mut session,
+                &continuation,
+                config,
+                false,
+                skills,
+                history_backend_factory,
+            )
+            .await?;
+        }
     } else if config.enabled {
         let workflow = polaris_core::workflow::SessionWorkflow::try_new(config.clone())?;
         if let Some(phase) = initial_phase {
@@ -315,10 +938,17 @@ async fn new_workflow_session(
     } else if initial_phase.is_some() {
         return Err("--phase には設定で [workflow].enabled = true が必要です".into());
     }
-    // Explicit workflow opt-out with legacy history retains the JSONL lifecycle.
-    // Workflow state needs an atomic marker even when strict history is off.
+    // Production Unix input always needs the v2 admission owner, including
+    // workflow opt-out with legacy history. Isolated caller tests can still
+    // exercise the older JSONL lifecycle without a management store.
+    #[cfg(unix)]
+    let managed_fresh = management_effects.is_some();
+    #[cfg(not(unix))]
+    let managed_fresh = false;
     if !has_continuation
-        && (config.enabled || history_mode != polaris_core::conversation_state::HistoryMode::Legacy)
+        && (managed_fresh
+            || config.enabled
+            || history_mode != polaris_core::conversation_state::HistoryMode::Legacy)
     {
         ensure_history_backend(&mut session, history_mode, history_backend_factory)?;
         let data_root = sessions_dir
@@ -330,6 +960,37 @@ async fn new_workflow_session(
         // session under a second identity the CLI never looks in.
         let project_id = persist::project_identity(&polaris_core::project::resolve_root(cwd))
             .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        let persistence = if let Some(effects) = management_effects {
+            let owner = project_mutation.ok_or("project mutation owner is unavailable")?;
+            let lease = owner.try_mutation().map_err(|error| error.to_string())?;
+            polaris_core::session_switch::SessionSwitchOwner {
+                effects,
+                lease: &lease,
+                state_dir,
+            }
+            .create_new(
+                None,
+                data_root,
+                &state_dir.join("memory.sqlite3"),
+                &project_id,
+                history_mode,
+                session.workflow.as_ref(),
+                polaris_core::management_effect::ManagementInventoryIdV1::parse("T06")
+                    .expect("approved T06 inventory"),
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            polaris_core::session_store::PersistedSession::create(
+                data_root,
+                &state_dir.join("memory.sqlite3"),
+                &project_id,
+                history_mode,
+                session.workflow.as_ref(),
+            )
+            .map_err(|error| error.to_string())?
+        };
+        #[cfg(not(unix))]
         let persistence = polaris_core::session_store::PersistedSession::create(
             data_root,
             &state_dir.join("memory.sqlite3"),
@@ -384,10 +1045,61 @@ struct TuiAdmissionTurn {
     admission_id: polaris_core::session_manager::AdmissionId,
 }
 
+struct TuiPromptRequest<'a> {
+    host: &'a polaris_core::mcp::local::LocalHost,
+    choice: &'a polaris_core::mcp::runtime::McpPromptChoice,
+    selector: Option<Arc<dyn Provider>>,
+    ceiling: polaris_core::mcp::operation::ExternalCeiling,
+}
+
+async fn select_tui_prompt(
+    request: TuiPromptRequest<'_>,
+    session_id: &str,
+    run_id: &str,
+) -> Result<
+    (
+        polaris_core::mcp::runtime::RunRuntime,
+        polaris_provider::Message,
+    ),
+    (String, bool),
+> {
+    let (mut runtime, _) = request
+        .host
+        .runtime(session_id, run_id, request.ceiling)
+        .map_err(|error| (format!("MCPを準備できません: {error}"), false))?
+        .ok_or_else(|| ("MCPサーバーを利用できません".to_owned(), false))?;
+    request
+        .host
+        .configure_preselection(&mut runtime, request.selector, None);
+    let selected = tokio::time::timeout(
+        Duration::from_secs(30),
+        runtime.host_prompt(request.choice, std::future::pending()),
+    )
+    .await;
+    match selected {
+        Ok(Ok(result)) if result.permits_continuation() => Ok((runtime, result.message)),
+        Ok(Ok(result)) => {
+            let unknown =
+                result.disposition == polaris_core::desktop_store::McpDisposition::OutcomeUnknown;
+            let _ = runtime.shutdown().await;
+            Err(("MCP promptを確認できません".into(), unknown))
+        }
+        Ok(Err(error)) => {
+            let _ = runtime.shutdown().await;
+            Err((format!("MCP promptを取得できません: {error}"), true))
+        }
+        Err(_) => {
+            let _ = runtime.shutdown().await;
+            Err(("MCP prompt取得が時間切れです".into(), true))
+        }
+    }
+}
+
 #[derive(Debug)]
 enum TuiAdmissionFailure {
     Retryable(String),
     Consumed(String),
+    PromptFailed { message: String, unknown: bool },
 }
 
 impl TuiAdmissionFailure {
@@ -398,6 +1110,7 @@ impl TuiAdmissionFailure {
     fn message(&self) -> &str {
         match self {
             Self::Retryable(message) | Self::Consumed(message) => message,
+            Self::PromptFailed { message, .. } => message,
         }
     }
 }
@@ -415,6 +1128,19 @@ impl From<&str> for TuiAdmissionFailure {
 }
 
 impl TuiAdmissionTurn {
+    fn run_id(&self) -> Result<&str, String> {
+        let admission = self
+            .manager
+            .status(&self.admission_id)
+            .map_err(|error| error.to_string())?;
+        match &admission.state {
+            polaris_core::session_manager::AdmissionState::Running { run_id, .. } => {
+                Ok(run_id.as_str())
+            }
+            _ => Err("sidechat runが実行中ではありません".into()),
+        }
+    }
+
     fn finish(
         mut self,
         status: polaris_core::session_manager::TerminalStatus,
@@ -451,7 +1177,7 @@ fn tui_routing_context(
     use polaris_core::session_manager::{CompletedUserTurnV1, RoutingContextV1};
     use polaris_provider::Role;
 
-    let goal = session.workflow.as_ref().map_or_else(
+    let mut goal = session.workflow.as_ref().map_or_else(
         || "none".to_owned(),
         |workflow| {
             let state = workflow.state();
@@ -466,6 +1192,16 @@ fn tui_routing_context(
             }
         },
     );
+    if let Some(saved) = &session.persistence {
+        let snapshot = saved.snapshot().map_err(|e| e.to_string())?;
+        if let Some(saved_goal) = snapshot
+            .state
+            .goal
+            .filter(|goal| goal.active && !goal.stopped)
+        {
+            goal = saved_goal.text;
+        }
+    }
     let users = session
         .messages
         .iter()
@@ -516,43 +1252,9 @@ fn open_tui_admission_owner(
     ),
     String,
 > {
-    use polaris_core::desktop_store::SessionManagerStore;
-    use polaris_core::session_manager::SessionManagerV1;
-
     let root = ensure_private_directory(&state_dir.join("tui-admissions-v1"))?;
-    let mut found = None;
-    for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let file_type = entry.file_type().map_err(|error| error.to_string())?;
-        if file_type.is_symlink() {
-            return Err("TUI admission保存先にsymlinkがあります".into());
-        }
-        if !file_type.is_dir() {
-            continue;
-        }
-        let path = fs::canonicalize(entry.path()).map_err(|error| error.to_string())?;
-        let store = SessionManagerStore::open_owned(&path).map_err(|error| error.to_string())?;
-        let Some(manager) = store.load().map_err(|error| error.to_string())? else {
-            continue;
-        };
-        if manager.sessions.contains_key(current) {
-            if found.is_some() {
-                return Err("conversationが複数のTUI admission ownerに属しています".into());
-            }
-            found = Some((store, manager));
-        }
-    }
-    if let Some(found) = found {
-        return Ok(found);
-    }
-
-    let family = ensure_private_directory(&root.join(current.as_str()))?;
-    let store = SessionManagerStore::open_owned(&family).map_err(|error| error.to_string())?;
-    let manager = SessionManagerV1::new(current.clone());
-    store
-        .initialize(&manager)
-        .map_err(|error| error.to_string())?;
-    Ok((store, manager))
+    polaris_core::desktop_store::SessionManagerStore::open_family_owned(&root, current)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(not(unix))]
@@ -579,7 +1281,8 @@ fn persist_manager_transition(
         .map_err(|error| error.to_string())
 }
 
-fn recover_tui_admission_owner(
+/// Restore accepted admissions before a TUI or one-shot CLI input is admitted.
+pub fn recover_admission_owner(
     store: &polaris_core::desktop_store::SessionManagerStore,
     manager: &mut polaris_core::session_manager::SessionManagerV1,
     data_root: &Path,
@@ -636,19 +1339,37 @@ fn recover_tui_admission_owner(
             }
         }
         let before = manager.revision;
-        if matches!(admission.state, AdmissionState::Running { .. }) {
-            manager
-                .terminal(
-                    &id,
-                    before,
-                    admission.revision,
-                    TerminalStatus::OutcomeUnknown,
-                )
-                .map_err(|error| error.to_string())?;
-        } else {
-            manager
-                .cancel(&id, before, admission.revision)
-                .map_err(|error| error.to_string())?;
+        match admission.state {
+            AdmissionState::Running { .. } => {
+                manager
+                    .terminal(
+                        &id,
+                        before,
+                        admission.revision,
+                        TerminalStatus::OutcomeUnknown,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            AdmissionState::InputAppended { .. } | AdmissionState::RunQueued { .. } => {
+                manager
+                    .recover_unstarted_committed(&id, before, admission.revision)
+                    .map_err(|error| error.to_string())?;
+            }
+            AdmissionState::DestinationReady { .. } => {
+                manager
+                    .fail_preflight(
+                        &id,
+                        before,
+                        admission.revision,
+                        TerminalStatus::OutcomeUnknown,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            _ => {
+                manager
+                    .cancel(&id, before, admission.revision)
+                    .map_err(|error| error.to_string())?;
+            }
         }
         persist_manager_transition(store, before, manager)?;
     }
@@ -702,7 +1423,20 @@ async fn admit_tui_input(
     session_started_at_millis: &mut u128,
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
     turn_authority: Option<&TurnAuthorityInstaller>,
-) -> Result<(TuiAdmissionTurn, Option<String>), TuiAdmissionFailure> {
+    rewind_pre_manifest_id: Option<&str>,
+    tool_memory_enabled: bool,
+    project: &Path,
+    auto_route: bool,
+    prompt_request: Option<TuiPromptRequest<'_>>,
+) -> Result<
+    (
+        TuiAdmissionTurn,
+        Option<String>,
+        Option<polaris_core::conversation_state::RewindBoundaryV1>,
+        Option<polaris_core::mcp::runtime::RunRuntime>,
+    ),
+    TuiAdmissionFailure,
+> {
     use polaris_core::session_manager::{
         AdmissionState, DestinationMode, NextRunnableV1, SessionId, SubmissionPayloadV1,
         SubmitOutcomeV1, SubmitRequestV1,
@@ -716,40 +1450,106 @@ async fn admit_tui_input(
     let current =
         SessionId::new(snapshot.state.session_id.clone()).map_err(|error| error.to_string())?;
     let session_revision = snapshot.state.generation;
-    let goal_revision = session
-        .workflow
+    let goal_revision = snapshot
+        .state
+        .goal
         .as_ref()
-        .map_or(0, |workflow| workflow.state().revision);
+        .map_or(0, |goal| goal.revision.get());
     let (store, mut manager) = open_tui_admission_owner(state_dir, &current)?;
-    recover_tui_admission_owner(
+    recover_admission_owner(
         &store,
         &mut manager,
         &persistence.data_root,
         &persistence.database,
         &snapshot.state.project_id,
     )?;
-    let before = manager.revision;
-    manager
-        .observe_session_revisions(&current, before, session_revision, goal_revision)
-        .map_err(|error| error.to_string())?;
-    persist_manager_transition(&store, before, &manager)?;
-
+    if let Some(blocked) = manager.outcome_unknown_blocker(&current) {
+        return Err(format!(
+            "入力 {} の実行状態が不明です。この会話では新しい入力を開始できません。/new で別会話を作成するか、保存状態を確認してください",
+            blocked.id.as_str()
+        )
+        .into());
+    }
     let request = SubmitRequestV1 {
         parent_session: current.clone(),
         payload: SubmissionPayloadV1 {
             text: text.to_owned(),
             attachment_ids: Vec::new(),
-            route: DestinationMode::Auto,
+            route: if auto_route {
+                DestinationMode::Auto
+            } else {
+                DestinationMode::Current
+            },
             expected_session_revision: session_revision,
             expected_goal_revision: goal_revision,
         },
-        admission_id: None,
+        admission_id: Some(
+            polaris_core::session_manager::AdmissionId::new(format!("tui-{}", new_session_id()))
+                .map_err(|error| error.to_string())?,
+        ),
     };
     let before = manager.revision;
-    let SubmitOutcomeV1::Accepted { admission, .. } = manager
-        .submit(request, before)
+    manager
+        .observe_session_revisions(&current, before, session_revision, goal_revision)
         .map_err(|error| error.to_string())?;
-    persist_manager_transition(&store, before, &manager)?;
+    let SubmitOutcomeV1::Accepted { admission, .. } = manager
+        .submit(request, manager.revision)
+        .map_err(|error| match error {
+            polaris_core::session_manager::AdmissionError::Capacity(_) => {
+                "この会話の保存容量が不足しています。処理が静止したら /fork で継続してください"
+                    .to_owned()
+            }
+            _ => error.to_string(),
+        })?;
+    let mut receipts = std::collections::BTreeMap::new();
+    receipts.insert(current.clone(), snapshot.state.admission_receipts.len());
+    for session_id in manager
+        .sessions
+        .keys()
+        .filter(|id| id.as_str() != current.as_str())
+    {
+        let count = match polaris_core::session_store::PersistedSession::open(
+            &persistence.data_root,
+            &persistence.database,
+            &snapshot.state.project_id,
+            session_id.as_str(),
+        ) {
+            Ok(saved) => saved
+                .snapshot()
+                .map_err(|error| error.to_string())?
+                .state
+                .admission_receipts
+                .len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.to_string().into()),
+        };
+        receipts.insert(session_id.clone(), count);
+    }
+    manager
+        .check_receipt_capacity(&receipts)
+        .map_err(|error| match error {
+            polaris_core::session_manager::AdmissionError::Capacity(_) => {
+                "この会話の保存容量が不足しています。処理が静止したら /fork で継続してください"
+                    .to_owned()
+            }
+            _ => error.to_string(),
+        })?;
+    store
+        .persist_observed_submission(
+            before,
+            &manager,
+            &receipts,
+            &current,
+            session_revision,
+            goal_revision,
+        )
+        .map_err(|error| match error {
+            polaris_core::desktop_store::StoreError::Capacity(_) => {
+                "この会話の保存容量が不足しています。処理が静止したら /fork で継続してください"
+                    .to_owned()
+            }
+            _ => error.to_string(),
+        })?;
 
     let before = manager.revision;
     let classifying = manager
@@ -757,7 +1557,7 @@ async fn admit_tui_input(
         .map_err(|error| error.to_string())?;
     persist_manager_transition(&store, before, &manager)?;
     let approval_reply = !session.clarification.unanswered().is_empty();
-    let judgement = if approval_reply {
+    let judgement = if !auto_route || approval_reply {
         None
     } else if let Some(decider) = decider {
         let context = tui_routing_context(session)?;
@@ -778,9 +1578,19 @@ async fn admit_tui_input(
         .map_err(|error| error.to_string())?;
     persist_manager_transition(&store, before, &manager)?;
     let before = manager.revision;
-    let prepared = manager
-        .prepare_destination(&admission.id, before, decided.revision)
-        .map_err(|error| error.to_string())?;
+    let prepared = match manager.prepare_destination(&admission.id, before, decided.revision) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // A rejected new Sidechat must not leave a Decided admission at
+            // the queue head. No input or host prompt has been sent yet.
+            manager
+                .cancel(&admission.id, before, decided.revision)
+                .map_err(|cancel_error| TuiAdmissionFailure::consumed(cancel_error.to_string()))?;
+            persist_manager_transition(&store, before, &manager)
+                .map_err(TuiAdmissionFailure::consumed)?;
+            return Err(format!("sidechat destinationを準備できません: {error}").into());
+        }
+    };
     persist_manager_transition(&store, before, &manager)?;
     let (destination, reason) = match &prepared.state {
         AdmissionState::DestinationReady { session_id, reason } => (session_id.clone(), *reason),
@@ -807,9 +1617,57 @@ async fn admit_tui_input(
         persist_manager_transition(&store, before, &manager)?;
         return Err(format!("routine authorityを接続できません: {error}").into());
     }
-    let appended_now = destination_session
-        .push_admitted_user(text, &admission.id, &prepared.payload_hash)
-        .map_err(|error| TuiAdmissionFailure::consumed(error.to_string()))?;
+    let mut selected_mcp_runtime = None;
+    let selected_message = if let Some(request) = prompt_request {
+        let run_id = polaris_core::session_manager::RunId::derive(&admission.id);
+        let selection = select_tui_prompt(request, destination.as_str(), run_id.as_str()).await;
+        match selection {
+            Ok((runtime, message)) => {
+                selected_mcp_runtime = Some(runtime);
+                Some(message)
+            }
+            Err((message, unknown)) => {
+                let before = manager.revision;
+                manager
+                    .fail_preflight(
+                        &admission.id,
+                        before,
+                        prepared.revision,
+                        if unknown {
+                            polaris_core::session_manager::TerminalStatus::OutcomeUnknown
+                        } else {
+                            polaris_core::session_manager::TerminalStatus::Failed
+                        },
+                    )
+                    .map_err(|error| TuiAdmissionFailure::consumed(error.to_string()))?;
+                persist_manager_transition(&store, before, &manager)
+                    .map_err(TuiAdmissionFailure::consumed)?;
+                return Err(TuiAdmissionFailure::PromptFailed { message, unknown });
+            }
+        }
+    } else {
+        None
+    };
+    let (rewind_boundary, rewind_warning) = match begin_rewind_for_session(
+        destination_session,
+        rewind_pre_manifest_id,
+        project,
+        state_dir,
+        tool_memory_enabled,
+    ) {
+        Ok(boundary) => (boundary, None),
+        Err(error) => (None, Some(format!("巻き戻し保存を開始できません: {error}"))),
+    };
+    let appended_now = match selected_message {
+        Some(message) => destination_session.push_admitted_user_with_supplement(
+            text,
+            message,
+            &admission.id,
+            &prepared.payload_hash,
+        ),
+        None => destination_session.push_admitted_user(text, &admission.id, &prepared.payload_hash),
+    }
+    .map_err(|error| TuiAdmissionFailure::consumed(error.to_string()))?;
     let before = manager.revision;
     let appended = if appended_now {
         manager
@@ -857,12 +1715,19 @@ async fn admit_tui_input(
             manager,
             admission_id: admission.id,
         },
-        switched.then(|| {
-            format!(
+        match (switched, rewind_warning) {
+            (true, Some(warning)) => Some(format!(
+                "sidechat {} に切り替えました ({reason:?}, running) · {warning}",
+                destination.as_str()
+            )),
+            (true, None) => Some(format!(
                 "sidechat {} に切り替えました ({reason:?}, running)",
                 destination.as_str()
-            )
-        }),
+            )),
+            (false, warning) => warning,
+        },
+        rewind_boundary,
+        selected_mcp_runtime,
     ))
 }
 
@@ -1020,6 +1885,10 @@ fn schedule_tui_shadow(
     let Some(input) = tui_shadow_input(session, prompt, control)? else {
         return Ok(false);
     };
+    #[cfg(target_os = "linux")]
+    if signal::pending_linux_process_shutdown().is_some() {
+        return Ok(false);
+    }
     finalizer
         .schedule(input)
         .map_err(|error| error.to_string())?;
@@ -1084,12 +1953,108 @@ fn configure_saved_tool_memory(
     if let Some(mode) = mode
         && memory::saved_project_matches(session, project, session_path)
     {
+        if let Some(persistence) = session.persistence.as_ref() {
+            let snapshot = persistence.snapshot()?;
+            let mut origins = snapshot
+                .state
+                .ancestors
+                .iter()
+                .map(|ancestor| ancestor.session_id.clone())
+                .collect::<Vec<_>>();
+            origins.sort();
+            origins.dedup();
+            if origins.len() > MAX_TOOL_MEMORY_ORIGINS {
+                return Err(std::io::Error::other("記憶の系譜が上限を超えています"));
+            }
+            if let Some(branch) = persistence.store.rewind_branch_metadata()? {
+                if !origins.contains(&branch.origin_session_id) {
+                    return Err(std::io::Error::other(
+                        "rewind分岐の記憶出自が保存された系譜と一致しません",
+                    ));
+                }
+                tool_memory::configure_tool_memory_with_origin_allowlist(
+                    session,
+                    project,
+                    state_dir,
+                    &snapshot.state.session_id,
+                    &origins,
+                    &branch.visible_memory_raw_object_ids,
+                    mode,
+                    embedding,
+                )?;
+            } else {
+                tool_memory::configure_tool_memory_with_origins(
+                    session,
+                    project,
+                    state_dir,
+                    &snapshot.state.session_id,
+                    &origins,
+                    mode,
+                    embedding,
+                )?;
+            }
+            return Ok(());
+        }
         let (id, origins) = saved_tool_memory_namespace(project, session_path)?;
         tool_memory::configure_tool_memory_with_origins(
             session, project, state_dir, &id, &origins, mode, embedding,
         )?;
     }
     Ok(())
+}
+
+fn visible_rewind_memory_ids(
+    session: &polaris_core::session::Session,
+    project: &Path,
+    state_dir: &Path,
+) -> std::io::Result<Vec<String>> {
+    let Some(persistence) = session.persistence.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let snapshot = persistence.snapshot()?;
+    let mut origins = snapshot
+        .state
+        .ancestors
+        .iter()
+        .map(|ancestor| ancestor.session_id.clone())
+        .collect::<Vec<_>>();
+    origins.sort();
+    origins.dedup();
+    if origins.len() > MAX_TOOL_MEMORY_ORIGINS {
+        return Err(std::io::Error::other("記憶の系譜が上限を超えています"));
+    }
+    let branch = persistence.store.rewind_branch_metadata()?;
+    tool_memory::visible_tool_memory_raw_object_ids(
+        project,
+        state_dir,
+        &snapshot.state.session_id,
+        &origins,
+        branch
+            .as_ref()
+            .map(|metadata| metadata.visible_memory_raw_object_ids.as_slice()),
+    )
+}
+
+fn begin_rewind_for_session(
+    session: &polaris_core::session::Session,
+    pre_manifest_id: Option<&str>,
+    project: &Path,
+    state_dir: &Path,
+    tool_memory_enabled: bool,
+) -> std::io::Result<Option<polaris_core::conversation_state::RewindBoundaryV1>> {
+    let (Some(pre_manifest_id), Some(persistence)) =
+        (pre_manifest_id, session.persistence.as_ref())
+    else {
+        return Ok(None);
+    };
+    let visible = if tool_memory_enabled {
+        visible_rewind_memory_ids(session, project, state_dir)?
+    } else {
+        Vec::new()
+    };
+    persistence
+        .begin_rewind_boundary(pre_manifest_id.to_owned(), visible)
+        .map(Some)
 }
 
 /// Collapses a leading `$HOME` to `~`, for the footer only (see
@@ -1176,6 +2141,7 @@ fn is_secret_command(text: &str) -> bool {
             .next()
             .is_some_and(|word| word.eq_ignore_ascii_case("secret"))
 }
+
 // A secret command can also be completed around text already in the composer
 // (for example by moving the cursor to the start). Check the complete buffer
 // before any draw, not only the next character typed after the command.
@@ -1196,6 +2162,7 @@ fn secret_set_has_value(input: &str) -> Option<bool> {
         None
     }
 }
+
 fn redact_inline_secret_value(
     input: &mut String,
     cursor: &mut usize,
@@ -1210,6 +2177,7 @@ fn redact_inline_secret_value(
     *cursor = input.len();
     true
 }
+
 fn secret_value_key_is_blocked(input: &str, key: &ratatui::crossterm::event::KeyEvent) -> bool {
     use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
@@ -1218,6 +2186,7 @@ fn secret_value_key_is_blocked(input: &str, key: &ratatui::crossterm::event::Key
         && matches!(key.code, KeyCode::Char(_))
         && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
+
 fn apply_inflight_key(
     input_buffer: &mut String,
     input_cursor: &mut usize,
@@ -1257,6 +2226,84 @@ fn record_submission(
 ) {
     if !dispatching_queued_input {
         input_history.record(text);
+    }
+}
+
+/// `/quit` consumes its own submission, but must leave other queued input
+/// and the draft that was displaced by a queued command intact.
+fn refuse_quit_with_pending_work(
+    queued_inputs: &VecDeque<String>,
+    input_history: &mut input::History,
+    input_buffer: &mut String,
+    input_cursor: &mut usize,
+    saved_draft: Option<(String, usize)>,
+    submitted_command: &str,
+    dispatching_queued_input: bool,
+    status: &mut Status,
+) -> bool {
+    let has_saved_draft = saved_draft
+        .as_ref()
+        .is_some_and(|(draft, _)| !draft.is_empty());
+    if queued_inputs.is_empty()
+        && input_buffer.is_empty()
+        && !has_saved_draft
+        && !input_history.has_hidden_draft()
+    {
+        return false;
+    }
+    if let Some((draft, cursor)) = saved_draft.filter(|(draft, _)| !draft.is_empty()) {
+        *input_buffer = draft;
+        *input_cursor = cursor;
+    } else if input_buffer.is_empty() {
+        if let Some(draft) = input_history.take_hidden_draft() {
+            *input_buffer = draft;
+            *input_cursor = input_buffer.len();
+        } else if !dispatching_queued_input {
+            input_buffer.push_str(submitted_command);
+            *input_cursor = input_buffer.len();
+        }
+    }
+    *status = Status::Notice("送信待ち・下書きを処理してから /quit を実行してください".into());
+    true
+}
+
+fn submission_resumes_queued_inputs(text: &str) -> bool {
+    !matches!(
+        slash::parse(text),
+        Some(slash::Action::New | slash::Action::Quit)
+    )
+}
+
+fn record_submission_before_dispatch(
+    input_history: &mut input::History,
+    text: &str,
+    dispatching_queued_input: bool,
+) {
+    // `/new` and `/quit` can be rejected after Enter, so a saved draft
+    // stays in history navigation until the command actually succeeds.
+    if !matches!(
+        slash::parse(text),
+        Some(slash::Action::New | slash::Action::Quit)
+    ) {
+        record_submission(input_history, text, dispatching_queued_input);
+    }
+}
+
+fn restore_rejected_new_submission(
+    submitted: String,
+    cursor: usize,
+    queued: bool,
+    input_buffer: &mut String,
+    input_cursor: &mut usize,
+    queued_inputs: &mut VecDeque<String>,
+    queued_inputs_paused: &mut bool,
+) {
+    if queued {
+        queued_inputs.push_front(submitted);
+        *queued_inputs_paused = true;
+    } else {
+        *input_buffer = submitted;
+        *input_cursor = cursor;
     }
 }
 
@@ -1348,6 +2395,7 @@ fn reset_conversation_view(
     history.extend(render::header_history_lines(header, width));
     history_wrap_cache.invalidate();
     activity_rows.rows.clear();
+    activity_rows.tools.clear();
     *scroll_offset = 0;
     *selection = None;
 }
@@ -1382,6 +2430,55 @@ fn keep_or_roll_back(
 #[derive(Default)]
 struct AgentActivityRows {
     rows: HashMap<(String, String), usize>,
+    tools: VecDeque<(String, String, &'static str)>,
+}
+
+impl AgentActivityRows {
+    fn tool_detail_lines(&self) -> Vec<String> {
+        if self.tools.is_empty() {
+            return vec!["この実行でtoolイベントは観測されていません".into()];
+        }
+        self.tools
+            .iter()
+            .map(|(name, _, state)| format!("tool {}: {}", render::sanitize(name), state))
+            .collect()
+    }
+    fn observe_tool(&mut self, event: &polaris_core::AgentEvent) {
+        let (name, detail, state) = match event {
+            polaris_core::AgentEvent::ToolStarted { name, detail } => {
+                (name, detail, "開始を観測・完了未確認")
+            }
+            polaris_core::AgentEvent::ToolFinished {
+                name, detail, ok, ..
+            } => (
+                name,
+                detail,
+                if *ok {
+                    "成功を観測"
+                } else {
+                    "失敗を観測"
+                },
+            ),
+            _ => return,
+        };
+        let name = name.chars().take(256).collect::<String>();
+        let detail = detail.chars().take(256).collect::<String>();
+        if matches!(event, polaris_core::AgentEvent::ToolFinished { .. }) {
+            if let Some(row) = self
+                .tools
+                .iter_mut()
+                .rev()
+                .find(|(n, d, s)| n == &name && d == &detail && *s == "開始を観測・完了未確認")
+            {
+                row.2 = state;
+                return;
+            }
+        }
+        if self.tools.len() == 128 {
+            self.tools.pop_front();
+        }
+        self.tools.push_back((name, detail, state));
+    }
 }
 
 fn append_live_event(
@@ -1389,6 +2486,7 @@ fn append_live_event(
     history: &mut Vec<render::HistoryLine>,
     activity_rows: &mut AgentActivityRows,
 ) -> usize {
+    activity_rows.observe_tool(event);
     let key = match event {
         polaris_core::AgentEvent::SpawnStarted {
             display_name,
@@ -1501,6 +2599,136 @@ fn print_resume_hint(session_id: &str) {
     );
 }
 
+/// A saved conversation may be resumed only against the workspace version
+/// recorded at its current raw head. In particular, rewinding one branch
+/// must not silently run an older conversation against the restored files.
+#[cfg(unix)]
+fn validate_resume_workspace(
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    persistence: &polaris_core::session_store::PersistedSession,
+) -> Result<(), String> {
+    polaris_core::rewind_admission::validate_execution(owner, persistence)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn open_rewind_workspace(
+    cwd: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> Result<polaris_core::rewind_workspace::WorkspaceOwner, String> {
+    use polaris_core::rewind_workspace::{ResolveOutcome, RewindLimits, WorkspaceOwner};
+    let project_root = polaris_core::project::resolve_root(cwd);
+    let owner = WorkspaceOwner::open(
+        &project_root,
+        &state_dir.join("rewind-workspace"),
+        RewindLimits::default(),
+    )
+    .map_err(|error| format!("巻き戻し保存先を検証できません: {error}"))?;
+    match owner.resolve_pending() {
+        Ok(ResolveOutcome::Clean) => Ok(owner),
+        Ok(ResolveOutcome::RolledBack(_)) => Err(
+            "巻き戻し途中のファイルを復旧しました。設定を読み直すためPolarisを再起動してください。"
+                .into(),
+        ),
+        Err(error) => Err(format!("巻き戻し途中の復旧を確認できません: {error}")),
+    }
+}
+
+#[cfg(unix)]
+fn show_persisted_read_only_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    persistence: &polaris_core::session_store::PersistedSession,
+    reason: &str,
+) -> Result<(), String> {
+    let snapshot = persistence.snapshot().map_err(|error| error.to_string())?;
+    let messages = snapshot
+        .events
+        .into_iter()
+        .map(|event| event.message)
+        .collect::<Vec<_>>();
+    let source = format!("保存会話（閲覧のみ）: {reason}");
+    show_read_only_transcript(terminal, reader, &messages, &source);
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn show_startup_read_only_resume(
+    persistence: &polaris_core::session_store::PersistedSession,
+    reason: &str,
+) -> Result<(), String> {
+    ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::EnterAlternateScreen
+    )
+    .map_err(|error| error.to_string())?;
+    let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
+        viewport: ratatui::Viewport::Fullscreen,
+    }));
+    let mut reader = CrosstermKeyReader;
+    let result = show_persisted_read_only_resume(&terminal, &mut reader, persistence, reason);
+    ratatui::restore();
+    result
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn show_startup_workflow_confirmation(view: &render::WorkflowChangeConfirmView<'_>) -> bool {
+    if ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::EnterAlternateScreen
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
+        viewport: ratatui::Viewport::Fullscreen,
+    }));
+    let mut reader = CrosstermKeyReader;
+    let accepted = confirm_workflow_change(&terminal, &mut reader, view);
+    ratatui::restore();
+    accepted
+}
+
+#[cfg(target_os = "linux")]
+fn show_startup_read_only_resume(
+    persistence: &polaris_core::session_store::PersistedSession,
+    reason: &str,
+) -> Result<(), String> {
+    let (mut guard, terminal) = match linux_start_terminal(
+        signal::pending_linux_process_shutdown,
+        LinuxTerminalGuard::enter,
+    ) {
+        Ok(started) => started,
+        // This viewer is only entered after an existing startup failure.
+        Err(LinuxTerminalStartError::Shutdown(_)) => return Ok(()),
+        Err(LinuxTerminalStartError::Failed(error)) => return Err(error),
+    };
+    let terminal = RefCell::new(terminal);
+    let mut reader = LinuxSignalAwareKeyReader;
+    let result = show_persisted_read_only_resume(&terminal, &mut reader, persistence, reason);
+    linux_finish_guarded_terminal(result, &mut guard, linux_restore_terminal_step)
+}
+
+#[cfg(target_os = "linux")]
+fn show_startup_workflow_confirmation_checked(
+    view: &render::WorkflowChangeConfirmView<'_>,
+) -> Result<bool, String> {
+    let (mut guard, terminal) = match linux_start_terminal(
+        signal::pending_linux_process_shutdown,
+        LinuxTerminalGuard::enter,
+    ) {
+        Ok(started) => started,
+        Err(LinuxTerminalStartError::Shutdown(_)) => return Ok(false),
+        Err(LinuxTerminalStartError::Failed(error)) => return Err(error),
+    };
+    let terminal = RefCell::new(terminal);
+    let mut reader = LinuxSignalAwareKeyReader;
+    let accepted = confirm_workflow_change(&terminal, &mut reader, view)
+        && signal::pending_linux_process_shutdown().is_none();
+    linux_finish_guarded_terminal(Ok(accepted), &mut guard, linux_restore_terminal_step)
+}
+
 /// Splits `frame.area()` into the scrollable history region (top) and the
 /// footer region (bottom, `render::footer_height(suggestions.len())` rows —
 /// sized fresh each frame for exactly what this frame's footer content
@@ -1603,45 +2831,210 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         eprintln!("polaris: refusing to start the TUI on a non-interactive terminal");
         return ExitCode::FAILURE;
     }
+    #[cfg(target_os = "linux")]
+    if let Some(code) = linux_pending_exit_code() {
+        return code;
+    }
+
+
+    // These catalogs are process-owned. A successful rewind rebuilds them
+    // from the restored project tree before its branch becomes active.
+    let mut effective_skills = args.skills.to_vec();
+    let mut effective_agent_types = args.agent_types.to_vec();
+
+    #[cfg(unix)]
+    let rewind_workspace = {
+        match open_rewind_workspace(&args.cwd, &args.state_dir) {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                if let Some(continuation) = &args.continuation
+                    && let Err(viewer_error) =
+                        show_startup_read_only_resume(&continuation.persistence, &error)
+                {
+                    eprintln!("保存会話を閲覧できません: {viewer_error}");
+                }
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    // Recover the management journal only after pending workspace file
+    // transactions have been resolved. Opening needs the same exclusive
+    // project lease as rewind; ordinary turns take its shared side below.
+    #[cfg(unix)]
+    let (management_effects, workflow_recovery_issue) = {
+        let owner = rewind_workspace
+            .as_ref()
+            .expect("Unix TUI startup requires a rewind workspace owner");
+        let lease = match owner.try_mutation() {
+            Ok(lease) => lease,
+            Err(error) => {
+                eprintln!("管理操作の復旧を開始できません: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let project_root = polaris_core::project::resolve_root(&args.cwd);
+        let store =
+            match polaris_core::management_effect::ManagementEffectStoreV1::open_at_state_dir(
+                &project_root,
+                &args.state_dir,
+                &lease,
+            ) {
+                Ok(store) => store,
+                Err(error) => {
+                    eprintln!("管理操作の記録を復旧できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let Some(data_root) = args.sessions_dir.parent() else {
+            eprintln!("v2セッションの保存先を特定できません");
+            return ExitCode::FAILURE;
+        };
+        let project_id = match persist::project_identity(&project_root) {
+            Ok(project_id) => project_id,
+            Err(error) => {
+                eprintln!("プロジェクト識別子を取得できません: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let switch = polaris_core::session_switch::SessionSwitchOwner {
+            effects: &store,
+            lease: &lease,
+            state_dir: &args.state_dir,
+        };
+        if let Err(error) = switch.recover(
+            data_root,
+            &args.state_dir.join("memory.sqlite3"),
+            &project_id,
+        ) {
+            eprintln!("会話切替の証拠を復旧できません: {error}");
+            return ExitCode::FAILURE;
+        }
+        let workflow_owner =
+            polaris_core::management_effect::workflow_change::WorkflowChangeOwner {
+                effects: &store,
+                lease: &lease,
+                state_dir: &args.state_dir,
+            };
+        let recovery_issue = workflow_owner
+            .recover(
+                data_root,
+                &args.state_dir.join("memory.sqlite3"),
+                &project_id,
+            )
+            .err()
+            .map(|error| error.to_string());
+        (store, recovery_issue)
+    };
+
+    #[cfg(unix)]
+    let management_startup_blocker = match management_effects.blocker() {
+        Ok(blocker) => blocker.map(|effect| {
+            format!(
+                "未解決の管理操作 {} ({}) があります。新しい入力は開始できません{}",
+                effect.request.operation_id,
+                effect.request.inventory,
+                workflow_recovery_issue
+                    .as_ref()
+                    .map(|reason| format!("。復旧理由: {reason}"))
+                    .unwrap_or_default()
+            )
+        }),
+        Err(error) => {
+            eprintln!("管理操作の状態を確認できません: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[cfg(unix)]
+    if let Some(continuation) = &args.continuation {
+        if management_startup_blocker.is_none()
+            && let Err(error) = continuation
+                .persistence
+                .abandon_unfinished_rewind_boundaries("前回の実行が完了する前に終了しました".into())
+        {
+            eprintln!("未完了の巻き戻し境界を確認できません: {error}");
+            return ExitCode::FAILURE;
+        }
+        if let Some(owner) = &rewind_workspace
+            && let Err(error) = validate_resume_workspace(owner, &continuation.persistence)
+        {
+            if let Err(viewer_error) =
+                show_startup_read_only_resume(&continuation.persistence, &error)
+            {
+                eprintln!("保存会話を閲覧できません: {viewer_error}");
+            }
+            eprintln!("保存済み会話の作業ファイルを確認できません: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     // A launch without an explicit continuation starts empty: there is no
     // implicit session per project. Its JSONL id remains unwritten until the
     // first message; a prepared continuation retains its resolved v2 id.
-    let mut session = match new_workflow_session(WorkflowSessionArgs {
-        config: &args.workflow_config,
-        initial_phase: args.initial_phase,
-        history_mode: args.history_mode,
-        input_preparation: args.input_preparation,
-        cwd: &args.cwd,
-        state_dir: &args.state_dir,
-        sessions_dir: &args.sessions_dir,
-        strict_history: args.strict_history.clone(),
-        summary_usage: args.summary_usage.clone(),
-        history_backend_factory: args.history_backend_factory.as_ref(),
-        files_md_auto_regenerate: args.files_md_auto_regenerate,
-        approval_auto: args.approval_auto,
-        continuation: args.continuation.clone(),
-        workflow_mode_overridden: args.workflow_mode_overridden,
-        skills: args.skills,
-    })
-    .await
-    {
+    let blocked_session = {
+        #[cfg(unix)]
+        {
+            management_startup_blocker.as_ref().map(|_| {
+                let mut session = polaris_core::session::Session::new();
+                session.input_preparation = args.input_preparation;
+                session.disable_files_md_auto_regenerate = !args.files_md_auto_regenerate;
+                session.approval_auto = args.approval_auto;
+                session
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(code) = linux_pending_exit_code() {
+        return code;
+    }
+    let mut session = match if let Some(blocked) = blocked_session {
+        Ok(blocked)
+    } else {
+        new_workflow_session(WorkflowSessionArgs {
+            config: &args.workflow_config,
+            initial_phase: args.initial_phase,
+            history_mode: args.history_mode,
+            input_preparation: args.input_preparation,
+            cwd: &args.cwd,
+            state_dir: &args.state_dir,
+            sessions_dir: &args.sessions_dir,
+            strict_history: args.strict_history.clone(),
+            summary_usage: args.summary_usage.clone(),
+            history_backend_factory: args.history_backend_factory.as_ref(),
+            files_md_auto_regenerate: args.files_md_auto_regenerate,
+            approval_auto: args.approval_auto,
+            continuation: args.continuation.clone(),
+            workflow_mode_overridden: args.workflow_mode_overridden,
+            skills: &effective_skills,
+            #[cfg(unix)]
+            management_effects: Some(&management_effects),
+            #[cfg(unix)]
+            project_mutation: rewind_workspace.as_ref(),
+        })
+        .await
+    } {
         Ok(session) => session,
         Err(error) => {
+            #[cfg(target_os = "linux")]
+            if error == LINUX_SHUTDOWN_DURING_RESTORE {
+                if let Some(code) = linux_pending_exit_code() {
+                    return code;
+                }
+            }
             eprintln!("Can't start the workflow session: {error}");
             return ExitCode::FAILURE;
         }
     };
-    let mut session_started_at_millis = now_millis();
-    let session_id = session
-        .persistence
-        .as_ref()
-        .and_then(|saved| saved.snapshot().ok())
-        .map(|snapshot| snapshot.state.session_id)
-        .unwrap_or_else(new_session_id);
-    let mut session_path = args.sessions_dir.join(format!("{session_id}.jsonl"));
-    let mut meta_path = session_path.with_extension("meta.json");
-
+    #[cfg(target_os = "linux")]
+    if let Some(code) = linux_pending_exit_code() {
+        return code;
+    }
     if args
         .continuation
         .as_ref()
@@ -1651,6 +3044,83 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         eprintln!("strict10履歴を復元できません: {error}");
         return ExitCode::FAILURE;
     }
+    #[cfg(target_os = "linux")]
+    if let Some(code) = linux_pending_exit_code() {
+        return code;
+    }
+    #[cfg(unix)]
+    if management_startup_blocker.is_none()
+        && args.continuation.is_some()
+        && args.workflow_mode_overridden
+    {
+        let candidate =
+            match workflow_override_candidate(&session, &args.workflow_config, &effective_skills) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    eprintln!("workflow変更を検証できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let workspace = rewind_workspace
+            .as_ref()
+            .expect("Unix TUI startup requires a rewind workspace owner");
+        #[cfg(target_os = "linux")]
+        let startup_terminal_error = RefCell::new(None);
+        #[cfg(target_os = "linux")]
+        let confirm = |view: &render::WorkflowChangeConfirmView<'_>| {
+            match show_startup_workflow_confirmation_checked(view) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    *startup_terminal_error.borrow_mut() = Some(error);
+                    false
+                }
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let confirm = show_startup_workflow_confirmation;
+        let workflow_change = apply_confirmed_workflow_change(
+            &mut session,
+            candidate,
+            polaris_core::management_effect::workflow_change::WorkflowEffectInventoryV1::F15,
+            workspace,
+            &management_effects,
+            &args.state_dir,
+            confirm,
+        );
+        #[cfg(target_os = "linux")]
+        if let Some(error) = startup_terminal_error.into_inner() {
+            eprintln!("workflow確認画面を復旧できません: {error}");
+            return ExitCode::FAILURE;
+        }
+        match workflow_change {
+            Ok(WorkflowChangeResult::Changed | WorkflowChangeResult::NoChange) => {}
+            Ok(WorkflowChangeResult::Cancelled) => {
+                #[cfg(target_os = "linux")]
+                if let Some(code) = linux_pending_exit_code() {
+                    return code;
+                }
+                eprintln!("workflow変更を取り消しました");
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("workflow変更を保存できません: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(code) = linux_pending_exit_code() {
+            return code;
+        }
+    }
+    let mut session_started_at_millis = now_millis();
+    let session_id = session
+        .persistence
+        .as_ref()
+        .and_then(|saved| saved.snapshot().ok())
+        .map(|snapshot| snapshot.state.session_id)
+        .unwrap_or_else(new_session_id);
+    let mut session_path = args.sessions_dir.join(format!("{session_id}.jsonl"));
+    let mut meta_path = session_path.with_extension("meta.json");
 
     // One handle for the whole process, shared with any subagent `spawn`
     // starts — see `agent::run`'s docs on why the audit log is shared
@@ -1662,6 +3132,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
 
     // Shared via `RefCell`, not held exclusively — the agent-turn loop
     // below redraws the screen concurrently with `agent::run` (to animate
@@ -1682,14 +3153,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // into the bottom region, sized fresh each frame by
     // `render::footer_height` — the one draw routine every redraw point in
     // this loop shares.
-    // `ratatui::init_with_options` enables raw mode but — regardless of
-    // `Viewport` — does not itself enter the alternate screen, so that's
-    // done explicitly here (`EnterAlternateScreen`). `ratatui::restore()`
-    // at this function's single cleanup point below already leaves the
-    // alternate screen again on its own (confirmed against ratatui
-    // 0.29.0's source), so nothing else needs to undo this call — a
-    // fullscreen redraw never overwrites the user's real shell scrollback
-    // and always hands it back on exit.
+    // The alternate screen keeps the shell scrollback intact. Linux owns
+    // each acquired terminal state through a guard; other platforms retain
+    // the existing ratatui initialization and restoration path.
+    #[cfg(not(target_os = "linux"))]
     if let Err(e) = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::terminal::EnterAlternateScreen
@@ -1697,9 +3164,27 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         eprintln!("Can't enter the alternate screen: {e}");
         return ExitCode::FAILURE;
     }
+    #[cfg(not(target_os = "linux"))]
     let terminal = RefCell::new(ratatui::init_with_options(ratatui::TerminalOptions {
         viewport: ratatui::Viewport::Fullscreen,
     }));
+    #[cfg(target_os = "linux")]
+    let (mut terminal_guard, terminal) = match linux_start_terminal(
+        signal::pending_linux_process_shutdown,
+        LinuxTerminalGuard::enter,
+    ) {
+        Ok(started) => started,
+        Err(LinuxTerminalStartError::Shutdown(reason)) => return linux_signal_exit_code(reason),
+        Err(LinuxTerminalStartError::Failed(error)) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let terminal = {
+        terminal_guard.enable_mouse_and_cursor();
+        RefCell::new(terminal)
+    };
     // Trackpad/mouse wheel scrolling of the conversation history, and mouse
     // drag-to-select (see `selection.rs`) — without this, crossterm never
     // emits `Event::Mouse` at all. This blocks the terminal's own native
@@ -1708,6 +3193,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // selection instead of relying on that. Best-effort: a terminal that
     // doesn't support mouse reporting just keeps not sending mouse events,
     // same as before.
+    #[cfg(not(target_os = "linux"))]
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::event::EnableMouseCapture
@@ -1720,6 +3206,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // characters instead of on top of one, so this can't happen
     // regardless of what's under it. Best-effort: an unsupported terminal
     // just keeps its own default cursor shape, which is cosmetic only.
+    #[cfg(not(target_os = "linux"))]
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::cursor::SetCursorStyle::BlinkingBar
@@ -1774,6 +3261,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // through the ordinary input path after that turn finishes; the in-flight
     // turn is never mutated concurrently.
     let mut queued_inputs = VecDeque::new();
+    #[cfg(unix)]
+    let mut queued_instructions = VecDeque::<instruction_commands::QueuedInstructionV1>::new();
+    #[cfg(unix)]
+    let mut active_instruction: Option<instruction_commands::QueuedInstructionV1> = None;
     // A local copy, not `args.approval_policy` directly — `/permissions`
     // needs to be able to change it for the rest of the session, and
     // `args` isn't mutable (nor should adding one slash command make it
@@ -1797,14 +3288,31 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         .unwrap_or(UNDECIDED_EFFORT)
         .to_string();
     let mut effort_name = cloud_effort_name.clone();
-    let mut status = Status::Idle;
+    let mut status = {
+        #[cfg(unix)]
+        {
+            management_startup_blocker
+                .map(Status::Error)
+                .unwrap_or(Status::Idle)
+        }
+        #[cfg(not(unix))]
+        {
+            Status::Idle
+        }
+    };
+    #[cfg(unix)]
+    let mut rewind_unavailable_reason = "まだ保存済みの巻き戻し境界がありません".to_owned();
     let mut exit_confirmation = ExitConfirmation::default();
+    let mut rewind_gesture = rewind_ui::DoubleEscape::default();
+    #[cfg(not(target_os = "linux"))]
     let mut key_reader = CrosstermKeyReader;
+    #[cfg(target_os = "linux")]
+    let mut key_reader = LinuxSignalAwareKeyReader;
     // Each turn gets its own MCP runtime; connections and grants never carry over.
     let mcp_ceiling =
         polaris_core::mcp::operation::ExternalCeiling::host_external(args.mcp_external);
-    let mcp_host = polaris_core::mcp::local::LocalHost::open(&args.cwd, false).ok();
-    let mcp_setup = mcp_host
+    let mut mcp_host = polaris_core::mcp::local::LocalHost::open(&args.cwd, false).ok();
+    let mut mcp_setup = mcp_host
         .as_ref()
         .map(|host| Arc::new(host.setup_tool(mcp_ceiling)));
     let setting = Arc::new(polaris_core::recipe::tool::SettingTool::new(
@@ -1812,6 +3320,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     ));
     let computer = polaris_core::computer::ComputerTool::available().map(Arc::new);
     let mut mcp_turns = 0u64;
+    let mut pending_mcp_prompt: Option<polaris_core::mcp::runtime::McpPromptChoice> = None;
+    let mut mcp_prompt_requires_reselect = false;
+    let mut queued_inputs_paused = false;
     let mut fatal_message: Option<String> = None;
     // Set when a `HistoryCompacted` event is drained mid-turn (see the
     // `events_rx.recv()`/`try_recv` sites below) — `session.messages`
@@ -1835,11 +3346,123 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // the real history.
     let mut local_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
 
+    #[cfg(unix)]
+    let mut initial_saved_settings =
+        match polaris_core::session_settings::SavedSessionSettingsV1::new(
+            provider_name.clone(),
+            args.model_name.clone(),
+            args.initial_effort_name
+                .clone()
+                .unwrap_or_else(|| "auto".into()),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("初期設定を確認できません: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    #[cfg(unix)]
+    {
+        use polaris_core::{session_settings::ToolMemoryModeV1, tool_memory::RetentionMode};
+        initial_saved_settings.remember = args.remember;
+        initial_saved_settings.tool_memory = match args.tool_memory {
+            Some(RetentionMode::History) => ToolMemoryModeV1::History,
+            Some(RetentionMode::Retrieval) => ToolMemoryModeV1::Retrieval,
+            None => ToolMemoryModeV1::Off,
+        };
+        initial_saved_settings.compact_threshold = args.compact_at;
+        initial_saved_settings.tool_memory_embedding = match args
+            .tool_memory_embedding
+            .clone()
+            .map(|(url, model)| {
+                polaris_core::session_settings::SavedToolEmbeddingV1::new(url, model)
+            })
+            .transpose()
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("初期埋め込み設定を確認できません: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+    #[cfg(unix)]
+    let mut effective_saved_settings = initial_saved_settings.clone();
+    #[cfg(unix)]
+    let mut saved_settings_path: Option<PathBuf> = None;
+    #[cfg(unix)]
+    let mut refresh_saved_settings = true;
+    #[cfg(unix)]
+    let mut draft_candidate = String::new();
+    #[cfg(unix)]
+    let mut draft_saved_text = String::new();
+    #[cfg(unix)]
+    let mut draft_changed_at = Instant::now();
+    let mut next_max_turns = args.max_turns;
+    #[cfg(unix)]
+    let mut last_submission_was_local = false;
     let mut tool_memory_path: Option<PathBuf> = None;
     let exit_code = 'outer: loop {
+        #[cfg(target_os = "linux")]
+        if let Some(code) = linux_pending_exit_code() {
+            break code;
+        }
+        if redact_inline_secret_value(&mut input_buffer, &mut input_cursor, &mut input_history) {
+            status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+        }
         // `/new`, `/fork`, and `/resume` replace the conversation owner.
         // Reattach process-owned services and selectors before accepting the
         // next input; none of these belong to durable conversation state.
+        #[cfg(unix)]
+        if refresh_saved_settings || saved_settings_path.as_ref() != Some(&session_path) {
+            let switched = saved_settings_path.as_ref() != Some(&session_path);
+            if let Some(saved) = &session.persistence {
+                match saved.snapshot() {
+                    Ok(snapshot) => {
+                        effective_saved_settings =
+                            snapshot.state.session_settings.unwrap_or_else(|| {
+                                let mut initial = initial_saved_settings.clone();
+                                initial.model = model_name.clone();
+                                initial
+                            });
+                        if effective_saved_settings.provider != provider_name {
+                            fatal_message = Some("保存providerが起動時providerと異なります。指定して再起動してください".into());
+                            break 'outer ExitCode::FAILURE;
+                        }
+                        if model_name != effective_saved_settings.model {
+                            if args.provider.model().is_none() {
+                                fatal_message =
+                                    Some("保存modelをこのproviderへ適用できません".into());
+                                break 'outer ExitCode::FAILURE;
+                            }
+                            args.provider.set_model(&effective_saved_settings.model);
+                            if args.provider.model().as_deref()
+                                != Some(effective_saved_settings.model.as_str())
+                            {
+                                fatal_message = Some("保存modelの適用を確認できません".into());
+                                break 'outer ExitCode::FAILURE;
+                            }
+                            model_name = effective_saved_settings.model.clone();
+                        }
+                        if switched {
+                            input_buffer = snapshot.state.draft.text;
+                            input_cursor = input_buffer.len();
+                            input_history = input::History::new();
+                            draft_saved_text = input_buffer.clone();
+                            draft_candidate = input_buffer.clone();
+                            draft_changed_at = Instant::now();
+                        }
+                    }
+                    Err(error) => {
+                        fatal_message = Some(format!("会話設定を復元できません: {error}"));
+                        break 'outer ExitCode::FAILURE;
+                    }
+                }
+            }
+            saved_settings_path = Some(session_path.clone());
+            refresh_saved_settings = false;
+            tool_memory_path = None;
+        }
         session.decider = args.decider.clone();
         session.tier_decider = args.tier_decider.clone();
         session.light_model = args.mcp_selection_provider.clone();
@@ -1851,7 +3474,25 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // since queueing it, then restore that draft before the queued item
         // begins its turn.
         let mut draft_after_queued_dispatch = None;
-        let dispatching_queued_input = if let Some(queued) = queued_inputs.pop_front() {
+        #[cfg(unix)]
+        if active_instruction.is_none() && !queued_inputs_paused {
+            active_instruction = queued_instructions.pop_front();
+        }
+        #[cfg(unix)]
+        let instruction_text = active_instruction
+            .as_ref()
+            .map(|item| item.text().to_owned());
+        #[cfg(not(unix))]
+        let instruction_text: Option<String> = None;
+        let dispatching_queued_input = if let Some(queued) = instruction_text {
+            draft_after_queued_dispatch = Some((std::mem::take(&mut input_buffer), input_cursor));
+            input_buffer = queued;
+            input_cursor = input_buffer.len();
+            true
+        } else if let Some(queued) = (!queued_inputs_paused)
+            .then(|| queued_inputs.pop_front())
+            .flatten()
+        {
             draft_after_queued_dispatch = Some((std::mem::take(&mut input_buffer), input_cursor));
             input_buffer = queued;
             input_cursor = input_buffer.len();
@@ -1859,8 +3500,30 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         } else {
             false
         };
+        if redact_inline_secret_value(&mut input_buffer, &mut input_cursor, &mut input_history) {
+            status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+        }
+        #[cfg(unix)]
+        let saved_tool_mode = match effective_saved_settings.tool_memory {
+            polaris_core::session_settings::ToolMemoryModeV1::Off => None,
+            polaris_core::session_settings::ToolMemoryModeV1::History => {
+                Some(polaris_core::tool_memory::RetentionMode::History)
+            }
+            polaris_core::session_settings::ToolMemoryModeV1::Retrieval => {
+                Some(polaris_core::tool_memory::RetentionMode::Retrieval)
+            }
+        };
+        #[cfg(not(unix))]
+        let saved_tool_mode = args.tool_memory;
+        #[cfg(unix)]
+        let saved_embedding = effective_saved_settings
+            .tool_memory_embedding
+            .as_ref()
+            .map(|p| (p.url.clone(), p.model.clone()));
+        #[cfg(not(unix))]
+        let saved_embedding = args.tool_memory_embedding.clone();
         if tool_memory_path.as_ref() != Some(&session_path)
-            || (args.tool_memory.is_some()
+            || (saved_tool_mode.is_some()
                 && session.tool_memory.is_none()
                 && memory::saved_project_matches(&session, &args.cwd, &session_path))
         {
@@ -1869,8 +3532,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 &args.cwd,
                 &args.state_dir,
                 &session_path,
-                args.tool_memory,
-                args.tool_memory_embedding.clone(),
+                saved_tool_mode,
+                saved_embedding.clone(),
             ) {
                 fatal_message = Some(format!("ツール記憶を準備できません: {error}"));
                 break 'outer ExitCode::FAILURE;
@@ -1878,8 +3541,19 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             tool_memory_path = Some(session_path.clone());
         }
         let mut cumulative_usage = usage_meter.snapshot().usage;
-        session.compaction_threshold = args.compact_at;
-        if args.remember {
+        #[cfg(unix)]
+        {
+            session.compaction_threshold = effective_saved_settings.compact_threshold;
+        }
+        #[cfg(not(unix))]
+        {
+            session.compaction_threshold = args.compact_at;
+        }
+        #[cfg(unix)]
+        let saved_remember = effective_saved_settings.remember;
+        #[cfg(not(unix))]
+        let saved_remember = args.remember;
+        if saved_remember {
             if let Err(error) = memory::configure_saved_memory(
                 &mut session,
                 &args.cwd,
@@ -1889,6 +3563,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 fatal_message = Some(format!("履歴保存を準備できません: {error}"));
                 break 'outer ExitCode::FAILURE;
             }
+        } else if session.persistence.is_some() {
+            session.before_compact = None;
         } else if session.persistence.is_none()
             && session.before_compact.is_none()
             && let Some(id) = session_path.file_stem().and_then(|s| s.to_str())
@@ -1902,6 +3578,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         }
         // Recomputed every draw from the live buffer, so the popup tracks
         // each keystroke — not just the moment `/` was first typed.
+        #[cfg(unix)]
+        let has_pending_inputs = !queued_inputs.is_empty()
+            || !queued_instructions.is_empty()
+            || active_instruction.is_some();
+        #[cfg(not(unix))]
+        let has_pending_inputs = !queued_inputs.is_empty();
         let suggestions = if dispatching_queued_input {
             // Let the full command reach `slash::parse` below. The picker is
             // for interactive completion and would otherwise reinterpret a
@@ -1974,6 +3656,46 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             ))
         } else {
             loop {
+                #[cfg(target_os = "linux")]
+                let candidate = match linux_read_idle_event_with(
+                    |duration| {
+                        let ready = ratatui::crossterm::event::poll(duration)?;
+                        if session.persistence.is_some() {
+                            let pending = input_history.pending_draft(&input_buffer);
+                            if pending != draft_candidate {
+                                draft_candidate = pending.to_owned();
+                                draft_changed_at = Instant::now();
+                            }
+                            if !ready
+                                && draft_candidate != draft_saved_text
+                                && draft_changed_at.elapsed() >= Duration::from_millis(350)
+                            {
+                                if let Err(error) = draft::save(
+                                    &session,
+                                    &initial_saved_settings,
+                                    rewind_workspace.as_ref().expect("startup owner"),
+                                    &management_effects,
+                                    &draft_candidate,
+                                ) {
+                                    fatal_message =
+                                        Some(format!("下書きを保存できません: {error}"));
+                                    return Err(std::io::Error::other(error));
+                                }
+                                draft_saved_text = draft_candidate.clone();
+                            }
+                        }
+                        Ok(ready)
+                    },
+                    ratatui::crossterm::event::read,
+                    || signal::pending_linux_process_shutdown().is_some(),
+                ) {
+                    Ok(Some(event)) => event,
+                    Ok(None) | Err(_) if linux_pending_exit_code().is_some() => {
+                        break 'outer linux_pending_exit_code().unwrap_or(ExitCode::FAILURE);
+                    }
+                    Ok(None) | Err(_) => break 'outer ExitCode::FAILURE,
+                };
+                #[cfg(not(target_os = "linux"))]
                 let candidate = match ratatui::crossterm::event::read() {
                     Ok(e) => e,
                     Err(_) => break 'outer ExitCode::FAILURE,
@@ -2068,12 +3790,20 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 break candidate;
             }
         };
+        #[cfg(target_os = "linux")]
+        if let Some(code) = linux_pending_exit_code() {
+            break 'outer code;
+        }
         if let ratatui::crossterm::event::Event::Resize(_, _) = &event {
             selection = None;
         }
         let ratatui::crossterm::event::Event::Key(key) = event else {
             continue;
         };
+        if secret_value_key_is_blocked(&input_buffer, &key) {
+            status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+            continue;
+        }
         if key.kind == ratatui::crossterm::event::KeyEventKind::Press
             && !(key.code == ratatui::crossterm::event::KeyCode::Char('c')
                 && key
@@ -2081,6 +3811,125 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     .contains(ratatui::crossterm::event::KeyModifiers::CONTROL))
         {
             exit_confirmation.cancel();
+        }
+
+        if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
+            use ratatui::crossterm::event::KeyCode;
+            if key.code == KeyCode::Esc {
+                if !input_buffer.is_empty() || has_pending_inputs || dispatching_queued_input {
+                    rewind_gesture.cancel();
+                    status =
+                        Status::Notice("入力欄と送信待ちを空にしてから巻き戻してください".into());
+                    continue;
+                }
+                if !rewind_gesture.press(Instant::now()) {
+                    status = Status::Notice("もう一度Escを押すと巻き戻し候補を開きます".into());
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    let Some(owner) = rewind_workspace.as_ref() else {
+                        status = Status::Notice(rewind_unavailable_reason.clone());
+                        continue;
+                    };
+                    if let Err(error) = ensure_rewind_unblocked(&management_effects) {
+                        status = Status::Error(error);
+                        continue;
+                    }
+                    let picked_rewind = match select_rewind_boundary(
+                        &terminal,
+                        &mut key_reader,
+                        &session,
+                        owner,
+                        &rewind_unavailable_reason,
+                    ) {
+                        Ok(selection) => selection,
+                        Err(error) => {
+                            status =
+                                Status::Error(format!("巻き戻し候補を確認できません: {error}"));
+                            continue;
+                        }
+                    };
+                    let Some((boundary, expected_post, target_pre)) = picked_rewind else {
+                        status = Status::Idle;
+                        continue;
+                    };
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = linux_pending_exit_code() {
+                        break 'outer code;
+                    }
+                    match perform_rewind(
+                        &session,
+                        &boundary,
+                        &expected_post,
+                        &target_pre,
+                        owner,
+                        &management_effects,
+                        &args,
+                        mcp_ceiling,
+                    )
+                    .await
+                    {
+                        Ok(activation) => {
+                            session = activation.session;
+                            session_path = activation.session_path;
+                            meta_path = session_path.with_extension("meta.json");
+                            session_started_at_millis = now_millis();
+                            effective_skills = activation.skills;
+                            effective_agent_types = activation.agent_types;
+                            mcp_host = Some(activation.mcp_host);
+                            mcp_setup = Some(activation.mcp_setup);
+                            tool_memory_path = Some(session_path.clone());
+                            input_history = input::History::new();
+                            history_compacted_this_turn = false;
+                            local_lines.clear();
+                            let width = terminal
+                                .borrow()
+                                .size()
+                                .map(|size| size.width)
+                                .unwrap_or(80);
+                            reset_conversation_view(
+                                &mut history,
+                                &mut history_wrap_cache,
+                                &mut agent_activity_rows,
+                                &mut scroll_offset,
+                                &mut selection,
+                                &render::HeaderInfo {
+                                    provider_name: &provider_name,
+                                    model_name: &model_name,
+                                    usage: cumulative_usage,
+                                    cwd: &cwd_display,
+                                    cwd_short: &cwd_footer_display,
+                                    effort_name: &effort_name,
+                                },
+                                width,
+                            );
+                            printed_messages = 0;
+                            printed_local_lines = 0;
+                            status = Status::Notice(format!(
+                                "入力「{}」の直前へ巻き戻しました。元の会話は保存されています。",
+                                boundary.user_message_preview.as_deref().unwrap_or("不明")
+                            ));
+                        }
+                        Err(error) if error.fatal => {
+                            fatal_message = Some(error.message);
+                            break 'outer ExitCode::FAILURE;
+                        }
+                        Err(error) => status = Status::Error(error.message),
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = linux_pending_exit_code() {
+                        break 'outer code;
+                    }
+                    continue;
+                }
+                #[cfg(not(unix))]
+                {
+                    status = Status::Notice("この環境ではファイル巻き戻しを利用できません".into());
+                    continue;
+                }
+            }
+            rewind_gesture.cancel();
         }
 
         // `/review` isn't a local command like the others — it expands
@@ -2108,14 +3957,153 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 }
                 KeyCode::Enter => {
                     let action = slash::action_for(suggestions[selected_suggestion].name);
-                    input_buffer.clear();
+                    #[cfg(unix)]
+                    {
+                        last_submission_was_local = true;
+                    }
+                    #[cfg(unix)]
+                    if let Some(error) = management_clearance_error(&management_effects, &action) {
+                        status = Status::Error(error);
+                        continue;
+                    }
+                    let pending_input = std::mem::take(&mut input_buffer);
+                    let pending_cursor = input_cursor;
                     input_cursor = 0;
                     selected_suggestion = 0;
                     match action {
+                        #[cfg(unix)]
+                        slash::Action::SessionControl(request) => {
+                            let result = session_commands::handle(
+                                &request,
+                                &terminal,
+                                &mut key_reader,
+                                &mut session,
+                                &initial_saved_settings,
+                                rewind_workspace.as_ref().expect("startup owner"),
+                                &management_effects,
+                                args.provider.as_ref(),
+                                args.history_backend_factory.as_ref(),
+                                has_pending_inputs,
+                            );
+                            match result {
+                                Ok(lines) => {
+                                    local_lines.extend(lines);
+                                    refresh_saved_settings = true;
+                                    status =
+                                        Status::Notice("セッション操作の結果を表示しました".into());
+                                }
+                                Err(error) => status = Status::Error(error),
+                            }
+                            continue;
+                        }
+                        #[cfg(unix)]
+                        slash::Action::RuntimeControl(request) => {
+                            if let Some(result) = handle_queued_control(
+                                &request,
+                                &terminal,
+                                &mut key_reader,
+                                &session,
+                                rewind_workspace.as_ref().expect("startup owner"),
+                                &management_effects,
+                                &args.state_dir,
+                                &mut queued_instructions,
+                                &mut active_instruction,
+                            ) {
+                                match result {
+                                    Ok(lines) => {
+                                        local_lines.extend(
+                                            lines.into_iter().map(ratatui::text::Line::from),
+                                        );
+                                        status =
+                                            Status::Notice("受理入力の結果を表示しました".into());
+                                    }
+                                    Err(error) => {
+                                        queued_inputs_paused = true;
+                                        status = Status::Error(error);
+                                    }
+                                }
+                                continue;
+                            }
+
+                            let result = handle_runtime_command(
+                                &request,
+                                session.delegation_control.as_ref(),
+                                session.persistence.as_ref(),
+                                &args.state_dir,
+                                &effective_agent_types,
+                                &args.sandbox,
+                                approval_policy,
+                                &mut next_max_turns,
+                                args.max_turns,
+                                &agent_activity_rows,
+                            )
+                            .await;
+                            match result {
+                                Ok(lines) => {
+                                    local_lines
+                                        .extend(lines.into_iter().map(ratatui::text::Line::from));
+                                    status = Status::Notice("実行状態を表示しました".into());
+                                }
+                                Err(error) => status = Status::Error(error),
+                            }
+                            continue;
+                        }
+                        slash::Action::Status => {
+                            local_lines.extend(status_lines(StatusSnapshot {
+                                session: &session,
+                                provider_name: &provider_name,
+                                model_name: &model_name,
+                                usage_report: usage_meter.snapshot(),
+                                sandbox: &args.sandbox,
+                                approval: approval_policy,
+                                startup_approval: args.approval_policy,
+                                mcp_external: args.mcp_external,
+                                audit_path: Some(&args.audit_path),
+                                turn_authority_present: args.turn_authority.is_some(),
+                                fixed_effort: args.initial_effort_name.as_deref(),
+                                answer_finalizer: args.answer_finalizer.as_deref(),
+                                #[cfg(unix)]
+                                management_effects: &management_effects,
+                                #[cfg(unix)]
+                                recovery_issue: workflow_recovery_issue.as_deref(),
+                            }));
+                            status = Status::Notice("状態を表示しました".into());
+                            continue;
+                        }
+                        slash::Action::Doctor => {
+                            local_lines.extend(doctor_lines(
+                                &provider_name,
+                                &model_name,
+                                &args.cwd,
+                                &args.sandbox,
+                                approval_policy,
+                                args.mcp_external,
+                            ));
+                            #[cfg(unix)]
+                            local_lines.extend(management_effect_diagnostic(
+                                &management_effects,
+                                workflow_recovery_issue.as_deref(),
+                            ));
+                            local_lines
+                                .extend(cat_diagnostic_lines(args.answer_finalizer.as_deref()));
+                            #[cfg(unix)]
+                            local_lines.extend(rewind_candidate_diagnostic(
+                                rewind_workspace.as_ref(),
+                                &args.sessions_dir,
+                                &args.cwd,
+                            ));
+                            status = Status::Notice("診断結果を表示しました".into());
+                            continue;
+                        }
                         slash::Action::Review(extra) => {
                             review_text = Some(review_prompt(&extra));
                         }
                         slash::Action::Resume => {
+                            #[cfg(target_os = "linux")]
+                            if let Some(code) = linux_pending_exit_code() {
+                                break 'outer code;
+                            }
+                            let previous_session_path = session_path.clone();
                             handle_resume(
                                 &terminal,
                                 &mut key_reader,
@@ -2124,8 +4112,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &cwd_display,
                                 &args.workflow_config,
                                 args.workflow_mode_overridden,
-                                args.skills,
+                                &effective_skills,
                                 args.history_backend_factory.as_ref(),
+                                #[cfg(unix)]
+                                rewind_workspace.as_ref(),
+                                #[cfg(unix)]
+                                Some(&management_effects),
                                 &mut session,
                                 &mut session_path,
                                 &mut meta_path,
@@ -2134,6 +4126,16 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &mut local_lines,
                             )
                             .await;
+                            #[cfg(target_os = "linux")]
+                            if let Some(code) = linux_pending_exit_code() {
+                                break 'outer code;
+                            }
+                            clear_mcp_prompt_on_session_change(
+                                &previous_session_path,
+                                &session_path,
+                                &mut pending_mcp_prompt,
+                                &mut mcp_prompt_requires_reselect,
+                            );
                             // A resumed session may be the same length as
                             // (or longer than) what's already printed but
                             // still a genuinely *different* conversation —
@@ -2162,7 +4164,22 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         slash::Action::New => {
-                            handle_new_session(
+                            let previous_session_path = session_path.clone();
+                            #[cfg(unix)]
+                            let switched = handle_managed_new_session(
+                                &args.sessions_dir,
+                                &args.state_dir,
+                                rewind_workspace.as_ref().expect("Unix workspace owner"),
+                                &management_effects,
+                                &mut session,
+                                &mut session_path,
+                                &mut meta_path,
+                                &mut session_started_at_millis,
+                                &mut status,
+                                &mut local_lines,
+                            );
+                            #[cfg(not(unix))]
+                            let switched = handle_new_session(
                                 &args.sessions_dir,
                                 &mut session,
                                 &mut session_path,
@@ -2170,6 +4187,25 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &mut session_started_at_millis,
                                 &mut status,
                                 &mut local_lines,
+                            );
+                            if !switched {
+                                restore_rejected_new_submission(
+                                    pending_input,
+                                    pending_cursor,
+                                    false,
+                                    &mut input_buffer,
+                                    &mut input_cursor,
+                                    &mut queued_inputs,
+                                    &mut queued_inputs_paused,
+                                );
+                                continue;
+                            }
+                            queued_inputs_paused = false;
+                            clear_mcp_prompt_on_session_change(
+                                &previous_session_path,
+                                &session_path,
+                                &mut pending_mcp_prompt,
+                                &mut mcp_prompt_requires_reselect,
                             );
                             let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                             reset_conversation_view(
@@ -2193,6 +4229,21 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         slash::Action::Fork => {
+                            let previous_session_path = session_path.clone();
+                            #[cfg(unix)]
+                            handle_managed_fork(
+                                &args.sessions_dir,
+                                &cwd_display,
+                                &args.state_dir,
+                                rewind_workspace.as_ref().expect("Unix workspace owner"),
+                                &management_effects,
+                                &mut session,
+                                &mut session_path,
+                                &mut meta_path,
+                                &mut session_started_at_millis,
+                                &mut status,
+                            );
+                            #[cfg(not(unix))]
                             handle_fork(
                                 &args.sessions_dir,
                                 &cwd_display,
@@ -2201,6 +4252,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &mut meta_path,
                                 &mut session_started_at_millis,
                                 &mut status,
+                            );
+                            clear_mcp_prompt_on_session_change(
+                                &previous_session_path,
+                                &session_path,
+                                &mut pending_mcp_prompt,
+                                &mut mcp_prompt_requires_reselect,
                             );
                             let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                             reset_conversation_view(
@@ -2235,6 +4292,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         slash::Action::Model => {
+                            #[cfg(target_os = "linux")]
+                            if let Some(code) = linux_pending_exit_code() {
+                                break 'outer code;
+                            }
                             handle_model(
                                 &terminal,
                                 &mut key_reader,
@@ -2250,11 +4311,31 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &mut status,
                             )
                             .await;
+                            #[cfg(target_os = "linux")]
+                            if let Some(code) = linux_pending_exit_code() {
+                                break 'outer code;
+                            }
                             continue;
                         }
                         slash::Action::Skills => {
-                            run_skills_picker(&terminal, &mut key_reader, args.skills);
+                            run_skills_picker(&terminal, &mut key_reader, &effective_skills);
                             status = Status::Idle;
+                            continue;
+                        }
+                        #[cfg(unix)]
+                        action @ (slash::Action::Phase(_) | slash::Action::Workflow(_)) => {
+                            handle_managed_workflow_action(
+                                &terminal,
+                                &mut key_reader,
+                                action,
+                                &mut session,
+                                &effective_skills,
+                                rewind_workspace.as_ref().expect("Unix workspace owner"),
+                                &management_effects,
+                                &args.state_dir,
+                                has_pending_inputs || dispatching_queued_input,
+                                &mut status,
+                            );
                             continue;
                         }
                         slash::Action::Compact => {
@@ -2322,8 +4403,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &provider_name,
                                 &model_name,
                                 usage_meter.snapshot(),
-                                args.skills,
+                                &effective_skills,
                                 &args.cwd,
+                                &args.state_dir,
+                                &args.sessions_dir,
+                                args.mcp_external,
                                 &mut local_lines,
                             ) {
                                 SlashOutcome::Continue => {
@@ -2351,10 +4435,38 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     }
                                     continue;
                                 }
-                                SlashOutcome::Quit => break ExitCode::SUCCESS,
+                                SlashOutcome::Quit => {
+                                    #[cfg(unix)]
+                                    if !queued_instructions.is_empty()
+                                        || active_instruction.is_some()
+                                    {
+                                        status = Status::Notice(
+                                            "受理済みの指示を処理・取消してから終了してください"
+                                                .into(),
+                                        );
+                                        continue;
+                                    }
+                                    if refuse_quit_with_pending_work(
+                                        &queued_inputs,
+                                        &mut input_history,
+                                        &mut input_buffer,
+                                        &mut input_cursor,
+                                        draft_after_queued_dispatch.take(),
+                                        &pending_input,
+                                        dispatching_queued_input,
+                                        &mut status,
+                                    ) {
+                                        continue;
+                                    }
+                                    break ExitCode::SUCCESS;
+                                }
                                 SlashOutcome::Fatal(msg) => {
                                     fatal_message = Some(msg);
                                     break 'outer ExitCode::FAILURE;
+                                }
+                                #[cfg(target_os = "linux")]
+                                SlashOutcome::Shutdown(reason) => {
+                                    break 'outer linux_signal_exit_code(reason);
                                 }
                             }
                         }
@@ -2424,13 +4536,25 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
 
         selection = None;
 
+        let cursor_before_submit = input_cursor;
         let text = if let Some(t) = review_text {
             t
         } else {
             let typed = match apply_key(&mut input_buffer, &mut input_cursor, key) {
                 InputAction::Continue => {
+                    #[cfg(unix)]
+                    {
+                        last_submission_was_local = false;
+                    }
                     exit_confirmation.cancel();
                     selected_suggestion = 0;
+                    if redact_inline_secret_value(
+                        &mut input_buffer,
+                        &mut input_cursor,
+                        &mut input_history,
+                    ) {
+                        status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
+                    }
                     continue;
                 }
                 InputAction::Quit => {
@@ -2444,12 +4568,30 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     exit_confirmation.cancel();
                     continue;
                 }
-                InputAction::Submit(text) => {
+                InputAction::Submit(mut text) => {
+                    #[cfg(unix)]
+                    {
+                        last_submission_was_local = text.trim_start().starts_with('/');
+                    }
                     exit_confirmation.cancel();
+                    if is_secret_command(&text) {
+                        text.zeroize();
+                        status = Status::Error(
+                            "このTUIでは秘密情報の設定をまだ受け付けていません".into(),
+                        );
+                        continue;
+                    }
+                    if !dispatching_queued_input && submission_resumes_queued_inputs(&text) {
+                        queued_inputs_paused = false;
+                    }
                     // In-flight submissions were recorded when Enter queued
                     // them. Recording the synthetic Enter again would add a
                     // second copy after any later queued entry.
-                    record_submission(&mut input_history, &text, dispatching_queued_input);
+                    record_submission_before_dispatch(
+                        &mut input_history,
+                        &text,
+                        dispatching_queued_input,
+                    );
                     scroll_offset = 0;
                     text
                 }
@@ -2465,9 +4607,181 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             // happen since Enter with any suggestion present is
             // intercepted, so this covers `/unknown-name` (no matches,
             // popup was empty) and plain text.
-            match slash::parse(&typed) {
+            let parsed_action = {
+                #[cfg(unix)]
+                if active_instruction.is_some() {
+                    None
+                } else {
+                    slash::parse(&typed)
+                }
+                #[cfg(not(unix))]
+                slash::parse(&typed)
+            };
+            #[cfg(unix)]
+            if let Some(error) = parsed_action
+                .as_ref()
+                .and_then(|action| management_clearance_error(&management_effects, action))
+            {
+                if dispatching_queued_input {
+                    queued_inputs.push_front(typed);
+                    queued_inputs_paused = true;
+                } else {
+                    input_buffer = typed;
+                    input_cursor = input_buffer.len();
+                }
+                status = Status::Error(error);
+                continue;
+            }
+            match parsed_action {
+                #[cfg(unix)]
+                Some(slash::Action::SessionControl(request)) => {
+                    let result = session_commands::handle(
+                        &request,
+                        &terminal,
+                        &mut key_reader,
+                        &mut session,
+                        &initial_saved_settings,
+                        rewind_workspace.as_ref().expect("startup owner"),
+                        &management_effects,
+                        args.provider.as_ref(),
+                        args.history_backend_factory.as_ref(),
+                        has_pending_inputs,
+                    );
+                    match result {
+                        Ok(lines) => {
+                            local_lines.extend(lines);
+                            refresh_saved_settings = true;
+                            status = Status::Notice("セッション操作の結果を表示しました".into());
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
+                #[cfg(unix)]
+                Some(slash::Action::RuntimeControl(request)) => {
+                    if let Some(result) = handle_queued_control(
+                        &request,
+                        &terminal,
+                        &mut key_reader,
+                        &session,
+                        rewind_workspace.as_ref().expect("startup owner"),
+                        &management_effects,
+                        &args.state_dir,
+                        &mut queued_instructions,
+                        &mut active_instruction,
+                    ) {
+                        match result {
+                            Ok(lines) => {
+                                local_lines
+                                    .extend(lines.into_iter().map(ratatui::text::Line::from));
+                                status = Status::Notice("受理入力の結果を表示しました".into());
+                            }
+                            Err(error) => {
+                                queued_inputs_paused = true;
+                                status = Status::Error(error);
+                            }
+                        }
+                        continue;
+                    }
+
+                    let result = handle_runtime_command(
+                        &request,
+                        session.delegation_control.as_ref(),
+                        session.persistence.as_ref(),
+                        &args.state_dir,
+                        &effective_agent_types,
+                        &args.sandbox,
+                        approval_policy,
+                        &mut next_max_turns,
+                        args.max_turns,
+                        &agent_activity_rows,
+                    )
+                    .await;
+                    match result {
+                        Ok(lines) => {
+                            local_lines.extend(lines.into_iter().map(ratatui::text::Line::from));
+                            status = Status::Notice("実行状態を表示しました".into());
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
+                Some(slash::Action::Status) => {
+                    local_lines.extend(status_lines(StatusSnapshot {
+                        session: &session,
+                        provider_name: &provider_name,
+                        model_name: &model_name,
+                        usage_report: usage_meter.snapshot(),
+                        sandbox: &args.sandbox,
+                        approval: approval_policy,
+                        startup_approval: args.approval_policy,
+                        mcp_external: args.mcp_external,
+                        audit_path: Some(&args.audit_path),
+                        turn_authority_present: args.turn_authority.is_some(),
+                        fixed_effort: args.initial_effort_name.as_deref(),
+                        answer_finalizer: args.answer_finalizer.as_deref(),
+                        #[cfg(unix)]
+                        management_effects: &management_effects,
+                        #[cfg(unix)]
+                        recovery_issue: workflow_recovery_issue.as_deref(),
+                    }));
+                    status = Status::Notice("状態を表示しました".into());
+                    continue;
+                }
+                Some(slash::Action::Doctor) => {
+                    local_lines.extend(doctor_lines(
+                        &provider_name,
+                        &model_name,
+                        &args.cwd,
+                        &args.sandbox,
+                        approval_policy,
+                        args.mcp_external,
+                    ));
+                    #[cfg(unix)]
+                    local_lines.extend(management_effect_diagnostic(
+                        &management_effects,
+                        workflow_recovery_issue.as_deref(),
+                    ));
+                    local_lines.extend(cat_diagnostic_lines(args.answer_finalizer.as_deref()));
+                    #[cfg(unix)]
+                    local_lines.extend(rewind_candidate_diagnostic(
+                        rewind_workspace.as_ref(),
+                        &args.sessions_dir,
+                        &args.cwd,
+                    ));
+                    status = Status::Notice("診断結果を表示しました".into());
+                    continue;
+                }
+                Some(slash::Action::Mcp(requested))
+                    if requested.split_whitespace().next() == Some("prompt") =>
+                {
+                    if requested == "prompt cancel" {
+                        pending_mcp_prompt = None;
+                        mcp_prompt_requires_reselect = false;
+                        status = Status::Notice("MCP prompt選択を取り消しました".into());
+                        continue;
+                    }
+                    match mcp_prompt_choice(&requested) {
+                        Ok(choice) => {
+                            status = Status::Notice(format!(
+                                "次の入力でMCP prompt {}/{} を選択します",
+                                render::sanitize(&choice.server),
+                                render::sanitize(&choice.prompt)
+                            ));
+                            pending_mcp_prompt = Some(choice);
+                            mcp_prompt_requires_reselect = false;
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
                 Some(slash::Action::Review(extra)) => review_prompt(&extra),
                 Some(slash::Action::Resume) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = linux_pending_exit_code() {
+                        break 'outer code;
+                    }
+                    let previous_session_path = session_path.clone();
                     handle_resume(
                         &terminal,
                         &mut key_reader,
@@ -2476,8 +4790,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &cwd_display,
                         &args.workflow_config,
                         args.workflow_mode_overridden,
-                        args.skills,
+                        &effective_skills,
                         args.history_backend_factory.as_ref(),
+                        #[cfg(unix)]
+                        rewind_workspace.as_ref(),
+                        #[cfg(unix)]
+                        Some(&management_effects),
                         &mut session,
                         &mut session_path,
                         &mut meta_path,
@@ -2486,6 +4804,16 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut local_lines,
                     )
                     .await;
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = linux_pending_exit_code() {
+                        break 'outer code;
+                    }
+                    clear_mcp_prompt_on_session_change(
+                        &previous_session_path,
+                        &session_path,
+                        &mut pending_mcp_prompt,
+                        &mut mcp_prompt_requires_reselect,
+                    );
                     // Same reasoning as the popup-selection path above: a
                     // resumed session's length alone can't be trusted to
                     // signal "this is a different conversation."
@@ -2511,7 +4839,22 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     continue;
                 }
                 Some(slash::Action::New) => {
-                    handle_new_session(
+                    let previous_session_path = session_path.clone();
+                    #[cfg(unix)]
+                    let switched = handle_managed_new_session(
+                        &args.sessions_dir,
+                        &args.state_dir,
+                        rewind_workspace.as_ref().expect("Unix workspace owner"),
+                        &management_effects,
+                        &mut session,
+                        &mut session_path,
+                        &mut meta_path,
+                        &mut session_started_at_millis,
+                        &mut status,
+                        &mut local_lines,
+                    );
+                    #[cfg(not(unix))]
+                    let switched = handle_new_session(
                         &args.sessions_dir,
                         &mut session,
                         &mut session_path,
@@ -2519,6 +4862,26 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut session_started_at_millis,
                         &mut status,
                         &mut local_lines,
+                    );
+                    if !switched {
+                        restore_rejected_new_submission(
+                            typed,
+                            cursor_before_submit,
+                            dispatching_queued_input,
+                            &mut input_buffer,
+                            &mut input_cursor,
+                            &mut queued_inputs,
+                            &mut queued_inputs_paused,
+                        );
+                        continue;
+                    }
+                    queued_inputs_paused = false;
+                    record_submission(&mut input_history, &typed, dispatching_queued_input);
+                    clear_mcp_prompt_on_session_change(
+                        &previous_session_path,
+                        &session_path,
+                        &mut pending_mcp_prompt,
+                        &mut mcp_prompt_requires_reselect,
                     );
                     let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                     reset_conversation_view(
@@ -2542,6 +4905,21 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     continue;
                 }
                 Some(slash::Action::Fork) => {
+                    let previous_session_path = session_path.clone();
+                    #[cfg(unix)]
+                    handle_managed_fork(
+                        &args.sessions_dir,
+                        &cwd_display,
+                        &args.state_dir,
+                        rewind_workspace.as_ref().expect("Unix workspace owner"),
+                        &management_effects,
+                        &mut session,
+                        &mut session_path,
+                        &mut meta_path,
+                        &mut session_started_at_millis,
+                        &mut status,
+                    );
+                    #[cfg(not(unix))]
                     handle_fork(
                         &args.sessions_dir,
                         &cwd_display,
@@ -2550,6 +4928,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut meta_path,
                         &mut session_started_at_millis,
                         &mut status,
+                    );
+                    clear_mcp_prompt_on_session_change(
+                        &previous_session_path,
+                        &session_path,
+                        &mut pending_mcp_prompt,
+                        &mut mcp_prompt_requires_reselect,
                     );
                     let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
                     reset_conversation_view(
@@ -2584,6 +4968,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     continue;
                 }
                 Some(slash::Action::Model) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = linux_pending_exit_code() {
+                        break 'outer code;
+                    }
                     handle_model(
                         &terminal,
                         &mut key_reader,
@@ -2599,11 +4987,31 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut status,
                     )
                     .await;
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = linux_pending_exit_code() {
+                        break 'outer code;
+                    }
                     continue;
                 }
                 Some(slash::Action::Skills) => {
-                    run_skills_picker(&terminal, &mut key_reader, args.skills);
+                    run_skills_picker(&terminal, &mut key_reader, &effective_skills);
                     status = Status::Idle;
+                    continue;
+                }
+                #[cfg(unix)]
+                Some(action @ (slash::Action::Phase(_) | slash::Action::Workflow(_))) => {
+                    handle_managed_workflow_action(
+                        &terminal,
+                        &mut key_reader,
+                        action,
+                        &mut session,
+                        &effective_skills,
+                        rewind_workspace.as_ref().expect("Unix workspace owner"),
+                        &management_effects,
+                        &args.state_dir,
+                        has_pending_inputs || dispatching_queued_input,
+                        &mut status,
+                    );
                     continue;
                 }
                 Some(slash::Action::Compact) => {
@@ -2664,8 +5072,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &provider_name,
                         &model_name,
                         usage_meter.snapshot(),
-                        args.skills,
+                        &effective_skills,
                         &args.cwd,
+                        &args.state_dir,
+                        &args.sessions_dir,
+                        args.mcp_external,
                         &mut local_lines,
                     ) {
                         SlashOutcome::Continue => {
@@ -2692,10 +5103,35 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             }
                             continue;
                         }
-                        SlashOutcome::Quit => break ExitCode::SUCCESS,
+                        SlashOutcome::Quit => {
+                            #[cfg(unix)]
+                            if !queued_instructions.is_empty() || active_instruction.is_some() {
+                                status = Status::Notice(
+                                    "受理済みの指示を処理・取消してから終了してください".into(),
+                                );
+                                continue;
+                            }
+                            if refuse_quit_with_pending_work(
+                                &queued_inputs,
+                                &mut input_history,
+                                &mut input_buffer,
+                                &mut input_cursor,
+                                None,
+                                &typed,
+                                dispatching_queued_input,
+                                &mut status,
+                            ) {
+                                continue;
+                            }
+                            break ExitCode::SUCCESS;
+                        }
                         SlashOutcome::Fatal(msg) => {
                             fatal_message = Some(msg);
                             break 'outer ExitCode::FAILURE;
+                        }
+                        #[cfg(target_os = "linux")]
+                        SlashOutcome::Shutdown(reason) => {
+                            break 'outer linux_signal_exit_code(reason);
                         }
                     }
                 }
@@ -2703,13 +5139,267 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             }
         };
 
+        #[cfg(unix)]
+        if session.persistence.is_some() && !dispatching_queued_input {
+            if let Err(error) = draft::save(
+                &session,
+                &initial_saved_settings,
+                rewind_workspace.as_ref().expect("startup owner"),
+                &management_effects,
+                "",
+            ) {
+                input_buffer = text;
+                input_cursor = input_buffer.len();
+                status = Status::Error(format!("下書きの送信準備を保存できません: {error}"));
+                continue;
+            }
+            draft_saved_text.clear();
+            draft_candidate.clear();
+        }
+        #[cfg(unix)]
+        let rewind_pre_manifest_id = if session.persistence.is_some() {
+            match rewind_workspace.as_ref() {
+                Some(owner) => match owner.capture(&args.sandbox) {
+                    Ok(id) => Some(id.to_string()),
+                    Err(error) => {
+                        rewind_unavailable_reason =
+                            format!("この入力のファイル保存を作成できません: {error}");
+                        None
+                    }
+                },
+                None => {
+                    rewind_unavailable_reason =
+                        "この作業場所はファイル巻き戻しの対象外です".to_owned();
+                    None
+                }
+            }
+        } else {
+            rewind_unavailable_reason = "この会話は保存済みv2セッションではありません".to_owned();
+            None
+        };
+        #[cfg(not(unix))]
+        let rewind_pre_manifest_id: Option<String> = None;
+
+        #[cfg(unix)]
+        let _project_activity = {
+            let acquired = match rewind_workspace.as_ref() {
+                Some(owner) => owner
+                    .try_activity_quiescent()
+                    .map_err(|error| error.to_string()),
+                None => {
+                    polaris_core::project_mutation::ProjectMutationOwnerV1::for_project(&args.cwd)
+                        .and_then(|owner| owner.try_activity())
+                        .map_err(|error| error.to_string())
+                }
+            };
+            match acquired {
+                Ok(lease) => lease,
+                Err(error) => {
+                    if dispatching_queued_input {
+                        queued_inputs.push_front(text);
+                        queued_inputs_paused = true;
+                    } else {
+                        input_buffer = text;
+                        input_cursor = input_buffer.len();
+                    }
+                    status = Status::Error(format!(
+                        "作業場所が他の処理に使われているため、この入力を開始できません: {error}"
+                    ));
+                    continue;
+                }
+            }
+        };
+
+        #[cfg(unix)]
+        match management_effects.blocker() {
+            Ok(Some(effect)) => {
+                if dispatching_queued_input {
+                    queued_inputs.push_front(text);
+                    queued_inputs_paused = true;
+                } else {
+                    input_buffer = text;
+                    input_cursor = input_buffer.len();
+                }
+                status = Status::Error(format!(
+                    "未解決の管理操作 {} ({}) があります。復旧前に新しい入力は開始できません",
+                    effect.request.operation_id, effect.request.inventory
+                ));
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if dispatching_queued_input {
+                    queued_inputs.push_front(text);
+                    queued_inputs_paused = true;
+                } else {
+                    input_buffer = text;
+                    input_cursor = input_buffer.len();
+                }
+                status = Status::Error(format!("管理操作の状態を確認できません: {error}"));
+                continue;
+            }
+        }
+
+        #[cfg(unix)]
+        if let Some(persistence) = session.persistence.as_ref() {
+            let admission = rewind_workspace
+                .as_ref()
+                .ok_or_else(|| "作業ファイルの検証ownerがありません".to_string())
+                .and_then(|owner| {
+                    let branch =
+                        polaris_core::rewind_admission::published_branch(owner, &persistence.store)
+                            .map_err(|error| error.to_string())?;
+                    if branch.is_some() {
+                        validate_resume_workspace(owner, persistence)?;
+                    }
+                    Ok::<_, String>(())
+                });
+            if let Err(error) = admission {
+                if dispatching_queued_input {
+                    queued_inputs.push_front(text);
+                    queued_inputs_paused = true;
+                } else {
+                    input_buffer = text;
+                    input_cursor = input_buffer.len();
+                }
+                status = Status::Error(format!("会話の実行許可を確認できません: {error}"));
+                continue;
+            }
+        }
+
+        #[cfg(unix)]
+        if let (Some(owner), Some(id)) = (rewind_workspace.as_ref(), &rewind_pre_manifest_id) {
+            let matches = id
+                .parse()
+                .map_err(|error| format!("保存した作業木IDが不正です: {error}"))
+                .and_then(|manifest| {
+                    owner
+                        .matches_manifest(&manifest)
+                        .map_err(|error| format!("作業木を照合できません: {error}"))
+                });
+            if !matches.is_ok_and(|matches| matches) {
+                if dispatching_queued_input {
+                    queued_inputs.push_front(text);
+                    queued_inputs_paused = true;
+                } else {
+                    input_buffer = text;
+                    input_cursor = input_buffer.len();
+                }
+                status = Status::Error(
+                    "入力準備中に作業ファイルが変更されました。再送前に状態を確認してください"
+                        .into(),
+                );
+                continue;
+            }
+        }
+
+        if mcp_prompt_requires_reselect {
+            if dispatching_queued_input {
+                queued_inputs.push_front(text);
+                queued_inputs_paused = true;
+            } else {
+                input_buffer = text;
+                input_cursor = input_buffer.len();
+            }
+            status = Status::Error(
+                "MCP promptの選択結果が不明です。/mcp prompt で再選択するか /mcp prompt cancel で取り消してください"
+                    .into(),
+            );
+            continue;
+        }
+        if pending_mcp_prompt.is_some() && (session.persistence.is_none() || mcp_host.is_none()) {
+            if dispatching_queued_input {
+                queued_inputs.push_front(text);
+                queued_inputs_paused = true;
+            } else {
+                input_buffer = text;
+                input_cursor = input_buffer.len();
+            }
+            status = Status::Error(if session.persistence.is_none() {
+                "MCP promptにはv2会話が必要です。会話を移行してから選択してください".into()
+            } else {
+                "MCPサーバーを利用できません。入力は開始していません".into()
+            });
+            continue;
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(code) = linux_pending_exit_code() {
+            break 'outer code;
+        }
+
         session.automatic_effort =
             args.initial_effort_name.is_none() && !is_local_provider(&provider_name);
         if session.automatic_effort {
             effort_name = UNDECIDED_EFFORT.to_string();
         }
         let mut tui_admission = None;
-        if args.sidechat_auto && session.persistence.is_some() {
+        let mut selected_mcp_runtime = None;
+        let mut rewind_boundary: Option<polaris_core::conversation_state::RewindBoundaryV1> = None;
+        #[cfg(unix)]
+        if let Some(instruction) = active_instruction.take() {
+            let prepared = (|| -> Result<TuiAdmissionTurn, String> {
+                session
+                    .persistence
+                    .as_ref()
+                    .ok_or("保存済み指示の会話がありません")?;
+                let (store, mut manager) =
+                    open_tui_admission_owner(&args.state_dir, instruction.parent_session())?;
+                instruction_commands::preflight(&manager, &session, &instruction)?;
+                if let Some(installer) = args.turn_authority.as_ref() {
+                    installer(&mut session, &text)?;
+                }
+                rewind_boundary = begin_rewind_for_session(
+                    &session,
+                    rewind_pre_manifest_id.as_deref(),
+                    &args.cwd,
+                    &args.state_dir,
+                    saved_tool_mode.is_some(),
+                )
+                .map_err(|error| error.to_string())?;
+                let applied =
+                    instruction_commands::apply(&store, &mut manager, &mut session, instruction)?;
+                let current = session
+                    .persistence
+                    .as_ref()
+                    .ok_or("保存済み指示の会話がありません")?
+                    .snapshot()
+                    .map_err(|e| e.to_string())?
+                    .state
+                    .session_id;
+                if applied.session_id.as_str() != current
+                    || applied.run_id
+                        != polaris_core::session_manager::RunId::derive(&applied.admission_id)
+                {
+                    return Err("保存済み指示の実行先と受理記録が一致しません".into());
+                }
+                Ok(TuiAdmissionTurn {
+                    store,
+                    manager,
+                    admission_id: applied.admission_id,
+                })
+            })();
+            match prepared {
+                Ok(admission) => tui_admission = Some(admission),
+                Err(error) => {
+                    fatal_message = Some(format!(
+                        "指示の適用を確認できません。再送せず復旧してください: {error}"
+                    ));
+                    break 'outer ExitCode::FAILURE;
+                }
+            }
+        }
+        if session.persistence.is_some() && tui_admission.is_none() {
+            let prompt_request =
+                pending_mcp_prompt
+                    .as_ref()
+                    .zip(mcp_host.as_ref())
+                    .map(|(choice, host)| TuiPromptRequest {
+                        host,
+                        choice,
+                        selector: args.mcp_selection_provider.clone(),
+                        ceiling: mcp_ceiling,
+                    });
             match admit_tui_input(
                 &mut session,
                 &text,
@@ -2721,11 +5411,27 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 &mut session_started_at_millis,
                 &mut local_lines,
                 args.turn_authority.as_ref(),
+                rewind_pre_manifest_id.as_deref(),
+                args.tool_memory.is_some(),
+                &args.cwd,
+                args.sidechat_auto,
+                prompt_request,
             )
             .await
             {
-                Ok((admission, notice)) => {
+                Ok((admission, notice, boundary, runtime)) => {
                     tui_admission = Some(admission);
+                    rewind_boundary = boundary;
+                    selected_mcp_runtime = runtime;
+                    if selected_mcp_runtime.is_some()
+                        && let Some(choice) = pending_mcp_prompt.take()
+                    {
+                        local_lines.push(ratatui::text::Line::from(format!(
+                            "MCP prompt {}/{} を選択しました",
+                            render::sanitize(&choice.server),
+                            render::sanitize(&choice.prompt)
+                        )));
+                    }
                     if let Some(notice) = notice {
                         local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
                             notice,
@@ -2740,15 +5446,35 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     status = Status::Error(format!("入力を振り分けできません: {error}"));
                     continue;
                 }
+                Err(TuiAdmissionFailure::PromptFailed { message, unknown }) => {
+                    pending_mcp_prompt = None;
+                    mcp_prompt_requires_reselect = true;
+                    if dispatching_queued_input {
+                        queued_inputs.push_front(text);
+                        queued_inputs_paused = true;
+                    } else {
+                        input_buffer = text;
+                        input_cursor = input_buffer.len();
+                    }
+                    status = Status::Error(format!(
+                        "{message}。会話履歴には追加していません。{}。/mcp prompt で再選択してください",
+                        if unknown {
+                            "取得結果は不明です"
+                        } else {
+                            "モデル実行は開始していません"
+                        }
+                    ));
+                    continue;
+                }
                 Err(error @ TuiAdmissionFailure::Consumed(_)) => {
                     fatal_message = Some(format!(
-                        "入力は保存済みですが、実行開始を確認できません: {}。再起動後に回復状態を確認してください。",
+                        "入力保存または実行開始を確認できません: {}。再起動後に回復状態を確認してください。",
                         error.message()
                     ));
                     break 'outer ExitCode::FAILURE;
                 }
             }
-        } else {
+        } else if session.persistence.is_none() {
             if let Some(installer) = &args.turn_authority
                 && let Err(error) = installer(&mut session, &text)
             {
@@ -2756,6 +5482,19 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 input_cursor = input_buffer.len();
                 status = Status::Error(format!("routine authorityを接続できません: {error}"));
                 continue;
+            }
+            match begin_rewind_for_session(
+                &session,
+                rewind_pre_manifest_id.as_deref(),
+                &args.cwd,
+                &args.state_dir,
+                args.tool_memory.is_some(),
+            ) {
+                Ok(boundary) => rewind_boundary = boundary,
+                Err(error) => {
+                    rewind_unavailable_reason =
+                        format!("この入力の会話境界を保存できません: {error}");
+                }
             }
             session.push_user(&text);
         }
@@ -2787,23 +5526,150 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     started_at_millis: session_started_at_millis,
                 },
             ) {
-                fatal_message = Some(format!("Can't write the session metadata: {e}"));
+                let message = format!("Can't write the session metadata: {e}");
+                #[cfg(target_os = "linux")]
+                let message = match linux_finish_pre_turn_shutdown(
+                    tui_admission.take(),
+                    selected_mcp_runtime.take(),
+                    rewind_boundary.take(),
+                    session.persistence.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => message,
+                    Err(cleanup) => format!("{message}; {cleanup}"),
+                };
+                fatal_message = Some(message);
                 break 'outer ExitCode::FAILURE;
             }
             if let Err(e) = persist::append_message(
                 &session_path,
                 session.messages.last().expect("just pushed"),
             ) {
-                fatal_message = Some(format!("Can't persist the message: {e}"));
+                let message = format!("Can't persist the message: {e}");
+                #[cfg(target_os = "linux")]
+                let message = match linux_finish_pre_turn_shutdown(
+                    tui_admission.take(),
+                    selected_mcp_runtime.take(),
+                    rewind_boundary.take(),
+                    session.persistence.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => message,
+                    Err(cleanup) => format!("{message}; {cleanup}"),
+                };
+                fatal_message = Some(message);
                 break 'outer ExitCode::FAILURE;
             }
         }
         if let Err(e) = session.check_persistence() {
-            fatal_message = Some(format!("Can't persist the message: {e}"));
+            let message = format!("Can't persist the message: {e}");
+            #[cfg(target_os = "linux")]
+            let message = match linux_finish_pre_turn_shutdown(
+                tui_admission.take(),
+                selected_mcp_runtime.take(),
+                rewind_boundary.take(),
+                session.persistence.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => message,
+                Err(cleanup) => format!("{message}; {cleanup}"),
+            };
+            fatal_message = Some(message);
             break 'outer ExitCode::FAILURE;
         }
 
+        #[cfg(target_os = "linux")]
+        if let Some(reason) = signal::pending_linux_process_shutdown() {
+            if let Err(error) = linux_finish_pre_turn_shutdown(
+                tui_admission.take(),
+                selected_mcp_runtime.take(),
+                rewind_boundary.take(),
+                session.persistence.as_ref(),
+            )
+            .await
+            {
+                fatal_message = Some(error);
+                break 'outer ExitCode::FAILURE;
+            }
+            break 'outer linux_signal_exit_code(reason);
+        }
+
+        // Prompt selection, when requested, already committed its result
+        // atomically with the input before the run was started.
+        mcp_turns += 1;
+        let durable_session_id = session
+            .persistence
+            .as_ref()
+            .and_then(|store| store.snapshot().ok())
+            .map(|snapshot| snapshot.state.session_id)
+            .or_else(|| {
+                session_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| format!("tui-session-{}", std::process::id()));
+        let mcp_run_id = match tui_admission.as_ref() {
+            Some(admission) => match admission.run_id() {
+                Ok(run_id) => run_id.to_owned(),
+                Err(error) => {
+                    let message = format!("sidechat runのIDを確認できません: {error}");
+                    #[cfg(target_os = "linux")]
+                    let message = match linux_finish_pre_turn_shutdown(
+                        tui_admission.take(),
+                        selected_mcp_runtime.take(),
+                        rewind_boundary.take(),
+                        session.persistence.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => message,
+                        Err(cleanup) => format!("{message}; {cleanup}"),
+                    };
+                    fatal_message = Some(message);
+                    break 'outer ExitCode::FAILURE;
+                }
+            },
+            None => format!("tui-{}-{}-{mcp_turns}", std::process::id(), now_millis()),
+        };
+        let mut mcp_runtime = selected_mcp_runtime.or_else(|| {
+            mcp_host.as_ref().and_then(|host| {
+                host.runtime(&durable_session_id, &mcp_run_id, mcp_ceiling)
+                    .ok()
+                    .flatten()
+                    .map(|(mut runtime, _)| {
+                        host.configure_preselection(
+                            &mut runtime,
+                            args.mcp_selection_provider.clone(),
+                            None,
+                        );
+                        runtime
+                    })
+            })
+        });
+
+        #[cfg(target_os = "linux")]
+        if let Some(reason) = signal::pending_linux_process_shutdown() {
+            if let Err(error) = linux_finish_pre_turn_shutdown(
+                tui_admission.take(),
+                mcp_runtime.take(),
+                rewind_boundary.take(),
+                session.persistence.as_ref(),
+            )
+            .await
+            {
+                fatal_message = Some(error);
+                break 'outer ExitCode::FAILURE;
+            }
+            break 'outer linux_signal_exit_code(reason);
+        }
+
         let turn_started = Instant::now();
+        #[cfg(unix)]
+        let mut rewind_effects = rewind_ui::EffectTracker::default();
         status = Status::Thinking {
             elapsed: Duration::ZERO,
         };
@@ -2848,6 +5714,17 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             })
             .is_err()
         {
+            #[cfg(target_os = "linux")]
+            if let Err(cleanup) = linux_finish_pre_turn_shutdown(
+                tui_admission.take(),
+                mcp_runtime.take(),
+                rewind_boundary.take(),
+                session.persistence.as_ref(),
+            )
+            .await
+            {
+                fatal_message = Some(format!("TUI表示を更新できません; {cleanup}"));
+            }
             break ExitCode::FAILURE;
         }
 
@@ -2855,6 +5732,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             Done(Result<agent::AgentOutcome, agent::AgentError>),
             Interrupted,
             Fatal,
+            #[cfg(target_os = "linux")]
+            Shutdown(signal::LinuxProcessShutdown),
         }
 
         // Scoped so every borrow taken to build `agent_future` (of
@@ -2862,32 +5741,21 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // below needs `&mut session` again, which it can't have while
         // any of these are still alive.
         session.mcp_setup = mcp_setup.clone();
-        mcp_turns += 1;
-        let mut mcp_runtime = mcp_host.as_ref().and_then(|host| {
-            host.runtime("tui", &format!("turn-{mcp_turns}"), mcp_ceiling)
-                .ok()
-                .flatten()
-                .map(|(mut runtime, _)| {
-                    host.configure_preselection(
-                        &mut runtime,
-                        args.mcp_selection_provider.clone(),
-                        None,
-                    );
-                    runtime
-                })
-        });
-        let durable_session_id = session
-            .persistence
-            .as_ref()
-            .and_then(|store| store.snapshot().ok())
-            .map(|snapshot| snapshot.state.session_id)
-            .or_else(|| {
-                session_path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| format!("tui-session-{}", std::process::id()));
+        #[cfg(target_os = "linux")]
+        if let Some(reason) = signal::pending_linux_process_shutdown() {
+            if let Err(error) = linux_finish_pre_turn_shutdown(
+                tui_admission.take(),
+                mcp_runtime.take(),
+                rewind_boundary.take(),
+                session.persistence.as_ref(),
+            )
+            .await
+            {
+                fatal_message = Some(error);
+                break 'outer ExitCode::FAILURE;
+            }
+            break 'outer linux_signal_exit_code(reason);
+        }
         let turn_control = match install_tui_root_control(
             &mut session,
             TuiRootControlArgs {
@@ -2903,17 +5771,88 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         ) {
             Ok(control) => control,
             Err(error) => {
+                #[cfg(target_os = "linux")]
+                if let Err(cleanup) = linux_finish_pre_turn_shutdown(
+                    tui_admission.take(),
+                    mcp_runtime.take(),
+                    rewind_boundary.take(),
+                    session.persistence.as_ref(),
+                )
+                .await
+                {
+                    fatal_message = Some(format!(
+                        "subagent controlを準備できません: {error}; {cleanup}"
+                    ));
+                    break 'outer ExitCode::FAILURE;
+                }
+                #[cfg(not(target_os = "linux"))]
+                if let (Some(boundary), Some(persistence)) =
+                    (rewind_boundary.take(), session.persistence.as_ref())
+                {
+                    let _ = persistence.abandon_rewind_boundary(
+                        &boundary.boundary_id,
+                        "subagent controlを開始できません".into(),
+                    );
+                }
                 status = Status::Error(format!("subagent controlを準備できません: {error}"));
+                #[cfg(target_os = "linux")]
+                if let Some(code) = linux_pending_exit_code() {
+                    break 'outer code;
+                }
                 continue 'outer;
             }
         };
+        #[cfg(unix)]
+        let runtime_generation = match session
+            .persistence
+            .as_ref()
+            .map(|p| p.snapshot())
+            .transpose()
+        {
+            Ok(Some(snapshot)) => snapshot.state.generation,
+            Ok(None) => 0,
+            Err(error) => {
+                status = Status::Error(format!("実行管理の保存状態を読めません: {error}"));
+                continue 'outer;
+            }
+        };
+        #[cfg(unix)]
+        let runtime_error = RefCell::new(None);
+        #[cfg(unix)]
+        let mut interruption_effect = None;
+        if let Some(active) = tui_admission.as_ref() {
+            history.push(render::HistoryLine {
+                line: ratatui::text::Line::from(format!(
+                    "受理ID: {}（/input status|cancel）",
+                    active.admission_id.as_str()
+                )),
+                shaded: true,
+            });
+            history_wrap_cache.invalidate();
+        }
+        #[cfg(unix)]
+        let runtime_persistence = session.persistence.clone();
         let outcome = {
-            let mut stop = StopTracker::new(args.max_turns);
+            let mut stop = StopTracker::new(next_max_turns);
             let mut gate = Gate::new(approval_policy);
-            let mut approver = TuiApprover {
+            let approver = TuiApprover {
                 terminal: &terminal,
                 reader: &mut key_reader,
             };
+            #[cfg(unix)]
+            let mut approver = runtime_effects::JournalledApprover {
+                inner: approver,
+                context: runtime_commands::RuntimeMutationContext {
+                    effects: &management_effects,
+                    lease: &_project_activity,
+                    session_id: &durable_session_id,
+                    generation: runtime_generation,
+                    accepted: false,
+                },
+                error: &runtime_error,
+            };
+            #[cfg(not(unix))]
+            let mut approver = approver;
             let mut ctx = ToolContext {
                 sandbox: &args.sandbox,
                 helper: &args.helper,
@@ -2945,6 +5884,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             // before that borrow starts, as the reply from *before* this
             // turn (there can't be a newer one yet; the turn hasn't
             // produced a reply until it finishes).
+            #[cfg(not(unix))]
             let reply_before_this_turn =
                 clipboard::last_agent_message_text(&session).map(str::to_string);
             //
@@ -2959,8 +5899,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 audit.clone(),
                 &mut stop,
                 args.always_on,
-                args.skills,
-                args.agent_types,
+                &effective_skills,
+                &effective_agent_types,
                 args.provider.clone(),
                 args.spawn_concurrency,
                 args.spawn_write_concurrency,
@@ -2974,6 +5914,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             // The first tick fires immediately; skip it since the
             // pre-draw above already painted the elapsed=0 frame.
             ticker.tick().await;
+            #[cfg(target_os = "linux")]
+            let mut shutdown_tick = tokio::time::interval(LINUX_SIGNAL_POLL_INTERVAL);
+            #[cfg(target_os = "linux")]
+            shutdown_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            #[cfg(target_os = "linux")]
+            shutdown_tick.tick().await;
             let mut event_stream = ratatui::crossterm::event::EventStream::new();
             // How long the `Ctrl+O` copy confirmation stays on screen
             // before the ticker branch resumes overwriting `status` with
@@ -2983,9 +5929,30 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             let mut mid_turn_notice_until: Option<Instant> = None;
 
             let turn_outcome = loop {
+                #[cfg(target_os = "linux")]
+                if let Some(reason) = signal::pending_linux_process_shutdown() {
+                    break TurnOutcome::Shutdown(reason);
+                }
                 tokio::select! {
                     biased;
-                    result = &mut agent_future => break TurnOutcome::Done(result),
+                    _ = async {
+                        #[cfg(target_os = "linux")]
+                        { shutdown_tick.tick().await; }
+                        #[cfg(not(target_os = "linux"))]
+                        { std::future::pending::<()>().await; }
+                    } => {
+                        #[cfg(target_os = "linux")]
+                        if let Some(reason) = signal::pending_linux_process_shutdown() {
+                            break TurnOutcome::Shutdown(reason);
+                        }
+                    }
+                    result = &mut agent_future => {
+                        #[cfg(target_os = "linux")]
+                        if let Some(reason) = signal::pending_linux_process_shutdown() {
+                            break TurnOutcome::Shutdown(reason);
+                        }
+                        break TurnOutcome::Done(result);
+                    }
                     // Ahead of the tick and the key-event arms so a burst
                     // of tool activity is printed as it happens rather
                     // than queueing behind cosmetic redraws; behind
@@ -2994,6 +5961,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     // display work. Anything still queued when the turn
                     // finishes is drained right after this loop.
                     Some(event) = events_rx.recv() => {
+                        #[cfg(unix)]
+                        rewind_effects.observe(&event, |path| {
+                            rewind_workspace.as_ref().is_some_and(|owner| {
+                                owner.is_restorable_path(path).unwrap_or(false)
+                            })
+                        });
                         update_effort_from_event(&event, &mut effort_name);
                         let appended = append_live_event(
                             &event,
@@ -3040,6 +6013,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         }
                     }
                     _ = ticker.tick() => {
+                        #[cfg(unix)]
+                        if runtime_error.borrow().is_some(){break TurnOutcome::Fatal;}
                         if mid_turn_notice_until.is_some_and(|until| Instant::now() < until) {
                             // Leave `status` as the Ctrl+O confirmation —
                             // redrawing it unchanged below keeps it
@@ -3099,7 +6074,17 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 // here. Ctrl+O copies the last reply, same
                                 // as the idle-loop handler.
                                 match key.code {
-                                    KeyCode::Esc => break TurnOutcome::Interrupted,
+                                    KeyCode::Esc => {
+                                        #[cfg(unix)]
+                                        {
+                                            let context = runtime_commands::RuntimeMutationContext {effects:&management_effects,lease:&_project_activity,session_id:&durable_session_id,generation:runtime_generation,accepted:true};
+                                            match runtime_effects::begin(&context,"D23",durable_session_id.as_bytes()) {
+                                                Ok(started)=>interruption_effect=started,
+                                                Err(error)=>{*runtime_error.borrow_mut()=Some(error);break TurnOutcome::Fatal;}
+                                            }
+                                        }
+                                        break TurnOutcome::Interrupted;
+                                    },
                                     KeyCode::PageUp => {
                                         scroll_offset = scroll_offset.saturating_add(1);
                                     }
@@ -3107,10 +6092,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         scroll_offset = scroll_offset.saturating_sub(1);
                                     }
                                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                        status = Status::Notice(clipboard::copy_text_with(
-                                            reply_before_this_turn.as_deref(),
-                                            clipboard::copy_to_clipboard,
-                                        ));
+                                        #[cfg(unix)]
+                                        { status = Status::Notice("コピーは実行終了後に /copy で確認してください".into()); }
+                                        #[cfg(not(unix))]
+                                        { status = Status::Notice(clipboard::copy_text_with(reply_before_this_turn.as_deref(), clipboard::copy_to_clipboard)); }
                                         // Draw immediately so the
                                         // confirmation appears right away
                                         // rather than up to 100ms late,
@@ -3150,6 +6135,80 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             break TurnOutcome::Fatal;
                                         }
                                     }
+                                    #[cfg(unix)]
+                                    KeyCode::Enter if input_buffer.starts_with("/instruction ") => {
+                                        let request=std::mem::take(&mut input_buffer);input_cursor=0;
+                                        let result=(||->Result<String,String>{
+                                            let text=request.strip_prefix("/instruction send ").ok_or("使い方: /instruction send <次のrunへの指示>")?;
+                                            let active=tui_admission.as_mut().ok_or("保存済み受理ownerがありません")?;
+                                            let saved=runtime_persistence.as_ref().ok_or("v2保存会話が必要です")?;
+                                            let handle=instruction_commands::receive(&active.store,&mut active.manager,saved,&management_effects,&_project_activity,polaris_core::management_effect::ManagementOperationIdV1::random().map_err(|e|e.to_string())?,text)?;
+                                            let id=handle.admission_id().as_str().to_owned();queued_instructions.push_back(handle);Ok(id)
+                                        })();
+                                        match result {Ok(id)=>{history.push(render::HistoryLine{line:ratatui::text::Line::from(format!("指示受理ID: {id}。この会話の次のrun境界で適用します")),shaded:true});history_wrap_cache.invalidate();status=Status::Notice("次のrunへの指示を保存しました".into());},Err(error)=>status=Status::Error(error)}
+                                        mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
+                                    }
+                                    #[cfg(unix)]
+                                    KeyCode::Enter if input_buffer.starts_with("/input ") => {
+                                        let request=std::mem::take(&mut input_buffer);input_cursor=0;
+                                        let result=(|| -> Result<(bool,String),String> {
+                                            let words=request.split_whitespace().collect::<Vec<_>>();
+                                            let ["/input",verb,id]=words.as_slice() else {return Err("使い方: /input status|cancel <受理ID>".into());};
+                                            let active=tui_admission.as_ref().ok_or("このrunには保存済み受理IDがありません")?;
+                                            let id=polaris_core::session_manager::AdmissionId::new(*id).map_err(|e|e.to_string())?;
+                                            let receipt=active.manager.status(&id).map_err(|e|e.to_string())?;
+                                            if *verb=="status" {return Ok((false,render::sanitize(&format!("入力 {} / revision {} / 状態 {:?}",receipt.id.as_str(),receipt.revision,receipt.state))));}
+                                            if *verb!="cancel" {return Err("使い方: /input status|cancel <受理ID>".into());}
+                                            if id!=active.admission_id {
+                                                let position=queued_instructions.iter().position(|item|item.admission_id()==&id).ok_or("この会話の実行中・送信待ちIDではありません")?;
+                                                #[cfg(target_os="linux")] let mut reader=LinuxSignalAwareKeyReader;
+                                                #[cfg(not(target_os="linux"))] let mut reader=approver::CrosstermKeyReader;
+                                                if !account::confirm(&terminal,&mut reader,"送信待ち入力の取消",id.as_str(),"このIDの未実行の指示だけを取り消します。") {
+                                                    let context=runtime_commands::RuntimeMutationContext{effects:&management_effects,lease:&_project_activity,session_id:&durable_session_id,generation:runtime_generation,accepted:false};
+                                                    runtime_effects::begin(&context,"D10",id.as_str().as_bytes())?;
+                                                    return Ok((false,"取消要求を取り消しました".into()));
+                                                }
+                                                let instruction=queued_instructions.remove(position).expect("queued");
+                                                let active=tui_admission.as_mut().ok_or("保存された受理ownerがありません")?;
+                                                instruction_commands::cancel_queue(&active.store,&mut active.manager,runtime_persistence.as_ref().ok_or("v2会話が必要です")?,&management_effects,&_project_activity,instruction)?;
+                                                return Ok((false,format!("入力 {} を取り消しました",id.as_str())));
+                                            }
+                                            #[cfg(target_os="linux")]
+                                            let mut reader=LinuxSignalAwareKeyReader;
+                                            #[cfg(not(target_os="linux"))]
+                                            let mut reader=approver::CrosstermKeyReader;
+                                            let accepted=account::confirm(&terminal,&mut reader,"入力の停止要求",id.as_str(),"この入力のrunを停止し、所有するchild/MCPの終了を確認します。");
+                                            let context=runtime_commands::RuntimeMutationContext{effects:&management_effects,lease:&_project_activity,session_id:&durable_session_id,generation:runtime_generation,accepted};
+                                            interruption_effect=runtime_effects::begin(&context,"D10",id.as_str().as_bytes())?;
+                                            Ok((accepted,if accepted {"入力の停止を要求しました".into()}else{"停止要求を取り消しました".into()}))
+                                        })();
+                                        match result {
+                                            Ok((true,_))=>break TurnOutcome::Interrupted,
+                                            Ok((false,line))=>{history.push(render::HistoryLine{line:ratatui::text::Line::from(line),shaded:false});history_wrap_cache.invalidate();status=Status::Notice("入力状態を表示しました".into());},
+                                            Err(error)=>status=Status::Error(error),
+                                        }
+                                        mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
+                                    }
+                                    #[cfg(unix)]
+                                    KeyCode::Enter if input_buffer.starts_with("/subagents") || input_buffer.starts_with("/run details") => {
+                                        let request=std::mem::take(&mut input_buffer);
+                                        input_cursor=0;
+                                        let result = if let Some(extra)=request.strip_prefix("/subagents") {
+                                            #[cfg(target_os="linux")]
+                                            let mut cancellation_reader=LinuxSignalAwareKeyReader;
+                                            #[cfg(not(target_os="linux"))]
+                                            let mut cancellation_reader=approver::CrosstermKeyReader;
+                                            let accepted = !extra.trim().starts_with("cancel ") || account::confirm(&terminal,&mut cancellation_reader,"subagent停止要求",extra.trim(),"現在のchild/attemptだけへ停止要求を送ります。終了はwaitで確認してください。");
+                                            runtime_commands::subagents(Some(&turn_control),extra.trim(),Some(runtime_commands::RuntimeMutationContext{effects:&management_effects,lease:&_project_activity,session_id:&durable_session_id,generation:runtime_generation,accepted})).await
+                                        } else {
+                                            runtime_commands::run_details(Some(&turn_control)).await.map(|mut lines| { lines.extend(agent_activity_rows.tool_detail_lines()); lines })
+                                        };
+                                        match result {
+                                            Ok(lines)=>{history.extend(lines.into_iter().map(|line|render::HistoryLine{line:ratatui::text::Line::from(line),shaded:false}));history_wrap_cache.invalidate();status=Status::Notice("実行状態を表示しました".into());},
+                                            Err(error)=>status=Status::Error(error),
+                                        }
+                                        mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
+                                    }
                                     _ => match apply_inflight_key(
                                         &mut input_buffer,
                                         &mut input_cursor,
@@ -3159,10 +6218,20 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     ) {
                                         InflightInputAction::Continue => {}
                                         InflightInputAction::Queued => {
-                                            status = Status::Notice(format!(
-                                                "queued input ({})",
-                                                queued_inputs.len()
-                                            ));
+                                            #[cfg(unix)]
+                                            if queued_inputs.back().is_some_and(|text|!text.starts_with('/')) && runtime_persistence.is_some() {
+                                                let text=queued_inputs.pop_back().expect("queued input");
+                                                let result=(||->Result<String,String>{
+                                                    let active=tui_admission.as_mut().ok_or("保存済み受理ownerがありません")?;
+                                                    let handle=instruction_commands::receive(&active.store,&mut active.manager,runtime_persistence.as_ref().expect("saved"),&management_effects,&_project_activity,polaris_core::management_effect::ManagementOperationIdV1::random().map_err(|e|e.to_string())?,&text)?;
+                                                    let id=handle.admission_id().as_str().to_owned();queued_instructions.push_back(handle);Ok(id)
+                                                })();
+                                                match result {Ok(id)=>status=Status::Notice(format!("入力 {id} を保存しました。次のrunで適用します")),Err(error)=>{input_buffer=text;input_cursor=input_buffer.len();status=Status::Error(error);}}
+                                            } else {
+                                                status=Status::Notice(format!("queued local command ({})",queued_inputs.len()));
+                                            }
+                                            #[cfg(not(unix))]
+                                            {status = Status::Notice(format!("queued input ({})",queued_inputs.len()));}
                                             mid_turn_notice_until = Some(
                                                 Instant::now() + MID_TURN_NOTICE_DURATION,
                                             );
@@ -3277,10 +6346,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         let wrapped = render::wrap_history_lines(&history, width);
                                         let text = selection::extract_text(&wrapped, sel);
                                         if !text.is_empty() {
-                                            status = Status::Notice(apply_selection_copy(
-                                                &text,
-                                                clipboard::copy_to_clipboard,
-                                            ));
+                                            #[cfg(unix)]
+                                            { status = Status::Notice("選択した範囲のコピーは実行終了後に確認してください".into()); }
+                                            #[cfg(not(unix))]
+                                            { status = Status::Notice(apply_selection_copy(&text, clipboard::copy_to_clipboard)); }
                                             mid_turn_notice_until = Some(
                                                 Instant::now() + MID_TURN_NOTICE_DURATION,
                                             );
@@ -3333,6 +6402,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             // print them rather than silently dropping the final tool's
             // result marker.
             while let Ok(event) = events_rx.try_recv() {
+                #[cfg(unix)]
+                rewind_effects.observe(&event, |path| {
+                    rewind_workspace
+                        .as_ref()
+                        .is_some_and(|owner| owner.is_restorable_path(path).unwrap_or(false))
+                });
                 update_effort_from_event(&event, &mut effort_name);
                 let appended = append_live_event(&event, &mut history, &mut agent_activity_rows);
                 history_wrap_cache.invalidate();
@@ -3354,19 +6429,54 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             }
             turn_outcome
         };
+        #[cfg(target_os = "linux")]
+        let shutdown_reason = match &outcome {
+            TurnOutcome::Shutdown(reason) => Some(*reason),
+            _ => signal::pending_linux_process_shutdown(),
+        };
+        #[cfg(target_os = "linux")]
+        let mcp_cleanup_error = if let Some(runtime) = mcp_runtime.as_mut() {
+            // An unconfirmed stop parks the child with the shared cleanup owner.
+            runtime
+                .shutdown()
+                .await
+                .err()
+                .map(|error| format!("MCP runtimeを終了できません: {error}"))
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
         if let Some(runtime) = mcp_runtime.as_mut() {
             // An unconfirmed stop parks the child with the shared cleanup owner.
             let _ = runtime.shutdown().await;
         }
+        #[cfg(target_os = "linux")]
+        let shutdown_reason = shutdown_reason.or_else(signal::pending_linux_process_shutdown);
         // Only a normally completed root turn can prove that every child
         // reached a terminal state.  Provider/tool errors can abandon a
         // spawn wave just as interruption can, so fail closed and mark any
         // still-running child outcome unknown before releasing the owner.
+        #[cfg(target_os = "linux")]
+        let cancel_children = linux_cancel_owned_children(
+            shutdown_reason,
+            matches!(&outcome, TurnOutcome::Done(Ok(_))),
+        );
+        #[cfg(not(target_os = "linux"))]
         let cancel_children = !matches!(&outcome, TurnOutcome::Done(Ok(_)));
         let mut control_cleanup_error = session
             .finish_root_delegation_control(cancel_children)
             .await
             .err();
+        #[cfg(target_os = "linux")]
+        let shutdown_reason = shutdown_reason.or_else(signal::pending_linux_process_shutdown);
+        #[cfg(unix)]
+        if let Some(error) = runtime_error.borrow_mut().take() {
+            control_cleanup_error = Some(format!("実行管理の保存に失敗しました: {error}"));
+        }
+        #[cfg(target_os = "linux")]
+        if control_cleanup_error.is_none() {
+            control_cleanup_error = mcp_cleanup_error.clone();
+        }
         if let Some(admission) = tui_admission.take() {
             let terminal = match &outcome {
                 TurnOutcome::Done(Ok(_)) => {
@@ -3377,14 +6487,61 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     polaris_core::session_manager::TerminalStatus::Cancelled
                 }
                 TurnOutcome::Fatal => polaris_core::session_manager::TerminalStatus::OutcomeUnknown,
+                #[cfg(target_os = "linux")]
+                TurnOutcome::Shutdown(_) => {
+                    polaris_core::session_manager::TerminalStatus::OutcomeUnknown
+                }
+            };
+            #[cfg(target_os = "linux")]
+            let terminal = linux_admission_status_after_cleanup(
+                terminal,
+                shutdown_reason.or_else(signal::pending_linux_process_shutdown),
+            );
+            let terminal = if control_cleanup_error.is_some() {
+                polaris_core::session_manager::TerminalStatus::OutcomeUnknown
+            } else {
+                terminal
             };
             if let Err(error) = admission.finish(terminal) {
                 control_cleanup_error = Some(format!("sidechat runを終了できません: {error}"));
             }
         }
-        if matches!(&outcome, TurnOutcome::Done(Ok(_)))
-            && let Some(finalizer) = args.answer_finalizer.as_ref()
+        #[cfg(target_os = "linux")]
+        if control_cleanup_error.is_none() {
+            control_cleanup_error = mcp_cleanup_error;
+        }
+        #[cfg(unix)]
         {
+            if let Some(error) = runtime_error.into_inner() {
+                control_cleanup_error = Some(format!("実行管理の保存に失敗しました: {error}"));
+            }
+            if let Some(started) = interruption_effect {
+                let context = runtime_commands::RuntimeMutationContext {
+                    effects: &management_effects,
+                    lease: &_project_activity,
+                    session_id: &durable_session_id,
+                    generation: runtime_generation,
+                    accepted: true,
+                };
+                if let Err(error) = runtime_effects::finish(
+                    &context,
+                    &started,
+                    control_cleanup_error.is_none(),
+                    b"root-interrupted-after-owned-cleanup",
+                ) {
+                    control_cleanup_error = Some(format!("停止結果を保存できません: {error}"));
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let mut cleanup_failure = control_cleanup_error.clone();
+        let turn_completed = matches!(&outcome, TurnOutcome::Done(Ok(_)));
+        #[cfg(target_os = "linux")]
+        let turn_completed = linux_turn_completed_without_shutdown(
+            turn_completed,
+            shutdown_reason.or_else(signal::pending_linux_process_shutdown),
+        );
+        if turn_completed && let Some(finalizer) = args.answer_finalizer.as_ref() {
             let scheduled = schedule_tui_shadow(finalizer, &session, &text, &turn_control);
             if let Err(error) = scheduled {
                 local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
@@ -3434,19 +6591,194 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     status = Status::Error(error.to_string());
                 }
             }
-            TurnOutcome::Fatal => break ExitCode::FAILURE,
+            #[cfg(target_os = "linux")]
+            TurnOutcome::Shutdown(_) => {
+                if let Err(error) = keep_or_roll_back(&mut session, checkpoint) {
+                    cleanup_failure = Some(format!("停止中の会話を復旧できません: {error}"));
+                }
+            }
+            TurnOutcome::Fatal => {
+                if let (Some(boundary), Some(persistence)) =
+                    (rewind_boundary.take(), session.persistence.as_ref())
+                {
+                    let _ = persistence.abandon_rewind_boundary(
+                        &boundary.boundary_id,
+                        "TUI実行が完了前に終了しました".into(),
+                    );
+                }
+                break ExitCode::FAILURE;
+            }
         }
+        #[cfg(unix)]
+        let rewind_writers_stopped = control_cleanup_error.is_none();
         if let Some(error) = control_cleanup_error {
             status = Status::Error(format!("subagent controlを終了できません: {error}"));
         }
+        #[cfg(target_os = "linux")]
+        let rewind_turn_completed = linux_turn_completed_without_shutdown(
+            turn_completed,
+            shutdown_reason.or_else(signal::pending_linux_process_shutdown),
+        );
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let rewind_turn_completed = turn_completed;
+        #[cfg(unix)]
+        if let Some(boundary) = rewind_boundary {
+            let Some(persistence) = session.persistence.as_ref() else {
+                fatal_message = Some("巻き戻し境界の保存元が失われました".into());
+                break 'outer ExitCode::FAILURE;
+            };
+            let completion = if rewind_turn_completed && rewind_writers_stopped {
+                match rewind_workspace.as_ref() {
+                    Some(owner) => match owner.capture(&args.sandbox) {
+                        Ok(post) => {
+                            let effect = match rewind_effects.unknown_reason() {
+                                Some(description) => {
+                                    polaris_core::conversation_state::RewindEffectStatusV1::Unknown {
+                                        description,
+                                    }
+                                }
+                                None => polaris_core::conversation_state::RewindEffectStatusV1::NoExternalMutation,
+                            };
+                            let eligibility = if matches!(
+                                effect,
+                                polaris_core::conversation_state::RewindEffectStatusV1::NoExternalMutation
+                            ) {
+                                polaris_core::conversation_state::RewindEligibilityV1::Eligible
+                            } else {
+                                polaris_core::conversation_state::RewindEligibilityV1::Ineligible {
+                                    reason: "外部効果を巻き戻せません".into(),
+                                }
+                            };
+                            let post_manifest_id = post.to_string();
+                            #[cfg(target_os = "linux")]
+                            let capture_can_complete = linux_turn_completed_without_shutdown(
+                                true,
+                                signal::pending_linux_process_shutdown(),
+                            );
+                            #[cfg(not(target_os = "linux"))]
+                            let capture_can_complete = true;
+                            if capture_can_complete {
+                                persistence.finish_rewind_boundary(
+                                    &boundary.boundary_id,
+                                    post_manifest_id,
+                                    eligibility,
+                                    effect,
+                                )
+                            } else {
+                                persistence.abandon_rewind_boundary(
+                                    &boundary.boundary_id,
+                                    "停止要求を受けたため巻き戻し境界は未完了です".into(),
+                                )
+                            }
+                        }
+                        Err(error) => {
+                            rewind_unavailable_reason =
+                                format!("ターン後のファイル保存を作成できません: {error}");
+                            persistence.abandon_rewind_boundary(
+                                &boundary.boundary_id,
+                                rewind_unavailable_reason.clone(),
+                            )
+                        }
+                    },
+                    None => persistence.abandon_rewind_boundary(
+                        &boundary.boundary_id,
+                        "ファイル保存先が利用できません".into(),
+                    ),
+                }
+            } else {
+                persistence.abandon_rewind_boundary(
+                    &boundary.boundary_id,
+                    "ターンまたはsubagentが正常終了していません".into(),
+                )
+            };
+            match completion {
+                Ok(saved) => {
+                    rewind_unavailable_reason = match saved.completion {
+                        Some(completion) if matches!(
+                            completion.eligibility,
+                            polaris_core::conversation_state::RewindEligibilityV1::Eligible
+                        ) => "まだ保存済みの巻き戻し境界がありません".into(),
+                        Some(completion) => match completion.effect {
+                            polaris_core::conversation_state::RewindEffectStatusV1::Unknown {
+                                description,
+                            }
+                            | polaris_core::conversation_state::RewindEffectStatusV1::ExternalMutation {
+                                description,
+                            } => description,
+                            _ => "このターンは巻き戻し対象外です".into(),
+                        },
+                        None => saved
+                            .abandoned_reason
+                            .unwrap_or_else(|| "このターンの保存境界は未完了です".into()),
+                    };
+                }
+                Err(error) => {
+                    fatal_message = Some(format!("巻き戻し境界を確定できません: {error}"));
+                    break 'outer ExitCode::FAILURE;
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(reason) = shutdown_reason.or_else(signal::pending_linux_process_shutdown) {
+            if let Some(error) = cleanup_failure {
+                fatal_message = Some(error);
+                break 'outer ExitCode::FAILURE;
+            }
+            break 'outer linux_signal_exit_code(reason);
+        }
     };
 
-    // Already leaves the alternate screen entered above, on its own
-    // (confirmed against ratatui 0.29.0's source) — no separate explicit
-    // `LeaveAlternateScreen` call is needed here.
+    #[cfg(unix)]
+    let exit_code = if session.persistence.is_some() && !last_submission_was_local {
+        match draft::save(
+            &session,
+            &initial_saved_settings,
+            rewind_workspace.as_ref().expect("startup owner"),
+            &management_effects,
+            input_history.pending_draft(&input_buffer),
+        ) {
+            Ok(()) => exit_code,
+            Err(error) => {
+                fatal_message = Some(match fatal_message.take() {
+                    Some(previous) => format!("{previous}; 下書き保存: {error}"),
+                    None => format!("下書きを保存できません: {error}"),
+                });
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        exit_code
+    };
+    #[cfg(target_os = "linux")]
+    let exit_code = match source_frontend {
+        Ok(owner) => match owner.shutdown().await {
+            Ok(()) => exit_code,
+            Err(error) => {
+                fatal_message = Some(error);
+                ExitCode::FAILURE
+            }
+        },
+        Err(_) => exit_code,
+    };
+    #[cfg(target_os = "linux")]
+    let (exit_code, restoration_error) = linux_exit_after_terminal_restoration(
+        exit_code,
+        terminal_guard.restore(),
+        signal::pending_linux_process_shutdown(),
+    );
+    #[cfg(target_os = "linux")]
+    if let Some(error) = restoration_error {
+        fatal_message = Some(match fatal_message.take() {
+            Some(previous) => format!("{previous}; {error}"),
+            None => error,
+        });
+    }
+    // ratatui restores the alternate screen on the other platforms.
+    #[cfg(not(target_os = "linux"))]
     ratatui::restore();
     // Restore the terminal's own default cursor shape, undoing the
     // BlinkingBar set at startup — best-effort, same as the set itself.
+    #[cfg(not(target_os = "linux"))]
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::cursor::SetCursorStyle::DefaultUserShape
@@ -3456,6 +6788,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // whatever the user's shell does next (e.g. text selection with the
     // mouse would stop working until they open and close another
     // mouse-reporting program).
+    #[cfg(not(target_os = "linux"))]
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         ratatui::crossterm::event::DisableMouseCapture
@@ -3518,6 +6851,844 @@ fn run_resume_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
+fn show_read_only_transcript<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    messages: &[polaris_provider::Message],
+    source: &str,
+) {
+    let unwrapped = render::transcript_lines_for(messages);
+    let mut offset = 0usize;
+    loop {
+        let Ok(size) = terminal.borrow().size() else {
+            return;
+        };
+        let wrapped = render::wrap_history_lines(&unwrapped, size.width.saturating_sub(2));
+        let page = size.height.saturating_sub(4).max(1) as usize;
+        let maximum = wrapped.len().saturating_sub(page);
+        offset = offset.min(maximum);
+        if terminal
+            .borrow_mut()
+            .draw(|frame| render::render_transcript_viewer(frame, &wrapped, offset, source))
+            .is_err()
+        {
+            return;
+        }
+        use ratatui::crossterm::event::KeyCode;
+        match reader.read_key() {
+            Ok(KeyCode::Up) => offset = offset.saturating_sub(1),
+            Ok(KeyCode::Down) => offset = (offset + 1).min(maximum),
+            Ok(KeyCode::PageUp) => offset = offset.saturating_sub(page),
+            Ok(KeyCode::PageDown) => offset = offset.saturating_add(page).min(maximum),
+            Ok(KeyCode::Home) => offset = 0,
+            Ok(KeyCode::End) => offset = maximum,
+            Ok(KeyCode::Esc | KeyCode::Enter | KeyCode::Null) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+fn run_rewind_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    rows: &[render::RewindPickerRow],
+) -> Option<String> {
+    let now = now_millis();
+    if rows.is_empty() {
+        let _ = terminal
+            .borrow_mut()
+            .draw(|f| render::render_rewind_picker(f, rows, 0, now));
+        let _ = reader.read_key();
+        return None;
+    }
+    let mut selected = 0usize;
+    loop {
+        if terminal
+            .borrow_mut()
+            .draw(|f| render::render_rewind_picker(f, rows, selected, now))
+            .is_err()
+        {
+            return None;
+        }
+        use ratatui::crossterm::event::KeyCode;
+        match reader.read_key() {
+            Ok(KeyCode::Down) => selected = (selected + 1) % rows.len(),
+            Ok(KeyCode::Up) => selected = (selected + rows.len() - 1) % rows.len(),
+            Ok(KeyCode::Enter) => return Some(rows[selected].boundary_id.clone()),
+            Ok(KeyCode::Esc) => return None,
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+fn confirm_rewind_preview<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    preview: &render::RewindPreviewView,
+) -> bool {
+    loop {
+        if terminal
+            .borrow_mut()
+            .draw(|f| render::render_rewind_preview(f, preview))
+            .is_err()
+        {
+            return false;
+        }
+        use ratatui::crossterm::event::KeyCode;
+        match reader.read_key() {
+            Ok(KeyCode::Char('r')) => return true,
+            Ok(KeyCode::Esc) | Err(_) => return false,
+            Ok(_) => continue,
+        }
+    }
+}
+
+
+
+
+
+fn confirm_workflow_change<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    view: &render::WorkflowChangeConfirmView<'_>,
+) -> bool {
+    loop {
+        if terminal
+            .borrow_mut()
+            .draw(|frame| render::render_workflow_change_confirmation(frame, view))
+            .is_err()
+        {
+            return false;
+        }
+        use ratatui::crossterm::event::KeyCode;
+        match reader.read_key() {
+            Ok(KeyCode::Char('y')) => return true,
+            Ok(KeyCode::Esc) | Err(_) => return false,
+            Ok(_) => continue,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn workflow_mode_name(config: &polaris_core::workflow::WorkflowConfig) -> &'static str {
+    if !config.enabled {
+        "off"
+    } else {
+        match config.mode {
+            polaris_core::workflow::WorkflowMode::Manual => "manual",
+            polaris_core::workflow::WorkflowMode::Adaptive => "adaptive",
+        }
+    }
+}
+
+#[cfg(unix)]
+fn workflow_override_candidate(
+    session: &polaris_core::session::Session,
+    requested: &polaris_core::workflow::WorkflowConfig,
+    skills: &[Skill],
+) -> Result<polaris_core::workflow::SessionWorkflow, String> {
+    let current = session
+        .workflow
+        .as_ref()
+        .ok_or("保存済みworkflow設定がありません")?;
+    let mut config = current.config.clone();
+    config.enabled = requested.enabled;
+    config.mode = requested.mode;
+    let candidate = polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
+        config,
+        current.gates.clone(),
+        current.state(),
+        current.artifact_graph().clone(),
+    )?;
+    if candidate.config.enabled {
+        drop(candidate.begin_turn_from_disk(skills)?);
+    }
+    Ok(candidate)
+}
+
+#[cfg(unix)]
+enum WorkflowChangeResult {
+    NoChange,
+    Cancelled,
+    Changed,
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn apply_confirmed_workflow_change(
+    session: &mut polaris_core::session::Session,
+    candidate: polaris_core::workflow::SessionWorkflow,
+    inventory: polaris_core::management_effect::workflow_change::WorkflowEffectInventoryV1,
+    workspace: &polaris_core::rewind_workspace::WorkspaceOwner,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    state_dir: &Path,
+    confirm: impl FnOnce(&render::WorkflowChangeConfirmView<'_>) -> bool,
+) -> Result<WorkflowChangeResult, String> {
+    use polaris_core::management_effect::workflow_change::{
+        WorkflowChangeError, WorkflowChangeOwner,
+    };
+
+    session
+        .check_persistence()
+        .map_err(|error| error.to_string())?;
+    let persistence = session
+        .persistence
+        .as_ref()
+        .ok_or("workflow設定を保存する会話がありません")?;
+    let preview = match WorkflowChangeOwner::preview(persistence, inventory, &candidate) {
+        Ok(preview) => preview,
+        Err(WorkflowChangeError::NoChange) => return Ok(WorkflowChangeResult::NoChange),
+        Err(error) => return Err(error.to_string()),
+    };
+    let before_config = preview
+        .before_config()
+        .ok_or("変更前のworkflow設定がありません")?;
+    let candidate_config = preview
+        .candidate_config()
+        .ok_or("変更後のworkflow設定がありません")?;
+    let before_phase = preview.before_workflow().phase.to_string();
+    let after_phase = preview.candidate_workflow().phase.to_string();
+    let view = render::WorkflowChangeConfirmView {
+        inventory: inventory.id(),
+        project_id: preview.project_id(),
+        session_id: preview.session_id(),
+        generation: preview.before_generation(),
+        before_phase: &before_phase,
+        after_phase: &after_phase,
+        before_mode: workflow_mode_name(&before_config.config),
+        after_mode: workflow_mode_name(&candidate_config.config),
+    };
+    if !confirm(&view) {
+        return Ok(WorkflowChangeResult::Cancelled);
+    }
+    #[cfg(target_os = "linux")]
+    if signal::pending_linux_process_shutdown().is_some() {
+        return Ok(WorkflowChangeResult::Cancelled);
+    }
+    let lease = workspace
+        .try_mutation()
+        .map_err(|error| error.to_string())?;
+    workspace
+        .require_quiescent_with_lease(&lease)
+        .map_err(|error| error.to_string())?;
+    let owner = WorkflowChangeOwner {
+        effects,
+        lease: &lease,
+        state_dir,
+    };
+    let operation_id = polaris_core::management_effect::ManagementOperationIdV1::random()
+        .map_err(|error| error.to_string())?;
+    let prepared = owner
+        .prepare_confirmed(persistence, &preview, operation_id)
+        .map_err(|error| error.to_string())?;
+    owner
+        .execute(persistence, &prepared)
+        .map_err(|error| error.to_string())?;
+    session.workflow = Some(candidate);
+    Ok(WorkflowChangeResult::Changed)
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn handle_managed_workflow_action<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    action: slash::Action,
+    session: &mut polaris_core::session::Session,
+    skills: &[Skill],
+    workspace: &polaris_core::rewind_workspace::WorkspaceOwner,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    state_dir: &Path,
+    has_queued_input: bool,
+    status: &mut Status,
+) {
+    use polaris_core::management_effect::workflow_change::WorkflowEffectInventoryV1;
+
+    if has_queued_input {
+        *status = Status::Notice("送信待ちを空にしてからworkflowを変更してください".into());
+        return;
+    }
+    let result = (|| -> Result<Option<String>, String> {
+        session
+            .check_persistence()
+            .map_err(|error| error.to_string())?;
+        let current = session
+            .workflow
+            .as_ref()
+            .ok_or("workflowはこのセッションで無効です")?;
+        let (inventory, candidate, notice) = match action {
+            slash::Action::Phase(requested) => {
+                if requested.is_empty() {
+                    return Ok(Some(format!("ワークフロー段階: {}", current.state().phase)));
+                }
+                if !current.config.enabled {
+                    return Err("workflowが無効な会話ではphaseを変更できません".into());
+                }
+                let phase = requested.parse::<polaris_core::workflow::Phase>()?;
+                let candidate = polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
+                    current.config.clone(),
+                    current.gates.clone(),
+                    current.state(),
+                    current.artifact_graph().clone(),
+                )?;
+                candidate.request_phase(phase)?;
+                (
+                    WorkflowEffectInventoryV1::T03,
+                    candidate,
+                    format!("ワークフロー段階: {phase}"),
+                )
+            }
+            slash::Action::Workflow(requested) => {
+                if requested.is_empty() {
+                    return Ok(Some(format!(
+                        "workflow: {}",
+                        workflow_mode_name(&current.config)
+                    )));
+                }
+                let mut config = current.config.clone();
+                match requested.strip_prefix("mode ").unwrap_or(&requested) {
+                    "manual" => {
+                        config.enabled = true;
+                        config.mode = polaris_core::workflow::WorkflowMode::Manual;
+                    }
+                    "adaptive" => {
+                        config.enabled = true;
+                        config.mode = polaris_core::workflow::WorkflowMode::Adaptive;
+                    }
+                    "off" => {
+                        config.enabled = false;
+                        config.mode = polaris_core::workflow::WorkflowMode::Manual;
+                    }
+                    _ => return Err("workflow modeは manual、adaptive、off のいずれかです".into()),
+                }
+                let candidate = polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
+                    config,
+                    current.gates.clone(),
+                    current.state(),
+                    current.artifact_graph().clone(),
+                )?;
+                let notice = format!("workflow: {}", workflow_mode_name(&candidate.config));
+                (WorkflowEffectInventoryV1::T04, candidate, notice)
+            }
+            _ => return Err("workflow操作の種類が不正です".into()),
+        };
+        if candidate.config.enabled {
+            drop(candidate.begin_turn_from_disk(skills)?);
+        }
+        match apply_confirmed_workflow_change(
+            session,
+            candidate,
+            inventory,
+            workspace,
+            effects,
+            state_dir,
+            |view| confirm_workflow_change(terminal, reader, view),
+        )? {
+            WorkflowChangeResult::Cancelled => Ok(None),
+            WorkflowChangeResult::NoChange | WorkflowChangeResult::Changed => Ok(Some(notice)),
+        }
+    })();
+    *status = match result {
+        Ok(Some(notice)) => Status::Notice(notice),
+        Ok(None) => Status::Notice("workflow変更を取り消しました".into()),
+        Err(error) => Status::Error(format!("workflowを保存できません: {error}")),
+    };
+}
+
+#[cfg(unix)]
+fn select_rewind_boundary<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    session: &polaris_core::session::Session,
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    unavailable_reason: &str,
+) -> Result<
+    Option<(
+        polaris_core::conversation_state::RewindBoundaryV1,
+        polaris_core::rewind_workspace::ManifestId,
+        polaris_core::rewind_workspace::ManifestId,
+    )>,
+    String,
+> {
+    let persistence = session
+        .persistence
+        .as_ref()
+        .ok_or("この会話には巻き戻し可能な保存履歴がありません")?;
+    let boundaries = persistence
+        .list_rewind_boundaries()
+        .map_err(|error| error.to_string())?;
+    let rows = boundaries
+        .iter()
+        .map(|boundary| render::RewindPickerRow {
+            boundary_id: boundary.boundary_id.clone(),
+            user_message: boundary
+                .user_message_preview
+                .clone()
+                .unwrap_or_else(|| "(message unavailable)".into()),
+            recorded_at_millis: boundary.created_at_unix_ms.into(),
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        run_rewind_picker(terminal, reader, &rows);
+        return Err(format!(
+            "検証済みの巻き戻し境界がありません: {unavailable_reason}"
+        ));
+    }
+    let Some(selected_id) = run_rewind_picker(terminal, reader, &rows) else {
+        return Ok(None);
+    };
+    let selected = boundaries
+        .iter()
+        .find(|boundary| boundary.boundary_id == selected_id)
+        .ok_or("選択した巻き戻し境界が見つかりません")?
+        .clone();
+    let latest = boundaries.last().ok_or("巻き戻し境界がありません")?;
+    let expected_post: polaris_core::rewind_workspace::ManifestId = latest
+        .completion
+        .as_ref()
+        .ok_or("最新の巻き戻し境界が未完了です")?
+        .workspace_post_manifest_id
+        .parse()
+        .map_err(|error: polaris_core::rewind_workspace::IdParseError| error.to_string())?;
+    let target_pre: polaris_core::rewind_workspace::ManifestId = selected
+        .workspace_pre_manifest_id
+        .parse()
+        .map_err(|error: polaris_core::rewind_workspace::IdParseError| error.to_string())?;
+    let preview = owner
+        .preview(&expected_post, &target_pre)
+        .map_err(|error| error.to_string())?;
+    if !preview.restorable {
+        return Err(format!(
+            "ファイルを復元できません: {:?}",
+            preview.blocked_reason
+        ));
+    }
+    let view = render::RewindPreviewView {
+        user_message: selected
+            .user_message_preview
+            .clone()
+            .unwrap_or_else(|| "(message unavailable)".into()),
+        changed_paths: preview
+            .changes
+            .iter()
+            .map(|change| format!("{:?} {}", change.kind, change.relative_path.display()))
+            .collect(),
+        recovery_location: preview.recovery_root.display().to_string(),
+    };
+    if !confirm_rewind_preview(terminal, reader, &view) {
+        return Ok(None);
+    }
+    Ok(Some((selected, expected_post, target_pre)))
+}
+
+#[cfg(unix)]
+async fn build_rewound_session(
+    source: &polaris_core::session::Session,
+    branch: polaris_core::session_store::PersistedSession,
+    args: &RunArgs<'_>,
+    skills: &[Skill],
+) -> Result<(polaris_core::session::Session, PathBuf), String> {
+    let id = branch
+        .snapshot()
+        .map_err(|error| error.to_string())?
+        .state
+        .session_id;
+    let path = args.sessions_dir.join(format!("{id}.jsonl"));
+    let mut candidate = polaris_core::session::Session::new();
+    candidate.disable_files_md_auto_regenerate = source.disable_files_md_auto_regenerate;
+    candidate.input_preparation = source.input_preparation;
+    candidate.strict_history = source.strict_history.clone();
+    candidate.summary_usage = source.summary_usage.clone();
+    candidate.examples = source.examples.clone();
+    restore_prepared_continuation(
+        &mut candidate,
+        &PreparedContinuation {
+            kind: ContinuationKind::Resume,
+            persistence: branch,
+        },
+        &args.workflow_config,
+        // A rewind branch keeps the selected checkpoint's workflow state.
+        // A launch override applies only to the session opened at startup.
+        false,
+        skills,
+        args.history_backend_factory.as_ref(),
+    )
+    .await?;
+    #[cfg(target_os = "linux")]
+    if signal::pending_linux_process_shutdown().is_some() {
+        return Err(LINUX_SHUTDOWN_DURING_RESTORE.into());
+    }
+    candidate
+        .recover_history()
+        .await
+        .map_err(|error| format!("巻き戻し先の履歴を復元できません: {error}"))?;
+    #[cfg(target_os = "linux")]
+    if signal::pending_linux_process_shutdown().is_some() {
+        return Err(LINUX_SHUTDOWN_DURING_RESTORE.into());
+    }
+    configure_saved_tool_memory(
+        &mut candidate,
+        &args.cwd,
+        &args.state_dir,
+        &path,
+        args.tool_memory,
+        args.tool_memory_embedding.clone(),
+    )
+    .map_err(|error| format!("巻き戻し先のツール記憶を復元できません: {error}"))?;
+    if args.remember {
+        memory::configure_saved_memory(&mut candidate, &args.cwd, &args.state_dir, &path)
+            .map_err(|error| format!("巻き戻し先の記憶を復元できません: {error}"))?;
+    }
+    Ok((candidate, path))
+}
+
+#[cfg(unix)]
+type RewoundProjectContext = (
+    Vec<Skill>,
+    Vec<polaris_skills::AgentType>,
+    polaris_core::mcp::local::LocalHost,
+    Arc<polaris_core::mcp::setup::SetupTool>,
+);
+
+#[cfg(unix)]
+fn reload_rewound_project_context(
+    cwd: &Path,
+    mcp_ceiling: polaris_core::mcp::operation::ExternalCeiling,
+) -> Result<RewoundProjectContext, String> {
+    let project = polaris_core::project::resolve_root(cwd);
+    let config = polaris_core::config::load(&project)
+        .map_err(|error| format!("復元後の設定を読み直せません: {error}"))?;
+    let skills = polaris_skills::discover(&project, &config.skills_paths).skills;
+    let agents = polaris_skills::discover_agent_types(&project, &config.agents_paths).agent_types;
+    let host = polaris_core::mcp::local::LocalHost::open(cwd, false)
+        .map_err(|error| format!("復元後のMCP設定を読み直せません: {error}"))?;
+    let setup = Arc::new(host.setup_tool(mcp_ceiling));
+    Ok((skills, agents, host, setup))
+}
+
+#[cfg(unix)]
+struct RewindActivation {
+    session: polaris_core::session::Session,
+    session_path: PathBuf,
+    skills: Vec<Skill>,
+    agent_types: Vec<polaris_skills::AgentType>,
+    mcp_host: polaris_core::mcp::local::LocalHost,
+    mcp_setup: Arc<polaris_core::mcp::setup::SetupTool>,
+}
+
+#[cfg(unix)]
+struct RewindFailure {
+    message: String,
+    fatal: bool,
+}
+
+#[cfg(unix)]
+fn ensure_rewind_unblocked(
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+) -> Result<(), String> {
+    match effects.blocker() {
+        Ok(Some(effect)) => Err(format!(
+            "未解決の管理操作 {} ({}) があるため巻き戻せません",
+            effect.request.operation_id, effect.request.inventory
+        )),
+        Err(error) => Err(format!("管理操作の状態を確認できません: {error}")),
+        Ok(None) => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn read_rewind_transaction(
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    lease: &polaris_core::project_mutation::ProjectMutationLeaseV1,
+    transaction_id: &polaris_core::rewind_workspace::TransactionId,
+    branch_id: &str,
+    expected_post: &polaris_core::rewind_workspace::ManifestId,
+    target_pre: &polaris_core::rewind_workspace::ManifestId,
+) -> Result<polaris_core::rewind_workspace::RewindTransactionReadback, String> {
+    let readback = owner
+        .transaction_readback_with_lease(lease, transaction_id)
+        .map_err(|error| format!("巻き戻しtransactionを同期・再読込できません: {error}"))?;
+    if readback.candidate_session_id.as_deref() != Some(branch_id)
+        || readback.expected_post != *expected_post
+        || readback.target_pre != *target_pre
+    {
+        return Err("巻き戻しtransactionと子会話の証拠が一致しません".into());
+    }
+    Ok(readback)
+}
+
+#[cfg(unix)]
+fn rollback_known_rewind(
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    lease: &polaris_core::project_mutation::ProjectMutationLeaseV1,
+    transaction_id: &polaris_core::rewind_workspace::TransactionId,
+    branch_id: &str,
+    expected_post: &polaris_core::rewind_workspace::ManifestId,
+    target_pre: &polaris_core::rewind_workspace::ManifestId,
+    before: &polaris_core::rewind_workspace::RewindTransactionReadback,
+) -> Result<(), String> {
+    use polaris_core::rewind_workspace::RewindTransactionPhase;
+
+    if before.phase != RewindTransactionPhase::PendingActivation {
+        return Err("巻き戻しtransactionは安全にrollbackできる状態ではありません".into());
+    }
+    let restored = before
+        .restored_manifest_id
+        .ok_or("巻き戻し後のmanifestがありません")?;
+    if !owner
+        .matches_manifest(&restored)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("巻き戻し後の作業ファイルが既知の状態と一致しません".into());
+    }
+    let write = owner.rollback_with_lease(lease, transaction_id);
+    let after = read_rewind_transaction(
+        owner,
+        lease,
+        transaction_id,
+        branch_id,
+        expected_post,
+        target_pre,
+    )?;
+    if after.phase == RewindTransactionPhase::RolledBack {
+        Ok(())
+    } else {
+        Err(format!(
+            "rollback結果を確認できません: {}",
+            write
+                .err()
+                .map_or_else(|| "phase不一致".into(), |error| error.to_string())
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn commit_rewind_if_unblocked(
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    transaction_id: &polaris_core::rewind_workspace::TransactionId,
+    branch_id: &str,
+    expected_post: &polaris_core::rewind_workspace::ManifestId,
+    target_pre: &polaris_core::rewind_workspace::ManifestId,
+) -> Result<(), RewindFailure> {
+    use polaris_core::rewind_workspace::RewindTransactionPhase;
+
+    let lease = owner.try_mutation().map_err(|error| RewindFailure {
+        message: format!("巻き戻し確定用のproject leaseを取得できません: {error}"),
+        fatal: true,
+    })?;
+    if let Err(blocker) = ensure_rewind_unblocked(effects) {
+        let result = read_rewind_transaction(
+            owner,
+            &lease,
+            transaction_id,
+            branch_id,
+            expected_post,
+            target_pre,
+        )
+        .and_then(|before| {
+            rollback_known_rewind(
+                owner,
+                &lease,
+                transaction_id,
+                branch_id,
+                expected_post,
+                target_pre,
+                &before,
+            )
+        });
+        return Err(match result {
+            Ok(()) => RewindFailure {
+                message: blocker,
+                fatal: false,
+            },
+            Err(recovery) => RewindFailure {
+                message: format!("巻き戻しの確定前に復旧できません: {blocker}; {recovery}"),
+                fatal: true,
+            },
+        });
+    }
+    let write = owner.commit_with_lease(&lease, transaction_id);
+    let readback = read_rewind_transaction(
+        owner,
+        &lease,
+        transaction_id,
+        branch_id,
+        expected_post,
+        target_pre,
+    )
+    .map_err(|error| RewindFailure {
+        message: format!("巻き戻しの確定結果が不明です: {error}"),
+        fatal: true,
+    })?;
+    match readback.phase {
+        RewindTransactionPhase::Committed => Ok(()),
+        RewindTransactionPhase::PendingActivation => {
+            let reason = write.err().map_or_else(
+                || "確定後のphaseが未終端です".to_string(),
+                |error| format!("巻き戻しの確定に失敗しました: {error}"),
+            );
+            match rollback_known_rewind(
+                owner,
+                &lease,
+                transaction_id,
+                branch_id,
+                expected_post,
+                target_pre,
+                &readback,
+            ) {
+                Ok(()) => Err(RewindFailure {
+                    message: reason,
+                    fatal: false,
+                }),
+                Err(recovery) => Err(RewindFailure {
+                    message: format!("{reason}; 復旧できません: {recovery}"),
+                    fatal: true,
+                }),
+            }
+        }
+        _ => Err(RewindFailure {
+            message: "巻き戻しの確定phaseを確認できません。再起動して復旧してください".into(),
+            fatal: true,
+        }),
+    }
+}
+
+#[cfg(unix)]
+async fn perform_rewind(
+    source: &polaris_core::session::Session,
+    boundary: &polaris_core::conversation_state::RewindBoundaryV1,
+    expected_post: &polaris_core::rewind_workspace::ManifestId,
+    target_pre: &polaris_core::rewind_workspace::ManifestId,
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    args: &RunArgs<'_>,
+    mcp_ceiling: polaris_core::mcp::operation::ExternalCeiling,
+) -> Result<RewindActivation, RewindFailure> {
+    ensure_rewind_unblocked(effects).map_err(|message| RewindFailure {
+        message,
+        fatal: false,
+    })?;
+    let persistence = source.persistence.as_ref().ok_or_else(|| RewindFailure {
+        message: "巻き戻し元の保存済みセッションがありません".into(),
+        fatal: false,
+    })?;
+    let branch = persistence
+        .prepare_rewind_branch(owner, &boundary.boundary_id)
+        .map_err(|error| RewindFailure {
+            message: format!("会話分岐を準備できません: {error}"),
+            fatal: false,
+        })?;
+    let branch_id = branch
+        .snapshot()
+        .map_err(|error| RewindFailure {
+            message: format!("会話分岐を検証できません: {error}"),
+            fatal: false,
+        })?
+        .state
+        .session_id;
+    let restored = match owner.restore_for_branch(expected_post, target_pre, &branch_id) {
+        Ok(restored) => restored,
+        Err(error) => {
+            return match owner.resolve_pending() {
+                Ok(_) => Err(RewindFailure {
+                    message: format!("ファイルを復元できません: {error}"),
+                    fatal: false,
+                }),
+                Err(recovery) => Err(RewindFailure {
+                    message: format!(
+                        "ファイル復元に失敗し、途中状態を解決できません: {error}; {recovery}"
+                    ),
+                    fatal: true,
+                }),
+            };
+        }
+    };
+    let candidate = async {
+        args.always_on
+            .system_for_request()
+            .map_err(|error| format!("復元後の指示を読み直せません: {error}"))?;
+        let (skills, agent_types, mcp_host, mcp_setup) =
+            reload_rewound_project_context(&args.cwd, mcp_ceiling)?;
+        let (session, session_path) = build_rewound_session(source, branch, args, &skills).await?;
+        Ok::<_, String>(RewindActivation {
+            session,
+            session_path,
+            skills,
+            agent_types,
+            mcp_host,
+            mcp_setup,
+        })
+    }
+    .await;
+    #[cfg(target_os = "linux")]
+    let candidate = if candidate.is_ok() && signal::pending_linux_process_shutdown().is_some() {
+        Err(LINUX_SHUTDOWN_DURING_RESTORE.into())
+    } else {
+        candidate
+    };
+    let candidate = match candidate {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            let recovery = (|| -> Result<(), String> {
+                let lease = owner.try_mutation().map_err(|error| error.to_string())?;
+                let before = read_rewind_transaction(
+                    owner,
+                    &lease,
+                    &restored.transaction_id,
+                    &branch_id,
+                    expected_post,
+                    target_pre,
+                )?;
+                rollback_known_rewind(
+                    owner,
+                    &lease,
+                    &restored.transaction_id,
+                    &branch_id,
+                    expected_post,
+                    target_pre,
+                    &before,
+                )
+            })();
+            return match recovery {
+                Ok(()) => Err(RewindFailure {
+                    message: format!("巻き戻し先を準備できません: {error}"),
+                    fatal: false,
+                }),
+                Err(recovery) => Err(RewindFailure {
+                    message: format!(
+                        "巻き戻し先の準備に失敗し、元のファイルへ復旧できません: {error}; {recovery}"
+                    ),
+                    fatal: true,
+                }),
+            };
+        }
+    };
+    commit_rewind_if_unblocked(
+        owner,
+        effects,
+        &restored.transaction_id,
+        &branch_id,
+        expected_post,
+        target_pre,
+    )?;
+    let committed = candidate
+        .session
+        .persistence
+        .as_ref()
+        .ok_or_else(|| RewindFailure {
+            message: format!("確定した子会話 {branch_id} の保存先を確認できません"),
+            fatal: true,
+        })?;
+    validate_resume_workspace(owner, committed).map_err(|error| RewindFailure {
+        message: format!("確定した子会話 {branch_id} を再読込できません: {error}"),
+        fatal: true,
+    })?;
+    Ok(candidate)
+}
+
 /// Handles `/resume`: shows the picker and, if the user picks a
 /// conversation, swaps `session`/`session_path`/`meta_path`/
 /// `session_started_at_millis` to it in place. A cancelled picker (Esc,
@@ -3533,6 +7704,10 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     workflow_mode_overridden: bool,
     skills: &[Skill],
     history_backend_factory: Option<&HistoryBackendFactory>,
+    #[cfg(unix)] rewind_workspace: Option<&polaris_core::rewind_workspace::WorkspaceOwner>,
+    #[cfg(unix)] management_effects: Option<
+        &polaris_core::management_effect::ManagementEffectStoreV1,
+    >,
     session: &mut polaris_core::session::Session,
     session_path: &mut PathBuf,
     meta_path: &mut PathBuf,
@@ -3540,6 +7715,15 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     status: &mut Status,
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
 ) {
+    #[cfg(target_os = "linux")]
+    let mut summaries = match sessions::try_list_sessions(sessions_dir) {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            *status = Status::Error(format!("保存会話の一覧を読めません: {error}"));
+            return;
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut summaries = sessions::list_sessions(sessions_dir);
     let Some(data_root) = sessions_dir.parent() else {
         *status = Status::Notice("v2セッションの保存先が不正です".into());
@@ -3550,6 +7734,42 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     ))
     .ok();
     if let Some(project_id) = &project_id {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = rewind_workspace {
+            match sessions::try_list_published_v2_sessions(
+                owner,
+                data_root,
+                &state_dir.join("memory.sqlite3"),
+                project_id,
+                cwd_display,
+            ) {
+                Ok(v2) => {
+                    summaries.extend(v2);
+                    if summaries.len() > 256 {
+                        *status = Status::Error("会話一覧が256件を超えています".into());
+                        return;
+                    }
+                }
+                Err(error) => {
+                    *status = Status::Error(format!("v2保存会話の一覧を読めません: {error}"));
+                    return;
+                }
+            }
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        if let Some(owner) = rewind_workspace {
+            summaries.extend(sessions::list_v2_sessions_filtered(
+                data_root,
+                &state_dir.join("memory.sqlite3"),
+                project_id,
+                cwd_display,
+                |persisted| {
+                    polaris_core::rewind_admission::published_branch(owner, &persisted.store)
+                        .is_ok()
+                },
+            ));
+        }
+        #[cfg(not(unix))]
         summaries.extend(sessions::list_v2_sessions(
             data_root,
             &state_dir.join("memory.sqlite3"),
@@ -3561,8 +7781,18 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
     let Some(selected) = run_resume_picker(terminal, reader, &groups) else {
         return;
     };
+    #[cfg(target_os = "linux")]
+    if signal::pending_linux_process_shutdown().is_some() {
+        return;
+    }
 
     if selected.kind == sessions::SessionKind::V2 {
+        #[cfg(unix)]
+        if rewind_workspace.is_none() {
+            *status =
+                Status::Notice("作業ファイルの検証ownerがないため会話を再開できません".into());
+            return;
+        }
         let Some(project_id) = project_id.as_deref() else {
             *status = Status::Notice(
                 "プロジェクト識別子を取得できないためv2セッションを再開できません".into(),
@@ -3573,6 +7803,8 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
         let summary_usage = session.summary_usage.clone();
         let examples = session.examples.clone();
         let disable_files_md_auto_regenerate = session.disable_files_md_auto_regenerate;
+        #[cfg(target_os = "linux")]
+        let mut compatibility_published = false;
         let result = async {
             let persistence = polaris_core::session_store::PersistedSession::open(
                 data_root,
@@ -3581,34 +7813,206 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                 &selected.id,
             )
             .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            persistence
+                .abandon_unfinished_rewind_boundaries("前回の実行が完了する前に終了しました".into())
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            if let Some(owner) = rewind_workspace
+                && let Err(error) = validate_resume_workspace(owner, &persistence)
+            {
+                let source = persistence.store.directory().join("raw.jsonl");
+                let snapshot = persistence.snapshot().map_err(|error| error.to_string())?;
+                let messages = snapshot
+                    .events
+                    .into_iter()
+                    .map(|event| event.message)
+                    .collect::<Vec<_>>();
+                show_read_only_transcript(
+                    terminal,
+                    reader,
+                    &messages,
+                    &source.display().to_string(),
+                );
+                return Err(format!("{error}。会話は閲覧のみ可能です"));
+            }
+            #[cfg(target_os="linux")]
+            let mut frozen_resume=resume_effect::ResumeSubjectV1::Persisted(&persistence).identity()?;
+            #[cfg(target_os="linux")]
+            if workflow_mode_overridden
+                && let Some(previous)=session.persistence.as_ref()
+                && previous.store.directory()==persistence.store.directory()
+                && resume_effect::ResumeSubjectV1::Persisted(previous).identity()?!=frozen_resume
+            {
+                return Err("変更前の会話が選択先と一致しません".into());
+            }
             let mut restored = polaris_core::session::Session::new();
             restored.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
             restored.input_preparation = session.input_preparation;
             restored.strict_history = strict_history;
             restored.summary_usage = summary_usage;
             restored.examples = examples;
-            restore_prepared_continuation(
-                &mut restored,
-                &PreparedContinuation {
-                    kind: ContinuationKind::Resume,
-                    persistence,
-                },
-                workflow_config,
-                workflow_mode_overridden,
-                skills,
-                history_backend_factory,
-            )
-            .await?;
+            let continuation = PreparedContinuation {
+                kind: ContinuationKind::Resume,
+                persistence,
+            };
+            if workflow_mode_overridden {
+                #[cfg(unix)]
+                restore_prepared_continuation_for_managed_override(
+                    &mut restored,
+                    &continuation,
+                    workflow_config,
+                    skills,
+                    history_backend_factory,
+                )
+                .await?;
+                #[cfg(target_os = "linux")]
+                if signal::pending_linux_process_shutdown().is_some() {
+                    return Err("停止要求を受信しました".into());
+                }
+                #[cfg(not(unix))]
+                return Err("workflow変更には管理操作が必要です".into());
+                #[cfg(unix)]
+                {
+                    restored
+                        .recover_history()
+                        .await
+                        .map_err(|error| format!("strict10履歴を復元できません: {error}"))?;
+                    #[cfg(target_os = "linux")]
+                    if signal::pending_linux_process_shutdown().is_some() {
+                        return Err("停止要求を受信しました".into());
+                    }
+                    let workspace = rewind_workspace.ok_or("project mutation ownerがありません")?;
+                    let effects = management_effects.ok_or("管理操作の記録がありません")?;
+                    let candidate = workflow_override_candidate(&restored, workflow_config, skills)?;
+                    match apply_confirmed_workflow_change(
+                        &mut restored,
+                        candidate,
+                        polaris_core::management_effect::workflow_change::WorkflowEffectInventoryV1::F15,
+                        workspace,
+                        effects,
+                        state_dir,
+                        |view| confirm_workflow_change(terminal, reader, view),
+                    )? {
+                        WorkflowChangeResult::Cancelled => {
+                            return Err("workflow変更を取り消しました".into());
+                        }
+                        WorkflowChangeResult::Changed | WorkflowChangeResult::NoChange => {}
+                    }
+                }
+            } else {
+                let publication = restore_prepared_continuation_inner(
+                    &mut restored,
+                    &continuation,
+                    workflow_config,
+                    false,
+                    true,
+                    skills,
+                    history_backend_factory,
+                )
+                .await?;
+                #[cfg(target_os="linux")]
+                if let Some(publication) = publication {
+                    if resume_effect::ResumeIdentityV1::published_snapshot(&publication.before)? != frozen_resume {
+                        return Err("互換復旧前に選択した会話が変更されました".into());
+                    }
+                    frozen_resume = resume_effect::ResumeIdentityV1::published_snapshot(&publication.published)?;
+                    compatibility_published = true;
+                }
+                #[cfg(not(target_os="linux"))]
+                let _ = publication;
+                #[cfg(target_os = "linux")]
+                if signal::pending_linux_process_shutdown().is_some() {
+                    return Err("停止要求を受信しました".into());
+                }
+                restored
+                    .recover_history()
+                    .await
+                    .map_err(|error| format!("strict10履歴を復元できません: {error}"))?;
+                #[cfg(target_os = "linux")]
+                if signal::pending_linux_process_shutdown().is_some() {
+                    return Err("停止要求を受信しました".into());
+                }
+            }
+            #[cfg(target_os="linux")]
+            {
+                let restored_saved=restored.persistence.as_ref().ok_or("復元先の会話がありません")?;
+                if !workflow_mode_overridden && resume_effect::ResumeSubjectV1::Persisted(restored_saved).identity()?!=frozen_resume {return Err("復元中に選択した会話が変更されました".into());}
+            }
             Ok::<_, String>(restored)
         }
         .await;
         match result {
-            Ok(mut restored) => {
-                if let Err(error) = restored.recover_history().await {
-                    *status = Status::Notice(format!("strict10履歴を復元できません: {error}"));
+            Ok(restored) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let result = (|| -> Result<(), String> {
+                        let workspace =
+                            rewind_workspace.ok_or("project mutation ownerがありません")?;
+                        let effects = management_effects.ok_or("管理効果ownerがありません")?;
+                        let target = restored
+                            .persistence
+                            .clone()
+                            .ok_or("選択したv2会話がありません")?;
+                        // F15 or compatibility recovery has published this
+                        // exact session. Use its verified new cursor.
+                        let same_session_override = (workflow_mode_overridden
+                            || compatibility_published)
+                            && session.persistence.as_ref().is_some_and(|previous| {
+                                previous.store.directory() == target.store.directory()
+                            });
+                        let previous = if same_session_override {
+                            Some(target.clone())
+                        } else {
+                            session.persistence.clone()
+                        };
+                        let lease = workspace.try_mutation().map_err(|e| e.to_string())?;
+                        let owner = resume_effect::ResumeSelectionOwnerV1 {
+                            effects,
+                            lease: &lease,
+                        };
+                        let from = previous
+                            .as_ref()
+                            .map(resume_effect::ResumeSubjectV1::Persisted);
+                        let to = resume_effect::ResumeSubjectV1::Persisted(&target);
+                        let prepared =
+                            owner.prepare(resume_effect::ResumeInventoryV1::D07, from, to)?;
+                        if same_session_override {
+                            // The owned publication remains committed even if
+                            // the later D07 selection is declined.
+                            session.persistence = Some(target.clone());
+                            session.workflow = restored.workflow.clone();
+                        }
+                        let accepted = account::confirm(
+                            terminal,
+                            reader,
+                            "会話を選択",
+                            &selected.id,
+                            "選択した保存会話のworkspace対応と原文を確認し、この会話へ切り替えます。",
+                        );
+                        let mut candidate = Some(restored);
+                        owner.execute(&prepared, from, to, accepted, || {
+                            *session = candidate.take().ok_or("復元候補がありません")?;
+                            Ok(())
+                        })?;
+                        if !accepted {
+                            return Err("会話の選択を取り消しました".into());
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        *status = Status::Error(error);
+                        return;
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                if signal::pending_linux_process_shutdown().is_some() {
                     return;
                 }
-                *session = restored;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    *session = restored;
+                }
                 *session_started_at_millis = selected.started_at_millis;
                 *session_path = sessions_dir.join(format!("{}.jsonl", selected.id));
                 *meta_path = session_path.with_extension("meta.json");
@@ -3622,8 +8026,42 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
         return;
     }
 
+    if workflow_mode_overridden {
+        *status =
+            Status::Notice("旧形式の会話への--workflow-mode適用には移行管理操作が必要です".into());
+        return;
+    }
     let new_session_path = selected.path;
     let new_meta_path = new_session_path.with_extension("meta.json");
+    #[cfg(unix)]
+    if let Some(owner) = rewind_workspace {
+        match owner.has_workspace_identity() {
+            Ok(true) => {
+                match persist::load_session(&new_session_path) {
+                    Ok((loaded, _)) => show_read_only_transcript(
+                        terminal,
+                        reader,
+                        &loaded.messages,
+                        &new_session_path.display().to_string(),
+                    ),
+                    Err(error) => {
+                        *status = Status::Notice(format!("会話の原文を読めません: {error}"));
+                        return;
+                    }
+                }
+                *status = Status::Notice(
+                    "旧形式の会話は保存済み作業ファイルとの対応記録がないため、閲覧のみ可能です"
+                        .into(),
+                );
+                return;
+            }
+            Err(error) => {
+                *status = Status::Notice(format!("作業ファイルを確認できません: {error}"));
+                return;
+            }
+            Ok(false) => {}
+        }
+    }
     match persist::load_session(&new_session_path) {
         Ok((mut loaded, truncated)) => {
             if let Some(previous) = session.persistence.clone() {
@@ -3642,6 +8080,10 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                     .snapshot()
                     .map(|snapshot| snapshot.state.history_mode)
                     .unwrap_or(polaris_core::conversation_state::HistoryMode::Legacy);
+                #[cfg(target_os = "linux")]
+                if signal::pending_linux_process_shutdown().is_some() {
+                    return;
+                }
                 match polaris_core::session_store::PersistedSession::import(
                     data_root,
                     &state_dir.join("memory.sqlite3"),
@@ -3651,6 +8093,19 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                     &loaded.messages,
                 ) {
                     Ok(persistence) => {
+                        #[cfg(target_os = "linux")]
+                        if signal::pending_linux_process_shutdown().is_some() {
+                            return;
+                        }
+                        #[cfg(unix)]
+                        if let Some(owner) = rewind_workspace
+                            && let Err(error) = validate_resume_workspace(owner, &persistence)
+                        {
+                            *status = Status::Notice(format!(
+                                "旧セッションを現在の作業ファイルへ結び付けられません: {error}"
+                            ));
+                            return;
+                        }
                         let mut imported = polaris_core::session::Session::new();
                         imported.input_preparation = session.input_preparation;
                         imported.disable_files_md_auto_regenerate =
@@ -3667,6 +8122,10 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                         if let Err(error) = imported.recover_history().await {
                             *status =
                                 Status::Notice(format!("strict10履歴を復元できません: {error}"));
+                            return;
+                        }
+                        #[cfg(target_os = "linux")]
+                        if signal::pending_linux_process_shutdown().is_some() {
                             return;
                         }
                         *session = imported;
@@ -3704,6 +8163,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
 /// file) without touching the one being left — unlike the old
 /// single-session-per-project model, it stays on disk and shows up in a
 /// later `/resume`.
+#[cfg(any(test, not(target_os = "linux")))]
 fn handle_new_session(
     sessions_dir: &std::path::Path,
     session: &mut polaris_core::session::Session,
@@ -3712,8 +8172,43 @@ fn handle_new_session(
     session_started_at_millis: &mut u128,
     status: &mut Status,
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
-) {
-    if let Some(previous) = session.persistence.clone() {
+) -> bool {
+    handle_new_session_with(
+        sessions_dir,
+        session,
+        session_path,
+        meta_path,
+        session_started_at_millis,
+        status,
+        local_lines,
+        |previous, snapshot, workflow| {
+            polaris_core::session_store::PersistedSession::create(
+                &previous.data_root,
+                &previous.database,
+                &snapshot.state.project_id,
+                snapshot.state.history_mode,
+                workflow,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_new_session_with(
+    sessions_dir: &std::path::Path,
+    session: &mut polaris_core::session::Session,
+    session_path: &mut PathBuf,
+    meta_path: &mut PathBuf,
+    session_started_at_millis: &mut u128,
+    status: &mut Status,
+    local_lines: &mut Vec<ratatui::text::Line<'static>>,
+    create: impl FnOnce(
+        &polaris_core::session_store::PersistedSession,
+        &polaris_core::conversation_state::ConversationSnapshot,
+        Option<&polaris_core::workflow::SessionWorkflow>,
+    ) -> std::io::Result<polaris_core::session_store::PersistedSession>,
+) -> bool {
+    let id = if let Some(previous) = session.persistence.clone() {
         let strict_history = session.strict_history.clone();
         let summary_usage = session.summary_usage.clone();
         let examples = session.examples.clone();
@@ -3723,7 +8218,7 @@ fn handle_new_session(
             Ok(snapshot) => snapshot,
             Err(error) => {
                 *status = Status::Notice(format!("新しいv2セッションを作成できません: {error}"));
-                return;
+                return false;
             }
         };
         let mut next = polaris_core::session::Session::new();
@@ -3734,26 +8229,22 @@ fn handle_new_session(
                 workflow.config.clone(),
             ));
         }
-        let persistence = polaris_core::session_store::PersistedSession::create(
-            &previous.data_root,
-            &previous.database,
-            &snapshot.state.project_id,
-            snapshot.state.history_mode,
-            next.workflow.as_ref(),
-        );
+        let persistence = create(&previous, &snapshot, next.workflow.as_ref());
         match persistence.and_then(|persistence| {
+            let id = persistence.snapshot()?.state.session_id;
             next.attach(persistence)?;
-            Ok(())
+            Ok(id)
         }) {
-            Ok(()) => {
+            Ok(id) => {
                 next.strict_history = strict_history;
                 next.summary_usage = summary_usage;
                 next.examples = examples;
                 *session = next;
+                id
             }
             Err(error) => {
                 *status = Status::Notice(format!("新しいv2セッションを作成できません: {error}"));
-                return;
+                return false;
             }
         }
     } else {
@@ -3762,12 +8253,14 @@ fn handle_new_session(
         *session = polaris_core::session::Session::default();
         session.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
         session.input_preparation = input_preparation;
-    }
-    *session_path = sessions_dir.join(format!("{}.jsonl", new_session_id()));
+        new_session_id()
+    };
+    *session_path = sessions_dir.join(format!("{id}.jsonl"));
     *meta_path = session_path.with_extension("meta.json");
     *session_started_at_millis = now_millis();
     local_lines.clear();
     *status = Status::Idle;
+    true
 }
 
 /// Handles `/fork`: like `/new`, rotates to a brand-new file/id without
@@ -3778,6 +8271,7 @@ fn handle_new_session(
 /// only starts existing on disk lazily at the first new message) — a
 /// fork with no messages yet added since forking would otherwise vanish
 /// from `/resume`'s list, which defeats the point of forking one.
+#[cfg(any(test, not(target_os = "linux")))]
 fn handle_fork(
     sessions_dir: &std::path::Path,
     cwd_display: &str,
@@ -3786,6 +8280,31 @@ fn handle_fork(
     meta_path: &mut PathBuf,
     session_started_at_millis: &mut u128,
     status: &mut Status,
+) {
+    handle_fork_with(
+        sessions_dir,
+        cwd_display,
+        session,
+        session_path,
+        meta_path,
+        session_started_at_millis,
+        status,
+        |previous| previous.fork(""),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_fork_with(
+    sessions_dir: &std::path::Path,
+    cwd_display: &str,
+    session: &mut polaris_core::session::Session,
+    session_path: &mut PathBuf,
+    meta_path: &mut PathBuf,
+    session_started_at_millis: &mut u128,
+    status: &mut Status,
+    fork: impl FnOnce(
+        &polaris_core::session_store::PersistedSession,
+    ) -> std::io::Result<polaris_core::session_store::PersistedSession>,
 ) {
     if let Some(previous) = session.persistence.clone() {
         let strict_history = session.strict_history.clone();
@@ -3797,7 +8316,7 @@ fn handle_fork(
             .workflow
             .as_ref()
             .map(|workflow| workflow.config.clone());
-        let persistence = previous.fork("");
+        let persistence = fork(&previous);
         let mut next = polaris_core::session::Session::new();
         next.disable_files_md_auto_regenerate = disable_files_md_auto_regenerate;
         next.input_preparation = input_preparation;
@@ -3914,6 +8433,112 @@ fn handle_fork(
     *meta_path = new_meta_path;
     *session_started_at_millis = started;
 }
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn handle_managed_new_session(
+    sessions_dir: &Path,
+    state_dir: &Path,
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    session: &mut polaris_core::session::Session,
+    session_path: &mut PathBuf,
+    meta_path: &mut PathBuf,
+    session_started_at_millis: &mut u128,
+    status: &mut Status,
+    local_lines: &mut Vec<ratatui::text::Line<'static>>,
+) -> bool {
+    if session.persistence.is_none() {
+        *status = Status::Notice("管理記録付きの/newにはv2セッションが必要です".into());
+        return false;
+    }
+    let lease = match owner.try_mutation() {
+        Ok(lease) => lease,
+        Err(error) => {
+            *status = Status::Notice(format!("新しい会話を開始できません: {error}"));
+            return false;
+        }
+    };
+    let switch = polaris_core::session_switch::SessionSwitchOwner {
+        effects,
+        lease: &lease,
+        state_dir,
+    };
+    handle_new_session_with(
+        sessions_dir,
+        session,
+        session_path,
+        meta_path,
+        session_started_at_millis,
+        status,
+        local_lines,
+        |previous, snapshot, workflow| {
+            switch
+                .create_new(
+                    Some(previous),
+                    &previous.data_root,
+                    &previous.database,
+                    &snapshot.state.project_id,
+                    snapshot.state.history_mode,
+                    workflow,
+                    polaris_core::management_effect::ManagementInventoryIdV1::parse("T06")
+                        .expect("approved T06 inventory"),
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        },
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn handle_managed_fork(
+    sessions_dir: &Path,
+    cwd_display: &str,
+    state_dir: &Path,
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    session: &mut polaris_core::session::Session,
+    session_path: &mut PathBuf,
+    meta_path: &mut PathBuf,
+    session_started_at_millis: &mut u128,
+    status: &mut Status,
+) {
+    if session.persistence.is_none() {
+        *status = Status::Notice("管理記録付きの/forkにはv2セッションが必要です".into());
+        return;
+    }
+    let lease = match owner.try_mutation() {
+        Ok(lease) => lease,
+        Err(error) => {
+            *status = Status::Notice(format!("会話を分岐できません: {error}"));
+            return;
+        }
+    };
+    let switch = polaris_core::session_switch::SessionSwitchOwner {
+        effects,
+        lease: &lease,
+        state_dir,
+    };
+    handle_fork_with(
+        sessions_dir,
+        cwd_display,
+        session,
+        session_path,
+        meta_path,
+        session_started_at_millis,
+        status,
+        |previous| {
+            switch
+                .fork(
+                    previous,
+                    polaris_core::management_effect::ManagementInventoryIdV1::parse("T16")
+                        .expect("approved T16 inventory"),
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        },
+    );
+}
+
 fn approval_within_startup_ceiling(ceiling: ApprovalPolicy, picked: ApprovalPolicy) -> bool {
     // `Always` adds mandatory prompts for in-scope work, but also maps to a
     // higher child-delegation capability. Neither axis may widen at runtime.
@@ -4068,6 +8693,7 @@ async fn discover_connected_local_models() -> Vec<ConnectedLocalModel> {
     ollama.into_iter().chain(lmstudio).collect()
 }
 
+
 /// Runs the `/model` picker — four hosted choices plus one local-runtime
 /// entry. Reasoning effort is intentionally absent because routing owns it.
 fn run_model_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
@@ -4164,10 +8790,18 @@ async fn handle_model<B: ratatui::backend::Backend, R: approver::KeyReader>(
     status: &mut Status,
 ) {
     loop {
+        #[cfg(target_os = "linux")]
+        if signal::pending_linux_process_shutdown().is_some() {
+            return;
+        }
         let current_is_local = is_local_provider(provider_name);
         let Some(choice) = run_model_picker(terminal, reader, model_name, current_is_local) else {
             return;
         };
+        #[cfg(target_os = "linux")]
+        if signal::pending_linux_process_shutdown().is_some() {
+            return;
+        }
         match choice {
             ModelMenuChoice::Hosted(picked_model) => {
                 if !matches!(cloud_provider_name, "codex" | "openai") {
@@ -4187,6 +8821,10 @@ async fn handle_model<B: ratatui::backend::Backend, R: approver::KeyReader>(
             }
             ModelMenuChoice::Local => {
                 let models = discover_connected_local_models().await;
+                #[cfg(target_os = "linux")]
+                if signal::pending_linux_process_shutdown().is_some() {
+                    return;
+                }
                 let Some(index) =
                     run_local_model_picker(terminal, reader, &models, provider_name, model_name)
                 else {
@@ -4196,6 +8834,10 @@ async fn handle_model<B: ratatui::backend::Backend, R: approver::KeyReader>(
                     }
                     continue;
                 };
+                #[cfg(target_os = "linux")]
+                if signal::pending_linux_process_shutdown().is_some() {
+                    return;
+                }
                 let picked = &models[index];
                 let selection = match picked.adapter.select(&picked.observed).await {
                     Ok(selection) => selection,
@@ -4204,6 +8846,10 @@ async fn handle_model<B: ratatui::backend::Backend, R: approver::KeyReader>(
                         return;
                     }
                 };
+                #[cfg(target_os = "linux")]
+                if signal::pending_linux_process_shutdown().is_some() {
+                    return;
+                }
                 if selection.model().capabilities().tools != Capability::Supported {
                     *status = Status::Error(
                         "local model does not report the tool support required by polaris"
@@ -4244,7 +8890,7 @@ async fn handle_compact(
     session_path: &std::path::Path,
     status: &mut Status,
     usage: &mut polaris_provider::Usage,
-) {
+) -> bool {
     let outcome = polaris_core::compaction::compact_with_usage(
         provider,
         &mut session.messages,
@@ -4263,6 +8909,7 @@ async fn handle_compact(
     usage.cached_tokens = usage
         .cached_tokens
         .saturating_add(outcome.usage_report.usage.cached_tokens);
+    let mut persistence_failed = false;
     match outcome.result {
         Ok(None) => {
             *status = Status::Notice("nothing old enough to compact yet".to_string());
@@ -4288,6 +8935,7 @@ async fn handle_compact(
                 match persist::rewrite(session_path, &session.messages) {
                     Ok(()) => *status = Status::Notice(summary),
                     Err(e) => {
+                        persistence_failed = true;
                         *status = Status::Notice(format!(
                             "compacted in memory, but couldn't persist it: {e}"
                         ));
@@ -4299,16 +8947,14 @@ async fn handle_compact(
             *status = Status::Notice(format!("compaction failed: {e}"));
         }
     }
+    persistence_failed
 }
 
 /// Runs the `/skills` picker: a blocking loop like the others, but with
 /// no selection outcome — Enter and Esc both just close it (see
 /// `render::render_skills_picker`'s docs on why: polaris has nothing
-/// analogous to codex's enable/disable state to act on). Up/Down still
-/// move a highlight for visual consistency with every other picker, even
-/// though nothing currently reads which row is highlighted; that's ready
-/// to become a scroll anchor if a project's skill list ever grows past
-/// what a single screen holds, but that's not implemented yet.
+/// analogous to codex's enable/disable state to act on). Up/Down move
+/// the highlight, and the renderer keeps its page visible.
 fn run_skills_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
@@ -4347,6 +8993,36 @@ enum SlashOutcome {
     Continue,
     Quit,
     Fatal(String),
+    #[cfg(target_os = "linux")]
+    Shutdown(signal::LinuxProcessShutdown),
+}
+
+#[cfg(target_os = "linux")]
+fn append_diff_result_after_read(
+    text: &str,
+    local_lines: &mut Vec<ratatui::text::Line<'static>>,
+    observe: impl FnOnce() -> Option<signal::LinuxProcessShutdown>,
+) -> Result<(), signal::LinuxProcessShutdown> {
+    const MAX_DIFF_LINES: usize = 200;
+    if let Some(reason) = observe() {
+        return Err(reason);
+    }
+    local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+        "diff:",
+        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+    )));
+    let all_lines: Vec<&str> = text.lines().collect();
+    let shown = all_lines.len().min(MAX_DIFF_LINES);
+    for raw_line in &all_lines[..shown] {
+        local_lines.push(ratatui::text::Line::from(render::sanitize(raw_line)));
+    }
+    if all_lines.len() > MAX_DIFF_LINES {
+        local_lines.push(ratatui::text::Line::from(format!(
+            "... truncated, showing {shown} of {} lines",
+            all_lines.len()
+        )));
+    }
+    Ok(())
 }
 
 /// The file `/init` writes.
@@ -4455,23 +9131,33 @@ fn apply_selection_copy(text: &str, copy_fn: impl FnOnce(&str) -> Result<(), Str
 /// What `/mcp` prints. Registration and admission only: nothing is
 /// connected to and no model is asked, so this is safe to run at any time
 /// and says nothing about whether a server is currently answering.
-fn mcp_state_lines(cwd: &std::path::Path) -> Vec<String> {
+fn mcp_state_lines(cwd: &std::path::Path, external_enabled: bool) -> Vec<String> {
+    let ceiling = polaris_core::mcp::operation::ExternalCeiling::host_external(external_enabled);
+    let mut lines = vec![format!(
+        "外部MCPホスト上限: {}",
+        if ceiling.permits_external() {
+            "許可"
+        } else {
+            "拒否"
+        }
+    )];
     let Ok(host) = polaris_core::mcp::local::LocalHost::open(cwd, false) else {
-        return vec!["MCPの設定を読めません。".into()];
+        lines.push("MCPの設定を読めません。".into());
+        return lines;
     };
-    // The report is what a run would admit, so it is read under the same
-    // ceiling a run without `--mcp-external` would use: a stricter view
-    // here would show servers a run can actually use as unavailable.
-    let report = match host
-        .state_report(polaris_core::mcp::operation::ExternalCeiling::host_external(false))
-    {
+    // Show the same external ceiling that the active run actually uses.
+    let report = match host.state_report(ceiling) {
         Ok(report) => report,
-        Err(error) => return vec![format!("MCPの状態を読めません: {error}")],
+        Err(error) => {
+            lines.push(format!("MCPの状態を読めません: {error}"));
+            return lines;
+        }
     };
     if report.is_empty() {
-        return vec!["登録されたMCPサーバーはありません。".into()];
+        lines.push("登録されたMCPサーバーはありません。".into());
+        return lines;
     }
-    let mut lines = vec![format!("MCPサーバー {}件", report.len())];
+    lines.push(format!("MCPサーバー {}件", report.len()));
     for server in report {
         let state = match (&server.quarantine, server.enabled_here) {
             // A refused server is refused whether or not this project
@@ -4483,6 +9169,110 @@ fn mcp_state_lines(cwd: &std::path::Path) -> Vec<String> {
         lines.push(format!("  {} — {state}", server.server_id));
     }
     lines
+}
+
+#[cfg(unix)]
+fn rewind_candidate_diagnostic(
+    owner: Option<&polaris_core::rewind_workspace::WorkspaceOwner>,
+    sessions_dir: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Vec<ratatui::text::Line<'static>> {
+    let Some(owner) = owner else {
+        return vec!["巻き戻し候補: workspace ownerを確認できません".into()];
+    };
+    let Some(data_root) = sessions_dir.parent() else {
+        return vec!["巻き戻し候補: 保存先を特定できません".into()];
+    };
+    let project_root = polaris_core::project::resolve_root(cwd);
+    let project_id = match persist::project_identity(&project_root) {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            return vec![format!("巻き戻し候補: projectを確認できません: {error}").into()];
+        }
+    };
+    let diagnostics =
+        polaris_core::rewind_admission::candidate_diagnostics(owner, data_root, &project_id);
+    if diagnostics.is_empty() {
+        return vec!["巻き戻し候補: 拒否・判定不能なし".into()];
+    }
+    let mut lines = vec![format!("巻き戻し候補: 拒否・判定不能 {}件", diagnostics.len()).into()];
+    for diagnostic in diagnostics.iter().take(128) {
+        lines.push(
+            format!(
+                "  {}: {}",
+                render::sanitize(&diagnostic.id),
+                render::sanitize(&diagnostic.reason)
+            )
+            .into(),
+        );
+    }
+    if diagnostics.len() > 128 {
+        lines.push(
+            format!(
+                "  他 {}件。保存領域を停止状態で確認してください",
+                diagnostics.len() - 128
+            )
+            .into(),
+        );
+    }
+    lines
+}
+
+fn doctor_lines(
+    provider_name: &str,
+    model_name: &str,
+    cwd: &std::path::Path,
+    sandbox: &polaris_sandbox::SandboxPolicy,
+    approval: polaris_core::approval::ApprovalPolicy,
+    mcp_external: bool,
+) -> Vec<ratatui::text::Line<'static>> {
+    let saved_chatgpt = polaris_auth::store::default_path()
+        .ok()
+        .is_some_and(|path| path.is_file());
+    let saved_api_key = polaris_auth::api_key::default_path()
+        .ok()
+        .is_some_and(|path| path.is_file());
+    let env_api_key = std::env::var_os("POLARIS_API_KEY").is_some();
+    let project_root = polaris_core::project::resolve_root(cwd);
+    let storage_root = std::env::var_os("POLARIS_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".polaris"))
+        });
+    let state = match storage_root {
+        Some(root) if root.is_absolute() => {
+            let path = root
+                .join("state")
+                .join(polaris_core::project::project_id(&project_root));
+            format!(
+                "{} ({})",
+                path.display(),
+                if path.is_dir() { "存在" } else { "未作成" }
+            )
+        }
+        _ => "利用不可 (保存先を特定できません)".to_owned(),
+    };
+    let rules = polaris_core::constitution::reach(&project_root);
+    let delivered = rules.iter().map(|rule| rule.delivered).sum::<usize>();
+    [
+        "診断 (read-only)".to_owned(),
+        format!("設定: provider={provider_name}, model={model_name}"),
+        format!(
+            "設定: ChatGPT認証ファイル={}, API keyファイル={}, 環境API key={}",
+            saved_chatgpt, saved_api_key, env_api_key
+        ),
+        format!(
+            "利用条件: sandbox={}, approval={approval:?}",
+            sandbox.describe()
+        ),
+        format!("利用条件: 外部MCP={mcp_external}; 個別サーバーは /mcp で確認"),
+        format!("利用条件: state={state}; 常時指示の到達行数={delivered}"),
+        "観測: この診断は認証・モデル・MCPへ送信しません。接続成功と実資源の可用性は未検証です。"
+            .to_owned(),
+    ]
+    .into_iter()
+    .map(|line| ratatui::text::Line::from(render::sanitize(&line).escape_debug().to_string()))
+    .collect()
 }
 
 fn cat_diagnostic_lines(
@@ -4507,26 +9297,532 @@ fn cat_diagnostic_lines(
     };
     vec![line.into()]
 }
+
+struct StatusSnapshot<'a> {
+    session: &'a polaris_core::session::Session,
+    provider_name: &'a str,
+    model_name: &'a str,
+    usage_report: polaris_provider::UsageReport,
+    sandbox: &'a polaris_sandbox::SandboxPolicy,
+    approval: polaris_core::approval::ApprovalPolicy,
+    startup_approval: polaris_core::approval::ApprovalPolicy,
+    mcp_external: bool,
+    audit_path: Option<&'a Path>,
+    turn_authority_present: bool,
+    fixed_effort: Option<&'a str>,
+    answer_finalizer: Option<&'a polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner>,
+    #[cfg(unix)]
+    management_effects: &'a polaris_core::management_effect::ManagementEffectStoreV1,
+    #[cfg(unix)]
+    recovery_issue: Option<&'a str>,
+}
+
+fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static>> {
+    let StatusSnapshot {
+        session,
+        provider_name,
+        model_name,
+        usage_report,
+        sandbox,
+        approval,
+        startup_approval,
+        mcp_external,
+        audit_path,
+        turn_authority_present,
+        fixed_effort,
+        answer_finalizer,
+        #[cfg(unix)]
+        management_effects,
+        #[cfg(unix)]
+        recovery_issue,
+    } = snapshot;
+    let usage = usage_report.usage;
+    let mut lines = vec![
+        "状態 (read-only)".to_owned(),
+        format!("設定: provider={provider_name}, model={model_name}"),
+        format!(
+            "利用条件: approval 現在={approval:?}, 起動時={startup_approval:?}; sandbox={}",
+            sandbox.describe()
+        ),
+        format!("利用条件: 外部MCP={mcp_external}; 個別サーバーは /mcp で確認"),
+        format!(
+            "観測: tokens in {} / out {} / cache {} / total {}; 欠測 {} / 失敗 {}",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_tokens,
+            usage.total_tokens,
+            usage_report.missing_responses,
+            usage_report.failed_requests,
+        ),
+        format!("観測: 会話 {} messages", session.messages.len()),
+    ];
+    if let Some(workflow) = &session.workflow {
+        let state = workflow.state();
+        let ids = state
+            .skills
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        lines.push(format!(
+            "観測: workflow phase={}; skills={}; manifest={}",
+            state.phase, ids, state.skill_manifest_hash
+        ));
+    }
+    lines.push("可用性: 認証・モデル・MCPの実接続はこの表示では未検証です".to_owned());
+    lines.push(
+        "可用性: web-search=disabled。cached/liveは接続先の上限契約が未確認のため利用できません。"
+            .to_owned(),
+    );
+    lines.push("可用性: capacity観測は未接続です。資源の空きを確認したとは扱いません。".to_owned());
+    lines.push(format!(
+        "設定: audit={}; 保存先変更は --audit を指定して再起動",
+        audit_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "未指定".into())
+    ));
+    lines.push(format!(
+        "設定: effort={}; TUIから固定overrideを変更できません",
+        fixed_effort.unwrap_or("automatic")
+    ));
+    lines.push(format!("設定: host-issued routine/review authorityの構成={turn_authority_present}。内容・承認tokenは表示しません。"));
+    let mut rendered: Vec<_> = lines
+        .into_iter()
+        .map(|line| ratatui::text::Line::from(render::sanitize(&line).escape_debug().to_string()))
+        .collect();
+    rendered.extend(cat_diagnostic_lines(answer_finalizer));
+    #[cfg(unix)]
+    rendered.extend(management_effect_diagnostic(
+        management_effects,
+        recovery_issue,
+    ));
+    rendered
+}
+
+fn account_list_lines() -> Result<Vec<ratatui::text::Line<'static>>, String> {
+    use polaris_auth::accounts::{owner::AccountOwner, store::AccountState};
+
+    let home = std::env::var_os("HOME").ok_or("HOMEを特定できません")?;
+    polaris_auth::protection::use_trusted_home(std::path::Path::new(&home))
+        .map_err(|error| format!("認証の保存先を確認できません: {error}"))?;
+    let Some(owner) = AccountOwner::open_if_registered(polaris_auth::ISSUER)
+        .map_err(|error| format!("アカウントを開けません: {error}"))?
+    else {
+        return Ok(vec![ratatui::text::Line::from(
+            "登録はありません。単一認証を使用しています。",
+        )]);
+    };
+    let snapshot = owner
+        .snapshot()
+        .map_err(|error| format!("一覧を取得できません: {error}"))?;
+    let mut lines = vec![ratatui::text::Line::from(format!(
+        "登録アカウント: {}件",
+        snapshot.accounts.len()
+    ))];
+    for account in snapshot.accounts {
+        let state = match account.state {
+            AccountState::Registering => "登録中",
+            AccountState::Ready => "利用可",
+            AccountState::RefreshPending => "更新中",
+            AccountState::ReauthRequired => "再認証が必要",
+            AccountState::Disconnected => "解除済み",
+        };
+        let usage = match owner.observation(&account.registration_id, "gpt-6-astra") {
+            Some(observed) => match observed.state {
+                polaris_auth::quota::ObservationState::Known(_) => "利用枠は取得済み",
+                polaris_auth::quota::ObservationState::Missing => "利用枠は未取得",
+                polaris_auth::quota::ObservationState::FetchFailed => "利用枠の取得に失敗",
+                polaris_auth::quota::ObservationState::MappingUnknown => "利用枠の対応は未検証",
+                polaris_auth::quota::ObservationState::Unsupported => "利用枠は非対応",
+            },
+            None => "利用枠は未取得",
+        };
+        let label = account.label.as_deref().unwrap_or("-");
+        lines.push(ratatui::text::Line::from(render::sanitize(&format!(
+            "  {}  {state}  {}  {usage}",
+            account.registration_id,
+            label.escape_debug().to_string()
+        ))));
+    }
+    Ok(lines)
+}
+
+/// Read-only memory access uses the same project identity and database as the
+/// CLI. A historical hit is evidence, never a current instruction or grant.
+fn memory_read_lines(
+    cwd: &std::path::Path,
+    state_dir: &std::path::Path,
+    sessions_dir: &std::path::Path,
+    request: &str,
+) -> Result<Vec<ratatui::text::Line<'static>>, String> {
+    use polaris_memory::{MemoryStore, SearchMode, SearchRequest};
+
+    const USAGE: &str = "/memory search <query> | /memory get <session> <id> | /memory source <session> <id-or-conversation-URI>";
+    if request.is_empty() {
+        return Ok(vec![ratatui::text::Line::from(USAGE)]);
+    }
+    if request.len() > 1024 || request.chars().any(char::is_control) {
+        return Err("記憶への照会は1024バイト以内の1行で指定してください".into());
+    }
+    let mut parts = request.split_whitespace();
+    let operation = parts.next().unwrap_or("");
+    if !matches!(operation, "search" | "get" | "source") {
+        return Err(format!("このTUIで利用できる記憶操作: {USAGE}"));
+    }
+    let project_id = persist::project_identity(cwd)
+        .map_err(|error| format!("プロジェクトを特定できません: {error}"))?;
+    let store = MemoryStore::open_read_only(state_dir.join("memory.sqlite3"))
+        .map_err(|error| format!("保存済み記憶を開けません: {error}"))?;
+    let mut lines = vec![ratatui::text::Line::from(
+        "過去の記録です。現在の指示・承認ではありません。",
+    )];
+    match operation {
+        "search" => {
+            let query = request.strip_prefix("search").unwrap_or("").trim();
+            if query.is_empty() {
+                return Err(format!("検索語が必要です: {USAGE}"));
+            }
+            let hits = store
+                .search(&SearchRequest {
+                    project_id: &project_id,
+                    session_id: None,
+                    mode: SearchMode::Lexical(query),
+                    limit: 5,
+                    excerpt_bytes: 512,
+                })
+                .map_err(|error| format!("記憶を検索できません: {error}"))?;
+            if hits.is_empty() {
+                lines.push(ratatui::text::Line::from("該当する記録はありません"));
+            }
+            for hit in hits {
+                lines.push(ratatui::text::Line::from(render::sanitize(&format!(
+                    "{} / {} / {} / {}",
+                    hit.session_id, hit.id, hit.timestamp, hit.source
+                ))));
+                lines.push(ratatui::text::Line::from(render::sanitize(
+                    &hit.excerpt.replace(['\n', '\r'], " "),
+                )));
+            }
+        }
+        "get" => {
+            let session = parts.next().ok_or_else(|| USAGE.to_string())?;
+            let id = parts.next().ok_or_else(|| USAGE.to_string())?;
+            let start = parts
+                .next()
+                .map(str::parse::<usize>)
+                .transpose()
+                .map_err(|_| "startはUTF-8 byte位置です")?
+                .unwrap_or(0);
+            let budget = parts
+                .next()
+                .map(str::parse::<usize>)
+                .transpose()
+                .map_err(|_| "max-bytesは整数です")?
+                .unwrap_or(4096);
+            if parts.next().is_some() || budget > 4096 {
+                return Err("/memory get <session> <id> [start] [max-bytes:0..4096]".into());
+            }
+            let range = store
+                .get_range(&project_id, session, id, start, budget)
+                .map_err(|error| format!("記憶を取得できません: {error}"))?
+                .ok_or("該当する記録はありません")?;
+            lines.push(ratatui::text::Line::from(render::sanitize(&format!(
+                "{} / {} / {} / {} ({} / {} bytes)",
+                range.record.session_id,
+                range.record.id,
+                range.record.timestamp,
+                range.record.source,
+                range.end,
+                range.total_bytes
+            ))));
+            for text in range.record.text.lines() {
+                lines.push(ratatui::text::Line::from(render::sanitize(text)));
+            }
+            if range.end < range.total_bytes {
+                lines.push(ratatui::text::Line::from(
+                    "続きは /memory get <session> <id> <表示済みbyte位置> で確認できます。",
+                ));
+            }
+        }
+        "source" => {
+            let session = parts.next().ok_or_else(|| USAGE.to_string())?;
+            let id = parts.next().ok_or_else(|| USAGE.to_string())?;
+            if parts.next().is_some()
+                || session.is_empty()
+                || !session
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(USAGE.to_string());
+            }
+            let uri = if id.starts_with("conversation://") {
+                id.to_owned()
+            } else if id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                format!("conversation://{id}")
+            } else {
+                return Err("出典IDかconversation:// URIを指定してください".into());
+            };
+            let data_root = sessions_dir
+                .parent()
+                .ok_or("会話の保存先を特定できません")?;
+            let persisted = polaris_core::session_store::PersistedSession::open(
+                data_root,
+                &state_dir.join("memory.sqlite3"),
+                &project_id,
+                session,
+            )
+            .map_err(|error| format!("保存会話を開けません: {error}"))?;
+            let source = polaris_core::conversation_memory::read_source(
+                persisted.store.as_ref(),
+                &state_dir.join("memory.sqlite3"),
+                &uri,
+            )
+            .map_err(|error| format!("出典を確認できません: {error}"))?;
+            for text in source.lines() {
+                lines.push(ratatui::text::Line::from(render::sanitize(text)));
+            }
+        }
+        _ => unreachable!("operation was validated"),
+    }
+    Ok(lines)
+}
+
+fn decided_read_lines(cwd: &std::path::Path) -> Result<Vec<ratatui::text::Line<'static>>, String> {
+    use std::io::Read;
+
+    let root = polaris_core::project::resolve_root(cwd);
+    let ledger = root.join(polaris_core::decisions::PATH);
+    let mut data = Vec::new();
+    match std::fs::File::open(&ledger) {
+        Ok(file) => file
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut data)
+            .map_err(|error| format!("決定事項を読めません: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(format!("決定事項を読めません: {error}")),
+    };
+    if data.len() > 1024 * 1024 {
+        return Err("決定事項の台帳が1 MiBを超えるためTUIでは表示できません".into());
+    }
+    let text = String::from_utf8(data).map_err(|_| "決定事項の台帳がUTF-8ではありません")?;
+    let entries = polaris_core::decisions::parse(&text);
+    let mut lines = vec![ratatui::text::Line::from(format!(
+        "記録済みの決定事項: {}件。過去の記録であり、現在の承認ではありません。",
+        entries.len()
+    ))];
+    if entries.is_empty() {
+        lines.push(ratatui::text::Line::from("記録はありません"));
+    }
+    let omitted = entries.len().saturating_sub(100);
+    if omitted > 0 {
+        lines.push(ratatui::text::Line::from(format!(
+            "古い{omitted}件は省略しました"
+        )));
+    }
+    for entry in entries.into_iter().skip(omitted) {
+        lines.push(ratatui::text::Line::from(render::sanitize(&format!(
+            "{}  {}",
+            entry.at, entry.what
+        ))));
+    }
+    Ok(lines)
+}
+
+fn compare_read_lines(
+    cwd: &std::path::Path,
+    request: &str,
+) -> Result<Vec<ratatui::text::Line<'static>>, String> {
+    use polaris_core::similarity::{self, Suggestion};
+    const USAGE: &str = "/compare <folder1> | <folder2> [| <folder3> ...]";
+    if request.is_empty() {
+        return Ok(vec![ratatui::text::Line::from(USAGE)]);
+    }
+    if request.len() > 2048 || request.chars().any(char::is_control) {
+        return Err("比較するフォルダは2048バイト以内の1行で指定してください".into());
+    }
+    let folders = request.split('|').map(str::trim).collect::<Vec<_>>();
+    if !(2..=8).contains(&folders.len()) || folders.iter().any(|path| path.is_empty()) {
+        return Err(format!("{USAGE}（2〜8フォルダ）"));
+    }
+    let mut samples = Vec::with_capacity(folders.len());
+    let mut lines = Vec::new();
+    for raw in folders {
+        let path = std::path::Path::new(raw);
+        let full = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        let id = full.display().to_string();
+        let sampled = similarity::sample::folder(&id, &full)
+            .map_err(|error| format!("{} を読めません: {error}", render::sanitize(&id)))?;
+        if sampled.truncated {
+            lines.push(ratatui::text::Line::from(render::sanitize(&format!(
+                "{id}: 一部だけの比較です。似ていない結果は確定しません"
+            ))));
+        }
+        samples.push(sampled.folder);
+    }
+    let graph = similarity::graph(&samples);
+    if graph.omitted > 0 {
+        lines.push(ratatui::text::Line::from(format!(
+            "{}件は上限のため比較していません",
+            graph.omitted
+        )));
+    }
+    if graph.edges.is_empty() {
+        lines.push(ratatui::text::Line::from(
+            "似ているフォルダはありませんでした",
+        ));
+    }
+    for edge in graph.edges {
+        lines.push(ratatui::text::Line::from(render::sanitize(&format!(
+            "{} / {}: 類似度 {}、共通 {}件",
+            edge.left,
+            edge.right,
+            edge.similarity,
+            edge.shared.len()
+        ))));
+    }
+    for proposal in graph.proposals {
+        let why = match proposal.suggestion {
+            Suggestion::SameWorkInTwoPlaces => "同じ作業が2箇所にある可能性",
+            Suggestion::SharedPart => "共通部分を切り出せる可能性",
+        };
+        lines.push(ratatui::text::Line::from(render::sanitize(&format!(
+            "提案: {} / {}: {why}。{}",
+            proposal.left, proposal.right, proposal.because
+        ))));
+    }
+    lines.push(ratatui::text::Line::from(
+        "提案は調査の手がかりです。移動・削除は行いません。",
+    ));
+    Ok(lines)
+}
+
+fn clear_mcp_prompt_on_session_change(
+    previous: &std::path::Path,
+    current: &std::path::Path,
+    pending: &mut Option<polaris_core::mcp::runtime::McpPromptChoice>,
+    requires_reselect: &mut bool,
+) {
+    if previous != current {
+        *pending = None;
+        *requires_reselect = false;
+    }
+}
+
+fn mcp_prompt_choice(request: &str) -> Result<polaris_core::mcp::runtime::McpPromptChoice, String> {
+    if request.len() > 2048 || request.chars().any(char::is_control) {
+        return Err("MCP prompt選択は2048バイト以内の1行で指定してください".into());
+    }
+    let mut parts = request.split_whitespace();
+    if parts.next() != Some("prompt") {
+        return Err("/mcp prompt <server>/<prompt> [key=value ...]".into());
+    }
+    let spec = parts
+        .next()
+        .ok_or("/mcp prompt <server>/<prompt> [key=value ...]")?;
+    let (server, prompt) = spec
+        .split_once('/')
+        .ok_or("MCP promptは server/prompt の形で指定してください")?;
+    if server.is_empty() || prompt.is_empty() {
+        return Err("MCP promptのserverとpromptを指定してください".into());
+    }
+    let mut arguments = serde_json::Map::new();
+    for argument in parts {
+        if arguments.len() >= 16 {
+            return Err("MCP promptの引数は16個までです".into());
+        }
+        let (key, value) = argument
+            .split_once('=')
+            .ok_or("MCP prompt引数はkey=valueの形で指定してください")?;
+        if key.is_empty() || arguments.contains_key(key) {
+            return Err("MCP prompt引数のキーが空または重複しています".into());
+        }
+        arguments.insert(key.into(), serde_json::Value::String(value.into()));
+    }
+    Ok(polaris_core::mcp::runtime::McpPromptChoice {
+        server: server.into(),
+        prompt: prompt.into(),
+        arguments,
+    })
+}
+
+#[cfg(unix)]
+fn management_effect_diagnostic(
+    store: &polaris_core::management_effect::ManagementEffectStoreV1,
+    recovery_issue: Option<&str>,
+) -> Vec<ratatui::text::Line<'static>> {
+    let mut result = match store.blocker() {
+        Ok(Some(effect)) => format!(
+            "管理操作: 未解決 {} ({}) / 状態 {:?} / 記録番号 {}",
+            effect.request.operation_id,
+            effect.request.inventory,
+            effect.state,
+            effect.last_sequence
+        ),
+        Ok(None) => "管理操作: 未解決なし".to_owned(),
+        Err(error) => format!("管理操作: 状態を確認できません ({error})"),
+    };
+    if let Some(reason) = recovery_issue {
+        result.push_str(&format!(" / 復旧理由: {reason}"));
+    }
+    vec![ratatui::text::Line::from(
+        render::sanitize(&result).escape_debug().to_string(),
+    )]
+}
+
+#[cfg(unix)]
+fn management_clearance_error(
+    store: &polaris_core::management_effect::ManagementEffectStoreV1,
+    action: &slash::Action,
+) -> Option<String> {
+    if !action.needs_management_clearance() {
+        return None;
+    }
+    match store.blocker() {
+        Ok(Some(effect)) => Some(format!(
+            "未解決の管理操作 {} ({}) があります。先に状態を確認してください",
+            effect.request.operation_id, effect.request.inventory
+        )),
+        Ok(None) => None,
+        Err(error) => Some(format!("管理操作の状態を確認できません: {error}")),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_slash_action(
     action: slash::Action,
     session: &mut polaris_core::session::Session,
     session_path: &std::path::Path,
     status: &mut Status,
-    provider_name: &str,
-    model_name: &str,
-    usage_report: polaris_provider::UsageReport,
+    _provider_name: &str,
+    _model_name: &str,
+    _usage_report: polaris_provider::UsageReport,
     // No longer read here — `/skills` is intercepted in `run()` before
     // dispatch (see `run_skills_picker`) now that it's a full-screen
     // picker instead of a one-line `Status::Notice`. Kept as a parameter
     // rather than removed, since removing it would mean touching every
     // `apply_slash_action`/`call` call site (production and test) for a
     // signature change with no behavior difference.
-    skills: &[polaris_skills::Skill],
+    _skills: &[polaris_skills::Skill],
     cwd: &std::path::Path,
+    state_dir: &std::path::Path,
+    sessions_dir: &std::path::Path,
+    mcp_external: bool,
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
 ) -> SlashOutcome {
     match action {
+        slash::Action::SessionControl(_)
+        | slash::Action::WorkspaceControl(_)
+        | slash::Action::RuntimeControl(_) => {
+            *status = Status::Error("この操作には有効な端末と保存ownerが必要です".into());
+            SlashOutcome::Continue
+        }
         slash::Action::Quit => SlashOutcome::Quit,
         slash::Action::Clear => {
             local_lines.clear();
@@ -4545,148 +9841,107 @@ fn apply_slash_action(
             }
         }
         slash::Action::Status => {
-            let cumulative_usage = usage_report.usage;
-            let workflow = session
-                .workflow
-                .as_ref()
-                .map(|workflow| {
-                    let state = workflow.state();
-                    let ids = state
-                        .skills
-                        .iter()
-                        .map(|skill| skill.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    format!(
-                        "; workflow phase: {}; skills: {}; manifest: {}",
-                        state.phase, ids, state.skill_manifest_hash
-                    )
-                })
-                .unwrap_or_default();
-            *status = Status::Notice(format!(
-                "{provider_name} / {model_name} — tokens: in {} / out {} / cache {} / total {} — {} messages{workflow}; 確認済み使用量、欠測 {} / 失敗 {}",
-                cumulative_usage.input_tokens,
-                cumulative_usage.output_tokens,
-                cumulative_usage.cached_tokens,
-                cumulative_usage.total_tokens,
-                session.messages.len(),
-                usage_report.missing_responses,
-                usage_report.failed_requests,
-            ));
+            *status = Status::Error("/status の表示経路を確認できません".into());
+            SlashOutcome::Continue
+        }
+        slash::Action::WebSearch(requested) => {
+            if !matches!(requested.as_str(), "" | "status" | "disabled") {
+                *status = Status::Error("Web検索は接続先の上限契約が未確認のため利用できません。disabledを使用してください。".into());
+            } else {
+                local_lines.push(ratatui::text::Line::from("Web検索: disabled。cached/liveは接続先の上限契約が未確認のため利用できません。送信は行っていません。"));
+                *status = Status::Notice("Web検索の利用条件を表示しました".into());
+            }
+            SlashOutcome::Continue
+        }
+        slash::Action::Account(requested) => {
+            if !requested.is_empty() && requested != "list" {
+                *status = Status::Error("/account は現在 list のみ利用できます".into());
+                return SlashOutcome::Continue;
+            }
+            match account_list_lines() {
+                Ok(lines) => {
+                    local_lines.extend(lines);
+                    *status = Status::Notice("アカウント一覧を表示しました".into());
+                }
+                Err(error) => *status = Status::Error(error),
+            }
+            SlashOutcome::Continue
+        }
+        slash::Action::Memory(requested) => {
+            match memory_read_lines(cwd, state_dir, sessions_dir, &requested) {
+                Ok(lines) => {
+                    local_lines.extend(lines);
+                    *status = Status::Notice("保存済み記憶の参照結果を表示しました".into());
+                }
+                Err(error) => *status = Status::Error(error),
+            }
+            SlashOutcome::Continue
+        }
+        slash::Action::Decided(requested) => {
+            if !requested.is_empty() && requested != "list" {
+                *status = Status::Error("/decided は現在 list のみ利用できます".into());
+                return SlashOutcome::Continue;
+            }
+            match decided_read_lines(cwd) {
+                Ok(lines) => {
+                    local_lines.extend(lines);
+                    *status = Status::Notice("決定事項を表示しました".into());
+                }
+                Err(error) => *status = Status::Error(error),
+            }
+            SlashOutcome::Continue
+        }
+        slash::Action::Compare(requested) => {
+            match compare_read_lines(cwd, &requested) {
+                Ok(lines) => {
+                    local_lines.extend(lines);
+                    *status = Status::Notice("フォルダ比較を表示しました".into());
+                }
+                Err(error) => *status = Status::Error(error),
+            }
+            SlashOutcome::Continue
+        }
+        #[cfg(target_os = "linux")]
+        slash::Action::Apply(_) => {
+            *status = Status::Error("D27操作には実端末とsource-bound ownerが必要です".into());
+            SlashOutcome::Continue
+        }
+        slash::Action::Sync(_) => {
+            *status = Status::Error("共有適用には対応OSの確認画面と共有ownerが必要です".into());
             SlashOutcome::Continue
         }
         slash::Action::Phase(requested) => {
-            let Some(workflow) = &session.workflow else {
-                *status = Status::Notice("workflowはこのセッションで無効です".into());
-                return SlashOutcome::Continue;
+            *status = if requested.is_empty() {
+                session.workflow.as_ref().map_or_else(
+                    || Status::Notice("workflowはこのセッションで無効です".into()),
+                    |workflow| {
+                        Status::Notice(format!("ワークフロー段階: {}", workflow.state().phase))
+                    },
+                )
+            } else {
+                Status::Error("phase変更には管理操作の確認画面が必要です".into())
             };
-            if requested.is_empty() {
-                *status = Status::Notice(format!("ワークフロー段階: {}", workflow.state().phase));
-                return SlashOutcome::Continue;
-            }
-            let configured = (|| -> Result<polaris_core::workflow::SessionWorkflow, String> {
-                session
-                    .check_persistence()
-                    .map_err(|error| error.to_string())?;
-                let phase = requested.parse::<polaris_core::workflow::Phase>()?;
-                let candidate = polaris_core::workflow::SessionWorkflow::restore(
-                    workflow.config.clone(),
-                    workflow.gates.clone(),
-                    workflow.state(),
-                )?;
-                candidate.request_phase(phase)?;
-                if candidate.config.enabled {
-                    drop(candidate.begin_turn_from_disk(skills)?);
-                }
-                if let Some(saved) = &session.persistence {
-                    saved
-                        .checkpoint(Some(&candidate))
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok(candidate)
-            })();
-            match configured {
-                Ok(candidate) => {
-                    *status =
-                        Status::Notice(format!("ワークフロー段階: {}", candidate.state().phase));
-                    session.workflow = Some(candidate);
-                }
-                Err(error) => *status = Status::Notice(format!("phaseを保存できません: {error}")),
-            }
             SlashOutcome::Continue
         }
         slash::Action::Workflow(requested) => {
-            if let Err(error) = session.check_persistence() {
-                *status = Status::Notice(format!("workflow設定を保存できません: {error}"));
-                return SlashOutcome::Continue;
-            }
-            let Some(current) = &session.workflow else {
-                *status = Status::Notice("workflowはこのセッションで無効です".into());
-                return SlashOutcome::Continue;
+            *status = if requested.is_empty() {
+                session.workflow.as_ref().map_or_else(
+                    || Status::Notice("workflowはこのセッションで無効です".into()),
+                    |workflow| {
+                        let mode = if workflow.config.enabled {
+                            match workflow.config.mode {
+                                polaris_core::workflow::WorkflowMode::Manual => "manual",
+                                polaris_core::workflow::WorkflowMode::Adaptive => "adaptive",
+                            }
+                        } else {
+                            "off"
+                        };
+                        Status::Notice(format!("workflow: {mode}"))
+                    },
+                )
+            } else {
+                Status::Error("workflow変更には管理操作の確認画面が必要です".into())
             };
-            if requested.is_empty() {
-                *status = Status::Notice(format!(
-                    "workflow: {}",
-                    if current.config.enabled {
-                        match current.config.mode {
-                            polaris_core::workflow::WorkflowMode::Manual => "manual",
-                            polaris_core::workflow::WorkflowMode::Adaptive => "adaptive",
-                        }
-                    } else {
-                        "off"
-                    }
-                ));
-                return SlashOutcome::Continue;
-            }
-            let mode = requested.strip_prefix("mode ").unwrap_or(&requested);
-            let mut config = current.config.clone();
-            match mode {
-                "manual" => {
-                    config.enabled = true;
-                    config.mode = polaris_core::workflow::WorkflowMode::Manual;
-                }
-                "adaptive" => {
-                    config.enabled = true;
-                    config.mode = polaris_core::workflow::WorkflowMode::Adaptive;
-                }
-                "off" => {
-                    config.enabled = false;
-                    config.mode = polaris_core::workflow::WorkflowMode::Manual;
-                }
-                _ => {
-                    *status = Status::Notice(
-                        "workflow modeは manual、adaptive、off のいずれかです".into(),
-                    );
-                    return SlashOutcome::Continue;
-                }
-            }
-            let candidate = match polaris_core::workflow::SessionWorkflow::restore(
-                config,
-                current.gates.clone(),
-                current.state(),
-            ) {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    *status = Status::Notice(format!("workflow設定を検証できません: {error}"));
-                    return SlashOutcome::Continue;
-                }
-            };
-            if candidate.config.enabled
-                && let Err(error) = candidate.begin_turn_from_disk(skills)
-            {
-                *status = Status::Notice(format!("workflow設定を検証できません: {error}"));
-                return SlashOutcome::Continue;
-            }
-            let Some(persistence) = &session.persistence else {
-                *status = Status::Notice("workflow設定を保存するセッションがありません".into());
-                return SlashOutcome::Continue;
-            };
-            if let Err(error) = persistence.checkpoint(Some(&candidate)) {
-                *status = Status::Notice(format!("workflow設定を保存できません: {error}"));
-                return SlashOutcome::Continue;
-            }
-            session.workflow = Some(candidate);
-            *status = Status::Notice(format!("workflow: {mode}"));
             SlashOutcome::Continue
         }
         slash::Action::Init => {
@@ -4710,11 +9965,19 @@ fn apply_slash_action(
             SlashOutcome::Continue
         }
         slash::Action::Pwd => {
-            *status = Status::Notice(cwd.display().to_string());
+            *status = Status::Notice(
+                polaris_core::project::resolve_root(cwd)
+                    .display()
+                    .to_string(),
+            );
             SlashOutcome::Continue
         }
-        slash::Action::Mcp => {
-            for line in mcp_state_lines(cwd) {
+        slash::Action::Mcp(requested) => {
+            if !requested.is_empty() && requested != "list" {
+                *status = Status::Error("/mcp prompt の選択は入力受付画面で処理します".into());
+                return SlashOutcome::Continue;
+            }
+            for line in mcp_state_lines(cwd, mcp_external) {
                 local_lines.push(ratatui::text::Line::from(line));
             }
             *status = Status::Idle;
@@ -4739,44 +10002,77 @@ fn apply_slash_action(
             SlashOutcome::Continue
         }
         slash::Action::Diff => {
-            // Read-only, so it runs directly rather than through the
-            // sandbox (which exists to confine what the *model* can
-            // mutate, not to gate the user's own read commands).
+            #[cfg(not(target_os = "linux"))]
             const MAX_DIFF_LINES: usize = 200;
-            let text = match std::process::Command::new("git")
-                .arg("diff")
-                .current_dir(cwd)
-                .output()
-            {
-                Ok(out) if out.status.success() => {
-                    if out.stdout.is_empty() {
-                        "(no changes)".to_string()
-                    } else {
-                        String::from_utf8_lossy(&out.stdout).into_owned()
+            let text = (|| -> Result<String, String> {
+                let project_root = polaris_core::project::resolve_root(cwd);
+                let root = std::fs::File::open(project_root)
+                    .map_err(|_| "Git情報を取得できません".to_string())?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let read = |args: &[&str]| {
+                    polaris_core::project_git::read_only_git(&root, args, deadline)
+                        .map_err(|error| error.to_string())
+                };
+                let mut text =
+                    String::from_utf8_lossy(&read(&["diff", "--no-ext-diff", "--no-textconv"])?)
+                        .into_owned();
+                let staged = read(&["diff", "--cached", "--no-ext-diff", "--no-textconv"])?;
+                if !staged.is_empty() {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
                     }
+                    text.push_str(&String::from_utf8_lossy(&staged));
                 }
-                Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                Err(e) => format!("can't run git diff: {e}"),
-            };
-            local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
-                "diff:",
-                ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD),
-            )));
-            let all_lines: Vec<&str> = text.lines().collect();
-            let shown = all_lines.len().min(MAX_DIFF_LINES);
-            for raw_line in &all_lines[..shown] {
-                local_lines.push(ratatui::text::Line::from(render::sanitize(raw_line)));
+                let untracked = read(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+                for path in untracked
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str("?? ");
+                    text.push_str(&String::from_utf8_lossy(path).escape_debug().to_string());
+                    text.push('\n');
+                }
+                Ok(if text.is_empty() {
+                    "(no changes)".to_string()
+                } else {
+                    text
+                })
+            })()
+            .unwrap_or_else(|error| error);
+            #[cfg(target_os = "linux")]
+            if let Err(reason) = append_diff_result_after_read(
+                &text,
+                local_lines,
+                signal::pending_linux_process_shutdown,
+            ) {
+                return SlashOutcome::Shutdown(reason);
             }
-            if all_lines.len() > MAX_DIFF_LINES {
-                local_lines.push(ratatui::text::Line::from(format!(
-                    "... truncated, showing {shown} of {} lines",
-                    all_lines.len()
+            #[cfg(not(target_os = "linux"))]
+            {
+                local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                    "diff:",
+                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD),
                 )));
+                let all_lines: Vec<&str> = text.lines().collect();
+                let shown = all_lines.len().min(MAX_DIFF_LINES);
+                for raw_line in &all_lines[..shown] {
+                    local_lines.push(ratatui::text::Line::from(render::sanitize(raw_line)));
+                }
+                if all_lines.len() > MAX_DIFF_LINES {
+                    local_lines.push(ratatui::text::Line::from(format!(
+                        "... truncated, showing {shown} of {} lines",
+                        all_lines.len()
+                    )));
+                }
             }
             *status = Status::Idle;
             SlashOutcome::Continue
         }
         slash::Action::Review(_)
+        | slash::Action::Doctor
         | slash::Action::New
         | slash::Action::Resume
         | slash::Action::Permissions
@@ -4803,27 +10099,18 @@ fn apply_slash_action(
             SlashOutcome::Continue
         }
         slash::Action::Logout => {
-            let outcome = polaris_auth::store::default_path()
-                .map_err(|e| e.to_string())
-                .and_then(|p| {
-                    polaris_auth::logout(&p)
-                        .map(|removed| (p, removed))
-                        .map_err(|e| e.to_string())
-                });
-            *status = match outcome {
-                Ok((p, true)) => Status::Notice(format!("logged out: {}", p.display())),
-                Ok((_, false)) => Status::Notice("not logged in".to_string()),
-                Err(e) => Status::Notice(format!("can't log out: {e}")),
-            };
+            *status = Status::Error("解除には対象アカウントの確認画面が必要です".into());
             SlashOutcome::Continue
         }
         slash::Action::Help => {
-            let list = slash::COMMANDS
-                .iter()
-                .map(|c| format!("/{}", c.name))
-                .collect::<Vec<_>>()
-                .join("  ");
-            *status = Status::Notice(format!("commands: {list}"));
+            local_lines.push(ratatui::text::Line::from("commands:"));
+            for command in slash::COMMANDS {
+                local_lines.push(ratatui::text::Line::from(format!(
+                    "/{} — {}",
+                    command.name, command.description
+                )));
+            }
+            *status = Status::Notice("commands listed above (scroll to see all)".to_string());
             SlashOutcome::Continue
         }
         slash::Action::Unknown(name) => {
@@ -4835,7 +10122,974 @@ fn apply_slash_action(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_tui_pre_raw_injection_avoids_terminal_mutation() {
+        use std::cell::Cell;
+
+        let terminal_calls = Cell::new(0);
+        let result = linux_start_terminal(
+            || Some(signal::LinuxProcessShutdown::SigInt),
+            || {
+                terminal_calls.set(terminal_calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LinuxTerminalStartError::Shutdown(
+                signal::LinuxProcessShutdown::SigInt
+            ))
+        ));
+        assert_eq!(terminal_calls.get(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_tui_startup_resume_guard_restores_once_on_error() {
+        let mut guard = LinuxTerminalGuard {
+            alternate: true,
+            raw: true,
+            mouse: false,
+            cursor: false,
+        };
+        let mut steps = Vec::new();
+        let result: Result<(), String> = linux_finish_guarded_terminal(
+            Err("saved transcript read failed".into()),
+            &mut guard,
+            |step| {
+                steps.push(step);
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("saved transcript read failed"));
+        guard
+            .restore_with(|step| {
+                steps.push(step);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            steps,
+            [LinuxTerminalStep::Raw, LinuxTerminalStep::Alternate]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_tui_startup_workflow_guard_restores_once_on_error() {
+        let mut guard = LinuxTerminalGuard {
+            alternate: true,
+            raw: true,
+            mouse: false,
+            cursor: false,
+        };
+        let mut steps = Vec::new();
+        let result: Result<bool, String> = linux_finish_guarded_terminal(
+            Err("confirmation draw failed".into()),
+            &mut guard,
+            |step| {
+                steps.push(step);
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("confirmation draw failed"));
+        guard
+            .restore_with(|step| {
+                steps.push(step);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            steps,
+            [LinuxTerminalStep::Raw, LinuxTerminalStep::Alternate]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_tui_picker_shutdown_accepts_no_choice() {
+        use approver::KeyReader;
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::cell::Cell;
+
+        struct LatchingReader(Cell<bool>);
+        impl KeyReader for LatchingReader {
+            fn read_key(&mut self) -> std::io::Result<KeyCode> {
+                let latched = &self.0;
+                linux_read_key_with(
+                    |_| Ok(true),
+                    || {
+                        latched.set(true);
+                        Ok(Event::Key(KeyEvent::new(
+                            KeyCode::Enter,
+                            KeyModifiers::NONE,
+                        )))
+                    },
+                    || latched.get(),
+                )
+            }
+        }
+
+        let terminal = RefCell::new(
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 14)).unwrap(),
+        );
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
+        let mut approval_policy = ApprovalPolicy::OnRequest;
+        let mut status = Status::Idle;
+        let mut reader = LatchingReader(Cell::new(false));
+        handle_permissions(
+            &terminal,
+            &mut reader,
+            &mut approval_policy,
+            ApprovalPolicy::OnRequest,
+            &sandbox,
+            &mut status,
+        );
+        assert!(reader.0.get());
+        assert_eq!(approval_policy, ApprovalPolicy::OnRequest);
+        assert!(matches!(status, Status::Idle));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_tui_diff_result_is_suppressed_after_latch() {
+        let mut lines = vec![ratatui::text::Line::from("earlier output")];
+        let result = append_diff_result_after_read("secret diff line\n", &mut lines, || {
+            Some(signal::LinuxProcessShutdown::SigTerm)
+        });
+        assert_eq!(result, Err(signal::LinuxProcessShutdown::SigTerm));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content, "earlier output");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_signal_tui_inflight_shutdown_uses_existing_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .unwrap();
+        let mut session = polaris_core::session::Session::new();
+        let control = install_tui_root_control(
+            &mut session,
+            TuiRootControlArgs {
+                session_id: "signal-session",
+                turn: 1,
+                sandbox: &sandbox,
+                approval: ApprovalPolicy::OnRequest,
+                mcp_available: false,
+                tool_names: &["read".into()],
+                model: "gpt-6-astra",
+                effort: "automatic",
+            },
+        )
+        .unwrap();
+        assert!(linux_cancel_owned_children(
+            Some(signal::LinuxProcessShutdown::SigInt),
+            true,
+        ));
+        assert_eq!(control.snapshot().await.session_id, "signal-session");
+        session.finish_root_delegation_control(true).await.unwrap();
+        assert!(session.delegation_control.is_none());
+        assert!(linux_cancel_owned_children(None, false));
+        assert!(!linux_cancel_owned_children(None, true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_tui_first_signal_wins_during_cleanup() {
+        use polaris_core::session_manager::TerminalStatus;
+        use std::cell::Cell;
+
+        // The turn can finish before the signal arrives while child cleanup
+        // is still awaited. Check the latch again before persisting receipt.
+        let pending = Cell::new(None);
+        let before_cleanup = pending.get();
+        pending.set(Some(signal::LinuxProcessShutdown::SigInt));
+        assert_eq!(
+            linux_admission_status_after_cleanup(
+                TerminalStatus::Completed,
+                before_cleanup.or_else(|| pending.get()),
+            ),
+            TerminalStatus::OutcomeUnknown,
+        );
+        assert_eq!(
+            linux_admission_status_after_cleanup(TerminalStatus::Completed, None),
+            TerminalStatus::Completed,
+        );
+        assert!(!linux_turn_completed_without_shutdown(true, pending.get()));
+        assert!(linux_turn_completed_without_shutdown(true, None));
+        pending.set(None);
+        let before_capture = linux_turn_completed_without_shutdown(true, pending.get());
+        assert!(before_capture);
+        // The signal arrives while post-capture effects are classified, after
+        // an earlier clear check but before the boundary's final commit.
+        let _effect = {
+            pending.set(Some(signal::LinuxProcessShutdown::SigInt));
+            polaris_core::conversation_state::RewindEffectStatusV1::NoExternalMutation
+        };
+        assert!(!linux_turn_completed_without_shutdown(
+            before_capture,
+            pending.get(),
+        ));
+        let first = linux_signal_exit_code(signal::LinuxProcessShutdown::SigInt);
+        let (exit, error) = linux_exit_after_terminal_restoration(
+            first,
+            Ok(()),
+            Some(signal::LinuxProcessShutdown::SigTerm),
+        );
+        assert_eq!(exit, ExitCode::from(130));
+        assert!(error.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_tui_cleanup_failure_exits_one_before_signal_status() {
+        let (exit, error) = linux_exit_after_terminal_restoration(
+            linux_signal_exit_code(signal::LinuxProcessShutdown::SigTerm),
+            Err(std::io::ErrorKind::BrokenPipe.into()),
+            Some(signal::LinuxProcessShutdown::SigTerm),
+        );
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert!(error.unwrap().contains("terminal restoration failed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_tui_handled_error_restores_every_acquired_state() {
+        let mut guard = LinuxTerminalGuard {
+            alternate: true,
+            raw: true,
+            mouse: true,
+            cursor: true,
+        };
+        let mut steps = Vec::new();
+        let result: Result<(), String> =
+            linux_finish_guarded_terminal(Err("handled error".into()), &mut guard, |step| {
+                steps.push(step);
+                if step == LinuxTerminalStep::Cursor {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(())
+                }
+            });
+        let error = result.unwrap_err();
+        assert!(error.contains("handled error"));
+        assert!(error.contains("terminal restoration failed"));
+        guard
+            .restore_with(|step| {
+                steps.push(step);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            steps,
+            [
+                LinuxTerminalStep::Cursor,
+                LinuxTerminalStep::Mouse,
+                LinuxTerminalStep::Raw,
+                LinuxTerminalStep::Alternate,
+            ]
+        );
+    }
+
+
+    #[test]
+    fn decided_read_is_bounded_and_marks_old_entries_as_history() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".polaris")).unwrap();
+        polaris_core::decisions::append(root.path(), "2026-09-23", "keep the old name").unwrap();
+        let lines = decided_read_lines(root.path())
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lines.contains("keep the old name"), "{lines}");
+        assert!(lines.contains("現在の承認ではありません"), "{lines}");
+        std::fs::write(
+            root.path().join(polaris_core::decisions::PATH),
+            "x".repeat(1024 * 1024 + 1),
+        )
+        .unwrap();
+        assert!(decided_read_lines(root.path()).is_err());
+    }
+
+    #[test]
+    fn readonly_acceptance_compare_folders_and_errors_preserve_source() {
+        let root = tempfile::tempdir().unwrap();
+        let left = root.path().join("left");
+        let right = root.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        for path in [&left, &right] {
+            std::fs::write(path.join("same.txt"), "contents stay in place").unwrap();
+        }
+        let mut session = Session::default();
+        let mut status = Status::Idle;
+        let mut local_lines = Vec::new();
+        let session_path = root.path().join("session.jsonl");
+        let outcome = call(
+            slash::parse("/compare left | right").unwrap(),
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            root.path(),
+            &mut local_lines,
+        );
+        assert!(matches!(outcome, SlashOutcome::Continue));
+        assert!(matches!(status, Status::Notice(_)));
+        let lines = local_lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lines.contains("類似度"), "{lines}");
+        assert!(lines.contains("移動・削除は行いません"), "{lines}");
+        for command in [
+            "/compare left | missing".to_owned(),
+            format!("/compare {} | right", "x".repeat(2049)),
+        ] {
+            let before = local_lines.clone();
+            call(
+                slash::parse(&command).unwrap(),
+                &mut session,
+                &session_path,
+                &mut status,
+                &[],
+                root.path(),
+                &mut local_lines,
+            );
+            assert!(matches!(status, Status::Error(_)));
+            assert_eq!(local_lines, before);
+        }
+        assert!(session.messages.is_empty());
+        assert!(!session_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(left.join("same.txt")).unwrap(),
+            "contents stay in place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(right.join("same.txt")).unwrap(),
+            "contents stay in place"
+        );
+    }
+
+
+    #[test]
+    fn mcp_prompt_selection_is_typed_and_rejects_ambiguous_arguments() {
+        let choice = mcp_prompt_choice("prompt files/review path=src/lib.rs depth=2").unwrap();
+        assert_eq!(choice.server, "files");
+        assert_eq!(choice.prompt, "review");
+        assert_eq!(choice.arguments["depth"], "2");
+        assert!(mcp_prompt_choice("prompt files/review path=a path=b").is_err());
+        assert!(mcp_prompt_choice("prompt files/review path").is_err());
+        assert!(mcp_prompt_choice("prompt files/review\nsecret=x").is_err());
+    }
+
+    #[test]
+    fn mcp_prompt_selection_does_not_follow_a_different_session() {
+        let mut pending = Some(mcp_prompt_choice("prompt files/review path=src/lib.rs").unwrap());
+        let mut requires_reselect = true;
+        clear_mcp_prompt_on_session_change(
+            std::path::Path::new("/sessions/first.jsonl"),
+            std::path::Path::new("/sessions/first.jsonl"),
+            &mut pending,
+            &mut requires_reselect,
+        );
+        assert!(pending.is_some());
+        assert!(requires_reselect);
+
+        clear_mcp_prompt_on_session_change(
+            std::path::Path::new("/sessions/first.jsonl"),
+            std::path::Path::new("/sessions/second.jsonl"),
+            &mut pending,
+            &mut requires_reselect,
+        );
+        assert!(pending.is_none());
+        assert!(!requires_reselect);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_management_effect_blocks_mutating_slash_but_allows_diagnostics() {
+        use polaris_core::management_effect::{
+            ManagementEffectHashV1, ManagementEffectScopeV1, ManagementInventoryIdV1,
+            ManagementOperationIdV1, ManagementPermissionScopeV1, ManagementRewindDispositionV1,
+            PrepareManagementEffectV1,
+        };
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &state_dir.join("rewind-workspace"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let lease = owner.try_mutation().unwrap();
+        let store = polaris_core::management_effect::ManagementEffectStoreV1::open_at_state_dir(
+            &project, &state_dir, &lease,
+        )
+        .unwrap();
+        let request = PrepareManagementEffectV1 {
+            operation_id: ManagementOperationIdV1::random().unwrap(),
+            inventory: ManagementInventoryIdV1::parse("T10").unwrap(),
+            scope: ManagementEffectScopeV1 {
+                project: store.project_scope_hash(),
+                session: None,
+                generation: 0,
+                revision: 0,
+                permission: ManagementPermissionScopeV1::Project,
+                account_binding: None,
+            },
+            request_hash: ManagementEffectHashV1::digest(b"synthetic-init"),
+            rewind: ManagementRewindDispositionV1::IrreversibleLocal,
+        };
+        store
+            .prepare(&lease, store.cursor().unwrap(), request)
+            .unwrap();
+        drop(lease);
+
+        assert!(management_clearance_error(&store, &slash::Action::Init).is_some());
+        assert!(management_clearance_error(&store, &slash::Action::Status).is_none());
+        let write_root = root.path().join("write\nroot");
+        std::fs::create_dir(&write_root).unwrap();
+        let sandbox =
+            SandboxPolicy::new(polaris_sandbox::SandboxMode::WorkspaceWrite, &[write_root])
+                .unwrap();
+        let session = Session::default();
+        let lines = status_lines(StatusSnapshot {
+            session: &session,
+            provider_name: "provider\n管理操作: 未解決なし",
+            model_name: "model\tname",
+            usage_report: polaris_provider::UsageReport::default(),
+            sandbox: &sandbox,
+            approval: ApprovalPolicy::Never,
+            startup_approval: ApprovalPolicy::OnRequest,
+            mcp_external: false,
+            audit_path: None,
+            turn_authority_present: false,
+            fixed_effort: None,
+            answer_finalizer: None,
+            management_effects: &store,
+            recovery_issue: Some("復旧\n確認待ち"),
+        });
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("現在=Never, 起動時=OnRequest"), "{text}");
+        let blocked = store.blocker().unwrap().unwrap();
+        assert!(
+            text.contains(&blocked.request.operation_id.to_string()),
+            "{text}"
+        );
+        assert!(text.contains("復旧\\n確認待ち"), "{text}");
+        assert!(text.contains("provider\\n管理操作: 未解決なし"), "{text}");
+        assert!(text.contains("model\\tname"), "{text}");
+        assert!(text.contains("write\\nroot"), "{text}");
+        assert!(lines.iter().all(|line| {
+            let line = line.to_string();
+            !line.contains('\n') && !line.contains('\t')
+        }));
+        assert!(session.messages.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_rewind_store_refuses_session_start_instead_of_skipping_resume_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(state_dir.join("rewind-workspace"), "blocked").unwrap();
+        assert!(open_rewind_workspace(&project, &state_dir).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_mismatch_shows_saved_transcript_without_a_run() {
+        use polaris_core::conversation_state::HistoryMode;
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+        use polaris_core::session_store::PersistedSession;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let file = project.join("task.txt");
+        std::fs::write(&file, "original").unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &root.path().join("rewind-store"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let persistence = PersistedSession::create(
+            root.path(),
+            &root.path().join("memory.sqlite3"),
+            "project",
+            HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let mut session = polaris_core::session::Session::new();
+        session.attach(persistence.clone()).unwrap();
+        session.push_user("saved question");
+        session.push_assistant("saved answer", Vec::new());
+        session.check_persistence().unwrap();
+        validate_resume_workspace(&owner, &persistence).unwrap();
+        std::fs::write(&file, "different tree").unwrap();
+        let reason = validate_resume_workspace(&owner, &persistence).unwrap_err();
+
+        let terminal = RefCell::new(
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 18)).unwrap(),
+        );
+        let mut reader = ScriptedReader(VecDeque::from([KeyCode::Enter]));
+        show_persisted_read_only_resume(&terminal, &mut reader, &persistence, &reason).unwrap();
+        let screen = {
+            let terminal = terminal.borrow();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>()
+        };
+        assert!(screen.contains("saved question"), "{screen}");
+        assert!(screen.contains("saved answer"), "{screen}");
+        assert!(screen.replace(' ', "").contains("閲覧のみ"), "{screen}");
+        assert_eq!(persistence.snapshot().unwrap().events.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_requires_the_workspace_recorded_at_the_conversation_head() {
+        use polaris_core::conversation_state::{
+            HistoryMode, RewindEffectStatusV1, RewindEligibilityV1,
+        };
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+        use polaris_core::session_store::PersistedSession;
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let file = project.join("task.txt");
+        std::fs::write(&file, "before").unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &root.path().join("rewind-store"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let policy =
+            SandboxPolicy::new(SandboxMode::WorkspaceWrite, std::slice::from_ref(&project))
+                .unwrap();
+        let persistence = PersistedSession::create(
+            root.path(),
+            &root.path().join("memory.sqlite3"),
+            "project",
+            HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let pre = owner.capture(&policy).unwrap();
+        let boundary = persistence
+            .begin_rewind_boundary(pre.to_string(), Vec::new())
+            .unwrap();
+        let mut session = polaris_core::session::Session::new();
+        session.attach(persistence.clone()).unwrap();
+        session.push_user("edit the file");
+        session.push_assistant("done", Vec::new());
+        session.check_persistence().unwrap();
+        std::fs::write(&file, "after").unwrap();
+        let post = owner.capture(&policy).unwrap();
+        persistence
+            .finish_rewind_boundary(
+                &boundary.boundary_id,
+                post.to_string(),
+                RewindEligibilityV1::Eligible,
+                RewindEffectStatusV1::NoExternalMutation,
+            )
+            .unwrap();
+
+        assert!(validate_resume_workspace(&owner, &persistence).is_ok());
+        std::fs::write(&file, "unrelated version").unwrap();
+        assert!(validate_resume_workspace(&owner, &persistence).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_unbound_resume_binds_the_tree_and_later_unbound_resumes_refuse() {
+        use polaris_core::conversation_state::HistoryMode;
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+        use polaris_core::session_store::PersistedSession;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let file = project.join("task.txt");
+        std::fs::write(&file, "initial").unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &root.path().join("rewind-store"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let database = root.path().join("memory.sqlite3");
+        let first =
+            PersistedSession::create(root.path(), &database, "project", HistoryMode::Legacy, None)
+                .unwrap();
+        let id = first.snapshot().unwrap().state.session_id;
+        assert!(validate_resume_workspace(&owner, &first).is_ok());
+        assert!(first.store.workspace_head_binding().unwrap().is_some());
+        let reopened = PersistedSession::open(root.path(), &database, "project", &id).unwrap();
+        assert!(validate_resume_workspace(&owner, &reopened).is_ok());
+        let second =
+            PersistedSession::create(root.path(), &database, "project", HistoryMode::Legacy, None)
+                .unwrap();
+        assert!(validate_resume_workspace(&owner, &second).is_err());
+        std::fs::write(file, "changed").unwrap();
+        assert!(validate_resume_workspace(&owner, &reopened).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_first_binding_retries_with_the_current_tree() {
+        use polaris_core::conversation_state::HistoryMode;
+        use polaris_core::rewind_workspace::{ErrorKind, RewindLimits, WorkspaceOwner};
+        use polaris_core::session_store::PersistedSession;
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let file = project.join("task.txt");
+        std::fs::write(&file, "initial").unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &root.path().join("rewind-store"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[project]).unwrap();
+        let session = PersistedSession::create(
+            root.path(),
+            &root.path().join("memory.sqlite3"),
+            "project",
+            HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let id = snapshot.state.session_id.clone();
+        let interrupted = owner.bind_first_legacy_head(&policy, &id, |manifest, permit| {
+            session.store.repair_pending_workspace_head_binding(
+                &snapshot,
+                &manifest.to_string(),
+                permit,
+            )?;
+            std::fs::write(&file, "changed while binding")
+        });
+        assert_eq!(interrupted.unwrap_err().kind, ErrorKind::Conflict);
+        assert!(owner.pending_legacy_binding_for(&id).unwrap());
+        assert!(validate_resume_workspace(&owner, &session).is_ok());
+        assert!(!owner.pending_legacy_binding_for(&id).unwrap());
+        let binding = session.store.workspace_head_binding().unwrap().unwrap();
+        let manifest = binding.workspace_manifest_id.parse().unwrap();
+        assert!(owner.matches_manifest(&manifest).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_turn_rewind_restores_earlier_files_and_blocks_the_origin() {
+        use polaris_core::conversation_state::{
+            HistoryMode, RewindEffectStatusV1, RewindEligibilityV1,
+        };
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+        use polaris_core::session_store::PersistedSession;
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &root.path().join("rewind-store"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let policy =
+            SandboxPolicy::new(SandboxMode::WorkspaceWrite, std::slice::from_ref(&project))
+                .unwrap();
+        let persistence = PersistedSession::create(
+            root.path(),
+            &root.path().join("memory.sqlite3"),
+            "project",
+            HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let mut session = polaris_core::session::Session::new();
+        session.attach(persistence.clone()).unwrap();
+
+        let first_pre = owner.capture(&policy).unwrap();
+        let first = persistence
+            .begin_rewind_boundary(first_pre.to_string(), Vec::new())
+            .unwrap();
+        session.push_user("create a file");
+        std::fs::write(project.join("task.txt"), "first").unwrap();
+        session.push_assistant("created", Vec::new());
+        session.check_persistence().unwrap();
+        let first_post = owner.capture(&policy).unwrap();
+        persistence
+            .finish_rewind_boundary(
+                &first.boundary_id,
+                first_post.to_string(),
+                RewindEligibilityV1::Eligible,
+                RewindEffectStatusV1::NoExternalMutation,
+            )
+            .unwrap();
+
+        let second_pre = owner.capture(&policy).unwrap();
+        let second = persistence
+            .begin_rewind_boundary(second_pre.to_string(), Vec::new())
+            .unwrap();
+        session.push_user("change the file");
+        std::fs::write(project.join("task.txt"), "second").unwrap();
+        std::fs::create_dir(project.join("new-dir")).unwrap();
+        std::fs::write(project.join("new-dir/extra.txt"), "later").unwrap();
+        session.push_assistant("changed", Vec::new());
+        session.check_persistence().unwrap();
+        let second_post = owner.capture(&policy).unwrap();
+        persistence
+            .finish_rewind_boundary(
+                &second.boundary_id,
+                second_post.to_string(),
+                RewindEligibilityV1::Eligible,
+                RewindEffectStatusV1::NoExternalMutation,
+            )
+            .unwrap();
+
+        let initial_branch = persistence
+            .prepare_rewind_branch(&owner, &first.boundary_id)
+            .unwrap();
+        assert!(
+            !initial_branch
+                .snapshot()
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.message.content == "create a file")
+        );
+
+        let branch = persistence
+            .prepare_rewind_branch(&owner, &second.boundary_id)
+            .unwrap();
+        let branch_snapshot = branch.snapshot().unwrap();
+        assert!(
+            branch_snapshot
+                .events
+                .iter()
+                .any(|event| event.message.content == "created")
+        );
+        assert!(
+            !branch_snapshot
+                .events
+                .iter()
+                .any(|event| event.message.content == "change the file")
+        );
+        let restored = owner
+            .restore_for_branch(&second_post, &second_pre, &branch_snapshot.state.session_id)
+            .unwrap();
+        owner.commit(&restored.transaction_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.join("task.txt")).unwrap(),
+            "first"
+        );
+        assert!(!project.join("new-dir").exists());
+        assert!(
+            validate_resume_workspace(&owner, &branch).is_ok(),
+            "{:?}",
+            validate_resume_workspace(&owner, &branch)
+        );
+        assert!(validate_resume_workspace(&owner, &persistence).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restarted_branch_preserves_workflow_state_without_copying_old_sidechat() {
+        use polaris_core::conversation_state::{
+            HistoryMode, RewindEffectStatusV1, RewindEligibilityV1,
+        };
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+        use polaris_core::session_manager::{
+            DestinationMode, SessionId, SubmissionPayloadV1, SubmitOutcomeV1, SubmitRequestV1,
+        };
+        use polaris_core::session_store::PersistedSession;
+        use polaris_core::workflow::Phase;
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&project).unwrap();
+        let file = project.join("task.txt");
+        std::fs::write(&file, "before").unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &root.path().join("rewind-store"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[project]).unwrap();
+        let database = root.path().join("memory.sqlite3");
+        let source =
+            PersistedSession::create(root.path(), &database, "project", HistoryMode::Legacy, None)
+                .unwrap();
+        let root_snapshot = source.snapshot().unwrap();
+        let root_id = SessionId::new(root_snapshot.state.session_id.clone()).unwrap();
+        let receipt_counts = std::collections::BTreeMap::from([(
+            root_id.clone(),
+            root_snapshot.state.admission_receipts.len(),
+        )]);
+        let (store, initial_manager) = open_tui_admission_owner(&state_dir, &root_id).unwrap();
+        let mut old_manager = initial_manager.clone();
+        let before = old_manager.revision;
+        let SubmitOutcomeV1::Accepted { admission, .. } = old_manager
+            .submit(
+                SubmitRequestV1 {
+                    parent_session: root_id.clone(),
+                    payload: SubmissionPayloadV1 {
+                        text: "unrelated side work".into(),
+                        attachment_ids: Vec::new(),
+                        route: DestinationMode::New,
+                        expected_session_revision: 0,
+                        expected_goal_revision: 0,
+                    },
+                    admission_id: None,
+                },
+                old_manager.revision,
+            )
+            .unwrap();
+        store
+            .persist_submission(before, &old_manager, &receipt_counts)
+            .unwrap();
+        let before = old_manager.revision;
+        let decided = old_manager
+            .decide(
+                &admission.id,
+                old_manager.revision,
+                admission.revision,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        persist_manager_transition(&store, before, &old_manager).unwrap();
+        let before = old_manager.revision;
+        old_manager
+            .prepare_destination(&decided.id, before, decided.revision)
+            .unwrap();
+        persist_manager_transition(&store, before, &old_manager).unwrap();
+        assert_eq!(old_manager.sessions.len(), 2);
+        drop(store);
+
+        let mut session = polaris_core::session::Session::new();
+        session.attach(source.clone()).unwrap();
+        session.push_user("previous turn");
+        session.push_assistant("previous answer", Vec::new());
+        session.check_persistence().unwrap();
+        let mut lock = source.store.lock().unwrap();
+        let snapshot = lock.snapshot().unwrap();
+        let mut state = snapshot.state.clone();
+        state.workflow.phase = Phase::Review;
+        state.workflow.revision = 1;
+        state.workflow_artifacts.revision = 1;
+        lock.publish(&snapshot, state).unwrap();
+        drop(lock);
+        drop(session);
+        let source =
+            PersistedSession::open(root.path(), &database, "project", root_id.as_str()).unwrap();
+        let mut session = polaris_core::session::Session::new();
+        session.attach(source.clone()).unwrap();
+
+        let pre = owner.capture(&policy).unwrap();
+        let boundary = source
+            .begin_rewind_boundary(pre.to_string(), Vec::new())
+            .unwrap();
+        session.push_user("later turn");
+        session.push_assistant("later answer", Vec::new());
+        session.check_persistence().unwrap();
+        std::fs::write(&file, "after").unwrap();
+        let post = owner.capture(&policy).unwrap();
+        source
+            .finish_rewind_boundary(
+                &boundary.boundary_id,
+                post.to_string(),
+                RewindEligibilityV1::Eligible,
+                RewindEffectStatusV1::NoExternalMutation,
+            )
+            .unwrap();
+        let branch = source
+            .prepare_rewind_branch(&owner, &boundary.boundary_id)
+            .unwrap();
+        let branch_id = branch.snapshot().unwrap().state.session_id;
+        let restored = owner.restore_for_branch(&post, &pre, &branch_id).unwrap();
+        owner.commit(&restored.transaction_id).unwrap();
+
+        let restarted =
+            PersistedSession::open(root.path(), &database, "project", &branch_id).unwrap();
+        validate_resume_workspace(&owner, &restarted).unwrap();
+        let branch_snapshot = restarted.snapshot().unwrap();
+        assert_eq!(branch_snapshot.state.workflow.phase, Phase::Review);
+        assert_eq!(branch_snapshot.state.workflow_artifacts.revision, 1);
+        assert_eq!(branch_snapshot.events.len(), 2);
+        let branch_session_id = SessionId::new(branch_id).unwrap();
+        let (new_store, new_manager) =
+            open_tui_admission_owner(&state_dir, &branch_session_id).unwrap();
+        assert_eq!(new_manager.sessions.len(), 1);
+        assert!(new_manager.sessions.contains_key(&branch_session_id));
+        drop(new_store);
+        let (_old_store, retained_old_manager) =
+            open_tui_admission_owner(&state_dir, &root_id).unwrap();
+        assert_eq!(retained_old_manager.sessions.len(), 2);
+    }
+
     struct DistinctContextJudge;
+
+    #[cfg(unix)]
+    fn prompt_fixture_host(
+        project: &Path,
+        home: &Path,
+        mut server: polaris_mcp::registration::Server,
+    ) -> polaris_core::mcp::local::LocalHost {
+        use polaris_mcp::registration::Registry;
+
+        let host = polaris_core::mcp::local::LocalHost::open_for_test(project, home, true).unwrap();
+        server.enabled_projects = [host.project().to_owned()].into_iter().collect();
+        host.store()
+            .unwrap()
+            .save_registry(
+                0,
+                &Registry {
+                    schema_version: 1,
+                    revision: 1,
+                    servers: vec![server],
+                },
+            )
+            .unwrap();
+        host
+    }
 
     #[async_trait::async_trait]
     impl polaris_provider::decision::Decider for DistinctContextJudge {
@@ -4862,6 +11116,325 @@ mod tests {
                 output_tokens: Some(1),
             })
         }
+    }
+
+    #[cfg(unix)]
+    fn mcp_prompt_child_gate(exact_test_name: &str, sentinel: &str) -> bool {
+        const MARKER: &str = "POLARIS_TUI_MCP_PROMPT_CHILD";
+        if let Some(value) = std::env::var_os(MARKER) {
+            assert!(
+                value == std::ffi::OsString::from(exact_test_name),
+                "unexpected MCP prompt child marker"
+            );
+            return false;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(exact_test_name)
+            .arg("--nocapture")
+            .env(MARKER, exact_test_name)
+            .env_remove("POLARIS_DATA_DIR")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(sentinel),
+            "MCP prompt child {exact_test_name} failed: status={:?} stdout={stdout} stderr={stderr}",
+            output.status
+        );
+        true
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_mcp_prompt_and_input_survive_sidechat_restart_together() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            mcp::{operation::ExternalCeiling, runtime::McpPromptChoice},
+            session_manager::{AdmissionState, SessionId, TerminalStatus},
+            session_store::PersistedSession,
+        };
+
+        if mcp_prompt_child_gate(
+            "tests::selected_mcp_prompt_and_input_survive_sidechat_restart_together",
+            "POLARIS_TUI_SELECTED_MCP_PROMPT_CHILD_COMPLETE",
+        ) {
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        let sessions_dir = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let database = root.path().join("memory.sqlite3");
+        let parent =
+            PersistedSession::create(root.path(), &database, "project", HistoryMode::Legacy, None)
+                .unwrap();
+        let parent_id = parent.snapshot().unwrap().state.session_id;
+        let mut session = polaris_core::session::Session::new();
+        session.attach(parent.clone()).unwrap();
+        let mut session_path = sessions_dir.join(format!("{parent_id}.jsonl"));
+        let mut meta_path = session_path.with_extension("meta.json");
+        let mut started = 1;
+        let mut local_lines = Vec::new();
+
+        let (server, methods, fixture) = polaris_mcp::test_support::server_fixture("").await;
+        let host = prompt_fixture_host(root.path(), home.path(), server);
+        let choice = McpPromptChoice {
+            server: "fixture".into(),
+            prompt: "prompt".into(),
+            arguments: Default::default(),
+        };
+        let (turn, _, _, selected_runtime) = admit_tui_input(
+            &mut session,
+            "original input",
+            Some(&DistinctContextJudge),
+            &state_dir,
+            &sessions_dir,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut local_lines,
+            None,
+            None,
+            false,
+            root.path(),
+            true,
+            Some(TuiPromptRequest {
+                host: &host,
+                choice: &choice,
+                selector: None,
+                ceiling: ExternalCeiling::Denied,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(selected_runtime.is_some());
+        assert!(matches!(
+            turn.manager.status(&turn.admission_id).unwrap().state,
+            AdmissionState::Running { .. }
+        ));
+        let sidechat = session.persistence.as_ref().unwrap().snapshot().unwrap();
+        assert_ne!(sidechat.state.session_id, parent_id);
+        assert!(parent.snapshot().unwrap().events.is_empty());
+        assert_eq!(sidechat.events.len(), 2);
+        assert_eq!(sidechat.events[0].message.content, "original input");
+        assert!(sidechat.events[0].starts_turn);
+        assert!(
+            sidechat.events[1]
+                .message
+                .content
+                .contains("selected prompt")
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(&sidechat.events[1].message.content).unwrap();
+        let expected_run = polaris_core::session_manager::RunId::derive(&turn.admission_id);
+        assert_eq!(
+            envelope["intent"]["session"].as_str(),
+            Some(sidechat.state.session_id.as_str())
+        );
+        assert_eq!(
+            envelope["intent"]["run"].as_str(),
+            Some(expected_run.as_str())
+        );
+        assert_eq!(
+            envelope["intent"]["binding"]["item"]["server_id"],
+            "fixture"
+        );
+        assert_eq!(envelope["intent"]["binding"]["item"]["key"], "prompt");
+        assert_eq!(envelope["disposition"], "completed");
+        assert!(!sidechat.events[1].starts_turn);
+        assert_eq!(sidechat.events[0].turn_id, sidechat.events[1].turn_id);
+        assert!(
+            sidechat
+                .state
+                .admission_receipts
+                .contains_key(turn.admission_id.as_str())
+        );
+        assert_eq!(
+            methods
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| *method == "prompts/get")
+                .count(),
+            1
+        );
+
+        let admission_id = turn.admission_id.clone();
+        let sidechat_id = SessionId::new(sidechat.state.session_id.clone()).unwrap();
+        drop(turn);
+        let (store, mut manager) = open_tui_admission_owner(&state_dir, &sidechat_id).unwrap();
+        recover_admission_owner(&store, &mut manager, root.path(), &database, "project").unwrap();
+        assert!(matches!(
+            manager.status(&admission_id).unwrap().state,
+            AdmissionState::Terminal {
+                status: TerminalStatus::OutcomeUnknown,
+                ..
+            }
+        ));
+        assert_eq!(
+            session
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+        drop(store);
+        let retry = admit_tui_input(
+            &mut session,
+            "must be blocked",
+            None,
+            &state_dir,
+            &sessions_dir,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut local_lines,
+            None,
+            None,
+            false,
+            root.path(),
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(retry, Err(TuiAdmissionFailure::Retryable(_))));
+        assert_eq!(
+            session
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+        if let Some(mut runtime) = selected_runtime {
+            runtime.shutdown().await.unwrap();
+        }
+        fixture.abort();
+        println!("POLARIS_TUI_SELECTED_MCP_PROMPT_CHILD_COMPLETE");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_or_timed_out_mcp_prompt_does_not_commit_tui_input() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            mcp::{operation::ExternalCeiling, runtime::McpPromptChoice},
+            session_manager::{AdmissionState, SessionId, TerminalStatus},
+            session_store::PersistedSession,
+        };
+
+        if mcp_prompt_child_gate(
+            "tests::failed_or_timed_out_mcp_prompt_does_not_commit_tui_input",
+            "POLARIS_TUI_FAILED_MCP_PROMPT_CHILD_COMPLETE",
+        ) {
+            return;
+        }
+
+        for delay in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let state_dir = root.path().join("state");
+            let sessions_dir = root.path().join("sessions");
+            std::fs::create_dir_all(&sessions_dir).unwrap();
+            let database = root.path().join("memory.sqlite3");
+            let parent = PersistedSession::create(
+                root.path(),
+                &database,
+                "project",
+                HistoryMode::Legacy,
+                None,
+            )
+            .unwrap();
+            let parent_id = parent.snapshot().unwrap().state.session_id;
+            let mut session = polaris_core::session::Session::new();
+            session.attach(parent.clone()).unwrap();
+            let mut session_path = sessions_dir.join(format!("{parent_id}.jsonl"));
+            let mut meta_path = session_path.with_extension("meta.json");
+            let mut started = 1;
+            let mut local_lines = Vec::new();
+            let (server, methods, fixture) = if delay {
+                polaris_mcp::test_support::server_fixture("prompts/get").await
+            } else {
+                polaris_mcp::test_support::server_fixture_with_failures(
+                    "",
+                    serde_json::json!({}),
+                    serde_json::json!([]),
+                    "prompts/get",
+                    vec![500; 10],
+                )
+                .await
+            };
+            let host = prompt_fixture_host(root.path(), home.path(), server);
+            let choice = McpPromptChoice {
+                server: "fixture".into(),
+                prompt: "prompt".into(),
+                arguments: Default::default(),
+            };
+            let result = admit_tui_input(
+                &mut session,
+                "uncommitted input",
+                Some(&DistinctContextJudge),
+                &state_dir,
+                &sessions_dir,
+                &mut session_path,
+                &mut meta_path,
+                &mut started,
+                &mut local_lines,
+                None,
+                None,
+                false,
+                root.path(),
+                true,
+                Some(TuiPromptRequest {
+                    host: &host,
+                    choice: &choice,
+                    selector: None,
+                    ceiling: ExternalCeiling::Denied,
+                }),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(TuiAdmissionFailure::PromptFailed { unknown: true, .. })
+            ));
+            assert!(
+                methods
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|method| method == "prompts/get")
+            );
+            assert!(parent.snapshot().unwrap().events.is_empty());
+            let current = SessionId::new(parent_id).unwrap();
+            let (_store, manager) = open_tui_admission_owner(&state_dir, &current).unwrap();
+            assert_eq!(manager.sessions.len(), 1);
+            assert!(manager.queue.is_empty());
+            assert_eq!(manager.admissions.len(), 1);
+            assert!(manager.admissions.values().all(|admission| matches!(
+                admission.state,
+                AdmissionState::Terminal {
+                    status: TerminalStatus::OutcomeUnknown,
+                    ..
+                }
+            )));
+            fixture.abort();
+        }
+        println!("POLARIS_TUI_FAILED_MCP_PROMPT_CHILD_COMPLETE");
     }
 
     #[cfg(unix)]
@@ -4897,7 +11470,7 @@ mod tests {
         let mut started = 1;
         let mut local_lines = Vec::new();
 
-        let (turn, notice) = admit_tui_input(
+        let (turn, notice, rewind_boundary, selected_runtime) = admit_tui_input(
             &mut session,
             "unrelated isolated task",
             Some(&DistinctContextJudge),
@@ -4908,9 +11481,16 @@ mod tests {
             &mut started,
             &mut local_lines,
             None,
+            None,
+            false,
+            root.path(),
+            true,
+            None,
         )
         .await
         .unwrap();
+        assert!(selected_runtime.is_none());
+        assert!(rewind_boundary.is_none());
         let admission_id = turn.admission_id.clone();
         let sidechat = session.persistence.as_ref().unwrap().snapshot().unwrap();
         assert_ne!(sidechat.state.session_id, parent_id);
@@ -4921,6 +11501,10 @@ mod tests {
         );
         assert_eq!(parent.snapshot().unwrap().events.len(), 0);
         assert_eq!(turn.manager.sessions.len(), 2);
+        assert_eq!(
+            turn.run_id().unwrap(),
+            polaris_core::session_manager::RunId::derive(&admission_id).as_str()
+        );
         assert!(notice.unwrap().contains("running"));
         turn.finish(TerminalStatus::Completed).unwrap();
 
@@ -4934,11 +11518,161 @@ mod tests {
                 ..
             }
         ));
+        drop(_store);
+
+        fn admission_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut files = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    files.insert(path.clone(), None);
+                    files.extend(admission_files(&path));
+                } else {
+                    files.insert(path.clone(), Some(std::fs::read(&path).unwrap()));
+                }
+            }
+            files
+        }
+        let admissions_root = state_dir.join("tui-admissions-v1");
+        let before_status = admission_files(&admissions_root);
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
+        let activity = AgentActivityRows::default();
+        let mut max_turns = 1;
+        let command = format!("input status {}", admission_id.as_str());
+        let lines = handle_runtime_command(
+            &command,
+            None,
+            session.persistence.as_ref(),
+            &state_dir,
+            &[],
+            &sandbox,
+            ApprovalPolicy::Never,
+            &mut max_turns,
+            1,
+            &activity,
+        )
+        .await
+        .unwrap();
+        assert!(lines[0].contains(admission_id.as_str()));
+        assert!(lines[0].contains("Completed"));
+        let unrelated =
+            PersistedSession::create(root.path(), &database, "project", HistoryMode::Legacy, None)
+                .unwrap();
+        assert!(
+            handle_runtime_command(
+                &command,
+                None,
+                Some(&unrelated),
+                &state_dir,
+                &[],
+                &sandbox,
+                ApprovalPolicy::Never,
+                &mut max_turns,
+                1,
+                &activity,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(admission_files(&admissions_root), before_status);
+        let index = admissions_root.join("family-index.v1.json");
+        let original_index = std::fs::read(&index).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 + 1)
+            .unwrap();
+        let oversized = admission_files(&admissions_root);
+        assert!(
+            handle_runtime_command(
+                &command,
+                None,
+                session.persistence.as_ref(),
+                &state_dir,
+                &[],
+                &sandbox,
+                ApprovalPolicy::Never,
+                &mut max_turns,
+                1,
+                &activity,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(admission_files(&admissions_root), oversized);
+        std::fs::write(&index, original_index).unwrap();
+
+        let denied = admit_tui_input(
+            &mut session,
+            "another isolated task",
+            Some(&DistinctContextJudge),
+            &state_dir,
+            &sessions_dir,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut local_lines,
+            None,
+            None,
+            false,
+            root.path(),
+            true,
+            None,
+        )
+        .await;
+        assert!(matches!(denied, Err(TuiAdmissionFailure::Retryable(_))));
+        let (blocked_store, blocked_manager) =
+            open_tui_admission_owner(&state_dir, &current).unwrap();
+        assert!(blocked_manager.queue.is_empty());
+        assert!(
+            blocked_manager
+                .admissions
+                .values()
+                .all(|admission| matches!(admission.state, AdmissionState::Terminal { .. }))
+        );
+        drop(blocked_store);
+
+        let (next, notice, _, runtime) = admit_tui_input(
+            &mut session,
+            "follow-up in this lane",
+            None,
+            &state_dir,
+            &sessions_dir,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut local_lines,
+            None,
+            None,
+            false,
+            root.path(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(notice.is_none());
+        assert!(runtime.is_none());
+        assert_eq!(next.manager.sessions.len(), 2);
+        assert_eq!(
+            session
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+        assert_ne!(next.admission_id, admission_id);
+        next.finish(TerminalStatus::Completed).unwrap();
     }
 
     #[cfg(unix)]
-    #[test]
-    fn recovery_proves_a_committed_input_before_cancelling_an_unstarted_run() {
+    #[tokio::test]
+    async fn recovery_blocks_a_new_turn_after_an_unstarted_committed_input() {
         use polaris_core::{
             conversation_state::HistoryMode,
             session_manager::{
@@ -4956,6 +11690,10 @@ mod tests {
                 .unwrap();
         let parent_id = parent.snapshot().unwrap().state.session_id;
         let current = SessionId::new(parent_id).unwrap();
+        let receipt_counts = std::collections::BTreeMap::from([(
+            current.clone(),
+            parent.snapshot().unwrap().state.admission_receipts.len(),
+        )]);
         let (store, mut manager) = open_tui_admission_owner(&state_dir, &current).unwrap();
         let before = manager.revision;
         let SubmitOutcomeV1::Accepted { admission, .. } = manager
@@ -4974,7 +11712,9 @@ mod tests {
                 before,
             )
             .unwrap();
-        persist_manager_transition(&store, before, &manager).unwrap();
+        store
+            .persist_submission(before, &manager, &receipt_counts)
+            .unwrap();
         let before = manager.revision;
         let decided = manager
             .decide(
@@ -5004,15 +11744,59 @@ mod tests {
                 .unwrap()
         );
 
-        recover_tui_admission_owner(&store, &mut manager, root.path(), &database, "project")
-            .unwrap();
+        recover_admission_owner(&store, &mut manager, root.path(), &database, "project").unwrap();
         assert!(matches!(
             manager.status(&admission.id).unwrap().state,
             AdmissionState::Terminal {
-                status: TerminalStatus::Cancelled,
+                status: TerminalStatus::OutcomeUnknown,
                 ..
             }
         ));
+        assert_eq!(
+            sidechat
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        drop(store);
+        let sessions_dir = root.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let session_id = sidechat
+            .persistence
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .state
+            .session_id;
+        let mut session_path = sessions_dir.join(format!("{session_id}.jsonl"));
+        let mut meta_path = session_path.with_extension("meta.json");
+        let mut started = 1;
+        let mut local_lines = Vec::new();
+        let result = admit_tui_input(
+            &mut sidechat,
+            "new input",
+            None,
+            &state_dir,
+            &sessions_dir,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut local_lines,
+            None,
+            None,
+            false,
+            root.path(),
+            true,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(TuiAdmissionFailure::Retryable(_))));
         assert_eq!(
             sidechat
                 .persistence
@@ -5112,23 +11896,34 @@ mod tests {
             },
         )
         .unwrap();
-        let owner = polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner::open_configured(
-            root.path().join("shadow.json"),
-            PresentationConfig {
-                language: PresentationLanguage::Ja,
-            },
-            AnswerFinalizerConfig {
-                mode: AnswerFinalizerMode::Shadow,
-                judge_profile: Some(JudgeProfile::FulfillmentV1),
-                ..Default::default()
-            },
-            None,
-            None,
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        let mut owner =
+            polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner::open_configured(
+                root.path().join("shadow.json"),
+                PresentationConfig {
+                    language: PresentationLanguage::Ja,
+                },
+                AnswerFinalizerConfig {
+                    mode: AnswerFinalizerMode::Shadow,
+                    judge_profile: Some(JudgeProfile::FulfillmentV1),
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
 
+        // Installation evidence does not make an absent runtime available.
+        Arc::get_mut(&mut owner)
+            .unwrap()
+            .record_translation_installation(Some(true));
+        let diagnostic = cat_diagnostic_lines(Some(&owner));
+        assert!(
+            diagnostic[0]
+                .to_string()
+                .contains("installed=導入確認; verified=false; observed=0")
+        );
         assert!(schedule_tui_shadow(&owner, &session, "answer this", &control).unwrap());
         assert_eq!(owner.records().unwrap().len(), 1);
     }
@@ -5148,6 +11943,178 @@ mod tests {
         assert!(!confirmation.press());
         confirmation.cancel();
         assert!(!confirmation.press());
+    }
+
+    #[test]
+    fn queued_quit_refusal_restores_the_displaced_draft_and_keeps_later_input() {
+        let queued = VecDeque::from(["send this next".to_string()]);
+        let mut input_history = input::History::new();
+        let mut input = String::new();
+        let mut cursor = 0;
+        let mut status = Status::Idle;
+
+        assert!(refuse_quit_with_pending_work(
+            &queued,
+            &mut input_history,
+            &mut input,
+            &mut cursor,
+            Some(("draft work".to_string(), 5)),
+            "/quit",
+            true,
+            &mut status,
+        ));
+        assert_eq!(input, "draft work");
+        assert_eq!(cursor, 5);
+        assert_eq!(queued.front().map(String::as_str), Some("send this next"));
+        assert!(matches!(status, Status::Notice(_)));
+    }
+
+    #[test]
+    fn typed_quit_refusal_keeps_the_command_when_work_is_queued() {
+        let queued = VecDeque::from(["send this next".to_string()]);
+        let mut input_history = input::History::new();
+        let mut input = String::new();
+        let mut cursor = 0;
+        let mut status = Status::Idle;
+
+        assert!(refuse_quit_with_pending_work(
+            &queued,
+            &mut input_history,
+            &mut input,
+            &mut cursor,
+            None,
+            "/quit",
+            false,
+            &mut status,
+        ));
+        assert_eq!(input, "/quit");
+        assert_eq!(cursor, input.len());
+        assert_eq!(queued.front().map(String::as_str), Some("send this next"));
+    }
+
+    #[test]
+    fn quit_is_allowed_only_after_the_queue_and_draft_are_empty() {
+        let queued = VecDeque::new();
+        let mut input_history = input::History::new();
+        let mut input = "unsent draft".to_string();
+        let mut cursor = input.len();
+        let mut status = Status::Idle;
+        assert!(refuse_quit_with_pending_work(
+            &queued,
+            &mut input_history,
+            &mut input,
+            &mut cursor,
+            None,
+            "/quit",
+            true,
+            &mut status,
+        ));
+        assert_eq!(input, "unsent draft");
+
+        input.clear();
+        cursor = 0;
+        status = Status::Idle;
+        assert!(!refuse_quit_with_pending_work(
+            &queued,
+            &mut input_history,
+            &mut input,
+            &mut cursor,
+            None,
+            "/quit",
+            false,
+            &mut status,
+        ));
+        assert!(matches!(status, Status::Idle));
+    }
+
+    #[test]
+    fn quit_submission_does_not_release_a_paused_queue() {
+        assert!(!submission_resumes_queued_inputs("/quit"));
+        assert!(!submission_resumes_queued_inputs("/quit ignored"));
+        assert!(!submission_resumes_queued_inputs("/exit"));
+        assert!(!submission_resumes_queued_inputs("/q"));
+        assert!(!submission_resumes_queued_inputs("/new"));
+        assert!(submission_resumes_queued_inputs("continue this work"));
+    }
+
+    #[test]
+    fn popup_quit_refuses_a_draft_hidden_by_input_history() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut input_history = input::History::new();
+        input_history.record("previous input");
+        let mut input_buffer = "unsent α".to_string();
+        assert_eq!(input_history.older(&input_buffer), Some("previous input"));
+        input_buffer = "/q".to_string();
+        let mut input_cursor = input_buffer.len();
+        let queued = VecDeque::new();
+        let mut status = Status::Idle;
+        let suggestions = slash::matching(input_buffer.trim_start_matches('/'));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(enter.code, KeyCode::Enter);
+        assert_eq!(suggestions[0].name, "quit");
+        assert!(matches!(
+            slash::action_for(suggestions[0].name),
+            slash::Action::Quit
+        ));
+        let submitted = std::mem::take(&mut input_buffer);
+        assert_eq!(input_cursor, 2);
+        input_cursor = 0;
+
+        assert!(refuse_quit_with_pending_work(
+            &queued,
+            &mut input_history,
+            &mut input_buffer,
+            &mut input_cursor,
+            None,
+            &submitted,
+            false,
+            &mut status,
+        ));
+        assert_eq!(input_buffer, "unsent α");
+        assert_eq!(input_cursor, input_buffer.len());
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn typed_quit_refuses_a_draft_hidden_by_input_history() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut input_history = input::History::new();
+        input_history.record("previous input");
+        let mut input_buffer = "unsent α".to_string();
+        assert_eq!(input_history.older(&input_buffer), Some("previous input"));
+        input_buffer = "/exit".to_string();
+        let mut input_cursor = input_buffer.len();
+        let queued = VecDeque::new();
+        let mut status = Status::Idle;
+        assert!(slash::matching("exit").is_empty());
+        let InputAction::Submit(submitted) = apply_key(
+            &mut input_buffer,
+            &mut input_cursor,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ) else {
+            panic!("Enter should submit /exit");
+        };
+        record_submission_before_dispatch(&mut input_history, &submitted, false);
+        assert!(matches!(
+            slash::parse(&submitted),
+            Some(slash::Action::Quit)
+        ));
+
+        assert!(refuse_quit_with_pending_work(
+            &queued,
+            &mut input_history,
+            &mut input_buffer,
+            &mut input_cursor,
+            None,
+            &submitted,
+            false,
+            &mut status,
+        ));
+        assert_eq!(input_buffer, "unsent α");
+        assert_eq!(input_cursor, input_buffer.len());
+        assert!(queued.is_empty());
     }
 
     #[test]
@@ -5445,6 +12412,7 @@ mod tests {
         assert!(queued.is_empty());
         assert!(history.older("").is_none());
     }
+
     #[test]
     fn inline_secret_value_is_redacted_before_idle_draw() {
         let mut buffer = "/mcp secret set TOKEN".to_string();
@@ -5468,6 +12436,7 @@ mod tests {
         ));
         assert_eq!(secret_set_has_value("/mcp secret setup TOKEN"), None);
     }
+
     struct Summarizer;
 
     #[async_trait::async_trait]
@@ -5482,6 +12451,62 @@ mod tests {
             })
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn m3e_run_tool_details_use_observed_events_and_keep_unfinished_unknown() {
+        let mut activity = AgentActivityRows::default();
+        activity.observe_tool(&polaris_core::AgentEvent::ToolStarted {
+            name: "read".into(),
+            detail: "one".into(),
+        });
+        assert!(activity.tool_detail_lines()[0].contains("完了未確認"));
+        activity.observe_tool(&polaris_core::AgentEvent::ToolFinished {
+            name: "read".into(),
+            detail: "one".into(),
+            ok: false,
+            result: "private body".into(),
+            diff: None,
+        });
+        assert!(activity.tool_detail_lines()[0].contains("失敗を観測"));
+        assert!(!activity.tool_detail_lines()[0].contains("private body"));
+        for n in 0..130 {
+            activity.observe_tool(&polaris_core::AgentEvent::ToolStarted {
+                name: format!("tool-{n}"),
+                detail: "x".into(),
+            });
+        }
+        assert_eq!(activity.tools.len(), 128);
+        assert!(
+            activity
+                .tool_detail_lines()
+                .iter()
+                .all(|line| line.contains("完了未確認"))
+        );
+        let mut history = Vec::new();
+        let mut cache = render::HistoryWrapCache::default();
+        let mut scroll = 1;
+        let mut selection = None;
+        reset_conversation_view(
+            &mut history,
+            &mut cache,
+            &mut activity,
+            &mut scroll,
+            &mut selection,
+            &render::HeaderInfo {
+                provider_name: "test",
+                model_name: "test",
+                usage: Default::default(),
+                cwd: "test",
+                cwd_short: "test",
+                effort_name: "auto",
+            },
+            80,
+        );
+        assert!(activity.tools.is_empty());
+        assert!(activity.tool_detail_lines()[0].contains("観測されていません"));
+    }
+
 
     #[tokio::test]
     async fn handle_compact_compacts_and_persists_when_there_is_something_to_compact() {
@@ -5610,6 +12635,40 @@ mod tests {
     impl KeyReader for ScriptedReader {
         fn read_key(&mut self) -> std::io::Result<KeyCode> {
             Ok(self.0.pop_front().unwrap_or(KeyCode::Null))
+        }
+    }
+
+
+
+
+    #[test]
+    fn workflow_confirmation_shows_exact_session_and_requires_y() {
+        let terminal = RefCell::new(
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16)).unwrap(),
+        );
+        let view = render::WorkflowChangeConfirmView {
+            inventory: "T03",
+            project_id: "project-1",
+            session_id: "session-2",
+            generation: 7,
+            before_phase: "specify",
+            after_phase: "implement",
+            before_mode: "manual",
+            after_mode: "manual",
+        };
+        let mut declined = ScriptedReader(VecDeque::from([KeyCode::Esc]));
+        assert!(!confirm_workflow_change(&terminal, &mut declined, &view));
+        let mut accepted = ScriptedReader(VecDeque::from([KeyCode::Char('y')]));
+        assert!(confirm_workflow_change(&terminal, &mut accepted, &view));
+        let screen = {
+            let terminal = terminal.borrow();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>()
+        };
+        for expected in ["T03", "project-1", "session-2", "7", "specify", "implement"] {
+            assert!(screen.contains(expected), "missing {expected}: {screen}");
         }
     }
 
@@ -6307,6 +13366,9 @@ mod tests {
             polaris_provider::UsageReport::default(),
             skills,
             cwd,
+            cwd,
+            cwd,
+            false,
             local_lines,
         )
     }
@@ -6618,6 +13680,10 @@ mod tests {
                 continuation: None,
                 workflow_mode_overridden: false,
                 skills: &[],
+                #[cfg(unix)]
+                management_effects: None,
+                #[cfg(unix)]
+                project_mutation: None,
             })
             .await
             .unwrap();
@@ -6635,6 +13701,393 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_new_creates_a_separate_family_and_preserves_a_denied_draft() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            desktop_store::SessionManagerStore,
+            management_effect::{ManagementEffectStateV1, ManagementEffectStoreV1},
+            rewind_workspace::{RewindLimits, WorkspaceOwner},
+            session_manager::SessionId,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state_dir = root.path().join("state");
+        let sessions_dir = root.path().join("data/sessions");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &state_dir.join("rewind-workspace"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let effects = {
+            let lease = owner.try_mutation().unwrap();
+            ManagementEffectStoreV1::open_at_state_dir(&project, &state_dir, &lease).unwrap()
+        };
+        let config = polaris_core::config::Config::default();
+        let mut workflow = config.workflow.clone();
+        workflow.enabled = false;
+        let mut session = new_workflow_session(WorkflowSessionArgs {
+            config: &workflow,
+            initial_phase: None,
+            approval_auto: config.approval_auto,
+            history_mode: HistoryMode::Legacy,
+            input_preparation: config.input_preparation,
+            cwd: &project,
+            state_dir: &state_dir,
+            sessions_dir: &sessions_dir,
+            strict_history: None,
+            summary_usage: None,
+            history_backend_factory: None,
+            files_md_auto_regenerate: config.files_md_auto_regenerate,
+            continuation: None,
+            workflow_mode_overridden: false,
+            skills: &[],
+            management_effects: Some(&effects),
+            project_mutation: Some(&owner),
+        })
+        .await
+        .unwrap();
+        assert!(session.workflow.is_none());
+        let saved = session.persistence.as_ref().unwrap().snapshot().unwrap();
+        assert_eq!(saved.state.history_mode, HistoryMode::Legacy);
+        let child = SessionId::new(saved.state.session_id.clone()).unwrap();
+        let (source_store, family) =
+            SessionManagerStore::open_family_owned(&state_dir.join("tui-admissions-v1"), &child)
+                .unwrap();
+        assert!(family.sessions.contains_key(&child));
+        drop(source_store);
+        assert!(effects.blocker().unwrap().is_none());
+        assert!(effects.effects().unwrap().iter().any(|effect| {
+            effect.request.inventory.encoded() == "T06"
+                && matches!(effect.state, ManagementEffectStateV1::Completed { .. })
+        }));
+
+        session.push_user("old v2 message");
+        session.check_persistence().unwrap();
+        let source = session.persistence.as_ref().unwrap().clone();
+        let source_dir = source.store.directory().to_path_buf();
+        let source_state = std::fs::read(source_dir.join("state.json")).unwrap();
+        let source_raw = std::fs::read(source_dir.join("raw.jsonl")).unwrap();
+        let mut session_path = sessions_dir.join(format!("{}.jsonl", child.as_str()));
+        let mut meta_path = session_path.with_extension("meta.json");
+        let mut started = 1;
+        let mut status = Status::Idle;
+        let mut local_lines = vec![Line::from("old local output")];
+        assert!(handle_managed_new_session(
+            &sessions_dir,
+            &state_dir,
+            &owner,
+            &effects,
+            &mut session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+            &mut local_lines,
+        ));
+        let new_id = session
+            .persistence
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .state
+            .session_id;
+        assert_ne!(new_id, child.as_str());
+        assert_eq!(session_path.file_stem().unwrap(), new_id.as_str());
+        assert_eq!(meta_path, session_path.with_extension("meta.json"));
+        assert!(session.messages.is_empty());
+        assert!(session.workflow.is_none());
+        assert!(local_lines.is_empty());
+        assert!(matches!(status, Status::Idle));
+        assert_eq!(
+            std::fs::read(source_dir.join("state.json")).unwrap(),
+            source_state
+        );
+        assert_eq!(
+            std::fs::read(source_dir.join("raw.jsonl")).unwrap(),
+            source_raw
+        );
+        let new_child = SessionId::new(new_id).unwrap();
+        let (new_store, new_family) = SessionManagerStore::open_family_owned(
+            &state_dir.join("tui-admissions-v1"),
+            &new_child,
+        )
+        .unwrap();
+        assert_eq!(new_family.sessions.len(), 1);
+        assert!(new_family.sessions.contains_key(&new_child));
+        drop(new_store);
+        let (_store, old_family) =
+            SessionManagerStore::open_family_owned(&state_dir.join("tui-admissions-v1"), &child)
+                .unwrap();
+        assert!(old_family.sessions.contains_key(&child));
+        assert_eq!(
+            effects
+                .effects()
+                .unwrap()
+                .iter()
+                .filter(|effect| {
+                    effect.request.inventory.encoded() == "T06"
+                        && matches!(effect.state, ManagementEffectStateV1::Completed { .. })
+                })
+                .count(),
+            2
+        );
+
+        let journal = state_dir.join("management-effects-v1/journal.v1.jsonl");
+        let journal_before = std::fs::read(&journal).unwrap();
+        let cursor_before = effects.cursor().unwrap();
+        let new_dir = session
+            .persistence
+            .as_ref()
+            .unwrap()
+            .store
+            .directory()
+            .to_path_buf();
+        let new_state = std::fs::read(new_dir.join("state.json")).unwrap();
+        let new_raw = std::fs::read(new_dir.join("raw.jsonl")).unwrap();
+        let current_path = session_path.clone();
+        let current_meta = meta_path.clone();
+        let current_started = started;
+        local_lines.push(Line::from("keep on refusal"));
+        let busy_lease = owner.try_mutation().unwrap();
+
+        let mut popup_draft = "/ne".to_string();
+        let mut popup_cursor = 2;
+        let mut queued = VecDeque::new();
+        let mut paused = false;
+        let submitted = std::mem::take(&mut popup_draft);
+        assert!(!handle_managed_new_session(
+            &sessions_dir,
+            &state_dir,
+            &owner,
+            &effects,
+            &mut session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+            &mut local_lines,
+        ));
+        restore_rejected_new_submission(
+            submitted,
+            popup_cursor,
+            false,
+            &mut popup_draft,
+            &mut popup_cursor,
+            &mut queued,
+            &mut paused,
+        );
+        assert_eq!(popup_draft, "/ne");
+        assert_eq!(popup_cursor, 2);
+
+        let mut ordinary_draft = "/new".to_string();
+        let mut ordinary_cursor = 2;
+        let mut history = input::History::new();
+        history.record("prior input");
+        let previous_cursor = ordinary_cursor;
+        let InputAction::Submit(submitted) = apply_key(
+            &mut ordinary_draft,
+            &mut ordinary_cursor,
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Enter,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        ) else {
+            panic!("Enter should submit /new");
+        };
+        record_submission_before_dispatch(&mut history, &submitted, false);
+        assert!(!handle_managed_new_session(
+            &sessions_dir,
+            &state_dir,
+            &owner,
+            &effects,
+            &mut session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+            &mut local_lines,
+        ));
+        restore_rejected_new_submission(
+            submitted,
+            previous_cursor,
+            false,
+            &mut ordinary_draft,
+            &mut ordinary_cursor,
+            &mut queued,
+            &mut paused,
+        );
+        assert_eq!(ordinary_draft, "/new");
+        assert_eq!(ordinary_cursor, 2);
+        assert_eq!(history.older(&ordinary_draft), Some("prior input"));
+        assert_eq!(history.newer(), Some("/new"));
+
+        let mut live_draft = "unsent request".to_string();
+        let mut live_cursor = 4;
+        queued.extend(["/new".to_string(), "later request".to_string()]);
+        let submitted = queued.pop_front().unwrap();
+        assert!(!handle_managed_new_session(
+            &sessions_dir,
+            &state_dir,
+            &owner,
+            &effects,
+            &mut session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+            &mut local_lines,
+        ));
+        restore_rejected_new_submission(
+            submitted,
+            4,
+            true,
+            &mut live_draft,
+            &mut live_cursor,
+            &mut queued,
+            &mut paused,
+        );
+        assert_eq!(live_draft, "unsent request");
+        assert_eq!(live_cursor, 4);
+        assert_eq!(
+            queued,
+            VecDeque::from(["/new".into(), "later request".into()])
+        );
+        assert!(paused);
+        drop(busy_lease);
+        assert_eq!(session_path, current_path);
+        assert_eq!(meta_path, current_meta);
+        assert_eq!(started, current_started);
+        assert_eq!(
+            std::fs::read(new_dir.join("state.json")).unwrap(),
+            new_state
+        );
+        assert_eq!(std::fs::read(new_dir.join("raw.jsonl")).unwrap(), new_raw);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+        assert_eq!(effects.cursor().unwrap(), cursor_before);
+        assert_eq!(local_lines.len(), 1);
+
+        assert!(handle_managed_new_session(
+            &sessions_dir,
+            &state_dir,
+            &owner,
+            &effects,
+            &mut session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+            &mut local_lines,
+        ));
+        // This manual `/new` is a separate accepted submission. It must not
+        // consume the earlier queued `/new`, even though the text is equal.
+        paused = false;
+        assert_eq!(
+            queued,
+            VecDeque::from(["/new".into(), "later request".into()])
+        );
+        assert!(!paused);
+        assert_eq!(live_draft, "unsent request");
+        let retry_id = session
+            .persistence
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .state
+            .session_id;
+        assert_eq!(session_path.file_stem().unwrap(), retry_id.as_str());
+        assert_ne!(retry_id, new_child.as_str());
+        let retry_child = SessionId::new(retry_id).unwrap();
+        let (retry_store, retry_family) = SessionManagerStore::open_family_owned(
+            &state_dir.join("tui-admissions-v1"),
+            &retry_child,
+        )
+        .unwrap();
+        assert_eq!(retry_family.sessions.len(), 1);
+        assert!(retry_family.sessions.contains_key(&retry_child));
+        drop(retry_store);
+        assert_eq!(
+            std::fs::read(new_dir.join("state.json")).unwrap(),
+            new_state
+        );
+        assert_eq!(std::fs::read(new_dir.join("raw.jsonl")).unwrap(), new_raw);
+        assert_eq!(
+            std::fs::read(source_dir.join("state.json")).unwrap(),
+            source_state
+        );
+        assert_eq!(
+            std::fs::read(source_dir.join("raw.jsonl")).unwrap(),
+            source_raw
+        );
+        assert_eq!(
+            effects
+                .effects()
+                .unwrap()
+                .iter()
+                .filter(|effect| {
+                    effect.request.inventory.encoded() == "T06"
+                        && matches!(effect.state, ManagementEffectStateV1::Completed { .. })
+                })
+                .count(),
+            3
+        );
+
+        // The queued invocation is dispatched once by taking its own head.
+        assert_eq!(queued.pop_front().as_deref(), Some("/new"));
+        assert!(handle_managed_new_session(
+            &sessions_dir,
+            &state_dir,
+            &owner,
+            &effects,
+            &mut session,
+            &mut session_path,
+            &mut meta_path,
+            &mut started,
+            &mut status,
+            &mut local_lines,
+        ));
+        assert_eq!(queued, VecDeque::from(["later request".into()]));
+        assert_eq!(live_draft, "unsent request");
+        let queued_id = session
+            .persistence
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .state
+            .session_id;
+        assert_ne!(queued_id, retry_child.as_str());
+        assert_eq!(session_path.file_stem().unwrap(), queued_id.as_str());
+        let queued_child = SessionId::new(queued_id).unwrap();
+        let (_store, queued_family) = SessionManagerStore::open_family_owned(
+            &state_dir.join("tui-admissions-v1"),
+            &queued_child,
+        )
+        .unwrap();
+        assert_eq!(queued_family.sessions.len(), 1);
+        assert!(queued_family.sessions.contains_key(&queued_child));
+        assert_eq!(
+            effects
+                .effects()
+                .unwrap()
+                .iter()
+                .filter(|effect| {
+                    effect.request.inventory.encoded() == "T06"
+                        && matches!(effect.state, ManagementEffectStateV1::Completed { .. })
+                })
+                .count(),
+            4
+        );
     }
 
     #[tokio::test]
@@ -6688,6 +14141,10 @@ mod tests {
             }),
             workflow_mode_overridden: false,
             skills: &[],
+            #[cfg(unix)]
+            management_effects: None,
+            #[cfg(unix)]
+            project_mutation: None,
         })
         .await
         .expect("resume selected session");
@@ -6771,6 +14228,346 @@ mod tests {
         assert_eq!(session.examples[0].content, "configured example");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn m3c_actual_resume_keeps_selected_identity_after_confirmed_workflow_override() {
+        exercise_actual_resume_after_owned_publication(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m3_remaining_managed_fork_preserves_original_and_refuses_active_owner() {
+        use polaris_core::{
+            conversation_state::HistoryMode, management_effect::*,
+            rewind_workspace::WorkspaceOwner, session_store::PersistedSession,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state = root.path().join("state");
+        let sessions = root.path().join("sessions");
+        for path in [&project, &state, &sessions] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let owner = WorkspaceOwner::open(
+            &project,
+            &state.join("rewind-workspace"),
+            Default::default(),
+        )
+        .unwrap();
+        let lease = owner.try_mutation().unwrap();
+        let effects = ManagementEffectStoreV1::open_at_state_dir(&project, &state, &lease).unwrap();
+        drop(lease);
+        let workflow = polaris_core::workflow::SessionWorkflow::new(Default::default());
+        let source = PersistedSession::create(
+            root.path(),
+            &state.join("memory.sqlite3"),
+            project.to_str().unwrap(),
+            HistoryMode::Legacy,
+            Some(&workflow),
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.workflow = Some(workflow);
+        session.attach(source.clone()).unwrap();
+        session.push_user("original transcript");
+        let before = source.snapshot().unwrap();
+        let mut path = sessions.join(format!("{}.jsonl", before.state.session_id));
+        let mut meta = path.with_extension("meta.json");
+        let mut started = 0;
+        let mut status = Status::Idle;
+        let busy = owner.try_mutation().unwrap();
+        handle_managed_fork(
+            &sessions,
+            project.to_str().unwrap(),
+            &state,
+            &owner,
+            &effects,
+            &mut session,
+            &mut path,
+            &mut meta,
+            &mut started,
+            &mut status,
+        );
+        assert_eq!(
+            session
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .state
+                .session_id,
+            before.state.session_id
+        );
+        assert!(effects.effects().unwrap().is_empty());
+        drop(busy);
+        handle_managed_fork(
+            &sessions,
+            project.to_str().unwrap(),
+            &state,
+            &owner,
+            &effects,
+            &mut session,
+            &mut path,
+            &mut meta,
+            &mut started,
+            &mut status,
+        );
+        if let Status::Notice(text) = &status {
+            assert!(text.contains("分岐しました"), "{text}");
+        } else {
+            panic!("fork did not display its result");
+        }
+        let child = session.persistence.as_ref().unwrap().snapshot().unwrap();
+        assert_ne!(child.state.session_id, before.state.session_id);
+        assert_eq!(session.messages[0].content, "original transcript");
+        let unchanged = source.snapshot().unwrap();
+        assert_eq!(unchanged.state, before.state);
+        assert_eq!(unchanged.raw_hash, before.raw_hash);
+        assert!(
+            effects
+                .effects()
+                .unwrap()
+                .iter()
+                .any(|e| e.request.inventory.encoded() == "T16"
+                    && matches!(e.state, ManagementEffectStateV1::Completed { .. }))
+        );
+        assert!(effects.blocker().unwrap().is_none());
+    }
+
+    #[test]
+    fn m3_remaining_web_search_reports_disabled_and_refuses_unverified_modes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.push_user("original");
+        let mut status = Status::Idle;
+        let mut lines = Vec::new();
+        call(
+            slash::parse("/web-search").unwrap(),
+            &mut session,
+            &root.path().join("session.jsonl"),
+            &mut status,
+            &[],
+            root.path(),
+            &mut lines,
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Web検索: disabled"))
+        );
+        let rendered = lines.len();
+        for mode in ["cached", "live"] {
+            call(
+                slash::parse(&format!("/web-search {mode}")).unwrap(),
+                &mut session,
+                &root.path().join("session.jsonl"),
+                &mut status,
+                &[],
+                root.path(),
+                &mut lines,
+            );
+            assert!(matches!(&status, Status::Error(text) if text.contains("上限契約")));
+            assert_eq!(lines.len(), rendered);
+        }
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "original");
+    }
+
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn m3c_actual_resume_migrates_missing_workflow_without_losing_identity() {
+        exercise_actual_resume_after_owned_publication(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_actual_resume_after_owned_publication(missing_workflow: bool) {
+        use polaris_core::{
+            conversation_state::HistoryMode, management_effect::*,
+            rewind_workspace::WorkspaceOwner, session_store::PersistedSession,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state = root.path().join("state");
+        let sessions = root.path().join("sessions");
+        for path in [&project, &state, &sessions] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let owner = WorkspaceOwner::open(
+            &project,
+            &state.join("rewind-workspace"),
+            Default::default(),
+        )
+        .unwrap();
+        let lease = owner.try_mutation().unwrap();
+        let effects = ManagementEffectStoreV1::open_at_state_dir(&project, &state, &lease).unwrap();
+        drop(lease);
+        let config = polaris_core::workflow::WorkflowConfig::default();
+        let workflow = polaris_core::workflow::SessionWorkflow::new(config.clone());
+        let selected = PersistedSession::create(
+            root.path(),
+            &state.join("memory.sqlite3"),
+            project.to_str().unwrap(),
+            HistoryMode::Legacy,
+            if missing_workflow {
+                None
+            } else {
+                Some(&workflow)
+            },
+        )
+        .unwrap();
+        let mut seeded = Session::new();
+        seeded.attach(selected.clone()).unwrap();
+        seeded.push_user("selected transcript");
+        validate_resume_workspace(&owner, &selected).unwrap();
+        let selected_id = selected.snapshot().unwrap().state.session_id;
+        let mut current = Session::new();
+        current.push_user("unsaved current");
+        let mut path = sessions.join("current.jsonl");
+        let mut meta = path.with_extension("meta.json");
+        let mut started = 0;
+        let mut status = Status::Idle;
+        let mut lines = Vec::new();
+        let terminal = RefCell::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+        let mut keys = ScriptedReader(VecDeque::from([KeyCode::Enter, KeyCode::Char('y')]));
+        handle_resume(
+            &terminal,
+            &mut keys,
+            &sessions,
+            &state,
+            project.to_str().unwrap(),
+            &config,
+            false,
+            &[],
+            None,
+            Some(&owner),
+            Some(&effects),
+            &mut current,
+            &mut path,
+            &mut meta,
+            &mut started,
+            &mut status,
+            &mut lines,
+        )
+        .await;
+        assert!(matches!(status, Status::Idle));
+        assert_eq!(current.messages[0].content, "selected transcript");
+        assert_eq!(
+            current
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .state
+                .session_id,
+            selected_id
+        );
+        let override_config = polaris_core::workflow::WorkflowConfig {
+            enabled: !config.enabled,
+            ..config
+        };
+        let mut keys = ScriptedReader(VecDeque::from([
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Char('y'),
+        ]));
+        handle_resume(
+            &terminal,
+            &mut keys,
+            &sessions,
+            &state,
+            project.to_str().unwrap(),
+            &override_config,
+            true,
+            &[],
+            None,
+            Some(&owner),
+            Some(&effects),
+            &mut current,
+            &mut path,
+            &mut meta,
+            &mut started,
+            &mut status,
+            &mut lines,
+        )
+        .await;
+        if let Status::Error(message) | Status::Notice(message) = &status {
+            panic!("resume: {message}");
+        }
+        assert!(matches!(status, Status::Idle));
+        assert_eq!(
+            current
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .state
+                .session_id,
+            selected_id
+        );
+        assert_eq!(
+            current.workflow.as_ref().unwrap().config.enabled,
+            override_config.enabled
+        );
+        let mut keys = ScriptedReader(VecDeque::from([
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Esc,
+        ]));
+        handle_resume(
+            &terminal,
+            &mut keys,
+            &sessions,
+            &state,
+            project.to_str().unwrap(),
+            &workflow.config,
+            true,
+            &[],
+            None,
+            Some(&owner),
+            Some(&effects),
+            &mut current,
+            &mut path,
+            &mut meta,
+            &mut started,
+            &mut status,
+            &mut lines,
+        )
+        .await;
+        assert!(matches!(&status,Status::Error(message) if message.contains("取り消")));
+        current.check_persistence().unwrap();
+        assert_eq!(
+            current.workflow.as_ref().unwrap().config.enabled,
+            workflow.config.enabled
+        );
+        assert_eq!(
+            current
+                .persistence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .state
+                .workflow_config
+                .unwrap()
+                .config
+                .enabled,
+            workflow.config.enabled
+        );
+        assert!(effects.blocker().unwrap().is_none());
+        assert!(
+            effects
+                .effects()
+                .unwrap()
+                .iter()
+                .any(|e| e.request.inventory.encoded() == "D07"
+                    && matches!(e.state, ManagementEffectStateV1::Completed { .. }))
+        );
+    }
+
     #[test]
     fn handle_resume_with_nothing_saved_dismisses_on_any_key_and_leaves_the_session_untouched() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -6800,6 +14597,10 @@ mod tests {
                 &polaris_core::workflow::WorkflowConfig::default(),
                 false,
                 &[],
+                None,
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
                 None,
                 &mut session,
                 &mut session_path,
@@ -6863,6 +14664,10 @@ mod tests {
                 false,
                 &[],
                 None,
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
+                None,
                 &mut session,
                 &mut session_path,
                 &mut meta_path,
@@ -6882,6 +14687,194 @@ mod tests {
             "switching conversations clears local-only output"
         );
         assert!(matches!(status, Status::Idle));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_jsonl_resume_binds_the_imported_session_to_current_files() {
+        use polaris_core::conversation_state::HistoryMode;
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+        use polaris_core::session_store::PersistedSession;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(project.join("task.txt"), "current files").unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &root.path().join("rewind-store"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        persist::append_message(&sessions.join("saved.jsonl"), &Message::user("old request"))
+            .unwrap();
+        persist::write_meta_if_absent(
+            &sessions.join("saved.meta.json"),
+            &persist::SessionMeta {
+                cwd: project.display().to_string(),
+                started_at_millis: 500,
+            },
+        )
+        .unwrap();
+
+        let project_id = persist::project_identity(&project).unwrap();
+        let persistence = PersistedSession::create(
+            root.path(),
+            &state_dir.join("memory.sqlite3"),
+            &project_id,
+            HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.attach(persistence).unwrap();
+        let mut session_path = sessions.join("current.jsonl");
+        let mut meta_path = sessions.join("current.meta.json");
+        let mut started = 1;
+        let mut status = Status::Idle;
+        let mut local_lines = Vec::new();
+        let terminal = RefCell::new(Terminal::new(TestBackend::new(70, 16)).unwrap());
+        let mut reader = ScriptedReader(std::collections::VecDeque::from([KeyCode::Enter]));
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(handle_resume(
+                &terminal,
+                &mut reader,
+                &sessions,
+                &state_dir,
+                &project.display().to_string(),
+                &polaris_core::workflow::WorkflowConfig::default(),
+                false,
+                &[],
+                None,
+                Some(&owner),
+                None,
+                &mut session,
+                &mut session_path,
+                &mut meta_path,
+                &mut started,
+                &mut status,
+                &mut local_lines,
+            ));
+        assert!(matches!(status, Status::Idle));
+        assert_eq!(session.messages[0].content, "old request");
+        let imported = session.persistence.as_ref().unwrap();
+        assert!(imported.store.workspace_head_binding().unwrap().is_some());
+        assert!(validate_resume_workspace(&owner, imported).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_resume_does_not_run_after_a_project_rewind() {
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&sessions).unwrap();
+        let owner = WorkspaceOwner::open(
+            &project,
+            &root.path().join("rewind-store"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let policy =
+            SandboxPolicy::new(SandboxMode::WorkspaceWrite, std::slice::from_ref(&project))
+                .unwrap();
+        let file = project.join("task.txt");
+        std::fs::write(&file, "before").unwrap();
+        let pre = owner.capture(&policy).unwrap();
+        std::fs::write(&file, "after").unwrap();
+        let post = owner.capture(&policy).unwrap();
+        let restored = owner.restore(&post, &pre).unwrap();
+        owner.commit(&restored.transaction_id).unwrap();
+
+        let saved_path = sessions.join("saved.jsonl");
+        persist::append_message(&saved_path, &Message::user("old request")).unwrap();
+        persist::write_meta_if_absent(
+            &sessions.join("saved.meta.json"),
+            &persist::SessionMeta {
+                cwd: project.display().to_string(),
+                started_at_millis: 500,
+            },
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.push_user("current request");
+        let mut session_path = sessions.join("current.jsonl");
+        let mut meta_path = sessions.join("current.meta.json");
+        let mut started = 1;
+        let mut status = Status::Idle;
+        let mut local_lines = Vec::new();
+        let terminal = RefCell::new(Terminal::new(TestBackend::new(70, 16)).unwrap());
+        let mut reader = ScriptedReader(std::collections::VecDeque::from([KeyCode::Enter]));
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(handle_resume(
+                &terminal,
+                &mut reader,
+                &sessions,
+                &root.path().join("state"),
+                &project.display().to_string(),
+                &polaris_core::workflow::WorkflowConfig::default(),
+                false,
+                &[],
+                None,
+                Some(&owner),
+                None,
+                &mut session,
+                &mut session_path,
+                &mut meta_path,
+                &mut started,
+                &mut status,
+                &mut local_lines,
+            ));
+        assert_eq!(session.messages[0].content, "current request");
+        assert!(matches!(status, Status::Notice(_)));
+        let display = terminal
+            .borrow()
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(display.contains("old request"));
+    }
+
+    #[test]
+    fn read_only_transcript_viewer_shows_saved_messages_without_session_switch() {
+        let terminal = RefCell::new(Terminal::new(TestBackend::new(70, 12)).unwrap());
+        let mut reader = ScriptedReader(std::collections::VecDeque::from([
+            KeyCode::Down,
+            KeyCode::Esc,
+        ]));
+        show_read_only_transcript(
+            &terminal,
+            &mut reader,
+            &[
+                Message::user("saved request"),
+                Message::assistant("saved answer"),
+            ],
+            "raw.jsonl",
+        );
+        let display = terminal
+            .borrow()
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(display.contains("saved request"));
+        assert!(display.contains("saved answer"));
+        assert!(display.contains("raw.jsonl"));
     }
 
     #[test]
@@ -6924,6 +14917,10 @@ mod tests {
                 &polaris_core::workflow::WorkflowConfig::default(),
                 false,
                 &[],
+                None,
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
                 None,
                 &mut session,
                 &mut session_path,
@@ -7086,12 +15083,30 @@ mod tests {
     }
 
     #[test]
-    fn status_includes_the_cached_token_count() {
-        let mut session = Session::default();
-        let mut status = Status::Idle;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let session_path = dir.path().join("session.jsonl");
-        let mut local_lines = Vec::new();
+    fn m3_acceptance_status_includes_usage_and_fixed_capability_truth() {
+        let session = Session::default();
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
+        #[cfg(unix)]
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let store = {
+            use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let state_dir = root.path().join("state");
+            std::fs::create_dir(&state_dir).unwrap();
+            let owner = WorkspaceOwner::open(
+                &project,
+                &state_dir.join("rewind-workspace"),
+                RewindLimits::default(),
+            )
+            .unwrap();
+            let lease = owner.try_mutation().unwrap();
+            polaris_core::management_effect::ManagementEffectStoreV1::open_at_state_dir(
+                &project, &state_dir, &lease,
+            )
+            .unwrap()
+        };
         let usage = polaris_provider::Usage {
             input_tokens: 100,
             output_tokens: 20,
@@ -7099,35 +15114,64 @@ mod tests {
             cached_tokens: 80,
         };
 
-        apply_slash_action(
-            slash::Action::Status,
-            &mut session,
-            &session_path,
-            &mut status,
-            "openai",
-            "gpt-5.4",
-            polaris_provider::UsageReport {
+        let local_lines = status_lines(StatusSnapshot {
+            session: &session,
+            provider_name: "openai",
+            model_name: "gpt-5.4",
+            usage_report: polaris_provider::UsageReport {
                 usage,
                 ..Default::default()
             },
-            &[],
-            dir.path(),
-            &mut local_lines,
+            sandbox: &sandbox,
+            approval: ApprovalPolicy::Never,
+            startup_approval: ApprovalPolicy::OnRequest,
+            mcp_external: true,
+            audit_path: Some(std::path::Path::new("/tmp/audit\nforged.jsonl")),
+            turn_authority_present: false,
+            fixed_effort: None,
+            answer_finalizer: None,
+            #[cfg(unix)]
+            management_effects: &store,
+            #[cfg(unix)]
+            recovery_issue: None,
+        });
+        let text = local_lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("cache 80"), "{text}");
+        assert!(text.contains("CAT: configured=shadow ownerなし; installed=未照合; verified=未確認; observed=未取得"), "{text}");
+        let diagnostic = doctor_lines(
+            "openai\nforged",
+            "model\tforged",
+            std::path::Path::new("."),
+            &sandbox,
+            ApprovalPolicy::Never,
+            false,
+        );
+        assert!(
+            diagnostic
+                .iter()
+                .all(|line| !line.to_string().contains(['\n', '\t', '\x1b']))
         );
 
-        match status {
-            Status::Notice(n) => {
-                assert!(n.contains("cache 80"), "expected a cache figure in: {n}");
-                assert!(n.contains("in 100"));
-                assert!(n.contains("out 20"));
-                assert!(n.contains("total 120"));
-            }
-            _ => panic!("expected a Notice"),
-        }
+        assert!(text.contains("audit=/tmp/audit\\nforged.jsonl"), "{text}");
+        assert!(text.contains("effort=automatic"));
+        assert!(text.contains("authorityの構成=false"));
+        assert!(text.contains("capacity観測は未接続"));
+        assert!(text.contains("web-search=disabled"));
+        assert!(text.contains("in 100"));
+        assert!(text.contains("out 20"));
+        assert!(text.contains("total 120"));
+        assert!(text.contains("現在=Never, 起動時=OnRequest"));
+        assert!(text.contains("外部MCP=true"));
+        assert!(text.contains("実接続はこの表示では未検証"));
+        assert!(session.messages.is_empty());
     }
 
     #[test]
-    fn phase_command_changes_an_enabled_workflow_and_rejects_unknown_names() {
+    fn phase_command_cannot_write_without_managed_owner() {
         let mut session = Session::new();
         session.workflow = Some(polaris_core::workflow::SessionWorkflow::new(
             polaris_core::workflow::WorkflowConfig {
@@ -7174,7 +15218,7 @@ mod tests {
         );
         assert_eq!(
             session.workflow.as_ref().unwrap().state().phase,
-            polaris_core::workflow::Phase::Review
+            polaris_core::workflow::Phase::General
         );
         assert_eq!(
             session
@@ -7186,9 +15230,10 @@ mod tests {
                 .state
                 .workflow
                 .phase,
-            polaris_core::workflow::Phase::Review,
-            "an idle /phase change must be durable before the next restart"
+            polaris_core::workflow::Phase::General,
+            "the fallback dispatch must not bypass the management effect owner"
         );
+        assert!(matches!(status, Status::Error(_)));
         call(
             slash::Action::Phase("not-a-phase".into()),
             &mut session,
@@ -7200,12 +15245,12 @@ mod tests {
         );
         assert_eq!(
             session.workflow.as_ref().unwrap().state().phase,
-            polaris_core::workflow::Phase::Review
+            polaris_core::workflow::Phase::General
         );
     }
 
     #[test]
-    fn workflow_command_reconfigures_and_checkpoints_before_exposing_mode() {
+    fn workflow_command_cannot_write_without_managed_owner() {
         let mut session = Session::new();
         session.workflow = Some(polaris_core::workflow::SessionWorkflow::new(
             polaris_core::workflow::WorkflowConfig {
@@ -7238,7 +15283,7 @@ mod tests {
         );
         assert_eq!(
             session.workflow.as_ref().unwrap().config.mode,
-            polaris_core::workflow::WorkflowMode::Adaptive
+            polaris_core::workflow::WorkflowMode::Manual
         );
         assert_eq!(
             session
@@ -7252,8 +15297,9 @@ mod tests {
                 .unwrap()
                 .config
                 .mode,
-            polaris_core::workflow::WorkflowMode::Adaptive
+            polaris_core::workflow::WorkflowMode::Manual
         );
+        assert!(matches!(status, Status::Error(_)));
 
         call(
             slash::Action::Workflow("off".into()),
@@ -7264,14 +15310,139 @@ mod tests {
             dir.path(),
             &mut local_lines,
         );
+        assert!(session.workflow.as_ref().unwrap().config.enabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_phase_change_records_effect_and_cancel_preserves_session() {
+        use polaris_core::management_effect::{ManagementEffectStateV1, ManagementEffectStoreV1};
+        use polaris_core::rewind_workspace::{RewindLimits, WorkspaceOwner};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&state_dir).unwrap();
+        let workspace = WorkspaceOwner::open(
+            &project,
+            &state_dir.join("rewind-workspace"),
+            RewindLimits::default(),
+        )
+        .unwrap();
+        let lease = workspace.try_mutation().unwrap();
+        let effects =
+            ManagementEffectStoreV1::open_at_state_dir(&project, &state_dir, &lease).unwrap();
+        drop(lease);
+        let project_id = persist::project_identity(&project).unwrap();
+        let workflow =
+            polaris_core::workflow::SessionWorkflow::new(polaris_core::workflow::WorkflowConfig {
+                enabled: true,
+                ..Default::default()
+            });
+        let persistence = polaris_core::session_store::PersistedSession::create(
+            root.path(),
+            &state_dir.join("memory.sqlite3"),
+            &project_id,
+            polaris_core::conversation_state::HistoryMode::Legacy,
+            Some(&workflow),
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.workflow = Some(workflow);
+        session.attach(persistence.clone()).unwrap();
+        let terminal = RefCell::new(Terminal::new(TestBackend::new(100, 16)).unwrap());
+        let mut status = Status::Idle;
+        let journal = state_dir.join("management-effects-v1/journal.v1.jsonl");
+        let before = persistence.snapshot().unwrap();
+        let journal_before = std::fs::read(&journal).unwrap();
+
+        let mut cancel = ScriptedReader(VecDeque::from([KeyCode::Esc]));
+        handle_managed_workflow_action(
+            &terminal,
+            &mut cancel,
+            slash::Action::Phase("review".into()),
+            &mut session,
+            &[],
+            &workspace,
+            &effects,
+            &state_dir,
+            false,
+            &mut status,
+        );
+        assert_eq!(persistence.snapshot().unwrap().state, before.state);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+
+        let mut accept = ScriptedReader(VecDeque::from([KeyCode::Char('y')]));
+        handle_managed_workflow_action(
+            &terminal,
+            &mut accept,
+            slash::Action::Phase("review".into()),
+            &mut session,
+            &[],
+            &workspace,
+            &effects,
+            &state_dir,
+            false,
+            &mut status,
+        );
+        assert!(matches!(status, Status::Notice(_)));
+        assert_eq!(
+            persistence.snapshot().unwrap().state.workflow.phase,
+            polaris_core::workflow::Phase::Review
+        );
+        assert_eq!(effects.effects().unwrap().len(), 1);
+        assert!(matches!(
+            effects.effects().unwrap()[0].state,
+            ManagementEffectStateV1::Completed { .. }
+        ));
+
+        let mut disable = ScriptedReader(VecDeque::from([KeyCode::Char('y')]));
+        handle_managed_workflow_action(
+            &terminal,
+            &mut disable,
+            slash::Action::Workflow("off".into()),
+            &mut session,
+            &[],
+            &workspace,
+            &effects,
+            &state_dir,
+            false,
+            &mut status,
+        );
+        assert!(matches!(status, Status::Notice(_)));
         assert!(!session.workflow.as_ref().unwrap().config.enabled);
+        assert_eq!(effects.effects().unwrap().len(), 2);
+
+        let disabled_state = persistence.snapshot().unwrap().state;
+        let disabled_journal = std::fs::read(&journal).unwrap();
+        let mut unused = ScriptedReader(VecDeque::new());
+        handle_managed_workflow_action(
+            &terminal,
+            &mut unused,
+            slash::Action::Phase("implement".into()),
+            &mut session,
+            &[],
+            &workspace,
+            &effects,
+            &state_dir,
+            false,
+            &mut status,
+        );
+        assert!(matches!(status, Status::Error(_)));
+        assert_eq!(persistence.snapshot().unwrap().state, disabled_state);
+        assert_eq!(std::fs::read(&journal).unwrap(), disabled_journal);
     }
 
     #[test]
-    fn pwd_reports_the_working_directory() {
+    fn pwd_reports_the_canonical_project_root() {
         let mut session = Session::default();
         let mut status = Status::Idle;
         let dir = tempfile::tempdir().expect("temp dir");
+        let project = dir.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
         let session_path = dir.path().join("session.jsonl");
         let mut local_lines = Vec::new();
 
@@ -7281,12 +15452,14 @@ mod tests {
             &session_path,
             &mut status,
             &[],
-            dir.path(),
+            &nested,
             &mut local_lines,
         );
 
         match status {
-            Status::Notice(n) => assert_eq!(n, dir.path().display().to_string()),
+            Status::Notice(n) => {
+                assert_eq!(n, project.canonicalize().unwrap().display().to_string())
+            }
             _ => panic!("expected a Notice"),
         }
     }
@@ -7313,7 +15486,7 @@ mod tests {
         let mut local_lines = Vec::new();
 
         call(
-            slash::Action::Mcp,
+            slash::Action::Mcp(String::new()),
             &mut session,
             &session_path,
             &mut status,
@@ -7321,14 +15494,17 @@ mod tests {
             dir.path(),
             &mut local_lines,
         );
+        let permitted_lines = mcp_state_lines(dir.path(), true);
 
         match prev {
             Some(p) => unsafe { std::env::set_var("HOME", p) },
             None => unsafe { std::env::remove_var("HOME") },
         }
-        assert_eq!(local_lines.len(), 1, "{local_lines:?}");
+        assert_eq!(local_lines.len(), 2, "{local_lines:?}");
+        assert_eq!(local_lines[0].to_string(), "外部MCPホスト上限: 拒否");
+        assert_eq!(permitted_lines[0], "外部MCPホスト上限: 許可");
         assert!(
-            local_lines[0]
+            local_lines[1]
                 .spans
                 .iter()
                 .any(|span| span.content.contains("登録されたMCPサーバーはありません")),
@@ -7601,6 +15777,7 @@ mod tests {
             }
         }
     }
+
     #[test]
     fn handle_permissions_rejects_a_policy_above_startup_never() {
         let backend = TestBackend::new(70, 14);
@@ -7626,6 +15803,7 @@ mod tests {
             _ => panic!("expected a Notice"),
         }
     }
+
     #[test]
     fn handle_permissions_can_narrow_and_restore_startup_on_request() {
         let backend = TestBackend::new(70, 14);
@@ -7655,6 +15833,7 @@ mod tests {
         );
         assert_eq!(approval_policy, ApprovalPolicy::OnRequest);
     }
+
     #[test]
     fn handle_permissions_keeps_delegation_within_startup_on_request() {
         let backend = TestBackend::new(70, 14);
@@ -7674,6 +15853,7 @@ mod tests {
         assert_eq!(approval_policy, ApprovalPolicy::OnRequest);
         assert!(matches!(status, Status::Notice(_)));
     }
+
     #[test]
     fn handle_permissions_keeps_startup_always_confirmations() {
         let backend = TestBackend::new(70, 14);
@@ -7735,12 +15915,10 @@ mod tests {
         assert_eq!(approval_policy, ApprovalPolicy::OnRequest);
         assert!(matches!(status, Status::Idle));
     }
+
     #[test]
     fn diff_reports_no_changes_outside_a_git_repository() {
-        // `cwd` here is a bare tempdir, not a git repo — `git diff` exits
-        // non-zero and prints to stderr, which must show up as content
-        // rather than a crash (a missing/broken git repo is a common,
-        // recoverable situation, not a fatal one).
+        // A missing repository is reported as local content, not a crash.
         let mut session = Session::default();
         let mut status = Status::Idle;
         let dir = tempfile::tempdir().expect("temp dir");
@@ -7759,6 +15937,33 @@ mod tests {
 
         assert!(matches!(outcome, SlashOutcome::Continue));
         assert!(!local_lines.is_empty(), "should still report something");
+    }
+
+    #[test]
+    fn help_lists_every_registered_command_in_scrollback() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::default();
+        let mut status = Status::Idle;
+        let mut local_lines = Vec::new();
+        let outcome = call(
+            slash::Action::Help,
+            &mut session,
+            &dir.path().join("session.jsonl"),
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+
+        assert!(matches!(outcome, SlashOutcome::Continue));
+        assert_eq!(local_lines.len(), slash::COMMANDS.len() + 1);
+        for (line, command) in local_lines.iter().skip(1).zip(slash::COMMANDS) {
+            assert_eq!(
+                line.to_string(),
+                format!("/{} — {}", command.name, command.description)
+            );
+        }
+        assert!(local_lines.last().unwrap().to_string().contains("/quit"));
     }
 
     #[test]
@@ -7842,6 +16047,210 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("a.txt"));
         assert!(rendered.contains("changed"));
+    }
+
+    #[test]
+    fn diff_shows_untracked_file_in_an_unborn_repository() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be on PATH for this test");
+        assert!(init.status.success());
+        std::fs::write(dir.path().join("new.txt"), "untracked\n").expect("write");
+
+        let mut session = Session::default();
+        let mut status = Status::Idle;
+        let session_path = dir.path().join("session.jsonl");
+        let mut local_lines = Vec::new();
+        call(
+            slash::Action::Diff,
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+
+        let rendered = local_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("new.txt"), "{rendered}");
+        assert!(!rendered.contains("(no changes)"), "{rendered}");
+    }
+
+    #[test]
+    fn diff_shows_staged_file_in_an_unborn_repository() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git must be on PATH for this test");
+            assert!(output.status.success(), "{:?}", output.stderr);
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.path().join("staged.txt"), "staged\n").expect("write");
+        run(&["add", "staged.txt"]);
+
+        let mut session = Session::default();
+        let mut status = Status::Idle;
+        let session_path = dir.path().join("session.jsonl");
+        let mut local_lines = Vec::new();
+        call(
+            slash::Action::Diff,
+            &mut session,
+            &session_path,
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+
+        let rendered = local_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("staged.txt"), "{rendered}");
+        assert!(!rendered.contains("(no changes)"), "{rendered}");
+    }
+
+    #[test]
+    fn diff_hostile_environment_child() {
+        let Some(project) = std::env::var_os("POLARIS_T13_CHILD_TARGET") else {
+            return;
+        };
+        let project = std::path::PathBuf::from(project);
+        let mut session = Session::default();
+        let mut status = Status::Idle;
+        let mut local_lines = Vec::new();
+        call(
+            slash::Action::Diff,
+            &mut session,
+            &project.join("session.jsonl"),
+            &mut status,
+            &[],
+            &project,
+            &mut local_lines,
+        );
+        let rendered = local_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("target.txt"), "{rendered}");
+        assert!(!rendered.contains("outside.txt"), "{rendered}");
+    }
+
+    #[test]
+    fn diff_ignores_hostile_git_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        let outside = dir.path().join("outside");
+        for repo in [&target, &outside] {
+            std::fs::create_dir(repo).expect("create repository directory");
+            let output = std::process::Command::new("/usr/bin/git")
+                .args(["init", "-q"])
+                .current_dir(repo)
+                .output()
+                .expect("git init");
+            assert!(output.status.success(), "{:?}", output.stderr);
+        }
+        std::fs::write(target.join("target.txt"), "target\n").expect("write target");
+        std::fs::write(outside.join("outside.txt"), "outside\n").expect("write outside");
+
+        let executable = std::env::current_exe().expect("test executable");
+        let run_child = |configure: &dyn Fn(&mut std::process::Command)| {
+            let mut child = std::process::Command::new(&executable);
+            child
+                .arg("diff_hostile_environment_child")
+                .arg("--nocapture")
+                .env("POLARIS_T13_CHILD_TARGET", &target);
+            configure(&mut child);
+            let output = child.output().expect("child test");
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_child(&|child| {
+            child.env("GIT_DIR", outside.join(".git"));
+            child.env("GIT_WORK_TREE", &outside);
+        });
+
+        let fake_bin = dir.path().join("fake-bin");
+        std::fs::create_dir(&fake_bin).expect("create fake bin");
+        let fake_git = fake_bin.join("git");
+        let marker = dir.path().join("fake-git-called");
+        std::fs::write(
+            &fake_git,
+            "#!/bin/sh\n: > \"$POLARIS_T13_GIT_MARKER\"\nexit 77\n",
+        )
+        .expect("write fake git");
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake git executable");
+        run_child(&|child| {
+            child
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env("PATH", &fake_bin)
+                .env("POLARIS_T13_GIT_MARKER", &marker);
+        });
+        assert!(!marker.exists(), "fake git on PATH must not run");
+    }
+
+    #[test]
+    fn diff_bounds_large_git_output() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git must run");
+            assert!(output.status.success(), "{:?}", output.stderr);
+        };
+        run(&["init", "-q"]);
+        std::fs::write(
+            dir.path().join("large.txt"),
+            "x".repeat(polaris_core::project_git::MAX_GIT_OUTPUT_BYTES + 1024),
+        )
+        .expect("write large file");
+        run(&["add", "large.txt"]);
+
+        let mut session = Session::default();
+        let mut status = Status::Idle;
+        let mut local_lines = Vec::new();
+        call(
+            slash::Action::Diff,
+            &mut session,
+            &dir.path().join("session.jsonl"),
+            &mut status,
+            &[],
+            dir.path(),
+            &mut local_lines,
+        );
+        let rendered = local_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Git情報を取得できません"), "{rendered}");
+        assert!(!rendered.contains("large.txt"), "{rendered}");
     }
 
     #[test]

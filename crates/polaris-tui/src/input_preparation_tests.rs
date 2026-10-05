@@ -64,6 +64,10 @@ async fn tui_input_preparation_changes_only_the_sent_copy_and_survives_reopen() 
             continuation: None,
             workflow_mode_overridden: false,
             skills: &[],
+            #[cfg(unix)]
+            management_effects: None,
+            #[cfg(unix)]
+            project_mutation: None,
         })
         .await
         .unwrap();

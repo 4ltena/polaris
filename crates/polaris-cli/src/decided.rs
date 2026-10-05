@@ -45,7 +45,7 @@ pub fn run(args: Args) -> Result<(), String> {
 fn add(root: &std::path::Path, what: &str) -> Result<(), String> {
     let at = now();
     decisions::append(root, &at, what).map_err(|e| format!("追記できません: {e}"))?;
-    println!("{at}  {}", what.trim());
+    println!("{at}  {what}");
     println!("{}", root.join(decisions::PATH).display());
     Ok(())
 }

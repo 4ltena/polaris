@@ -1372,6 +1372,289 @@ pub fn render_resume_picker(
     );
 }
 
+/// A mismatched workspace may inspect a saved conversation, but the viewer
+/// never changes the active session or offers a model action. Unlike the
+/// ordinary history pane, it includes tool messages and call arguments so
+/// the saved transcript can be inspected without opening its raw file.
+pub fn transcript_lines_for(messages: &[polaris_provider::Message]) -> Vec<HistoryLine> {
+    let mut lines = Vec::new();
+    for message in messages {
+        let role = match message.role {
+            Role::User => "user",
+            Role::Assistant => "polaris",
+            Role::Tool => "tool",
+        };
+        lines.push(HistoryLine::plain(Line::styled(
+            role.to_owned(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for text in message.content.split('\n') {
+            lines.push(HistoryLine::plain(Line::from(sanitize(text))));
+        }
+        for call in &message.tool_calls {
+            lines.push(HistoryLine::plain(Line::from(sanitize(&format!(
+                "→ {}({})",
+                call.name, call.arguments
+            )))));
+        }
+        lines.push(HistoryLine::plain(Line::from("")));
+    }
+    lines
+}
+
+pub fn render_transcript_viewer(
+    frame: &mut Frame,
+    lines: &[HistoryLine],
+    offset: usize,
+    source: &str,
+) {
+    let area = frame.area();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("会話の閲覧（実行不可）");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let content_height = inner.height.saturating_sub(2) as usize;
+    let start = offset.min(lines.len().saturating_sub(content_height));
+    let end = (start + content_height).min(lines.len());
+    render_history_into(
+        frame.buffer_mut(),
+        ratatui::layout::Rect {
+            height: content_height as u16,
+            ..inner
+        },
+        &lines[start..end],
+    );
+    if inner.height >= 2 {
+        let footer = ratatui::layout::Rect {
+            y: inner.y + inner.height - 2,
+            height: 2,
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    sanitize(source),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "↑↓/PgUp/PgDnで移動 · Escで戻る",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]),
+            footer,
+        );
+    }
+}
+
+pub struct RewindPickerRow {
+    pub boundary_id: String,
+    pub user_message: String,
+    pub recorded_at_millis: u128,
+}
+
+/// Only verified, complete boundaries are passed here by the session owner.
+pub fn render_rewind_picker(
+    frame: &mut Frame,
+    rows: &[RewindPickerRow],
+    selected: usize,
+    now_millis: u128,
+) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "rewind before a message",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no complete, reversible checkpoint is available",
+            dim,
+        )));
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let marker = if index == selected { "\u{276f} " } else { "  " };
+        let when = crate::time::format_relative(row.recorded_at_millis, now_millis);
+        let preview = sanitize(&row.user_message.replace('\n', " "));
+        let style = if index == selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            dim
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{when}  {preview}"),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "enter to preview file and context changes \u{b7} esc to cancel",
+        dim,
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
+        frame.area(),
+    );
+}
+
+pub struct RewindPreviewView {
+    pub user_message: String,
+    pub changed_paths: Vec<String>,
+    pub recovery_location: String,
+}
+
+pub fn render_rewind_preview(frame: &mut Frame, preview: &RewindPreviewView) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "restore files and conversation context",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "Before: {}",
+            sanitize(&preview.user_message.replace('\n', " "))
+        )),
+        Line::from(Span::styled(
+            "The working tree will change. Later conversation, workflow and memory state will not enter the new session.",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "External effects and commands already run cannot be undone.",
+            dim,
+        )),
+        Line::from(""),
+        Line::from(format!("Files to change: {}", preview.changed_paths.len())),
+    ];
+    if preview.changed_paths.is_empty() {
+        lines.push(Line::from(Span::styled("  (none)", dim)));
+    } else {
+        for path in preview.changed_paths.iter().take(20) {
+            lines.push(Line::from(format!("  {}", sanitize(path))));
+        }
+        if preview.changed_paths.len() > 20 {
+            lines.push(Line::from(format!(
+                "  ... and {} more",
+                preview.changed_paths.len() - 20
+            )));
+        }
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(format!(
+            "Recovery: {}",
+            sanitize(&preview.recovery_location)
+        )),
+        Line::from(Span::styled("press r to restore \u{b7} esc to cancel", dim)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
+        frame.area(),
+    );
+}
+
+/// Exact management target and scope must fit before confirmation is enabled.
+pub fn render_management_confirmation(
+    frame: &mut Frame,
+    operation: &str,
+    target: &str,
+    detail: &str,
+) -> bool {
+    use unicode_width::UnicodeWidthStr;
+    let operation = sanitize(operation).escape_debug().to_string();
+    let target = sanitize(target).escape_debug().to_string();
+    let detail = sanitize(detail).escape_debug().to_string();
+    let columns = frame.area().width.saturating_sub(4) as usize;
+    let required = [&operation, &target, &detail]
+        .iter()
+        .map(|text| (text.width() + columns.saturating_sub(1)) / columns.max(1))
+        .sum::<usize>()
+        + 7;
+    let ready = columns >= 36 && frame.area().height as usize >= required;
+    let lines = if ready {
+        vec![
+            Line::from(operation),
+            Line::from("対象:"),
+            Line::from(target),
+            Line::from(""),
+            Line::from(detail),
+            Line::from(""),
+            Line::from("y: 実行 / Esc: 取消"),
+        ]
+    } else {
+        vec![
+            Line::from("対象をすべて表示できません。端末を広げてください。"),
+            Line::from("Esc: 取消"),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("確認")),
+        frame.area(),
+    );
+    ready
+}
+
+
+
+pub struct WorkflowChangeConfirmView<'a> {
+    pub inventory: &'a str,
+    pub project_id: &'a str,
+    pub session_id: &'a str,
+    pub generation: u64,
+    pub before_phase: &'a str,
+    pub after_phase: &'a str,
+    pub before_mode: &'a str,
+    pub after_mode: &'a str,
+}
+
+pub fn render_workflow_change_confirmation(
+    frame: &mut Frame,
+    view: &WorkflowChangeConfirmView<'_>,
+) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let lines = vec![
+        Line::from(Span::styled(
+            "confirm workflow change",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Operation: {}", sanitize(view.inventory))),
+        Line::from(format!("Project: {}", sanitize(view.project_id))),
+        Line::from(format!("Session: {}", sanitize(view.session_id))),
+        Line::from(format!("Saved generation: {}", view.generation)),
+        Line::from("Rewind disposition: CapturedRestorable"),
+        Line::from(format!(
+            "Phase: {} -> {}",
+            sanitize(view.before_phase),
+            sanitize(view.after_phase)
+        )),
+        Line::from(format!(
+            "Mode: {} -> {}",
+            sanitize(view.before_mode),
+            sanitize(view.after_mode)
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Local session change; eligible rewind boundaries restore workflow state.",
+            dim,
+        )),
+        Line::from(Span::styled("press y to save · esc to cancel", dim)),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
+        frame.area(),
+    );
+}
+
 /// Fixed hosted choices for `/model`. Local runtimes are discovered only
 /// after the separate local-model row is chosen.
 pub const MODEL_CATALOG: &[&str] = &[
@@ -1681,6 +1964,7 @@ const PERMISSIONS_OPTIONS: [(polaris_core::approval::ApprovalPolicy, &str, &str)
         "ask before every mutating operation",
     ),
 ];
+
 pub(crate) fn approval_cli_value(policy: polaris_core::approval::ApprovalPolicy) -> &'static str {
     use polaris_core::approval::ApprovalPolicy;
     match policy {
@@ -1689,6 +1973,7 @@ pub(crate) fn approval_cli_value(policy: polaris_core::approval::ApprovalPolicy)
         ApprovalPolicy::Always => "always",
     }
 }
+
 pub(crate) const PERMISSIONS_MIN_WIDTH: u16 = 40;
 pub(crate) const PERMISSIONS_MIN_HEIGHT: u16 = 8;
 
@@ -2503,6 +2788,63 @@ mod tests {
         assert!(!content.chars().any(|c| matches!(c, '\n' | '\t' | '\u{1b}')));
         assert!(content.contains("enter to resume"));
     }
+
+    #[test]
+    fn the_rewind_picker_names_the_message_and_requires_preview() {
+        let now = 1_705_311_000_000u128;
+        let rows = vec![RewindPickerRow {
+            boundary_id: "checkpoint-1".into(),
+            user_message: "first line\nsecond line".into(),
+            recorded_at_millis: now - 42_000,
+        }];
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_rewind_picker(f, &rows, 0, now))
+            .expect("draw");
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("42s ago"));
+        assert!(content.contains("first line second line"));
+        assert!(content.contains("enter to preview"));
+        assert!(content.contains("esc to cancel"));
+    }
+
+    #[test]
+    fn the_rewind_preview_warns_about_file_changes_and_requires_a_second_action() {
+        let backend = TestBackend::new(110, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| {
+                render_rewind_preview(
+                    f,
+                    &RewindPreviewView {
+                        user_message: "edit the package".into(),
+                        changed_paths: vec!["src/main.rs".into()],
+                        recovery_location: "/private/recovery".into(),
+                    },
+                )
+            })
+            .expect("draw");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("working tree will change"));
+        assert!(content.contains("src/main.rs"));
+        assert!(content.contains("/private/recovery"));
+        assert!(content.contains("press r to restore"));
+    }
+
     #[test]
     fn the_model_picker_marks_the_current_model_and_highlights_the_selection() {
         let backend = TestBackend::new(70, 14);
@@ -2570,6 +2912,7 @@ mod tests {
             assert!(content.contains("enter to confirm"));
         }
     }
+
     #[test]
     fn the_local_model_picker_lists_connected_runtime_models() {
         let backend = TestBackend::new(80, 12);
@@ -2591,6 +2934,7 @@ mod tests {
         assert!(content.contains("Ollama · qwen3:4b (current)"));
         assert!(content.contains("LM Studio · gemma"));
     }
+
     #[test]
     fn the_local_model_picker_keeps_the_selected_model_visible_on_a_short_terminal() {
         let models = (0..8)
@@ -2706,6 +3050,7 @@ mod tests {
             "selected skill is not visible: {rows:?}"
         );
     }
+
     #[test]
     fn the_skills_picker_shows_a_message_when_there_are_none() {
         let backend = TestBackend::new(70, 14);
@@ -2728,9 +3073,18 @@ mod tests {
     fn the_permissions_picker_marks_the_currently_active_policy() {
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                .expect("sandbox");
         terminal
             .draw(|f| {
-                render_permissions_picker(f, polaris_core::approval::ApprovalPolicy::Always, 0)
+                render_permissions_picker(
+                    f,
+                    polaris_core::approval::ApprovalPolicy::Always,
+                    polaris_core::approval::ApprovalPolicy::Always,
+                    &sandbox,
+                    0,
+                )
             })
             .expect("draw");
 
@@ -2744,15 +3098,30 @@ mod tests {
             .collect();
         assert!(rows.iter().any(|r| r.contains("always (current)")));
         assert!(!rows.iter().any(|r| r.contains("never (current)")));
+        assert!(rows.iter().any(|r| r.contains("startup --approval always")));
+        assert!(rows.iter().any(|r| r.contains("--sandbox read-only")));
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("--approval never (restart)"))
+        );
     }
 
     #[test]
     fn the_permissions_picker_highlights_whichever_option_is_selected() {
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
+        let sandbox =
+            polaris_sandbox::SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[])
+                .expect("sandbox");
         terminal
             .draw(|f| {
-                render_permissions_picker(f, polaris_core::approval::ApprovalPolicy::Never, 2)
+                render_permissions_picker(
+                    f,
+                    polaris_core::approval::ApprovalPolicy::Never,
+                    polaris_core::approval::ApprovalPolicy::Never,
+                    &sandbox,
+                    2,
+                )
             })
             .expect("draw");
 
@@ -2777,6 +3146,7 @@ mod tests {
         assert_eq!(find_title_color("always"), Color::Cyan);
         assert_ne!(find_title_color("never"), Color::Cyan);
     }
+
     #[test]
     fn the_permissions_picker_shows_the_fixed_write_root() {
         let root = tempfile::tempdir().expect("root");
@@ -2815,6 +3185,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("on request (current)")));
         assert!(rows.iter().any(|row| row.contains("--approval always")));
     }
+
     #[test]
     fn the_permissions_picker_keeps_startup_limits_visible_in_short_terminals() {
         let root = tempfile::tempdir().expect("root");
@@ -2876,6 +3247,7 @@ mod tests {
             .collect();
         assert!(content.contains("8 rows; esc to cancel"));
     }
+
     #[test]
     fn the_permissions_picker_escapes_newlines_in_write_roots() {
         let temp = tempfile::tempdir().expect("temp");
@@ -3880,6 +4252,30 @@ mod tests {
         assert!(sanitized.contains('\n'));
         assert!(sanitized.contains('\t'));
         assert_eq!(sanitized, "a\u{fffd}b\u{fffd}c\u{fffd}d\ne\tf");
+    }
+
+    #[test]
+    fn transcript_viewer_includes_tool_messages_and_sanitizes_control_bytes() {
+        let mut assistant = polaris_provider::Message::assistant("確認しました");
+        assistant.tool_calls.push(polaris_provider::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        });
+        let messages = vec![
+            polaris_provider::Message::user("質問\u{1b}[2J"),
+            assistant,
+            polaris_provider::Message::tool_result("call-1", "file contents"),
+        ];
+        let text = transcript_lines_for(&messages)
+            .into_iter()
+            .map(|line| line.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("user\n質問"));
+        assert!(text.contains("→ read({\"path\":\"src/main.rs\"})"));
+        assert!(text.contains("tool\nfile contents"));
+        assert!(!text.contains('\u{1b}'));
     }
 }
 

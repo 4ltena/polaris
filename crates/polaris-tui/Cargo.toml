@@ -28,5 +28,8 @@ zeroize = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = { workspace = true }
+polaris-core = { path = "../polaris-core", features = ["mcp-test-support", "execution-test-support"] }
+polaris-mcp = { path = "../polaris-mcp", features = ["test-support"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"

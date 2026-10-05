@@ -32,12 +32,64 @@ pub struct SlashCommand {
 
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "session",
+        description: "inspect or configure the saved conversation",
+    },
+    SlashCommand {
+        name: "goal",
+        description: "inspect or update the saved goal",
+    },
+    SlashCommand {
+        name: "history",
+        description: "inspect a bounded original transcript page",
+    },
+    SlashCommand {
+        name: "input",
+        description: "inspect an exact admitted input",
+    },
+    SlashCommand {
+        name: "instruction",
+        description: "submit through input admission",
+    },
+    SlashCommand {
+        name: "tool-memory",
+        description: "configure tool-result retention and loopback embedding",
+    },
+    SlashCommand {
+        name: "remember",
+        description: "configure saved conversation memory",
+    },
+    SlashCommand {
+        name: "subagents",
+        description: "inspect or wait for an exact child attempt",
+    },
+    SlashCommand {
+        name: "run",
+        description: "inspect a run or change its next turn limit",
+    },
+    SlashCommand {
         name: "help",
         description: "list available commands",
     },
     SlashCommand {
         name: "status",
         description: "show provider, model, and token usage",
+    },
+    SlashCommand {
+        name: "web-search",
+        description: "inspect hosted search availability",
+    },
+    SlashCommand {
+        name: "doctor",
+        description: "inspect local configuration and runtime availability",
+    },
+    SlashCommand {
+        name: "decided",
+        description: "inspect recorded project decisions",
+    },
+    SlashCommand {
+        name: "compare",
+        description: "compare folder names and sizes without opening file contents",
     },
     SlashCommand {
         name: "phase",
@@ -101,7 +153,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "pwd",
-        description: "show the current working directory",
+        description: "show the project root",
     },
     SlashCommand {
         name: "copy",
@@ -131,6 +183,20 @@ pub fn matching(prefix: &str) -> Vec<&'static SlashCommand> {
 pub enum Action {
     Help,
     Status,
+    WebSearch(String),
+    Doctor,
+    Account(String),
+    Memory(String),
+    SessionControl(String),
+    WorkspaceControl(String),
+    RuntimeControl(String),
+    Decided(String),
+    Compare(String),
+    /// Apply is intercepted by the terminal handler; recovery never resends
+    /// the source effect and requires the exact displayed operation key.
+    Sync(String),
+    #[cfg(target_os = "linux")]
+    Apply(String),
     /// Empty means display the current phase. A nonempty value is checked by
     /// the session so unknown names are rejected rather than coerced.
     Phase(String),
@@ -167,7 +233,7 @@ pub enum Action {
     Model,
     /// Local and display-only: registration and admission state, read
     /// without connecting to any server and without asking the model.
-    Mcp,
+    Mcp(String),
     Diff,
     /// Not a local command — the caller expands this (plus the carried
     /// extra instructions, if any were typed after the command name) into
@@ -198,6 +264,64 @@ pub enum Action {
     Unknown(String),
 }
 
+impl Action {
+    /// A pending durable management effect must be reconciled before these
+    /// commands can change session, project, clipboard, or remote state.
+    pub fn needs_management_clearance(&self) -> bool {
+        match self {
+            Self::Phase(value) | Self::Workflow(value) => !value.is_empty(),
+            Self::SessionControl(value) => {
+                !matches!(
+                    value.as_str(),
+                    "session" | "session current" | "session history" | "goal" | "goal current"
+                ) && !value.starts_with("history")
+            }
+            Self::WorkspaceControl(_) | Self::RuntimeControl(_) => false,
+            Self::Sync(value) => {
+                value == "apply"
+                    || value.starts_with("join ")
+                    || matches!(value.as_str(), "pull" | "leave")
+            }
+            #[cfg(target_os = "linux")]
+            Self::Apply(value) => {
+                value.starts_with("run ")
+                    || value.starts_with("resolve ") && value.ends_with(" allow")
+            }
+            Self::Account(value) => !value.is_empty() && value != "list",
+            Self::Memory(value) => {
+                let command = value.split_whitespace().next().unwrap_or("");
+                matches!(command, "import" | "index" | "embed" | "forget")
+            }
+            Self::Decided(value) => !value.is_empty() && value != "list",
+            Self::Mcp(value) => {
+                let command = value.split_whitespace().next().unwrap_or("");
+                matches!(
+                    command,
+                    "enable"
+                        | "disable"
+                        | "secret"
+                        | "check"
+                        | "setup"
+                        | "materialize"
+                        | "register"
+                        | "configure"
+                )
+            }
+            Self::New
+            | Self::Resume
+            | Self::Clear
+            | Self::Compact
+            | Self::Init
+            | Self::Fork
+            | Self::Export(_)
+            | Self::Copy
+            | Self::Logout
+            | Self::Quit => true,
+            _ => false,
+        }
+    }
+}
+
 /// The action for a name taken directly from `COMMANDS` (e.g. the
 /// currently-highlighted row in the suggestion popup) — every name in
 /// `COMMANDS` is by construction one `parse` already recognizes, so this
@@ -224,15 +348,28 @@ pub fn parse(line: &str) -> Option<Action> {
     Some(match name.as_str() {
         "" | "help" => Action::Help,
         "status" => Action::Status,
+        "web-search" => Action::WebSearch(extra),
+        "doctor" => Action::Doctor,
+        "session" | "goal" | "history" | "tool-memory" | "remember" => {
+            Action::SessionControl(format!("{name} {extra}").trim_end().to_owned())
+        }
+        "input" | "instruction" | "subagents" | "roles" | "run" | "sandbox" => {
+            Action::RuntimeControl(format!("{name} {extra}").trim_end().to_owned())
+        }
+        "decided" => Action::Decided(extra),
+        "compare" => Action::Compare(extra),
         "phase" => Action::Phase(extra),
         "workflow" => Action::Workflow(extra),
         "skills" => Action::Skills,
         "new" => Action::New,
         "resume" => Action::Resume,
         "clear" => Action::Clear,
+        "compact" if extra.starts_with("threshold ") => {
+            Action::SessionControl(format!("compact {extra}"))
+        }
         "compact" => Action::Compact,
         "init" => Action::Init,
-        "mcp" => Action::Mcp,
+        "mcp" => Action::Mcp(extra),
         "model" => Action::Model,
         "diff" => Action::Diff,
         "review" => Action::Review(extra),
@@ -250,6 +387,8 @@ pub fn parse(line: &str) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
 
     #[test]
     fn a_bare_slash_matches_every_command() {

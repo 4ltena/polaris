@@ -1785,6 +1785,7 @@ dependencies = [
  "libc",
  "polaris-auth",
  "polaris-core",
+ "polaris-mcp",
  "polaris-memory",
  "polaris-provider",
  "polaris-sandbox",

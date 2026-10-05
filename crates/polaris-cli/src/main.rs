@@ -1,7 +1,7 @@
 //! Entry point for the `polaris` binary. Decides the endpoint from environment
 //! variables, assembles the always-on context, and runs the agent loop once.
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -23,6 +23,8 @@ use polaris_sandbox::{SandboxMode, SandboxPolicy};
 use serde::Deserialize;
 
 mod account;
+#[cfg(unix)]
+mod admission;
 mod benchmark_report;
 mod compare;
 mod decided;
@@ -1400,18 +1402,30 @@ async fn restore_continuation_workflow(
         (None, None) => return Ok(()),
         _ => unreachable!("clap rejects mutually exclusive session flags"),
     };
-    polaris_tui::restore_prepared_continuation(
-        session,
-        &polaris_tui::PreparedContinuation {
-            kind,
-            persistence: saved.clone(),
-        },
-        config,
-        workflow_mode.is_some(),
-        skills,
-        history_backend_factory,
-    )
-    .await
+    let continuation = polaris_tui::PreparedContinuation {
+        kind,
+        persistence: saved.clone(),
+    };
+    if workflow_mode.is_some() {
+        polaris_tui::restore_prepared_continuation_for_managed_override(
+            session,
+            &continuation,
+            config,
+            skills,
+            history_backend_factory,
+        )
+        .await
+    } else {
+        polaris_tui::restore_prepared_continuation(
+            session,
+            &continuation,
+            config,
+            false,
+            skills,
+            history_backend_factory,
+        )
+        .await
+    }
 }
 
 enum ContinuationSource {
@@ -1595,6 +1609,7 @@ fn resolve_pending_workspace_before_execution(
         }
     }
 }
+
 #[cfg(unix)]
 fn validate_resolved_continuation_workspace(
     resolved: &ResolvedContinuation,
@@ -1620,13 +1635,29 @@ fn validate_resolved_continuation_workspace(
     )?;
     polaris_core::rewind_admission::validate_execution(&owner, &persistence)
 }
+
 /// Fork/import only after provider, helper, and strict-history preconditions
 /// have succeeded. Resume merely carries its earlier validated attachment.
+#[cfg(any(test, not(unix)))]
 fn prepare_continuation(
     resolved: ResolvedContinuation,
     data_root: &Path,
     database: &Path,
     project_id: &str,
+) -> std::io::Result<polaris_tui::PreparedContinuation> {
+    prepare_continuation_with(resolved, data_root, database, project_id, |source| {
+        source.fork("")
+    })
+}
+
+fn prepare_continuation_with(
+    resolved: ResolvedContinuation,
+    data_root: &Path,
+    database: &Path,
+    project_id: &str,
+    fork: impl FnOnce(
+        &polaris_core::session_store::PersistedSession,
+    ) -> std::io::Result<polaris_core::session_store::PersistedSession>,
 ) -> std::io::Result<polaris_tui::PreparedContinuation> {
     let persistence = match resolved.source {
         ContinuationSource::V2(target) => {
@@ -1646,7 +1677,7 @@ fn prepare_continuation(
             }
             match resolved.kind {
                 polaris_tui::ContinuationKind::Resume => persistence,
-                polaris_tui::ContinuationKind::Fork => persistence.fork("")?,
+                polaris_tui::ContinuationKind::Fork => fork(&persistence)?,
             }
         }
         ContinuationSource::Legacy(messages) => {
@@ -1664,6 +1695,210 @@ fn prepare_continuation(
         kind: resolved.kind,
         persistence,
     })
+}
+
+#[cfg(unix)]
+fn with_cli_management_lease<T>(
+    cwd: &Path,
+    state_dir: &Path,
+    data_root: &Path,
+    project_id: &str,
+    action: impl FnOnce(
+        &polaris_core::project_mutation::ProjectMutationLeaseV1,
+        &polaris_core::management_effect::ManagementEffectStoreV1,
+        &polaris_core::rewind_workspace::WorkspaceOwner,
+    ) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let owner = polaris_core::project_mutation::ProjectMutationOwnerV1::for_project(cwd)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let lease = owner
+        .try_mutation()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let rewind = polaris_core::rewind_workspace::WorkspaceOwner::open(
+        &polaris_core::project::resolve_root(cwd),
+        &state_dir.join("rewind-workspace"),
+        polaris_core::rewind_workspace::RewindLimits::default(),
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    rewind
+        .require_quiescent_with_lease(&lease)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let project_root = polaris_core::project::resolve_root(cwd);
+    let effects = polaris_core::management_effect::ManagementEffectStoreV1::open_at_state_dir(
+        &project_root,
+        state_dir,
+        &lease,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    polaris_core::session_switch::SessionSwitchOwner {
+        effects: &effects,
+        lease: &lease,
+        state_dir,
+    }
+    .recover(data_root, &state_dir.join("memory.sqlite3"), project_id)
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    polaris_core::management_effect::workflow_change::WorkflowChangeOwner {
+        effects: &effects,
+        lease: &lease,
+        state_dir,
+    }
+    .recover(data_root, &state_dir.join("memory.sqlite3"), project_id)
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if let Some(effect) = effects
+        .blocker()
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+    {
+        return Err(std::io::Error::other(format!(
+            "未解決の管理操作 {} ({}) があります",
+            effect.request.operation_id, effect.request.inventory
+        )));
+    }
+    action(&lease, &effects, &rewind)
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn apply_cli_workflow_override(
+    session: &mut Session,
+    mode: WorkflowModeArg,
+    skills: &[polaris_skills::Skill],
+    cwd: &Path,
+    state_dir: &Path,
+    data_root: &Path,
+    project_id: &str,
+) -> Result<(), String> {
+    let stdin = io::stdin();
+    let stderr = io::stderr();
+    apply_cli_workflow_override_with_confirmation(
+        session,
+        mode,
+        skills,
+        cwd,
+        state_dir,
+        data_root,
+        project_id,
+        stdin.is_terminal(),
+        stderr.is_terminal(),
+        &mut stdin.lock(),
+        &mut stderr.lock(),
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn apply_cli_workflow_override_with_confirmation<R: BufRead, W: Write>(
+    session: &mut Session,
+    mode: WorkflowModeArg,
+    skills: &[polaris_skills::Skill],
+    cwd: &Path,
+    state_dir: &Path,
+    data_root: &Path,
+    project_id: &str,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), String> {
+    use polaris_core::management_effect::workflow_change::{
+        WorkflowChangeError, WorkflowChangeOwner, WorkflowEffectInventoryV1,
+    };
+
+    session
+        .check_persistence()
+        .map_err(|error| error.to_string())?;
+    let current = session
+        .workflow
+        .as_ref()
+        .ok_or("保存済みworkflow設定がありません")?;
+    let mut config = current.config.clone();
+    mode.apply(&mut config);
+    let candidate = polaris_core::workflow::SessionWorkflow::restore_with_artifacts(
+        config,
+        current.gates.clone(),
+        current.state(),
+        current.artifact_graph().clone(),
+    )?;
+    if candidate.config.enabled {
+        drop(candidate.begin_turn_from_disk(skills)?);
+    }
+    let persistence = session
+        .persistence
+        .as_ref()
+        .ok_or("保存済み会話がありません")?;
+    let preview =
+        match WorkflowChangeOwner::preview(persistence, WorkflowEffectInventoryV1::F15, &candidate)
+        {
+            Ok(preview) => preview,
+            Err(WorkflowChangeError::NoChange) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+    if !stdin_is_terminal || !stderr_is_terminal {
+        return Err("既存会話の--workflow-modeには対話端末での確認が必要です".into());
+    }
+    let before = preview
+        .before_config()
+        .ok_or("変更前のworkflow設定がありません")?;
+    let after = preview
+        .candidate_config()
+        .ok_or("変更後のworkflow設定がありません")?;
+    writeln!(
+        output,
+        "F15 workflow変更: project={} session={} generation={} rewind=CapturedRestorable / phase {} → {} / mode {} → {}",
+        preview.project_id(),
+        preview.session_id(),
+        preview.before_generation(),
+        preview.before_workflow().phase,
+        preview.candidate_workflow().phase,
+        cli_workflow_mode_name(&before.config),
+        cli_workflow_mode_name(&after.config),
+    )
+    .map_err(|error| error.to_string())?;
+    write!(output, "この保存変更を受理しますか？ [y/N] ").map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())?;
+    let mut answer = String::new();
+    input
+        .read_line(&mut answer)
+        .map_err(|error| error.to_string())?;
+    if answer.trim() != "y" {
+        return Err("workflow変更を取り消しました".into());
+    }
+    with_cli_management_lease(
+        cwd,
+        state_dir,
+        data_root,
+        project_id,
+        |lease, effects, _rewind| {
+            let owner = WorkflowChangeOwner {
+                effects,
+                lease,
+                state_dir,
+            };
+            let operation_id = polaris_core::management_effect::ManagementOperationIdV1::random()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let prepared = owner
+                .prepare_confirmed(persistence, &preview, operation_id)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            owner
+                .execute(persistence, &prepared)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            Ok(())
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    session.workflow = Some(candidate);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cli_workflow_mode_name(config: &polaris_core::workflow::WorkflowConfig) -> &'static str {
+    if !config.enabled {
+        "off"
+    } else {
+        match config.mode {
+            polaris_core::workflow::WorkflowMode::Manual => "manual",
+            polaris_core::workflow::WorkflowMode::Adaptive => "adaptive",
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1752,6 +1987,7 @@ fn strict_history(
         usage,
     ))
 }
+
 #[cfg(target_os = "linux")]
 fn strict_history(
     _config: &polaris_core::config::EmbeddingConfig,
@@ -2117,7 +2353,79 @@ fn tier_providers(
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut args = Args::parse();
+    let args = Args::parse();
+    #[cfg(target_os = "linux")]
+    if linux_interactive_requested(&args) {
+        return run_with_linux_signal_owner(
+            || polaris_tui::signal::install_linux_process_signal_owner().map_err(|e| e.to_string()),
+            || main_with_args(args),
+            |diagnostic| eprintln!("{diagnostic}"),
+        )
+        .await;
+    }
+    main_with_args(args).await
+}
+
+#[cfg(target_os = "linux")]
+fn linux_interactive_requested(args: &Args) -> bool {
+    args.prompt.is_none() && args.command.is_none() && !args.confined_read && !args.confined_apply
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_linux_signal_diagnostic(kind: &str, error: &str) -> String {
+    let detail = error
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect::<String>();
+    format!("Linux signal owner {kind} failed: {detail}")
+}
+
+#[cfg(target_os = "linux")]
+async fn run_with_linux_signal_owner<Run, Fut>(
+    install: impl FnOnce() -> Result<polaris_tui::signal::LinuxProcessSignalOwner, String>,
+    run: Run,
+    mut report: impl FnMut(&str),
+) -> ExitCode
+where
+    Run: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ExitCode>,
+{
+    let mut owner = match install() {
+        Ok(owner) => owner,
+        Err(error) => {
+            report(&bounded_linux_signal_diagnostic("installation", &error));
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = run().await;
+    let signal = match owner.try_uninstall() {
+        Ok(signal) => signal,
+        Err(error) => {
+            report(&bounded_linux_signal_diagnostic(
+                "restoration",
+                &error.to_string(),
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+    if result != ExitCode::SUCCESS {
+        return result;
+    }
+    match signal {
+        Some(polaris_tui::signal::LinuxProcessShutdown::SigInt) => ExitCode::from(130),
+        Some(polaris_tui::signal::LinuxProcessShutdown::SigTerm) => ExitCode::from(143),
+        None => result,
+    }
+}
+
+async fn main_with_args(mut args: Args) -> ExitCode {
     if args.web_search != WebSearchArg::Disabled {
         eprintln!(
             "Web検索は接続先の上限契約が未確認のため利用できません。disabledを使用してください。"
@@ -2274,7 +2582,7 @@ async fn main() -> ExitCode {
     // types, while the state directory (which resolves internally) stays
     // the same. Half the run followed the project and half did not.
     let project_root = polaris_core::project::resolve_root(&cwd);
-    let (_, preflight_sessions_dir) = match preflight_storage_paths(&cwd) {
+    let (preflight_state_dir, preflight_sessions_dir) = match preflight_storage_paths(&cwd) {
         Ok(paths) => paths,
         Err(error) => {
             eprintln!("Can't determine the storage directories: {error}");
@@ -2307,6 +2615,13 @@ async fn main() -> ExitCode {
         eprintln!("v2セッションの保存先を特定できません");
         return ExitCode::FAILURE;
     };
+    #[cfg(unix)]
+    if let Err(error) =
+        resolve_pending_workspace_before_execution(&project_root, &preflight_state_dir)
+    {
+        eprintln!("巻き戻し途中の作業ファイルを復旧できません: {error}");
+        return ExitCode::FAILURE;
+    }
     let resolved_continuation = match resolve_continuation(
         args.resume.as_deref(),
         args.fork.as_deref(),
@@ -2322,6 +2637,19 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    #[cfg(unix)]
+    if let Some(resolved) = &resolved_continuation
+        && let Err(error) = validate_resolved_continuation_workspace(
+            resolved,
+            &project_root,
+            &preflight_state_dir,
+            preflight_data_root,
+            &project_id,
+        )
+    {
+        eprintln!("保存済み会話の実行許可を確認できません: {error}");
+        return ExitCode::FAILURE;
+    }
     let history_mode = resolved_continuation
         .as_ref()
         .map(|continuation| continuation.history_mode)
@@ -2872,13 +3200,56 @@ async fn main() -> ExitCode {
         None
     };
     let continuation = match resolved_continuation {
-        Some(resolved) => prepare_continuation(
-            resolved,
-            data_root,
-            &state_dir.join("memory.sqlite3"),
-            &project_id,
-        )
-        .map(Some),
+        Some(resolved) => {
+            #[cfg(unix)]
+            let prepared = with_cli_management_lease(
+                &cwd,
+                &state_dir,
+                data_root,
+                &project_id,
+                |lease, effects, rewind| {
+                    if let ContinuationSource::V2(target) = &resolved.source {
+                        let source = polaris_core::session_store::PersistedSession::open(
+                            data_root,
+                            &state_dir.join("memory.sqlite3"),
+                            &project_id,
+                            &target.id,
+                        )?;
+                        polaris_core::rewind_admission::validate_execution(rewind, &source)?;
+                    }
+                    let switch = polaris_core::session_switch::SessionSwitchOwner {
+                        effects,
+                        lease,
+                        state_dir: &state_dir,
+                    };
+                    prepare_continuation_with(
+                        resolved,
+                        data_root,
+                        &state_dir.join("memory.sqlite3"),
+                        &project_id,
+                        |source| {
+                            switch
+                            .fork(
+                                source,
+                                polaris_core::management_effect::ManagementInventoryIdV1::parse(
+                                    "F18",
+                                )
+                                .expect("approved F18 inventory"),
+                            )
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                        },
+                    )
+                },
+            );
+            #[cfg(not(unix))]
+            let prepared = prepare_continuation(
+                resolved,
+                data_root,
+                &state_dir.join("memory.sqlite3"),
+                &project_id,
+            );
+            prepared.map(Some)
+        }
         None => Ok(None),
     };
     let continuation = match continuation {
@@ -3030,20 +3401,46 @@ async fn main() -> ExitCode {
                 (Some(_), None) | (None, Some(_)) => continuation
                     .as_ref()
                     .map(|continuation| Ok(continuation.persistence.clone())),
-                (None, None)
-                    if config.workflow.enabled
-                        || history_mode
-                            != polaris_core::conversation_state::HistoryMode::Legacy =>
-                {
-                    Some(polaris_core::session_store::PersistedSession::create(
+                (None, None) => {
+                    #[cfg(unix)]
+                    let created = with_cli_management_lease(
+                        &cwd,
+                        &state_dir,
+                        data_root,
+                        &project_id,
+                        |lease, effects, _rewind| {
+                            let switch = polaris_core::session_switch::SessionSwitchOwner {
+                                effects,
+                                lease,
+                                state_dir: &state_dir,
+                            };
+                            switch
+                            .create_new(
+                                None,
+                                data_root,
+                                &database,
+                                &project_id,
+                                history_mode,
+                                session.workflow.as_ref(),
+                                // Fresh CLI and TUI /new share the local-session owner.
+                                polaris_core::management_effect::ManagementInventoryIdV1::parse(
+                                    "T06",
+                                )
+                                .expect("approved T06 inventory"),
+                            )
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                        },
+                    );
+                    #[cfg(not(unix))]
+                    let created = polaris_core::session_store::PersistedSession::create(
                         data_root,
                         &database,
                         &project_id,
                         history_mode,
                         session.workflow.as_ref(),
-                    ))
+                    );
+                    Some(created)
                 }
-                (None, None) => None,
                 _ => unreachable!("clap rejects mutually exclusive session flags"),
             };
             let persistence = match persistence {
@@ -3069,6 +3466,29 @@ async fn main() -> ExitCode {
             {
                 eprintln!("{error}");
                 return ExitCode::FAILURE;
+            }
+            if (args.resume.is_some() || args.fork.is_some())
+                && let Some(mode) = args.workflow_mode
+            {
+                #[cfg(unix)]
+                if let Err(error) = apply_cli_workflow_override(
+                    &mut session,
+                    mode,
+                    &discovered.skills,
+                    &cwd,
+                    &state_dir,
+                    data_root,
+                    &project_id,
+                ) {
+                    eprintln!("workflow変更を保存できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = mode;
+                    eprintln!("workflow変更には管理操作が必要です");
+                    return ExitCode::FAILURE;
+                }
             }
             if args.resume.is_none()
                 && args.fork.is_none()
@@ -3208,15 +3628,117 @@ async fn main() -> ExitCode {
             if args.tool_memory.retention().is_some() {
                 eprintln!("ツール記憶セッション: {session_id}");
             }
-            session.push_user(&prompt);
+            #[cfg(unix)]
+            let (_management_effects, _project_activity) = {
+                let owner =
+                    match polaris_core::project_mutation::ProjectMutationOwnerV1::for_project(&cwd)
+                    {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            eprintln!("管理操作の記録を確認できません: {error}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                let lease = match owner.try_mutation() {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        eprintln!("管理操作の復旧を開始できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let project_root = polaris_core::project::resolve_root(&cwd);
+                let store = match polaris_core::management_effect::ManagementEffectStoreV1::open_at_state_dir(
+                    &project_root,
+                    &state_dir,
+                    &lease,
+                ) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        eprintln!("管理操作の記録を復旧できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                match store.blocker() {
+                    Ok(None) => {}
+                    Ok(Some(effect)) => {
+                        eprintln!(
+                            "未解決の管理操作 {} ({}) があります。新しい入力は開始できません",
+                            effect.request.operation_id, effect.request.inventory
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    Err(error) => {
+                        eprintln!("管理操作の状態を確認できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                drop(lease);
+                let workspace = match polaris_core::rewind_workspace::WorkspaceOwner::open(
+                    &project_root,
+                    &state_dir.join("rewind-workspace"),
+                    polaris_core::rewind_workspace::RewindLimits::default(),
+                ) {
+                    Ok(workspace) => workspace,
+                    Err(error) => {
+                        eprintln!("巻き戻しtransactionを確認できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let activity = match workspace.try_activity_quiescent() {
+                    Ok(activity) => activity,
+                    Err(error) => {
+                        eprintln!(
+                            "作業場所が他の処理に使われているため、実行を開始できません: {error}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if let Err(error) = store.blocker().and_then(|blocker| {
+                    if blocker.is_some() {
+                        Err(polaris_core::management_effect::ManagementEffectStoreError::UnresolvedEffect)
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    eprintln!("管理操作の状態を確認できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+                (store, activity)
+            };
+            #[cfg(unix)]
+            let mut cli_admission =
+                match admission::CliAdmission::reserve(&state_dir, &session, &prompt) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        eprintln!("CLI入力を受理できません: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            macro_rules! abort_before_input {
+                ($($argument:tt)*) => {{
+                    #[cfg(unix)]
+                    if let Err(error) = cli_admission.cancel_before_append() {
+                        eprintln!("受理済み入力を取消できません: {error}");
+                    }
+                    eprintln!($($argument)*);
+                    return ExitCode::FAILURE;
+                }};
+            }
+            let durable_session_id = session
+                .persistence
+                .as_ref()
+                .and_then(|store| store.snapshot().ok())
+                .map(|snapshot| snapshot.state.session_id)
+                .unwrap_or_else(|| session_id.clone());
             let ceiling =
                 polaris_core::mcp::operation::ExternalCeiling::host_external(args.mcp_external);
             let mut mcp_runtime = None;
             let mut mcp_revision = None;
+            let mut selected_prompt_message = None;
             match polaris_core::mcp::local::LocalHost::open(&cwd, false) {
                 Ok(host) => {
                     mcp_revision = Some(registry_revision(&host));
-                    match host.runtime(&session_id, "exec", ceiling) {
+                    match host.runtime(&durable_session_id, "exec", ceiling) {
                         Ok(Some((mut runtime, quarantined))) => {
                             if !quarantined.is_empty() && host.root_contains_home() {
                                 eprintln!(
@@ -3242,27 +3764,27 @@ async fn main() -> ExitCode {
                                 let choice = match mcp_prompt_choice(spec, &args.mcp_prompt_args) {
                                     Ok(choice) => choice,
                                     Err(message) => {
-                                        eprintln!("{message}");
-                                        return ExitCode::FAILURE;
+                                        abort_before_input!("{message}");
                                     }
                                 };
                                 match runtime.host_prompt(&choice, std::future::pending()).await {
-                                    Ok(result) if result.permits_continuation() => {
+                                    Ok(result) => {
+                                        let confirmed = result.permits_continuation();
+                                        if !confirmed {
+                                            abort_before_input!(
+                                                "MCP prompt {}/{} は確認できませんでした",
+                                                choice.server,
+                                                choice.prompt
+                                            );
+                                        }
+                                        selected_prompt_message = Some(result.message);
                                         eprintln!(
                                             "MCP prompt {}/{} を選びました",
                                             choice.server, choice.prompt
                                         );
                                     }
-                                    Ok(_) => {
-                                        eprintln!(
-                                            "MCP prompt {}/{} は確認できませんでした",
-                                            choice.server, choice.prompt
-                                        );
-                                        return ExitCode::FAILURE;
-                                    }
                                     Err(error) => {
-                                        eprintln!("MCP promptを選べません: {error}");
-                                        return ExitCode::FAILURE;
+                                        abort_before_input!("MCP promptを選べません: {error}");
                                     }
                                 }
                             }
@@ -3274,6 +3796,29 @@ async fn main() -> ExitCode {
                     session.mcp_setup = Some(std::sync::Arc::new(host.setup_tool(ceiling)));
                 }
                 Err(error) => eprintln!("MCPを使わずに実行します: {error}"),
+            }
+            if args.mcp_prompt.is_some() && mcp_runtime.is_none() {
+                abort_before_input!("MCP promptを選べません: MCPサーバーを利用できません");
+            }
+            #[cfg(unix)]
+            if let Err(error) =
+                cli_admission.append_and_start(&mut session, &prompt, selected_prompt_message)
+            {
+                eprintln!("CLI入力を保存・開始できません: {error}");
+                return ExitCode::FAILURE;
+            }
+            #[cfg(not(unix))]
+            if let Some(message) = selected_prompt_message {
+                if let Err(error) = session.push_user_with_supplement(&prompt, message) {
+                    eprintln!("MCP prompt付き入力を保存できません: {error}");
+                    return ExitCode::FAILURE;
+                }
+            } else {
+                session.push_user(&prompt);
+            }
+            if let Err(error) = session.check_persistence() {
+                eprintln!("入力を保存できません: {error}");
+                return ExitCode::FAILURE;
             }
             // 同梱の定型コマンド。projectのrootへ束縛するので、実行した
             // directoryではなくprojectが対象になる。
@@ -3293,12 +3838,6 @@ async fn main() -> ExitCode {
             // durable Desktop projection hook, so this owner is intentionally
             // in-memory for this root run while still routing every spawn
             // through the controlled path.
-            let durable_session_id = session
-                .persistence
-                .as_ref()
-                .and_then(|store| store.snapshot().ok())
-                .map(|snapshot| snapshot.state.session_id)
-                .unwrap_or_else(|| session_id.clone());
             let active_task = session
                 .workflow
                 .as_ref()
@@ -3406,6 +3945,11 @@ async fn main() -> ExitCode {
                 mcp_runtime.as_mut(),
             )
             .await;
+            #[cfg(unix)]
+            if let Err(error) = cli_admission.finish(outcome.is_ok()) {
+                eprintln!("CLI入力の終端状態を保存できません: {error}");
+                return ExitCode::FAILURE;
+            }
             // Child MCP read snapshots are in-memory, root-bound evidence.
             // Do not let a one-shot CLI root retain them while shutdown,
             // output formatting, or later process reuse runs.
@@ -4082,6 +4626,7 @@ fn doctor_rewind_candidate_lines(
     }
     lines
 }
+
 #[cfg(all(test, unix))]
 mod doctor_rewind_candidate_tests {
     use super::doctor_rewind_candidate_lines;
@@ -4145,6 +4690,7 @@ mod doctor_rewind_candidate_tests {
         assert_eq!(std::fs::read(store).unwrap(), b"keep");
     }
 }
+
 /// When `POLARIS_PROVIDER` isn't set, decides which provider arm to try
 /// first. Prefers `openai` if a key is available (env var or the saved
 /// `api_key.json`), since that's the arm onboarding itself lives on. If no
@@ -4216,6 +4762,43 @@ mod prompt_choice_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_process_signal_install_failure_exits_one_before_terminal_mutation() {
+        use clap::Parser;
+
+        let interactive = super::Args::try_parse_from(["polaris"]).unwrap();
+        assert!(super::linux_interactive_requested(&interactive));
+        let one_shot = super::Args::try_parse_from(["polaris", "--prompt", "hello"]).unwrap();
+        assert!(!super::linux_interactive_requested(&one_shot));
+        let confined = super::Args::try_parse_from(["polaris", "--confined-read"]).unwrap();
+        assert!(!super::linux_interactive_requested(&confined));
+
+        let entered = std::rc::Rc::new(std::cell::Cell::new(false));
+        let entered_run = std::rc::Rc::clone(&entered);
+        let diagnostics = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let reported = std::rc::Rc::clone(&diagnostics);
+        let status = super::run_with_linux_signal_owner(
+            || Err("x".repeat(2048)),
+            move || async move {
+                entered_run.set(true);
+                std::process::ExitCode::SUCCESS
+            },
+            move |message| reported.borrow_mut().push(message.to_owned()),
+        )
+        .await;
+        assert_eq!(status, std::process::ExitCode::FAILURE);
+        assert!(
+            !entered.get(),
+            "the terminal entry must not run after install failure"
+        );
+        let diagnostics = diagnostics.borrow();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].starts_with("Linux signal owner installation failed: "));
+        assert!(diagnostics[0].len() <= 560);
+        assert!(!diagnostics[0].contains('\n'));
+    }
+
     #[cfg(unix)]
     #[test]
     fn ordinary_cli_startup_resolves_pending_rewind_before_execution() {
@@ -4247,6 +4830,7 @@ mod tests {
         assert_eq!(std::fs::read(project.join("file.txt")).unwrap(), b"after");
         assert!(resolve_pending_workspace_before_execution(&project, &state_dir).is_ok());
     }
+
     #[tokio::test]
     async fn resume_and_fork_restore_saved_focus_without_resetting_runtime_settings() {
         use polaris_core::{
@@ -4335,9 +4919,10 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(!session.workflow.as_ref().unwrap().config.enabled);
+            // F15 is applied only after terminal confirmation by the owner.
+            assert!(session.workflow.as_ref().unwrap().config.enabled);
             assert!(
-                !saved
+                saved
                     .snapshot()
                     .unwrap()
                     .state
@@ -4347,6 +4932,211 @@ mod tests {
                     .enabled
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_v2_workflow_override_cancellation_and_noninteractive_do_not_mutate_persistence() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            management_effect::ManagementEffectStoreV1,
+            project_mutation::ProjectMutationOwnerV1,
+            session_store::PersistedSession,
+            workflow::{Phase, SessionWorkflow, WorkflowConfig},
+        };
+
+        for (label, stdin_is_terminal, stderr_is_terminal, answer, expected) in [
+            (
+                "cancel",
+                true,
+                true,
+                b"n\n".as_slice(),
+                "workflow変更を取り消しました",
+            ),
+            (
+                "noninteractive",
+                false,
+                false,
+                b"y\n".as_slice(),
+                "既存会話の--workflow-modeには対話端末での確認が必要です",
+            ),
+        ] {
+            let root = tempfile::tempdir().expect("temp root");
+            let home = root.path().join("home");
+            let project = root.path().join("project");
+            let data = root.path().join("data");
+            std::fs::create_dir(&home).expect("home");
+            std::fs::create_dir(&project).expect("project");
+            std::fs::create_dir(project.join(".polaris")).expect("project marker");
+            std::fs::create_dir(&data).expect("data");
+            with_home(&home, || {
+                let state_dir = polaris_core::project::state_dir(&project).expect("state dir");
+                let workflow = SessionWorkflow::new(WorkflowConfig {
+                    enabled: true,
+                    initial_phase: Phase::Review,
+                    ..WorkflowConfig::default()
+                });
+                let saved = PersistedSession::create(
+                    &data,
+                    &data.join("memory.sqlite3"),
+                    "test-project",
+                    HistoryMode::Legacy,
+                    Some(&workflow),
+                )
+                .expect("create saved v2 session");
+                let mutation_owner = ProjectMutationOwnerV1::for_project(&project).expect("owner");
+                let lease = mutation_owner.try_mutation().expect("lease");
+                ManagementEffectStoreV1::open_at_state_dir(&project, &state_dir, &lease)
+                    .expect("effect store");
+                drop(lease);
+                let journal = state_dir.join("management-effects-v1/journal.v1.jsonl");
+                let management_before = std::fs::read(&journal).expect("management journal");
+                let session_id = saved.snapshot().expect("snapshot").state.session_id;
+                let session_dir = data.join("sessions-v2").join(session_id);
+                let state_before =
+                    std::fs::read(session_dir.join("state.json")).expect("state bytes");
+                let raw_before = std::fs::read(session_dir.join("raw.jsonl")).expect("raw bytes");
+                let snapshot_before = saved.snapshot().expect("snapshot before");
+                let workflow_before = workflow.config.clone();
+                let mut session = Session {
+                    workflow: Some(workflow),
+                    ..Session::default()
+                };
+                session.attach(saved.clone()).expect("attach saved session");
+                let mut input = std::io::Cursor::new(answer);
+                let mut output = Vec::new();
+
+                let error = apply_cli_workflow_override_with_confirmation(
+                    &mut session,
+                    WorkflowModeArg::Adaptive,
+                    &[],
+                    &project,
+                    &state_dir,
+                    &data,
+                    "test-project",
+                    stdin_is_terminal,
+                    stderr_is_terminal,
+                    &mut input,
+                    &mut output,
+                )
+                .expect_err("F15 must stop before its owner executes");
+
+                assert_eq!(error, expected, "{label}");
+                assert_eq!(
+                    session.workflow.as_ref().expect("workflow").config,
+                    workflow_before,
+                    "{label}"
+                );
+                let snapshot_after = saved.snapshot().expect("snapshot after");
+                assert_eq!(snapshot_after.state, snapshot_before.state, "{label}");
+                assert_eq!(
+                    snapshot_after.raw_offset, snapshot_before.raw_offset,
+                    "{label}"
+                );
+                assert_eq!(snapshot_after.raw_hash, snapshot_before.raw_hash, "{label}");
+                assert_eq!(
+                    std::fs::read(session_dir.join("state.json")).unwrap(),
+                    state_before,
+                    "{label}"
+                );
+                assert_eq!(
+                    std::fs::read(session_dir.join("raw.jsonl")).unwrap(),
+                    raw_before,
+                    "{label}"
+                );
+                assert_eq!(
+                    std::fs::read(&journal).unwrap(),
+                    management_before,
+                    "{label}"
+                );
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_v2_workflow_override_confirmation_executes_completed_f15() {
+        use polaris_core::{
+            conversation_state::HistoryMode,
+            management_effect::{ManagementEffectStateV1, ManagementEffectStoreV1},
+            project_mutation::ProjectMutationOwnerV1,
+            session_store::PersistedSession,
+            workflow::{Phase, SessionWorkflow, WorkflowConfig, WorkflowMode},
+        };
+
+        let root = tempfile::tempdir().expect("temp root");
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let data = root.path().join("data");
+        std::fs::create_dir(&home).expect("home");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(project.join(".polaris")).expect("project marker");
+        std::fs::create_dir(&data).expect("data");
+        with_home(&home, || {
+            let state_dir = polaris_core::project::state_dir(&project).expect("state dir");
+            let workflow = SessionWorkflow::new(WorkflowConfig {
+                enabled: true,
+                initial_phase: Phase::Review,
+                ..WorkflowConfig::default()
+            });
+            let saved = PersistedSession::create(
+                &data,
+                &data.join("memory.sqlite3"),
+                "test-project",
+                HistoryMode::Legacy,
+                Some(&workflow),
+            )
+            .expect("create saved v2 session");
+            let mut session = Session {
+                workflow: Some(workflow),
+                ..Session::default()
+            };
+            session.attach(saved.clone()).expect("attach saved session");
+            let mut input = std::io::Cursor::new(b"y\n");
+            let mut output = Vec::new();
+
+            apply_cli_workflow_override_with_confirmation(
+                &mut session,
+                WorkflowModeArg::Adaptive,
+                &[],
+                &project,
+                &state_dir,
+                &data,
+                "test-project",
+                true,
+                true,
+                &mut input,
+                &mut output,
+            )
+            .expect("confirmed F15");
+
+            assert_eq!(
+                session.workflow.as_ref().expect("workflow").config.mode,
+                WorkflowMode::Adaptive
+            );
+            assert_eq!(
+                saved
+                    .snapshot()
+                    .expect("saved snapshot")
+                    .state
+                    .workflow_config
+                    .expect("saved config")
+                    .config
+                    .mode,
+                WorkflowMode::Adaptive
+            );
+            let mutation_owner = ProjectMutationOwnerV1::for_project(&project).expect("owner");
+            let lease = mutation_owner.try_mutation().expect("lease");
+            let effects = ManagementEffectStoreV1::open_at_state_dir(&project, &state_dir, &lease)
+                .expect("effect store");
+            let effects = effects.effects().expect("effects");
+            assert!(matches!(
+                effects.as_slice(),
+                [effect]
+                    if effect.request.inventory.encoded() == "F15"
+                        && matches!(&effect.state, ManagementEffectStateV1::Completed { .. })
+            ));
+        });
     }
 
     #[test]
@@ -5988,12 +6778,13 @@ mod tool_memory_settings_tests {
 
         config.answer_finalizer.translation.activation = TranslationActivation::Requested;
         config.answer_finalizer.translation.profile = Some(TranslationProfile::CatTranslate3_3b);
-        assert!(
-            build_tui_answer_finalizer(&config, root.path(), Some(root.path()))
-                .await
-                .unwrap()
-                .is_some(),
-            "a missing managed model remains an observational shadow failure"
+        let owner = build_tui_answer_finalizer(&config, root.path(), Some(root.path()))
+            .await
+            .unwrap()
+            .expect("missing managed model remains an observational shadow failure");
+        assert_eq!(
+            owner.translation_observation().unwrap(),
+            (true, None, false, 0)
         );
 
         config.answer_finalizer.mode = AnswerFinalizerMode::Enforce;

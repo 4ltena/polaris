@@ -26,6 +26,41 @@ fn names_and_sizes_come_back_and_nothing_else() {
 }
 
 #[test]
+fn a_missing_or_non_directory_root_is_not_an_empty_sample() {
+    let dir = tempfile::tempdir().expect("a temporary folder");
+    let missing = dir.path().join("missing");
+    let file = dir.path().join("file.txt");
+    std::fs::write(&file, "not a folder").expect("a regular file");
+
+    for root in [&missing, &file] {
+        assert!(
+            folder("one", root).is_err(),
+            "{root:?} must not produce a successful empty comparison"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_root_is_an_error_when_permissions_are_enforced() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("a temporary folder");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000))
+        .expect("locked root");
+
+    let read_is_denied = std::fs::read_dir(dir.path()).is_err();
+    let sampled = folder("one", dir.path());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("unlocked root");
+
+    if read_is_denied {
+        assert!(
+            sampled.is_err(),
+            "an unreadable root must not sample as empty"
+        );
+    }
+}
+
+#[test]
 fn what_a_build_left_behind_is_not_what_the_project_is() {
     let dir = tempfile::tempdir().expect("a temporary folder");
     write(dir.path(), "src/main.rs", "fn main() {}");

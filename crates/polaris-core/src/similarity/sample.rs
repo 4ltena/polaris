@@ -61,11 +61,12 @@ fn walk(
     if depth > MAX_DEPTH || *truncated {
         return Ok(());
     }
-    // A directory that cannot be read is left out rather than failing the
-    // whole sample: one unreadable corner should not make a project
-    // uncomparable.
-    let Ok(read) = std::fs::read_dir(at) else {
-        return Ok(());
+    // An unreadable child can be left out, but an unreadable root is not a
+    // successful empty sample of the requested project.
+    let read = match std::fs::read_dir(at) {
+        Ok(read) => read,
+        Err(error) if depth == 0 => return Err(error),
+        Err(_) => return Ok(()),
     };
     for entry in read.flatten() {
         let name = entry.file_name();

@@ -20,6 +20,466 @@ fn empty() -> RegisteredSecrets {
     RegisteredSecrets::new([]).unwrap()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_d27_fixture() -> (
+    TempDir,
+    Snapshot,
+    ChangeSet,
+    TempDir,
+    crate::workspace_apply::RecoveryParent,
+    crate::desktop_store::SavedSourceApply,
+) {
+    use crate::desktop_store::*;
+    use polaris_desktop_protocol::{ids::*, snapshot::ApprovalDecision};
+    let (source_owner, source) = fixture();
+    fs::write(source.join("changed"), b"before").unwrap();
+    fs::set_permissions(source.join("changed"), Permissions::from_mode(0o6755)).unwrap();
+    fs::write(source.join("deleted"), b"delete").unwrap();
+    fs::write(source.join("unchanged"), b"retain").unwrap();
+    let snapshot = snapshot(&source, &empty(), limits()).unwrap();
+    fs::write(snapshot.path().join("changed"), b"after").unwrap();
+    fs::set_permissions(
+        snapshot.path().join("changed"),
+        Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    fs::remove_file(snapshot.path().join("deleted")).unwrap();
+    fs::write(snapshot.path().join("created"), b"new").unwrap();
+    fs::set_permissions(
+        snapshot.path().join("created"),
+        Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let mut changes = collect_changes(&snapshot, &empty(), limits()).unwrap();
+    let (recovery_owner, recovery_path) = fixture();
+    fs::set_permissions(&recovery_path, Permissions::from_mode(0o700)).unwrap();
+    let recovery_file = File::open(&recovery_path).unwrap();
+    let metadata = recovery_file.metadata().unwrap();
+    let recovery = crate::workspace_apply::RecoveryParent::pin(
+        &recovery_file,
+        (metadata.dev(), metadata.ino()),
+        &recovery_path,
+    )
+    .unwrap();
+    let version = |entry: &ManifestEntry, before: bool| SourceApplyVersion {
+        hash: entry
+            .sha256
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+        mode: if before {
+            entry.observed_mode()
+        } else {
+            entry.mode
+        },
+    };
+    let payload = SourceApplyPayload {
+        source_path: source.to_str().unwrap().into(),
+        source_identity: SourceApplyIdentity {
+            device: DecimalU64::new(snapshot.source_identity.device),
+            inode: DecimalU64::new(snapshot.source_identity.inode),
+        },
+        recovery_parent_path: recovery_path.to_str().unwrap().into(),
+        recovery_parent_identity: SourceApplyIdentity {
+            device: DecimalU64::new(metadata.dev()),
+            inode: DecimalU64::new(metadata.ino()),
+        },
+        entries: changes
+            .changes
+            .iter()
+            .map(|change| SourceApplyEntry {
+                relative_path: change.relative_path.to_str().unwrap().into(),
+                before: change.before.as_ref().map(|entry| version(entry, true)),
+                after: change.after.as_ref().map(|entry| version(entry, false)),
+            })
+            .collect(),
+    };
+    let record = SavedSourceApply {
+        candidate: SourceApplyCandidate {
+            run_id: RunId::new("run").unwrap(),
+            attempt_id: AttemptId::new("attempt").unwrap(),
+            approval_id: ApprovalId::new("approval").unwrap(),
+            operation_id: OperationId::new("operation").unwrap(),
+            policy_revision: DecimalU64::new(7),
+            expires_at_unix_ms: DecimalU64::new(100),
+            payload_hash: payload.payload_hash().unwrap(),
+            payload,
+        },
+        decision: Some(ApprovalDecision::Allow),
+        invalidated: false,
+        intent_revision: None,
+        reserved_result_id: None,
+        result: None,
+    };
+    changes.changes.reverse(); // Container order is not wire order.
+    (
+        source_owner,
+        snapshot,
+        changes,
+        recovery_owner,
+        recovery,
+        record,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_d27_tree(root: &Path) -> BTreeMap<PathBuf, (Identity, u32, u32, u64, Vec<u8>)> {
+    fn visit(path: &Path, out: &mut BTreeMap<PathBuf, (Identity, u32, u32, u64, Vec<u8>)>) {
+        let meta = fs::symlink_metadata(path).unwrap();
+        let bytes = if meta.is_file() {
+            fs::read(path).unwrap()
+        } else {
+            Vec::new()
+        };
+        out.insert(
+            path.to_owned(),
+            (
+                Identity::of(&meta),
+                meta.mode(),
+                meta.uid(),
+                meta.nlink(),
+                bytes,
+            ),
+        );
+        if meta.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(&entry.unwrap().path(), out);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    visit(root, &mut out);
+    out
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_d27_projection_reads_changed_subset_and_keeps_observed_and_normal_modes() {
+    use crate::apply_intent::CanonicalApplyEvidence;
+    let (_source, snapshot, changes, _recovery, recovery, record) = m2a_d27_fixture();
+    let before = [
+        m2a_d27_tree(&snapshot.source_path),
+        m2a_d27_tree(snapshot.path()),
+        m2a_d27_tree(recovery.provenance()),
+    ];
+    let artifacts =
+        project_d27_source_m2a(&snapshot, &changes, &record, &recovery, &empty(), limits())
+            .unwrap();
+    assert_eq!(
+        before,
+        [
+            m2a_d27_tree(&snapshot.source_path),
+            m2a_d27_tree(snapshot.path()),
+            m2a_d27_tree(recovery.provenance())
+        ]
+    );
+    assert_eq!(
+        artifacts
+            .binding
+            .manifest
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        ["changed", "created", "deleted"]
+    );
+    assert_eq!(artifacts.binding.manifest.entries.len(), 3);
+    assert!(
+        !artifacts
+            .binding
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path == "unchanged")
+    );
+    let changed = &artifacts.binding.manifest.entries[0];
+    let old = changed.before.as_ref().unwrap();
+    let new = changed.after.as_ref().unwrap();
+    assert_eq!(old.normal_mode, 0o755);
+    assert_eq!(old.observed_mode, 0o6755);
+    assert_eq!(new.normal_mode, 0o640);
+    assert_eq!(new.observed_mode, 0o640);
+    assert_eq!(old.bytes, 6);
+    assert_eq!(new.bytes, 5);
+    assert_eq!(
+        old.device,
+        changes
+            .changes
+            .iter()
+            .find(|c| c.relative_path == Path::new("changed"))
+            .unwrap()
+            .before
+            .as_ref()
+            .unwrap()
+            .identity
+            .device
+    );
+    assert_eq!(
+        artifacts.request.entries[0].before.as_ref().unwrap().mode,
+        0o755
+    );
+    assert_eq!(
+        artifacts.request.entries[0]
+            .before
+            .as_ref()
+            .unwrap()
+            .observed_mode,
+        0o6755
+    );
+    assert!(artifacts.request.entries[1].before.is_none());
+    assert!(artifacts.request.entries[2].after.is_none());
+    artifacts
+        .source_before
+        .verify_before(&artifacts.request)
+        .unwrap();
+    assert_eq!(
+        artifacts.binding.payload_hash.as_hex(),
+        record.candidate.payload_hash
+    );
+    assert_eq!(
+        artifacts.binding.payload_bytes,
+        serde_json::to_vec(&record.candidate.payload).unwrap().len() as u64
+    );
+    assert_eq!(
+        artifacts.binding.manifest_bytes,
+        artifacts.binding.manifest.canonical_bytes().unwrap().len() as u64
+    );
+    assert_eq!(
+        artifacts.binding.request_bytes,
+        artifacts.request.canonical_bytes().unwrap().len() as u64
+    );
+    assert_eq!(
+        artifacts.binding.source_before_hash,
+        artifacts.source_before.observation_hash().unwrap()
+    );
+    assert_eq!(
+        artifacts.binding.source_before_bytes,
+        artifacts.source_before.canonical_bytes().unwrap().len() as u64
+    );
+    assert_eq!(
+        artifacts.binding,
+        crate::apply_intent::D27SourceBindingV1::from_canonical_bytes(
+            &artifacts.binding.canonical_bytes().unwrap()
+        )
+        .unwrap()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_d27_projection_refuses_each_payload_field_and_changed_manifest_field_without_writes() {
+    use polaris_desktop_protocol::ids::DecimalU64;
+    let (_source, snapshot, changes, _recovery, recovery, record) = m2a_d27_fixture();
+    let before = [
+        m2a_d27_tree(&snapshot.source_path),
+        m2a_d27_tree(snapshot.path()),
+        m2a_d27_tree(recovery.provenance()),
+    ];
+    for field in 0..17 {
+        let mut altered = record.clone();
+        let payload = &mut altered.candidate.payload;
+        match field {
+            0 => payload.source_path.push_str("-other"),
+            1 => {
+                payload.source_identity.device =
+                    payload.source_identity.device.checked_add(1).unwrap()
+            }
+            2 => {
+                payload.source_identity.inode =
+                    payload.source_identity.inode.checked_add(1).unwrap()
+            }
+            3 => payload.recovery_parent_path.push_str("-other"),
+            4 => {
+                payload.recovery_parent_identity.device = payload
+                    .recovery_parent_identity
+                    .device
+                    .checked_add(1)
+                    .unwrap()
+            }
+            5 => {
+                payload.recovery_parent_identity.inode = payload
+                    .recovery_parent_identity
+                    .inode
+                    .checked_add(1)
+                    .unwrap()
+            }
+            6 => {
+                payload.entries.pop();
+            }
+            7 => payload.entries.swap(0, 1),
+            8 => payload.entries.push(payload.entries[0].clone()),
+            9 => payload.entries[0].relative_path = "missing".into(),
+            10 => payload.entries[0].before.as_mut().unwrap().hash = "1".repeat(64),
+            11 => payload.entries[0].before.as_mut().unwrap().mode = 0o755,
+            12 => payload.entries[0].after.as_mut().unwrap().hash = "2".repeat(64),
+            13 => payload.entries[0].after.as_mut().unwrap().mode = 0o600,
+            14 => payload.entries[0].before = None,
+            15 => payload.entries[0].after = None,
+            16 => altered.candidate.payload_hash = "3".repeat(64),
+            _ => unreachable!(),
+        }
+        if field != 16 {
+            altered.candidate.payload_hash = crate::conversation_state::content_hash(
+                &serde_json::to_vec(&altered.candidate.payload).unwrap(),
+            );
+        }
+        assert!(
+            project_d27_source_m2a(&snapshot, &changes, &altered, &recovery, &empty(), limits())
+                .is_err(),
+            "payload {field}"
+        );
+        assert_eq!(
+            before,
+            [
+                m2a_d27_tree(&snapshot.source_path),
+                m2a_d27_tree(snapshot.path()),
+                m2a_d27_tree(recovery.provenance())
+            ]
+        );
+    }
+    for after in [false, true] {
+        for field in 0..7 {
+            let mut altered = ChangeSet {
+                changes: changes.changes.clone(),
+                exclusions: changes.exclusions.clone(),
+                snapshot_path: changes.snapshot_path.clone(),
+                copy_identity: changes.copy_identity,
+                source_identity: changes.source_identity,
+            };
+            let change = altered
+                .changes
+                .iter_mut()
+                .find(|c| c.relative_path == Path::new("changed"))
+                .unwrap();
+            let entry = if after {
+                change.after.as_mut().unwrap()
+            } else {
+                change.before.as_mut().unwrap()
+            };
+            match field {
+                0 => entry.identity.device += 1,
+                1 => entry.identity.inode += 1,
+                2 => entry.bytes += 1,
+                3 => entry.mode ^= 1,
+                4 => entry.observed_mode ^= 1,
+                5 => entry.sha256 = Some([4; 32]),
+                6 => entry.relative_path = PathBuf::from("different"),
+                _ => unreachable!(),
+            }
+            assert!(
+                project_d27_source_m2a(&snapshot, &altered, &record, &recovery, &empty(), limits())
+                    .is_err(),
+                "manifest after={after} field={field}"
+            );
+            assert_eq!(
+                before,
+                [
+                    m2a_d27_tree(&snapshot.source_path),
+                    m2a_d27_tree(snapshot.path()),
+                    m2a_d27_tree(recovery.provenance())
+                ]
+            );
+        }
+    }
+    for field in 0..4 {
+        let mut altered = record.clone();
+        match field {
+            0 => altered.invalidated = true,
+            1 => altered.decision = None,
+            2 => altered.intent_revision = Some(DecimalU64::new(9)),
+            3 => {
+                altered.reserved_result_id =
+                    Some(polaris_desktop_protocol::ids::ResultId::new("already-bound").unwrap())
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            project_d27_source_m2a(&snapshot, &changes, &altered, &recovery, &empty(), limits())
+                .is_err()
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_d27_projection_refuses_live_source_and_copy_drift_and_secret_registration() {
+    let (_source, snapshot, changes, _recovery, recovery, record) = m2a_d27_fixture();
+    let secrets = RegisteredSecrets::new([snapshot.source_path.join("changed")]).unwrap();
+    assert!(
+        project_d27_source_m2a(&snapshot, &changes, &record, &recovery, &secrets, limits())
+            .is_err()
+    );
+    fs::write(snapshot.path().join("changed"), b"newer-copy").unwrap();
+    let before = m2a_d27_tree(snapshot.path());
+    assert!(
+        project_d27_source_m2a(&snapshot, &changes, &record, &recovery, &empty(), limits())
+            .is_err()
+    );
+    assert_eq!(before, m2a_d27_tree(snapshot.path()));
+    let (_source2, snapshot2, changes2, _recovery2, recovery2, record2) = m2a_d27_fixture();
+    fs::write(snapshot2.source_path.join("changed"), b"newer-source").unwrap();
+    let before = m2a_d27_tree(&snapshot2.source_path);
+    assert!(
+        project_d27_source_m2a(
+            &snapshot2,
+            &changes2,
+            &record2,
+            &recovery2,
+            &empty(),
+            limits()
+        )
+        .is_err()
+    );
+    assert_eq!(before, m2a_d27_tree(&snapshot2.source_path));
+    let mut wrong = ChangeSet {
+        changes: changes2.changes.clone(),
+        exclusions: changes2.exclusions.clone(),
+        snapshot_path: snapshot.path().into(),
+        copy_identity: snapshot.copy_identity,
+        source_identity: snapshot.source_identity,
+    };
+    wrong.changes.clear();
+    assert!(
+        project_d27_source_m2a(&snapshot2, &wrong, &record2, &recovery2, &empty(), limits())
+            .is_err()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_d27_projection_retains_copy_observed_bits_without_installing_them() {
+    let (_source, snapshot, _changes, _recovery, recovery, mut record) = m2a_d27_fixture();
+    fs::set_permissions(
+        snapshot.path().join("changed"),
+        Permissions::from_mode(0o4640),
+    )
+    .unwrap();
+    let changes = collect_changes(&snapshot, &empty(), limits()).unwrap();
+    // The approved payload's after mode remains ordinary 0640.
+    record.candidate.payload_hash = record.candidate.payload.payload_hash().unwrap();
+    let artifacts =
+        project_d27_source_m2a(&snapshot, &changes, &record, &recovery, &empty(), limits())
+            .unwrap();
+    let version = artifacts.binding.manifest.entries[0]
+        .after
+        .as_ref()
+        .unwrap();
+    assert_eq!(version.normal_mode, 0o640);
+    assert_eq!(version.observed_mode, 0o4640);
+    assert_eq!(
+        artifacts.request.entries[0].after.as_ref().unwrap().mode,
+        0o640
+    );
+    assert_eq!(
+        fs::metadata(snapshot.path().join("changed"))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o4640
+    );
+}
+
 #[test]
 fn copies_source_empty_directory_and_executable_without_setid() {
     let (_temp, source) = fixture();

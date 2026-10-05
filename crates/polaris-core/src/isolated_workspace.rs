@@ -242,6 +242,266 @@ impl Snapshot {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+pub struct D27SourceArtifactsV1 {
+    pub binding: crate::apply_intent::D27SourceBindingV1,
+    pub request: crate::apply_intent::RequestV1,
+    pub source_before: crate::apply_intent::ObservedSourceV1,
+}
+
+/// Projects only approved changed files. It reads both held ownership
+/// coordinates again; no artifact is published and no apply is authorized.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn project_d27_source_m2a(
+    snapshot: &Snapshot,
+    changes: &ChangeSet,
+    record: &crate::desktop_store::SavedSourceApply,
+    recovery: &crate::workspace_apply::RecoveryParent,
+    secrets: &RegisteredSecrets,
+    limits: Limits,
+) -> Result<D27SourceArtifactsV1> {
+    use crate::apply_intent::{
+        BeforeV1, CanonicalApplyEvidence, D27ManifestProjectionEntryV1, D27ManifestProjectionV1,
+        D27ManifestVersionV1, D27SourceBindingV1, IdentityV1, ObservedEntryV1, ObservedSourceV1,
+    };
+    use crate::management_effect::ManagementEffectHashV1 as Hash;
+    use polaris_desktop_protocol::snapshot::ApprovalDecision;
+    let fail = || error(&snapshot.source_path, ErrorKind::SourceChanged);
+    if record.decision != Some(ApprovalDecision::Allow)
+        || record.invalidated
+        || record.intent_revision.is_some()
+        || record.reserved_result_id.is_some()
+        || record.result.is_some()
+        || !changes.is_applicable()
+        || changes.snapshot_path != snapshot.path()
+        || changes.copy_identity != snapshot.copy_identity
+        || changes.source_identity != snapshot.source_identity
+    {
+        return Err(fail());
+    }
+    validate_baseline(snapshot, limits)?;
+    let candidate = &record.candidate;
+    candidate.payload.validate().map_err(|_| fail())?;
+    if candidate.payload.payload_hash().map_err(|_| fail())? != candidate.payload_hash {
+        return Err(fail());
+    }
+    let payload = &candidate.payload;
+    let (source_fd, source_ancestors) = open_root_with_ancestors(&snapshot.source_path)?;
+    if source_ancestors != snapshot.source_ancestors
+        || Identity::of(&io(&snapshot.source_path, source_fd.metadata())?)
+            != snapshot.source_identity
+    {
+        return Err(fail());
+    }
+    recovery
+        .validate_for_snapshot(snapshot)
+        .map_err(|_| fail())?;
+    let (recovery_device, recovery_inode) = recovery.identity();
+    if snapshot.source_path.to_str() != Some(payload.source_path.as_str())
+        || payload.source_identity.device.get() != snapshot.source_identity.device
+        || payload.source_identity.inode.get() != snapshot.source_identity.inode
+        || recovery.provenance().to_str() != Some(payload.recovery_parent_path.as_str())
+        || payload.recovery_parent_identity.device.get() != recovery_device
+        || payload.recovery_parent_identity.inode.get() != recovery_inode
+        || payload.entries.len() != changes.changes.len()
+    {
+        return Err(fail());
+    }
+    let same_entry = |a: &Option<ManifestEntry>, b: &Option<ManifestEntry>| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.relative_path == b.relative_path
+                && a.identity == b.identity
+                && a.bytes == b.bytes
+                && a.mode == b.mode
+                && a.sha256 == b.sha256
+                && a.observed_mode == b.observed_mode
+                && a.observed_mtime == b.observed_mtime
+                && a.observed_ctime == b.observed_ctime
+        }
+        _ => false,
+    };
+    let check_changes = || -> Result<()> {
+        let fresh = collect_changes(snapshot, secrets, limits)?;
+        if !fresh.is_applicable() || fresh.changes.len() != changes.changes.len() {
+            return Err(fail());
+        }
+        let indexed = changes
+            .changes
+            .iter()
+            .map(|change| (change.relative_path.as_path(), change))
+            .collect::<BTreeMap<_, _>>();
+        if indexed.len() != changes.changes.len() {
+            return Err(fail());
+        }
+        for change in &fresh.changes {
+            let supplied = indexed
+                .get(change.relative_path.as_path())
+                .ok_or_else(fail)?;
+            if supplied.kind != change.kind
+                || !same_entry(&supplied.before, &change.before)
+                || !same_entry(&supplied.after, &change.after)
+            {
+                return Err(fail());
+            }
+        }
+        Ok(())
+    };
+    check_changes()?;
+    let version = |entry: &ManifestEntry| -> Result<D27ManifestVersionV1> {
+        let bytes = entry.sha256.ok_or_else(fail)?;
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(D27ManifestVersionV1 {
+            device: entry.identity.device,
+            inode: entry.identity.inode,
+            hash: Hash::from_hex(&hex).map_err(|_| fail())?,
+            normal_mode: entry.mode,
+            observed_mode: entry.observed_mode(),
+            bytes: entry.bytes,
+        })
+    };
+    let indexed = changes
+        .changes
+        .iter()
+        .map(|change| (change.relative_path.as_path(), change))
+        .collect::<BTreeMap<_, _>>();
+    let mut entries = Vec::with_capacity(payload.entries.len());
+    let mut selection = Selection::default();
+    for entry in &payload.entries {
+        let path = Path::new(&entry.relative_path);
+        let change = indexed.get(path).ok_or_else(fail)?;
+        let before = change.before.as_ref().map(&version).transpose()?;
+        let after = change.after.as_ref().map(&version).transpose()?;
+        let matches = |wire: &Option<crate::desktop_store::SourceApplyVersion>,
+                       manifest: &Option<D27ManifestVersionV1>,
+                       observed: bool| {
+            match (wire, manifest) {
+                (None, None) => true,
+                (Some(w), Some(m)) => {
+                    w.hash == m.hash.as_hex()
+                        && w.mode
+                            == if observed {
+                                m.observed_mode
+                            } else {
+                                m.normal_mode
+                            }
+                }
+                _ => false,
+            }
+        };
+        if !matches(&entry.before, &before, true) || !matches(&entry.after, &after, false) {
+            return Err(fail());
+        }
+        for ancestor in path.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+            selection.exact.insert(ancestor.to_path_buf());
+        }
+        entries.push(D27ManifestProjectionEntryV1 {
+            path: entry.relative_path.clone(),
+            before,
+            after,
+        });
+    }
+    let manifest = D27ManifestProjectionV1 {
+        schema_version: 1,
+        source_path: payload.source_path.clone(),
+        source_identity: IdentityV1 {
+            device: snapshot.source_identity.device,
+            inode: snapshot.source_identity.inode,
+        },
+        recovery_parent_path: payload.recovery_parent_path.clone(),
+        recovery_parent_identity: IdentityV1 {
+            device: recovery_device,
+            inode: recovery_inode,
+        },
+        entries,
+    };
+    let request = manifest.project_request().map_err(|_| fail())?;
+    let observe = || -> Result<ObservedSourceV1> {
+        let current = scan(
+            &snapshot.source_path,
+            &snapshot.source_path,
+            snapshot.source_identity,
+            &refreshed_secrets(secrets)?,
+            limits,
+            Some(&selection),
+            snapshot.exclude_build_caches,
+        )?;
+        if !current.exclusions.is_empty() {
+            return Err(fail());
+        }
+        let indexed = current
+            .manifest
+            .iter()
+            .map(|entry| (entry.relative_path.as_path(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut entries = Vec::with_capacity(request.entries.len());
+        for entry in &request.entries {
+            let current = indexed
+                .get(Path::new(&entry.path))
+                .map(|entry| {
+                    let v = version(entry)?;
+                    Ok::<BeforeV1, SnapshotError>(BeforeV1 {
+                        device: v.device,
+                        inode: v.inode,
+                        hash: v.hash,
+                        mode: v.normal_mode,
+                        observed_mode: v.observed_mode,
+                        bytes: v.bytes,
+                    })
+                })
+                .transpose()?;
+            entries.push(ObservedEntryV1 {
+                path: entry.path.clone(),
+                current,
+            });
+        }
+        Ok(ObservedSourceV1 {
+            schema_version: 1,
+            source_identity: request.source_identity,
+            entries,
+        })
+    };
+    let source_before = observe()?;
+    source_before.verify_before(&request).map_err(|_| fail())?;
+    let payload_bytes = serde_json::to_vec(payload).map_err(|_| fail())?;
+    let manifest_bytes = manifest.canonical_bytes().map_err(|_| fail())?;
+    let request_bytes = request.canonical_bytes().map_err(|_| fail())?;
+    let before_bytes = source_before.canonical_bytes().map_err(|_| fail())?;
+    let binding = D27SourceBindingV1 {
+        schema_version: 1,
+        payload_bytes: u64::try_from(payload_bytes.len()).map_err(|_| fail())?,
+        payload_hash: Hash::digest(&payload_bytes),
+        manifest_bytes: u64::try_from(manifest_bytes.len()).map_err(|_| fail())?,
+        manifest_hash: manifest.manifest_hash().map_err(|_| fail())?,
+        request_bytes: u64::try_from(request_bytes.len()).map_err(|_| fail())?,
+        request_hash: request.request_hash().map_err(|_| fail())?,
+        source_before_bytes: u64::try_from(before_bytes.len()).map_err(|_| fail())?,
+        source_before_hash: source_before.observation_hash().map_err(|_| fail())?,
+        manifest,
+    };
+    binding.canonical_bytes().map_err(|_| fail())?;
+    check_changes()?;
+    if observe()? != source_before
+        || open_root_with_ancestors(&snapshot.source_path)?.1 != source_ancestors
+        || Identity::of(&io(&snapshot.source_path, source_fd.metadata())?)
+            != snapshot.source_identity
+    {
+        return Err(fail());
+    }
+    recovery
+        .validate_for_snapshot(snapshot)
+        .map_err(|_| fail())?;
+    Ok(D27SourceArtifactsV1 {
+        binding,
+        request,
+        source_before,
+    })
+}
+
 fn validate_absolute(path: &Path) -> Result<()> {
     if !path.is_absolute()
         || path

@@ -667,7 +667,8 @@ async fn a_cancel_that_loses_the_race_still_takes_back_the_saved_login() {
         1,
     )
     .await;
-    let release = hold(&owner, &gate);
+    let reauth_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = hold(&owner, &reauth_gate);
     let cancelled = owner
         .reauthenticate(
             &token.registration_id,

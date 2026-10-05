@@ -15,6 +15,8 @@ mod input_preparation_tests;
 #[cfg(unix)]
 mod instruction_commands;
 #[cfg(unix)]
+mod local_actions;
+#[cfg(unix)]
 mod mcp_commands;
 mod memory;
 #[cfg(unix)]
@@ -3817,10 +3819,37 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 let wrapped = render::wrap_history_lines(&history, width);
                                 let text = selection::extract_text(&wrapped, sel);
                                 if !text.is_empty() {
-                                    status = Status::Notice(apply_selection_copy(
-                                        &text,
-                                        clipboard::copy_to_clipboard,
-                                    ));
+                                    #[cfg(unix)]
+                                    {
+                                        status = match local_actions::handle_with_selection(
+                                            &slash::Action::Copy,
+                                            &terminal,
+                                            &mut key_reader,
+                                            &mut session,
+                                            rewind_workspace.as_ref().expect("startup owner"),
+                                            &management_effects,
+                                            &args.cwd,
+                                            has_pending_inputs,
+                                            Some(&text),
+                                            clipboard::copy_to_clipboard,
+                                        ) {
+                                            Ok(lines) => Status::Notice(
+                                                lines
+                                                    .iter()
+                                                    .map(|l| l.to_string())
+                                                    .collect::<Vec<_>>()
+                                                    .join(" / "),
+                                            ),
+                                            Err(error) => Status::Error(error),
+                                        };
+                                    }
+                                    #[cfg(not(unix))]
+                                    {
+                                        status = Status::Notice(apply_selection_copy(
+                                            &text,
+                                            clipboard::copy_to_clipboard,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -4153,6 +4182,59 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 Ok(lines) => {
                                     local_lines.extend(lines);
                                     status = Status::Notice("決定記録の結果を表示しました".into());
+                                }
+                                Err(error) => status = Status::Error(error),
+                            }
+                            continue;
+                        }
+                        #[cfg(unix)]
+                        slash::Action::Clear
+                        | slash::Action::Init
+                        | slash::Action::Export(_)
+                        | slash::Action::Copy => {
+                            let operation = &action;
+                            let result = local_actions::handle(
+                                operation,
+                                &terminal,
+                                &mut key_reader,
+                                &mut session,
+                                rewind_workspace.as_ref().expect("startup owner"),
+                                &management_effects,
+                                &args.cwd,
+                                has_pending_inputs,
+                                clipboard::copy_to_clipboard,
+                            );
+                            match result {
+                                Ok(lines) => {
+                                    if matches!(operation, slash::Action::Clear)
+                                        && lines
+                                            .iter()
+                                            .any(|line| line.to_string().starts_with("T08 完了"))
+                                    {
+                                        local_lines.clear();
+                                        let width =
+                                            terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                                        reset_conversation_view(
+                                            &mut history,
+                                            &mut history_wrap_cache,
+                                            &mut agent_activity_rows,
+                                            &mut scroll_offset,
+                                            &mut selection,
+                                            &render::HeaderInfo {
+                                                provider_name: &provider_name,
+                                                model_name: &model_name,
+                                                usage: cumulative_usage,
+                                                cwd: &cwd_display,
+                                                cwd_short: &cwd_footer_display,
+                                                effort_name: &effort_name,
+                                            },
+                                            width,
+                                        );
+                                        printed_messages = 0;
+                                        printed_local_lines = 0;
+                                    }
+                                    local_lines.extend(lines);
+                                    status = Status::Notice("管理操作の結果を表示しました".into());
                                 }
                                 Err(error) => status = Status::Error(error),
                             }
@@ -4634,7 +4716,33 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             {
                                 break ExitCode::FAILURE;
                             }
-                            handle_compact(
+                            #[cfg(target_os = "linux")]
+                            if let Some(code) = linux_pending_exit_code() {
+                                break 'outer code;
+                            }
+                            #[cfg(unix)]
+                            let _compact_persistence_failed = match local_actions::compact(
+                                &terminal,
+                                &mut key_reader,
+                                args.provider.as_ref(),
+                                &mut session,
+                                &session_path,
+                                rewind_workspace.as_ref().expect("startup owner"),
+                                &management_effects,
+                                &mut status,
+                                &mut cumulative_usage,
+                                has_pending_inputs,
+                            )
+                            .await
+                            {
+                                Ok(_) => false,
+                                Err(error) => {
+                                    status = Status::Error(error);
+                                    true
+                                }
+                            };
+                            #[cfg(not(unix))]
+                            let _compact_persistence_failed = handle_compact(
                                 args.provider.as_ref(),
                                 &mut session,
                                 &session_path,
@@ -4642,6 +4750,17 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &mut cumulative_usage,
                             )
                             .await;
+                            #[cfg(target_os = "linux")]
+                            if let Some(code) = linux_pending_exit_code() {
+                                if _compact_persistence_failed {
+                                    fatal_message = Some(
+                                        "compacted history could not be persisted during shutdown"
+                                            .into(),
+                                    );
+                                    break 'outer ExitCode::FAILURE;
+                                }
+                                break 'outer code;
+                            }
                             printed_messages = session.messages.len();
                             continue;
                         }
@@ -4786,10 +4905,36 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 .modifiers
                 .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
         {
-            status = Status::Notice(clipboard::copy_last_reply_with(
-                &session,
-                clipboard::copy_to_clipboard,
-            ));
+            #[cfg(unix)]
+            {
+                status = match local_actions::handle(
+                    &slash::Action::Copy,
+                    &terminal,
+                    &mut key_reader,
+                    &mut session,
+                    rewind_workspace.as_ref().expect("startup owner"),
+                    &management_effects,
+                    &args.cwd,
+                    has_pending_inputs,
+                    clipboard::copy_to_clipboard,
+                ) {
+                    Ok(lines) => Status::Notice(
+                        lines
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" / "),
+                    ),
+                    Err(error) => Status::Error(error),
+                };
+            }
+            #[cfg(not(unix))]
+            {
+                status = Status::Notice(clipboard::copy_last_reply_with(
+                    &session,
+                    clipboard::copy_to_clipboard,
+                ));
+            }
             continue;
         }
 
@@ -5032,6 +5177,60 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         Ok(lines) => {
                             local_lines.extend(lines);
                             status = Status::Notice("決定記録の結果を表示しました".into());
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
+                #[cfg(unix)]
+                Some(
+                    slash::Action::Clear
+                    | slash::Action::Init
+                    | slash::Action::Export(_)
+                    | slash::Action::Copy,
+                ) => {
+                    let operation = &parsed_action.as_ref().expect("local action");
+                    let result = local_actions::handle(
+                        operation,
+                        &terminal,
+                        &mut key_reader,
+                        &mut session,
+                        rewind_workspace.as_ref().expect("startup owner"),
+                        &management_effects,
+                        &args.cwd,
+                        has_pending_inputs,
+                        clipboard::copy_to_clipboard,
+                    );
+                    match result {
+                        Ok(lines) => {
+                            if matches!(operation, slash::Action::Clear)
+                                && lines
+                                    .iter()
+                                    .any(|line| line.to_string().starts_with("T08 完了"))
+                            {
+                                local_lines.clear();
+                                let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
+                                reset_conversation_view(
+                                    &mut history,
+                                    &mut history_wrap_cache,
+                                    &mut agent_activity_rows,
+                                    &mut scroll_offset,
+                                    &mut selection,
+                                    &render::HeaderInfo {
+                                        provider_name: &provider_name,
+                                        model_name: &model_name,
+                                        usage: cumulative_usage,
+                                        cwd: &cwd_display,
+                                        cwd_short: &cwd_footer_display,
+                                        effort_name: &effort_name,
+                                    },
+                                    width,
+                                );
+                                printed_messages = 0;
+                                printed_local_lines = 0;
+                            }
+                            local_lines.extend(lines);
+                            status = Status::Notice("管理操作の結果を表示しました".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }
@@ -5521,7 +5720,33 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     {
                         break ExitCode::FAILURE;
                     }
-                    handle_compact(
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = linux_pending_exit_code() {
+                        break 'outer code;
+                    }
+                    #[cfg(unix)]
+                    let _compact_persistence_failed = match local_actions::compact(
+                        &terminal,
+                        &mut key_reader,
+                        args.provider.as_ref(),
+                        &mut session,
+                        &session_path,
+                        rewind_workspace.as_ref().expect("startup owner"),
+                        &management_effects,
+                        &mut status,
+                        &mut cumulative_usage,
+                        has_pending_inputs,
+                    )
+                    .await
+                    {
+                        Ok(_) => false,
+                        Err(error) => {
+                            status = Status::Error(error);
+                            true
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let _compact_persistence_failed = handle_compact(
                         args.provider.as_ref(),
                         &mut session,
                         &session_path,
@@ -5529,6 +5754,16 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut cumulative_usage,
                     )
                     .await;
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = linux_pending_exit_code() {
+                        if _compact_persistence_failed {
+                            fatal_message = Some(
+                                "compacted history could not be persisted during shutdown".into(),
+                            );
+                            break 'outer ExitCode::FAILURE;
+                        }
+                        break 'outer code;
+                    }
                     printed_messages = session.messages.len();
                     continue;
                 }
@@ -9636,8 +9871,11 @@ fn review_prompt(extra: &str) -> String {
 /// as the heading text, content underneath — rather than trying to
 /// reproduce the TUI's own tool-call/tool-result formatting.
 fn export_markdown(session: &polaris_core::session::Session) -> String {
+    export_messages(&session.messages)
+}
+fn export_messages(messages: &[polaris_provider::Message]) -> String {
     let mut out = String::from("# polaris conversation\n\n");
-    for m in &session.messages {
+    for m in messages {
         let heading = match m.role {
             polaris_provider::Role::User => "You",
             polaris_provider::Role::Assistant => "polaris",
@@ -9680,6 +9918,7 @@ fn apply_copy_action(
 /// (Tasks 8/11) already has it from `selection::extract_text`, and is
 /// expected to only call this when `text` is non-empty (an empty/zero-
 /// width selection copies nothing and shows no notice at all).
+#[cfg(any(test, not(unix)))]
 fn apply_selection_copy(text: &str, copy_fn: impl FnOnce(&str) -> Result<(), String>) -> String {
     match copy_fn(text) {
         Ok(()) => "copied selection to the clipboard".to_string(),
@@ -13176,6 +13415,100 @@ mod tests {
         assert!(activity.tool_detail_lines()[0].contains("観測されていません"));
     }
 
+    #[tokio::test]
+    async fn m3e_confirmed_compaction_keeps_original_and_refuses_cancelled_send() {
+        struct BoundSummary;
+        #[async_trait::async_trait]
+        impl polaris_provider::Provider for BoundSummary {
+            async fn complete(
+                &self,
+                request: polaris_provider::CompletionRequest,
+            ) -> Result<polaris_provider::CompletionResponse, polaris_provider::ProviderError>
+            {
+                Summarizer.complete(request).await
+            }
+            fn model(&self) -> Option<String> {
+                Some("test-summary".into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let state = root.path().join("state");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&state).unwrap();
+        let workspace = polaris_core::rewind_workspace::WorkspaceOwner::open(
+            &project,
+            &state.join("rewind-workspace"),
+            Default::default(),
+        )
+        .unwrap();
+        let lease = workspace.try_mutation().unwrap();
+        let effects = polaris_core::management_effect::ManagementEffectStoreV1::open_at_state_dir(
+            &project, &state, &lease,
+        )
+        .unwrap();
+        drop(lease);
+        let saved = polaris_core::session_store::PersistedSession::create(
+            root.path(),
+            &state.join("memory.sqlite3"),
+            project.to_str().unwrap(),
+            polaris_core::conversation_state::HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.attach(saved.clone()).unwrap();
+        session.push_user("turn1");
+        session.push_assistant(&"older detailed reply ".repeat(2000), Vec::new());
+        session.push_user("turn2");
+        session.push_assistant("reply2", Vec::new());
+        session.push_user("turn3");
+        session.push_assistant("reply3", Vec::new());
+        let before = saved.snapshot().unwrap();
+        let terminal = RefCell::new(Terminal::new(TestBackend::new(100, 30)).unwrap());
+        let mut status = Status::Idle;
+        let mut usage = polaris_provider::Usage::default();
+        let mut declined = ScriptedReader(VecDeque::from([KeyCode::Esc]));
+        assert!(
+            !local_actions::compact(
+                &terminal,
+                &mut declined,
+                &BoundSummary,
+                &mut session,
+                &root.path().join("unused.jsonl"),
+                &workspace,
+                &effects,
+                &mut status,
+                &mut usage,
+                false
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(saved.snapshot().unwrap().raw_hash, before.raw_hash);
+        assert_eq!(session.messages.len(), 6);
+        let mut accepted = ScriptedReader(VecDeque::from([KeyCode::Char('y')]));
+        assert!(
+            local_actions::compact(
+                &terminal,
+                &mut accepted,
+                &BoundSummary,
+                &mut session,
+                &root.path().join("unused.jsonl"),
+                &workspace,
+                &effects,
+                &mut status,
+                &mut usage,
+                false
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(session.messages.len(), 5);
+        assert_eq!(saved.snapshot().unwrap().events.len(), 6);
+        assert!(!root.path().join("unused.jsonl").exists());
+        assert!(effects.blocker().unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn handle_compact_compacts_and_persists_when_there_is_something_to_compact() {

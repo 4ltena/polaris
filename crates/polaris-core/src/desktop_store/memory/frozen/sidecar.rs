@@ -23,6 +23,7 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         let mut seen = BTreeSet::new();
+        let mut version = 1;
         let mut saved_workflow = None;
         let mut workflow_artifacts = None;
         while let Some(name) = key(&mut map, self.budget)? {
@@ -30,6 +31,14 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
                 return Err(serde::de::Error::custom("固定記憶の付随field重複"));
             }
             match name.as_str() {
+                "desktop_sidecar_schema_version" => {
+                    version = value::<_, u8>(&mut map, self.budget, 64)?;
+                    if version != 2 {
+                        return Err(serde::de::Error::custom(
+                            "unsupported desktop sidecar version",
+                        ));
+                    }
+                }
                 "session_revision" => {
                     self.collector.revision = Some(value(&mut map, self.budget, 64)?)
                 }
@@ -63,6 +72,36 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
                     if let Some(roles) = roles {
                         roles.validate().map_err(serde::de::Error::custom)?;
                     }
+                }
+                "tier_bindings" => {
+                    let tiers: Option<crate::desktop_store::SavedTierBindings> =
+                        value(&mut map, self.budget, RECORD)?;
+                    if let Some(tiers) = tiers {
+                        tiers.validate().map_err(serde::de::Error::custom)?;
+                    }
+                }
+                "goal" => {
+                    let goal: Option<crate::desktop_store::SavedGoal> =
+                        value(&mut map, self.budget, RECORD)?;
+                    if let Some(goal) = goal {
+                        goal.validate().map_err(serde::de::Error::custom)?;
+                    }
+                }
+                "instructions" => {
+                    let mut ids = BTreeSet::new();
+                    sequence(
+                        &mut map,
+                        self.budget,
+                        RECORD,
+                        crate::desktop_store::goal::MAX_INSTRUCTIONS,
+                        |instruction: crate::desktop_store::SavedInstruction| {
+                            instruction.validate()?;
+                            if !ids.insert(instruction.instruction_id) {
+                                return Err(StoreError::Corrupt("instruction"));
+                            }
+                            Ok(())
+                        },
+                    )?;
                 }
                 "workflow" => {
                     let workflow: Option<SavedWorkflow> = value(&mut map, self.budget, RECORD)?;
@@ -126,7 +165,7 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
                 .approved_routine_contract(reference)
                 .map_err(serde::de::Error::custom)?;
         }
-        for required in [
+        let mut required = vec![
             "session_revision",
             "configuration",
             "conversation_memory",
@@ -136,7 +175,22 @@ impl<'de> Visitor<'de> for SidecarSeed<'_, '_> {
             "runs",
             "requests",
             "unresolved_approvals",
-        ] {
+        ];
+        if version == 2 {
+            required.extend([
+                "inherited_turn_count",
+                "source_applies",
+                "children",
+                "role_bindings",
+                "tier_bindings",
+                "goal",
+                "instructions",
+                "approval_records",
+                "workflow",
+                "workflow_artifacts",
+            ]);
+        }
+        for required in required {
             if !seen.contains(required) {
                 return Err(serde::de::Error::custom(format!(
                     "固定記憶の必須field不在: {required}"

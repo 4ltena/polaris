@@ -371,7 +371,7 @@ async fn frozen_projection_rejects_crossed_operations_raw_bindings_and_coverage(
         2
     );
     drop(valid);
-    for case in 0..6 {
+    for case in 0..9 {
         let changed = replace_last_state(&path, &sidecar, marker.clone(), |value| match case {
             0 => {
                 value["conversation_memory"]["attempts"][0]["operation_id"] =
@@ -400,6 +400,13 @@ async fn frozen_projection_rejects_crossed_operations_raw_bindings_and_coverage(
                     .find(|op| op["operation_id"].as_str().unwrap().starts_with("memory-"))
                     .unwrap();
                 operation["result_id"] = serde_json::Value::Null;
+            }
+            6 => value["desktop_sidecar_schema_version"] = 3.into(),
+            7 => {
+                value.as_object_mut().unwrap().remove("tier_bindings");
+            }
+            8 => {
+                value["goal"] = serde_json::json!({"text":"invalid", "revision":"0", "active":true})
             }
             _ => unreachable!(),
         });

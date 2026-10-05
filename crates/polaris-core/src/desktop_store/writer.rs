@@ -45,6 +45,521 @@ struct StoreRoot {
     // The prototype alone owns deletion; Writers retain this owner until released.
     _temporary: Option<Arc<TempDir>>,
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopCapacityIdentityV1 {
+    pub root_identity: crate::apply_intent::IdentityV1,
+    pub allocation_unit: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopLogicalCapacityV1 {
+    pub records_remaining: u64,
+    pub bytes_remaining: u64,
+}
+
+/// A read-only prediction bound to the retained writer lock. It deliberately
+/// cannot be cloned or constructed by callers; the shared owner consumes it once.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub struct SourceApplyPrecommitTokenV1 {
+    precommit: SourceApplyPrecommitV1,
+    next: Published,
+    prediction: disk::CommitPredictionM2a,
+    root_identity: DesktopCapacityIdentityV1,
+    session_identity: (u64, u64),
+    lock_identity: (u64, u64),
+    logical_capacity: DesktopLogicalCapacityV1,
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl SourceApplyPrecommitTokenV1 {
+    pub fn precommit(&self) -> &SourceApplyPrecommitV1 {
+        &self.precommit
+    }
+    pub fn logical_capacity(&self) -> DesktopLogicalCapacityV1 {
+        self.logical_capacity
+    }
+
+    /// Counts each new row with the actual v2 encoder. A result replaces only
+    /// this record's null; both marker temporaries use the approved hard cap.
+    pub fn inventory_commit_bytes(&self) -> StoreResult<u64> {
+        let consume = u64::try_from(
+            self.prediction.target_sidecar_prefix.len() - self.prediction.base_sidecar_prefix.len(),
+        )
+        .map_err(|_| StoreError::Overflow)?;
+        let mut result_state = self.next.state.clone();
+        result_state.session_revision = result_state.session_revision.checked_add(1)?;
+        let result = encoded_size_m2a(&result_state)?
+            .checked_add(1)
+            .and_then(|n| n.checked_sub(4))
+            .and_then(|n| n.checked_add(self.precommit.result_capacity_bytes))
+            .ok_or(StoreError::Overflow)?;
+        let unit = self.root_identity.allocation_unit;
+        let allocated = |bytes: u64| -> StoreResult<u64> {
+            bytes
+                .checked_add(unit - 1)
+                .and_then(|n| (n / unit).checked_mul(unit))
+                .ok_or(StoreError::Overflow)
+        };
+        allocated(consume)?
+            .checked_add(allocated(result)?)
+            .and_then(|n| {
+                n.checked_add(
+                    allocated(MAX_D27_MARKER_BYTES as u64)
+                        .ok()?
+                        .checked_mul(2)?,
+                )
+            })
+            .ok_or(StoreError::Overflow)
+    }
+
+    pub(crate) fn result_remaining_bytes(&self) -> StoreResult<u64> {
+        let unit = self.root_identity.allocation_unit;
+        let consume = publication_remaining_bytes_m2a(
+            &self.prediction,
+            &self.prediction.base_marker_bytes,
+            &self.prediction.base_sidecar_prefix,
+            0,
+            unit,
+        )?;
+        self.inventory_commit_bytes()?
+            .checked_sub(consume)
+            .ok_or(StoreError::Overflow)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publication_remaining_bytes_m2a(
+    prediction: &disk::CommitPredictionM2a,
+    observed_marker: &[u8],
+    observed_sidecar: &[u8],
+    temporary_bytes: u64,
+    unit: u64,
+) -> StoreResult<u64> {
+    let allocated =
+        |bytes| crate::apply_intent::allocated_bytes(bytes, unit).map_err(|_| StoreError::Overflow);
+    let sidecar = allocated(prediction.target_sidecar_prefix.len() as u64)?
+        .checked_sub(allocated(observed_sidecar.len() as u64)?)
+        .ok_or(StoreError::RecoveryRequired)?;
+    let marker = if observed_marker == prediction.target_marker_bytes {
+        0
+    } else {
+        allocated(MAX_D27_MARKER_BYTES as u64)?.saturating_sub(allocated(temporary_bytes)?)
+    };
+    sidecar.checked_add(marker).ok_or(StoreError::Overflow)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub struct SourceApplyConsumedReceiptV1 {
+    pub precommit: SourceApplyPrecommitV1,
+    pub marker_bytes: Vec<u8>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceApplyResultEvidenceV1 {
+    pub session_revision: u64,
+    pub marker_bytes: Vec<u8>,
+    pub marker_evidence_hash: crate::management_effect::ManagementEffectHashV1,
+    pub sidecar_offset: u64,
+    pub sidecar_hash: crate::management_effect::ManagementEffectHashV1,
+    pub sidecar_prefix_hash: crate::management_effect::ManagementEffectHashV1,
+    pub reserved_result_id_digest: crate::management_effect::ManagementEffectHashV1,
+    pub report_hash: crate::management_effect::ManagementEffectHashV1,
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LegacyUnboundIntentDiagnosticV1 {
+    pub schema_version: u32,
+    pub code: &'static str,
+    pub project_binding: crate::management_effect::ManagementEffectHashV1,
+    pub session_binding: crate::management_effect::ManagementEffectHashV1,
+    pub marker_evidence_hash: crate::management_effect::ManagementEffectHashV1,
+    pub sidecar_prefix_hash: crate::management_effect::ManagementEffectHashV1,
+    pub session_revision: u64,
+    pub record_index: u64,
+    pub intent_revision: u64,
+    pub source_operation_digest: crate::management_effect::ManagementEffectHashV1,
+    pub result_present: bool,
+    pub next_action: &'static str,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, thiserror::Error)]
+pub enum D27RecoveryOpenError {
+    #[error("legacy source apply requires its original desktop recovery route")]
+    LegacyUnboundIntent(Box<LegacyUnboundIntentDiagnosticV1>),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+pub struct D27RecoveryInspectV1 {
+    pub root_identity: crate::apply_intent::IdentityV1,
+    pub session_identity: crate::apply_intent::IdentityV1,
+    pub writer_lock_identity: crate::apply_intent::IdentityV1,
+    pub marker_bytes: Vec<u8>,
+    pub marker_evidence_hash: crate::management_effect::ManagementEffectHashV1,
+    pub raw_prefix_bytes: Vec<u8>,
+    pub raw_tail_bytes: Vec<u8>,
+    pub sidecar_prefix_bytes: Vec<u8>,
+    pub sidecar_tail_bytes: Vec<u8>,
+    pub snapshot: Published,
+    pub state_next: disk::StateNextInspectV1,
+    pub files: Vec<disk::D27ReadFileV1>,
+}
+
+/// Retains the exclusive existing writer lock without exposing mutating Writer
+/// APIs. The shared owner must exact-join durable evidence before recovering.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub struct D27RecoveryOpenOutcomeV1 {
+    pub view: D27RecoveryInspectV1,
+    pub legacy_terminal_notices: Vec<LegacyUnboundIntentDiagnosticV1>,
+    writer: Writer,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D27PublicationKindV1 {
+    Consume,
+    Result,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub struct JoinedD27MarkerRecoveryV1 {
+    kind: D27PublicationKindV1,
+    prediction: disk::CommitPredictionM2a,
+    next: Published,
+    observed_marker: Vec<u8>,
+    observed_raw: Vec<u8>,
+    observed_sidecar: Vec<u8>,
+    observed_next: disk::StateNextInspectV1,
+    root_identity: crate::apply_intent::IdentityV1,
+    session_identity: crate::apply_intent::IdentityV1,
+    lock_identity: crate::apply_intent::IdentityV1,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl JoinedD27MarkerRecoveryV1 {
+    pub(crate) fn remaining_publication_bytes(&self, unit: u64) -> StoreResult<u64> {
+        publication_remaining_bytes_m2a(
+            &self.prediction,
+            &self.observed_marker,
+            &self.observed_sidecar,
+            self.observed_next.length.unwrap_or(0),
+            unit,
+        )
+    }
+    pub(crate) fn result_evidence_m2a(
+        &self,
+        precommit: &SourceApplyPrecommitV1,
+        report_hash: crate::management_effect::ManagementEffectHashV1,
+    ) -> StoreResult<SourceApplyResultEvidenceV1> {
+        use crate::management_effect::ManagementEffectHashV1 as Hash;
+        if self.kind != D27PublicationKindV1::Result {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let marker = &self.prediction.target_marker;
+        let bytes = &self.prediction.target_marker_bytes;
+        let sidecar = &self.prediction.target_sidecar_prefix;
+        Ok(SourceApplyResultEvidenceV1 {
+            session_revision: marker.session_revision.get(),
+            marker_bytes: bytes.clone(),
+            marker_evidence_hash: marker_evidence_hash(bytes, sidecar),
+            sidecar_offset: marker.sidecar_offset.get(),
+            sidecar_hash: Hash::from_hex(&marker.sidecar_hash)
+                .map_err(|_| StoreError::RecoveryRequired)?,
+            sidecar_prefix_hash: Hash::digest(sidecar),
+            reserved_result_id_digest: precommit.reserved_result_id_digest,
+            report_hash,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl D27RecoveryOpenOutcomeV1 {
+    pub(crate) fn retained_root_directory_m2a(&self) -> StoreResult<File> {
+        self.writer.root.directory.verify()?;
+        self.writer.root.directory.retained_file_m2a()
+    }
+    /// Only the shared core owner calls this after joining the durable intent
+    /// and verified generic event. Every ledger target is rebuilt here.
+    pub(crate) fn join_marker_recovery_m2a(
+        &self,
+        precommit: &SourceApplyPrecommitV1,
+        descriptor: &crate::apply_intent::ApplyIntentDescriptorV1,
+        binding: &crate::apply_intent::D27SourceBindingV1,
+        request: &crate::apply_intent::RequestV1,
+        before: &crate::apply_intent::ObservedSourceV1,
+        generic: &crate::management_effect::PrepareManagementEffectV1,
+        report: Option<(&[u8], crate::management_effect::ManagementEffectHashV1)>,
+    ) -> StoreResult<JoinedD27MarkerRecoveryV1> {
+        use crate::{
+            apply_intent::d27_session_binding, management_effect::ManagementEffectHashV1 as Hash,
+        };
+        use std::os::unix::fs::MetadataExt;
+        precommit.canonical_bytes()?;
+        binding
+            .verify_artifacts(descriptor, request, before)
+            .map_err(|_| StoreError::TargetMismatch)?;
+        let expected_generic = crate::management_effect::PrepareManagementEffectV1 {
+            operation_id: descriptor.management_operation_id,
+            inventory: crate::management_effect::ManagementInventoryIdV1::parse("D27")
+                .map_err(|_| StoreError::TargetMismatch)?,
+            scope: crate::management_effect::ManagementEffectScopeV1 {
+                project: descriptor.project_binding,
+                session: Some(
+                    d27_session_binding(self.writer.published.marker.session_id.as_str())
+                        .map_err(|_| StoreError::TargetMismatch)?,
+                ),
+                generation: self.writer.published.marker.epoch.get(),
+                revision: precommit.consume_target_revision,
+                permission: crate::management_effect::ManagementPermissionScopeV1::Project,
+                account_binding: None,
+            },
+            request_hash: descriptor
+                .descriptor_hash()
+                .map_err(|_| StoreError::TargetMismatch)?,
+            rewind: crate::management_effect::ManagementRewindDispositionV1::IrreversibleLocal,
+        };
+        if *generic != expected_generic {
+            return Err(StoreError::TargetMismatch);
+        }
+        let observed = disk::inspect_published_m2a(
+            &self.writer.directory,
+            &self.writer.published.marker.project_id,
+            &self.writer.published.marker.session_id,
+        )?;
+        let (base, marker, raw, sidecar) =
+            disk::historical_published_m2a(&observed, precommit.base_session_revision)?;
+        if marker_evidence_hash(&marker, &sidecar) != precommit.base_marker_evidence_hash {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let index = base
+            .state
+            .source_applies
+            .iter()
+            .position(|r| {
+                r.candidate.run_id == precommit.run_id
+                    && r.candidate.attempt_id == precommit.attempt_id
+                    && r.candidate.approval_id == precommit.approval_id
+            })
+            .ok_or(StoreError::NotFound)?;
+        let record = &base.state.source_applies[index];
+        if record.decision != Some(ApprovalDecision::Allow)
+            || record.invalidated
+            || record.intent_revision.is_some()
+            || record.reserved_result_id.is_some()
+            || record.result.is_some()
+            || record.candidate.payload_hash != binding.payload_hash.as_hex()
+            || serde_json::to_vec(&record.candidate.payload)?.len() as u64 != binding.payload_bytes
+        {
+            return Err(StoreError::TargetMismatch);
+        }
+        let mut consumed = base.clone();
+        consumed.state.source_applies[index].intent_revision =
+            Some(DecimalU64::new(precommit.consume_target_revision));
+        consumed.state.source_applies[index].reserved_result_id =
+            Some(precommit.reserved_result_id.clone());
+        remaining_ledger_bytes_m2a(&consumed.state)?;
+        let mut consumed = prepare_transition_m2a(&base, consumed, false)?;
+        self.writer.validate_d27_descriptor_m2a(
+            precommit,
+            descriptor,
+            &consumed.state.source_applies[index],
+            &precommit.reserved_result_id,
+        )?;
+        let mut record_bytes = b"polaris-d27-consume-record-v1\0".to_vec();
+        record_bytes.extend(serde_json::to_vec(&consumed.state.source_applies[index])?);
+        let consume_prediction =
+            disk::predict_from_prefixes_m2a(&base, &consumed, marker, raw, sidecar)?;
+        if Hash::digest(&record_bytes) != precommit.consume_record_hash
+            || consume_prediction.target_marker.sidecar_offset.get()
+                != precommit.consume_sidecar_offset
+            || consume_prediction.target_marker.sidecar_hash
+                != precommit.consume_sidecar_hash.as_hex()
+            || marker_evidence_hash(
+                &consume_prediction.target_marker_bytes,
+                &consume_prediction.target_sidecar_prefix,
+            ) != precommit.consume_marker_evidence_hash
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+        consumed.marker = consume_prediction.target_marker.clone();
+        let (kind, prediction, next) = if let Some((bytes, expected_hash)) = report {
+            if bytes.len() as u64 > precommit.result_capacity_bytes {
+                return Err(StoreError::Capacity("D27 report artifact"));
+            }
+            let typed: crate::workspace_apply::ApplyReport = serde_json::from_slice(bytes)?;
+            let mut hash_bytes = b"polaris-workspace-apply-report-v1\0".to_vec();
+            hash_bytes.extend(bytes);
+            if typed
+                .canonical_bytes()
+                .map_err(|_| StoreError::Corrupt("D27 report encoding"))?
+                != bytes
+                || Hash::digest(&hash_bytes) != expected_hash
+                || typed.source_path != std::path::Path::new(&record.candidate.payload.source_path)
+            {
+                return Err(StoreError::TargetMismatch);
+            }
+            let result = SourceApplyResult {
+                result_id: precommit.reserved_result_id.clone(),
+                report: serde_json::to_value(typed)?,
+            };
+            result.validate()?;
+            if serde_json::to_vec(&result)?.len() as u64 > precommit.result_capacity_bytes {
+                return Err(StoreError::Capacity("D27 result evidence"));
+            }
+            // Policy changes after consume cannot revoke dispatch. Rebuild
+            // result publication from the retained result-free generation,
+            // while requiring the exact consumed row and immutable prefix.
+            let current_record = observed
+                .published
+                .state
+                .source_applies
+                .get(index)
+                .ok_or(StoreError::RecoveryRequired)?;
+            let base_revision = if current_record.result.is_some() {
+                observed
+                    .published
+                    .marker
+                    .session_revision
+                    .get()
+                    .checked_sub(1)
+                    .ok_or(StoreError::Overflow)?
+            } else {
+                observed.published.marker.session_revision.get()
+            };
+            if base_revision < precommit.consume_target_revision {
+                return Err(StoreError::RecoveryRequired);
+            }
+            let (result_base, marker, raw, sidecar) =
+                disk::historical_published_m2a(&observed, base_revision)?;
+            if result_base.state.source_applies.get(index)
+                != consumed.state.source_applies.get(index)
+            {
+                return Err(StoreError::RecoveryRequired);
+            }
+            let mut next = result_base.clone();
+            next.state.source_applies[index].result = Some(result);
+            let mut next = prepare_transition_m2a(&result_base, next, false)?;
+            let prediction =
+                disk::predict_from_prefixes_m2a(&result_base, &next, marker, raw, sidecar)?;
+            require_d27_result_capacity_m2a(
+                descriptor,
+                consume_prediction.target_sidecar_prefix.len()
+                    - consume_prediction.base_sidecar_prefix.len(),
+                prediction.target_sidecar_prefix.len() - prediction.base_sidecar_prefix.len(),
+            )?;
+            next.marker = prediction.target_marker.clone();
+            (D27PublicationKindV1::Result, prediction, next)
+        } else {
+            (D27PublicationKindV1::Consume, consume_prediction, consumed)
+        };
+        let state_next = self
+            .writer
+            .directory
+            .inspect_next_m2a(Some(&prediction.target_marker_bytes))?;
+        if !matches!(
+            state_next.classification,
+            disk::StateNextClassificationV1::Absent
+                | disk::StateNextClassificationV1::ProperPrefix
+                | disk::StateNextClassificationV1::ExactTarget
+        ) {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let marker_is_base = observed.marker_bytes == prediction.base_marker_bytes;
+        let marker_is_target = observed.marker_bytes == prediction.target_marker_bytes;
+        let logs_are_base = observed.raw_bytes == prediction.base_raw_prefix
+            && observed.sidecar_bytes == prediction.base_sidecar_prefix;
+        let logs_are_target = observed.raw_bytes == prediction.target_raw_prefix
+            && observed.sidecar_bytes == prediction.target_sidecar_prefix;
+        if !(marker_is_base
+            && logs_are_base
+            && state_next.classification == disk::StateNextClassificationV1::Absent
+            || marker_is_base && logs_are_target
+            || marker_is_target
+                && logs_are_target
+                && state_next.classification == disk::StateNextClassificationV1::Absent)
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let (device, inode) = self.writer.root.directory.identity()?;
+        let root_identity = crate::apply_intent::IdentityV1 { device, inode };
+        let (device, inode) = self.writer.directory.identity()?;
+        let session_identity = crate::apply_intent::IdentityV1 { device, inode };
+        let lock = self.writer.guard.metadata()?;
+        disk::same(
+            &self.writer.guard,
+            &self.writer.directory.open("writer.lock", true, false)?,
+        )?;
+        if lock.mode() & 0o777 != 0o600 {
+            return Err(StoreError::RecoveryRequired);
+        }
+        Ok(JoinedD27MarkerRecoveryV1 {
+            kind,
+            prediction,
+            next,
+            observed_marker: observed.marker_bytes,
+            observed_raw: observed.raw_bytes,
+            observed_sidecar: observed.sidecar_bytes,
+            observed_next: state_next,
+            root_identity,
+            session_identity,
+            lock_identity: crate::apply_intent::IdentityV1 {
+                device: lock.dev(),
+                inode: lock.ino(),
+            },
+        })
+    }
+
+    pub(crate) fn recover_published_m2a(
+        mut self,
+        token: JoinedD27MarkerRecoveryV1,
+    ) -> StoreResult<(Writer, bool, D27PublicationKindV1)> {
+        use std::os::unix::fs::MetadataExt;
+        let (device, inode) = self.writer.root.directory.identity()?;
+        if token.root_identity != (crate::apply_intent::IdentityV1 { device, inode }) {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let (device, inode) = self.writer.directory.identity()?;
+        let lock = self.writer.guard.metadata()?;
+        if token.session_identity != (crate::apply_intent::IdentityV1 { device, inode })
+            || token.lock_identity
+                != (crate::apply_intent::IdentityV1 {
+                    device: lock.dev(),
+                    inode: lock.ino(),
+                })
+            || lock.mode() & 0o777 != 0o600
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+        disk::same(
+            &self.writer.guard,
+            &self.writer.directory.open("writer.lock", true, false)?,
+        )?;
+        let committed = disk::recover_published_m2a(
+            &self.writer.directory,
+            &token.prediction,
+            &token.observed_marker,
+            &token.observed_raw,
+            &token.observed_sidecar,
+            &token.observed_next,
+        )?;
+        if committed {
+            self.writer.published = token.next;
+        }
+        self.writer.recovery_required = false;
+        Ok((self.writer, committed, token.kind))
+    }
+}
+
 impl PrototypeRoot {
     pub fn new() -> StoreResult<Self> {
         disk::supported()?;
@@ -77,6 +592,86 @@ impl PrototypeRoot {
     }
 }
 impl DesktopRoot {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn recovery_open_m2a(
+        &self,
+        project: &ProjectId,
+        session: &SessionId,
+        project_binding: crate::management_effect::ManagementEffectHashV1,
+    ) -> Result<D27RecoveryOpenOutcomeV1, D27RecoveryOpenError> {
+        use crate::apply_intent::IdentityV1;
+        use std::os::unix::fs::MetadataExt;
+        self.backing.directory.verify()?;
+        let directory = Arc::new(
+            self.backing
+                .directory
+                .child(&content_hash(session.as_str().as_bytes()), false)?,
+        );
+        let guard = directory.open("writer.lock", true, false)?;
+        acquire(&guard)?;
+        disk::same(&guard, &directory.open("writer.lock", true, false)?)?;
+        let inspected = disk::inspect_published_m2a(&directory, project, session)?;
+        validate_ledger(&inspected.published)?;
+        validate_artifact_bodies_with_mode(&self.backing, &inspected.published, true)?;
+        let (device, inode) = self.identity()?;
+        let root_identity = IdentityV1 { device, inode };
+        let (device, inode) = directory.identity()?;
+        let session_identity = IdentityV1 { device, inode };
+        let lock = guard.metadata().map_err(StoreError::Io)?;
+        let writer_lock_identity = IdentityV1 {
+            device: lock.dev(),
+            inode: lock.ino(),
+        };
+        let raw_offset = inspected.published.marker.raw_offset.get() as usize;
+        let sidecar_offset = inspected.published.marker.sidecar_offset.get() as usize;
+        let raw_prefix_bytes = inspected.raw_bytes[..raw_offset].to_vec();
+        let sidecar_prefix_bytes = inspected.sidecar_bytes[..sidecar_offset].to_vec();
+        let marker_evidence_hash =
+            marker_evidence_hash(&inspected.marker_bytes, &sidecar_prefix_bytes);
+        let legacy_terminal_notices = legacy_unbound_notices_m2a(
+            &inspected.published,
+            project_binding,
+            marker_evidence_hash,
+            &sidecar_prefix_bytes,
+        )?;
+        let view = D27RecoveryInspectV1 {
+            root_identity,
+            session_identity,
+            writer_lock_identity,
+            marker_bytes: inspected.marker_bytes,
+            marker_evidence_hash,
+            raw_prefix_bytes,
+            raw_tail_bytes: inspected.raw_bytes[raw_offset..].to_vec(),
+            sidecar_prefix_bytes,
+            sidecar_tail_bytes: inspected.sidecar_bytes[sidecar_offset..].to_vec(),
+            snapshot: inspected.published.clone(),
+            state_next: inspected.state_next,
+            files: inspected.files,
+        };
+        Ok(D27RecoveryOpenOutcomeV1 {
+            view,
+            legacy_terminal_notices,
+            writer: Writer {
+                root: self.backing.clone(),
+                directory,
+                guard,
+                published: inspected.published,
+                recovery_required: true,
+            },
+        })
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn capacity_identity_m2a(&self) -> StoreResult<DesktopCapacityIdentityV1> {
+        self.backing.capacity_identity_m2a()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn available_bytes_m2a(&self) -> StoreResult<u64> {
+        self.backing
+            .directory
+            .capacity_m2a()
+            .map(|(_, available)| available)
+    }
     /// Verify and identify the retained private directory without reopening it.
     /// Used to compare native publication coordinates before consuming a Writer.
     pub fn identity(&self) -> StoreResult<(u64, u64)> {
@@ -138,6 +733,18 @@ impl DesktopRoot {
     }
 }
 impl StoreRoot {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn capacity_identity_m2a(&self) -> StoreResult<DesktopCapacityIdentityV1> {
+        let (device, inode) = self.directory.identity()?;
+        let (allocation_unit, _) = self.directory.capacity_m2a()?;
+        if self.directory.identity()? != (device, inode) {
+            return Err(StoreError::RecoveryRequired);
+        }
+        Ok(DesktopCapacityIdentityV1 {
+            root_identity: crate::apply_intent::IdentityV1 { device, inode },
+            allocation_unit,
+        })
+    }
     pub fn create(
         &self,
         project: ProjectId,
@@ -230,6 +837,14 @@ impl StoreRoot {
         );
         let guard = directory.open("writer.lock", true, false)?;
         acquire(&guard)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // Ordinary open validates only the published prefixes. Auxiliary
+            // entries and unpublished tails belong to recovery inspection.
+            let published = disk::load(&directory, project, session)?;
+            validate_ledger(&published)?;
+            validate_artifact_bodies_with_mode(self, &published, true)?;
+        }
         let published = reconcile(&directory, project, session)?;
         validate_artifact_bodies(self, &published)?;
         self.directory.sync()?;
@@ -285,6 +900,102 @@ impl StoreRoot {
         }
         Ok(writer)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn legacy_unbound_notices_m2a(
+    published: &Published,
+    project_binding: crate::management_effect::ManagementEffectHashV1,
+    marker_evidence_hash: crate::management_effect::ManagementEffectHashV1,
+    sidecar_prefix_bytes: &[u8],
+) -> Result<Vec<LegacyUnboundIntentDiagnosticV1>, D27RecoveryOpenError> {
+    use crate::{
+        apply_intent::{d27_operation_binding, d27_session_binding},
+        management_effect::ManagementEffectHashV1 as Hash,
+    };
+    let mut legacy_terminal_notices = Vec::new();
+    for (index, record) in published.state.source_applies.iter().enumerate() {
+        if let Some(intent_revision) = record.intent_revision
+            && record.reserved_result_id.is_none()
+        {
+            let diagnostic = LegacyUnboundIntentDiagnosticV1 {
+                schema_version: 1,
+                code: "legacy_source_apply_binding_missing",
+                project_binding,
+                session_binding: d27_session_binding(published.marker.session_id.as_str())
+                    .map_err(|_| StoreError::Corrupt("session binding"))?,
+                marker_evidence_hash,
+                sidecar_prefix_hash: Hash::digest(sidecar_prefix_bytes),
+                session_revision: published.marker.session_revision.get(),
+                record_index: index as u64,
+                intent_revision: intent_revision.get(),
+                source_operation_digest: d27_operation_binding(
+                    record.candidate.operation_id.as_str(),
+                )
+                .map_err(|_| StoreError::Corrupt("operation binding"))?,
+                result_present: record.result.is_some(),
+                next_action: if record.result.is_some() {
+                    "preserve_terminal_legacy_record"
+                } else {
+                    "complete_with_legacy_desktop"
+                },
+            };
+            if record.result.is_none() {
+                return Err(D27RecoveryOpenError::LegacyUnboundIntent(Box::new(
+                    diagnostic,
+                )));
+            }
+            legacy_terminal_notices.push(diagnostic);
+        }
+    }
+    Ok(legacy_terminal_notices)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn require_d27_result_capacity_m2a(
+    descriptor: &crate::apply_intent::ApplyIntentDescriptorV1,
+    consume_bytes: usize,
+    result_bytes: usize,
+) -> StoreResult<()> {
+    let unit = descriptor
+        .capacity_plan
+        .desktop_allocation_unit
+        .ok_or(StoreError::TargetMismatch)?;
+    let allocated = |bytes: u64| {
+        crate::apply_intent::allocated_bytes(bytes, unit).map_err(|_| StoreError::Overflow)
+    };
+    let required = allocated(consume_bytes as u64)?
+        .checked_add(allocated(result_bytes as u64)?)
+        .and_then(|n| {
+            n.checked_add(
+                allocated(MAX_D27_MARKER_BYTES as u64)
+                    .ok()?
+                    .checked_mul(2)?,
+            )
+        })
+        .ok_or(StoreError::Overflow)?;
+    if required > descriptor.capacity_plan.inventory_commit_bytes {
+        return Err(StoreError::Capacity("D27 reserved publication bytes"));
+    }
+    Ok(())
+}
+
+fn prepare_transition_m2a(
+    old: &Published,
+    mut next: Published,
+    content_changed: bool,
+) -> StoreResult<Published> {
+    super::memory::validate_transition(&old.state, &next.state)?;
+    mcp::validate_transition(&old.state, &next.state)?;
+    prompt::validate_transition(&old.state, &next.state)?;
+    next.marker.session_revision = old.marker.session_revision.checked_add(1)?;
+    next.state.session_revision = next.marker.session_revision;
+    if content_changed {
+        next.marker.content_revision = old.marker.content_revision.checked_add(1)?;
+    }
+    validate_ledger(&next)?;
+    super::source_apply::validate_transition(&old.state, &next.state)?;
+    Ok(next)
 }
 
 fn acquire(file: &File) -> StoreResult<()> {
@@ -455,6 +1166,14 @@ fn validate_ledger(p: &Published) -> StoreResult<()> {
 }
 
 fn validate_artifact_bodies(root: &StoreRoot, published: &Published) -> StoreResult<()> {
+    validate_artifact_bodies_with_mode(root, published, false)
+}
+
+fn validate_artifact_bodies_with_mode(
+    root: &StoreRoot,
+    published: &Published,
+    readonly: bool,
+) -> StoreResult<()> {
     let mut contracts = std::collections::BTreeSet::new();
     let mut features = std::collections::BTreeSet::new();
     let mut tasks = Vec::new();
@@ -493,10 +1212,17 @@ fn validate_artifact_bodies(root: &StoreRoot, published: &Published) -> StoreRes
         return Ok(());
     }
 
-    let store = super::WorkflowArtifactStore::from_root(
-        root.directory.clone(),
-        &published.marker.project_id,
-    )?;
+    let store = if readonly {
+        super::WorkflowArtifactStore::inspect_from_root_m2a(
+            root.directory.clone(),
+            &published.marker.project_id,
+        )?
+    } else {
+        super::WorkflowArtifactStore::from_root(
+            root.directory.clone(),
+            &published.marker.project_id,
+        )?
+    };
     for reference in contracts {
         let metadata = published
             .state
@@ -751,6 +1477,83 @@ impl Writer {
             &self.published.marker.project_id,
             &self.published.marker.session_id,
         )
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn retained_root_m2a(&self) -> StoreResult<(std::path::PathBuf, std::fs::File)> {
+        self.ready()?;
+        Ok((
+            self.root.directory.path().to_owned(),
+            self.root.directory.retained_file_m2a()?,
+        ))
+    }
+    /// Inspect an ambiguous publication while retaining this same open writer
+    /// lock. The duplicate descriptor shares its flock; no second lock or
+    /// normal-open reconciliation occurs before the owner joins evidence.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn inspect_retained_recovery_m2a(
+        &self,
+        project_binding: crate::management_effect::ManagementEffectHashV1,
+    ) -> Result<D27RecoveryOpenOutcomeV1, D27RecoveryOpenError> {
+        use crate::apply_intent::IdentityV1;
+        use std::os::unix::fs::MetadataExt;
+        self.root.directory.verify()?;
+        self.directory.verify()?;
+        disk::same(
+            &self.guard,
+            &self.directory.open("writer.lock", true, false)?,
+        )?;
+        let inspected = disk::inspect_published_m2a(
+            &self.directory,
+            &self.published.marker.project_id,
+            &self.published.marker.session_id,
+        )?;
+        validate_ledger(&inspected.published)?;
+        validate_artifact_bodies_with_mode(&self.root, &inspected.published, true)?;
+        let (device, inode) = self.root.directory.identity()?;
+        let root_identity = IdentityV1 { device, inode };
+        let (device, inode) = self.directory.identity()?;
+        let session_identity = IdentityV1 { device, inode };
+        let lock = self.guard.metadata().map_err(StoreError::Io)?;
+        let writer_lock_identity = IdentityV1 {
+            device: lock.dev(),
+            inode: lock.ino(),
+        };
+        let raw_offset = inspected.published.marker.raw_offset.get() as usize;
+        let sidecar_offset = inspected.published.marker.sidecar_offset.get() as usize;
+        let raw_prefix_bytes = inspected.raw_bytes[..raw_offset].to_vec();
+        let sidecar_prefix_bytes = inspected.sidecar_bytes[..sidecar_offset].to_vec();
+        let marker_evidence_hash =
+            marker_evidence_hash(&inspected.marker_bytes, &sidecar_prefix_bytes);
+        let legacy_terminal_notices = legacy_unbound_notices_m2a(
+            &inspected.published,
+            project_binding,
+            marker_evidence_hash,
+            &sidecar_prefix_bytes,
+        )?;
+        Ok(D27RecoveryOpenOutcomeV1 {
+            view: D27RecoveryInspectV1 {
+                root_identity,
+                session_identity,
+                writer_lock_identity,
+                marker_bytes: inspected.marker_bytes,
+                marker_evidence_hash,
+                raw_prefix_bytes,
+                raw_tail_bytes: inspected.raw_bytes[raw_offset..].to_vec(),
+                sidecar_prefix_bytes,
+                sidecar_tail_bytes: inspected.sidecar_bytes[sidecar_offset..].to_vec(),
+                snapshot: inspected.published.clone(),
+                state_next: inspected.state_next,
+                files: inspected.files,
+            },
+            legacy_terminal_notices,
+            writer: Writer {
+                root: self.root.clone(),
+                directory: self.directory.clone(),
+                guard: self.guard.try_clone().map_err(StoreError::Io)?,
+                published: inspected.published,
+                recovery_required: true,
+            },
+        })
     }
     #[cfg(all(test, unix))]
     pub(super) fn test_directory(&self) -> std::path::PathBuf {
@@ -1172,18 +1975,13 @@ impl Writer {
         Ok(value)
     }
 
-    pub(super) fn commit(&mut self, mut next: Published, content_changed: bool) -> StoreResult<()> {
+    fn prepare_commit(&self, next: Published, content_changed: bool) -> StoreResult<Published> {
         self.ready()?;
-        super::memory::validate_transition(&self.published.state, &next.state)?;
-        mcp::validate_transition(&self.published.state, &next.state)?;
-        prompt::validate_transition(&self.published.state, &next.state)?;
-        next.marker.session_revision = self.published.marker.session_revision.checked_add(1)?;
-        next.state.session_revision = next.marker.session_revision;
-        if content_changed {
-            next.marker.content_revision = self.published.marker.content_revision.checked_add(1)?;
-        }
-        validate_ledger(&next)?;
-        super::source_apply::validate_transition(&self.published.state, &next.state)?;
+        prepare_transition_m2a(&self.published, next, content_changed)
+    }
+
+    pub(super) fn commit(&mut self, next: Published, content_changed: bool) -> StoreResult<()> {
+        let mut next = self.prepare_commit(next, content_changed)?;
         // 事前失敗も含め停止し、未公開tailを次の変更に混ぜない。
         self.recovery_required = true;
         next.marker = disk::commit(&self.directory, &self.published, &next)?;
@@ -2642,6 +3440,7 @@ impl Writer {
             decision: None,
             invalidated: false,
             intent_revision: None,
+            reserved_result_id: None,
             result: None,
         });
         self.commit(next, false)
@@ -2756,6 +3555,475 @@ impl Writer {
             Some(next.marker.session_revision.checked_add(1)?);
         self.commit(next, false)?;
         Ok(IntentReceipt::NewlyPublished)
+    }
+
+    /// Computes the complete consume row and marker before either management
+    /// Prepared publication. Identity proofs remain controller assertions; F5
+    /// binds this token to pinned source FDs and the immutable capacity plan.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn precommit_source_apply_m2a(
+        &self,
+        target: &RunTarget,
+        approval: &ApprovalId,
+        payload_hash: &str,
+        guard: SourceApplyGuard,
+        proof: SourceApplyIdentityProof,
+        project_binding: crate::management_effect::ManagementEffectHashV1,
+        reserved_result_id: ResultId,
+        result_capacity_bytes: u64,
+    ) -> StoreResult<SourceApplyPrecommitTokenV1> {
+        use crate::{
+            apply_intent::{d27_operation_binding, d27_result_id_digest},
+            management_effect::ManagementEffectHashV1 as Hash,
+        };
+        use std::os::unix::fs::MetadataExt;
+        self.check_source_apply_guard(target, guard)?;
+        let index = self.source_apply_index(target, approval)?;
+        let record = &self.published.state.source_applies[index];
+        record.candidate.payload.check_proof(proof)?;
+        Self::check_source_apply_permission(record, guard)?;
+        if record.candidate.payload_hash != payload_hash
+            || record.decision != Some(ApprovalDecision::Allow)
+            || record.intent_revision.is_some()
+            || record.reserved_result_id.is_some()
+            || record.result.is_some()
+        {
+            return Err(StoreError::RunConflict);
+        }
+        if result_capacity_bytes == 0 || result_capacity_bytes > MAX_SOURCE_APPLY_BYTES as u64 {
+            return Err(StoreError::Capacity("D27 result reservation"));
+        }
+        let root_identity = self.root.capacity_identity_m2a()?;
+        let logical_capacity = DesktopLogicalCapacityV1 {
+            records_remaining: (MAX_SOURCE_APPLY_RECORDS as u64)
+                .checked_sub(self.published.state.source_applies.len() as u64)
+                .ok_or(StoreError::Overflow)?,
+            bytes_remaining: remaining_ledger_bytes_m2a(&self.published.state)?,
+        };
+        let session_identity = self.directory.identity()?;
+        let lock = self.guard.metadata()?;
+        let lock_identity = (lock.dev(), lock.ino());
+        let mut next = self.published.clone();
+        next.state.source_applies[index].intent_revision =
+            Some(next.marker.session_revision.checked_add(1)?);
+        next.state.source_applies[index].reserved_result_id = Some(reserved_result_id.clone());
+        remaining_ledger_bytes_m2a(&next.state)?;
+        let next = self.prepare_commit(next, false)?;
+        let prediction = disk::predict_commit_m2a(&self.directory, &self.published, &next)?;
+        let mut record_bytes = b"polaris-d27-consume-record-v1\0".to_vec();
+        record_bytes.extend(serde_json::to_vec(&next.state.source_applies[index])?);
+        let precommit = SourceApplyPrecommitV1 {
+            schema_version: 1,
+            project_binding,
+            run_id: target.run_id.clone(),
+            attempt_id: target.attempt_id.clone(),
+            approval_id: approval.clone(),
+            source_operation_digest: d27_operation_binding(record.candidate.operation_id.as_str())
+                .map_err(|_| StoreError::Corrupt("source operation binding"))?,
+            payload_hash: Hash::from_hex(payload_hash)
+                .map_err(|_| StoreError::Corrupt("source payload hash"))?,
+            policy_revision: record.candidate.policy_revision.get(),
+            base_session_revision: self.published.marker.session_revision.get(),
+            consume_target_revision: next.marker.session_revision.get(),
+            reserved_result_id_digest: d27_result_id_digest(reserved_result_id.as_str())
+                .map_err(|_| StoreError::Corrupt("reserved result ID digest"))?,
+            reserved_result_id,
+            base_marker_evidence_hash: marker_evidence_hash(
+                &prediction.base_marker_bytes,
+                &prediction.base_sidecar_prefix,
+            ),
+            consume_marker_evidence_hash: marker_evidence_hash(
+                &prediction.target_marker_bytes,
+                &prediction.target_sidecar_prefix,
+            ),
+            consume_sidecar_offset: prediction.target_marker.sidecar_offset.get(),
+            consume_sidecar_hash: Hash::from_hex(&prediction.target_marker.sidecar_hash)
+                .map_err(|_| StoreError::Corrupt("consume sidecar hash"))?,
+            consume_record_hash: Hash::digest(&record_bytes),
+            result_capacity_bytes,
+        };
+        precommit.canonical_bytes()?;
+        self.ready()?;
+        if self.root.capacity_identity_m2a()? != root_identity
+            || self.directory.identity()? != session_identity
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+        Ok(SourceApplyPrecommitTokenV1 {
+            precommit,
+            next,
+            prediction,
+            root_identity,
+            session_identity,
+            lock_identity,
+            logical_capacity,
+        })
+    }
+
+    /// The shared owner calls this only after both Prepared records are durable.
+    /// A successful receipt binds one consume; it is never replay authorization.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn consume_source_apply_precommitted_m2a(
+        &mut self,
+        token: SourceApplyPrecommitTokenV1,
+        guard: SourceApplyGuard,
+        proof: SourceApplyIdentityProof,
+    ) -> StoreResult<SourceApplyConsumedReceiptV1> {
+        let target = RunTarget {
+            run_id: token.precommit.run_id.clone(),
+            attempt_id: token.precommit.attempt_id.clone(),
+        };
+        let rebuilt = self.precommit_source_apply_m2a(
+            &target,
+            &token.precommit.approval_id,
+            &token.precommit.payload_hash.as_hex(),
+            guard,
+            proof,
+            token.precommit.project_binding,
+            token.precommit.reserved_result_id.clone(),
+            token.precommit.result_capacity_bytes,
+        )?;
+        if rebuilt.precommit != token.precommit
+            || rebuilt.prediction != token.prediction
+            || rebuilt.root_identity != token.root_identity
+            || rebuilt.session_identity != token.session_identity
+            || rebuilt.lock_identity != token.lock_identity
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+        self.recovery_required = true;
+        let mut next = token.next;
+        next.marker = disk::commit_precommitted_m2a(
+            &self.directory,
+            &self.published,
+            &next,
+            &token.prediction,
+        )?;
+        self.root.directory.verify()?;
+        self.directory.verify()?;
+        let marker_bytes =
+            disk::read_exact_m2a(&self.directory, disk::MARKER, MAX_D27_MARKER_BYTES as u64)?;
+        let sidecar = disk::read_exact_m2a(
+            &self.directory,
+            disk::SIDECAR,
+            token.precommit.consume_sidecar_offset,
+        )?;
+        if marker_bytes != token.prediction.target_marker_bytes
+            || marker_evidence_hash(&marker_bytes, &sidecar)
+                != token.precommit.consume_marker_evidence_hash
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+        self.published = next;
+        self.recovery_required = false;
+        Ok(SourceApplyConsumedReceiptV1 {
+            precommit: token.precommit,
+            marker_bytes,
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn validate_d27_descriptor_m2a(
+        &self,
+        precommit: &SourceApplyPrecommitV1,
+        descriptor: &crate::apply_intent::ApplyIntentDescriptorV1,
+        record: &SavedSourceApply,
+        result_id: &ResultId,
+    ) -> StoreResult<()> {
+        use crate::apply_intent::{
+            ApplyContextV1, ApplyInventoryV1, IdentityV1, d27_operation_binding,
+            d27_session_binding,
+        };
+        let source = record.candidate.payload.source_identity;
+        let recovery = record.candidate.payload.recovery_parent_identity;
+        let identity = self.root.capacity_identity_m2a()?;
+        let ApplyContextV1::Session {
+            base_epoch,
+            session_binding,
+            base_session_revision,
+            consume_target_revision,
+            policy_revision,
+            source_operation_digest,
+            reserved_result_id,
+            reserved_result_id_digest,
+            base_marker_evidence_hash,
+            consume_marker_evidence_hash,
+            consume_sidecar_offset,
+            consume_sidecar_hash,
+            precommit_hash,
+        } = &descriptor.context
+        else {
+            return Err(StoreError::TargetMismatch);
+        };
+        if descriptor.inventory_id != ApplyInventoryV1::D27
+            || descriptor.project_binding != precommit.project_binding
+            || descriptor.source_identity
+                != (IdentityV1 {
+                    device: source.device.get(),
+                    inode: source.inode.get(),
+                })
+            || descriptor.recovery_parent_identity
+                != (IdentityV1 {
+                    device: recovery.device.get(),
+                    inode: recovery.inode.get(),
+                })
+            || descriptor.agreed_revision.value != precommit.payload_hash.as_hex()
+            || descriptor.capacity_plan.desktop_root_identity != Some(identity.root_identity)
+            || descriptor.capacity_plan.desktop_device != Some(identity.root_identity.device)
+            || descriptor.capacity_plan.desktop_allocation_unit != Some(identity.allocation_unit)
+            || descriptor.capacity_plan.desktop_result_required_bytes
+                != Some(precommit.result_capacity_bytes)
+            || *base_epoch != self.published.marker.epoch.get()
+            || *session_binding
+                != d27_session_binding(self.published.marker.session_id.as_str())
+                    .map_err(|_| StoreError::TargetMismatch)?
+            || *base_session_revision != precommit.base_session_revision
+            || *consume_target_revision != precommit.consume_target_revision
+            || *policy_revision != precommit.policy_revision
+            || *source_operation_digest != precommit.source_operation_digest
+            || reserved_result_id != &precommit.reserved_result_id.as_str()
+            || *reserved_result_id_digest != precommit.reserved_result_id_digest
+            || *base_marker_evidence_hash != precommit.base_marker_evidence_hash
+            || *consume_marker_evidence_hash != precommit.consume_marker_evidence_hash
+            || *consume_sidecar_offset != precommit.consume_sidecar_offset
+            || *consume_sidecar_hash != precommit.consume_sidecar_hash
+            || *precommit_hash != precommit.precommit_hash()?
+            || record.candidate.payload_hash != precommit.payload_hash.as_hex()
+            || record.candidate.payload.payload_hash()? != record.candidate.payload_hash
+            || record.candidate.policy_revision.get() != precommit.policy_revision
+            || d27_operation_binding(record.candidate.operation_id.as_str())
+                .map_err(|_| StoreError::TargetMismatch)?
+                != precommit.source_operation_digest
+            || record.intent_revision.map(DecimalU64::get)
+                != Some(precommit.consume_target_revision)
+            || record.reserved_result_id.as_ref() != Some(&precommit.reserved_result_id)
+            || result_id != &precommit.reserved_result_id
+        {
+            return Err(StoreError::TargetMismatch);
+        }
+        Ok(())
+    }
+
+    /// Records the exact retained ApplyReport artifact after the shared owner
+    /// has joined its hash to ApplyReported. This does not certify apply success.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn source_apply_result_remaining_bytes_m2a(
+        &self,
+        precommit: &SourceApplyPrecommitV1,
+        report_bytes: &[u8],
+    ) -> StoreResult<u64> {
+        self.ready()?;
+        let target = RunTarget {
+            run_id: precommit.run_id.clone(),
+            attempt_id: precommit.attempt_id.clone(),
+        };
+        let index = self.source_apply_index(&target, &precommit.approval_id)?;
+        let report: crate::workspace_apply::ApplyReport = serde_json::from_slice(report_bytes)?;
+        let result = SourceApplyResult {
+            result_id: precommit.reserved_result_id.clone(),
+            report: serde_json::to_value(report)?,
+        };
+        if let Some(old) = &self.published.state.source_applies[index].result {
+            return if old == &result {
+                Ok(0)
+            } else {
+                Err(StoreError::RunConflict)
+            };
+        }
+        let mut next = self.published.clone();
+        next.state.source_applies[index].result = Some(result);
+        let next = self.prepare_commit(next, false)?;
+        let prediction = disk::predict_commit_m2a(&self.directory, &self.published, &next)?;
+        publication_remaining_bytes_m2a(
+            &prediction,
+            &prediction.base_marker_bytes,
+            &prediction.base_sidecar_prefix,
+            0,
+            self.root.capacity_identity_m2a()?.allocation_unit,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn record_source_apply_result_evidence_m2a(
+        &mut self,
+        precommit: &SourceApplyPrecommitV1,
+        descriptor: &crate::apply_intent::ApplyIntentDescriptorV1,
+        result_id: ResultId,
+        report_bytes: &[u8],
+        report_hash: crate::management_effect::ManagementEffectHashV1,
+    ) -> StoreResult<SourceApplyResultEvidenceV1> {
+        use crate::apply_intent::CanonicalApplyEvidence;
+        use crate::management_effect::ManagementEffectHashV1 as Hash;
+        self.ready()?;
+        let identity = self.root.capacity_identity_m2a()?;
+        precommit.canonical_bytes()?;
+        descriptor
+            .canonical_bytes()
+            .map_err(|_| StoreError::Corrupt("D27 result descriptor"))?;
+        let target = RunTarget {
+            run_id: precommit.run_id.clone(),
+            attempt_id: precommit.attempt_id.clone(),
+        };
+        let index = self.source_apply_index(&target, &precommit.approval_id)?;
+        let record = &self.published.state.source_applies[index];
+        self.validate_d27_descriptor_m2a(precommit, descriptor, record, &result_id)?;
+        let mut consumed_record = record.clone();
+        consumed_record.result = None;
+        let mut consumed_bytes = b"polaris-d27-consume-record-v1\0".to_vec();
+        consumed_bytes.extend(serde_json::to_vec(&consumed_record)?);
+        if Hash::digest(&consumed_bytes) != precommit.consume_record_hash {
+            return Err(StoreError::RecoveryRequired);
+        }
+        if report_bytes.len() as u64 > crate::workspace_apply::MAX_APPLY_REPORT_BYTES
+            || report_bytes.len() as u64 > precommit.result_capacity_bytes
+        {
+            return Err(StoreError::Capacity("D27 report artifact"));
+        }
+        let report: crate::workspace_apply::ApplyReport = serde_json::from_slice(report_bytes)?;
+        if report
+            .canonical_bytes()
+            .map_err(|_| StoreError::Corrupt("D27 report encoding"))?
+            != report_bytes
+        {
+            return Err(StoreError::Corrupt("noncanonical D27 report artifact"));
+        }
+        let mut exact = b"polaris-workspace-apply-report-v1\0".to_vec();
+        exact.extend(report_bytes);
+        if Hash::digest(&exact) != report_hash
+            || report.source_path != std::path::Path::new(&record.candidate.payload.source_path)
+        {
+            return Err(StoreError::TargetMismatch);
+        }
+        let result = SourceApplyResult {
+            result_id,
+            report: serde_json::to_value(report)?,
+        };
+        let result_length = serde_json::to_vec(&result)?.len() as u64;
+        if result_length > precommit.result_capacity_bytes
+            || result_length > MAX_SOURCE_APPLY_BYTES as u64
+        {
+            return Err(StoreError::Capacity("D27 result evidence"));
+        }
+        result.validate()?;
+        let revision = self.published.marker.session_revision.get();
+        if revision < precommit.consume_target_revision {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let marker_bytes =
+            disk::read_exact_m2a(&self.directory, disk::MARKER, MAX_D27_MARKER_BYTES as u64)?;
+        let sidecar = disk::read_exact_m2a(
+            &self.directory,
+            disk::SIDECAR,
+            self.published.marker.sidecar_offset.get(),
+        )?;
+        let raw = disk::read_exact_m2a(
+            &self.directory,
+            disk::RAW,
+            self.published.marker.raw_offset.get(),
+        )?;
+        disk::require_published_exact_m2a(
+            &self.directory,
+            &self.published,
+            &marker_bytes,
+            &raw,
+            &sidecar,
+        )?;
+        let consume_length =
+            usize::try_from(precommit.consume_sidecar_offset).map_err(|_| StoreError::Overflow)?;
+        let consume_prefix = sidecar
+            .get(..consume_length)
+            .ok_or(StoreError::RecoveryRequired)?;
+        if content_hash(consume_prefix) != precommit.consume_sidecar_hash.as_hex() {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let inspected = disk::inspect_published_m2a(
+            &self.directory,
+            &self.published.marker.project_id,
+            &self.published.marker.session_id,
+        )?;
+        let (_, consume_marker, _, _) =
+            disk::historical_published_m2a(&inspected, precommit.consume_target_revision)?;
+        if marker_evidence_hash(&consume_marker, consume_prefix)
+            != precommit.consume_marker_evidence_hash
+        {
+            return Err(StoreError::RecoveryRequired);
+        }
+        if let Some(old) = &record.result {
+            if old != &result {
+                return Err(StoreError::RunConflict);
+            }
+            // Replay certifies the result publication marker only. A later
+            // policy/session commit cannot become new successful evidence.
+            let previous_revision = revision
+                .checked_sub(1)
+                .ok_or(StoreError::RecoveryRequired)?;
+            let (previous, _, _, _) =
+                disk::historical_published_m2a(&inspected, previous_revision)?;
+            if previous.state.source_applies.get(index) != Some(&consumed_record) {
+                return Err(StoreError::RecoveryRequired);
+            }
+            // An explicit joined replay may establish durability, never dispatch.
+            self.recovery_required = true;
+            disk::sync_published(&self.directory)?;
+        } else {
+            let mut next = self.published.clone();
+            next.state.source_applies[index].result = Some(result);
+            let mut next = self.prepare_commit(next, false)?;
+            let prediction = disk::predict_commit_m2a(&self.directory, &self.published, &next)?;
+            let (_, _, _, base_sidecar) =
+                disk::historical_published_m2a(&inspected, precommit.base_session_revision)?;
+            require_d27_result_capacity_m2a(
+                descriptor,
+                consume_length
+                    .checked_sub(base_sidecar.len())
+                    .ok_or(StoreError::Overflow)?,
+                prediction.target_sidecar_prefix.len() - prediction.base_sidecar_prefix.len(),
+            )?;
+            self.recovery_required = true;
+            next.marker = disk::commit_precommitted_m2a(
+                &self.directory,
+                &self.published,
+                &next,
+                &prediction,
+            )?;
+            self.published = next;
+        }
+        self.root.directory.verify()?;
+        if self.root.capacity_identity_m2a()? != identity {
+            self.recovery_required = true;
+            return Err(StoreError::RecoveryRequired);
+        }
+        let marker_bytes =
+            disk::read_exact_m2a(&self.directory, disk::MARKER, MAX_D27_MARKER_BYTES as u64)?;
+        let sidecar = disk::read_exact_m2a(
+            &self.directory,
+            disk::SIDECAR,
+            self.published.marker.sidecar_offset.get(),
+        )?;
+        let raw = disk::read_exact_m2a(
+            &self.directory,
+            disk::RAW,
+            self.published.marker.raw_offset.get(),
+        )?;
+        disk::require_published_exact_m2a(
+            &self.directory,
+            &self.published,
+            &marker_bytes,
+            &raw,
+            &sidecar,
+        )?;
+        self.recovery_required = false;
+        Ok(SourceApplyResultEvidenceV1 {
+            session_revision: self.published.marker.session_revision.get(),
+            marker_evidence_hash: marker_evidence_hash(&marker_bytes, &sidecar),
+            marker_bytes,
+            sidecar_offset: self.published.marker.sidecar_offset.get(),
+            sidecar_hash: Hash::from_hex(&self.published.marker.sidecar_hash)
+                .map_err(|_| StoreError::RecoveryRequired)?,
+            sidecar_prefix_hash: Hash::digest(&sidecar),
+            reserved_result_id_digest: precommit.reserved_result_id_digest,
+            report_hash,
+        })
     }
 
     /// Expiry or later revocation cannot suppress evidence of an in-flight apply.
@@ -3037,6 +4305,7 @@ fn same_or_staled_gates(
         || previous.phase_gate_schema_version != candidate.phase_gate_schema_version
         || previous.approved_spec_hash != candidate.approved_spec_hash
         || previous.convergence != candidate.convergence
+        || previous.full_spec != candidate.full_spec
         || previous.external_grants != candidate.external_grants
     {
         return false;

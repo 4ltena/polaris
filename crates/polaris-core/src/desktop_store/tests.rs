@@ -38,6 +38,185 @@ fn setup() -> (PrototypeRoot, Writer) {
     let writer = root.create(project(), session(), initial()).unwrap();
     (root, writer)
 }
+
+// Independently authored wire fixtures. Never regenerate these from a writer.
+const M2A_SIDECAR_V1: &str = r#"{"session_revision":"0","draft":{"draft_revision":"0","text":"原文\n入力","attachment_ids":["attachment"]},"configuration":{"configuration_revision":"0","provider":"fake","model":"model","effort":"medium"},"policy_revision":"7","tasks":[],"runs":[],"requests":[],"unresolved_approvals":[]}"#;
+const M2A_SIDECAR_V2: &str = r#"{"desktop_sidecar_schema_version":2,"inherited_turn_count":"0","conversation_memory":null,"source_applies":[],"children":[],"session_revision":"0","draft":{"draft_revision":"0","text":"原文\n入力","attachment_ids":["attachment"]},"configuration":{"configuration_revision":"0","provider":"fake","model":"model","effort":"medium"},"role_bindings":null,"tier_bindings":null,"goal":null,"instructions":[],"policy_revision":"7","tasks":[],"runs":[],"requests":[],"unresolved_approvals":[],"approval_records":[],"workflow":null,"workflow_artifacts":{"schema_version":1,"revision":0,"artifacts":[]}}"#;
+
+#[test]
+fn m2a_source_apply_sidecar_independent_v1_v2_bytes_and_field_order() {
+    let (legacy, version) = super::model::decode_sidecar_wire(M2A_SIDECAR_V1.as_bytes()).unwrap();
+    assert_eq!(version, 1);
+    assert!(legacy.source_applies.is_empty());
+    assert_eq!(legacy.inherited_turn_count.get(), 0);
+    let (modern, version) = super::model::decode_sidecar_wire(M2A_SIDECAR_V2.as_bytes()).unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(legacy, modern);
+    assert_eq!(
+        serde_json::to_vec(&legacy).unwrap(),
+        M2A_SIDECAR_V2.as_bytes()
+    );
+    let (_root, writer) = setup();
+    assert_eq!(
+        fs::read(dir(&writer).join(disk::SIDECAR)).unwrap(),
+        format!("{M2A_SIDECAR_V2}\n").as_bytes()
+    );
+}
+
+#[test]
+fn m2a_source_apply_sidecar_rejects_all_missing_unknown_duplicate_and_version_fields() {
+    let full: serde_json::Value = serde_json::from_str(M2A_SIDECAR_V2).unwrap();
+    assert_eq!(full.as_object().unwrap().len(), 20);
+    for key in full.as_object().unwrap().keys() {
+        if key == "desktop_sidecar_schema_version" {
+            continue;
+        } // Absence dispatches v1.
+        let mut missing = full.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(
+            super::model::decode_sidecar_wire(&serde_json::to_vec(&missing).unwrap()).is_err(),
+            "missing {key}"
+        );
+        let duplicate = format!(
+            "{{{}:{},{}",
+            serde_json::to_string(key).unwrap(),
+            full[key],
+            &M2A_SIDECAR_V2[1..]
+        );
+        assert!(
+            super::model::decode_sidecar_wire(duplicate.as_bytes()).is_err(),
+            "duplicate {key}"
+        );
+    }
+    for value in ["0", "1", "3", "2.0", "null", "true", "\"2\""] {
+        let raw = M2A_SIDECAR_V2.replacen(
+            "\"desktop_sidecar_schema_version\":2",
+            &format!("\"desktop_sidecar_schema_version\":{value}"),
+            1,
+        );
+        assert!(
+            super::model::decode_sidecar_wire(raw.as_bytes()).is_err(),
+            "version {value}"
+        );
+    }
+    for raw in [
+        format!(
+            "{{\"desktop_sidecar_schema_version\":2,{}",
+            &M2A_SIDECAR_V2[1..]
+        ),
+        format!("{{\"foreign\":null,{}", &M2A_SIDECAR_V2[1..]),
+        format!("{{\"session_revision\":\"0\",{}", &M2A_SIDECAR_V1[1..]),
+        "[]".to_string(),
+        "null".to_string(),
+    ] {
+        assert!(
+            super::model::decode_sidecar_wire(raw.as_bytes()).is_err(),
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn m2a_source_apply_sidecar_record_versions_require_exact_nullable_and_reserved_fields() {
+    let (candidate, _) = source_apply_fixture();
+    let record = SavedSourceApply {
+        candidate,
+        decision: None,
+        invalidated: false,
+        intent_revision: None,
+        reserved_result_id: None,
+        result: None,
+    };
+    let record_bytes = serde_json::to_string(&record).unwrap();
+    let raw = M2A_SIDECAR_V2.replace(
+        "\"source_applies\":[]",
+        &format!("\"source_applies\":[{record_bytes}]"),
+    );
+    let (state, version) = super::model::decode_sidecar_wire(raw.as_bytes()).unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(state.source_applies, [record.clone()]);
+    let parsed: serde_json::Value = serde_json::from_str(&record_bytes).unwrap();
+    for field in parsed.as_object().unwrap().keys() {
+        let mut missing = parsed.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        let changed = raw.replace(&record_bytes, &missing.to_string());
+        assert!(
+            super::model::decode_sidecar_wire(changed.as_bytes()).is_err(),
+            "record missing {field}"
+        );
+        let duplicate = format!(
+            "{{{}:{},{}",
+            serde_json::to_string(field).unwrap(),
+            parsed[field],
+            &record_bytes[1..]
+        );
+        assert!(
+            super::model::decode_sidecar_wire(raw.replace(&record_bytes, &duplicate).as_bytes())
+                .is_err(),
+            "record duplicate {field}"
+        );
+    }
+    let unversioned = raw.replacen("\"desktop_sidecar_schema_version\":2,", "", 1);
+    assert!(
+        super::model::decode_sidecar_wire(unversioned.as_bytes()).is_err(),
+        "reserved field on v1"
+    );
+    let legacy = unversioned.replace("\"reserved_result_id\":null,", "");
+    let (legacy, version) = super::model::decode_sidecar_wire(legacy.as_bytes()).unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(legacy.source_applies, [record]);
+    let foreign = format!("{{\"foreign\":null,{}", &record_bytes[1..]);
+    assert!(
+        super::model::decode_sidecar_wire(raw.replace(&record_bytes, &foreign).as_bytes()).is_err()
+    );
+}
+
+#[test]
+fn m2a_source_apply_sidecar_prefix_migrates_without_rewrite_and_rejects_v2_to_v1() {
+    use crate::conversation_state::content_hash;
+    let (root, writer) = setup();
+    let directory = dir(&writer);
+    let mut marker = writer.snapshot().unwrap().marker;
+    let legacy = format!("{M2A_SIDECAR_V1}\n").into_bytes();
+    marker.sidecar_offset = DecimalU64::new(legacy.len() as u64);
+    marker.sidecar_hash = content_hash(&legacy);
+    fs::write(directory.join(disk::SIDECAR), &legacy).unwrap();
+    fs::write(
+        directory.join(disk::MARKER),
+        serde_json::to_vec(&marker).unwrap(),
+    )
+    .unwrap();
+    drop(writer);
+    let mut writer = root.open(&project(), &session()).unwrap();
+    writer.apply(&draft("migration", 0, "new"), None).unwrap();
+    let migrated = fs::read(directory.join(disk::SIDECAR)).unwrap();
+    assert!(migrated.starts_with(&legacy));
+    let (_, version) = super::model::decode_sidecar_wire(&migrated[legacy.len()..]).unwrap();
+    assert_eq!(version, 2);
+    let mut marker = writer.snapshot().unwrap().marker;
+    drop(writer);
+    root.open(&project(), &session()).unwrap();
+    let mut last: serde_json::Value = serde_json::from_slice(&migrated[legacy.len()..]).unwrap();
+    last.as_object_mut()
+        .unwrap()
+        .remove("desktop_sidecar_schema_version");
+    let mut rollback = format!("{M2A_SIDECAR_V2}\n").into_bytes();
+    rollback.extend(disk::line(&last).unwrap());
+    marker.sidecar_offset = DecimalU64::new(rollback.len() as u64);
+    marker.sidecar_hash = content_hash(&rollback);
+    let marker_bytes = serde_json::to_vec(&marker).unwrap();
+    fs::write(directory.join(disk::SIDECAR), &rollback).unwrap();
+    fs::write(directory.join(disk::MARKER), &marker_bytes).unwrap();
+    assert!(matches!(
+        root.open(&project(), &session()),
+        Err(StoreError::Corrupt("desktop sidecar version rollback"))
+    ));
+    assert_eq!(fs::read(directory.join(disk::SIDECAR)).unwrap(), rollback);
+    assert_eq!(
+        fs::read(directory.join(disk::MARKER)).unwrap(),
+        marker_bytes
+    );
+}
 fn request(id: &str, body: RequestBody) -> Request {
     Request {
         protocol_version: Default::default(),
@@ -2770,6 +2949,10 @@ fn saved_roles_none_and_explicit_empty_round_trip_and_legacy_missing_fields() {
             .unwrap();
         let saved = writer.snapshot().unwrap();
         let mut legacy = serde_json::to_value(&saved.state).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("desktop_sidecar_schema_version");
         legacy.as_object_mut().unwrap().remove("role_bindings");
         for run in legacy["runs"].as_array_mut().unwrap() {
             run.as_object_mut().unwrap().remove("role_bindings");
@@ -3188,6 +3371,10 @@ fn child_ledger_legacy_and_session_bound_validation() {
     writer.apply(&start("start", 0), Some(target())).unwrap();
     let mut state = writer.snapshot().unwrap().state;
     let mut legacy = serde_json::to_value(&state).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("desktop_sidecar_schema_version");
     legacy.as_object_mut().unwrap().remove("children");
     assert!(
         serde_json::from_value::<Sidecar>(legacy)
@@ -3220,6 +3407,817 @@ fn child_ledger_legacy_and_session_bound_validation() {
     assert!(super::children::validate(&state).is_err());
     state.children.pop();
     super::children::validate(&state).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_normal_open_preserves_auxiliary_directory_and_unpublished_tails() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, writer) = setup();
+    let path = dir(&writer);
+    let root = DesktopRoot::open_owned(path.parent().unwrap()).unwrap();
+    let directory = disk::Directory::open_owned(&path).unwrap();
+    let marker = disk::read_marker(&directory).unwrap();
+    drop(writer);
+    let auxiliary = path.join("auxiliary");
+    fs::create_dir(&auxiliary).unwrap();
+    fs::set_permissions(&auxiliary, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(auxiliary.join("sentinel"), b"caller-owned auxiliary data").unwrap();
+    for name in [disk::RAW, disk::SIDECAR] {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path.join(name))
+            .unwrap()
+            .write_all(b"unpublished, incomplete tail\n")
+            .unwrap();
+    }
+    let raw = fs::read(path.join(disk::RAW)).unwrap();
+    let sidecar = fs::read(path.join(disk::SIDECAR)).unwrap();
+    let _reopened = root.open(&project(), &session()).unwrap();
+    assert_eq!(disk::read_marker(&directory).unwrap(), marker);
+    assert_eq!(fs::read(path.join(disk::RAW)).unwrap(), raw);
+    assert_eq!(fs::read(path.join(disk::SIDECAR)).unwrap(), sidecar);
+    assert_eq!(
+        fs::read(auxiliary.join("sentinel")).unwrap(),
+        b"caller-owned auxiliary data"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_recovery_open_preserves_all_files_and_calls_no_mutations() {
+    let (_root, mut writer) = setup();
+    source_terminal(&mut writer);
+    let (candidate, proof) = source_allow(&mut writer);
+    let pre = m2a_precommit(
+        &writer,
+        &candidate,
+        proof,
+        ResultId::new("readonly-result").unwrap(),
+    )
+    .unwrap()
+    .precommit()
+    .clone();
+    let baseline = m2a_session_files(&writer);
+    let path = dir(&writer);
+    let root = DesktopRoot::open_owned(dir(&writer).parent().unwrap()).unwrap();
+    drop(writer);
+    disk::M2A_MUTATION_CALLS.with(|calls| calls.set([0; 3]));
+    let inspected = root
+        .recovery_open_m2a(&project(), &session(), pre.project_binding)
+        .unwrap();
+    assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+    assert_eq!(
+        inspected.view.snapshot.marker.session_revision.get(),
+        pre.base_session_revision
+    );
+    assert_eq!(
+        inspected.view.state_next.classification,
+        StateNextClassificationV1::Absent
+    );
+    assert_eq!(inspected.view.files.len(), 4);
+    assert!(inspected.legacy_terminal_notices.is_empty());
+    assert!(matches!(
+        root.open(&project(), &session()),
+        Err(StoreError::Busy)
+    ));
+    drop(inspected);
+    // Re-open only the disk directory to compare the complete original fixture.
+    let directory = disk::Directory::open_owned(&path).unwrap();
+    assert_eq!(m2a_directory_files(&path), baseline);
+    let names = directory.names_m2a().unwrap();
+    assert_eq!(names.len(), 4);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_state_next_all_safe_and_unsafe_classes_are_readonly() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, writer) = setup();
+    let directory = disk::Directory::open_owned(&dir(&writer)).unwrap();
+    let target = b"target-marker";
+    assert_eq!(
+        directory
+            .inspect_next_m2a(Some(target))
+            .unwrap()
+            .classification,
+        StateNextClassificationV1::Absent
+    );
+    for (bytes, class) in [
+        (&b""[..], StateNextClassificationV1::ProperPrefix),
+        (&target[..1], StateNextClassificationV1::ProperPrefix),
+        (
+            &target[..target.len() - 1],
+            StateNextClassificationV1::ProperPrefix,
+        ),
+        (&target[..], StateNextClassificationV1::ExactTarget),
+        (&b"foreign!!!!!!"[..], StateNextClassificationV1::Foreign),
+        (&b"target-marker+"[..], StateNextClassificationV1::Overlong),
+    ] {
+        let mut file = directory.open("state.next", true, true).unwrap();
+        file.write_all(bytes).unwrap();
+        drop(file);
+        disk::M2A_MUTATION_CALLS.with(|calls| calls.set([0; 3]));
+        let inspected = directory.inspect_next_m2a(Some(target)).unwrap();
+        assert_eq!(inspected.classification, class);
+        assert_eq!(inspected.bytes.as_deref(), Some(bytes));
+        assert_eq!(
+            inspected.hash,
+            Some(crate::management_effect::ManagementEffectHashV1::digest(
+                bytes
+            ))
+        );
+        assert_eq!(inspected.mode, Some(0o600));
+        assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+        assert_eq!(fs::read(dir(&writer).join("state.next")).unwrap(), bytes);
+        fs::remove_file(dir(&writer).join("state.next")).unwrap();
+    }
+    for length in [65_536, 65_537] {
+        let mut file = directory.open("state.next", true, true).unwrap();
+        let bytes = vec![b'x'; length];
+        file.write_all(&bytes).unwrap();
+        drop(file);
+        let inspected = directory.inspect_next_m2a(Some(target)).unwrap();
+        assert_eq!(
+            inspected.classification,
+            StateNextClassificationV1::Overlong
+        );
+        assert_eq!(inspected.bytes.is_some(), length == 65_536);
+        assert_eq!(
+            inspected.hash,
+            Some(crate::management_effect::ManagementEffectHashV1::digest(
+                &bytes
+            ))
+        );
+        fs::remove_file(dir(&writer).join("state.next")).unwrap();
+    }
+    for mode in [0o400, 0o640] {
+        let file = directory.open("state.next", true, true).unwrap();
+        drop(file);
+        fs::set_permissions(
+            dir(&writer).join("state.next"),
+            fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+        let inspected = directory.inspect_next_m2a(Some(target)).unwrap();
+        assert_eq!(
+            inspected.classification,
+            StateNextClassificationV1::UnsafeInode
+        );
+        assert!(inspected.bytes.is_none() && inspected.hash.is_none());
+        fs::remove_file(dir(&writer).join("state.next")).unwrap();
+    }
+    std::os::unix::fs::symlink("raw.jsonl", dir(&writer).join("state.next")).unwrap();
+    assert_eq!(
+        directory
+            .inspect_next_m2a(Some(target))
+            .unwrap()
+            .classification,
+        StateNextClassificationV1::UnsafeInode
+    );
+    fs::remove_file(dir(&writer).join("state.next")).unwrap();
+    fs::hard_link(
+        dir(&writer).join(disk::RAW),
+        dir(&writer).join("state.next"),
+    )
+    .unwrap();
+    assert_eq!(
+        directory
+            .inspect_next_m2a(Some(target))
+            .unwrap()
+            .classification,
+        StateNextClassificationV1::UnsafeInode
+    );
+    fs::remove_file(dir(&writer).join("state.next")).unwrap();
+    fs::create_dir(dir(&writer).join("state.next")).unwrap();
+    assert_eq!(
+        directory
+            .inspect_next_m2a(Some(target))
+            .unwrap()
+            .classification,
+        StateNextClassificationV1::UnsafeInode
+    );
+    fs::remove_dir(dir(&writer).join("state.next")).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_joined_marker_recovery_uses_exact_precommit_and_report_at_publication_stops() {
+    for result_publication in [false, true] {
+        for point in [
+            "marker_partial",
+            "marker_sync",
+            "marker_rename",
+            "directory_sync",
+        ] {
+            let (_prototype, mut writer) = setup();
+            source_terminal(&mut writer);
+            let (candidate, proof) = source_allow(&mut writer);
+            let token = m2a_precommit(
+                &writer,
+                &candidate,
+                proof,
+                ResultId::new("joined-result").unwrap(),
+            )
+            .unwrap();
+            let pre = token.precommit().clone();
+            let (descriptor, binding, request, before, generic) =
+                m2a_result_artifacts(&writer, &pre);
+            let root = DesktopRoot::open_owned(dir(&writer).parent().unwrap()).unwrap();
+            let path = dir(&writer);
+            let guard = source_guard(&writer);
+            let mut token = Some(token);
+            if result_publication {
+                writer
+                    .consume_source_apply_precommitted_m2a(token.take().unwrap(), guard, proof)
+                    .unwrap();
+            }
+            disk::FAIL.with(|f| f.set(Some(point)));
+            let failed = if result_publication {
+                writer
+                    .record_source_apply_result_evidence_m2a(
+                        &pre,
+                        &descriptor,
+                        pre.reserved_result_id.clone(),
+                        M2A_REPORT,
+                        m2a_result_hash(M2A_REPORT),
+                    )
+                    .map(|_| ())
+            } else {
+                writer
+                    .consume_source_apply_precommitted_m2a(token.take().unwrap(), guard, proof)
+                    .map(|_| ())
+            };
+            assert!(failed.is_err(), "{point}");
+            disk::FAIL.with(|f| f.set(None));
+            let frozen = m2a_directory_files(&path);
+            drop(writer);
+            disk::M2A_MUTATION_CALLS.with(|calls| calls.set([0; 3]));
+            disk::M2A_REMOVE_NEXT_CALLS.with(|calls| calls.set(0));
+            let opened = root
+                .recovery_open_m2a(&project(), &session(), pre.project_binding)
+                .unwrap();
+            assert_eq!(m2a_directory_files(&path), frozen);
+            assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+            let report = result_publication.then_some((M2A_REPORT, m2a_result_hash(M2A_REPORT)));
+            let joined = opened
+                .join_marker_recovery_m2a(
+                    &pre,
+                    &descriptor,
+                    &binding,
+                    &request,
+                    &before,
+                    &generic,
+                    report,
+                )
+                .unwrap();
+            assert_eq!(m2a_directory_files(&path), frozen);
+            assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+            let (writer, committed, kind) = opened.recover_published_m2a(joined).unwrap();
+            assert!(committed);
+            assert_eq!(
+                kind,
+                if result_publication {
+                    D27PublicationKindV1::Result
+                } else {
+                    D27PublicationKindV1::Consume
+                }
+            );
+            let state = writer.snapshot().unwrap();
+            assert_eq!(
+                state.marker.session_revision.get(),
+                pre.consume_target_revision + u64::from(result_publication)
+            );
+            let record = state
+                .state
+                .source_applies
+                .iter()
+                .find(|r| r.candidate.approval_id == candidate.approval_id)
+                .unwrap();
+            assert_eq!(
+                record.reserved_result_id.as_ref(),
+                Some(&pre.reserved_result_id)
+            );
+            assert_eq!(record.result.is_some(), result_publication);
+            assert!(!path.join("state.next").exists());
+            assert_eq!(disk::M2A_REMOVE_NEXT_CALLS.with(|calls| calls.get()), 0);
+            assert!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get())[1] > 0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_joined_marker_token_rejects_changed_inode_mode_link_length_and_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    for change in 0..5 {
+        let (_prototype, mut writer) = setup();
+        source_terminal(&mut writer);
+        let (candidate, proof) = source_allow(&mut writer);
+        let token = m2a_precommit(
+            &writer,
+            &candidate,
+            proof,
+            ResultId::new("joined-result").unwrap(),
+        )
+        .unwrap();
+        let pre = token.precommit().clone();
+        let (descriptor, binding, request, before, generic) = m2a_result_artifacts(&writer, &pre);
+        let root = DesktopRoot::open_owned(dir(&writer).parent().unwrap()).unwrap();
+        let path = dir(&writer);
+        let guard = source_guard(&writer);
+        disk::FAIL.with(|f| f.set(Some("marker_partial")));
+        assert!(
+            writer
+                .consume_source_apply_precommitted_m2a(token, guard, proof)
+                .is_err()
+        );
+        disk::FAIL.with(|f| f.set(None));
+        drop(writer);
+        let opened = root
+            .recovery_open_m2a(&project(), &session(), pre.project_binding)
+            .unwrap();
+        let joined = opened
+            .join_marker_recovery_m2a(
+                &pre,
+                &descriptor,
+                &binding,
+                &request,
+                &before,
+                &generic,
+                None,
+            )
+            .unwrap();
+        let next = path.join("state.next");
+        let mut bytes = fs::read(&next).unwrap();
+        match change {
+            0 => {
+                fs::rename(&next, path.join("retained-next")).unwrap();
+                let file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&next)
+                    .unwrap();
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                fs::write(&next, &bytes).unwrap();
+            }
+            1 => {
+                fs::set_permissions(&next, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            2 => {
+                fs::hard_link(&next, path.join("retained-link")).unwrap();
+            }
+            3 => {
+                bytes.push(b'x');
+                fs::write(&next, &bytes).unwrap();
+            }
+            _ => {
+                bytes[0] ^= 1;
+                fs::write(&next, &bytes).unwrap();
+            }
+        }
+        let frozen = m2a_directory_files(&path);
+        disk::M2A_MUTATION_CALLS.with(|calls| calls.set([0; 3]));
+        assert!(opened.recover_published_m2a(joined).is_err());
+        assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+        assert_eq!(m2a_directory_files(&path), frozen);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_recovery_open_validates_artifacts_without_namespace_or_sync_calls() {
+    let (_prototype, mut writer) = setup();
+    let workflow = SavedWorkflow::capture(&crate::workflow::SessionWorkflow::new(
+        crate::workflow::WorkflowConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    ));
+    writer
+        .configure_workflow(DecimalU64::new(0), Some(workflow))
+        .unwrap();
+    let draft = crate::workflow::ChangeContractV1::draft(
+        "readonly-artifact",
+        crate::workflow::RoutineEligibilityV1::local_component("desktop_store"),
+        "need",
+        "cause",
+        "outcome",
+        vec!["criterion".into()],
+    )
+    .unwrap();
+    let rev = writer.snapshot().unwrap().marker.session_revision;
+    let reference = writer.publish_change_contract(rev, draft).unwrap();
+    let rev = writer.snapshot().unwrap().marker.session_revision;
+    writer
+        .approve_change_contract_trusted(rev, &reference)
+        .unwrap();
+    let root = DesktopRoot::open_owned(dir(&writer).parent().unwrap()).unwrap();
+    let path = dir(&writer);
+    let frozen = m2a_directory_files(&path);
+    drop(writer);
+    disk::M2A_MUTATION_CALLS.with(|calls| calls.set([0; 3]));
+    let opened = root
+        .recovery_open_m2a(
+            &project(),
+            &session(),
+            crate::management_effect::ManagementEffectHashV1::digest(b"project"),
+        )
+        .unwrap();
+    assert!(
+        opened
+            .view
+            .snapshot
+            .state
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state
+            .active_change_contract
+            .is_some()
+    );
+    assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+    assert_eq!(m2a_directory_files(&path), frozen);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_legacy_pending_is_typed_blocker_and_reported_is_privacy_bounded_notice() {
+    use crate::management_effect::ManagementEffectHashV1 as Hash;
+    for version in [1, 2] {
+        for reported in [false, true] {
+            let (_prototype, mut writer) = setup();
+            source_terminal(&mut writer);
+            let (candidate, proof) = source_allow(&mut writer);
+            writer
+                .consume_source_apply_intent(
+                    &target(),
+                    &candidate.approval_id,
+                    &candidate.payload_hash,
+                    source_guard(&writer),
+                    proof,
+                )
+                .unwrap();
+            if reported {
+                let rev = writer.snapshot().unwrap().marker.session_revision;
+                writer
+                    .record_source_apply_result(
+                        &target(),
+                        &candidate.operation_id,
+                        rev,
+                        source_report(),
+                    )
+                    .unwrap();
+            }
+            let root = DesktopRoot::open_owned(dir(&writer).parent().unwrap()).unwrap();
+            let path = dir(&writer);
+            let mut marker = writer.snapshot().unwrap().marker;
+            drop(writer);
+            if version == 1 {
+                let mut legacy = Vec::new();
+                for line in fs::read(path.join(disk::SIDECAR))
+                    .unwrap()
+                    .split_inclusive(|b| *b == b'\n')
+                {
+                    let mut state: serde_json::Value = serde_json::from_slice(line).unwrap();
+                    state
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("desktop_sidecar_schema_version");
+                    for record in state["source_applies"].as_array_mut().unwrap() {
+                        record.as_object_mut().unwrap().remove("reserved_result_id");
+                    }
+                    legacy.extend(disk::line(&state).unwrap());
+                }
+                marker.sidecar_offset = DecimalU64::new(legacy.len() as u64);
+                marker.sidecar_hash = crate::conversation_state::content_hash(&legacy);
+                fs::write(path.join(disk::SIDECAR), legacy).unwrap();
+                fs::write(
+                    path.join(disk::MARKER),
+                    serde_json::to_vec(&marker).unwrap(),
+                )
+                .unwrap();
+            }
+            let frozen = m2a_directory_files(&path);
+            disk::M2A_MUTATION_CALLS.with(|calls| calls.set([0; 3]));
+            let outcome = root.recovery_open_m2a(&project(), &session(), Hash::digest(b"project"));
+            let diagnostic = match outcome {
+                Err(D27RecoveryOpenError::LegacyUnboundIntent(d)) => {
+                    assert!(!reported);
+                    *d
+                }
+                Ok(opened) => {
+                    assert!(reported);
+                    assert_eq!(opened.legacy_terminal_notices.len(), 1);
+                    opened.legacy_terminal_notices[0].clone()
+                }
+                Err(other) => panic!("{other}"),
+            };
+            assert_eq!(diagnostic.result_present, reported);
+            assert_eq!(diagnostic.record_index, 0);
+            assert_eq!(diagnostic.session_revision, marker.session_revision.get());
+            let wire = serde_json::to_vec(&diagnostic).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(value.as_object().unwrap().len(), 12);
+            assert!(wire.starts_with(br#"{"schema_version":1,"code":"legacy_source_apply_binding_missing","project_binding":"#));
+            assert_eq!(
+                diagnostic.next_action,
+                if reported {
+                    "preserve_terminal_legacy_record"
+                } else {
+                    "complete_with_legacy_desktop"
+                }
+            );
+            let text = String::from_utf8(wire).unwrap();
+            for forbidden in [candidate.operation_id.as_str(), "/source", "file.txt"] {
+                assert!(!text.contains(forbidden));
+            }
+            assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+            assert_eq!(m2a_directory_files(&path), frozen);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+type D27RestartFixture = (
+    SourceApplyPrecommitV1,
+    crate::apply_intent::ApplyIntentDescriptorV1,
+    crate::apply_intent::D27SourceBindingV1,
+    crate::apply_intent::RequestV1,
+    crate::apply_intent::ObservedSourceV1,
+    crate::management_effect::PrepareManagementEffectV1,
+);
+
+// Child entry point, excluded from the acceptance selector. The parent tests
+// below own all positive assertions and capture this process's output.
+#[cfg(target_os = "linux")]
+#[test]
+fn d27_marker_restart_worker() {
+    let Some(path) = std::env::var_os("POLARIS_D27_RESTART_FIXTURE") else {
+        return;
+    };
+    let root = DesktopRoot::open_owned(std::path::Path::new(&path)).unwrap();
+    let point = std::env::var("POLARIS_D27_RESTART_POINT").unwrap();
+    let result_publication = std::env::var("POLARIS_D27_RESTART_RESULT").unwrap() == "true";
+    let fixture_path = std::path::Path::new(&path).join("restart-fixture.json");
+    if !fixture_path.exists() {
+        let mut writer = root.create(project(), session(), initial()).unwrap();
+        source_terminal(&mut writer);
+        let (candidate, proof) = source_allow(&mut writer);
+        let token = m2a_precommit(
+            &writer,
+            &candidate,
+            proof,
+            ResultId::new("fresh-process-result").unwrap(),
+        )
+        .unwrap();
+        let pre = token.precommit().clone();
+        let (descriptor, binding, request, before, generic) = m2a_result_artifacts(&writer, &pre);
+        let fixture = (
+            pre.clone(),
+            descriptor.clone(),
+            binding,
+            request,
+            before,
+            generic,
+        );
+        fs::write(&fixture_path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let guard = source_guard(&writer);
+        if result_publication {
+            writer
+                .consume_source_apply_precommitted_m2a(token, guard, proof)
+                .unwrap();
+            disk::FAIL.with(|f| f.set(Some(point.as_str().to_owned().leak())));
+            assert!(
+                writer
+                    .record_source_apply_result_evidence_m2a(
+                        &pre,
+                        &descriptor,
+                        pre.reserved_result_id.clone(),
+                        M2A_REPORT,
+                        m2a_result_hash(M2A_REPORT)
+                    )
+                    .is_err()
+            );
+        } else {
+            disk::FAIL.with(|f| f.set(Some(point.as_str().to_owned().leak())));
+            assert!(
+                writer
+                    .consume_source_apply_precommitted_m2a(token, guard, proof)
+                    .is_err()
+            );
+        }
+        // Exit bypasses all destructor recovery/cleanup, leaving the exact
+        // failed publication for a genuinely fresh process.
+        std::process::exit(74);
+    }
+    let (pre, descriptor, binding, request, before, generic): D27RestartFixture =
+        serde_json::from_slice(&fs::read(&fixture_path).unwrap()).unwrap();
+    let session_path = std::path::Path::new(&path).join(crate::conversation_state::content_hash(
+        session().as_str().as_bytes(),
+    ));
+    let frozen = m2a_directory_files(&session_path);
+    disk::M2A_MUTATION_CALLS.with(|calls| calls.set([0; 3]));
+    let opened = root
+        .recovery_open_m2a(&project(), &session(), pre.project_binding)
+        .unwrap();
+    assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+    assert_eq!(m2a_directory_files(&session_path), frozen);
+    let report = result_publication.then_some((M2A_REPORT, m2a_result_hash(M2A_REPORT)));
+    let joined = opened
+        .join_marker_recovery_m2a(
+            &pre,
+            &descriptor,
+            &binding,
+            &request,
+            &before,
+            &generic,
+            report,
+        )
+        .unwrap();
+    assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+    let (writer, committed, _) = opened.recover_published_m2a(joined).unwrap();
+    assert!(committed);
+    let state = writer.snapshot().unwrap();
+    assert_eq!(
+        state.marker.session_revision.get(),
+        pre.consume_target_revision + u64::from(result_publication)
+    );
+    assert_eq!(
+        state.state.source_applies[0].result.is_some(),
+        result_publication
+    );
+    assert!(!session_path.join("state.next").exists());
+    assert_eq!(disk::M2A_REMOVE_NEXT_CALLS.with(|calls| calls.get()), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_marker_publication_restarts_in_fresh_processes() {
+    use std::os::unix::fs::PermissionsExt;
+    for result in [false, true] {
+        for point in [
+            "marker_partial",
+            "marker_sync",
+            "marker_rename",
+            "directory_sync",
+        ] {
+            let mut builder = tempfile::Builder::new();
+            builder
+                .prefix("d27-marker-restart-")
+                .permissions(fs::Permissions::from_mode(0o700));
+            let fixture = builder.tempdir().unwrap();
+            for expected_exit in [74, 0] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "desktop_store::tests::d27_marker_restart_worker",
+                        "--nocapture",
+                    ])
+                    .env("POLARIS_D27_RESTART_FIXTURE", fixture.path())
+                    .env("POLARIS_D27_RESTART_POINT", point)
+                    .env("POLARIS_D27_RESTART_RESULT", result.to_string())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected_exit),
+                    "{point}/{result}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if expected_exit == 0 {
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_marker_recovery_stops_resume_without_new_names_or_unjoined_cleanup() {
+    for point in [
+        "m2a_prefix_unlinked",
+        "m2a_prefix_cleanup_sync",
+        "m2a_next_created",
+        "marker_partial",
+        "marker_sync",
+        "m2a_next_synced",
+        "marker_rename",
+        "directory_sync",
+        "m2a_directory_synced",
+    ] {
+        let (_prototype, mut writer) = setup();
+        source_terminal(&mut writer);
+        let (candidate, proof) = source_allow(&mut writer);
+        let token = m2a_precommit(
+            &writer,
+            &candidate,
+            proof,
+            ResultId::new("recovery-result").unwrap(),
+        )
+        .unwrap();
+        let pre = token.precommit().clone();
+        let (descriptor, binding, request, before, generic) = m2a_result_artifacts(&writer, &pre);
+        let root = DesktopRoot::open_owned(dir(&writer).parent().unwrap()).unwrap();
+        let path = dir(&writer);
+        let guard = source_guard(&writer);
+        disk::FAIL.with(|f| f.set(Some("marker_partial")));
+        assert!(
+            writer
+                .consume_source_apply_precommitted_m2a(token, guard, proof)
+                .is_err()
+        );
+        disk::FAIL.with(|f| f.set(None));
+        drop(writer);
+        let opened = root
+            .recovery_open_m2a(&project(), &session(), pre.project_binding)
+            .unwrap();
+        let joined = opened
+            .join_marker_recovery_m2a(
+                &pre,
+                &descriptor,
+                &binding,
+                &request,
+                &before,
+                &generic,
+                None,
+            )
+            .unwrap();
+        disk::FAIL.with(|f| f.set(Some(point)));
+        assert!(opened.recover_published_m2a(joined).is_err(), "{point}");
+        disk::FAIL.with(|f| f.set(None));
+        let frozen = m2a_directory_files(&path);
+        let opened = root
+            .recovery_open_m2a(&project(), &session(), pre.project_binding)
+            .unwrap();
+        let joined = opened
+            .join_marker_recovery_m2a(
+                &pre,
+                &descriptor,
+                &binding,
+                &request,
+                &before,
+                &generic,
+                None,
+            )
+            .unwrap();
+        assert_eq!(m2a_directory_files(&path), frozen);
+        let (writer, committed, _) = opened.recover_published_m2a(joined).unwrap();
+        assert!(committed);
+        assert_eq!(
+            writer.snapshot().unwrap().marker.session_revision.get(),
+            pre.consume_target_revision
+        );
+        assert_eq!(m2a_directory_files(&path).len(), 4);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m2a_source_apply_state_next_wrong_owner_simulation_and_actual_open_race_refuse_without_mutations()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, writer) = setup();
+    let path = dir(&writer);
+    let directory = disk::Directory::open_owned(&path).unwrap();
+    let mut file = directory.open("state.next", true, true).unwrap();
+    file.write_all(b"target").unwrap();
+    drop(file);
+    disk::M2A_NEXT_UID
+        .with(|value| value.set(Some(unsafe { libc::geteuid() }.checked_add(1).unwrap())));
+    disk::M2A_MUTATION_CALLS.with(|calls| calls.set([0; 3]));
+    let wrong_owner = directory.inspect_next_m2a(Some(b"target")).unwrap();
+    disk::M2A_NEXT_UID.with(|value| value.set(None));
+    assert_eq!(
+        wrong_owner.classification,
+        StateNextClassificationV1::UnsafeInode
+    );
+    assert!(wrong_owner.hash.is_none() && wrong_owner.bytes.is_none());
+    assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+    let (start, started) = std::sync::mpsc::channel();
+    let (finished, done) = std::sync::mpsc::channel();
+    let thread_path = path.clone();
+    let racer = std::thread::spawn(move || {
+        started.recv().unwrap();
+        fs::rename(thread_path.join("state.next"), thread_path.join("old-next")).unwrap();
+        fs::write(thread_path.join("state.next"), b"target").unwrap();
+        fs::set_permissions(
+            thread_path.join("state.next"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        finished.send(()).unwrap();
+    });
+    disk::M2A_NEXT_RACE.with(|hook| *hook.borrow_mut() = Some((start, done)));
+    let raced = directory.inspect_next_m2a(Some(b"target")).unwrap();
+    racer.join().unwrap();
+    assert_eq!(raced.classification, StateNextClassificationV1::Raced);
+    assert!(raced.hash.is_none() && raced.bytes.is_none());
+    assert_eq!(disk::M2A_MUTATION_CALLS.with(|calls| calls.get()), [0; 3]);
+    assert_eq!(fs::read(path.join("state.next")).unwrap(), b"target");
+    assert_eq!(fs::read(path.join("old-next")).unwrap(), b"target");
 }
 
 fn source_apply_fixture() -> (SourceApplyCandidate, SourceApplyIdentityProof) {
@@ -3304,6 +4302,1065 @@ fn source_report() -> SourceApplyResult {
         result_id: ResultId::new("source-result").unwrap(),
         report: serde_json::json!({"entries": [{"relative_path":"file.txt", "installed":true}], "failure":null}),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const M2A_PRECOMMIT: &str = r#"{"schema_version":1,"project_binding":"1111111111111111111111111111111111111111111111111111111111111111","run_id":"run","attempt_id":"attempt","approval_id":"approval","source_operation_digest":"2222222222222222222222222222222222222222222222222222222222222222","payload_hash":"3333333333333333333333333333333333333333333333333333333333333333","policy_revision":7,"base_session_revision":8,"consume_target_revision":9,"reserved_result_id":"result-原文","reserved_result_id_digest":"1fec8a4ec4b8065d13d67b4258adfc8ecf8d6059d319211e609e51b3a45ce8db","base_marker_evidence_hash":"4444444444444444444444444444444444444444444444444444444444444444","consume_marker_evidence_hash":"5555555555555555555555555555555555555555555555555555555555555555","consume_sidecar_offset":100,"consume_sidecar_hash":"6666666666666666666666666666666666666666666666666666666666666666","consume_record_hash":"7777777777777777777777777777777777777777777777777777777777777777","result_capacity_bytes":1048576}"#;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_session_files(
+    writer: &Writer,
+) -> std::collections::BTreeMap<String, (u64, u64, u32, u32, u64, Vec<u8>)> {
+    m2a_directory_files(&dir(writer))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_directory_files(
+    path: &std::path::Path,
+) -> std::collections::BTreeMap<String, (u64, u64, u32, u32, u64, Vec<u8>)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.path().symlink_metadata().unwrap();
+            let bytes = if metadata.is_file() {
+                fs::read(entry.path()).unwrap()
+            } else {
+                Vec::new()
+            };
+            (
+                entry.file_name().into_string().unwrap(),
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.uid(),
+                    metadata.nlink(),
+                    bytes,
+                ),
+            )
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_precommit_independent_bytes_and_hash_vectors() {
+    let value = SourceApplyPrecommitV1::from_canonical_bytes(M2A_PRECOMMIT.as_bytes()).unwrap();
+    assert_eq!(value.canonical_bytes().unwrap(), M2A_PRECOMMIT.as_bytes());
+    assert_eq!(
+        value.precommit_hash().unwrap().as_hex(),
+        "343eb447f4320fca11ccc6c8d921c0e5793b97b0125c9c1edc796107e459afca"
+    );
+    assert_eq!(
+        super::source_apply::marker_evidence_hash(br#"{"marker":1}"#, b"row\n").as_hex(),
+        "ef0a406474ef5f528e60c6895e044107a41ffc4a1ca8b8ff1e9aa2c711489a9e"
+    );
+    let marker = br#"{"marker":1}"#;
+    assert_ne!(
+        super::source_apply::marker_evidence_hash(marker, b"row\n"),
+        super::source_apply::marker_evidence_hash(b" {\"marker\":1}", b"row\n")
+    );
+    assert_ne!(
+        super::source_apply::marker_evidence_hash(marker, b"row\n"),
+        super::source_apply::marker_evidence_hash(marker, b"row")
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_precommit_closed_schema_and_boundaries() {
+    let value: serde_json::Value = serde_json::from_str(M2A_PRECOMMIT).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 18);
+    for key in value.as_object().unwrap().keys() {
+        let mut changed = value.clone();
+        changed.as_object_mut().unwrap().remove(key);
+        assert!(
+            SourceApplyPrecommitV1::from_canonical_bytes(&serde_json::to_vec(&changed).unwrap())
+                .is_err(),
+            "missing {key}"
+        );
+        let duplicate = format!(
+            "{{{},{}",
+            serde_json::to_string(key).unwrap()
+                + ":"
+                + &serde_json::to_string(&value[key]).unwrap(),
+            &M2A_PRECOMMIT[1..]
+        );
+        assert!(
+            SourceApplyPrecommitV1::from_canonical_bytes(duplicate.as_bytes()).is_err(),
+            "duplicate {key}"
+        );
+    }
+    let mut valid = SourceApplyPrecommitV1::from_canonical_bytes(M2A_PRECOMMIT.as_bytes()).unwrap();
+    valid.result_capacity_bytes = 1;
+    valid.canonical_bytes().unwrap();
+    valid.result_capacity_bytes = MAX_SOURCE_APPLY_BYTES as u64;
+    valid.canonical_bytes().unwrap();
+    for limit in [0, MAX_SOURCE_APPLY_BYTES as u64 + 1] {
+        valid.result_capacity_bytes = limit;
+        assert!(valid.canonical_bytes().is_err());
+    }
+    for (key, replacement) in [
+        ("schema_version", serde_json::json!(2)),
+        ("schema_version", serde_json::json!(1.0)),
+        ("consume_target_revision", serde_json::json!(8)),
+        ("consume_target_revision", serde_json::json!(10)),
+        ("base_session_revision", serde_json::json!(u64::MAX)),
+        ("consume_sidecar_offset", serde_json::json!(0)),
+        ("reserved_result_id", serde_json::json!("result-other")),
+        ("policy_revision", serde_json::json!("7")),
+    ] {
+        let mut changed = value.clone();
+        changed[key] = replacement;
+        assert!(
+            SourceApplyPrecommitV1::from_canonical_bytes(&serde_json::to_vec(&changed).unwrap())
+                .is_err(),
+            "{key}"
+        );
+    }
+    let zero = crate::management_effect::ManagementEffectHashV1::from_hex(&"0".repeat(64)).unwrap();
+    for index in 0..8 {
+        let mut changed =
+            SourceApplyPrecommitV1::from_canonical_bytes(M2A_PRECOMMIT.as_bytes()).unwrap();
+        let fields = [
+            &mut changed.project_binding,
+            &mut changed.source_operation_digest,
+            &mut changed.payload_hash,
+            &mut changed.reserved_result_id_digest,
+            &mut changed.base_marker_evidence_hash,
+            &mut changed.consume_marker_evidence_hash,
+            &mut changed.consume_sidecar_hash,
+            &mut changed.consume_record_hash,
+        ];
+        *fields.into_iter().nth(index).unwrap() = zero;
+        assert!(changed.canonical_bytes().is_err());
+    }
+    assert!(
+        SourceApplyPrecommitV1::from_canonical_bytes(format!(" {M2A_PRECOMMIT}").as_bytes())
+            .is_err()
+    );
+    assert!(
+        SourceApplyPrecommitV1::from_canonical_bytes(
+            M2A_PRECOMMIT
+                .replace("\"schema_version\":1", "\"extra\":0,\"schema_version\":1")
+                .as_bytes()
+        )
+        .is_err()
+    );
+    assert!(
+        SourceApplyPrecommitV1::from_canonical_bytes(&serde_json::to_vec(&value).unwrap()).is_err(),
+        "reordered"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_precommit(
+    writer: &Writer,
+    candidate: &SourceApplyCandidate,
+    proof: SourceApplyIdentityProof,
+    reserved: ResultId,
+) -> StoreResult<SourceApplyPrecommitTokenV1> {
+    writer.precommit_source_apply_m2a(
+        &target(),
+        &candidate.approval_id,
+        &candidate.payload_hash,
+        source_guard(writer),
+        proof,
+        crate::management_effect::ManagementEffectHashV1::digest(b"verified-project-binding"),
+        reserved,
+        MAX_SOURCE_APPLY_BYTES as u64,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const M2A_REPORT: &[u8] = br#"{"source_path":"/source","recovery_path":null,"recovery_identity":null,"entries":[{"relative_path":"file.txt","source_parent_chain":[],"phase":"Preparing","old_retained":false,"installed":false,"deleted":false,"restored":false,"old_name":"old-0","candidate_name":"candidate-0","install_name":"install-0","candidate_identity":null,"install_identity":null}],"failure":{"kind":"Conflict","entry":0,"os_error":null}}"#;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_result_hash(bytes: &[u8]) -> crate::management_effect::ManagementEffectHashV1 {
+    let mut value = b"polaris-workspace-apply-report-v1\0".to_vec();
+    value.extend(bytes);
+    crate::management_effect::ManagementEffectHashV1::digest(&value)
+}
+
+// Synthetic source/recovery coordinates exercise only the D27 ledger API.
+// Actual pinned source effects and capacity admission belong to F5.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_result_descriptor(
+    writer: &Writer,
+    precommit: &SourceApplyPrecommitV1,
+) -> crate::apply_intent::ApplyIntentDescriptorV1 {
+    m2a_result_artifacts(writer, precommit).0
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_result_artifacts(
+    writer: &Writer,
+    precommit: &SourceApplyPrecommitV1,
+) -> (
+    crate::apply_intent::ApplyIntentDescriptorV1,
+    crate::apply_intent::D27SourceBindingV1,
+    crate::apply_intent::RequestV1,
+    crate::apply_intent::ObservedSourceV1,
+    crate::management_effect::PrepareManagementEffectV1,
+) {
+    use crate::apply_intent::*;
+    use crate::management_effect::*;
+    let current = writer.snapshot().unwrap();
+    let candidate = &current
+        .state
+        .source_applies
+        .iter()
+        .find(|record| record.candidate.approval_id == precommit.approval_id)
+        .unwrap()
+        .candidate;
+    let payload = &candidate.payload;
+    let source = IdentityV1 {
+        device: payload.source_identity.device.get(),
+        inode: payload.source_identity.inode.get(),
+    };
+    let recovery = IdentityV1 {
+        device: payload.recovery_parent_identity.device.get(),
+        inode: payload.recovery_parent_identity.inode.get(),
+    };
+    let manifest = D27ManifestProjectionV1 {
+        schema_version: 1,
+        source_path: payload.source_path.clone(),
+        source_identity: source,
+        recovery_parent_path: payload.recovery_parent_path.clone(),
+        recovery_parent_identity: recovery,
+        entries: payload
+            .entries
+            .iter()
+            .map(|entry| {
+                let version = |value: &SourceApplyVersion| D27ManifestVersionV1 {
+                    device: source.device,
+                    inode: 30,
+                    hash: ManagementEffectHashV1::from_hex(&value.hash).unwrap(),
+                    normal_mode: value.mode,
+                    observed_mode: value.mode,
+                    bytes: 1,
+                };
+                D27ManifestProjectionEntryV1 {
+                    path: entry.relative_path.clone(),
+                    before: entry.before.as_ref().map(version),
+                    after: entry.after.as_ref().map(version),
+                }
+            })
+            .collect(),
+    };
+    let request = manifest.project_request().unwrap();
+    let before = ObservedSourceV1 {
+        schema_version: 1,
+        source_identity: source,
+        entries: request
+            .entries
+            .iter()
+            .map(|entry| ObservedEntryV1 {
+                path: entry.path.clone(),
+                current: entry.before.clone(),
+            })
+            .collect(),
+    };
+    let binding = D27SourceBindingV1 {
+        schema_version: 1,
+        payload_bytes: serde_json::to_vec(payload).unwrap().len() as u64,
+        payload_hash: precommit.payload_hash,
+        manifest_bytes: manifest.canonical_bytes().unwrap().len() as u64,
+        manifest_hash: manifest.manifest_hash().unwrap(),
+        request_bytes: request.canonical_bytes().unwrap().len() as u64,
+        request_hash: request.request_hash().unwrap(),
+        source_before_bytes: before.canonical_bytes().unwrap().len() as u64,
+        source_before_hash: before.observation_hash().unwrap(),
+        manifest,
+    };
+    let identity = DesktopRoot::open_owned(dir(writer).parent().unwrap())
+        .unwrap()
+        .capacity_identity_m2a()
+        .unwrap();
+    let prepare = PrepareManagementEffectV1 {
+        operation_id: d27_management_operation_id(precommit.source_operation_digest).unwrap(),
+        inventory: ManagementInventoryIdV1::parse("D27").unwrap(),
+        scope: ManagementEffectScopeV1 {
+            project: precommit.project_binding,
+            session: Some(d27_session_binding(current.marker.session_id.as_str()).unwrap()),
+            generation: current.marker.epoch.get(),
+            revision: precommit.policy_revision,
+            permission: ManagementPermissionScopeV1::Project,
+            account_binding: None,
+        },
+        request_hash: request.request_hash().unwrap(),
+        rewind: ManagementRewindDispositionV1::CapturedRestorable,
+    };
+    let sample = CapacityRootSampleV1 {
+        identity: identity.root_identity,
+        allocation_unit: identity.allocation_unit,
+        available_bytes: 1024 * 1024 * 1024,
+    };
+    let plan = CapacityPlanV1::build(CapacityAdmissionV1 {
+        roots: CapacityRootsV1 {
+            state: sample,
+            recovery: CapacityRootSampleV1 {
+                identity: recovery,
+                allocation_unit: 4096,
+                available_bytes: 1024 * 1024 * 1024,
+            },
+            desktop: Some(sample),
+        },
+        request: &request,
+        source_before: &before,
+        d27_source_binding: Some(&binding),
+        prepare: &prepare,
+        management_record_limit: 16 * 1024,
+        management_records_remaining: 100,
+        management_bytes_remaining: 16 * 1024 * 1024,
+        inventory_commit_bytes: 2 * MAX_SOURCE_APPLY_LEDGER_BYTES as u64,
+        journal_bytes: 4096,
+        report_bytes: 4096,
+        archive_seal_bytes: 4096,
+        desktop_result_required_bytes: Some(precommit.result_capacity_bytes),
+        desktop_records_remaining: Some(0),
+        desktop_bytes_remaining: Some(MAX_SOURCE_APPLY_LEDGER_BYTES as u64),
+        archive_count: 0,
+        archive_file_bytes: 0,
+    })
+    .unwrap();
+    let key =
+        d27_operation_key(precommit.project_binding, precommit.source_operation_digest).unwrap();
+    let descriptor = ApplyIntentDescriptorV1 {
+        schema_version: 1,
+        operation_key: key,
+        management_operation_id: prepare.operation_id,
+        inventory_id: ApplyInventoryV1::D27,
+        project_binding: precommit.project_binding,
+        source_identity: source,
+        agreed_revision: RevisionV1 {
+            kind: RevisionKindV1::Sha256,
+            value: precommit.payload_hash.as_hex(),
+        },
+        staged_revision: RevisionV1 {
+            kind: RevisionKindV1::Sha256,
+            value: request.request_hash().unwrap().as_hex(),
+        },
+        previous_applied_revision: None,
+        context: ApplyContextV1::Session {
+            base_epoch: current.marker.epoch.get(),
+            session_binding: d27_session_binding(current.marker.session_id.as_str()).unwrap(),
+            base_session_revision: precommit.base_session_revision,
+            consume_target_revision: precommit.consume_target_revision,
+            policy_revision: precommit.policy_revision,
+            source_operation_digest: precommit.source_operation_digest,
+            reserved_result_id: precommit.reserved_result_id.as_str().into(),
+            reserved_result_id_digest: precommit.reserved_result_id_digest,
+            base_marker_evidence_hash: precommit.base_marker_evidence_hash,
+            consume_marker_evidence_hash: precommit.consume_marker_evidence_hash,
+            consume_sidecar_offset: precommit.consume_sidecar_offset,
+            consume_sidecar_hash: precommit.consume_sidecar_hash,
+            precommit_hash: precommit.precommit_hash().unwrap(),
+        },
+        share_source_manifest_digest: binding.manifest_hash,
+        changed_path_count: request.entries.len() as u64,
+        path_set_digest: request.path_set_digest().unwrap(),
+        workspace_apply_request_digest: request.request_hash().unwrap(),
+        source_before_observation_digest: before.observation_hash().unwrap(),
+        d27_source_binding_bytes: Some(binding.canonical_bytes().unwrap().len() as u64),
+        d27_source_binding_hash: Some(binding.binding_hash().unwrap()),
+        recovery_parent_identity: recovery,
+        recovery_provenance_digest: binding.manifest.recovery_provenance_digest().unwrap(),
+        recovery_child: recovery_child(key).unwrap(),
+        capacity_plan_bytes: plan.canonical_bytes().unwrap().len() as u64,
+        capacity_plan_hash: plan.plan_hash().unwrap(),
+        capacity_plan: plan,
+        phase: ApplyPhaseV1::Prepared,
+    };
+    binding
+        .verify_artifacts(&descriptor, &request, &before)
+        .unwrap();
+    let mut prepare = prepare;
+    prepare.scope.revision = precommit.consume_target_revision;
+    prepare.request_hash = descriptor.descriptor_hash().unwrap();
+    prepare.rewind = ManagementRewindDispositionV1::IrreversibleLocal;
+    (descriptor, binding, request, before, prepare)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_consumed(
+    capacity: u64,
+) -> (
+    PrototypeRoot,
+    Writer,
+    SourceApplyPrecommitV1,
+    crate::apply_intent::ApplyIntentDescriptorV1,
+) {
+    let (root, mut writer) = setup();
+    source_terminal(&mut writer);
+    let (candidate, proof) = source_allow(&mut writer);
+    let token = writer
+        .precommit_source_apply_m2a(
+            &target(),
+            &candidate.approval_id,
+            &candidate.payload_hash,
+            source_guard(&writer),
+            proof,
+            crate::management_effect::ManagementEffectHashV1::digest(b"verified-project-binding"),
+            ResultId::new("trusted-result").unwrap(),
+            capacity,
+        )
+        .unwrap();
+    let guard = source_guard(&writer);
+    let consumed = writer
+        .consume_source_apply_precommitted_m2a(token, guard, proof)
+        .unwrap();
+    let descriptor = m2a_result_descriptor(&writer, &consumed.precommit);
+    (root, writer, consumed.precommit, descriptor)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_result_joins_reserved_id_original_report_and_exact_marker_and_replay() {
+    let (_root, mut writer, precommit, descriptor) = m2a_consumed(MAX_SOURCE_APPLY_BYTES as u64);
+    let hash = m2a_result_hash(M2A_REPORT);
+    assert_eq!(
+        hash.as_hex(),
+        "c3cc7890c45e7325ee19bd793a35f2c95ab492da3e1173209cb62b8336bcfc81"
+    );
+    let evidence = writer
+        .record_source_apply_result_evidence_m2a(
+            &precommit,
+            &descriptor,
+            precommit.reserved_result_id.clone(),
+            M2A_REPORT,
+            hash,
+        )
+        .unwrap();
+    let snapshot = writer.snapshot().unwrap();
+    assert_eq!(
+        evidence.session_revision,
+        precommit.consume_target_revision + 1
+    );
+    assert_eq!(evidence.report_hash, hash);
+    assert_eq!(
+        evidence.reserved_result_id_digest,
+        precommit.reserved_result_id_digest
+    );
+    assert_eq!(
+        evidence.marker_bytes,
+        fs::read(dir(&writer).join(disk::MARKER)).unwrap()
+    );
+    let sidecar = fs::read(dir(&writer).join(disk::SIDECAR)).unwrap();
+    assert_eq!(
+        evidence.marker_evidence_hash,
+        super::source_apply::marker_evidence_hash(&evidence.marker_bytes, &sidecar)
+    );
+    assert_eq!(
+        evidence.sidecar_prefix_hash.as_hex(),
+        crate::conversation_state::content_hash(&sidecar)
+    );
+    assert_eq!(evidence.sidecar_hash.as_hex(), snapshot.marker.sidecar_hash);
+    assert_eq!(
+        evidence.sidecar_offset,
+        snapshot.marker.sidecar_offset.get()
+    );
+    let record = &snapshot.state.source_applies[0];
+    assert_eq!(
+        record.reserved_result_id.as_ref(),
+        Some(&precommit.reserved_result_id)
+    );
+    assert_eq!(
+        record.result.as_ref().unwrap().result_id,
+        precommit.reserved_result_id
+    );
+    let before = m2a_session_files(&writer);
+    let replay = writer
+        .record_source_apply_result_evidence_m2a(
+            &precommit,
+            &descriptor,
+            precommit.reserved_result_id.clone(),
+            M2A_REPORT,
+            hash,
+        )
+        .unwrap();
+    assert_eq!(replay, evidence);
+    assert_eq!(m2a_session_files(&writer), before);
+    writer.set_policy_revision(DecimalU64::new(8)).unwrap();
+    let before = m2a_session_files(&writer);
+    assert!(
+        writer
+            .record_source_apply_result_evidence_m2a(
+                &precommit,
+                &descriptor,
+                precommit.reserved_result_id.clone(),
+                M2A_REPORT,
+                hash
+            )
+            .is_err()
+    );
+    assert_eq!(m2a_session_files(&writer), before);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_result_refuses_wrong_id_hash_encoding_context_and_capacity_before_writes() {
+    use crate::apply_intent::ApplyContextV1;
+    let result = SourceApplyResult {
+        result_id: ResultId::new("trusted-result").unwrap(),
+        report: serde_json::from_slice(M2A_REPORT).unwrap(),
+    };
+    let length = serde_json::to_vec(&result).unwrap().len() as u64;
+    for capacity in [length - 1, length] {
+        let (_root, mut writer, precommit, descriptor) = m2a_consumed(capacity);
+        let before = m2a_session_files(&writer);
+        let outcome = writer.record_source_apply_result_evidence_m2a(
+            &precommit,
+            &descriptor,
+            precommit.reserved_result_id.clone(),
+            M2A_REPORT,
+            m2a_result_hash(M2A_REPORT),
+        );
+        if capacity == length {
+            outcome.unwrap();
+        } else {
+            assert!(matches!(outcome, Err(StoreError::Capacity(_))));
+            assert_eq!(m2a_session_files(&writer), before);
+        }
+    }
+    let (_root, mut writer, precommit, descriptor) = m2a_consumed(MAX_SOURCE_APPLY_BYTES as u64);
+    let before = m2a_session_files(&writer);
+    for field in 0..6 {
+        let mut d = descriptor.clone();
+        let mut report = M2A_REPORT.to_vec();
+        let mut hash = m2a_result_hash(&report);
+        let mut id = precommit.reserved_result_id.clone();
+        match field {
+            0 => id = ResultId::new("different-result").unwrap(),
+            1 => {
+                hash = crate::management_effect::ManagementEffectHashV1::digest(b"different-report")
+            }
+            2 => {
+                report.insert(0, b' ');
+                hash = m2a_result_hash(&report);
+            }
+            3 => {
+                if let ApplyContextV1::Session {
+                    policy_revision, ..
+                } = &mut d.context
+                {
+                    *policy_revision += 1;
+                }
+            }
+            4 => {
+                if let ApplyContextV1::Session {
+                    consume_sidecar_offset,
+                    ..
+                } = &mut d.context
+                {
+                    *consume_sidecar_offset += 1;
+                }
+            }
+            5 => {
+                report = String::from_utf8(report)
+                    .unwrap()
+                    .replacen(
+                        "\"source_path\":\"/source\"",
+                        "\"source_path\":\"/different\"",
+                        1,
+                    )
+                    .into_bytes();
+                hash = m2a_result_hash(&report);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            writer
+                .record_source_apply_result_evidence_m2a(&precommit, &d, id, &report, hash)
+                .is_err(),
+            "field {field}"
+        );
+        assert_eq!(m2a_session_files(&writer), before);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_capacity_counts_exact_wrapper_escaping_and_actual_full_sidecar_rows() {
+    for raw_id in [
+        "trusted-result".to_owned(),
+        "原文\n\\\"".to_owned(),
+        "\0".repeat(128),
+    ] {
+        let id = ResultId::new(raw_id).unwrap();
+        let result = SourceApplyResult {
+            result_id: id.clone(),
+            report: serde_json::from_slice(M2A_REPORT).unwrap(),
+        };
+        let actual = serde_json::to_vec(&result).unwrap().len() as u64;
+        assert_eq!(
+            source_apply_result_capacity_m2a(&id, M2A_REPORT.len() as u64).unwrap(),
+            actual
+        );
+        assert!(matches!(
+            source_apply_result_capacity_m2a(&id, u64::MAX),
+            Err(StoreError::Overflow)
+        ));
+    }
+    let (_root, mut writer) = setup();
+    source_terminal(&mut writer);
+    let (candidate, proof) = source_allow(&mut writer);
+    let token = m2a_precommit(
+        &writer,
+        &candidate,
+        proof,
+        ResultId::new("trusted-result").unwrap(),
+    )
+    .unwrap();
+    let inventory = token.inventory_commit_bytes().unwrap();
+    let unit = DesktopRoot::open_owned(dir(&writer).parent().unwrap())
+        .unwrap()
+        .capacity_identity_m2a()
+        .unwrap()
+        .allocation_unit;
+    let base_length = fs::metadata(dir(&writer).join(disk::SIDECAR))
+        .unwrap()
+        .len();
+    let guard = source_guard(&writer);
+    let consumed = writer
+        .consume_source_apply_precommitted_m2a(token, guard, proof)
+        .unwrap();
+    let consume_length = fs::metadata(dir(&writer).join(disk::SIDECAR))
+        .unwrap()
+        .len()
+        - base_length;
+    let descriptor = m2a_result_descriptor(&writer, &consumed.precommit);
+    let before_result_length = fs::metadata(dir(&writer).join(disk::SIDECAR))
+        .unwrap()
+        .len();
+    writer
+        .record_source_apply_result_evidence_m2a(
+            &consumed.precommit,
+            &descriptor,
+            consumed.precommit.reserved_result_id.clone(),
+            M2A_REPORT,
+            m2a_result_hash(M2A_REPORT),
+        )
+        .unwrap();
+    let result_row_length = fs::metadata(dir(&writer).join(disk::SIDECAR))
+        .unwrap()
+        .len()
+        - before_result_length;
+    let result_object_length = serde_json::to_vec(
+        writer.snapshot().unwrap().state.source_applies[0]
+            .result
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap()
+    .len() as u64;
+    let result_bound_row = result_row_length - result_object_length + MAX_SOURCE_APPLY_BYTES as u64;
+    let allocated = |bytes: u64| bytes.div_ceil(unit) * unit;
+    assert_eq!(
+        inventory,
+        allocated(consume_length) + allocated(result_bound_row) + 2 * allocated(65_536)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_capacity_full_record_table_and_ledger_plus_minus_one() {
+    for delta in [-1_i64, 0, 1] {
+        let (_root, mut writer) = setup();
+        source_terminal(&mut writer);
+        let (candidate, proof) = source_allow(&mut writer);
+        let mut next = writer.snapshot().unwrap();
+        let future_revision = next.marker.session_revision.checked_add(2).unwrap();
+        let reserved = ResultId::new("trusted-result").unwrap();
+        for index in 1..MAX_SOURCE_APPLY_RECORDS {
+            let mut record = next.state.source_applies[0].clone();
+            record.candidate.approval_id =
+                ApprovalId::new(format!("filler-approval-{index}")).unwrap();
+            record.candidate.operation_id =
+                OperationId::new(format!("filler-operation-{index}")).unwrap();
+            record.decision = None;
+            record.candidate.payload.entries.clear();
+            record.candidate.payload.source_path = format!("/s{}", "a".repeat(2000));
+            record.candidate.payload.recovery_parent_path = format!("/r{}", "b".repeat(2000));
+            record.candidate.payload_hash = record.candidate.payload.payload_hash().unwrap();
+            next.state.source_applies.push(record);
+        }
+        let mut consumed_rows = next.state.source_applies.clone();
+        consumed_rows[0].intent_revision = Some(future_revision);
+        consumed_rows[0].reserved_result_id = Some(reserved.clone());
+        let desired = (MAX_SOURCE_APPLY_LEDGER_BYTES - MAX_SOURCE_APPLY_BYTES) as i64 + delta;
+        let mut gap = desired as usize - serde_json::to_vec(&consumed_rows).unwrap().len();
+        for index in 1..MAX_SOURCE_APPLY_RECORDS {
+            for recovery in [false, true] {
+                let payload = &mut next.state.source_applies[index].candidate.payload;
+                let text = if recovery {
+                    &mut payload.recovery_parent_path
+                } else {
+                    &mut payload.source_path
+                };
+                let count = gap.min(4096 - text.len());
+                text.push_str(&"x".repeat(count));
+                gap -= count;
+            }
+            let record = &mut next.state.source_applies[index];
+            record.candidate.payload_hash = record.candidate.payload.payload_hash().unwrap();
+            consumed_rows[index] = record.clone();
+        }
+        assert_eq!(gap, 0);
+        assert_eq!(
+            serde_json::to_vec(&consumed_rows).unwrap().len(),
+            desired as usize
+        );
+        writer.commit(next, false).unwrap();
+        let before = m2a_session_files(&writer);
+        let outcome = m2a_precommit(&writer, &candidate, proof, reserved);
+        if delta == 1 {
+            assert!(
+                matches!(outcome, Err(StoreError::Capacity(_))),
+                "ledger overflow before consume"
+            );
+        } else {
+            let token = outcome.unwrap();
+            assert_eq!(
+                token.logical_capacity().records_remaining,
+                0,
+                "existing record needs no new slot"
+            );
+            let guard = source_guard(&writer);
+            writer
+                .consume_source_apply_precommitted_m2a(token, guard, proof)
+                .unwrap();
+            assert_eq!(
+                writer.snapshot().unwrap().state.source_applies.len(),
+                MAX_SOURCE_APPLY_RECORDS
+            );
+            continue;
+        }
+        assert_eq!(m2a_session_files(&writer), before);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_result_id_rejects_each_existing_namespace_and_reservation_retrofit() {
+    let (_root, mut writer) = setup();
+    writer
+        .apply(&start("source-start", 0), Some(target()))
+        .unwrap();
+    writer.record_intent(&target(), op()).unwrap();
+    writer
+        .record_operation_result(&target(), &op(), ResultId::new("operation-only").unwrap())
+        .unwrap();
+    writer
+        .finish(
+            &target(),
+            Observation::Succeeded,
+            ResultId::new("run-only").unwrap(),
+        )
+        .unwrap();
+    let (candidate, proof) = source_allow(&mut writer);
+    let before = m2a_session_files(&writer);
+    for id in ["operation-only", "run-only"] {
+        assert!(
+            m2a_precommit(&writer, &candidate, proof, ResultId::new(id).unwrap()).is_err(),
+            "{id}"
+        );
+        assert_eq!(m2a_session_files(&writer), before);
+    }
+    let guard = source_guard(&writer);
+    writer
+        .consume_source_apply_intent(
+            &target(),
+            &candidate.approval_id,
+            &candidate.payload_hash,
+            guard,
+            proof,
+        )
+        .unwrap();
+    let mut next = writer.snapshot().unwrap();
+    next.state.source_applies[0].reserved_result_id = Some(ResultId::new("retrofit").unwrap());
+    let before = m2a_session_files(&writer);
+    assert!(
+        writer.commit(next, false).is_err(),
+        "legacy consume cannot be rebound"
+    );
+    assert_eq!(m2a_session_files(&writer), before);
+    let mut legacy_result = source_report();
+    legacy_result.result_id = ResultId::new("legacy-result-only").unwrap();
+    let revision = writer.snapshot().unwrap().marker.session_revision;
+    writer
+        .record_source_apply_result(&target(), &candidate.operation_id, revision, legacy_result)
+        .unwrap();
+    let mut second = candidate.clone();
+    second.approval_id = ApprovalId::new("second-approval").unwrap();
+    second.operation_id = OperationId::new("second-operation").unwrap();
+    let guard = source_guard(&writer);
+    writer
+        .publish_source_apply(&target(), second.clone(), guard, proof)
+        .unwrap();
+    let guard = source_guard(&writer);
+    writer
+        .resolve_source_apply(
+            &target(),
+            &second.approval_id,
+            ApprovalDecision::Allow,
+            guard,
+        )
+        .unwrap();
+    let before = m2a_session_files(&writer);
+    assert!(
+        m2a_precommit(
+            &writer,
+            &second,
+            proof,
+            ResultId::new("legacy-result-only").unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(m2a_session_files(&writer), before);
+
+    let (_root2, mut writer2) = setup();
+    source_terminal(&mut writer2);
+    let (first, proof2) = source_allow(&mut writer2);
+    let token = m2a_precommit(
+        &writer2,
+        &first,
+        proof2,
+        ResultId::new("reservation-only").unwrap(),
+    )
+    .unwrap();
+    let guard = source_guard(&writer2);
+    writer2
+        .consume_source_apply_precommitted_m2a(token, guard, proof2)
+        .unwrap();
+    let mut next = writer2.snapshot().unwrap();
+    next.state.source_applies[0].reserved_result_id =
+        Some(ResultId::new("changed-reservation").unwrap());
+    let before = m2a_session_files(&writer2);
+    assert!(
+        writer2.commit(next, false).is_err(),
+        "durable reservation is immutable"
+    );
+    assert_eq!(m2a_session_files(&writer2), before);
+    let mut second = first.clone();
+    second.approval_id = ApprovalId::new("other-approval").unwrap();
+    second.operation_id = OperationId::new("other-operation").unwrap();
+    let guard = source_guard(&writer2);
+    writer2
+        .publish_source_apply(&target(), second.clone(), guard, proof2)
+        .unwrap();
+    let guard = source_guard(&writer2);
+    writer2
+        .resolve_source_apply(
+            &target(),
+            &second.approval_id,
+            ApprovalDecision::Allow,
+            guard,
+        )
+        .unwrap();
+    let before = m2a_session_files(&writer2);
+    assert!(
+        m2a_precommit(
+            &writer2,
+            &second,
+            proof2,
+            ResultId::new("reservation-only").unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(m2a_session_files(&writer2), before);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_full_result_one_mib_accepts_and_plus_one_refuses_before_publication() {
+    for extra in [0, 1] {
+        let (_root, mut writer, precommit, descriptor) =
+            m2a_consumed(MAX_SOURCE_APPLY_BYTES as u64);
+        let mut report: crate::workspace_apply::ApplyReport =
+            serde_json::from_slice(M2A_REPORT).unwrap();
+        let original = SourceApplyResult {
+            result_id: precommit.reserved_result_id.clone(),
+            report: serde_json::to_value(&report).unwrap(),
+        };
+        let length = serde_json::to_vec(&original).unwrap().len();
+        // The ledger boundary is tested with a legal variable-length typed
+        // report field. This is not a claim of a real source apply or its shape.
+        report.entries[0]
+            .old_name
+            .push_str(&"x".repeat(MAX_SOURCE_APPLY_BYTES - length + extra));
+        let bytes = report.canonical_bytes().unwrap();
+        let result = SourceApplyResult {
+            result_id: precommit.reserved_result_id.clone(),
+            report: serde_json::to_value(&report).unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_vec(&result).unwrap().len(),
+            MAX_SOURCE_APPLY_BYTES + extra
+        );
+        let before = m2a_session_files(&writer);
+        let outcome = writer.record_source_apply_result_evidence_m2a(
+            &precommit,
+            &descriptor,
+            precommit.reserved_result_id.clone(),
+            &bytes,
+            m2a_result_hash(&bytes),
+        );
+        if extra == 0 {
+            outcome.unwrap();
+            assert_eq!(
+                serde_json::to_vec(
+                    writer.snapshot().unwrap().state.source_applies[0]
+                        .result
+                        .as_ref()
+                        .unwrap()
+                )
+                .unwrap()
+                .len(),
+                MAX_SOURCE_APPLY_BYTES
+            );
+        } else {
+            assert!(matches!(outcome, Err(StoreError::Capacity(_))));
+            assert_eq!(m2a_session_files(&writer), before);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_precommit_is_readonly_and_consume_matches_exact_prediction() {
+    let (_root, mut writer) = setup();
+    source_terminal(&mut writer);
+    let (candidate, proof) = source_allow(&mut writer);
+    let before = m2a_session_files(&writer);
+    let reserved = ResultId::new("trusted-exact-result-原文").unwrap();
+    let token = m2a_precommit(&writer, &candidate, proof, reserved.clone()).unwrap();
+    assert_eq!(m2a_session_files(&writer), before);
+    let expected = token.precommit().clone();
+    let base = writer.snapshot().unwrap();
+    assert_eq!(
+        expected.base_session_revision,
+        base.marker.session_revision.get()
+    );
+    assert_eq!(
+        expected.consume_target_revision,
+        expected.base_session_revision + 1
+    );
+    assert_eq!(expected.reserved_result_id, reserved);
+    let guard = source_guard(&writer);
+    let receipt = writer
+        .consume_source_apply_precommitted_m2a(token, guard, proof)
+        .unwrap();
+    assert_eq!(receipt.precommit, expected);
+    let after = writer.snapshot().unwrap();
+    let record = after
+        .state
+        .source_applies
+        .iter()
+        .find(|r| r.candidate.operation_id == candidate.operation_id)
+        .unwrap();
+    assert_eq!(
+        record.intent_revision.unwrap().get(),
+        expected.consume_target_revision
+    );
+    assert_eq!(record.reserved_result_id.as_ref(), Some(&reserved));
+    let mut bytes = b"polaris-d27-consume-record-v1\0".to_vec();
+    bytes.extend(serde_json::to_vec(record).unwrap());
+    assert_eq!(
+        crate::management_effect::ManagementEffectHashV1::digest(&bytes),
+        expected.consume_record_hash
+    );
+    assert_eq!(
+        after.marker.sidecar_offset.get(),
+        expected.consume_sidecar_offset
+    );
+    assert_eq!(
+        after.marker.sidecar_hash,
+        expected.consume_sidecar_hash.as_hex()
+    );
+    let sidecar = fs::read(dir(&writer).join(disk::SIDECAR)).unwrap();
+    assert_eq!(
+        super::source_apply::marker_evidence_hash(&receipt.marker_bytes, &sidecar),
+        expected.consume_marker_evidence_hash
+    );
+    assert_eq!(
+        fs::read(dir(&writer).join(disk::MARKER)).unwrap(),
+        receipt.marker_bytes
+    );
+    assert!(!dir(&writer).join("state.next").exists());
+    assert!(
+        m2a_precommit(&writer, &candidate, proof, reserved).is_err(),
+        "cannot bind a second consume"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn m2a_source_apply_precommit_rejects_collisions_stale_and_foreign_entries_without_mutation() {
+    let (_root, mut writer) = setup();
+    source_terminal(&mut writer);
+    let (candidate, proof) = source_allow(&mut writer);
+    let before = m2a_session_files(&writer);
+    assert!(
+        m2a_precommit(&writer, &candidate, proof, result()).is_err(),
+        "existing result namespace"
+    );
+    let mut wrong = proof;
+    wrong.source.inode = DecimalU64::new(99);
+    assert!(
+        m2a_precommit(
+            &writer,
+            &candidate,
+            wrong,
+            ResultId::new("fresh-result").unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(m2a_session_files(&writer), before);
+    let token = m2a_precommit(
+        &writer,
+        &candidate,
+        proof,
+        ResultId::new("fresh-result").unwrap(),
+    )
+    .unwrap();
+    let guard = source_guard(&writer);
+    fs::write(dir(&writer).join("state.next"), b"foreign").unwrap();
+    let foreign = m2a_session_files(&writer);
+    assert!(
+        writer
+            .consume_source_apply_precommitted_m2a(token, guard, proof)
+            .is_err()
+    );
+    assert_eq!(m2a_session_files(&writer), foreign);
+    assert!(
+        m2a_precommit(
+            &writer,
+            &candidate,
+            proof,
+            ResultId::new("fresh-result").unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(m2a_session_files(&writer), foreign);
+    fs::remove_file(dir(&writer).join("state.next")).unwrap();
+    let token = m2a_precommit(
+        &writer,
+        &candidate,
+        proof,
+        ResultId::new("fresh-result").unwrap(),
+    )
+    .unwrap();
+    writer.set_policy_revision(DecimalU64::new(8)).unwrap();
+    let changed = m2a_session_files(&writer);
+    assert!(
+        writer
+            .consume_source_apply_precommitted_m2a(token, guard, proof)
+            .is_err()
+    );
+    assert_eq!(m2a_session_files(&writer), changed);
 }
 
 #[test]
@@ -3637,6 +5694,9 @@ fn source_apply_bounds_and_legacy_metadata() {
     assert!(report.validate().is_err());
     let (_, w) = setup();
     let mut old = serde_json::to_value(w.snapshot().unwrap().state).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("desktop_sidecar_schema_version");
     old.as_object_mut().unwrap().remove("source_applies");
     assert!(
         serde_json::from_value::<Sidecar>(old)
@@ -3767,6 +5827,7 @@ fn source_apply_aggregate_bytes_are_bounded_independently_of_record_count() {
             decision: Some(ApprovalDecision::Allow),
             invalidated: false,
             intent_revision: Some(state.session_revision),
+            reserved_result_id: None,
             result: Some(SourceApplyResult {
                 result_id: ResultId::new(format!("aggregate-result-{i}")).unwrap(),
                 report: serde_json::json!({"entries": [], "evidence": "x".repeat(700_000)}),

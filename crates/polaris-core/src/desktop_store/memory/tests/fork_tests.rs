@@ -527,6 +527,10 @@ fn legacy_sidecar_without_inherited_metadata_reopens_and_new_run_completes() {
             .as_object_mut()
             .unwrap()
             .remove("inherited_turn_count");
+        state
+            .as_object_mut()
+            .unwrap()
+            .remove("desktop_sidecar_schema_version");
         old_bytes.extend(disk::line(&state).unwrap());
     }
     let mut marker = before.marker;

@@ -52,6 +52,18 @@ impl WorkflowArtifactStore {
         Ok(Self { objects })
     }
 
+    pub(super) fn inspect_from_root_m2a(
+        root: Arc<Directory>,
+        project: &ProjectId,
+    ) -> StoreResult<Self> {
+        root.verify()?;
+        let artifacts = root.child(ARTIFACTS_DIRECTORY, false)?;
+        let project = artifacts.child(&project_bucket(project), false)?;
+        let objects = Arc::new(project.child(OBJECTS_DIRECTORY, false)?);
+        objects.verify()?;
+        Ok(Self { objects })
+    }
+
     /// Write a canonical, validated body.  Repeating the exact same body is a
     /// successful no-op; a malformed or different pre-existing object is a
     /// recovery error and is never overwritten.

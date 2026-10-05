@@ -28,6 +28,8 @@ pub use bootstrap::{
     ValidatedOwnerBootstrap, read_owner_bootstrap, validate_owner_configuration,
 };
 pub use children::SavedChild;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use disk::{D27ReadFileV1, StateNextClassificationV1, StateNextInspectV1};
 pub use goal::{AppliedInstruction, MAX_INSTRUCTIONS, SavedGoal, SavedInstruction};
 pub use hub::{
     ApprovalSummary, Changes, Delta, GoalSummary, HubView, InstructionSummary, ListChange,
@@ -47,6 +49,10 @@ pub use roles::{
 };
 pub use session_manager::{
     MAX_SESSION_MANAGER_COMMITS, MAX_SESSION_MANAGER_STATE_BYTES, SessionManagerStore,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use source_apply::{
+    MAX_D27_MARKER_BYTES, SourceApplyPrecommitV1, source_apply_result_capacity_m2a,
 };
 pub use source_apply::{
     MAX_SOURCE_APPLY_BYTES, MAX_SOURCE_APPLY_ENTRIES, MAX_SOURCE_APPLY_LEDGER_BYTES,
@@ -69,6 +75,13 @@ pub use writer::recipe::{
     SavedRecipeStep, SavedRecipeTerminal, StepOutcome, reusable_steps,
 };
 pub(crate) use writer::validate_turn_suffix;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use writer::{
+    D27PublicationKindV1, D27RecoveryInspectV1, D27RecoveryOpenError, D27RecoveryOpenOutcomeV1,
+    DesktopCapacityIdentityV1, DesktopLogicalCapacityV1, JoinedD27MarkerRecoveryV1,
+    LegacyUnboundIntentDiagnosticV1, SourceApplyConsumedReceiptV1, SourceApplyPrecommitTokenV1,
+    SourceApplyResultEvidenceV1,
+};
 pub use writer::{DesktopRoot, PrototypeRoot, Writer};
 pub use writer::{OwnerRequestHistory, RunDetailEntry, RunDetails};
 

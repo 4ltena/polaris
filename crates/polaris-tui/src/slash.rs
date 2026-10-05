@@ -92,6 +92,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "register an account without changing the current binding",
     },
     SlashCommand {
+        name: "memory",
+        description: "search or inspect saved project memory",
+    },
+    SlashCommand {
         name: "decided",
         description: "inspect recorded project decisions",
     },
@@ -365,6 +369,10 @@ pub fn parse(line: &str) -> Option<Action> {
         "doctor" => Action::Doctor,
         "account" => Action::Account(extra),
         "login" => Action::Account(format!("login {extra}").trim_end().to_owned()),
+        "memory" if extra.starts_with("configure ") => {
+            Action::SessionControl(format!("memory {extra}"))
+        }
+        "memory" => Action::Memory(extra),
         "session" | "goal" | "history" | "tool-memory" | "remember" => {
             Action::SessionControl(format!("{name} {extra}").trim_end().to_owned())
         }

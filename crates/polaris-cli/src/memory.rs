@@ -1,6 +1,16 @@
 //! Local project memory commands; embedding requests require explicit configuration.
 
+use polaris_core::{
+    management_effect::{
+        ManagementEffectStoreV1, ManagementOperationIdV1, memory_change::MemoryChangeOwnerV1,
+    },
+    project_mutation::ProjectMutationOwnerV1,
+};
+use polaris_memory::management::{
+    MAX_CHANGE_BYTES, MemoryChangeRequestV1, MemoryChangeV1, MemoryEmbeddingUpdateV1,
+};
 use polaris_memory::{Embedding, MemoryStore, Record, SearchMode, SearchRequest};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -60,6 +70,11 @@ enum Command {
     /// セッション内の保存済み記録をローカルモデルで埋め込む。
     Index {
         session: String,
+        /// 今回処理する最大件数。続きは表示されたIDを--afterに指定します。
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
+        batch: u32,
+        #[arg(long)]
+        after: Option<String>,
         #[command(flatten)]
         embedding: EmbeddingArgs,
     },
@@ -77,52 +92,23 @@ struct EmbeddingArgs {
 }
 
 impl EmbeddingArgs {
-    async fn encode(&self, text: &str) -> Result<Option<Embedding>, Box<dyn std::error::Error>> {
+    fn encoder(
+        &self,
+    ) -> Result<Option<polaris_tui::tool_memory::Encoder>, Box<dyn std::error::Error>> {
         let Some(base) = &self.embedding_url else {
             return Ok(None);
         };
-        let url = url::Url::parse(base)?;
-        let local = match url.host_str() {
-            Some("localhost") => true,
-            Some(host) => host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback()),
-            None => false,
-        };
-        if !local
-            || !matches!(url.scheme(), "http" | "https")
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(
-                "埋め込みURLは認証情報を含まないローカルのhttp/https URLにしてください".into(),
-            );
-        }
         let model = self
             .embedding_model
-            .as_deref()
+            .clone()
             .ok_or("埋め込みモデルが必要です")?;
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?
-            .post(url)
-            .json(&serde_json::json!({"model":model,"input":text}))
-            .send()
-            .await?
-            .error_for_status()?;
-        let body: serde_json::Value = response.json().await?;
-        let values: Vec<f32> = serde_json::from_value(
-            body.pointer("/data/0/embedding")
-                .ok_or("埋め込みが応答にありません")?
-                .clone(),
-        )?;
-        Ok(Some(Embedding {
-            model: model.into(),
-            values,
-        }))
+        Ok(Some(polaris_tui::tool_memory::Encoder::new(base, model)?))
+    }
+    async fn encode(&self, text: &str) -> Result<Option<Embedding>, Box<dyn std::error::Error>> {
+        match self.encoder()? {
+            Some(encoder) => Ok(Some(encoder.encode(text).await?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -141,10 +127,6 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let project = polaris_core::project::resolve_root(&cwd).canonicalize()?;
     let project_id = polaris_tui::persist::project_identity(&project)?;
     let home = std::env::var_os("HOME").ok_or("HOMEが設定されていません")?;
-    let state = PathBuf::from(home.clone())
-        .join(".polaris/state")
-        .join(polaris_core::project::project_id(&project));
-    let database = state.join("memory.sqlite3");
     let writes = matches!(
         &args.command,
         Command::Import { .. }
@@ -152,33 +134,104 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             | Command::Index { .. }
             | Command::Forget { .. }
     );
-    let mut store = if writes {
-        std::fs::create_dir_all(&state)?;
-        MemoryStore::open(&database)?
+    let state = if writes {
+        polaris_core::project::state_dir(&project)?
     } else {
-        MemoryStore::open_read_only(&database)?
+        match std::env::var_os("POLARIS_DATA_DIR") {
+            Some(root) if !root.is_empty() && PathBuf::from(&root).is_absolute() => {
+                PathBuf::from(root)
+            }
+            Some(_) => return Err("POLARIS_DATA_DIRは空でない絶対パスが必要です".into()),
+            None => PathBuf::from(home.clone()).join(".polaris"),
+        }
+        .join("state")
+        .join(polaris_core::project::project_id(&project))
+    };
+    let database = state.join("memory.sqlite3");
+    let data_root = state
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or("メモリ保存先が不正です")?;
+    let mutation = if writes {
+        Some(ProjectMutationOwnerV1::for_project(&project)?)
+    } else {
+        None
+    };
+    let lease = mutation
+        .as_ref()
+        .map(ProjectMutationOwnerV1::try_mutation)
+        .transpose()?;
+    let effects = lease
+        .as_ref()
+        .map(|lease| ManagementEffectStoreV1::open_at_state_dir(&project, &state, lease))
+        .transpose()?;
+    let owner = effects
+        .as_ref()
+        .zip(lease.as_ref())
+        .map(|(effects, lease)| MemoryChangeOwnerV1 {
+            effects,
+            lease,
+            project_root: &project,
+            data_root,
+            active_session: None,
+        });
+    let mut store = match &owner {
+        Some(owner) => owner.open_store()?,
+        None => MemoryStore::open_read_only(&database)?,
     };
     match args.command {
         Command::Import { file } => {
-            let contents = std::fs::read_to_string(file)?;
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let file = file.canonicalize()?;
+            let metadata = std::fs::symlink_metadata(&file)?;
+            if !metadata.is_file() {
+                return Err("取り込み元は通常ファイルが必要です".into());
+            }
+            let denied = polaris_auth::protection::with_protected_paths(|snapshot| {
+                snapshot.paths().contains(&file)
+                    || snapshot.identities().contains(
+                        &polaris_auth::protection::ProtectedIdentity {
+                            dev: metadata.dev(),
+                            ino: metadata.ino(),
+                        },
+                    )
+            })?;
+            if denied {
+                return Err("保護されたファイルは取り込めません".into());
+            }
+            let input = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&file)?;
+            if (input.metadata()?.dev(), input.metadata()?.ino())
+                != (metadata.dev(), metadata.ino())
+            {
+                return Err("取り込み元が変更されました".into());
+            }
+            if !input.metadata()?.is_file() || input.metadata()?.len() > MAX_CHANGE_BYTES as u64 {
+                return Err("取り込みファイルが上限を超えました".into());
+            }
+            let mut contents = String::new();
+            input
+                .take(MAX_CHANGE_BYTES as u64 + 1)
+                .read_to_string(&mut contents)?;
+            if contents.len() > MAX_CHANGE_BYTES {
+                return Err("取り込みファイルが上限を超えました".into());
+            }
             let records = contents
                 .lines()
                 .filter(|line| !line.trim().is_empty())
                 .map(serde_json::from_str::<Record>)
+                .take(101)
                 .collect::<Result<Vec<_>, _>>()?;
-            for record in &records {
-                if record.project_id != project_id {
-                    return Err("別プロジェクトの記録は取り込めません".into());
-                }
-                validate_session(&record.session_id)?;
-                if store.is_session_forgotten(&project_id, &record.session_id)? {
-                    return Err("削除済みセッションは取り込めません".into());
-                }
-            }
-            for record in &records {
-                store.upsert(record, None)?;
-            }
-            println!("{}件を取り込みました", records.len());
+            let receipt = apply_change(
+                owner.as_ref().ok_or("メモリownerがありません")?,
+                &mut store,
+                &project_id,
+                MemoryChangeV1::Import { records },
+                None,
+            )?;
+            println!("{}件を取り込みました", receipt.records_changed);
         }
         Command::Search {
             query,
@@ -251,9 +304,8 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             validate_session(&session)?;
             validate_session(&id)?;
-            let data_root = PathBuf::from(&home).join(".polaris");
             let persisted = polaris_core::session_store::PersistedSession::open(
-                &data_root,
+                data_root,
                 &database,
                 &project_id,
                 &session,
@@ -276,59 +328,94 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             id,
             embedding,
         } => {
+            let before = store.project_revision(&project_id)?;
             let record = store
                 .get(&project_id, &session, &id)?
                 .ok_or("記録がありません")?;
+            if record.text.len() > MAX_CHANGE_BYTES {
+                return Err("埋め込み本文が上限を超えました".into());
+            }
             let vector = embedding
                 .encode(&record.text)
                 .await?
                 .ok_or("--embedding-urlと--embedding-modelが必要です")?;
-            store.set_embedding(&project_id, &session, &id, &vector)?;
+            apply_change(
+                owner.as_ref().ok_or("メモリownerがありません")?,
+                &mut store,
+                &project_id,
+                MemoryChangeV1::Embed {
+                    updates: vec![MemoryEmbeddingUpdateV1 {
+                        session_id: session,
+                        id,
+                        embedding: vector,
+                    }],
+                },
+                Some(before),
+            )?;
             println!("埋め込みを保存しました");
         }
-        Command::Index { session, embedding } => {
-            if embedding.embedding_url.is_none() {
-                return Err("--embedding-urlと--embedding-modelが必要です".into());
+        Command::Index {
+            session,
+            batch,
+            after,
+            embedding,
+        } => {
+            let encoder = embedding
+                .encoder()?
+                .ok_or("--embedding-urlと--embedding-modelが必要です")?;
+            let before = store.project_revision(&project_id)?;
+            let records =
+                store.records_page(&project_id, &session, after.as_deref(), batch as usize)?;
+            if records.is_empty() {
+                return Err("索引対象の記録がありません".into());
             }
-            let mut after: Option<String> = None;
-            let mut count = 0usize;
-            loop {
-                let records = store.records_page(&project_id, &session, after.as_deref(), 50)?;
-                if records.is_empty() {
-                    break;
-                }
-                for record in &records {
-                    let vector = embedding
-                        .encode(&record.text)
-                        .await?
-                        .ok_or("埋め込み設定がありません")?;
-                    store.set_embedding(&project_id, &session, &record.id, &vector)?;
-                    count += 1;
-                }
-                after = records.last().map(|r| r.id.clone());
+            if records
+                .iter()
+                .try_fold(0usize, |sum, r| sum.checked_add(r.text.len()))
+                .is_none_or(|sum| sum > MAX_CHANGE_BYTES)
+            {
+                return Err("索引本文が上限を超えました".into());
             }
-            println!("{count}件の埋め込みを保存しました");
+            let next = records.last().map(|r| r.id.clone());
+            let updates = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                let mut updates = Vec::with_capacity(records.len());
+                for record in records {
+                    updates.push(MemoryEmbeddingUpdateV1 {
+                        session_id: record.session_id,
+                        id: record.id,
+                        embedding: encoder.encode(&record.text).await?,
+                    });
+                }
+                Ok::<_, std::io::Error>(updates)
+            })
+            .await
+            .map_err(|_| "索引の通信時間が120秒を超えました")??;
+            let receipt = apply_change(
+                owner.as_ref().ok_or("メモリownerがありません")?,
+                &mut store,
+                &project_id,
+                MemoryChangeV1::Index { updates },
+                Some(before),
+            )?;
+            println!(
+                "{}件の埋め込みを保存しました。続きの開始ID: {}",
+                receipt.records_changed,
+                next.unwrap_or_default()
+            );
         }
         Command::Forget { session } => {
-            validate_session(&session)?;
-            let _lock = polaris_tui::lock_memory(&state)?;
-            let count = store.delete_session(&project_id, &session)?;
-            let v2_count = store.cleanup_forgotten_conversation(&project_id, &session)?;
-            let directory = state
-                .join("memory-archives")
-                .join(format!("{session}.archive"));
-            if directory.exists() {
-                std::fs::remove_dir_all(directory)?;
-            }
-            let raw = PathBuf::from(&home)
-                .join(".polaris")
-                .join("sessions-v2")
-                .join(&session);
-            if raw.exists() {
-                std::fs::remove_dir_all(&raw)?;
-            }
+            let receipt = apply_change(
+                owner.as_ref().ok_or("メモリownerがありません")?,
+                &mut store,
+                &project_id,
+                MemoryChangeV1::Forget {
+                    session_id: session,
+                },
+                None,
+            )?;
             println!(
-                "{count}件、v2索引{v2_count}件と対象セッションの保管原文を削除しました。再取り込みは禁止されます。"
+                "{}件、v2索引{}件と対象セッションの保管原文を削除しました。再取り込みは禁止されます。",
+                receipt.records_changed, receipt.conversation_rows_deleted
             );
         }
     }
@@ -336,12 +423,24 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn validate_session(session: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if session.is_empty()
-        || !session
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err("セッションIDが不正です".into());
-    }
-    Ok(())
+    polaris_memory::management::validate_session_id(session).map_err(Into::into)
+}
+
+fn apply_change(
+    owner: &MemoryChangeOwnerV1<'_>,
+    store: &mut MemoryStore,
+    project: &str,
+    change: MemoryChangeV1,
+    before: Option<u64>,
+) -> Result<polaris_memory::management::MemoryChangeReceiptV1, Box<dyn std::error::Error>> {
+    let request = MemoryChangeRequestV1 {
+        operation_id: ManagementOperationIdV1::random()?.as_hex(),
+        project_id: project.into(),
+        expected_revision: before.unwrap_or(store.project_revision(project)?),
+        change,
+    };
+    let prepared = owner.prepare(store, request)?;
+    owner
+        .apply(store, &prepared, true)?
+        .ok_or_else(|| "メモリ操作が取り消されました".into())
 }

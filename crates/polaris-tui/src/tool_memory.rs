@@ -868,7 +868,7 @@ fn bounded_read(
 #[cfg(test)]
 type TestEncoder = Arc<dyn Fn(&str) -> io::Result<Embedding> + Send + Sync>;
 
-struct Encoder {
+pub struct Encoder {
     client: reqwest::Client,
     url: url::Url,
     model: String,
@@ -876,7 +876,7 @@ struct Encoder {
     fake: Option<TestEncoder>,
 }
 impl Encoder {
-    fn new(base: &str, model: String) -> io::Result<Self> {
+    pub fn new(base: &str, model: String) -> io::Result<Self> {
         let mut url =
             url::Url::parse(base).map_err(|_| io::Error::other("埋め込みURLが不正です"))?;
         let local = match url.host_str() {
@@ -918,7 +918,7 @@ impl Encoder {
             fake: None,
         })
     }
-    async fn encode(&self, text: &str) -> io::Result<Embedding> {
+    pub async fn encode(&self, text: &str) -> io::Result<Embedding> {
         #[cfg(test)]
         if let Some(fake) = &self.fake {
             return fake(text);

@@ -15,6 +15,8 @@ mod input_preparation_tests;
 #[cfg(unix)]
 mod instruction_commands;
 mod memory;
+#[cfg(unix)]
+mod memory_commands;
 pub mod onboarding;
 pub mod persist;
 #[cfg(target_os = "linux")]
@@ -4008,6 +4010,38 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             continue;
                         }
                         #[cfg(unix)]
+                        slash::Action::Memory(request) => {
+                            let id = match active_saved_session_id(&session) {
+                                Ok(id) => id,
+                                Err(error) => {
+                                    status = Status::Error(error);
+                                    continue;
+                                }
+                            };
+                            let result = memory_commands::handle(
+                                &request,
+                                &terminal,
+                                &mut key_reader,
+                                rewind_workspace.as_ref().expect("startup owner"),
+                                &management_effects,
+                                &args.cwd,
+                                &args.state_dir,
+                                id.as_deref(),
+                                saved_embedding.clone(),
+                                has_pending_inputs,
+                            )
+                            .await;
+                            match result {
+                                Ok(lines) => {
+                                    local_lines.extend(lines);
+                                    status =
+                                        Status::Notice("メモリ操作の結果を表示しました".into());
+                                }
+                                Err(error) => status = Status::Error(error),
+                            }
+                            continue;
+                        }
+                        #[cfg(unix)]
                         slash::Action::RuntimeControl(request) => {
                             if let Some(result) = handle_queued_control(
                                 &request,
@@ -4715,6 +4749,37 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             local_lines.extend(lines);
                             refresh_saved_settings = true;
                             status = Status::Notice("セッション操作の結果を表示しました".into());
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
+                #[cfg(unix)]
+                Some(slash::Action::Memory(request)) => {
+                    let id = match active_saved_session_id(&session) {
+                        Ok(id) => id,
+                        Err(error) => {
+                            status = Status::Error(error);
+                            continue;
+                        }
+                    };
+                    let result = memory_commands::handle(
+                        &request,
+                        &terminal,
+                        &mut key_reader,
+                        rewind_workspace.as_ref().expect("startup owner"),
+                        &management_effects,
+                        &args.cwd,
+                        &args.state_dir,
+                        id.as_deref(),
+                        saved_embedding.clone(),
+                        has_pending_inputs,
+                    )
+                    .await;
+                    match result {
+                        Ok(lines) => {
+                            local_lines.extend(lines);
+                            status = Status::Notice("メモリ操作の結果を表示しました".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }
@@ -10549,6 +10614,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn m3c_memory_read_keeps_project_scope_and_bounds_exact_ranges() {
+        use polaris_memory::{MemoryStore, Record};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let other_project = root.path().join("other");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&other_project).unwrap();
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        assert!(memory_read_lines(&project, &state_dir, root.path(), "search needle").is_err());
+        assert!(!state_dir.join("memory.sqlite3").exists());
+
+        let mut store = MemoryStore::open(state_dir.join("memory.sqlite3")).unwrap();
+        for (path, id) in [
+            (&project, "same-project"),
+            (&other_project, "other-project"),
+        ] {
+            store
+                .upsert(
+                    &Record {
+                        project_id: persist::project_identity(path).unwrap(),
+                        session_id: "session-1".into(),
+                        id: id.into(),
+                        role: "user".into(),
+                        timestamp: "2026-09-23".into(),
+                        source: "test".into(),
+                        text: "needle evidence".into(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        drop(store);
+        let lines = memory_read_lines(&project, &state_dir, root.path(), "search needle")
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lines.contains("same-project"), "{lines}");
+        assert!(!lines.contains("other-project"), "{lines}");
+        assert!(lines.contains("現在の指示・承認ではありません"));
+        let page = memory_read_lines(
+            &project,
+            &state_dir,
+            root.path(),
+            "get session-1 same-project 7 8",
+        )
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(page.contains("evidence"));
+        assert!(
+            memory_read_lines(
+                &project,
+                &state_dir,
+                root.path(),
+                "get session-1 same-project 900 8"
+            )
+            .is_err()
+        );
+        assert!(
+            memory_read_lines(
+                &project,
+                &state_dir,
+                root.path(),
+                "get session-1 same-project 0 4097"
+            )
+            .is_err()
+        );
+        assert!(
+            memory_read_lines(
+                &project,
+                &state_dir,
+                root.path(),
+                "get session-1 other-project"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn decided_read_is_bounded_and_marks_old_entries_as_history() {
@@ -14527,6 +14676,98 @@ mod tests {
         assert_eq!(session.messages[0].content, "original");
     }
 
+    #[tokio::test]
+    async fn m3_acceptance_memory_source_verifies_original_and_refuses_modified_raw() {
+        struct SourceSummary;
+        impl StrictSummaryProvider for SourceSummary {
+            fn summarize<'a>(&'a self, request: SummaryRequest) -> StrictFuture<'a, String> {
+                Box::pin(async move {
+                    Ok(serde_json::json!({"facts":["remember original verified source"], "decisions":[], "constraints":[], "corrections":[], "open_items":[], "source_turn_ids":[request.source_turn_id]}).to_string())
+                })
+            }
+        }
+        struct SourceEmbedder(EmbeddingModel);
+        impl StrictEmbedder for SourceEmbedder {
+            fn metadata(&self) -> &EmbeddingModel {
+                &self.0
+            }
+            fn embed_passage<'a>(&'a self, _: &'a str) -> StrictFuture<'a, Vec<f32>> {
+                Box::pin(async { Ok(vec![1.0]) })
+            }
+            fn embed_query<'a>(&'a self, _: &'a str) -> StrictFuture<'a, Vec<Vec<f32>>> {
+                Box::pin(async { Ok(vec![vec![1.0]]) })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project_id = persist::project_identity(&project).unwrap();
+        let saved = polaris_core::session_store::PersistedSession::create(
+            root.path(),
+            &root.path().join("memory.sqlite3"),
+            &project_id,
+            polaris_core::conversation_state::HistoryMode::Strict10,
+            None,
+        )
+        .unwrap();
+        for turn in 1..=11 {
+            saved
+                .append(
+                    Message::user(format!("original verified source {turn}")),
+                    true,
+                    None,
+                )
+                .unwrap();
+        }
+        let history = StrictHistory::new(
+            Arc::new(SourceSummary),
+            Arc::new(SourceEmbedder(EmbeddingModel {
+                model: "fixture".into(),
+                revision: "v1".into(),
+                dimension: 1,
+            })),
+        );
+        let prepared = history
+            .prepare_observed(
+                &saved.store,
+                &saved.database,
+                "remember original",
+                &|snapshot| saved.accept_publication(snapshot),
+            )
+            .await
+            .unwrap();
+        let source = &prepared.retrieval[0].source.id;
+        let id = saved.snapshot().unwrap().state.session_id;
+        let request = format!("source {id} {source}");
+        let lines = memory_read_lines(
+            &project,
+            root.path(),
+            &root.path().join("sessions"),
+            &request,
+        )
+        .unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("original verified source 1"))
+        );
+        let raw = saved.store.directory().join("raw.jsonl");
+        let original = std::fs::read_to_string(&raw).unwrap();
+        std::fs::write(
+            &raw,
+            original.replacen("original verified", "modified verified", 1),
+        )
+        .unwrap();
+        assert!(
+            memory_read_lines(
+                &project,
+                root.path(),
+                &root.path().join("sessions"),
+                &request
+            )
+            .is_err()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

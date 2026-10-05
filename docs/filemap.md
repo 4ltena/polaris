@@ -130,6 +130,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-cli/src`
 
 - `account.rs` — 複数アカウントの登録操作と、1つのrunを1つの登録へ固定する束縛。
+- `admission.rs` — One-shot CLI admission owner. The manager commit precedes MCP prompt
 - `benchmark_report.rs` — Opt-in, machine-readable observations for the offline comparison harness.
 - `compare.rs` — フォルダ同士がどれだけ似ているかを示す。名前とサイズだけを読み、
 - `decided.rs` — `polaris decided` — the ledger of questions this project has settled.
@@ -148,6 +149,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `confined_helper.rs` — Integration test that launches the real `polaris` binary as a helper
 - `entry_points.rs` — The three commands that had no caller until now: comparing folders,
 - `input_preparation.rs` — Real CLI input preparation with an isolated home and a synthetic loopback model.
+- `linux_signal_cleanup.rs` — Real Linux PTY evidence for interactive shutdown. Every child is the
 - `mcp.rs` — `polaris mcp` against a synthetic home; no server or model is contacted.
 - `memory.rs` — Exercises project memory through the real CLI without model calls.
 - `setting.rs` — The bundled setting commands from the terminal. Real directories and a
@@ -162,6 +164,8 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `activity.rs` — M6-2: what the host knows about a run's liveness, decided from events and
 - `agent.rs` — The agent loop. Returns the body text at the point tool calls stop.
+- `apply_intent.rs` — Canonical evidence for an owned, recoverable workspace apply.
+- `apply_owner.rs` — The C12/D27 owner retains the project lease across durable lifecycle steps.
 - `approval.rs` — Approval boundary. `sandbox_mode` sets the technical boundary;
 - `audit.rs` — Append-only audit log. Not signed: in-process, the entity signing and the
 - `budget.rs` — Measurement of the always-on context. Numbers are backed by measurement,
@@ -191,12 +195,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `gitignore.rs` — `files.md`(ハーネスが自動生成する、コミット対象外のファイル)を
 - `handoff.rs` — M7a-1: the prompt that hands a finished implementation to someone who can
 - `input_preparation.rs` — Reversible, host-only projection of repeated paragraphs in a new root input.
-- `isolated_run.rs` — macOS prepare-only composition. Paths and executable identity are supplied by
+- `isolated_run.rs` — Prepare-only composition on Linux and macOS. Paths and executable identity are supplied by
 - `isolated_workspace.rs` — Bounded, sanitized source snapshots. No apply-back or execution policy lives here.
 - `lib.rs` — Entry point for polaris-core. Ties together the budget, constitution, and prompt modules.
+- `linux_l04_parent.rs` — Read-only validation of an empty disposable restart fixture parent.
 - `llama_server.rs` — Supervising the bundled `llama-server`.
 - `local_execution.rs` — Fixed local selections with endpoint-wide physical inference admission.
 - `managed_runtime.rs` — Package-trusted, read-only Python runtime image.
+- `management_effect.rs` — Durable, typed lifecycle records for management side effects.
 - `mcp.rs` — Run-owned MCP connections, request context and local result retention.
 - `measurement.rs` — M8: what one comparison measurement leaves behind. Nothing here sends
 - `os_home.rs` — Trusted OS account home lookup. Never consults or changes the environment.
@@ -205,14 +211,21 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `project.rs` — Resolves the project root.
 - `project_analysis.rs` — Minimal, state-driven bootstrap for a first-turn project analysis.
 - `project_git.rs` — A read-only git call against the user's own repository.
+- `project_mutation.rs` — One project-wide lock for turns, owned children and workspace mutations.
 - `prompt.rs` — The single place that assembles the set of things loaded every turn.
 - `recipe.rs` — M7c: the build recipes Polaris ships. A recipe is a fixed definition, not
 - `request_input.rs` — Ephemeral raw-event identity and request slots for lossless input preparation.
 - `resume.rs` — M6-2b: whether a finished run should be continued without being asked.
+- `rewind_admission.rs` — Execution admission for saved conversations after a workspace rewind.
+- `rewind_candidate_capacity.rs` — Fail-closed capacity accounting for durable rewind candidates.
+- `rewind_workspace.rs` — Durable, bounded workspace checkpoints used by file-and-context rewind.
+- `sandbox_command.rs` — One explicit command under a narrowed startup ceiling and project lease.
 - `scratch_registry.rs` — M6-5: the private copies Polaris created, recorded so that a later start
 - `session.rs` — Request history with optional durable v2 storage or a v3 desktop owner port.
 - `session_manager.rs` — Durable, side-effect-free admission and multi-session scheduling state.
+- `session_settings.rs` — Conversation-owned settings, independent draft and revision-bound goals.
 - `session_store.rs` — Durable session attachment, generation checks, and tombstone-serialized writes.
+- `session_switch.rs` — Project-owned local session switches. A started switch is never replayed
 - `similarity.rs` — M7a-2: which registered project folders look like one another, and what
 - `spare.rs` — M7a-3: whether spare quota may be spent on refactoring nobody asked for.
 - `spawn.rs` — The `spawn` tool's implementation. Type discovery reuses
@@ -226,7 +239,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `turn_intent.rs` — What one user turn is, along several axes at once.
 - `workflow.rs` — Explicit workflow focus, independent of tool permissions and completion evidence.
 - `workflow_artifact_store.rs` — Private immutable bodies for the durable workflow artifact graph.
-- `workspace_apply.rs` — macOS file-only apply-back with retained originals and a durable intent journal.
+- `workspace_apply.rs` — Unix file-only apply-back with retained originals and a durable intent journal.
 
 ## `crates/polaris-core/src/activity`
 
@@ -343,6 +356,8 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `model.rs` — P1値を共用する保存marker、付随状態、要求結果と明示的な保存エラー。
 - `roles.rs` — Durable role choices and past metadata observations, never runtime authorization.
 - `session_manager.rs` — Root-owned durable state for the two-session admission manager.
+- `session_manager_family.rs` — Bounded family index reads and durable session-family membership.
+- `session_manager_generation.rs` — Session-manager generation publication, sealing and archive recovery.
 - `source_apply.rs` — Controller-only evidence ledger. No filesystem authorization or dispatch.
 - `star_names.rs` — Stable display names for child runs.
 - `subagent_control.rs` — Durable, private owner storage for the typed subagent control plane.
@@ -490,9 +505,25 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `tests.rs` — Local endpoint capacity, bounded waiters, cancellation, and quarantine tests.
 
+## `crates/polaris-core/src/management_effect`
+
+- `account_change.rs` — Account management uses the existing auth owner and project effect journal.
+- `generation.rs` — Durable management-effect generations, checkpoints and sealed archives.
+- `mcp_change.rs` — MCP project admission changes retain the registry CAS owner and effect journal.
+- `memory_change.rs` — One project owner for explicit import, embedding, indexing and session forgetting.
+- `store.rs` — Lease-bound management-effect journal storage and validation.
+- `tests.rs` — Management-effect ownership, journal and recovery regression tests.
+- `workflow_change.rs` — Durable local-session workflow changes.  A started change is reconciled
+- `workspace_change.rs` — Confirmed Git recipe changes share the existing recipe ledger and effect journal.
+
+## `crates/polaris-core/src/management_effect/memory_change`
+
+- `tests.rs` — Memory-change effect tests for durable mutation and recovery.
+
 ## `crates/polaris-core/src/mcp`
 
 - `apps.rs` — Built-in creative-app definitions (M2b). Every entry is unverified until a
+- `credentials.rs` — Typed ownership of MCP credential mutations.
 - `lease.rs` — Fail-closed leases for parent-captured MCP read evidence.
 - `local.rs` — CLI and TUI hosts: the same store, startup admission and setup tool as the
 - `operation.rs` — Host-bound MCP operation evidence.
@@ -538,7 +569,6 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/mcp/runtime/tests`
 
 - `budget.rs` — Catalog acquisition limits survive eviction, refresh, failure and cancellation.
-- `fixture.rs` — Loopback-only, scripted MCP server. No credentials or production endpoint.
 - `prompt.rs` — Host prompt preparation blocks request snapshots until durable confirmation.
 - `retry.rs` — Retry only pre-operation metadata failures, preserving cancellation and bounds.
 
@@ -629,6 +659,11 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `mod.rs` — Remna's privacy filter. Pure logic that runs **before** a captured event
 
+## `crates/polaris-core/src/session_settings`
+
+- `owner.rs` — Preview and commit session settings through the management-effect owner.
+- `tests.rs` — Session-settings persistence, denial and recovery regression tests.
+
 ## `crates/polaris-core/src/similarity`
 
 - `sample.rs` — Reading folders into the shape the comparison takes.
@@ -651,7 +686,9 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `apply.rs` — M7b-4: putting an agreed shared tree into the project. Nothing here writes
 - `exchange.rs` — M7b-3: exchanging with the other devices and deciding what each change
+- `owner.rs` — Durable owner for sync operations that may mutate a remote ref.
 - `participation.rs` — M7b-5: what this device remembers about a shared project. One small file
+- `remote_intent.rs` — Durable request and receipt types for one state-changing sync remote call.
 - `repository.rs` — M7b-2: the synchronization repository. Git only ever sees the staging
 - `share.rs` — M7b-1: who takes part in a shared project, what is shared, and where the
 
@@ -714,6 +751,8 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `architecture.rs` — A snapshot test that confirms `docs/architecture.md` matches the
 - `filemap.rs` — A snapshot test that confirms `docs/filemap.md` matches the actual state of the repository.
 - `isolated_execution.rs` — Synthetic end-to-end snapshot, confined execution, and source conflict tests.
+- `linux_apply_intent_restart.rs` — Local XFS restart acceptance. Phase fixtures use the public canonical wire
+- `linux_filesystem_acceptance.rs` — Explicit, disposable-root acceptance probe for Linux filesystem primitives.
 
 ## `crates/polaris-desktop-protocol`
 
@@ -887,8 +926,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `content.rs` — SDK-independent result variants. Binary content is never serialized into a
 - `lib.rs` — Host-owned MCP registration and bounded client data.
 - `registration.rs` — Validated host registrations, without SDK types or secret values.
+- `secret_input.rs` — Masked, short-lived credential input for trusted interactive hosts.
 - `store.rs` — Descriptor-relative private storage shared by trusted host surfaces.
 - `template.rs` — Bounded RFC 6570 expansion for catalog resource templates. Expansion never
+- `test_support.rs` — Loopback-only, scripted MCP server. No credentials or production endpoint.
 - `transport.rs` — Private SDK boundary. Neither upstream errors nor credential-bearing clients
 
 ## `crates/polaris-mcp/src/catalog`
@@ -927,11 +968,16 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `conversation.rs` — Pending, scope-bound summaries for strict conversation history.
 - `lib.rs` — Local, explicitly populated memory. Retrieved text is quoted historical evidence,
+- `management.rs` — Bounded atomic management batches, durable project revisions and receipts.
 - `structured.rs` — Version 3 structured-memory schema and host-owned domain values.
 
 ## `crates/polaris-memory/src/conversation`
 
 - `related.rs` — Bounded candidate generation, separate from structured-memory classification.
+
+## `crates/polaris-memory/src/management`
+
+- `tests.rs` — Atomic memory import, revision and forget regression tests.
 
 ## `crates/polaris-memory/src/structured`
 
@@ -1113,21 +1159,49 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-tui/src`
 
+- `account.rs` — Account commands never put OAuth codes or token values into TUI history.
 - `approver.rs` — The `Approver` that runs inside the TUI: draws a modal over the current
 - `clipboard.rs` — Copies text to the system clipboard. macOS uses `/usr/bin/pbcopy`, whose
 - `continuation_tests.rs` — Shared continuation recovery through real raw/receipt owners and fake backends.
+- `draft.rs` — An unsent draft belongs to its conversation and never enters raw history.
 - `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from
 - `input_preparation_tests.rs` — TUI initialization and cloned run ownership preserve request-only input preparation.
+- `instruction_commands.rs` — Durable next-run instructions in the existing TUI admission family.
 - `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
+- `local_actions.rs` — Confirmed local actions share the project lease and management journal.
+- `mcp_commands.rs` — MCP controls change next-run admission; they never replace a running runtime.
 - `memory.rs` — Explicitly enabled project memory and pre-compaction archival.
+- `memory_commands.rs` — Explicit host memory commands. Confirmation and results stay in the TUI;
 - `onboarding.rs` — The onboarding screen: shown by `polaris-cli` when the interactive TUI
 - `persist.rs` — Session persistence: one JSON `Message` per line.
 - `render.rs` — Pure rendering: turns a `Session` + input state into terminal cells.
+- `resume_effect.rs` — Exact saved-session selection before a host activates a prepared candidate.
+- `rewind_ui.rs` — TUI-only rewind interaction state. Checkpoint eligibility and file changes
+- `role_commands.rs` — Role bindings select existing fixed tier providers; they create no provider.
+- `runtime_commands.rs` — Commands over the live host control plane; no desktop-state mirror.
+- `runtime_effects.rs` — Runtime management requests use the bound activity lease, never source mutation.
+- `sandbox_commands.rs` — Explicit argv execution under the startup ceiling and durable C38 receipt.
 - `selection.rs` — Mouse drag-to-select over the conversation history. Operates entirely
+- `session_commands.rs` — Saved session controls use the conversation owner and shared project lease.
 - `sessions.rs` — Enumerates saved conversations under `~/.polaris/sessions/` for the
+- `signal.rs` — Linux process-signal capture for the interactive terminal lifetime.
 - `slash.rs` — Slash commands: local, client-side commands recognized when the input
+- `source_apply.rs` — Linux terminal adapter for the existing source-bound native owner.
 - `time.rs` — A tiny, dependency-free UTC timestamp formatter — just enough to
 - `tool_memory.rs` — Immutable, scoped tool output storage behind the reserved memory read path.
+- `workspace_commands.rs` — Workspace projections remain UI-only and bound to the startup source.
+
+## `crates/polaris-tui/src/role_commands`
+
+- `tests.rs` — TUI role and tier controls with fixed-provider and permission checks.
+
+## `crates/polaris-tui/src/sandbox_commands`
+
+- `tests.rs` — TUI sandbox controls and startup permission-ceiling regression tests.
+
+## `crates/polaris-tui/src/session_commands`
+
+- `tests.rs` — TUI session settings and history controls without provider requests.
 
 ## `docs`
 
@@ -1146,6 +1220,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `testing.md` — テスト
 - `tool-preselection.md` — ツールの事前選定
 - `usage.md` — 利用ガイド
+
+## `scripts/fixtures/tui-parity-ledger`
+
+- `d42-without-addendum.md` — Fixed synthetic parent inventory and Linux ledger
+- `duplicate-id.md` — Fixed synthetic parent inventory and Linux ledger
+- `valid-129.md` — Fixed synthetic parent inventory and Linux ledger
+- `valid-130-with-addendum.md` — Fixed synthetic parent inventory and Linux ledger
+- `wrong-set-129.md` — Fixed synthetic parent inventory and Linux ledger
 
 ## `skills/mutation-check`
 

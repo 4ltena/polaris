@@ -128,5 +128,46 @@ pub fn apply_agreed(
     ))
 }
 
+/// C12's durable lifecycle. The caller supplies the retained agreed revision
+/// and exact participation body; the shared owner derives admission evidence.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn apply_agreed_m2a(
+    owner: &crate::apply_owner::ApplyOwnerV1,
+    admission: crate::apply_owner::C12ApplyAdmissionV1,
+    project_root: &Path,
+    agreed_tree: &Path,
+    manifest: &ShareManifest,
+    changed: &Changed,
+    limits: Limits,
+    recovery_parent: &crate::workspace_apply::RecoveryParent,
+) -> io::Result<(crate::workspace_apply::ApplyReport, Shaped)> {
+    let (snapshot, shaped, changes) =
+        polaris_auth::protection::with_protected_paths(|registered| {
+            let secrets = RegisteredSecrets::from_auth_registry(registered)
+                .map_err(|_| io::Error::other("保護状態を確認できません"))?;
+            let (snapshot, shaped) = shape_copy(
+                project_root,
+                agreed_tree,
+                manifest,
+                changed,
+                &secrets,
+                limits,
+            )?;
+            if !shaped.deferred.is_empty() {
+                return Err(io::Error::other(
+                    "未作成ディレクトリの共有変更が残っています",
+                ));
+            }
+            let changes = planned_changes(&snapshot, &secrets, limits)?;
+            Ok::<_, io::Error>((snapshot, shaped, changes))
+        })
+        .map_err(|_| io::Error::other("保護状態を確認できません"))??;
+    let report = owner
+        .apply_c12(admission, &snapshot, &changes, limits, recovery_parent)
+        .map_err(io::Error::other)?;
+    Ok((report, shaped))
+}
+
 #[cfg(test)]
 mod tests;

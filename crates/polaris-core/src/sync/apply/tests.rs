@@ -1,6 +1,116 @@
 //! Temporary projects only; the apply owner is exercised through the copy.
 use super::*;
 
+#[test]
+fn m2a_agreed_tree_adapter_joins_the_owner_and_refuses_deferred_files_before_intent() {
+    use crate::apply_intent::{RevisionKindV1, RevisionV1};
+    use crate::apply_owner::{ApplyOwnerV1, C12ApplyAdmissionV1};
+    use crate::management_effect::ManagementOperationIdV1;
+    use crate::project_mutation::ProjectMutationOwnerV1;
+    use crate::sync::{participation::Participation, share::ShareLink};
+    use crate::workspace_apply::RecoveryParent;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for deferred in [true, false] {
+        let target = std::env::var_os("CARGO_TARGET_DIR").expect("isolated target");
+        let temporary = tempfile::Builder::new()
+            .prefix("c12-adapter-")
+            .tempdir_in(target)
+            .unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let state = root.join("state");
+        let agreed = root.join("agreed");
+        let recovery = root.join("recovery");
+        for path in [&project, &state, &agreed, &recovery, &state.join("sync")] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(project.join("main.rs"), b"before\n").unwrap();
+        fs::write(agreed.join("main.rs"), b"after\n").unwrap();
+        let revision = RevisionV1 {
+            kind: RevisionKindV1::GitSha1,
+            value: "c".repeat(40),
+        };
+        let manifest = ShareManifest::default();
+        let mut participation = Participation {
+            share: ShareLink {
+                remote: "file:///test-repository".into(),
+                share_id: "project-1".into(),
+                invitation_id: "invite-1".into(),
+                expires_unix_seconds: u64::MAX,
+            },
+            manifest: manifest.clone(),
+            joined_unix_seconds: 1,
+            agreed_commit: Some(revision.value.clone()),
+            applied_commit: None,
+            unresolved: vec![],
+        };
+        fs::write(
+            state.join("sync/participation.json"),
+            serde_json::to_vec(&participation).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            state.join("sync/participation.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        participation.applied_commit = participation.agreed_commit.clone();
+        let lease_owner =
+            ProjectMutationOwnerV1::at_store_root(&state.join("rewind-workspace")).unwrap();
+        let owner = ApplyOwnerV1::with_lease(&project, &state, lease_owner.try_mutation().unwrap())
+            .unwrap();
+        let parent_file = fs::File::open(&recovery).unwrap();
+        let meta = parent_file.metadata().unwrap();
+        let parent =
+            RecoveryParent::pin(&parent_file, (meta.dev(), meta.ino()), &recovery).unwrap();
+        let mut changed = Changed {
+            written: vec!["main.rs".into()],
+            removed: vec![],
+        };
+        if deferred {
+            fs::create_dir(agreed.join("missing")).unwrap();
+            fs::write(agreed.join("missing/new.rs"), b"new\n").unwrap();
+            changed.written.push("missing/new.rs".into());
+        }
+        let result = apply_agreed_m2a(
+            &owner,
+            C12ApplyAdmissionV1 {
+                management_operation_id: ManagementOperationIdV1::random().unwrap(),
+                agreed_revision: revision.clone(),
+                staged_revision: revision,
+                previous_applied_revision: None,
+                target_participation: serde_json::to_vec(&participation).unwrap(),
+            },
+            &project,
+            &agreed,
+            &manifest,
+            &changed,
+            limits(),
+            &parent,
+        );
+        if deferred {
+            assert!(result.is_err());
+            assert_eq!(fs::read(project.join("main.rs")).unwrap(), b"before\n");
+            assert!(!state.join("apply-intents-v1").exists());
+            assert!(!state.join("management-effects-v1").exists());
+            assert_eq!(fs::read_dir(&recovery).unwrap().count(), 0);
+        } else {
+            let (report, shaped) = result.unwrap();
+            assert!(report.failure.is_none());
+            assert!(shaped.deferred.is_empty());
+            assert_eq!(fs::read(project.join("main.rs")).unwrap(), b"after\n");
+            assert!(owner.active().unwrap().is_none());
+            assert_eq!(
+                fs::read_dir(state.join("apply-intents-v1/archive"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
 fn limits() -> Limits {
     Limits {
         max_entries: 256,

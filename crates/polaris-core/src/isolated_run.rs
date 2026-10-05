@@ -1,8 +1,8 @@
-//! macOS prepare-only composition. Paths and executable identity are supplied by
+//! Prepare-only composition on Linux and macOS. Paths and executable identity are supplied by
 //! the trusted owner, never by model output. Load/register auth paths first.
 //! Retain this owner until process cleanup completes; this type does not enforce
 //! that lifecycle, launch a process, or apply changes back to the source.
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use crate::isolated_workspace::{self, Limits, RegisteredSecrets, Snapshot};
 use polaris_auth::protection::ProtectedPathsSnapshot;

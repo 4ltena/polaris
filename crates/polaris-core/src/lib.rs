@@ -25,7 +25,7 @@ pub mod desktop_events;
 pub mod desktop_execution;
 pub mod desktop_memory;
 pub mod desktop_response;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod desktop_run;
 pub mod desktop_store;
 pub mod desktop_workflow;
@@ -85,7 +85,7 @@ pub mod workflow;
 pub mod workflow_artifact_store;
 
 pub use events::{AgentEvent, Diff, DiffHunk, DiffLine, compute_diff};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod handoff;
 pub mod isolated_run;
 #[cfg(unix)]

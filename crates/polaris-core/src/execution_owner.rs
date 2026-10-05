@@ -1,5 +1,5 @@
 //! 共通のrun専用有界実行所有者。保存スレッドではcommandを実行しない。
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::isolated_run::PreparedWorkspace;
 use crate::{
     desktop_execution::*,
@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn prepared_policy_matches(workspace: &PreparedWorkspace, policy: &SandboxPolicy) -> bool {
     let Ok(narrowed) = workspace
         .policy()
@@ -145,7 +145,7 @@ impl Drop for Reservation {
     }
 }
 struct Slot {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     workspace: Option<Arc<PreparedWorkspace>>,
     _reservation: Reservation,
     target: RunTarget,
@@ -161,7 +161,7 @@ struct Slot {
 enum Cleanup {
     Native(PendingCleanup),
     // A panic may park an unattributed native handle in the shared registry.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     Registry,
     #[cfg(any(test, feature = "execution-test-support"))]
     Deferred(Arc<AtomicBool>),
@@ -169,7 +169,7 @@ enum Cleanup {
 impl Cleanup {
     fn confirmed(&mut self) -> bool {
         match self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             Self::Registry => false,
             Self::Native(pending) => matches!(pending.try_reap(), Ok(Some(_))),
             #[cfg(any(test, feature = "execution-test-support"))]
@@ -180,7 +180,7 @@ impl Cleanup {
 pub struct RunExecution {
     mcp: Option<mcp::McpRelay>,
     registration: Option<registration::RegistrationRelay>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     workspace: Option<Arc<PreparedWorkspace>>,
     pub port: ExecutionPort,
     incoming: mpsc::Receiver<ExecutionRequest>,
@@ -203,7 +203,7 @@ impl RunExecution {
         Self {
             mcp: None,
             registration: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             workspace: None,
             port,
             incoming,
@@ -223,7 +223,7 @@ impl RunExecution {
     }
     /// Trusted parent only: owns the sanitized copy and its read-helper grant.
     /// The parent retains its Arc for change collection/apply after execution.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[allow(dead_code)] // Production run_start is wired by the parent later.
     pub fn with_prepared_workspace(
         target: &RunTarget,
@@ -234,7 +234,7 @@ impl RunExecution {
     }
     /// Confirmed copy-write scope only; this grants no source apply authority.
     /// None retains the existing interactive mutation approval behavior.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn with_prepared_workspace_and_mutations(
         target: &RunTarget,
         disconnected: Arc<AtomicBool>,
@@ -250,7 +250,7 @@ impl RunExecution {
         )
     }
     /// Explicit confirmed folder execution ceiling; None preserves legacy behavior.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn with_prepared_workspace_and_capabilities(
         target: &RunTarget,
         disconnected: Arc<AtomicBool>,
@@ -333,7 +333,7 @@ impl RunExecution {
     }
 
     fn policy_matches(&self, policy: &SandboxPolicy) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(workspace) = &self.workspace {
             return prepared_policy_matches(workspace, policy);
         }
@@ -623,7 +623,7 @@ impl RunExecution {
         };
         let completion = Arc::new(Mutex::new(None));
         let owned = Arc::new(Mutex::new(Slot {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             workspace: self.workspace.clone(),
             _reservation: reservation,
             target: target.clone(),
@@ -663,7 +663,7 @@ impl RunExecution {
         }
         #[cfg(any(test, feature = "execution-test-support"))]
         let panic_worker = self.panic_worker;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let workspace = self.workspace.clone();
         let worker = std::thread::Builder::new()
             .name("desktop-execution".into())
@@ -681,7 +681,7 @@ impl RunExecution {
                                 || disconnected.load(Ordering::Acquire)
                         },
                         || {
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
                             if workspace.as_ref().is_some_and(|workspace| {
                                 !prepared_policy_matches(workspace, &request.command.policy)
                             }) {
@@ -710,7 +710,7 @@ impl RunExecution {
                     Some((result.clone(), pending));
                 // 通知先が消えていても、結果とcleanupはslot内に既にある。
                 let _ = request.reply.send(result);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 drop(workspace);
             });
         match worker {
@@ -888,7 +888,7 @@ impl Slot {
             {
                 self.result = Some(result);
                 self.pending = pending.map(Cleanup::Native);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if self.workspace.is_some()
                     && self.pending.is_none()
                     && self
@@ -899,7 +899,7 @@ impl Slot {
                     self.pending = Some(Cleanup::Registry);
                 }
             } else {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if self.workspace.is_some() {
                     self.pending = Some(Cleanup::Registry);
                 }
@@ -916,7 +916,7 @@ impl Slot {
         if self.pending.as_mut().is_some_and(Cleanup::confirmed) {
             self.pending = None;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.worker.is_none() && self.pending.is_none() && self.result.is_some() {
             self.workspace = None;
         }
@@ -962,7 +962,7 @@ impl Recovery {
         // Registration is serialized by RECOVERY, but service-side Slot::poll
         // can join concurrently with the first drain. Observe all joins BEFORE
         // the final drain: a worker may have parked a handle after the first one.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.pending.is_empty()
             && self.slots.iter().all(|owned| {
                 let slot = owned.lock().unwrap_or_else(|e| e.into_inner());

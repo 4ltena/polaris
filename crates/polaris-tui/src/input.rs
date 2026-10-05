@@ -3,6 +3,7 @@
 //! testable without a real terminal.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use zeroize::Zeroize;
 
 pub enum InputAction {
     Continue,
@@ -97,6 +98,16 @@ impl History {
         }
     }
 
+    /// Navigation temporarily displays old submissions; only this independent
+    /// buffer is an unsent draft eligible for conversation persistence.
+    pub(crate) fn pending_draft<'a>(&'a self, current: &'a str) -> &'a str {
+        if self.index.is_some() {
+            &self.draft
+        } else {
+            current
+        }
+    }
+
     /// Records a submitted line. Empty text and immediate repeats of the
     /// last entry are not recorded (matching typical shell history).
     /// Resets navigation back to the live draft.
@@ -105,7 +116,30 @@ impl History {
             self.entries.push(text.to_string());
         }
         self.index = None;
-        self.draft.clear();
+        self.draft.zeroize();
+    }
+
+    /// Erases a saved draft when the composer is reclassified as sensitive.
+    pub fn clear_draft(&mut self) {
+        self.draft.zeroize();
+        self.index = None;
+    }
+
+    pub(crate) fn has_hidden_draft(&self) -> bool {
+        self.index.is_some() && !self.draft.is_empty()
+    }
+
+    pub(crate) fn take_hidden_draft(&mut self) -> Option<String> {
+        if !self.has_hidden_draft() {
+            return None;
+        }
+        self.index = None;
+        Some(std::mem::take(&mut self.draft))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn draft_is_empty(&self) -> bool {
+        self.draft.is_empty()
     }
 
     /// Moves one entry older. `current` is the live buffer's current
@@ -118,6 +152,7 @@ impl History {
                 if self.entries.is_empty() {
                     return None;
                 }
+                self.draft.zeroize();
                 self.draft = current.to_string();
                 self.index = Some(self.entries.len() - 1);
             }
@@ -296,6 +331,17 @@ mod tests {
         history.record("first");
         assert_eq!(history.older("unsent draft"), Some("first"));
         assert_eq!(history.newer(), Some("unsent draft"));
+    }
+
+    #[test]
+    fn sensitive_draft_is_cleared_after_history_restore() {
+        let mut history = History::new();
+        history.record("first");
+        assert_eq!(history.older("VALUE"), Some("first"));
+        assert_eq!(history.newer(), Some("VALUE"));
+        history.clear_draft();
+        assert!(history.draft.is_empty());
+        assert_eq!(history.index, None);
     }
 
     #[test]

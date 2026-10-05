@@ -46,6 +46,7 @@ use polaris_provider::Provider;
 use polaris_provider::local::{Capability, Endpoint, LocalAdapter, ModelMetadata, Runtime};
 use polaris_sandbox::SandboxPolicy;
 use polaris_skills::Skill;
+use zeroize::Zeroize;
 
 use approver::{CrosstermKeyReader, TuiApprover};
 use input::{InputAction, apply_key};
@@ -1162,9 +1163,61 @@ fn update_effort_from_event(event: &polaris_core::AgentEvent, effort_name: &mut 
 enum InflightInputAction {
     Continue,
     Queued,
+    RejectedSecret,
     Interrupt,
 }
 
+fn is_secret_command(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("/mcp"))
+        && words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("secret"))
+}
+// A secret command can also be completed around text already in the composer
+// (for example by moving the cursor to the start). Check the complete buffer
+// before any draw, not only the next character typed after the command.
+fn secret_set_has_value(input: &str) -> Option<bool> {
+    let mut words = input.split_whitespace();
+    if words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("/mcp"))
+        && words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("secret"))
+        && words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("set"))
+    {
+        Some(words.next().is_some())
+    } else {
+        None
+    }
+}
+fn redact_inline_secret_value(
+    input: &mut String,
+    cursor: &mut usize,
+    history: &mut input::History,
+) -> bool {
+    if secret_set_has_value(input) != Some(true) {
+        return false;
+    }
+    input.zeroize();
+    history.clear_draft();
+    input.push_str("/mcp secret set");
+    *cursor = input.len();
+    true
+}
+fn secret_value_key_is_blocked(input: &str, key: &ratatui::crossterm::event::KeyEvent) -> bool {
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    secret_set_has_value(input) == Some(false)
+        && key.kind == KeyEventKind::Press
+        && matches!(key.code, KeyCode::Char(_))
+        && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
 fn apply_inflight_key(
     input_buffer: &mut String,
     input_cursor: &mut usize,
@@ -1172,10 +1225,23 @@ fn apply_inflight_key(
     queued_inputs: &mut VecDeque<String>,
     key: ratatui::crossterm::event::KeyEvent,
 ) -> InflightInputAction {
+    if secret_value_key_is_blocked(input_buffer, &key) {
+        return InflightInputAction::RejectedSecret;
+    }
     match apply_key(input_buffer, input_cursor, key) {
-        InputAction::Continue => InflightInputAction::Continue,
+        InputAction::Continue => {
+            if redact_inline_secret_value(input_buffer, input_cursor, input_history) {
+                InflightInputAction::RejectedSecret
+            } else {
+                InflightInputAction::Continue
+            }
+        }
         InputAction::Submit(text) if text.trim().is_empty() => InflightInputAction::Continue,
-        InputAction::Submit(text) => {
+        InputAction::Submit(mut text) => {
+            if is_secret_command(&text) {
+                text.zeroize();
+                return InflightInputAction::RejectedSecret;
+            }
             input_history.record(&text);
             queued_inputs.push_back(text);
             InflightInputAction::Queued
@@ -3093,6 +3159,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                 "queued input ({})",
                                                 queued_inputs.len()
                                             ));
+                                            mid_turn_notice_until = Some(
+                                                Instant::now() + MID_TURN_NOTICE_DURATION,
+                                            );
+                                        }
+                                        InflightInputAction::RejectedSecret => {
+                                            status = Status::Error(
+                                                "このTUIでは秘密情報の設定をまだ受け付けていません".into(),
+                                            );
                                             mid_turn_notice_until = Some(
                                                 Instant::now() + MID_TURN_NOTICE_DURATION,
                                             );
@@ -5224,6 +5298,113 @@ mod tests {
         assert_eq!(history.older(""), None);
     }
 
+    #[test]
+    fn secret_command_never_enters_inflight_history_or_queue() {
+        assert!(is_secret_command("  /MCP secret set VALUE"));
+        assert!(!is_secret_command("/mcp prompt select"));
+        assert!(secret_value_key_is_blocked(
+            "/MCP secret set",
+            &KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE)
+        ));
+        assert!(!secret_value_key_is_blocked(
+            "/mcp secret se",
+            &KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)
+        ));
+        assert!(!secret_value_key_is_blocked(
+            "/mcp secret set",
+            &KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+        ));
+        let mut buffer = String::new();
+        let mut cursor = 0;
+        let mut history = input::History::new();
+        let mut queued = VecDeque::new();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for character in "/mcp secret set VALUE".chars() {
+            apply_inflight_key(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                &mut queued,
+                key(KeyCode::Char(character)),
+            );
+        }
+        assert_eq!(buffer, "/mcp secret set");
+        assert_eq!(cursor, buffer.len());
+        assert_eq!(
+            apply_inflight_key(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                &mut queued,
+                key(KeyCode::Enter),
+            ),
+            InflightInputAction::RejectedSecret
+        );
+        assert!(queued.is_empty());
+        assert!(history.older("").is_none());
+
+        // Complete the command around an already typed value. The first
+        // whitespace between `set` and `VALUE` must erase the value before
+        // the next frame can use the composer buffer.
+        let mut buffer = "VALUE".to_string();
+        let mut cursor = buffer.len();
+        for _ in 0.."VALUE".chars().count() {
+            apply_inflight_key(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                &mut queued,
+                key(KeyCode::Left),
+            );
+        }
+        for character in "/MCP\u{2003}SECRET\u{2003}SET".chars() {
+            apply_inflight_key(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                &mut queued,
+                key(KeyCode::Char(character)),
+            );
+        }
+        assert_eq!(buffer, "/MCP\u{2003}SECRET\u{2003}SETVALUE");
+        assert_eq!(
+            apply_inflight_key(
+                &mut buffer,
+                &mut cursor,
+                &mut history,
+                &mut queued,
+                key(KeyCode::Char('\u{2003}')),
+            ),
+            InflightInputAction::RejectedSecret
+        );
+        assert_eq!(buffer, "/mcp secret set");
+        assert_eq!(cursor, buffer.len());
+        assert!(queued.is_empty());
+        assert!(history.older("").is_none());
+    }
+    #[test]
+    fn inline_secret_value_is_redacted_before_idle_draw() {
+        let mut buffer = "/mcp secret set TOKEN".to_string();
+        let mut cursor = buffer.len();
+        let mut history = input::History::new();
+        history.record("previous");
+        assert_eq!(history.older("TOKEN"), Some("previous"));
+        assert_eq!(history.newer(), Some("TOKEN"));
+        assert!(redact_inline_secret_value(
+            &mut buffer,
+            &mut cursor,
+            &mut history,
+        ));
+        assert_eq!(buffer, "/mcp secret set");
+        assert_eq!(cursor, buffer.len());
+        assert!(history.draft_is_empty());
+        assert!(!redact_inline_secret_value(
+            &mut buffer,
+            &mut cursor,
+            &mut history,
+        ));
+        assert_eq!(secret_set_has_value("/mcp secret setup TOKEN"), None);
+    }
     struct Summarizer;
 
     #[async_trait::async_trait]

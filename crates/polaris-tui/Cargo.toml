@@ -23,6 +23,7 @@ tokio = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

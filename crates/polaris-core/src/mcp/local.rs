@@ -15,6 +15,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(target_os = "linux")]
+const RUNTIME_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib"];
+#[cfg(not(target_os = "linux"))]
 const RUNTIME_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib", "/System/Library"];
 #[cfg(test)]
 mod tests;
@@ -88,12 +91,21 @@ impl LocalHost {
     /// servers. A run never creates the store; `create_store` is for explicit
     /// MCP commands.
     pub fn open(cwd: &Path, create_store: bool) -> Result<Self, Error> {
+        let home = &std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or(Error::Protection)?;
+        Self::open_with_home(cwd, home, create_store)
+    }
+
+    /// Isolates cross-crate MCP tests from the process-wide HOME variable.
+    #[cfg(feature = "mcp-test-support")]
+    pub fn open_for_test(cwd: &Path, home: &Path, create_store: bool) -> Result<Self, Error> {
+        Self::open_with_home(cwd, home, create_store)
+    }
+
+    fn open_with_home(cwd: &Path, home: &Path, create_store: bool) -> Result<Self, Error> {
         let canonical = |path: &Path| path.canonicalize().map_err(|_| Error::Protection);
-        let home = canonical(
-            &std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or(Error::Protection)?,
-        )?;
+        let home = canonical(home)?;
         let root = canonical(&crate::project::resolve_root(cwd))?;
         let storage = crate::project::storage_root_from_env().map_err(|_| Error::Protection)?;
         let storage = storage.canonicalize().unwrap_or(storage);

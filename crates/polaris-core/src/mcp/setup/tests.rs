@@ -1,5 +1,7 @@
 //! Host detection from Codex and Claude configs, with secrets bound by HMAC.
 use super::*;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 
 fn home() -> (tempfile::TempDir, PathBuf) {
@@ -32,6 +34,305 @@ fn saved(store: Option<&polaris_mcp::store::Store>) -> polaris_mcp::store::Snaps
 
 fn by_name<'a>(found: &'a [Detected], name: &str) -> &'a Detected {
     found.iter().find(|d| d.name == name).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixtureReadRoot {
+    Pass,
+    Protection,
+    Limit,
+    Other,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixtureDecision {
+    Accept,
+    RetryInstall,
+    RetryCwd,
+    Fatal,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct FixtureInputs {
+    structure_ok: bool,
+    snapshot_ok: bool,
+    path_overlap: bool,
+    install_collisions: [bool; 3],
+    read_root: FixtureReadRoot,
+    cwd_collision: bool,
+    cwd_invalid_path: bool,
+    registry_absent: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn classify_fixture(input: FixtureInputs, cwd_refused: bool) -> FixtureDecision {
+    if !input.structure_ok || !input.snapshot_ok || input.path_overlap {
+        return FixtureDecision::Fatal;
+    }
+    let collision = input.install_collisions.contains(&true);
+    match (input.read_root, collision) {
+        (FixtureReadRoot::Protection, true) => return FixtureDecision::RetryInstall,
+        (FixtureReadRoot::Pass, false) => {}
+        _ => return FixtureDecision::Fatal,
+    }
+    if cwd_refused {
+        if input.cwd_collision && input.cwd_invalid_path && input.registry_absent {
+            FixtureDecision::RetryCwd
+        } else {
+            FixtureDecision::Fatal
+        }
+    } else {
+        FixtureDecision::Accept
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fixture_decision_table() {
+    use FixtureDecision::*;
+    let safe = FixtureInputs {
+        structure_ok: true,
+        snapshot_ok: true,
+        path_overlap: false,
+        install_collisions: [false; 3],
+        read_root: FixtureReadRoot::Pass,
+        cwd_collision: false,
+        cwd_invalid_path: false,
+        registry_absent: true,
+    };
+    assert_eq!(classify_fixture(safe, false), Accept);
+    for index in 0..3 {
+        let mut input = FixtureInputs {
+            read_root: FixtureReadRoot::Protection,
+            ..safe
+        };
+        input.install_collisions[index] = true;
+        assert_eq!(classify_fixture(input, false), RetryInstall);
+    }
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                read_root: FixtureReadRoot::Protection,
+                ..safe
+            },
+            false
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                snapshot_ok: false,
+                ..safe
+            },
+            false
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                path_overlap: true,
+                ..safe
+            },
+            false
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                structure_ok: false,
+                ..safe
+            },
+            false
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                read_root: FixtureReadRoot::Limit,
+                ..safe
+            },
+            false
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                read_root: FixtureReadRoot::Other,
+                ..safe
+            },
+            false
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                install_collisions: [true, false, false],
+                ..safe
+            },
+            false
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                cwd_collision: true,
+                cwd_invalid_path: true,
+                ..safe
+            },
+            true
+        ),
+        RetryCwd
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                cwd_collision: false,
+                cwd_invalid_path: true,
+                ..safe
+            },
+            true
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                cwd_collision: true,
+                cwd_invalid_path: false,
+                ..safe
+            },
+            true
+        ),
+        Fatal
+    );
+    assert_eq!(
+        classify_fixture(
+            FixtureInputs {
+                cwd_collision: true,
+                cwd_invalid_path: true,
+                registry_absent: false,
+                ..safe
+            },
+            true
+        ),
+        Fatal
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn fixture_read_root(result: Result<(), polaris_mcp::Error>) -> FixtureReadRoot {
+    match result {
+        Ok(()) => FixtureReadRoot::Pass,
+        Err(polaris_mcp::Error::Protection) => FixtureReadRoot::Protection,
+        Err(polaris_mcp::Error::Limit) => FixtureReadRoot::Limit,
+        Err(_) => FixtureReadRoot::Other,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_preflight(
+    home: &Path,
+    generation: usize,
+    role: &str,
+    discarded_install: usize,
+    discarded_cwd: usize,
+) -> FixtureDecision {
+    let install = home.join("tools/example");
+    let bin = install.join("bin");
+    let script = bin.join("server");
+    let nodes = [&install, &bin, &script];
+    let metadata = nodes.map(|path| fs::symlink_metadata(path).ok());
+    let euid = unsafe { libc::geteuid() };
+    let directory_ok = |index: usize| {
+        metadata[index].as_ref().is_some_and(|m| {
+            m.is_dir()
+                && !m.file_type().is_symlink()
+                && m.uid() == euid
+                && m.mode() & 0o022 == 0
+                && m.nlink() >= 1
+        })
+    };
+    let entries_are = |path: &Path, expected: &Path| {
+        fs::read_dir(path)
+            .ok()
+            .and_then(|iter| {
+                iter.map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .ok()
+            })
+            .is_some_and(|entries| entries == [expected])
+    };
+    let diagnostic = home.join(".polaris/mcp/servers/__fixture_preflight__");
+    let structure_ok = directory_ok(0)
+        && directory_ok(1)
+        && metadata[2].as_ref().is_some_and(|m| {
+            m.is_file()
+                && !m.file_type().is_symlink()
+                && m.uid() == euid
+                && m.mode() & 0o7777 == 0o755
+                && m.nlink() == 1
+        })
+        && entries_are(&install, &bin)
+        && entries_are(&bin, &script)
+        && nodes.iter().all(|path| {
+            path.canonicalize().ok().as_deref() == Some(path.as_path())
+                && !polaris_tools::path_policy::is_denied(path)
+        })
+        && diagnostic.starts_with(home)
+        && !diagnostic.exists()
+        && !install.starts_with(&diagnostic)
+        && !diagnostic.starts_with(&install);
+    let snapshot = polaris_auth::protection::with_protected_paths(|registered| {
+        let overlap = registered
+            .paths()
+            .iter()
+            .any(|path| path.starts_with(&install));
+        let matches = metadata.each_ref().map(|m| {
+            m.as_ref().is_some_and(|m| {
+                registered
+                    .identities()
+                    .contains(&polaris_auth::protection::ProtectedIdentity {
+                        dev: m.dev(),
+                        ino: m.ino(),
+                    })
+            })
+        });
+        (overlap, matches)
+    });
+    let snapshot_ok = snapshot.is_ok();
+    let (path_overlap, install_collisions) = snapshot.unwrap_or((false, [false; 3]));
+    let read_root = fixture_read_root(crate::mcp::runtime::resources::admit_read_root(
+        &install,
+        home,
+        &diagnostic,
+        &[],
+    ));
+    let decision = classify_fixture(
+        FixtureInputs {
+            structure_ok,
+            snapshot_ok,
+            path_overlap,
+            install_collisions,
+            read_root,
+            cwd_collision: false,
+            cwd_invalid_path: false,
+            registry_absent: true,
+        },
+        false,
+    );
+    eprintln!(
+        "mcp setup fixture role={role} generation={generation} install_collisions={install_collisions:?} read_root={read_root:?} cwd_class=NotChecked decision={decision:?} discarded_install={discarded_install} discarded_cwd={discarded_cwd}"
+    );
+    decision
 }
 
 #[test]
@@ -100,20 +401,21 @@ auth = "oauth"
 
 #[test]
 fn stdio_launchers_credentials_and_env_shebangs_are_classified() {
-    let (_temp, home) = home();
-    let tool = home.join("tools/example/bin/server");
-    write(&tool, "#!/usr/bin/env sh\nexit 0\n");
-    let split = home.join("tools/split/server");
-    write(&split, "#!/usr/bin/env -S sh -e\nexit 0\n");
-    let long = home.join("tools/long/server");
-    write(&long, &format!("#!/bin/sh {}\n", "a".repeat(600)));
-    for path in [&tool, &split, &long] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    write(
-        &home.join(".codex/config.toml"),
-        &format!(
-            r#"
+    let make_fixture = || {
+        let (temp, home) = home();
+        let tool = home.join("tools/example/bin/server");
+        write(&tool, "#!/usr/bin/env sh\nexit 0\n");
+        let split = home.join("tools/split/server");
+        write(&split, "#!/usr/bin/env -S sh -e\nexit 0\n");
+        let long = home.join("tools/long/server");
+        write(&long, &format!("#!/bin/sh {}\n", "a".repeat(600)));
+        for path in [&tool, &split, &long] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        write(
+            &home.join(".codex/config.toml"),
+            &format!(
+                r#"
 [mcp_servers.script]
 command = "{}"
 args = ["--verbose"]
@@ -141,14 +443,69 @@ command = "{}"
 [mcp_servers.long]
 command = "{}"
 "#,
-            tool.display(),
-            tool.display(),
-            tool.display(),
-            split.display(),
-            long.display()
-        ),
-    );
-    let found = detector(&home).detect("project", &saved(None));
+                tool.display(),
+                tool.display(),
+                tool.display(),
+                split.display(),
+                long.display()
+            ),
+        );
+        (temp, home, tool)
+    };
+    #[cfg(target_os = "linux")]
+    let (_retained, _temp, home, tool, found) = {
+        fixture_decision_table();
+        let mut retained = Vec::new();
+        let mut accepted = None;
+        for generation in 1..=32 {
+            let (temp, home, tool) = make_fixture();
+            let detector = detector(&home);
+            match install_preflight(&home, generation, "classification", retained.len(), 0) {
+                FixtureDecision::Accept => {
+                    let found = detector.detect("project", &saved(None));
+                    let script = by_name(&found, "script").proposal.as_ref().unwrap();
+                    let Destination::Stdio {
+                        readable_roots,
+                        cwd,
+                        ..
+                    } = &script.server.transport
+                    else {
+                        panic!("stdio");
+                    };
+                    assert_eq!(readable_roots, &[home.join("tools/example")]);
+                    assert!(cwd.starts_with(home.join(".polaris/mcp/servers")));
+                    assert_eq!(
+                        fixture_read_root(crate::mcp::runtime::resources::admit_read_root(
+                            &home.join("tools/example"),
+                            &home,
+                            cwd,
+                            &[],
+                        )),
+                        FixtureReadRoot::Pass
+                    );
+                    eprintln!(
+                        "mcp setup fixture role=classification generation={generation} cwd_class=Pass accepted=1 discarded_install={} discarded_cwd=0",
+                        retained.len()
+                    );
+                    accepted = Some((temp, home, tool, found));
+                    break;
+                }
+                FixtureDecision::RetryInstall if generation < 32 => retained.push(temp),
+                decision => {
+                    panic!("classification fixture generation={generation} decision={decision:?}")
+                }
+            }
+        }
+        let (temp, home, tool, found) =
+            accepted.expect("classification fixture exhausted 32 generations");
+        (retained, temp, home, tool, found)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (_temp, home, tool, found) = {
+        let (temp, home, tool) = make_fixture();
+        let found = detector(&home).detect("project", &saved(None));
+        (temp, home, tool, found)
+    };
     let script = by_name(&found, "script");
     assert_eq!(script.reason, None);
     let proposal = script.proposal.as_ref().unwrap();
@@ -396,24 +753,176 @@ fn approval_text_escapes_source_names_and_names_every_saved_field() {
 
 #[test]
 fn stdio_proposals_get_a_private_cwd_and_pass_startup_admission_before_saving() {
-    let (_temp, home) = home();
-    let tool = home.join("tools/example/bin/server");
-    write(&tool, "#!/bin/sh\nexit 0\n");
-    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-    write(
-        &home.join(".claude.json"),
-        &format!(
-            r#"{{"mcpServers":{{"local":{{"command":"{}"}}}}}}"#,
-            tool.display()
-        ),
-    );
-    let detector = detector(&home);
-    let proposal = detector.detect("project", &saved(None))[0]
-        .proposal
-        .clone()
-        .unwrap();
-    let store = polaris_mcp::store::Store::open(&home).unwrap();
+    let make_fixture = || {
+        let (temp, home) = home();
+        let tool = home.join("tools/example/bin/server");
+        write(&tool, "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        write(
+            &home.join(".claude.json"),
+            &format!(
+                r#"{{"mcpServers":{{"local":{{"command":"{}"}}}}}}"#,
+                tool.display()
+            ),
+        );
+        (temp, home)
+    };
+    #[cfg(target_os = "linux")]
+    let runtime_roots = ["/bin", "/usr/bin", "/usr/lib"].map(PathBuf::from);
+    #[cfg(not(target_os = "linux"))]
     let runtime_roots = ["/bin", "/usr/bin", "/usr/lib", "/System/Library"].map(PathBuf::from);
+    #[cfg(target_os = "linux")]
+    let (_retained, _temp, home, detector, proposal, store) = {
+        fixture_decision_table();
+        let mut retained = Vec::new();
+        let mut discarded_install = 0;
+        let mut discarded_cwd = 0;
+        let mut accepted = None;
+        for generation in 1..=32 {
+            let (temp, home) = make_fixture();
+            let detector = detector(&home);
+            match install_preflight(
+                &home,
+                generation,
+                "registration",
+                discarded_install,
+                discarded_cwd,
+            ) {
+                FixtureDecision::RetryInstall if generation < 32 => {
+                    discarded_install += 1;
+                    retained.push(temp);
+                    continue;
+                }
+                FixtureDecision::Accept => {}
+                decision => panic!(
+                    "registration fixture generation={generation} install decision={decision:?}"
+                ),
+            }
+            let proposal = detector.detect("project", &saved(None))[0]
+                .proposal
+                .clone()
+                .unwrap();
+            let Destination::Stdio {
+                readable_roots,
+                cwd,
+                ..
+            } = &proposal.server.transport
+            else {
+                panic!("stdio");
+            };
+            assert_eq!(readable_roots, &[home.join("tools/example")]);
+            assert!(cwd.starts_with(home.join(".polaris/mcp/servers")));
+            assert_eq!(
+                fixture_read_root(crate::mcp::runtime::resources::admit_read_root(
+                    &home.join("tools/example"),
+                    &home,
+                    cwd,
+                    &[],
+                )),
+                FixtureReadRoot::Pass
+            );
+            let store = polaris_mcp::store::Store::open(&home).unwrap();
+            let admission = Admission {
+                store: &store,
+                home: &home,
+                runtime_roots: &runtime_roots,
+                excluded_roots: &[],
+                limits: limits(),
+            };
+            let description = proposal.description("local");
+            assert!(description.contains("読取りを許可する場所"));
+            assert!(description.contains("ネットワーク: 使いません"));
+            match detector.register(&proposal, &admission) {
+                Ok(1) => {
+                    let cwd_meta = fs::symlink_metadata(cwd).unwrap();
+                    let euid = unsafe { libc::geteuid() };
+                    assert!(cwd_meta.is_dir() && !cwd_meta.file_type().is_symlink());
+                    assert_eq!(cwd_meta.uid(), euid);
+                    assert_eq!(cwd_meta.mode() & 0o7777, 0o700);
+                    assert_eq!(cwd.canonicalize().unwrap(), *cwd);
+                    eprintln!(
+                        "mcp setup fixture role=registration generation={generation} cwd_class=Pass accepted=1 discarded_install={discarded_install} discarded_cwd={discarded_cwd}"
+                    );
+                    accepted = Some((temp, home, detector, proposal, store));
+                    break;
+                }
+                Err(polaris_mcp::Error::Protection) => {
+                    let cwd = store.server_directory(&proposal.server.server_id).unwrap();
+                    let metadata = fs::symlink_metadata(&cwd).unwrap();
+                    let euid = unsafe { libc::geteuid() };
+                    let cwd_ok = metadata.is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.uid() == euid
+                        && metadata.mode() & 0o7777 == 0o700;
+                    let snapshot = polaris_auth::protection::with_protected_paths(|registered| {
+                        let overlap = registered
+                            .paths()
+                            .iter()
+                            .any(|path| path.starts_with(&cwd) || cwd.starts_with(path));
+                        let collision = registered.identities().contains(
+                            &polaris_auth::protection::ProtectedIdentity {
+                                dev: metadata.dev(),
+                                ino: metadata.ino(),
+                            },
+                        );
+                        (overlap, collision)
+                    });
+                    let snapshot_ok = snapshot.is_ok();
+                    let (overlap, collision) = snapshot.unwrap_or((true, false));
+                    let invalid_path = matches!(
+                        crate::isolated_workspace::RegisteredDirectory::open(&cwd, limits()),
+                        Err(error) if error.kind == crate::isolated_workspace::ErrorKind::InvalidPath
+                    );
+                    let registry_absent = store.load_registry().unwrap().is_none();
+                    let read_root =
+                        fixture_read_root(crate::mcp::runtime::resources::admit_read_root(
+                            &home.join("tools/example"),
+                            &home,
+                            &cwd,
+                            &[],
+                        ));
+                    let decision = classify_fixture(
+                        FixtureInputs {
+                            structure_ok: cwd_ok,
+                            snapshot_ok,
+                            path_overlap: overlap,
+                            install_collisions: [false; 3],
+                            read_root,
+                            cwd_collision: collision,
+                            cwd_invalid_path: invalid_path,
+                            registry_absent,
+                        },
+                        true,
+                    );
+                    eprintln!(
+                        "mcp setup fixture role=registration generation={generation} cwd_class=Protection cwd_collision={collision} read_root={read_root:?} decision={decision:?} accepted=0 discarded_install={discarded_install} discarded_cwd={discarded_cwd}"
+                    );
+                    if decision != FixtureDecision::RetryCwd || generation == 32 {
+                        panic!(
+                            "registration fixture generation={generation} cwd decision={decision:?}"
+                        );
+                    }
+                    discarded_cwd += 1;
+                    retained.push(temp);
+                }
+                result => panic!("registration fixture generation={generation} result={result:?}"),
+            }
+        }
+        let (temp, home, detector, proposal, store) =
+            accepted.expect("registration fixture exhausted 32 generations");
+        (retained, temp, home, detector, proposal, store)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (_temp, home, detector, proposal, store) = {
+        let (temp, home) = make_fixture();
+        let detector = detector(&home);
+        let proposal = detector.detect("project", &saved(None))[0]
+            .proposal
+            .clone()
+            .unwrap();
+        let store = polaris_mcp::store::Store::open(&home).unwrap();
+        (temp, home, detector, proposal, store)
+    };
     let admission = Admission {
         store: &store,
         home: &home,
@@ -424,6 +933,7 @@ fn stdio_proposals_get_a_private_cwd_and_pass_startup_admission_before_saving() 
     let description = proposal.description("local");
     assert!(description.contains("読取りを許可する場所"));
     assert!(description.contains("ネットワーク: 使いません"));
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(detector.register(&proposal, &admission).unwrap(), 1);
     let Destination::Stdio { cwd, .. } = &proposal.server.transport else {
         panic!("stdio");
@@ -649,7 +1159,7 @@ fn a_launcher_with_a_pin_registers_as_the_file_that_was_pinned() {
         } => {
             // The interpreter runs, and what it runs is the pinned file —
             // followed by the arguments the server itself asked for.
-            assert_eq!(command, Path::new("/bin/sh"));
+            assert_eq!(*command, Path::new("/bin/sh").canonicalize().unwrap());
             assert_eq!(
                 args,
                 &[

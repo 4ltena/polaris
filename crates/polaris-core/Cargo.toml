@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 # Fault injection is opt-in for cross-crate regression tests only.
 execution-test-support = []
+mcp-test-support = []
 
 [dependencies]
 polaris-auth = { path = "../polaris-auth" }

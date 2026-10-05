@@ -78,9 +78,75 @@ pub fn delete_at(path: &Path) -> Result<bool, AuthError> {
     }
 }
 
+/// Metadata-only identity for confirmation of the default credential store.
+/// Credential bytes are never copied into a preview or receipt.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CredentialIdentity {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+fn identity(file: &std::fs::File) -> Result<CredentialIdentity, AuthError> {
+    use std::os::unix::fs::MetadataExt;
+    let data = file.metadata()?;
+    Ok(CredentialIdentity {
+        device: data.dev(),
+        inode: data.ino(),
+        bytes: data.len(),
+        changed_seconds: data.ctime(),
+        changed_nanoseconds: data.ctime_nsec(),
+    })
+}
+
+pub fn credential_identity(path: &Path) -> Result<Option<CredentialIdentity>, AuthError> {
+    let mut protection = crate::protection::lock()?;
+    let path = protection.register_store(path)?;
+    match crate::protection::open_regular(&path, false) {
+        Ok(file) => {
+            protection.remember(&file.metadata()?)?;
+            identity(&file).map(Some)
+        }
+        Err(AuthError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Reject a refresh/replacement since confirmation. Cooperating writers use
+/// this same lock. A successful removal is durable before returning.
+pub fn delete_exact(path: &Path, expected: &CredentialIdentity) -> Result<(), AuthError> {
+    let mut protection = crate::protection::lock()?;
+    let path = protection.register_store(path)?;
+    let file = crate::protection::open_regular(&path, false)?;
+    protection.remember(&file.metadata()?)?;
+    if &identity(&file)? != expected {
+        return Err(AuthError::Denied("stale_credential_store".into()));
+    }
+    std::fs::remove_file(&path)?;
+    std::fs::File::open(path.parent().ok_or(AuthError::Protection)?)?.sync_all()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m3a_exact_logout_preserves_replaced_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        save_to(&path, &sample()).unwrap();
+        let expected = credential_identity(&path).unwrap().unwrap();
+        let replacement = sample();
+        save_to(&path, &replacement).unwrap();
+        assert!(delete_exact(&path, &expected).is_err());
+        assert_eq!(load_from(&path).unwrap().unwrap(), replacement);
+        let current = credential_identity(&path).unwrap().unwrap();
+        delete_exact(&path, &current).unwrap();
+        assert!(credential_identity(&path).unwrap().is_none());
+    }
 
     fn sample() -> Credentials {
         Credentials {

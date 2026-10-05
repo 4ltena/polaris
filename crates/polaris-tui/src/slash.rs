@@ -32,6 +32,14 @@ pub struct SlashCommand {
 
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "setting",
+        description: "inspect Next.js plan or confirm Git ignore recipe",
+    },
+    SlashCommand {
+        name: "handoff",
+        description: "render a bounded handoff from actual project evidence",
+    },
+    SlashCommand {
         name: "session",
         description: "inspect or configure the saved conversation",
     },
@@ -58,6 +66,22 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "remember",
         description: "configure saved conversation memory",
+    },
+    SlashCommand {
+        name: "browse",
+        description: "inspect project files locally",
+    },
+    SlashCommand {
+        name: "attachment",
+        description: "preview bounded text without sending it",
+    },
+    SlashCommand {
+        name: "recipe",
+        description: "inspect built-in recipe definitions",
+    },
+    SlashCommand {
+        name: "models",
+        description: "inspect available models",
     },
     SlashCommand {
         name: "subagents",
@@ -378,6 +402,11 @@ pub fn parse(line: &str) -> Option<Action> {
         }
         "input" | "instruction" | "subagents" | "roles" | "run" | "sandbox" => {
             Action::RuntimeControl(format!("{name} {extra}").trim_end().to_owned())
+        }
+        #[cfg(not(target_os = "linux"))]
+        "models" if extra.is_empty() || extra == "list" => Action::Model,
+        "browse" | "attachment" | "recipe" | "models" | "setting" | "handoff" => {
+            Action::WorkspaceControl(format!("{name} {extra}").trim_end().to_owned())
         }
         "decided" => Action::Decided(extra),
         "compare" => Action::Compare(extra),

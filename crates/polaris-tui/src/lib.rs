@@ -29,6 +29,8 @@ mod runtime_commands;
 mod runtime_effects;
 #[cfg(unix)]
 mod session_commands;
+#[cfg(target_os = "linux")]
+mod workspace_commands;
 pub use memory::{configure_archive, configure_memory, lock_memory};
 pub mod render;
 mod rewind_ui;
@@ -3416,6 +3418,26 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     let mut next_max_turns = args.max_turns;
     #[cfg(unix)]
     let mut last_submission_was_local = false;
+    #[cfg(target_os = "linux")]
+    let workspace_commands = {
+        use std::os::unix::fs::MetadataExt;
+        let root = rewind_workspace
+            .as_ref()
+            .expect("startup owner")
+            .project_root()
+            .to_owned();
+        std::fs::symlink_metadata(&root)
+            .map_err(|e| e.to_string())
+            .and_then(|meta| {
+                workspace_commands::WorkspaceCommands::new(
+                    root,
+                    polaris_desktop_service::WorkspaceSourceIdentity {
+                        device: meta.dev(),
+                        inode: meta.ino(),
+                    },
+                )
+            })
+    };
     let mut tool_memory_path: Option<PathBuf> = None;
     let exit_code = 'outer: loop {
         #[cfg(target_os = "linux")]
@@ -4068,6 +4090,65 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         mcp_prompt_requires_reselect = false;
                                     }
                                     status = Status::Notice("MCP操作の結果を表示しました".into());
+                                }
+                                Err(error) => status = Status::Error(error),
+                            }
+                            continue;
+                        }
+                        #[cfg(target_os = "linux")]
+                        slash::Action::WorkspaceControl(request) => {
+                            let (verb, extra) = request.split_once(' ').unwrap_or((&request, ""));
+                            let result = if verb == "models" {
+                                model_inventory_read_lines(extra).await
+                            } else {
+                                match workspace_commands.as_ref() {
+                                    Ok(owner) => match verb {
+                                        "browse" => owner.browse(extra),
+                                        "attachment" => owner.attachment(extra),
+                                        "recipe" => workspace_commands::recipes(extra),
+                                        "setting" => owner.setting(
+                                            extra,
+                                            &terminal,
+                                            &mut key_reader,
+                                            rewind_workspace.as_ref().expect("startup owner"),
+                                            &management_effects,
+                                            has_pending_inputs,
+                                        ),
+                                        "handoff" => owner.handoff(extra),
+                                        _ => Err("対象の操作はありません".into()),
+                                    },
+                                    Err(error) => Err(error.clone()),
+                                }
+                            };
+                            match result {
+                                Ok(lines) => {
+                                    local_lines.extend(lines);
+                                    status = Status::Notice("読み取り結果を表示しました".into());
+                                }
+                                Err(error) => status = Status::Error(error),
+                            }
+                            continue;
+                        }
+                        #[cfg(target_os = "linux")]
+                        slash::Action::Decided(request) if request.starts_with("add ") => {
+                            let result = workspace_commands
+                                .as_ref()
+                                .map_err(Clone::clone)
+                                .and_then(|owner| {
+                                    owner.decided(
+                                        request.trim_start_matches("add "),
+                                        &format!("{}", now_millis()),
+                                        &terminal,
+                                        &mut key_reader,
+                                        rewind_workspace.as_ref().expect("startup owner"),
+                                        &management_effects,
+                                        has_pending_inputs,
+                                    )
+                                });
+                            match result {
+                                Ok(lines) => {
+                                    local_lines.extend(lines);
+                                    status = Status::Notice("決定記録の結果を表示しました".into());
                                 }
                                 Err(error) => status = Status::Error(error),
                             }
@@ -4842,6 +4923,66 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 mcp_prompt_requires_reselect = false;
                             }
                             status = Status::Notice("MCP操作の結果を表示しました".into());
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
+                #[cfg(target_os = "linux")]
+                Some(slash::Action::WorkspaceControl(request)) => {
+                    let (verb, extra) = request.split_once(' ').unwrap_or((&request, ""));
+                    let result = if verb == "models" {
+                        model_inventory_read_lines(extra).await
+                    } else {
+                        match workspace_commands.as_ref() {
+                            Ok(owner) => match verb {
+                                "browse" => owner.browse(extra),
+                                "attachment" => owner.attachment(extra),
+                                "recipe" => workspace_commands::recipes(extra),
+                                "setting" => owner.setting(
+                                    extra,
+                                    &terminal,
+                                    &mut key_reader,
+                                    rewind_workspace.as_ref().expect("startup owner"),
+                                    &management_effects,
+                                    has_pending_inputs,
+                                ),
+                                "handoff" => owner.handoff(extra),
+                                _ => Err("対象の操作はありません".into()),
+                            },
+                            Err(error) => Err(error.clone()),
+                        }
+                    };
+                    match result {
+                        Ok(lines) => {
+                            local_lines.extend(lines);
+                            status = Status::Notice("読み取り結果を表示しました".into());
+                        }
+                        Err(error) => status = Status::Error(error),
+                    }
+                    continue;
+                }
+                #[cfg(target_os = "linux")]
+                Some(slash::Action::Decided(request)) if request.starts_with("add ") => {
+                    let result =
+                        workspace_commands
+                            .as_ref()
+                            .map_err(Clone::clone)
+                            .and_then(|owner| {
+                                owner.decided(
+                                    request.trim_start_matches("add "),
+                                    &format!("{}", now_millis()),
+                                    &terminal,
+                                    &mut key_reader,
+                                    rewind_workspace.as_ref().expect("startup owner"),
+                                    &management_effects,
+                                    has_pending_inputs,
+                                )
+                            });
+                    match result {
+                        Ok(lines) => {
+                            local_lines.extend(lines);
+                            status = Status::Notice("決定記録の結果を表示しました".into());
                         }
                         Err(error) => status = Status::Error(error),
                     }
@@ -8973,6 +9114,47 @@ async fn discover_connected_local_models() -> Vec<ConnectedLocalModel> {
     ollama.into_iter().chain(lmstudio).collect()
 }
 
+#[cfg(target_os = "linux")]
+async fn model_inventory_read_lines(
+    request: &str,
+) -> Result<Vec<ratatui::text::Line<'static>>, String> {
+    if !request.is_empty() && request != "list" {
+        return Err("/models [list]。インストール・削除は提供していません".into());
+    }
+    let mut lines = vec![ratatui::text::Line::from(
+        "モデル一覧: 利用可能性は接続先の報告、インストール状態は未確認です。",
+    )];
+    let Ok(models) =
+        tokio::time::timeout(Duration::from_secs(3), discover_connected_local_models()).await
+    else {
+        lines.push(ratatui::text::Line::from(
+            "一覧取得の期限を超えました。利用可能性は未確認です。",
+        ));
+        return Ok(lines);
+    };
+    if models.is_empty() {
+        lines.push(ratatui::text::Line::from(
+            "観測できた生成対応モデルはありません。未接続・取得失敗・生成非対応は区別できません。",
+        ));
+    }
+    for model in models.iter().take(64) {
+        lines.push(ratatui::text::Line::from(
+            render::sanitize(&format!(
+                "{} / available=接続先の報告 / installed=未確認",
+                model.display_name()
+            ))
+            .escape_debug()
+            .to_string(),
+        ));
+    }
+    if models.len() > 64 {
+        lines.push(ratatui::text::Line::from(format!(
+            "残り{}件は表示上限のため省略しました",
+            models.len() - 64
+        )));
+    }
+    Ok(lines)
+}
 
 /// Runs the `/model` picker — four hosted choices plus one local-runtime
 /// entry. Reasoning effort is intentionally absent because routing owns it.
@@ -10843,6 +11025,25 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn readonly_acceptance_models_distinguishes_observation_and_installation() {
+        let Some(slash::Action::WorkspaceControl(request)) = slash::parse("/models list") else {
+            panic!("model inventory must reach the read-only command route");
+        };
+        let (verb, arguments) = request.split_once(' ').unwrap();
+        assert_eq!(verb, "models");
+        let lines = model_inventory_read_lines(arguments).await.unwrap();
+        assert!(lines[0].to_string().contains("接続先の報告"));
+        assert!(lines[0].to_string().contains("インストール状態は未確認"));
+        assert!(lines.len() <= 66);
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.to_string().contains(['\n', '\t', '\x1b']))
+        );
+        assert!(model_inventory_read_lines("install").await.is_err());
+    }
 
     #[test]
     fn mcp_prompt_selection_is_typed_and_rejects_ambiguous_arguments() {

@@ -88,6 +88,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "inspect or wait for an exact child attempt",
     },
     SlashCommand {
+        name: "roles",
+        description: "inspect role and tier bindings",
+    },
+    SlashCommand {
         name: "run",
         description: "inspect a run or change its next turn limit",
     },

@@ -24,6 +24,8 @@ pub mod persist;
 #[cfg(target_os = "linux")]
 mod resume_effect;
 #[cfg(unix)]
+mod role_commands;
+#[cfg(unix)]
 mod runtime_commands;
 #[cfg(unix)]
 mod runtime_effects;
@@ -4183,6 +4185,30 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 continue;
                             }
 
+                            if request == "roles" || request.starts_with("roles ") {
+                                match role_commands::handle(
+                                    &request,
+                                    &terminal,
+                                    &mut key_reader,
+                                    &session,
+                                    &initial_saved_settings,
+                                    rewind_workspace.as_ref().expect("startup owner"),
+                                    &management_effects,
+                                    args.provider.as_ref(),
+                                    &effective_agent_types,
+                                    has_pending_inputs,
+                                ) {
+                                    Ok(lines) => {
+                                        local_lines.extend(lines);
+                                        refresh_saved_settings = true;
+                                        status = Status::Notice(
+                                            "role bindingの結果を表示しました".into(),
+                                        );
+                                    }
+                                    Err(error) => status = Status::Error(error),
+                                }
+                                continue;
+                            }
                             let result = handle_runtime_command(
                                 &request,
                                 session.delegation_control.as_ref(),
@@ -5015,6 +5041,28 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         continue;
                     }
 
+                    if request == "roles" || request.starts_with("roles ") {
+                        match role_commands::handle(
+                            &request,
+                            &terminal,
+                            &mut key_reader,
+                            &session,
+                            &initial_saved_settings,
+                            rewind_workspace.as_ref().expect("startup owner"),
+                            &management_effects,
+                            args.provider.as_ref(),
+                            &effective_agent_types,
+                            has_pending_inputs,
+                        ) {
+                            Ok(lines) => {
+                                local_lines.extend(lines);
+                                refresh_saved_settings = true;
+                                status = Status::Notice("role bindingの結果を表示しました".into());
+                            }
+                            Err(error) => status = Status::Error(error),
+                        }
+                        continue;
+                    }
                     let result = handle_runtime_command(
                         &request,
                         session.delegation_control.as_ref(),
@@ -6215,6 +6263,20 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         }
         #[cfg(unix)]
         let runtime_persistence = session.persistence.clone();
+        #[cfg(unix)]
+        let child_provider = match role_commands::activation(
+            args.provider.clone(),
+            &effective_saved_settings,
+            &effective_agent_types,
+        ) {
+            Ok(provider) => provider,
+            Err(error) => {
+                fatal_message = Some(format!("role bindingを実行へ接続できません: {error}"));
+                break 'outer ExitCode::FAILURE;
+            }
+        };
+        #[cfg(not(unix))]
+        let child_provider = args.provider.clone();
         let outcome = {
             let mut stop = StopTracker::new(next_max_turns);
             let mut gate = Gate::new(approval_policy);
@@ -6284,7 +6346,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 args.always_on,
                 &effective_skills,
                 &effective_agent_types,
-                args.provider.clone(),
+                child_provider,
                 args.spawn_concurrency,
                 args.spawn_write_concurrency,
                 Some(events_tx),

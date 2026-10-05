@@ -1,0 +1,15 @@
+{
+  "share": {
+    "remote": "https://example.invalid/polaris.git",
+    "share_id": "fixture-share",
+    "invitation_id": "fixture-invitation",
+    "expires_unix_seconds": 18446744073709551615
+  },
+  "manifest": {
+    "version": 1,
+    "excluded": []
+  },
+  "joined_unix_seconds": 18446744073709551615,
+  "agreed_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "applied_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

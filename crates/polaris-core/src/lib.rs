@@ -3,6 +3,8 @@
 pub mod activity;
 pub mod agent;
 pub mod answer_finalizer;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod apply_intent;
 pub mod approval;
 pub mod audit;
 pub mod budget;
@@ -91,5 +93,5 @@ pub mod local_execution;
 #[cfg(unix)]
 pub mod management_effect;
 pub mod mcp;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod workspace_apply;

@@ -1,25 +1,23 @@
-//! macOS file-only apply-back with retained originals and a durable intent journal.
+//! Unix file-only apply-back with retained originals and a durable intent journal.
 //! The caller stops snapshot writers and serializes secret registration for the
 //! entire call (including candidate staging and capture validation).
 //! Recovery directories are deliberately never garbage-collected. This is not a
 //! multi-file transaction or a CAS against non-cooperating editors/open file FDs.
 
-#![cfg(target_os = "macos")]
-
 use crate::isolated_workspace::{
     self as copy, Change, ChangeSet, Limits, ManifestEntry, RegisteredSecrets, Snapshot,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{File, Metadata, Permissions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Preparing,
     Prepared,
@@ -33,7 +31,7 @@ pub enum Phase {
     Deleted,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
     ProtectionUnavailable,
     InvalidChangeSet,
@@ -46,7 +44,8 @@ pub enum FailureKind {
     RestoreConflict,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApplyFailure {
     pub kind: FailureKind,
     pub entry: Option<usize>,
@@ -54,7 +53,8 @@ pub struct ApplyFailure {
 }
 
 /// Flags describe completed syscalls even if their subsequent sync/journal failed.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EntryReport {
     pub relative_path: PathBuf,
     /// Includes ancestors above source; a path may no longer name this directory.
@@ -72,7 +72,8 @@ pub struct EntryReport {
     pub install_identity: Option<(u64, u64)>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApplyReport {
     pub source_path: PathBuf,
     /// Intended path, not a guarantee that an external rename left it attached.
@@ -89,6 +90,511 @@ impl ApplyReport {
     /// caller may retain this handle while presenting/manual recovery proceeds.
     pub fn recovery_directory(&self) -> Option<&File> {
         self.recovery_directory.as_ref()
+    }
+}
+
+pub const MAX_APPLY_REPORT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Header entry order follows the existing v1 JSON-map writer. These types
+/// retain the hash-array and tuple representation used by recovery artifacts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalAfter {
+    pub bytes: u64,
+    pub hash: [u8; 32],
+    pub mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalBefore {
+    pub bytes: u64,
+    pub device: u64,
+    pub hash: [u8; 32],
+    pub inode: u64,
+    pub mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalChange {
+    pub after: Option<JournalAfter>,
+    pub before: Option<JournalBefore>,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalHeaderV2 {
+    pub version: u8,
+    pub operation_key: crate::management_effect::ManagementEffectHashV1,
+    pub intent_descriptor_hash: crate::management_effect::ManagementEffectHashV1,
+    pub recovery_parent_identity: crate::apply_intent::IdentityV1,
+    pub source: PathBuf,
+    pub source_chain: Vec<(PathBuf, (u64, u64))>,
+    pub recovery_chain: Vec<(PathBuf, (u64, u64))>,
+    pub entries: Vec<JournalChange>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalHeaderV1 {
+    pub entries: Vec<JournalChange>,
+    pub recovery_chain: Vec<(PathBuf, (u64, u64))>,
+    pub source: PathBuf,
+    pub source_chain: Vec<(PathBuf, (u64, u64))>,
+    pub version: u8,
+}
+
+#[derive(Debug)]
+pub enum SavedJournalHeader {
+    V1(JournalHeaderV1),
+    V2(JournalHeaderV2),
+}
+
+#[derive(Debug)]
+pub struct SavedJournal {
+    pub header: SavedJournalHeader,
+    pub entries: Vec<EntryReport>,
+}
+
+fn evidence_hash(domain: &[u8], bytes: &[u8]) -> crate::management_effect::ManagementEffectHashV1 {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    let hex: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    crate::management_effect::ManagementEffectHashV1::from_hex(&hex)
+        .expect("SHA-256 produces a fixed-width lowercase hash")
+}
+
+fn bounded_evidence(bytes: &[u8], maximum: u64) -> Result<()> {
+    let length = u64::try_from(bytes.len()).map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+    if length > maximum {
+        return Err(fail(FailureKind::InvalidChangeSet));
+    }
+    Ok(())
+}
+
+fn decode_exact<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T> {
+    let value: T =
+        serde_json::from_slice(bytes).map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+    if serde_json::to_vec(&value).map_err(|_| fail(FailureKind::InvalidChangeSet))? != bytes {
+        return Err(fail(FailureKind::InvalidChangeSet));
+    }
+    Ok(value)
+}
+
+fn validate_journal_paths(
+    source: &Path,
+    source_chain: &[(PathBuf, (u64, u64))],
+    recovery_chain: &[(PathBuf, (u64, u64))],
+    entries: &[JournalChange],
+) -> Result<()> {
+    let absolute = |path: &Path| {
+        path.to_str().is_some()
+            && path.is_absolute()
+            && path
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+    };
+    if !absolute(source)
+        || source_chain.last().map(|e| e.0.as_path()) != Some(source)
+        || source_chain.is_empty()
+        || recovery_chain.len() < 2
+    {
+        return Err(fail(FailureKind::InvalidChangeSet));
+    }
+    for chain in [source_chain, recovery_chain] {
+        if chain.first().map(|e| e.0.as_path()) != Some(Path::new("/"))
+            || chain.iter().any(|(p, _)| !absolute(p))
+            || chain
+                .windows(2)
+                .any(|pair| pair[1].0.parent() != Some(pair[0].0.as_path()))
+        {
+            return Err(fail(FailureKind::InvalidChangeSet));
+        }
+    }
+    let mut previous: Option<&[u8]> = None;
+    for entry in entries {
+        let path = entry
+            .path
+            .to_str()
+            .ok_or_else(|| fail(FailureKind::UnsupportedEntry))?;
+        crate::apply_intent::validate_relative_path(path)
+            .map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+        if previous.is_some_and(|p| p >= path.as_bytes())
+            || (entry.before.is_none() && entry.after.is_none())
+            || entry.before.as_ref().is_some_and(|e| e.mode > 0o7777)
+            || entry.after.as_ref().is_some_and(|e| e.mode > 0o777)
+        {
+            return Err(fail(FailureKind::InvalidChangeSet));
+        }
+        previous = Some(path.as_bytes());
+    }
+    Ok(())
+}
+
+impl JournalHeaderV2 {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        validate_journal_paths(
+            &self.source,
+            &self.source_chain,
+            &self.recovery_chain,
+            &self.entries,
+        )?;
+        let parent = self.recovery_chain[self.recovery_chain.len() - 2].1;
+        let child = self.recovery_chain.last().unwrap().0.file_name();
+        let expected_child = crate::apply_intent::recovery_child(self.operation_key)
+            .map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+        if self.version != 2
+            || parent
+                != (
+                    self.recovery_parent_identity.device,
+                    self.recovery_parent_identity.inode,
+                )
+            || child != Some(OsStr::new(&expected_child))
+            || self
+                .intent_descriptor_hash
+                .as_hex()
+                .bytes()
+                .all(|b| b == b'0')
+        {
+            return Err(fail(FailureKind::InvalidChangeSet));
+        }
+        serde_json::to_vec(self).map_err(|_| fail(FailureKind::InvalidChangeSet))
+    }
+
+    pub fn header_hash(&self) -> Result<crate::management_effect::ManagementEffectHashV1> {
+        Ok(evidence_hash(
+            b"polaris-workspace-journal-v2-header-v1\0",
+            &self.canonical_bytes()?,
+        ))
+    }
+}
+
+/// Decoding is inspection only. A v2 header alone never grants permission to
+/// repair or apply; the shared owner must join its descriptor and effect chain.
+pub fn decode_journal(bytes: &[u8], maximum: u64) -> Result<SavedJournal> {
+    bounded_evidence(bytes, maximum)?;
+    if !bytes.ends_with(b"\n") {
+        return Err(fail(FailureKind::InvalidChangeSet));
+    }
+    let mut lines = bytes[..bytes.len() - 1].split(|b| *b == b'\n');
+    let first = lines
+        .next()
+        .ok_or_else(|| fail(FailureKind::InvalidChangeSet))?;
+    let version: serde_json::Value =
+        serde_json::from_slice(first).map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+    let header = match version.get("version").and_then(|v| v.as_u64()) {
+        Some(1) => {
+            let header: JournalHeaderV1 = decode_exact(first)?;
+            validate_journal_paths(
+                &header.source,
+                &header.source_chain,
+                &header.recovery_chain,
+                &header.entries,
+            )?;
+            SavedJournalHeader::V1(header)
+        }
+        Some(2) => {
+            let header: JournalHeaderV2 = decode_exact(first)?;
+            header.canonical_bytes()?;
+            SavedJournalHeader::V2(header)
+        }
+        _ => return Err(fail(FailureKind::InvalidChangeSet)),
+    };
+    let entries = lines
+        .map(decode_exact)
+        .collect::<Result<Vec<EntryReport>>>()?;
+    Ok(SavedJournal { header, entries })
+}
+
+pub fn journal_tip_hash(
+    bytes: &[u8],
+    maximum: u64,
+) -> Result<crate::management_effect::ManagementEffectHashV1> {
+    match decode_journal(bytes, maximum)?.header {
+        SavedJournalHeader::V2(_) => Ok(evidence_hash(
+            b"polaris-workspace-journal-v2-tip-v1\0",
+            bytes,
+        )),
+        SavedJournalHeader::V1(_) => Err(fail(FailureKind::InvalidChangeSet)),
+    }
+}
+
+pub fn decode_apply_report(bytes: &[u8]) -> Result<ApplyReport> {
+    bounded_evidence(bytes, MAX_APPLY_REPORT_BYTES)?;
+    decode_exact(bytes)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceCapacityUpperBound {
+    pub journal_bytes: u64,
+    pub report_bytes: u64,
+}
+
+struct EncodedLength(u64);
+impl Write for EncodedLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("workspace evidence length overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_length(value: &impl Serialize) -> Result<u64> {
+    let mut length = EncodedLength(0);
+    serde_json::to_writer(&mut length, value).map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+    Ok(length.0)
+}
+
+fn journal_hash_array(hash: crate::management_effect::ManagementEffectHashV1) -> [u8; 32] {
+    let hex = hash.as_hex();
+    let mut result = [0; 32];
+    for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+        result[i] = digit(pair[0]) * 16 + digit(pair[1]);
+    }
+    result
+}
+
+/// Admission uses known paths and request metadata. Only future syscall
+/// identities, booleans, phase/failure variants and integer widths use maxima.
+/// Lengths are counted with the same encoders as the actual artifacts.
+pub fn capacity_upper_bound(
+    request: &crate::apply_intent::RequestV1,
+    source: &Path,
+    source_chain: &[(PathBuf, (u64, u64))],
+    recovery_parent: &Path,
+    recovery_chain: &[(PathBuf, (u64, u64))],
+    operation_key: crate::management_effect::ManagementEffectHashV1,
+) -> Result<WorkspaceCapacityUpperBound> {
+    use crate::apply_intent::CanonicalApplyEvidence;
+    request
+        .validate()
+        .map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+    if encoded_length(request)? > crate::apply_intent::MAX_ARTIFACT_BYTES {
+        return Err(fail(FailureKind::InvalidChangeSet));
+    }
+    if source_chain.last().map(|e| e.1)
+        != Some((
+            request.source_identity.device,
+            request.source_identity.inode,
+        ))
+        || recovery_chain.last().map(|e| e.0.as_path()) != Some(recovery_parent)
+    {
+        return Err(fail(FailureKind::InvalidChangeSet));
+    }
+    let parent_identity = recovery_chain
+        .last()
+        .ok_or_else(|| fail(FailureKind::InvalidChangeSet))?
+        .1;
+    let child = crate::apply_intent::recovery_child(operation_key)
+        .map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+    let recovery_path = recovery_parent.join(child);
+    let mut child_chain = recovery_chain.to_vec();
+    child_chain.push((recovery_path.clone(), (parent_identity.0, u64::MAX)));
+    let header = JournalHeaderV2 {
+        version: 2,
+        operation_key,
+        // The eventual descriptor hash has this fixed width. It is not
+        // persisted or used as authorization evidence by this calculation.
+        intent_descriptor_hash: crate::management_effect::ManagementEffectHashV1::from_hex(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("fixed-width capacity hash"),
+        recovery_parent_identity: crate::apply_intent::IdentityV1 {
+            device: parent_identity.0,
+            inode: parent_identity.1,
+        },
+        source: source.into(),
+        source_chain: source_chain.to_vec(),
+        recovery_chain: child_chain,
+        entries: request
+            .entries
+            .iter()
+            .map(|entry| JournalChange {
+                after: entry.after.as_ref().map(|e| JournalAfter {
+                    bytes: e.bytes,
+                    hash: journal_hash_array(e.hash),
+                    mode: e.mode,
+                }),
+                before: entry.before.as_ref().map(|e| JournalBefore {
+                    bytes: e.bytes,
+                    device: e.device,
+                    hash: journal_hash_array(e.hash),
+                    inode: e.inode,
+                    mode: e.observed_mode,
+                }),
+                path: entry.path.clone().into(),
+            })
+            .collect(),
+    };
+    let mut journal_bytes = (header.canonical_bytes()?.len() as u64)
+        .checked_add(1)
+        .ok_or_else(|| fail(FailureKind::InvalidChangeSet))?;
+    let report = ApplyReport {
+        source_path: source.into(),
+        recovery_path: Some(recovery_path),
+        recovery_identity: Some((parent_identity.0, u64::MAX)),
+        recovery_directory: None,
+        entries: Vec::new(),
+        failure: Some(ApplyFailure {
+            kind: FailureKind::ProtectionUnavailable,
+            entry: Some(usize::MAX),
+            os_error: Some(i32::MIN),
+        }),
+    };
+    let mut report_bytes = encoded_length(&report)?;
+    if report_bytes > MAX_APPLY_REPORT_BYTES {
+        return Err(fail(FailureKind::InvalidChangeSet));
+    }
+    for (i, change) in request.entries.iter().enumerate() {
+        let mut parent_chain = source_chain.to_vec();
+        let mut path = source.to_path_buf();
+        for component in Path::new(&change.path).parent().unwrap().components() {
+            path.push(component.as_os_str());
+            parent_chain.push((path.clone(), (u64::MAX, u64::MAX)));
+        }
+        let mut row = EntryReport {
+            relative_path: change.path.clone().into(),
+            source_parent_chain: parent_chain,
+            phase: if change.before.is_some() {
+                Phase::PreserveIntent
+            } else {
+                Phase::InstallIntent
+            },
+            old_retained: false,
+            installed: false,
+            deleted: false,
+            restored: false,
+            old_name: format!("old-{i}"),
+            candidate_name: change.after.as_ref().map(|_| format!("candidate-{i}")),
+            install_name: change.after.as_ref().map(|_| format!("install-{i}")),
+            candidate_identity: change.after.as_ref().map(|_| (parent_identity.0, u64::MAX)),
+            install_identity: change.after.as_ref().map(|_| (parent_identity.0, u64::MAX)),
+        };
+        // A replacement can reach rollback after InstallIntent. Delete can
+        // roll back after verification; create has no original to restore.
+        let phases: &[Phase] = match (change.before.is_some(), change.after.is_some()) {
+            (true, true) => &[
+                Phase::Prepared,
+                Phase::PreserveIntent,
+                Phase::Preserved,
+                Phase::InstallIntent,
+                Phase::RestoreIntent,
+                Phase::Restored,
+            ],
+            (true, false) => &[
+                Phase::Prepared,
+                Phase::PreserveIntent,
+                Phase::Preserved,
+                Phase::RestoreIntent,
+                Phase::Restored,
+            ],
+            (false, true) => &[Phase::Prepared, Phase::InstallIntent, Phase::Installed],
+            (false, false) => return Err(fail(FailureKind::InvalidChangeSet)),
+        };
+        let report_phase = row.phase;
+        for phase in phases {
+            row.phase = *phase;
+            journal_bytes = journal_bytes
+                .checked_add(encoded_length(&row)?)
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(|| fail(FailureKind::InvalidChangeSet))?;
+        }
+        row.phase = report_phase;
+        // Count the rows inside the existing [] and their commas. Do not
+        // retain every repeated ancestor chain just to reject an oversized
+        // report after constructing the entire object.
+        report_bytes = report_bytes
+            .checked_add(encoded_length(&row)?)
+            .and_then(|n| n.checked_add(u64::from(i != 0)))
+            .ok_or_else(|| fail(FailureKind::InvalidChangeSet))?;
+        if report_bytes > MAX_APPLY_REPORT_BYTES {
+            return Err(fail(FailureKind::InvalidChangeSet));
+        }
+    }
+    Ok(WorkspaceCapacityUpperBound {
+        journal_bytes,
+        report_bytes,
+    })
+}
+
+impl ApplyReport {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        let bytes = serde_json::to_vec(self).map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+        bounded_evidence(&bytes, MAX_APPLY_REPORT_BYTES)?;
+        Ok(bytes)
+    }
+
+    pub fn evidence_hash(&self) -> Result<crate::management_effect::ManagementEffectHashV1> {
+        Ok(evidence_hash(
+            b"polaris-workspace-apply-report-v1\0",
+            &self.canonical_bytes()?,
+        ))
+    }
+
+    /// The supplied FD is an already pinned, owner-private recovery directory.
+    /// Failures retain a newly created artifact, including any partial prefix.
+    pub fn publish_exact(
+        &self,
+        directory: &File,
+    ) -> Result<crate::management_effect::ManagementEffectHashV1> {
+        let bytes = self.canonical_bytes()?;
+        let expected = self
+            .recovery_identity
+            .ok_or_else(|| fail(FailureKind::InvalidChangeSet))?;
+        private_directory(directory, expected)?;
+        let name = OsStr::new("apply-report.v1.json");
+        let mut file = open_at(directory, name, false, true)?;
+        file.set_permissions(Permissions::from_mode(0o600))
+            .map_err(io)?;
+        let metadata = file.metadata().map_err(io)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(fail(FailureKind::InvalidChangeSet));
+        }
+        file.write_all(&bytes).map_err(io)?;
+        file.sync_data().map_err(io)?;
+        file.seek(SeekFrom::Start(0)).map_err(io)?;
+        let mut reread = Vec::new();
+        (&mut file)
+            .take(bytes.len() as u64 + 1)
+            .read_to_end(&mut reread)
+            .map_err(io)?;
+        if reread != bytes {
+            return Err(fail(FailureKind::Conflict));
+        }
+        decode_apply_report(&reread)?;
+        let entry = open_at(directory, name, false, false)?;
+        let current = file.metadata().map_err(io)?;
+        if identity(&entry.metadata().map_err(io)?) != identity(&metadata)
+            || current.len() != bytes.len() as u64
+            || current.mode() & 0o7777 != 0o600
+            || current.nlink() != 1
+            || current.uid() != unsafe { libc::geteuid() }
+            || !stable(&current, &entry.metadata().map_err(io)?)
+        {
+            return Err(fail(FailureKind::AncestorChanged));
+        }
+        private_directory(directory, expected)?;
+        directory.sync_all().map_err(io)?;
+        Ok(evidence_hash(
+            b"polaris-workspace-apply-report-v1\0",
+            &bytes,
+        ))
     }
 }
 
@@ -182,6 +688,9 @@ impl RecoveryParent {
     pub fn identity(&self) -> (u64, u64) {
         self.expected
     }
+    pub(crate) fn retained_directory(&self) -> std::io::Result<File> {
+        self.directory.try_clone()
+    }
     /// Original informational path, shared by approval and report evidence.
     /// It may have been renamed; only the held FD selects the recovery directory.
     pub fn provenance(&self) -> &Path {
@@ -251,11 +760,310 @@ fn outside(directory: &File, forbidden: &File) -> Result<()> {
     Err(fail(FailureKind::InvalidChangeSet))
 }
 
+#[derive(Debug)]
 struct Anchor {
     path: PathBuf,
     dir: File,
     chain: Vec<(PathBuf, (u64, u64))>,
     pinned: Option<(u64, u64)>,
+}
+
+/// A retained child and its exact v2 header, pinned before effect dispatch.
+/// This evidence token carries no management-effect or source-write authority.
+#[derive(Debug)]
+pub struct ReservedRecoveryV2 {
+    parent: RecoveryParent,
+    anchor: Anchor,
+    header: JournalHeaderV2,
+}
+
+impl ReservedRecoveryV2 {
+    pub(crate) fn retained_parent_directory(&self) -> std::io::Result<File> {
+        self.parent.retained_directory()
+    }
+    pub fn header(&self) -> &JournalHeaderV2 {
+        &self.header
+    }
+    pub fn directory(&self) -> &File {
+        &self.anchor.dir
+    }
+    pub fn path(&self) -> &Path {
+        &self.anchor.path
+    }
+
+    pub fn inspect_journal(&self, maximum: u64) -> Result<Vec<u8>> {
+        self.parent.validate_identity()?;
+        self.anchor.check()?;
+        let name = self
+            .anchor
+            .path
+            .file_name()
+            .ok_or_else(|| fail(FailureKind::InvalidChangeSet))?;
+        let child = open_at(&self.parent.directory, name, true, false)?;
+        if identity(&child.metadata().map_err(io)?)
+            != identity(&self.anchor.dir.metadata().map_err(io)?)
+        {
+            return Err(fail(FailureKind::AncestorChanged));
+        }
+        let bytes = read_owned_artifact(&self.anchor.dir, OsStr::new("journal.jsonl"), maximum)?;
+        match decode_journal(&bytes, maximum)?.header {
+            SavedJournalHeader::V2(ref header) if header == &self.header => Ok(bytes),
+            _ => Err(fail(FailureKind::Conflict)),
+        }
+    }
+}
+
+fn read_owned_artifact(directory: &File, name: &OsStr, maximum: u64) -> Result<Vec<u8>> {
+    let mut file = open_at(directory, name, false, false)?;
+    let before = file.metadata().map_err(io)?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.mode() & 0o7777 != 0o600
+        || before.len() > maximum
+    {
+        return Err(fail(FailureKind::InvalidChangeSet));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    bounded_evidence(&bytes, maximum)?;
+    let entry = open_at(directory, name, false, false)?;
+    if !stable(&before, &file.metadata().map_err(io)?)
+        || !stable(&before, &entry.metadata().map_err(io)?)
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(fail(FailureKind::AncestorChanged));
+    }
+    Ok(bytes)
+}
+
+fn journal_changes(changes: &[Change]) -> Result<Vec<JournalChange>> {
+    changes
+        .iter()
+        .map(|c| {
+            Ok(JournalChange {
+                after: c
+                    .after
+                    .as_ref()
+                    .map(|e| {
+                        Ok::<_, ApplyFailure>(JournalAfter {
+                            bytes: e.bytes,
+                            hash: e
+                                .sha256
+                                .ok_or_else(|| fail(FailureKind::UnsupportedEntry))?,
+                            mode: e.mode,
+                        })
+                    })
+                    .transpose()?,
+                before: c
+                    .before
+                    .as_ref()
+                    .map(|e| {
+                        Ok::<_, ApplyFailure>(JournalBefore {
+                            bytes: e.bytes,
+                            device: e.identity.device,
+                            hash: e
+                                .sha256
+                                .ok_or_else(|| fail(FailureKind::UnsupportedEntry))?,
+                            inode: e.identity.inode,
+                            mode: e.observed_mode(),
+                        })
+                    })
+                    .transpose()?,
+                path: c.relative_path.clone(),
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_reserved_recovery_v2(
+    snapshot: &Snapshot,
+    changes: &ChangeSet,
+    secrets: &RegisteredSecrets,
+    limits: Limits,
+    parent: &RecoveryParent,
+    operation_key: crate::management_effect::ManagementEffectHashV1,
+    descriptor_hash: crate::management_effect::ManagementEffectHashV1,
+) -> Result<ReservedRecoveryV2> {
+    parent.validate_for_snapshot(snapshot)?;
+    let source = Anchor::open(&snapshot.source_path)?;
+    let owner = Anchor::open(parent.provenance())?;
+    if identity(&owner.dir.metadata().map_err(io)?) != parent.identity() {
+        return Err(fail(FailureKind::AncestorChanged));
+    }
+    let fresh = validate_changes(snapshot, changes, secrets, limits)?;
+    let child = crate::apply_intent::recovery_child(operation_key)
+        .map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+    let path = parent.provenance().join(&child);
+    let mut chain = owner.chain.clone();
+    chain.push((path.clone(), (parent.expected.0, u64::MAX)));
+    let mut header = JournalHeaderV2 {
+        version: 2,
+        operation_key,
+        intent_descriptor_hash: descriptor_hash,
+        recovery_parent_identity: crate::apply_intent::IdentityV1 {
+            device: parent.expected.0,
+            inode: parent.expected.1,
+        },
+        source: snapshot.source_path.clone(),
+        source_chain: source.chain.clone(),
+        recovery_chain: chain,
+        entries: journal_changes(&fresh.changes)?,
+    };
+    // Invalid wire/bindings are refused before child creation.
+    header.canonical_bytes()?;
+    source.check()?;
+    owner.check()?;
+    parent.validate_identity()?;
+    let name = cstr(OsStr::new(&child))?;
+    if unsafe { libc::mkdirat(parent.directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(io(std::io::Error::last_os_error()));
+    }
+    let directory = open_at(&parent.directory, OsStr::new(&child), true, false)?;
+    let expected = identity(&directory.metadata().map_err(io)?);
+    private_directory(&directory, expected)?;
+    header.recovery_chain.last_mut().unwrap().1 = expected;
+    let anchor = Anchor {
+        path,
+        dir: directory,
+        chain: header.recovery_chain.clone(),
+        pinned: Some(expected),
+    };
+    let mut bytes = header.canonical_bytes()?;
+    bytes.push(b'\n');
+    let mut log = open_at(&anchor.dir, OsStr::new("journal.jsonl"), false, true)?;
+    log.set_permissions(Permissions::from_mode(0o600))
+        .map_err(io)?;
+    log.write_all(&bytes).map_err(io)?;
+    log.sync_data().map_err(io)?;
+    log.seek(SeekFrom::Start(0)).map_err(io)?;
+    let mut reread = Vec::new();
+    (&mut log)
+        .take(bytes.len() as u64 + 1)
+        .read_to_end(&mut reread)
+        .map_err(io)?;
+    if reread != bytes {
+        return Err(fail(FailureKind::Conflict));
+    }
+    decode_journal(&reread, bytes.len() as u64)?;
+    if read_owned_artifact(&anchor.dir, OsStr::new("journal.jsonl"), bytes.len() as u64)? != bytes {
+        return Err(fail(FailureKind::Conflict));
+    }
+    anchor.dir.sync_all().map_err(io)?;
+    parent.directory.sync_all().map_err(io)?;
+    let linked = open_at(&anchor.dir, OsStr::new("journal.jsonl"), false, false)?;
+    if !stable(
+        &log.metadata().map_err(io)?,
+        &linked.metadata().map_err(io)?,
+    ) {
+        return Err(fail(FailureKind::AncestorChanged));
+    }
+    source.check()?;
+    owner.check()?;
+    parent.validate_identity()?;
+    Ok(ReservedRecoveryV2 {
+        parent: RecoveryParent::pin(&parent.directory, parent.expected, &parent.provenance)?,
+        anchor,
+        header,
+    })
+}
+
+fn require_header_only_entries(directory: &File) -> Result<()> {
+    let raw = open_at(directory, OsStr::new("."), true, false)?.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(raw) };
+        return Err(io(error));
+    }
+    let result = (|| {
+        let mut journal_seen = false;
+        loop {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(0) {
+                    return Err(io(error));
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if name != b"journal.jsonl" || journal_seen {
+                return Err(fail(FailureKind::Conflict));
+            }
+            journal_seen = true;
+        }
+        if !journal_seen {
+            return Err(fail(FailureKind::Conflict));
+        }
+        Ok(())
+    })();
+    if unsafe { libc::closedir(stream) } != 0 && result.is_ok() {
+        return Err(io(std::io::Error::last_os_error()));
+    }
+    result
+}
+
+/// Read-only reopening is not authorization or repair. The owner must join the
+/// returned header/rows to its saved intent and management evidence.
+pub fn inspect_reserved_recovery_v2(
+    parent: &RecoveryParent,
+    operation_key: crate::management_effect::ManagementEffectHashV1,
+    descriptor_hash: crate::management_effect::ManagementEffectHashV1,
+    maximum: u64,
+) -> Result<Option<ReservedRecoveryV2>> {
+    parent.validate_identity()?;
+    let child = crate::apply_intent::recovery_child(operation_key)
+        .map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+    let directory = match open_at(&parent.directory, OsStr::new(&child), true, false) {
+        Ok(file) => file,
+        Err(e) if e.os_error == Some(libc::ENOENT) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let expected = identity(&directory.metadata().map_err(io)?);
+    private_directory(&directory, expected)?;
+    let bytes = read_owned_artifact(&directory, OsStr::new("journal.jsonl"), maximum)?;
+    let SavedJournalHeader::V2(header) = decode_journal(&bytes, maximum)?.header else {
+        return Err(fail(FailureKind::Conflict));
+    };
+    if header.operation_key != operation_key
+        || header.intent_descriptor_hash != descriptor_hash
+        || (
+            header.recovery_parent_identity.device,
+            header.recovery_parent_identity.inode,
+        ) != parent.expected
+        || header.recovery_chain.last().map(|e| e.1) != Some(expected)
+        || header.recovery_chain.last().map(|e| e.0.as_path())
+            != Some(parent.provenance().join(&child).as_path())
+    {
+        return Err(fail(FailureKind::Conflict));
+    }
+    let anchor = Anchor {
+        path: parent.provenance().join(&child),
+        dir: directory,
+        chain: header.recovery_chain.clone(),
+        pinned: Some(expected),
+    };
+    Ok(Some(ReservedRecoveryV2 {
+        parent: RecoveryParent::pin(&parent.directory, parent.expected, &parent.provenance)?,
+        anchor,
+        header,
+    }))
 }
 impl Anchor {
     fn open(path: &Path) -> Result<Self> {
@@ -300,6 +1108,7 @@ fn exclusive(from: &File, name: &OsStr, to: &File, target: &OsStr) -> Result<()>
     let name = cstr(name)?;
     let target = cstr(target)?;
     // EXCL tests destination absence; source identity is checked after capture.
+    #[cfg(target_os = "macos")]
     let status = unsafe {
         libc::renameatx_np(
             from.as_raw_fd(),
@@ -309,14 +1118,35 @@ fn exclusive(from: &File, name: &OsStr, to: &File, target: &OsStr) -> Result<()>
             libc::RENAME_EXCL,
         )
     };
-    if status != 0 {
-        let mut error = io(std::io::Error::last_os_error());
-        if matches!(error.os_error, Some(libc::EEXIST | libc::ENOENT)) {
-            error.kind = FailureKind::Conflict;
+    #[cfg(target_os = "linux")]
+    let status = unsafe {
+        libc::renameat2(
+            from.as_raw_fd(),
+            name.as_ptr(),
+            to.as_raw_fd(),
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if status != 0 {
+            return Err(exclusive_error(std::io::Error::last_os_error()));
         }
-        return Err(error);
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err(io(std::io::Error::from(std::io::ErrorKind::Unsupported)))
+    }
+}
+
+fn exclusive_error(error: std::io::Error) -> ApplyFailure {
+    let mut failure = io(error);
+    if matches!(failure.os_error, Some(libc::EEXIST | libc::ENOENT)) {
+        failure.kind = FailureKind::Conflict;
+    }
+    failure
 }
 
 fn matching(a: &ManifestEntry, b: &ManifestEntry) -> bool {
@@ -326,6 +1156,8 @@ fn matching(a: &ManifestEntry, b: &ManifestEntry) -> bool {
         && a.mode == b.mode
         && a.sha256 == b.sha256
         && a.observed_mode() == b.observed_mode()
+        && a.observed_mtime() == b.observed_mtime()
+        && a.observed_ctime() == b.observed_ctime()
 }
 fn same_change(a: &Change, b: &Change) -> bool {
     let same = |a: &Option<ManifestEntry>, b: &Option<ManifestEntry>| match (a, b) {
@@ -573,6 +1405,7 @@ fn apply_pinned_with_hook(
         limits,
         &recovery_parent.provenance,
         Some(recovery_parent),
+        None,
         hook,
     )
 }
@@ -592,10 +1425,34 @@ fn apply_with_hook(
         limits,
         recovery_parent,
         None,
+        None,
         hook,
     )
 }
 
+/// Dispatch only after the shared owner has durably started this exact effect.
+/// It accepts a header-only reserved child; recovery of existing rows belongs
+/// to the explicit joined recovery path, not to another apply attempt.
+pub fn apply_reserved_v2(
+    snapshot: &Snapshot,
+    changes: &ChangeSet,
+    secrets: &RegisteredSecrets,
+    limits: Limits,
+    reserved: &ReservedRecoveryV2,
+) -> ApplyReport {
+    apply_with_parent(
+        snapshot,
+        changes,
+        secrets,
+        limits,
+        reserved.parent.provenance(),
+        Some(&reserved.parent),
+        Some(reserved),
+        &mut |_, _, _| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_with_parent(
     snapshot: &Snapshot,
     changes: &ChangeSet,
@@ -603,6 +1460,7 @@ fn apply_with_parent(
     limits: Limits,
     recovery_parent: &Path,
     pinned: Option<&RecoveryParent>,
+    reserved: Option<&ReservedRecoveryV2>,
     hook: &mut Hook<'_>,
 ) -> ApplyReport {
     let mut report = ApplyReport {
@@ -620,6 +1478,7 @@ fn apply_with_parent(
         limits,
         recovery_parent,
         pinned,
+        reserved,
         hook,
         &mut report,
     );
@@ -637,6 +1496,7 @@ fn run(
     limits: Limits,
     recovery_parent: &Path,
     pinned: Option<&RecoveryParent>,
+    reserved: Option<&ReservedRecoveryV2>,
     hook: &mut Hook<'_>,
     report: &mut ApplyReport,
 ) -> Result<()> {
@@ -664,51 +1524,116 @@ fn run(
     outside(&owner.dir, &source.dir)?;
     outside(&owner.dir, &snapshot_owner.dir)?;
     let fresh = validate_changes(snapshot, changes, secrets, limits)?;
-    if fresh.changes.is_empty() {
+    if fresh.changes.is_empty() && reserved.is_none() {
         return Ok(());
     }
-    let mut random = [0u8; 16];
-    getrandom::fill(&mut random).map_err(|_| fail(FailureKind::Io))?;
-    let name = format!(
-        "polaris-apply-{}",
-        random
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
-    let recovery_path = recovery_parent.join(&name);
-    owner.check()?;
-    let c_name = cstr(OsStr::new(&name))?;
-    if unsafe { libc::mkdirat(owner.dir.as_raw_fd(), c_name.as_ptr(), 0o700) } != 0 {
-        return Err(io(std::io::Error::last_os_error()));
-    }
-    report.recovery_path = Some(recovery_path.clone());
-    let directory = open_at(&owner.dir, OsStr::new(&name), true, false)?;
-    let recovery_id = identity(&directory.metadata().map_err(io)?);
-    let mut chain = owner.chain.clone();
-    chain.push((recovery_path.clone(), recovery_id));
-    let recovery = Anchor {
-        path: recovery_path.clone(),
-        dir: directory,
-        chain,
-        pinned: pinned.map(|_| recovery_id),
+    let (recovery, mut log) = if let Some(reserved) = reserved {
+        if reserved.header.source != source.path
+            || reserved.header.source_chain != source.chain
+            || reserved.header.entries != journal_changes(&fresh.changes)?
+        {
+            return Err(fail(FailureKind::Conflict));
+        }
+        let mut expected = reserved.header.canonical_bytes()?;
+        expected.push(b'\n');
+        if reserved.inspect_journal(expected.len() as u64)? != expected {
+            return Err(fail(FailureKind::Conflict));
+        }
+        require_header_only_entries(&reserved.anchor.dir)?;
+        let recovery = Anchor {
+            path: reserved.anchor.path.clone(),
+            dir: reserved.anchor.dir.try_clone().map_err(io)?,
+            chain: reserved.anchor.chain.clone(),
+            pinned: reserved.anchor.pinned,
+        };
+        let name = cstr(OsStr::new("journal.jsonl"))?;
+        let raw = unsafe {
+            libc::openat(
+                recovery.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_APPEND
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+            )
+        };
+        if raw < 0 {
+            return Err(io(std::io::Error::last_os_error()));
+        }
+        let mut log = unsafe { File::from_raw_fd(raw) };
+        let before = log.metadata().map_err(io)?;
+        if !before.is_file()
+            || before.nlink() != 1
+            || before.uid() != unsafe { libc::geteuid() }
+            || before.mode() & 0o7777 != 0o600
+            || before.len() != expected.len() as u64
+        {
+            return Err(fail(FailureKind::Conflict));
+        }
+        let mut reread = Vec::new();
+        (&mut log)
+            .take(expected.len() as u64 + 1)
+            .read_to_end(&mut reread)
+            .map_err(io)?;
+        let linked = open_at(&recovery.dir, OsStr::new("journal.jsonl"), false, false)?;
+        if reread != expected
+            || !stable(&before, &log.metadata().map_err(io)?)
+            || !stable(&before, &linked.metadata().map_err(io)?)
+        {
+            return Err(fail(FailureKind::AncestorChanged));
+        }
+        (recovery, log)
+    } else {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|_| fail(FailureKind::Io))?;
+        let name = format!(
+            "polaris-apply-{}",
+            random
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        let recovery_path = recovery_parent.join(&name);
+        owner.check()?;
+        let c_name = cstr(OsStr::new(&name))?;
+        if unsafe { libc::mkdirat(owner.dir.as_raw_fd(), c_name.as_ptr(), 0o700) } != 0 {
+            return Err(io(std::io::Error::last_os_error()));
+        }
+        report.recovery_path = Some(recovery_path.clone());
+        let directory = open_at(&owner.dir, OsStr::new(&name), true, false)?;
+        let recovery_id = identity(&directory.metadata().map_err(io)?);
+        let mut chain = owner.chain.clone();
+        chain.push((recovery_path.clone(), recovery_id));
+        let recovery = Anchor {
+            path: recovery_path.clone(),
+            dir: directory,
+            chain,
+            pinned: pinned.map(|_| recovery_id),
+        };
+        report.recovery_identity = Some(identity(&recovery.dir.metadata().map_err(io)?));
+        report.recovery_directory = Some(recovery.dir.try_clone().map_err(io)?);
+        owner.dir.sync_all().map_err(io)?;
+        owner.check()?;
+        recovery.check()?;
+        let mut log = open_at(&recovery.dir, OsStr::new("journal.jsonl"), false, true)?;
+        // Persist identities, baseline/target hashes and modes before any source move.
+        let header = serde_json::json!({ "version": 1, "source": snapshot.source_path, "source_chain": source.chain,
+            "recovery_chain": recovery.chain, "entries": fresh.changes.iter().map(|c| serde_json::json!({
+                "path": c.relative_path, "before": c.before.as_ref().map(|e| serde_json::json!({"device": e.identity.device, "inode":e.identity.inode, "hash":e.sha256, "mode":e.observed_mode(), "bytes":e.bytes})),
+                "after": c.after.as_ref().map(|e| serde_json::json!({"hash":e.sha256, "mode":e.mode, "bytes":e.bytes}))
+            })).collect::<Vec<_>>() });
+        serde_json::to_writer(&mut log, &header)
+            .map_err(|_| fail(FailureKind::InvalidChangeSet))?;
+        log.write_all(b"\n").map_err(io)?;
+        log.sync_all().map_err(io)?;
+        recovery.dir.sync_all().map_err(io)?;
+        (recovery, log)
     };
+    let recovery_path = recovery.path.clone();
+    report.recovery_path = Some(recovery_path.clone());
     report.recovery_identity = Some(identity(&recovery.dir.metadata().map_err(io)?));
     report.recovery_directory = Some(recovery.dir.try_clone().map_err(io)?);
-    owner.dir.sync_all().map_err(io)?;
-    owner.check()?;
-    recovery.check()?;
-    let mut log = open_at(&recovery.dir, OsStr::new("journal.jsonl"), false, true)?;
-    // Persist identities, baseline/target hashes and modes before any source move.
-    let header = serde_json::json!({ "version": 1, "source": snapshot.source_path, "source_chain": source.chain,
-        "recovery_chain": recovery.chain, "entries": fresh.changes.iter().map(|c| serde_json::json!({
-            "path": c.relative_path, "before": c.before.as_ref().map(|e| serde_json::json!({"device": e.identity.device, "inode":e.identity.inode, "hash":e.sha256, "mode":e.observed_mode(), "bytes":e.bytes})),
-            "after": c.after.as_ref().map(|e| serde_json::json!({"hash":e.sha256, "mode":e.mode, "bytes":e.bytes}))
-        })).collect::<Vec<_>>() });
-    serde_json::to_writer(&mut log, &header).map_err(|_| fail(FailureKind::InvalidChangeSet))?;
-    log.write_all(b"\n").map_err(io)?;
-    log.sync_all().map_err(io)?;
-    recovery.dir.sync_all().map_err(io)?;
     let mut parents = Vec::new();
     // Fix all candidates before opening a gap at any source entry.
     for (i, change) in fresh.changes.iter().enumerate() {

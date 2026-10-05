@@ -1,0 +1,1 @@
+{"schema_version":1,"source_identity":{"device":7,"inode":11},"entries":[{"path":"a.txt","before":{"device":7,"inode":18446744073709551615,"hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","mode":511,"observed_mode":4095,"bytes":3},"after":{"hash":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","mode":511,"bytes":3}}]}

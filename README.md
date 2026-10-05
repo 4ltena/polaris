@@ -8,18 +8,18 @@
 </p>
 
 <p align="center">
-  <strong>v0.12.0 “Alrescha” · 実装完了・未リリース</strong> · <a href="CHANGELOG.md">変更履歴</a>
+  <strong>v1.0.0 開発中 · 配布前</strong> · <a href="CHANGELOG.md">変更履歴</a>
 </p>
 
 <p align="center">
   <strong>日本語</strong> · <a href="README.en.md" lang="en">English</a>
 </p>
 
-Polarisは、必要な指示と資料だけをモデルへ渡すRust製のCLI/TUIエージェントである。作業段階を記録するworkflowを標準で備え、共通ルールと企画・仕様策定・実装・レビューなどの段階に必要なskillを、通常のskill検索とは別に読み込む。
+Polarisは、作業に必要な文脈を選んでモデルへ渡すRust製のコーディングエージェントである。CLIとTUIを主な操作経路とし、macOS向けの作業画面も備える。workflowの段階を状態として保存し、その段階に必要な指示・skillを組み立てる。
 
-v0.12.0ではmacOSの作業画面へ実モデル接続、ファイル・Git・作業表示、ローカルモデル、復旧、strict10の会話記憶を統合した。ローカル確認用の未署名アプリであり、RC化・公開は行っていない。承認が必要な追加検証は省略し、確認済み範囲と未検証項目を[macOSデスクトップの確認方法](apps/macos/README.md)へ記載した。
+このcheckoutではv1.0.0を実装中である。通常会話、Sidechatへの自動振分け、MCP、subagent、会話・作業ファイルの巻き戻しなどをTUIへ接続している。一部の管理操作、MCPとSidechatを併用する場合の復旧、実端末での受入は未完了であり、配布版としての公開も行っていない。[現在の利用方法](docs/usage.md)と[macOSアプリの組立て](apps/macos/README.md)を参照。
 
-## 純正Codexとの比較
+## v0.12.0での純正Codexとの比較
 
 同じ`gpt-6-astra`／`medium`で、workflowを有効にしたPolarisとCodex CLI 0.154.0を比較した。下表はPRE02〜08で課題・反復がそろった15試行、各2ターンの部分結果である。PRE01の追加測定は省略した。
 
@@ -31,17 +31,19 @@ v0.12.0ではmacOSの作業画面へ実モデル接続、ファイル・Git・�
 
 総トークンはキャッシュ済み入力を含む入力と出力の合計。費用は測定仕様で固定したAPI単価による参考額で、Codexの実請求額ではない。この15組ではPolarisの所要時間は23.5%長かった。短い合成課題による逐次測定であり、一般の実装作業や長期対話へは外挿しない。[測定条件・品質評価・時間・制約](docs/preimplementation-evaluation.md#v0120とcodex-01540の途中結果)を参照。
 
-## はじめに
+## 開発中の利用方法
 
-Rust 1.96.0を用意し、ChatGPTサブスクリプションで認証する。
+macOS arm64では、ビルド済みCLIを同梱したローカル検証用パッケージを作成できる。パッケージを取得した後の導入は`sudo installer -pkg polaris-cli-preview-0.12.0-arm64.pkg -target /`の1コマンドで、以後は`polaris`で起動する。利用者側にRustは不要。現時点では未署名・未公開であり、実機へのインストール受入も未完了。組立て方法と検証範囲は[macOSの説明](apps/macos/README.md)を参照。
+
+このcheckoutをソースから実行する場合はRust 1.96.0を用意する。ChatGPT認証を使う例は次のとおり。
 
 ```sh
-cargo build --release
+cargo build --release -p polaris-cli
 target/release/polaris login
-POLARIS_PROVIDER=codex target/release/polaris -p "Cargo.toml は何行か"
+POLARIS_PROVIDER=codex target/release/polaris
 ```
 
-`-p`を省略すると対話TUIを起動する。開発中は`cargo run -p polaris-cli -- -p "..."`でも実行できる。既定モデルは`gpt-6-astra`、推論強度は`xhigh`である。
+引数を省略すると対話TUI、`-p`を指定すると一発実行になる。既定のプロバイダは`openai`でAPIキーを必要とするため、ChatGPT認証を使う場合は例のように`POLARIS_PROVIDER=codex`を指定する。この端末の`polaris`コマンドは開発用ラッパーであり、一般向けインストーラにはまだ含まれない。
 
 段階を指定して始める場合は、`--phase`を使う。
 
@@ -49,16 +51,16 @@ POLARIS_PROVIDER=codex target/release/polaris -p "Cargo.toml は何行か"
 POLARIS_PROVIDER=codex target/release/polaris --phase specify -p "機材貸出サービスの受入条件を整理する"
 ```
 
-APIキー用の`openai`プロバイダはChat Completions形式のため、Responses APIが必要なAstraのtool callingには未対応である。認証・設定・保存済み会話の再開方法は[利用ガイド](docs/usage.md)にまとめる。
+APIキー用の`openai`プロバイダはChat Completions形式のため、Responses APIが必要なAstraのtool callingには未対応である。認証・設定・会話の再開方法は[利用ガイド](docs/usage.md)にまとめる。
 
 ## 主な機能
 
-- **段階別workflow**：共通skillと現在の段階の必須skillを各ターンで固定する。通常のskill検索は必要なときに使い、カタログ全体を常時展開しない。
-- **小さな基底コンテキスト**：基底の指示と最大6個のツール定義は`o200k_base`で990トークン以下。workflowのskillと識別情報には別枠で最大384トークンを設ける。履歴・取得資料・ツール結果はこの固定部分に含めない。
-- **保存と再取得**：大きなツール結果を原文とともに保存し、必要な行や段落だけを取り出せる。ツール記憶は`--tool-memory history|retrieval`で有効化する。
-- **会話の継続**：workflowの段階と会話を保存し、再開・分岐で引き継ぐ。子エージェントは1波で並列実行し、型ごとの出力Schemaで検証する。
+- **状態で管理するworkflow**：段階、作業、必要なskillを記録し、毎ターンの文脈を組み立てる。
+- **会話の保存と分岐**：Sidechatで別文脈を分け、保存済み会話を再開・分岐できる。TUIでは対象のユーザー入力より前へ会話と作業ファイルを巻き戻せる。
+- **ツールと委譲**：ファイル・Git・MCPの操作とsubagentへの委譲を共通の実行基盤で扱う。MCPの接続条件と操作権限を検査する。
+- **記憶と取得**：原文を保持し、直近のターンと過去の関連情報を必要に応じて取り出す。大きなツール結果は参照から再取得できる。
 
-v0.11.0 “Sadalmelik”ではworkflowを標準採用し、会話保存・再開・分岐を整えた。直近10ターンと要約検索を使う`strict10`と、キャッシュ用の要求間隔制御は任意設定である。strict10の実モデル評価は未完了で、Web検索は現行CLIでは有効化できない。利用条件と制限は[検証状況](docs/sadalmelik-validation.md)に記載する。各版の変更は[変更履歴](CHANGELOG.md)を参照。
+macOSのCLI専用プレビューパッケージには追加資源を含めない。GUIインストーラには固定manifestからllama.cpp、埋め込み実行環境、multilingual-e5-small/baseを検証して`~/.polaris`へ取得する経路があり、Rustは任意選択である。Qwen系はSemIf用のQwen3.5-4Bを候補としているが、固定資源の登録と受入が未完了で、自動取得しない。署名済み配布資源と実機受入も未完了である。検証済み範囲は[macOSデスクトップ](apps/macos/README.md)に記載する。
 
 ## 文書
 
@@ -66,6 +68,7 @@ v0.11.0 “Sadalmelik”ではworkflowを標準採用し、会話保存・再開
 | --- | --- |
 | [利用ガイド](docs/usage.md) | 認証、設定、workflow、TUI、会話の再開・分岐。 |
 | [macOSデスクトップ](apps/macos/README.md) | ローカル確認用アプリの組立て、保存境界、ローカルモデル。 |
+| [アーキテクチャ](docs/architecture.md) | crate間の依存と外部接続点。 |
 | [コンテキスト効率化](docs/context-efficiency.md) | 圧縮、原文保存、検索、埋め込み、strict10。 |
 | [subagent](docs/subagents.md) | 並列実行、出力Schema、実行制限。 |
 | [実装前段階の実測](docs/preimplementation-evaluation.md) | 企画から計画レビューまでの品質と純正Codex比較。 |

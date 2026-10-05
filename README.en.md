@@ -8,18 +8,18 @@
 </p>
 
 <p align="center">
-  <strong>v0.12.0 “Alrescha” · Implementation complete, unreleased</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
+  <strong>v1.0.0 in development · not yet distributed</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
 </p>
 
 <p align="center">
   <a href="README.md" lang="ja">日本語</a> · <strong>English</strong>
 </p>
 
-Polaris is a Rust CLI/TUI agent that sends the model the instructions and material needed for the current task. Its built-in workflow records the working phase and loads shared rules and phase-required skills separately from ordinary skill search.
+Polaris is a Rust coding agent that selects the context needed for the current task. Its main interfaces are a CLI and TUI, with a separate macOS workspace app. It stores workflow state and assembles instructions and skills for the active phase.
 
-v0.12.0 integrates model execution, files, Git, task state, local models, recovery, and strict10 conversation memory into the macOS desktop. The app is an unsigned local build; no RC or public release has been created. Additional checks requiring approval were skipped. See the [macOS guide](apps/macos/README.md) for verified behavior and remaining validation limits.
+This checkout contains the in-progress v1.0.0 implementation. The TUI connects ordinary conversations, automatic Sidechat routing, MCP, subagents, and conversation/workspace rewind. Some management operations, recovery when MCP prompts and Sidechat routing interact, and real-terminal acceptance remain unfinished. No v1.0.0 distribution has been published. See the [usage guide](docs/usage.md) and [macOS build guide](apps/macos/README.md).
 
-## Comparison with stock Codex
+## v0.12.0 comparison with stock Codex
 
 Both tools requested `gpt-6-astra` with `medium` effort; Polaris had workflow enabled. These partial results cover 15 matched PRE02–08 trials with two turns each against Codex CLI 0.154.0. The additional PRE01 measurement was skipped.
 
@@ -31,17 +31,19 @@ Both tools requested `gpt-6-astra` with `medium` effort; Polaris had workflow en
 
 Total tokens include input and output; cached input is already part of input. Cost uses API prices frozen in the measurement specification, not actual Codex billing. Polaris took 23.5% longer across these 15 trials. These short synthetic tasks were run sequentially and do not establish reductions for general coding work or long conversations. See the [method, quality checks, timing, and limitations](docs/preimplementation-evaluation.md#v0120とcodex-01540の途中結果).
 
-## Getting started
+## Using this development checkout
 
-Install Rust 1.96.0, build, and authenticate with a ChatGPT subscription.
+On macOS arm64, a local preview package can be assembled with a compiled Polaris CLI. Once obtained, install it with one command, `sudo installer -pkg polaris-cli-preview-0.12.0-arm64.pkg -target /`, then launch the TUI with `polaris`. Rust is not needed on the user's machine. This package is currently unsigned and unpublished; a real-machine installation check is still pending. See the [macOS guide](apps/macos/README.md) for assembly and verification details.
+
+Building from source requires Rust 1.96.0. To use ChatGPT authentication:
 
 ```sh
-cargo build --release
+cargo build --release -p polaris-cli
 target/release/polaris login
-POLARIS_PROVIDER=codex target/release/polaris -p "How many lines are in Cargo.toml?"
+POLARIS_PROVIDER=codex target/release/polaris
 ```
 
-Omit `-p` to start the interactive TUI. During development, use `cargo run -p polaris-cli -- -p "..."`. The default model is `gpt-6-astra`, with `xhigh` reasoning effort.
+With no prompt argument, Polaris starts the interactive TUI; `-p` runs one prompt. The default provider is `openai` and requires an API key, so set `POLARIS_PROVIDER=codex` for ChatGPT authentication as shown. The `polaris` command on the developer's machine is a local source-building wrapper, not a distributed installer.
 
 Use `--phase` to choose the starting phase:
 
@@ -53,12 +55,12 @@ The API-key `openai` provider currently uses Chat Completions and does not suppo
 
 ## Core features
 
-- **Phase-aware workflow:** Shared and phase-required skills are fixed for each turn. Ordinary skill search remains available on demand without expanding the entire catalog into every request.
-- **Small base context:** Base instructions and at most six tool definitions stay within 990 tokens under `o200k_base`. Workflow skills and identifying wrappers have a separate 384-token budget. History, retrieved material, and tool results are outside this fixed budget.
-- **Retention and retrieval:** Large tool results can be stored and retrieved by selected lines or paragraphs. Enable this with `--tool-memory history|retrieval`.
-- **Conversation continuity:** Saved conversations preserve workflow state across resume and fork. Subagents run in one parallel wave with output validated against per-type schemas.
+- **Stateful workflow:** Persist the phase and active task, then assemble the instructions and skills needed for each turn.
+- **Conversation continuity:** Separate unrelated work into Sidechats; resume, fork, or rewind a conversation and its workspace files from the TUI.
+- **Tools and delegation:** Use files, Git, MCP, and subagents through a shared execution core with connection and permission checks.
+- **Memory and retrieval:** Preserve source material while retrieving older relevant context and large tool results when needed.
 
-v0.11.0 “Sadalmelik” adopts workflow by default and adds durable conversation state, resume, and fork. The recent-ten-turn `strict10` mode with summary retrieval and cache request pacing remain opt-in. Real-model evaluation of strict10 is incomplete, and Web search cannot be enabled in the current CLI; see the [validation report](docs/sadalmelik-validation.md) for requirements and limits, and the [changelog](CHANGELOG.md) for release history.
+The macOS CLI preview package contains no optional resources. The GUI installer has a manifest-verified download path for llama.cpp, the embedding runtime, and multilingual-e5-small/base under `~/.polaris`; Rust is optional. Qwen3.5-4B is a candidate for the SemIf classifier, but its pinned distribution artifacts and acceptance checks are incomplete, so it is not automatically downloaded. Signed distribution assets and real-device acceptance are still missing. See the [macOS guide](apps/macos/README.md) for the verified scope.
 
 ## Documentation
 
@@ -67,6 +69,8 @@ The detailed documents below are in Japanese.
 | Document | Contents |
 | --- | --- |
 | [Usage guide](docs/usage.md) | Authentication, configuration, workflow, TUI, resume, and fork. |
+| [macOS desktop](apps/macos/README.md) | Local app and installer assembly, storage boundaries, and local models. |
+| [Architecture](docs/architecture.md) | Crate dependencies and external integration points. |
 | [Context efficiency](docs/context-efficiency.md) | Compaction, archival, retrieval, embeddings, and strict10. |
 | [Subagents](docs/subagents.md) | Parallel execution, schemas, and execution limits. |
 | [Preimplementation measurements](docs/preimplementation-evaluation.md) | Planning quality and the stock Codex comparison. |

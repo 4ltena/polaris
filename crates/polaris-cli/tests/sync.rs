@@ -67,6 +67,27 @@ impl Device {
         ])
     }
 
+    /// Seed the local test remote so receive/apply does not depend on C10.
+    /// Production Linux push stays disabled; no participation is published here.
+    #[cfg(target_os = "linux")]
+    fn seed_received_fixture(&self) -> polaris_core::sync::repository::Staged {
+        use polaris_core::sync::{participation, repository::SyncRepository, share::SyncPaths};
+        let state = self
+            .data
+            .join("state")
+            .join(polaris_core::project::project_id(&self.root));
+        let held = participation::read(&state).expect("synthetic joined sender");
+        assert!(
+            held.share.remote.starts_with("file://"),
+            "fixture must stay local"
+        );
+        let repository = SyncRepository::open(SyncPaths::under(&state)).unwrap();
+        let staged = repository.stage_from(&self.root, &held.manifest).unwrap();
+        repository.commit("Linux receive fixture").unwrap();
+        repository.send(&held.share.remote).unwrap();
+        staged
+    }
+
     fn write(&self, name: &str, body: &str) {
         let path = self.root.join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -88,6 +109,374 @@ fn remote(directory: &Path) -> String {
     format!("file://{}", path.to_string_lossy())
 }
 
+#[cfg(target_os = "linux")]
+fn tree_snapshot(root: &Path) -> Vec<(PathBuf, bool, u64, u64, u32, u64, i64, i64, Vec<u8>)> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        entries: &mut Vec<(PathBuf, bool, u64, u64, u32, u64, i64, i64, Vec<u8>)>,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let is_dir = metadata.is_dir();
+        let body = if is_dir {
+            Vec::new()
+        } else {
+            fs::read(path).unwrap()
+        };
+        entries.push((
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            is_dir,
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            body,
+        ));
+        if is_dir {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), entries);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sync_apply_uses_shared_owner_and_preserves_local_files() {
+    let unjoined = Device::new();
+    unjoined.write("keep.txt", "unchanged\n");
+    let before = tree_snapshot(&unjoined.root);
+    let (ok, message) = unjoined.run(&["apply"]);
+    assert!(
+        !ok && message.contains("共有に参加していません"),
+        "{message}"
+    );
+    assert_eq!(before, tree_snapshot(&unjoined.root));
+    let state = unjoined
+        .data
+        .join("state")
+        .join(polaris_core::project::project_id(&unjoined.root));
+    assert!(!state.join("apply-intents-v1").exists());
+    assert!(!state.join("management-effects-v1").exists());
+    assert!(!state.join("sync/recovery").exists());
+
+    let bare = tempfile::tempdir().unwrap();
+    let remote = remote(&bare.path().canonicalize().unwrap());
+    let sender = Device::new();
+    assert!(sender.join(&remote).0);
+    sender.write("incoming.txt", "remote content\n");
+    sender.seed_received_fixture();
+    let receiver = Device::new();
+    assert!(receiver.join(&remote).0);
+    let (ok, message) = receiver.run(&["pull"]);
+    assert!(ok, "{message}");
+    receiver.write("keep.txt", "local content\n");
+    let (ok, message) = receiver.run(&["apply"]);
+    assert!(ok && message.contains("反映しました"), "{message}");
+    assert!(!message.contains("未接続"));
+    assert_eq!(
+        fs::read(receiver.root.join("incoming.txt")).unwrap(),
+        b"remote content\n"
+    );
+    assert_eq!(
+        fs::read(receiver.root.join("keep.txt")).unwrap(),
+        b"local content\n"
+    );
+    let state = receiver
+        .data
+        .join("state")
+        .join(polaris_core::project::project_id(&receiver.root));
+    let held = polaris_core::sync::participation::read(&state).unwrap();
+    assert_eq!(held.agreed_commit, held.applied_commit);
+    assert!(held.agreed_commit.is_some());
+    assert_eq!(
+        fs::read_dir(state.join("apply-intents-v1/active"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(state.join("apply-intents-v1/archive"))
+            .unwrap()
+            .count(),
+        1
+    );
+    run_owner_fixture(&receiver, "inspect");
+    let before = tree_snapshot(&receiver.root);
+    let (ok, message) = receiver.run(&["apply"]);
+    assert!(ok && message.contains("反映済み"), "{message}");
+    assert_eq!(before, tree_snapshot(&receiver.root));
+    assert_eq!(
+        fs::read_dir(state.join("apply-intents-v1/archive"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sync_staging_is_refused_while_shared_owner_holds_the_lease() {
+    let bare = tempfile::tempdir().unwrap();
+    let remote = remote(&bare.path().canonicalize().unwrap());
+    let device = Device::new();
+    assert!(device.join(&remote).0);
+    device.write("main.rs", "unchanged\n");
+    let before = tree_snapshot(&device.root);
+    let state = device
+        .data
+        .join("state")
+        .join(polaris_core::project::project_id(&device.root));
+    let participation = fs::read(state.join("sync/participation.json")).unwrap();
+    run_owner_fixture(&device, "lease");
+    assert_eq!(before, tree_snapshot(&device.root));
+    assert_eq!(
+        participation,
+        fs::read(state.join("sync/participation.json")).unwrap()
+    );
+    assert!(!state.join("sync/recovery").exists());
+    assert!(!state.join("apply-intents-v1").exists());
+}
+
+#[cfg(target_os = "linux")]
+fn run_owner_fixture(device: &Device, role: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "sync_owner_fixture_child",
+            "--nocapture",
+        ])
+        .current_dir(&device.root)
+        .env("POLARIS_DATA_DIR", &device.data)
+        .env("HOME", &device.data)
+        .env("POLARIS_SYNC_FIXTURE_ROLE", role)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sync_refuses_unsupported_root_encoding_before_staging() {
+    use std::os::unix::ffi::OsStringExt;
+    for root_kind in ["project", "state"] {
+        let mut device = Device::new();
+        let component = std::ffi::OsString::from_vec(b"unsupported-\xff".to_vec());
+        if root_kind == "project" {
+            device.root = device.root.join(component);
+            fs::create_dir_all(device.root.join(".polaris")).unwrap();
+        } else {
+            device.data = device.data.join(component);
+            fs::create_dir(&device.data).unwrap();
+        }
+        device.write("keep.txt", "unchanged\n");
+        let before = tree_snapshot(&device.root);
+        let (ok, message) = device.run(&["apply"]);
+        assert!(!ok, "{message}");
+        assert_eq!(
+            message.trim(),
+            format!(
+                "{{\"schema_version\":1,\"code\":\"root_encoding_unsupported\",\"root\":\"{root_kind}\"}}"
+            )
+        );
+        assert_eq!(before, tree_snapshot(&device.root));
+        let state = device
+            .data
+            .join("state")
+            .join(polaris_core::project::project_id(&device.root));
+        for artifact in [
+            "sync",
+            "rewind-workspace",
+            "apply-intents-v1",
+            "management-effects-v1",
+        ] {
+            assert!(!state.join(artifact).exists(), "unexpected {artifact}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "launched with explicit fixture data root by the sync integration tests"]
+fn sync_owner_fixture_child() {
+    let project = std::env::current_dir().unwrap();
+    let owner = polaris_core::apply_owner::ApplyOwnerV1::acquire(&project).unwrap();
+    match std::env::var("POLARIS_SYNC_FIXTURE_ROLE").unwrap().as_str() {
+        "inspect" => match owner.inspect_management().unwrap() {
+            polaris_core::management_effect::ManagementEffectInspectOpenV1::Present(inspected) => {
+                assert!(inspected.effects().any(|effect| effect.request.inventory.to_string() == "C12" && matches!(effect.state, polaris_core::management_effect::ManagementEffectStateV1::Completed { .. })));
+            }
+            _ => panic!("the CLI bypassed the shared effect owner"),
+        },
+        "lease" => {
+            let state = polaris_core::project::state_dir(&project).unwrap();
+            let before = tree_snapshot(&project);
+            let participation = fs::read(state.join("sync/participation.json")).unwrap();
+            for command in ["push", "pull", "apply", "leave"] {
+                let output = Command::new(bin())
+                    .args(["sync", command])
+                    .current_dir(&project)
+                    .output()
+                    .unwrap();
+                let message = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    !output.status.success() && message.contains("共有操作を開始できません"),
+                    "{command}: {message}"
+                );
+                assert_eq!(before, tree_snapshot(&project));
+                assert_eq!(
+                    participation,
+                    fs::read(state.join("sync/participation.json")).unwrap()
+                );
+            }
+        }
+        role => panic!("unknown fixture role {role}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sync_apply_refuses_deferred_directories_without_intent_or_source_effect() {
+    let bare = tempfile::tempdir().unwrap();
+    let remote = remote(&bare.path().canonicalize().unwrap());
+    let sender = Device::new();
+    assert!(sender.join(&remote).0);
+    sender.write("new-directory/main.rs", "remote content\n");
+    sender.seed_received_fixture();
+    let receiver = Device::new();
+    assert!(receiver.join(&remote).0);
+    assert!(receiver.run(&["pull"]).0);
+    let state = receiver
+        .data
+        .join("state")
+        .join(polaris_core::project::project_id(&receiver.root));
+    let management = state.join("management-effects-v1");
+    let effects_before = management.exists().then(|| tree_snapshot(&management));
+    let before = tree_snapshot(&receiver.root);
+    let (ok, message) = receiver.run(&["apply"]);
+    assert!(!ok && message.contains("未作成ディレクトリ"), "{message}");
+    assert_eq!(before, tree_snapshot(&receiver.root));
+    assert!(!state.join("apply-intents-v1").exists());
+    assert_eq!(
+        effects_before,
+        management.exists().then(|| tree_snapshot(&management)),
+        "refused apply must preserve the effects already published by join"
+    );
+    let held = polaris_core::sync::participation::read(&state).unwrap();
+    assert_ne!(held.agreed_commit, held.applied_commit);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sync_apply_refuses_cross_device_recovery_before_creation() {
+    use std::os::unix::fs::MetadataExt;
+    let bare = tempfile::tempdir().unwrap();
+    let remote = remote(&bare.path().canonicalize().unwrap());
+    let sender = Device::new();
+    assert!(sender.join(&remote).0);
+    sender.write("main.rs", "remote content\n");
+    sender.seed_received_fixture();
+    let mut receiver = Device::new();
+    let data = tempfile::Builder::new()
+        .prefix("cli-sync-cross-device-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    receiver.data = data.path().canonicalize().unwrap();
+    receiver._data = data;
+    assert_ne!(
+        fs::metadata(&receiver.root).unwrap().dev(),
+        fs::metadata(&receiver.data).unwrap().dev(),
+        "the Linux tmpfs recovery fixture needs distinct devices"
+    );
+    assert!(receiver.join(&remote).0);
+    let (ok, message) = receiver.run(&["pull"]);
+    assert!(ok, "{message}");
+    let state = receiver
+        .data
+        .join("state")
+        .join(polaris_core::project::project_id(&receiver.root));
+    let management = state.join("management-effects-v1");
+    let effects_before = management.exists().then(|| tree_snapshot(&management));
+    let before = tree_snapshot(&receiver.root);
+    let participation = fs::read(state.join("sync/participation.json")).unwrap();
+    let (ok, message) = receiver.run(&["apply"]);
+    assert!(!ok && message.contains("同じファイルシステム"), "{message}");
+    assert_eq!(before, tree_snapshot(&receiver.root));
+    assert_eq!(
+        participation,
+        fs::read(state.join("sync/participation.json")).unwrap()
+    );
+    assert!(!state.join("sync/recovery").exists());
+    assert!(!state.join("apply-intents-v1").exists());
+    assert_eq!(
+        effects_before,
+        management.exists().then(|| tree_snapshot(&management)),
+        "refused apply must preserve the effects already published by join"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sync_apply_refuses_symlink_recovery_before_publication() {
+    let bare = tempfile::tempdir().unwrap();
+    let remote = remote(&bare.path().canonicalize().unwrap());
+    let sender = Device::new();
+    assert!(sender.join(&remote).0);
+    sender.write("main.rs", "remote content\n");
+    sender.seed_received_fixture();
+    let receiver = Device::new();
+    assert!(receiver.join(&remote).0);
+    assert!(receiver.run(&["pull"]).0);
+    let state = receiver
+        .data
+        .join("state")
+        .join(polaris_core::project::project_id(&receiver.root));
+    let foreign = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(foreign.path(), state.join("sync/recovery")).unwrap();
+    let management = state.join("management-effects-v1");
+    let effects_before = management.exists().then(|| tree_snapshot(&management));
+    let before = tree_snapshot(&receiver.root);
+    let participation = fs::read(state.join("sync/participation.json")).unwrap();
+    let foreign_before = tree_snapshot(foreign.path());
+    let (ok, message) = receiver.run(&["apply"]);
+    assert!(!ok && message.contains("復旧"), "{message}");
+    assert_eq!(before, tree_snapshot(&receiver.root));
+    assert_eq!(foreign_before, tree_snapshot(foreign.path()));
+    assert_eq!(
+        participation,
+        fs::read(state.join("sync/participation.json")).unwrap()
+    );
+    assert_eq!(
+        fs::read_link(state.join("sync/recovery")).unwrap(),
+        foreign.path()
+    );
+    assert!(!state.join("apply-intents-v1").exists());
+    assert_eq!(
+        effects_before,
+        management.exists().then(|| tree_snapshot(&management)),
+        "refused apply must preserve the effects already published by join"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn two_devices_share_a_project_and_keep_both_versions_of_a_clash() {
     let bare = tempfile::tempdir().unwrap();
@@ -161,6 +550,7 @@ fn two_devices_share_a_project_and_keep_both_versions_of_a_clash() {
     assert!(!first.run(&["status"]).0);
 }
 
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn applying_needs_an_agreed_state_and_never_removes_what_was_never_shared() {
     let bare = tempfile::tempdir().unwrap();
@@ -207,6 +597,7 @@ fn applying_needs_an_agreed_state_and_never_removes_what_was_never_shared() {
     );
 }
 
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn sending_is_refused_while_received_work_has_not_reached_the_project() {
     let bare = tempfile::tempdir().unwrap();
@@ -253,9 +644,23 @@ fn every_env_variant_and_generated_output_stays_on_this_device() {
     }
     device.write(".next/build-manifest.json", "{}\n");
     device.write("coverage/lcov.info", "TN:\n");
-    let (ok, message) = device.run(&["push"]);
-    assert!(ok, "{message}");
-    assert!(message.contains("送信しました: 1件"), "{message}");
+    #[cfg(target_os = "linux")]
+    {
+        let before = tree_snapshot(&device.root);
+        let (ok, message) = device.run(&["push"]);
+        assert!(
+            !ok && message.contains("共有送信ownerは未実装"),
+            "{message}"
+        );
+        assert_eq!(before, tree_snapshot(&device.root));
+        assert_eq!(device.seed_received_fixture().files, 1);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (ok, message) = device.run(&["push"]);
+        assert!(ok, "{message}");
+        assert!(message.contains("送信しました: 1件"), "{message}");
+    }
 
     // Read the shared history back from the remote itself.
     let listing = Command::new("git")

@@ -141,6 +141,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "run in an isolated copy, inspect changes, and confirm source apply",
     },
     SlashCommand {
+        name: "sync",
+        description: "join, receive, leave, inspect, confirm apply, or recover shared changes",
+    },
+    SlashCommand {
         name: "phase",
         description: "show or set the explicit workflow phase",
     },
@@ -418,6 +422,7 @@ pub fn parse(line: &str) -> Option<Action> {
         }
         "decided" => Action::Decided(extra),
         "compare" => Action::Compare(extra),
+        "sync" => Action::Sync(extra),
         #[cfg(target_os = "linux")]
         "apply" => Action::Apply(extra),
         "phase" => Action::Phase(extra),

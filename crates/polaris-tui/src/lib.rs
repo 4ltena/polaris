@@ -4662,6 +4662,21 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             );
                             continue;
                         }
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        slash::Action::Sync(requested) => {
+                            handle_sync_action(
+                                &terminal,
+                                &mut key_reader,
+                                &args.cwd,
+                                &args.state_dir,
+                                &requested,
+                                has_pending_inputs || dispatching_queued_input,
+                                &session,
+                                &mut status,
+                                &mut local_lines,
+                            );
+                            continue;
+                        }
                         #[cfg(target_os = "linux")]
                         slash::Action::Apply(requested) => {
                             handle_source_apply_action(
@@ -5666,6 +5681,21 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &args.state_dir,
                         has_pending_inputs || dispatching_queued_input,
                         &mut status,
+                    );
+                    continue;
+                }
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                Some(slash::Action::Sync(requested)) => {
+                    handle_sync_action(
+                        &terminal,
+                        &mut key_reader,
+                        &args.cwd,
+                        &args.state_dir,
+                        &requested,
+                        has_pending_inputs || dispatching_queued_input,
+                        &session,
+                        &mut status,
+                        &mut local_lines,
                     );
                     continue;
                 }
@@ -7667,8 +7697,453 @@ fn confirm_rewind_preview<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sync_action(
+    project: &Path,
+    state: &Path,
+    requested: &str,
+    has_queued_input: bool,
+    confirm: impl FnOnce(&render::SyncConfirmView) -> bool,
+) -> Result<String, String> {
+    use polaris_core::apply_intent::{ApplyInventoryV1, RevisionKindV1, RevisionV1};
+    use polaris_core::apply_owner::{ApplyOwnerRecoveryV1, ApplyOwnerV1, C12ApplyAdmissionV1};
+    use polaris_core::isolated_workspace::{Limits, RegisteredSecrets};
+    use polaris_core::sync::{apply, participation, repository::SyncRepository, share::SyncPaths};
+    use std::os::unix::fs::MetadataExt;
 
+    let words: Vec<_> = requested.split_whitespace().collect();
+    let inspect = words.is_empty() || words == ["status"];
+    let recovering = words.len() == 2 && words[0] == "recover";
+    if !inspect
+        && words != ["apply"]
+        && !recovering
+        && !matches!(words.first(), Some(&"join" | &"pull" | &"leave" | &"push"))
+    {
+        return Err("使い方: /sync [status|join <remote> <share-id> <invite-id> <expires> [除外名... ]|pull|leave|apply|recover <表示された操作ID>]".into());
+    }
+    if !inspect && has_queued_input {
+        return Err("送信待ちを空にしてから共有内容を操作してください".into());
+    }
+    let project = std::fs::canonicalize(polaris_core::project::resolve_root(project))
+        .map_err(|e| e.to_string())?;
+    let expected_state = polaris_core::project::state_dir(&project).map_err(|e| e.to_string())?;
+    let state = std::fs::canonicalize(state).map_err(|e| e.to_string())?;
+    if state != std::fs::canonicalize(expected_state).map_err(|e| e.to_string())? {
+        return Err("projectと保存場所が一致しません".into());
+    }
+    // Retain the same owner from inspection through confirmation and commit.
+    let owner = ApplyOwnerV1::acquire(&project).map_err(|e| e.to_string())?;
+    if matches!(words.first(), Some(&"join" | &"pull" | &"leave" | &"push")) {
+        if words[0] == "push" {
+            return Err(
+                "共有送信ownerは未実装です。credential実機検証が必要なため送信できません。".into(),
+            );
+        }
+        owner
+            .ensure_sync_idle()
+            .map_err(|_| "未完了の共有操作を確認してください")?;
+        let held = participation::read(&state);
+        let mut join = None;
+        let (id, detail) = match words[0] {
+            "join" if words.len() >= 5 => {
+                let share = polaris_core::sync::share::ShareLink {
+                    remote: words[1].into(),
+                    share_id: words[2].into(),
+                    invitation_id: words[3].into(),
+                    expires_unix_seconds: words[4]
+                        .parse()
+                        .map_err(|_| "招待期限はUNIX秒で指定してください")?,
+                };
+                let now =
+                    u64::try_from(now_millis() / 1000).map_err(|_| "招待期限を照合できません")?;
+                share
+                    .accept(now)
+                    .map_err(|_| "招待URL・ID・期限を確認してください。変更していません。")?;
+                if held.is_some() {
+                    return Err("参加済みです。安全なcredential rebind ownerは未実装です。".into());
+                }
+                let manifest = polaris_core::sync::share::ShareManifest {
+                    version: 1,
+                    excluded: words[5..].iter().map(|w| (*w).to_owned()).collect(),
+                };
+                let detail = format!(
+                    "共有: {}\n招待: {}\nremote: {}\n期限: {}\n除外: {:?}\n参加はこの端末の保存のみ。peer・sourceを変更しません。",
+                    share.share_id,
+                    share.invitation_id,
+                    share.remote,
+                    share.expires_unix_seconds,
+                    manifest.excluded
+                );
+                join = Some((share, manifest, now));
+                ("C08 join", detail)
+            }
+            "pull" if words.len() == 1 => {
+                let held = held.as_ref().ok_or("このprojectは未参加です")?;
+                (
+                    "C11 pull",
+                    format!(
+                        "共有: {}\nremote: {}\n合意revision: {}\n受信・local stagingだけを更新します。source適用は別の確認です。",
+                        held.share.share_id,
+                        held.share.remote,
+                        held.agreed_commit.as_deref().unwrap_or("なし")
+                    ),
+                )
+            }
+            "leave" if words.len() == 1 => {
+                let held = held.as_ref().ok_or("このprojectは未参加です")?;
+                (
+                    "C13 leave",
+                    format!(
+                        "共有: {}\nこの端末の参加状態を削除します。共有履歴・peer・sourceは残します。",
+                        held.share.share_id
+                    ),
+                )
+            }
+            _ => return Err(
+                "/sync join <remote> <share-id> <invite-id> <expires> [除外名...] | pull | leave"
+                    .into(),
+            ),
+        };
+        let view = render::SyncConfirmView {
+            recovering: false,
+            project: project.display().to_string(),
+            operation: id.into(),
+            revision: detail,
+            previous_revision: "変更前の参加状態を管理記録へ結び付けます".into(),
+            recovery: "sourceとpeerは変更しません".into(),
+            changes: Vec::new(),
+        };
+        let accepted = confirm(&view);
+        return match words[0] {
+            "join" => {
+                let (share, manifest, now) = join.expect("join validated");
+                owner
+                    .join_confirmed(share, manifest, now, accepted)
+                    .map(|p| {
+                        if p.is_some() {
+                            "参加しました"
+                        } else {
+                            "参加を取り消しました"
+                        }
+                        .into()
+                    })
+            }
+            "pull" => owner.pull_confirmed(accepted).map(|p| match p {
+                Some(exchange) => format!(
+                    "受け取りました: {}件、解消待ち{}件。sourceへは未反映です。",
+                    exchange.changes.len(),
+                    exchange.needs_attention().len()
+                ),
+                None => "受信を取り消しました".into(),
+            }),
+            "leave" => owner.leave_confirmed(accepted).map(|p| {
+                if p.is_some() {
+                    "この端末の参加を解除しました"
+                } else {
+                    "離脱を取り消しました"
+                }
+                .into()
+            }),
+            _ => unreachable!(),
+        }
+        .map_err(|_| "共有操作の結果を確定できません。/syncで状態を確認してください。".into());
+    }
+    let active = owner.active().map_err(|e| e.to_string())?;
+    let recovery = state.join("sync/recovery").display().to_string();
+    if inspect {
+        let pending = active.as_ref().map_or_else(
+            || "なし".into(),
+            |intent| {
+                format!(
+                    "{:?} {:?} / 操作ID: {}",
+                    intent.descriptor().inventory_id,
+                    intent.latest().phase,
+                    intent.descriptor().operation_key.as_hex()
+                )
+            },
+        );
+        let management_pending = match owner
+            .inspect_management()
+            .map_err(|_| "共有の管理記録を確認できません")?
+        {
+            polaris_core::management_effect::ManagementEffectInspectOpenV1::Absent => {
+                "なし".to_owned()
+            }
+            polaris_core::management_effect::ManagementEffectInspectOpenV1::Present(inspected) => {
+                let records: Vec<_> = inspected
+                    .effects()
+                    .filter(|e| e.state.blocks_new_work())
+                    .map(|e| {
+                        format!(
+                            "{} {} {:?}",
+                            e.request.inventory, e.request.operation_id, e.state
+                        )
+                    })
+                    .collect();
+                if records.is_empty() {
+                    "なし".into()
+                } else {
+                    records.join("\n")
+                }
+            }
+        };
+        let held = participation::read(&state);
+        return Ok(format!(
+            "共有適用: {}\n合意revision: {}\n反映済みrevision: {}\n解消待ち: {}\n未完了: {}\n管理操作: {}\n復旧用の控え: {}\n/sync apply · /sync recover <操作ID>",
+            if held.is_some() {
+                "参加中"
+            } else {
+                "未参加"
+            },
+            held.as_ref()
+                .and_then(|p| p.agreed_commit.as_deref())
+                .unwrap_or("なし"),
+            held.as_ref()
+                .and_then(|p| p.applied_commit.as_deref())
+                .unwrap_or("なし"),
+            held.as_ref().map_or(0, |p| p.unresolved.len()),
+            pending,
+            management_pending,
+            recovery,
+        ));
+    }
+    if recovering {
+        let active = active.ok_or("未完了の共有適用はありません")?;
+        let key = active.descriptor().operation_key.as_hex();
+        if active.descriptor().inventory_id != ApplyInventoryV1::C12 || words[1] != key {
+            return Err("C12の表示された未完了操作IDを指定してください。変更していません。".into());
+        }
+        let parent = owner
+            .c12_recovery_parent(false)
+            .map_err(|e| e.to_string())?;
+        let view = render::SyncConfirmView {
+            recovering: true,
+            project: project.display().to_string(),
+            operation: key.clone(),
+            revision: active.descriptor().agreed_revision.value.clone(),
+            previous_revision: "変更しない".into(),
+            recovery,
+            changes: Vec::new(),
+        };
+        if !confirm(&view) {
+            return Ok("共有適用の復旧を取り消しました".into());
+        }
+        return match owner.recover_current(&parent).map_err(|e| e.to_string())? {
+            ApplyOwnerRecoveryV1::OutcomeUnknown(_) => Ok(format!(
+                "適用結果は未確定です ({key})。sourceを再適用していません。復旧用の控え: {}",
+                view.recovery
+            )),
+            ApplyOwnerRecoveryV1::Archived(_) => Ok(format!(
+                "保存済み証拠から操作を閉じました ({key})。sourceを再適用していません。/syncで状態を確認してください。"
+            )),
+            ApplyOwnerRecoveryV1::Idle => {
+                Err("未完了状態が変わりました。/syncで確認してください。".into())
+            }
+        };
+    }
+    if let Some(active) = active {
+        return Err(format!(
+            "未完了の適用があります ({})。/syncで確認してください。新しい適用は行っていません。",
+            active.descriptor().operation_key.as_hex()
+        ));
+    }
+    owner.ensure_sync_idle().map_err(|e| e.to_string())?;
+    let mut held = participation::read(&state).ok_or("このprojectは共有に参加していません")?;
+    if !held.unresolved.is_empty() {
+        return Err(format!(
+            "解消待ちが{}件あります。先に解消してください。",
+            held.unresolved.len()
+        ));
+    }
+    let agreed = held
+        .agreed_commit
+        .clone()
+        .ok_or("合意した内容がありません。先にpolaris sync pullを実行してください。")?;
+    if held.applied_commit.as_deref() == Some(&agreed) {
+        return Ok("この内容は反映済みです。".into());
+    }
+    if std::fs::metadata(&project)
+        .map_err(|e| e.to_string())?
+        .dev()
+        != std::fs::metadata(&state).map_err(|e| e.to_string())?.dev()
+    {
+        return Err("projectと同じファイルシステムの復旧場所が必要です".into());
+    }
+    let parent = owner.c12_recovery_parent(true).map_err(|e| e.to_string())?;
+    let paths = SyncPaths::under(&state);
+    let staging = paths.work_tree.clone();
+    let repository = SyncRepository::open(paths).map_err(|e| e.to_string())?;
+    if repository.head().as_deref() != Some(&agreed) {
+        return Err(
+            "同期用の記録が合意内容と一致しません。先にpolaris sync pullを実行してください。"
+                .into(),
+        );
+    }
+    repository.restore(&agreed).map_err(|e| e.to_string())?;
+    let (written, removed) = repository
+        .changed_paths(held.applied_commit.as_deref(), &agreed)
+        .map_err(|e| e.to_string())?;
+    let limits = Limits {
+        max_entries: 40_000,
+        max_files: 20_000,
+        max_file_bytes: 16 * 1024 * 1024,
+        max_total_bytes: 256 * 1024 * 1024,
+        max_depth: 32,
+    };
+    let (snapshot, changes) = polaris_auth::protection::with_protected_paths(|registered| {
+        let secrets =
+            RegisteredSecrets::from_auth_registry(registered).map_err(|e| e.to_string())?;
+        let (snapshot, shaped) = apply::shape_copy(
+            &project,
+            &staging,
+            &held.manifest,
+            &apply::Changed { written, removed },
+            &secrets,
+            limits,
+        )
+        .map_err(|e| e.to_string())?;
+        if !shaped.deferred.is_empty() {
+            return Err("未作成ディレクトリの共有変更が残っています".to_string());
+        }
+        let changes =
+            apply::planned_changes(&snapshot, &secrets, limits).map_err(|e| e.to_string())?;
+        if !changes.is_applicable() {
+            return Err("保護対象を含むため共有内容を適用できません".into());
+        }
+        Ok::<_, String>((snapshot, changes))
+    })
+    .map_err(|_| "保護状態を確認できません".to_string())??;
+    let revision = |value: &str| -> Result<RevisionV1, String> {
+        let kind = match value.len() {
+            40 => RevisionKindV1::GitSha1,
+            64 => RevisionKindV1::GitSha256,
+            _ => return Err("合意revisionの形式を確認できません".into()),
+        };
+        if !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("合意revisionの形式を確認できません".into());
+        }
+        Ok(RevisionV1 {
+            kind,
+            value: value.into(),
+        })
+    };
+    let agreed_revision = revision(&agreed)?;
+    let previous_applied_revision = held.applied_commit.as_deref().map(revision).transpose()?;
+    let management_operation_id =
+        polaris_core::management_effect::ManagementOperationIdV1::random()
+            .map_err(|e| e.to_string())?;
+    let view = render::SyncConfirmView {
+        recovering: false,
+        project: project.display().to_string(),
+        operation: management_operation_id.to_string(),
+        revision: agreed.clone(),
+        previous_revision: held.applied_commit.clone().unwrap_or_else(|| "なし".into()),
+        recovery,
+        changes: changes
+            .changes
+            .iter()
+            .map(|c| format!("{:?}: {}", c.kind, c.relative_path.display()))
+            .collect(),
+    };
+    if !confirm(&view) {
+        return Ok("共有内容の適用を取り消しました".into());
+    }
+    held.applied_commit = Some(agreed);
+    let admission = C12ApplyAdmissionV1 {
+        management_operation_id,
+        agreed_revision: agreed_revision.clone(),
+        staged_revision: agreed_revision,
+        previous_applied_revision,
+        target_participation: serde_json::to_vec_pretty(&held).map_err(|e| e.to_string())?,
+    };
+    // Apply precisely the inspected snapshot; do not reconstruct it after y.
+    let report = owner
+        .apply_c12(admission, &snapshot, &changes, limits, &parent)
+        .map_err(|e| format!("反映を確定できません。/syncで状態を確認してください: {e}"))?;
+    if let Some(failure) = report.failure {
+        return Err(format!(
+            "適用結果は未確定です: {failure:?}。/syncで状態を確認してください。"
+        ));
+    }
+    Ok(format!(
+        "{}件を反映しました。復旧用の控え: {}",
+        report.entries.len(),
+        view.recovery
+    ))
+}
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn confirm_sync<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    view: &render::SyncConfirmView,
+) -> bool {
+    if view.operation.starts_with("C08 ")
+        || view.operation.starts_with("C11 ")
+        || view.operation.starts_with("C13 ")
+    {
+        return account::confirm(
+            terminal,
+            reader,
+            &view.operation,
+            &view.project,
+            &view.revision,
+        );
+    }
+    loop {
+        if terminal
+            .borrow_mut()
+            .draw(|f| render::render_sync_confirmation(f, view))
+            .is_err()
+        {
+            return false;
+        }
+        use ratatui::crossterm::event::KeyCode;
+        match reader.read_key() {
+            Ok(KeyCode::Char('y')) => return true,
+            Ok(KeyCode::Esc) | Err(_) => return false,
+            Ok(_) => {}
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn handle_sync_action<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    project: &Path,
+    state: &Path,
+    requested: &str,
+    has_queued_input: bool,
+    session: &polaris_core::session::Session,
+    status: &mut Status,
+    local_lines: &mut Vec<ratatui::text::Line<'static>>,
+) {
+    let result = if !requested.is_empty() && requested != "status" {
+        session.check_persistence().map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
+    .and_then(|()| {
+        sync_action(project, state, requested, has_queued_input, |view| {
+            confirm_sync(terminal, reader, view)
+        })
+    });
+    match result {
+        Ok(text) => {
+            local_lines.extend(
+                text.lines()
+                    .map(|line| ratatui::text::Line::from(render::sanitize(line))),
+            );
+            *status = Status::Notice("共有適用の状態を表示しました".into());
+        }
+        Err(error) => *status = Status::Error(render::sanitize(&error)),
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
@@ -13640,8 +14115,545 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn m2d_sync_confirmation_cancels_and_sanitizes_paths() {
+        let terminal = RefCell::new(
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 18)).unwrap(),
+        );
+        let view = render::SyncConfirmView {
+            recovering: false,
+            operation: "operation-id".into(),
+            project: "project\x1b[2J".into(),
+            revision: "agreed-revision".into(),
+            previous_revision: "old-revision".into(),
+            recovery: "private-recovery".into(),
+            changes: vec!["Modified: file\x1b[31m".into()],
+        };
+        let mut declined = ScriptedReader(VecDeque::from([KeyCode::Esc]));
+        assert!(!confirm_sync(&terminal, &mut declined, &view));
+        let mut accepted = ScriptedReader(VecDeque::from([KeyCode::Enter, KeyCode::Char('y')]));
+        assert!(confirm_sync(&terminal, &mut accepted, &view));
+        let screen = {
+            let term = terminal.borrow();
+            let buffer = term.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>()
+        };
+        for expected in [
+            "C12",
+            "agreed-revision",
+            "old-revision",
+            "private-recovery",
+            "IrreversibleLocal",
+        ] {
+            assert!(screen.contains(expected), "{screen}");
+        }
+        assert!(!screen.contains('\x1b'));
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m3b_sync_tui_join_pull_leave_and_denial() {
+        const CHILD: &str = "POLARIS_M3B_TUI_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "tests::m3b_sync_tui_join_pull_leave_and_denial",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use polaris_core::sync::{
+            participation,
+            repository::SyncRepository,
+            share::{ShareManifest, SyncPaths},
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        polaris_auth::protection::use_trusted_home(&home).unwrap();
+        let project = home.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let state = polaris_core::project::state_dir(&project).unwrap();
+        source_apply::prepare_state(&project, &state).unwrap();
+        let peer_project = home.join("peer-project");
+        std::fs::create_dir(&peer_project).unwrap();
+        std::fs::write(peer_project.join("received.txt"), "peer body\n").unwrap();
+        let peer = SyncRepository::open(SyncPaths::under(&home.join("peer-state"))).unwrap();
+        peer.stage_from(&peer_project, &ShareManifest::default())
+            .unwrap();
+        let head = peer.commit("fixture").unwrap();
+        let request = format!(
+            "join file://{} fixture-share fixture-invite {}",
+            home.join("peer-state/sync/repository").display(),
+            u64::MAX
+        );
+        assert!(
+            sync_action(&project, &state, &request, true, |_| panic!(
+                "queued mutation confirmed"
+            ))
+            .is_err()
+        );
+        assert!(
+            sync_action(
+                &project,
+                &state,
+                "join https://user:secret@example.com/x fixture-share fixture-invite 9999999999",
+                false,
+                |_| panic!("invalid invite displayed")
+            )
+            .is_err()
+        );
+        let cancelled = sync_action(&project, &state, &request, false, |view| {
+            assert!(view.revision.contains("fixture-share"));
+            false
+        })
+        .unwrap();
+        assert!(cancelled.contains("取り消"));
+        assert!(participation::read(&state).is_none());
+        assert!(
+            sync_action(&project, &state, &request, false, |_| true)
+                .unwrap()
+                .contains("参加")
+        );
+        assert!(sync_action(&project, &state, &request, false, |_| panic!("rebind")).is_err());
+        let status = sync_action(&project, &state, "status", false, |_| {
+            panic!("read confirmation")
+        })
+        .unwrap();
+        assert!(status.contains("参加中"));
+        assert!(
+            sync_action(&project, &state, "push", false, |_| panic!(
+                "unapproved push"
+            ))
+            .is_err()
+        );
+        assert!(
+            sync_action(&project, &state, "pull", false, |_| false)
+                .unwrap()
+                .contains("取り消")
+        );
+        assert!(
+            sync_action(&project, &state, "pull", false, |_| true)
+                .unwrap()
+                .contains("sourceへは未反映")
+        );
+        assert!(!project.join("received.txt").exists());
+        assert_eq!(peer.head(), head);
+        assert!(
+            sync_action(&project, &state, "leave", false, |_| false)
+                .unwrap()
+                .contains("取り消")
+        );
+        assert!(participation::read(&state).is_some());
+        assert!(
+            sync_action(&project, &state, "leave", false, |_| true)
+                .unwrap()
+                .contains("解除")
+        );
+        assert!(participation::read(&state).is_none());
+        assert_eq!(peer.head(), head);
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m2d_c12_confirmation_apply_reopen_and_refusal() {
+        const CHILD: &str = "POLARIS_TUI_M2D_C12_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate project state in a normal child rather than swapping
+            // a process-global data root while other TUI tests are running.
+            let fixture = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::m2d_c12_confirmation_apply_reopen_and_refusal",
+                    "--nocapture",
+                ])
+                .env(CHILD, fixture.path())
+                .env("POLARIS_DATA_DIR", fixture.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("m2d-c12-receipt: verified"));
+            return;
+        }
+        use polaris_core::sync::{
+            participation,
+            repository::SyncRepository,
+            share::{ShareLink, ShareManifest, SyncPaths},
+        };
+        let fixture = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let project = fixture.join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("shared.txt"), b"local").unwrap();
+        let state = polaris_core::project::state_dir(&project).unwrap();
+        source_apply::prepare_state(&project, &state).unwrap();
+        let manifest = ShareManifest {
+            version: 1,
+            excluded: Vec::new(),
+        };
+        participation::join(
+            &state,
+            ShareLink {
+                remote: "file:///unused-sync-remote".into(),
+                share_id: "share-id1".into(),
+                invitation_id: "invite-id1".into(),
+                expires_unix_seconds: u64::MAX,
+            },
+            manifest.clone(),
+            1,
+        )
+        .unwrap();
+        let repository = SyncRepository::open(SyncPaths::under(&state)).unwrap();
+        let incoming = fixture.join("incoming");
+        std::fs::create_dir(&incoming).unwrap();
+        std::fs::write(incoming.join("shared.txt"), b"agreed").unwrap();
+        repository.stage_from(&incoming, &manifest).unwrap();
+        let agreed = repository.commit("incoming fixture").unwrap().unwrap();
+        let mut held = participation::read(&state).unwrap();
+        held.agreed_commit = Some(agreed.clone());
+        participation::write(&state, &held).unwrap();
+        let initial = std::fs::read(state.join("sync/participation.json")).unwrap();
+        let read = sync_action(&project, &state, "", true, |_| {
+            panic!("read must not confirm")
+        })
+        .unwrap();
+        assert!(read.contains(&agreed));
+        assert!(
+            sync_action(&project, &state, "apply", true, |_| panic!(
+                "queued apply must refuse"
+            ))
+            .is_err()
+        );
+        let mut broken_session = Session::new();
+        let broken_persistence = polaris_core::session_store::PersistedSession::create(
+            &fixture.join("broken-session"),
+            &fixture.join("broken-memory.sqlite3"),
+            "project",
+            polaris_core::conversation_state::HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        broken_session.attach(broken_persistence).unwrap();
+        let broken_path = broken_session
+            .persistence
+            .as_ref()
+            .unwrap()
+            .store
+            .directory()
+            .join("state.json");
+        std::fs::write(&broken_path, b"corrupt-state").unwrap();
+        assert!(broken_session.check_persistence().is_err());
+        let terminal = RefCell::new(
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 22)).unwrap(),
+        );
+        let mut reader = ScriptedReader(VecDeque::from([KeyCode::Char('y')]));
+        let mut status = Status::Idle;
+        let mut lines = Vec::new();
+        handle_sync_action(
+            &terminal,
+            &mut reader,
+            &project,
+            &state,
+            "apply",
+            false,
+            &broken_session,
+            &mut status,
+            &mut lines,
+        );
+        assert!(matches!(status, Status::Error(_)));
+        assert_eq!(
+            reader.0.len(),
+            1,
+            "a valid candidate must still refuse before confirmation"
+        );
+        assert!(lines.is_empty());
+        assert_eq!(std::fs::read(project.join("shared.txt")).unwrap(), b"local");
+        assert_eq!(
+            std::fs::read(state.join("sync/participation.json")).unwrap(),
+            initial
+        );
+        assert!(
+            polaris_core::apply_owner::ApplyOwnerV1::acquire(&project)
+                .unwrap()
+                .active()
+                .unwrap()
+                .is_none()
+        );
+        let cancelled = sync_action(&project, &state, "apply", false, |view| {
+            assert_eq!(view.revision, agreed);
+            assert_eq!(view.changes, ["Modified: shared.txt"]);
+            assert!(
+                polaris_core::apply_owner::ApplyOwnerV1::acquire(&project).is_err(),
+                "confirmation must retain lease"
+            );
+            false
+        })
+        .unwrap();
+        assert!(cancelled.contains("取り消し"));
+        assert_eq!(std::fs::read(project.join("shared.txt")).unwrap(), b"local");
+        assert_eq!(
+            std::fs::read(state.join("sync/participation.json")).unwrap(),
+            initial
+        );
+        assert!(
+            polaris_core::apply_owner::ApplyOwnerV1::acquire(&project)
+                .unwrap()
+                .active()
+                .unwrap()
+                .is_none()
+        );
+        let drift = sync_action(&project, &state, "apply", false, |_| {
+            std::fs::write(project.join("shared.txt"), b"changed-after-preview").unwrap();
+            true
+        });
+        assert!(drift.is_err(), "preview drift must refuse");
+        assert_eq!(
+            std::fs::read(project.join("shared.txt")).unwrap(),
+            b"changed-after-preview"
+        );
+        assert_eq!(
+            std::fs::read(state.join("sync/participation.json")).unwrap(),
+            initial
+        );
+        std::fs::write(project.join("shared.txt"), b"local").unwrap();
+        let applied = sync_action(&project, &state, "apply", false, |_| true).unwrap();
+        assert!(applied.contains("1件"));
+        assert_eq!(
+            std::fs::read(project.join("shared.txt")).unwrap(),
+            b"agreed"
+        );
+        assert_eq!(
+            participation::read(&state)
+                .unwrap()
+                .applied_commit
+                .as_deref(),
+            Some(agreed.as_str())
+        );
+        let archived = polaris_core::apply_owner::ApplyOwnerV1::acquire(&project).unwrap();
+        assert!(archived.active().unwrap().is_none());
+        drop(archived);
+        let repeated = sync_action(&project, &state, "apply", false, |_| {
+            panic!("already applied must not confirm")
+        })
+        .unwrap();
+        assert!(repeated.contains("反映済み"));
+        assert!(
+            sync_action(&project, &state, "recover wrong", false, |_| panic!(
+                "wrong recovery must refuse"
+            ))
+            .is_err()
+        );
+
+        // A non-writable source directory gives a real, deterministic effect
+        // failure after durable admission without killing a process or mocking
+        // the owner. Reopening and recovery must never retry the source rename.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let unknown_project = fixture.join("unknown-project");
+        std::fs::create_dir(&unknown_project).unwrap();
+        let source_file = unknown_project.join("shared.txt");
+        std::fs::write(&source_file, b"untouched").unwrap();
+        let unknown_state = polaris_core::project::state_dir(&unknown_project).unwrap();
+        source_apply::prepare_state(&unknown_project, &unknown_state).unwrap();
+        participation::join(&unknown_state, held.share.clone(), manifest.clone(), 1).unwrap();
+        let unknown_repository = SyncRepository::open(SyncPaths::under(&unknown_state)).unwrap();
+        unknown_repository.stage_from(&incoming, &manifest).unwrap();
+        let incoming_revision = unknown_repository
+            .commit("unknown fixture")
+            .unwrap()
+            .unwrap();
+        let mut joined = participation::read(&unknown_state).unwrap();
+        joined.agreed_commit = Some(incoming_revision);
+        participation::write(&unknown_state, &joined).unwrap();
+        let initial_participation =
+            std::fs::read(unknown_state.join("sync/participation.json")).unwrap();
+        let before = std::fs::metadata(&source_file).unwrap();
+        std::fs::set_permissions(&unknown_project, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed_apply = sync_action(&unknown_project, &unknown_state, "apply", false, |_| true);
+        std::fs::set_permissions(&unknown_project, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed_apply.is_err(), "{failed_apply:?}");
+        let owner = polaris_core::apply_owner::ApplyOwnerV1::acquire(&unknown_project).unwrap();
+        let active = owner
+            .active()
+            .unwrap()
+            .expect("failed source effect must remain discoverable");
+        let key = active.descriptor().operation_key.as_hex();
+        assert!(matches!(
+            active.latest().phase,
+            polaris_core::apply_intent::ApplyPhaseV1::OutcomeUnknown
+        ));
+        let effects = {
+            let workspace = polaris_core::rewind_workspace::WorkspaceOwner::open(
+                &unknown_project,
+                &unknown_state.join("rewind-workspace"),
+                polaris_core::rewind_workspace::RewindLimits::default(),
+            )
+            .unwrap();
+            drop(owner);
+            let lease = workspace.try_mutation().unwrap();
+            polaris_core::management_effect::ManagementEffectStoreV1::open_at_state_dir(
+                &unknown_project,
+                &unknown_state,
+                &lease,
+            )
+            .unwrap()
+        };
+        assert!(
+            management_clearance_error(&effects, &slash::Action::Sync("apply".into())).is_some()
+        );
+        assert!(
+            management_clearance_error(&effects, &slash::Action::Sync("status".into())).is_none()
+        );
+        assert!(
+            management_clearance_error(&effects, &slash::Action::Sync(format!("recover {key}")))
+                .is_none()
+        );
+        assert!(
+            sync_action(
+                &unknown_project,
+                &unknown_state,
+                "status",
+                false,
+                |_| panic!("inspect")
+            )
+            .unwrap()
+            .contains(&key)
+        );
+        assert!(
+            sync_action(
+                &unknown_project,
+                &unknown_state,
+                "apply",
+                false,
+                |_| panic!("must not retry")
+            )
+            .is_err()
+        );
+        assert!(
+            sync_action(
+                &unknown_project,
+                &unknown_state,
+                "recover wrong",
+                false,
+                |_| panic!("wrong key must not confirm")
+            )
+            .is_err()
+        );
+        let cancelled_recovery = sync_action(
+            &unknown_project,
+            &unknown_state,
+            &format!("recover {key}"),
+            false,
+            |_| false,
+        )
+        .unwrap();
+        assert!(cancelled_recovery.contains("取り消し"));
+        // Mirror startup: C12 unknown must not hide the recovery command.
+        let workspace = open_rewind_workspace(&unknown_project, &unknown_state).unwrap();
+        {
+            let lease = workspace.try_mutation().unwrap();
+            let data_root = fixture.join("data");
+            let project_id = persist::project_identity(&unknown_project).unwrap();
+            polaris_core::session_switch::SessionSwitchOwner {
+                effects: &effects,
+                lease: &lease,
+                state_dir: &unknown_state,
+            }
+            .recover(
+                &data_root,
+                &unknown_state.join("memory.sqlite3"),
+                &project_id,
+            )
+            .unwrap();
+            polaris_core::management_effect::workflow_change::WorkflowChangeOwner {
+                effects: &effects,
+                lease: &lease,
+                state_dir: &unknown_state,
+            }
+            .recover(
+                &data_root,
+                &unknown_state.join("memory.sqlite3"),
+                &project_id,
+            )
+            .unwrap();
+        }
+        let terminal = RefCell::new(
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 22)).unwrap(),
+        );
+        for _ in 0..2 {
+            let mut reader = ScriptedReader(VecDeque::from([KeyCode::Char('y')]));
+            let mut status = Status::Idle;
+            let mut lines = Vec::new();
+            let mut refused_reader = ScriptedReader(VecDeque::from([KeyCode::Char('y')]));
+            handle_sync_action(
+                &terminal,
+                &mut refused_reader,
+                &unknown_project,
+                &unknown_state,
+                &format!("recover {key}"),
+                false,
+                &broken_session,
+                &mut status,
+                &mut lines,
+            );
+            assert!(matches!(status, Status::Error(_)));
+            assert_eq!(refused_reader.0.len(), 1);
+            assert!(lines.is_empty());
+            handle_sync_action(
+                &terminal,
+                &mut reader,
+                &unknown_project,
+                &unknown_state,
+                &format!("recover {key}"),
+                false,
+                &Session::new(),
+                &mut status,
+                &mut lines,
+            );
+            assert!(matches!(status, Status::Notice(_)));
+            assert!(
+                reader.0.is_empty(),
+                "recovery requires explicit confirmation"
+            );
+            let recovered = lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                recovered.contains("未確定") && recovered.contains("再適用していません"),
+                "{recovered}"
+            );
+            let after = std::fs::metadata(&source_file).unwrap();
+            assert_eq!(
+                (before.dev(), before.ino(), before.mtime(), before.ctime()),
+                (after.dev(), after.ino(), after.mtime(), after.ctime())
+            );
+            assert_eq!(std::fs::read(&source_file).unwrap(), b"untouched");
+            assert_eq!(
+                std::fs::read(unknown_state.join("sync/participation.json")).unwrap(),
+                initial_participation
+            );
+        }
+        println!("m2d-c12-receipt: verified");
+    }
 
     #[test]
     fn workflow_confirmation_shows_exact_session_and_requires_y() {

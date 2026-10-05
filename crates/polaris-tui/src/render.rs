@@ -1603,7 +1603,62 @@ pub fn render_management_confirmation(
     ready
 }
 
+pub struct SyncConfirmView {
+    pub recovering: bool,
+    pub project: String,
+    pub operation: String,
+    pub revision: String,
+    pub previous_revision: String,
+    pub recovery: String,
+    pub changes: Vec<String>,
+}
 
+pub fn render_sync_confirmation(frame: &mut Frame, view: &SyncConfirmView) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines = vec![
+        Line::from(if view.recovering {
+            "confirm recovery (C12)"
+        } else {
+            "confirm shared changes (C12)"
+        }),
+        Line::from(format!("Project: {}", sanitize(&view.project))),
+        Line::from(format!("Operation: {}", sanitize(&view.operation))),
+        Line::from(format!("Agreed revision: {}", sanitize(&view.revision))),
+        Line::from(format!(
+            "Previously applied: {}",
+            sanitize(&view.previous_revision)
+        )),
+        Line::from("Rewind disposition: IrreversibleLocal"),
+        Line::from(format!("Recovery: {}", sanitize(&view.recovery))),
+        Line::from(format!("Changed files: {}", view.changes.len())),
+    ];
+    let visible = frame.area().height.saturating_sub(13) as usize;
+    lines.extend(
+        view.changes
+            .iter()
+            .take(visible)
+            .map(|path| Line::from(sanitize(path))),
+    );
+    if view.changes.len() > visible {
+        lines.push(Line::from(format!(
+            "… {} more",
+            view.changes.len() - visible
+        )));
+    }
+    lines.push(Line::from(if view.recovering {
+        "Join saved evidence only; never apply source changes again."
+    } else {
+        "Changes affect this project; conversation rewind does not undo them."
+    }));
+    lines.push(Line::from(Span::styled(
+        "press y to confirm · esc to cancel",
+        dim,
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
+        frame.area(),
+    );
+}
 
 pub struct WorkflowChangeConfirmView<'a> {
     pub inventory: &'a str,

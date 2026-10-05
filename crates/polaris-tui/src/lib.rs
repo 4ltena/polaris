@@ -15,6 +15,9 @@ pub use memory::{configure_archive, configure_memory, lock_memory};
 pub mod render;
 mod selection;
 pub mod sessions;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod signal;
 pub mod slash;
 mod time;
 pub mod tool_memory;
@@ -49,6 +52,19 @@ use input::{InputAction, apply_key};
 use render::Status;
 
 const UNDECIDED_EFFORT: &str = "undecided";
+#[cfg(target_os = "linux")]
+const LINUX_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(target_os = "linux")]
+fn linux_signal_exit_code(reason: signal::LinuxProcessShutdown) -> ExitCode {
+    match reason {
+        signal::LinuxProcessShutdown::SigInt => ExitCode::from(130),
+        signal::LinuxProcessShutdown::SigTerm => ExitCode::from(143),
+    }
+}
+#[cfg(target_os = "linux")]
+fn linux_pending_exit_code() -> Option<ExitCode> {
+    signal::pending_linux_process_shutdown().map(linux_signal_exit_code)
+}
 
 /// CLI-owned constructor, invoked only when a selected strict session needs it.
 pub type HistoryBackend = (

@@ -182,8 +182,21 @@ pub fn apply_key_entry_key(buffer: &mut String, key: KeyEvent) -> KeyEntryAction
     }
 }
 
+#[cfg(target_os = "linux")]
+use std::io;
 use std::io::IsTerminal;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+use ratatui::backend::{Backend, CrosstermBackend};
+#[cfg(target_os = "linux")]
+use ratatui::crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+#[cfg(target_os = "linux")]
+use ratatui::{DefaultTerminal, Terminal};
 
 /// Which credential became available once onboarding completes
 /// successfully. `polaris-cli::main()` uses this to decide which
@@ -216,11 +229,349 @@ impl std::fmt::Display for OnboardingError {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn shutdown_requested() -> bool {
+    crate::signal::pending_linux_process_shutdown().is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn enter_onboarding_terminal_with<T>(
+    pending_shutdown: impl FnOnce() -> bool,
+    enter: impl FnOnce() -> Result<T, OnboardingError>,
+) -> Result<T, OnboardingError> {
+    if pending_shutdown() {
+        Err(OnboardingError::Cancelled)
+    } else {
+        enter()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn save_api_key_after_observation<E: std::fmt::Display>(
+    pending_shutdown: impl FnOnce() -> bool,
+    save: impl FnOnce() -> Result<(), E>,
+) -> Result<Outcome, OnboardingError> {
+    if pending_shutdown() {
+        return Err(OnboardingError::Cancelled);
+    }
+    // A completed save remains committed even if a signal arrives in flight.
+    save()
+        .map(|()| Outcome::ApiKeySaved)
+        .map_err(|error| OnboardingError::Auth(error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn reenter_after_oauth_success<T>(
+    mut pending_shutdown: impl FnMut() -> bool,
+    enter: impl FnOnce() -> Result<T, OnboardingError>,
+) -> Result<Option<T>, OnboardingError> {
+    // A completed login remains a success; pending shutdown only suppresses
+    // the former redundant terminal re-entry before returning to the caller.
+    if pending_shutdown() || pending_shutdown() {
+        return Ok(None);
+    }
+    enter().map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn reenter_after_oauth_error<T>(
+    auth_error: &str,
+    mut pending_shutdown: impl FnMut() -> bool,
+    enter: impl FnOnce() -> Result<T, OnboardingError>,
+) -> Result<T, OnboardingError> {
+    // The OAuth call is opaque. Observe immediately after its error and again
+    // before enabling raw mode; keep the call's actual error if interrupted.
+    if pending_shutdown() || pending_shutdown() {
+        return Err(OnboardingError::Auth(auth_error.to_string()));
+    }
+    enter()
+}
+
+#[cfg(target_os = "linux")]
+fn read_onboarding_event() -> Result<ratatui::crossterm::event::Event, OnboardingError> {
+    loop {
+        if shutdown_requested() {
+            return Err(OnboardingError::Cancelled);
+        }
+        let ready = match ratatui::crossterm::event::poll(Duration::from_millis(50)) {
+            Ok(ready) => ready,
+            Err(_) if shutdown_requested() => return Err(OnboardingError::Cancelled),
+            Err(_) => return Err(OnboardingError::Auth("failed to read a key".to_string())),
+        };
+        if shutdown_requested() {
+            return Err(OnboardingError::Cancelled);
+        }
+        if ready {
+            break;
+        }
+    }
+
+    let event = match ratatui::crossterm::event::read() {
+        Ok(event) => event,
+        Err(_) if shutdown_requested() => return Err(OnboardingError::Cancelled),
+        Err(_) => return Err(OnboardingError::Auth("failed to read a key".to_string())),
+    };
+    if shutdown_requested() {
+        Err(OnboardingError::Cancelled)
+    } else {
+        Ok(event)
+    }
+}
+
+/// Release every acquired terminal state, retaining the first cleanup error.
+#[cfg(target_os = "linux")]
+fn restore_acquired_terminal<B: Backend>(
+    terminal: &mut Option<Terminal<B>>,
+    cursor_hidden: &mut bool,
+    raw: &mut bool,
+    alternate: &mut bool,
+    mut disable_raw: impl FnMut() -> io::Result<()>,
+    mut leave_alternate: impl FnMut() -> io::Result<()>,
+) -> Result<(), OnboardingError> {
+    let mut first_error = None;
+    if let Some(mut terminal) = terminal.take() {
+        if std::mem::take(cursor_hidden) {
+            if let Err(error) = terminal.show_cursor() {
+                first_error = Some(error);
+                // ratatui retains its hidden flag when Show fails, so Drop
+                // would issue a second Show. This terminal is no longer used;
+                // the caller receives a cleanup error. Leak only this
+                // instance to keep the one attempted restoration.
+                std::mem::forget(terminal);
+            } else {
+                drop(terminal);
+            }
+        } else {
+            drop(terminal);
+        }
+    }
+    if *raw {
+        *raw = false;
+        if let Err(error) = disable_raw() {
+            first_error.get_or_insert(error);
+        }
+    }
+    if *alternate {
+        *alternate = false;
+        if let Err(error) = leave_alternate() {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error
+        .map(|error| {
+            Err(OnboardingError::Auth(format!(
+                "failed to restore terminal: {error}"
+            )))
+        })
+        .unwrap_or(Ok(()))
+}
+
+/// Owns raw mode, the alternate screen and cursor visibility. Onboarding
+/// never enables mouse capture or changes the cursor shape.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct OnboardingTerminal {
+    terminal: Option<DefaultTerminal>,
+    cursor_hidden: bool,
+    raw: bool,
+    alternate: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl OnboardingTerminal {
+    fn enter() -> Result<Self, OnboardingError> {
+        let mut owner = Self::default();
+        enable_raw_mode().map_err(|error| OnboardingError::Auth(error.to_string()))?;
+        owner.raw = true;
+        ratatui::crossterm::execute!(io::stdout(), EnterAlternateScreen)
+            .map_err(|error| OnboardingError::Auth(error.to_string()))?;
+        owner.alternate = true;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
+            .map_err(|error| OnboardingError::Auth(error.to_string()))?;
+        terminal
+            .hide_cursor()
+            .map_err(|error| OnboardingError::Auth(error.to_string()))?;
+        owner.cursor_hidden = true;
+        owner.terminal = Some(terminal);
+        Ok(owner)
+    }
+
+    fn terminal_mut(&mut self) -> &mut DefaultTerminal {
+        self.terminal
+            .as_mut()
+            .expect("onboarding terminal is active")
+    }
+
+    fn restore(&mut self) -> Result<(), OnboardingError> {
+        restore_acquired_terminal(
+            &mut self.terminal,
+            &mut self.cursor_hidden,
+            &mut self.raw,
+            &mut self.alternate,
+            disable_raw_mode,
+            || ratatui::crossterm::execute!(io::stdout(), LeaveAlternateScreen),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OnboardingTerminal {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("{error}");
+        }
+    }
+}
+
 /// Shows the onboarding screen and drives it to completion. Owns the
 /// terminal for its own lifetime (enters/leaves the alternate screen
-/// itself via `ratatui::init()`/`ratatui::restore()`), independent of
+/// through an owned guard), independent of
 /// whatever the caller does with the terminal afterward — the chat loop's
 /// own `run()` re-inits the terminal fresh once this returns.
+#[cfg(target_os = "linux")]
+pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
+    let mut terminal = enter_onboarding_terminal_with(shutdown_requested, || {
+        if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
+            return Err(OnboardingError::NonInteractive);
+        }
+        OnboardingTerminal::enter()
+    })?;
+    let mut selected = Choice::ChatGpt;
+
+    let outcome = 'outer: loop {
+        if shutdown_requested() {
+            break 'outer Err(OnboardingError::Cancelled);
+        }
+        if terminal
+            .terminal_mut()
+            .draw(|f| render_choice_screen(f, selected))
+            .is_err()
+        {
+            break 'outer Err(OnboardingError::Auth(
+                "failed to draw the terminal".to_string(),
+            ));
+        }
+        let event = match read_onboarding_event() {
+            Ok(e) => e,
+            Err(error) => break 'outer Err(error),
+        };
+        let ratatui::crossterm::event::Event::Key(key) = event else {
+            continue;
+        };
+
+        match apply_choice_key(key) {
+            ChoiceAction::Continue => continue,
+            ChoiceAction::Toggle => {
+                selected = selected.toggled();
+                continue;
+            }
+            ChoiceAction::Quit => break 'outer Err(OnboardingError::Cancelled),
+            ChoiceAction::Submit => {}
+        }
+
+        match selected {
+            Choice::ChatGpt => {
+                // Leave the alternate screen before calling into the
+                // existing OAuth flow: `login::run` prints the
+                // authorize-in-your-browser URL via `eprintln!` and opens
+                // a browser, neither of which should happen while the TUI
+                // owns the terminal.
+                if let Err(error) = terminal.restore() {
+                    break 'outer Err(error);
+                }
+                if shutdown_requested() {
+                    break 'outer Err(OnboardingError::Cancelled);
+                }
+                let result = polaris_auth::login::run(polaris_auth::ISSUER, auth_store_path).await;
+                match result {
+                    Ok(_) => {
+                        terminal = match reenter_after_oauth_success(
+                            shutdown_requested,
+                            OnboardingTerminal::enter,
+                        ) {
+                            Ok(Some(terminal)) => terminal,
+                            Ok(None) => break 'outer Ok(Outcome::CodexLoggedIn),
+                            Err(error) => break 'outer Err(error),
+                        };
+                        break 'outer Ok(Outcome::CodexLoggedIn);
+                    }
+                    Err(e) => {
+                        // Stay on the choice screen and let the user try
+                        // again rather than exiting the whole process over
+                        // one failed sign-in attempt (e.g. the user closed
+                        // the browser tab without authorizing).
+                        let message = e.to_string();
+                        terminal = match reenter_after_oauth_error(
+                            &message,
+                            shutdown_requested,
+                            OnboardingTerminal::enter,
+                        ) {
+                            Ok(terminal) => terminal,
+                            Err(error) => break 'outer Err(error),
+                        };
+                        if terminal
+                            .terminal_mut()
+                            .draw(|f| {
+                                let area = f.area();
+                                f.render_widget(
+                                    ratatui::widgets::Paragraph::new(format!(
+                                        "sign-in failed: {message}\n\npress any key to try again"
+                                    )),
+                                    area,
+                                )
+                            })
+                            .is_err()
+                        {
+                            break 'outer Err(OnboardingError::Auth(message));
+                        }
+                        if let Err(error) = read_onboarding_event() {
+                            break 'outer Err(error);
+                        }
+                        continue;
+                    }
+                }
+            }
+            Choice::ApiKey => {
+                let mut typed = String::new();
+                let key = 'entry: loop {
+                    if shutdown_requested() {
+                        break 'outer Err(OnboardingError::Cancelled);
+                    }
+                    if terminal
+                        .terminal_mut()
+                        .draw(|f| render_api_key_prompt(f, typed.chars().count()))
+                        .is_err()
+                    {
+                        break 'outer Err(OnboardingError::Auth(
+                            "failed to draw the terminal".to_string(),
+                        ));
+                    }
+                    let event = match read_onboarding_event() {
+                        Ok(e) => e,
+                        Err(error) => break 'outer Err(error),
+                    };
+                    let ratatui::crossterm::event::Event::Key(key_event) = event else {
+                        continue;
+                    };
+                    match apply_key_entry_key(&mut typed, key_event) {
+                        KeyEntryAction::Continue => continue,
+                        KeyEntryAction::Quit => break 'outer Err(OnboardingError::Cancelled),
+                        KeyEntryAction::Submit(key) => break 'entry key,
+                    }
+                };
+                break 'outer save_api_key_after_observation(shutdown_requested, || {
+                    polaris_auth::api_key::save_to(api_key_path, &key)
+                });
+            }
+        }
+    };
+
+    terminal.restore()?;
+    outcome
+}
+
+/// Preserve the existing non-Linux onboarding behavior.
+#[cfg(not(target_os = "linux"))]
 pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(OnboardingError::NonInteractive);
@@ -337,6 +688,238 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    #[cfg(target_os = "linux")]
+    use std::cell::Cell;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_onboarding_pre_raw_shutdown_skips_terminal_and_auth() {
+        let entered_raw = Cell::new(false);
+        let started_auth = Cell::new(false);
+        let result = (|| {
+            enter_onboarding_terminal_with(
+                || true,
+                || {
+                    entered_raw.set(true);
+                    Ok(())
+                },
+            )?;
+            started_auth.set(true);
+            Ok::<(), OnboardingError>(())
+        })();
+        assert!(matches!(result, Err(OnboardingError::Cancelled)));
+        assert!(!entered_raw.get());
+        assert!(!started_auth.get());
+
+        // A signal after enter but before draw must restore the cursor, raw
+        // mode and alternate screen exactly once. The same production release
+        // function uses a real ratatui Terminal and a recording backend here.
+        use std::cell::RefCell;
+        use std::io::Write;
+        use std::rc::Rc;
+
+        struct RecordingWriter {
+            bytes: Rc<RefCell<Vec<u8>>>,
+            fail_next_write: Rc<Cell<bool>>,
+            show_attempts: Rc<Cell<usize>>,
+        }
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let is_show = bytes
+                    .windows(b"\x1b[?25h".len())
+                    .any(|part| part == b"\x1b[?25h");
+                if is_show || self.fail_next_write.get() {
+                    self.show_attempts.set(self.show_attempts.get() + 1);
+                }
+                if self.fail_next_write.replace(false) {
+                    return Err(io::Error::other("injected cursor Show failure"));
+                }
+                self.bytes.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let make_terminal = |bytes: &Rc<RefCell<Vec<u8>>>,
+                             fail: &Rc<Cell<bool>>,
+                             show_attempts: &Rc<Cell<usize>>| {
+            Terminal::with_options(
+                CrosstermBackend::new(RecordingWriter {
+                    bytes: Rc::clone(bytes),
+                    fail_next_write: Rc::clone(fail),
+                    show_attempts: Rc::clone(show_attempts),
+                }),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 16)),
+                },
+            )
+            .expect("recording terminal")
+        };
+        let sequence_count = |bytes: &[u8], sequence: &[u8]| {
+            bytes
+                .windows(sequence.len())
+                .filter(|part| *part == sequence)
+                .count()
+        };
+        let hide = b"\x1b[?25l";
+        let show = b"\x1b[?25h";
+
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let fail = Rc::new(Cell::new(false));
+        let show_attempts = Rc::new(Cell::new(0));
+        let mut terminal = make_terminal(&bytes, &fail, &show_attempts);
+        terminal.hide_cursor().expect("acquire hidden cursor");
+        let mut acquired_terminal = Some(terminal);
+        let mut cursor_hidden = true;
+        let mut raw = true;
+        let mut alternate = true;
+        let raw_cleanup = Cell::new(0);
+        let alternate_cleanup = Cell::new(0);
+        let pending_shutdown = Cell::new(false);
+        pending_shutdown.set(true); // signal after enter and before the first draw
+        let mut restore = || {
+            restore_acquired_terminal(
+                &mut acquired_terminal,
+                &mut cursor_hidden,
+                &mut raw,
+                &mut alternate,
+                || {
+                    raw_cleanup.set(raw_cleanup.get() + 1);
+                    Ok(())
+                },
+                || {
+                    alternate_cleanup.set(alternate_cleanup.get() + 1);
+                    Ok(())
+                },
+            )
+        };
+        let shutdown_restore = if pending_shutdown.get() {
+            restore()
+        } else {
+            panic!("signal must be pending before the first draw");
+        };
+        shutdown_restore.expect("signal restore");
+        restore().expect("idempotent restore");
+        let recorded = bytes.borrow();
+        assert_eq!(sequence_count(&recorded, hide), 1);
+        assert_eq!(sequence_count(&recorded, show), 1);
+        assert_eq!(show_attempts.get(), 1);
+        assert_eq!(raw_cleanup.get(), 1);
+        assert_eq!(alternate_cleanup.get(), 1);
+        drop(recorded);
+
+        // A failed cursor Show must become a reportable cleanup error while
+        // the raw and alternate restorations are still attempted.
+        let failing_bytes = Rc::new(RefCell::new(Vec::new()));
+        let fail_next_write = Rc::new(Cell::new(false));
+        let failing_show_attempts = Rc::new(Cell::new(0));
+        let mut terminal = make_terminal(&failing_bytes, &fail_next_write, &failing_show_attempts);
+        terminal.hide_cursor().expect("acquire hidden cursor");
+        let mut acquired_terminal = Some(terminal);
+        let mut cursor_hidden = true;
+        let mut raw = true;
+        let mut alternate = true;
+        let raw_cleanup = Cell::new(0);
+        let alternate_cleanup = Cell::new(0);
+        fail_next_write.set(true);
+        let error = restore_acquired_terminal(
+            &mut acquired_terminal,
+            &mut cursor_hidden,
+            &mut raw,
+            &mut alternate,
+            || {
+                raw_cleanup.set(raw_cleanup.get() + 1);
+                Ok(())
+            },
+            || {
+                alternate_cleanup.set(alternate_cleanup.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("cursor Show failure must win over clean signal status");
+        assert!(matches!(
+            error,
+            OnboardingError::Auth(message) if message.contains("injected cursor Show failure")
+        ));
+        assert_eq!(raw_cleanup.get(), 1);
+        assert_eq!(alternate_cleanup.get(), 1);
+        assert_eq!(failing_show_attempts.get(), 1);
+        assert_eq!(sequence_count(&failing_bytes.borrow(), show), 0);
+        assert!(!cursor_hidden);
+        assert!(!raw);
+        assert!(!alternate);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_onboarding_api_key_shutdown_starts_no_save() {
+        let saved = Cell::new(false);
+        let result = save_api_key_after_observation(
+            || true,
+            || {
+                saved.set(true);
+                Ok::<(), io::Error>(())
+            },
+        );
+        assert!(matches!(result, Err(OnboardingError::Cancelled)));
+        assert!(!saved.get());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_onboarding_oauth_return_after_shutdown_does_not_reenter_raw() {
+        let observations = Cell::new(0);
+        let entered_raw = Cell::new(false);
+        let successful_login = reenter_after_oauth_success(
+            || true,
+            || {
+                entered_raw.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(successful_login, Ok(None)));
+        assert!(!entered_raw.get());
+
+        let result = reenter_after_oauth_error(
+            "oauth exchange failed",
+            || {
+                let next = observations.get() + 1;
+                observations.set(next);
+                next == 2
+            },
+            || {
+                entered_raw.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(observations.get(), 2);
+        assert!(!entered_raw.get());
+        assert!(matches!(
+            result,
+            Err(OnboardingError::Auth(message)) if message == "oauth exchange failed"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_signal_onboarding_completed_pre_observation_save_is_preserved() {
+        let pending = Cell::new(false);
+        let saved = Cell::new(0);
+        let result = save_api_key_after_observation(
+            || pending.get(),
+            || {
+                saved.set(saved.get() + 1);
+                pending.set(true);
+                Ok::<(), io::Error>(())
+            },
+        );
+        assert_eq!(saved.get(), 1);
+        assert!(pending.get());
+        assert!(matches!(result, Ok(Outcome::ApiKeySaved)));
+    }
 
     #[test]
     fn the_choice_screen_marks_the_selected_option() {

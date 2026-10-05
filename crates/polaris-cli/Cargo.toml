@@ -33,3 +33,6 @@ tokio = { workspace = true }
 # 本物のバイナリを本物のプロファイルの下でヘルパとして起動する統合テスト
 # （tests/confined_helper.rs）が、ツール層をそのまま通すために要る。
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"

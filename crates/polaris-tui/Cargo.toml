@@ -27,3 +27,5 @@ url = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = { workspace = true }
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"

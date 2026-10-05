@@ -8,6 +8,8 @@ fn polaris(
     args: &[&str],
     input: &str,
 ) -> Output {
+    // The child's synthetic HOME must not redirect project identity upward.
+    std::fs::create_dir_all(project.join(".git")).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_polaris"))
         .env("HOME", home)
         .env_remove("POLARIS_DATA_DIR")
@@ -365,6 +367,7 @@ fn one_shot_runs_ask_at_the_terminal_before_an_mcp_tool_call() {
     for (answer, sent) in [("n\n", 0), ("y\n", 1)] {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".git")).unwrap();
         let project_id = polaris_core::project::project_id(&project.path().canonicalize().unwrap());
         let (tool_url, calls) = serve_one_tool();
         let store = polaris_mcp::store::Store::open(&home.path().canonicalize().unwrap()).unwrap();

@@ -43,6 +43,7 @@ fn reports_a_broken_agent_type_without_crashing() {
     let exe = env!("CARGO_BIN_EXE_polaris");
     let home = tempfile::tempdir().expect("temp directory");
     let project = tempfile::tempdir().expect("temp directory");
+    std::fs::create_dir(project.path().join(".polaris")).expect("could not create project marker");
     let broken = project.path().join("agents").join("broken-type");
     std::fs::create_dir_all(&broken).expect("could not create agents/broken-type");
     std::fs::write(
@@ -58,6 +59,7 @@ fn reports_a_broken_agent_type_without_crashing() {
             "HOME",
             home.path().canonicalize().expect("physical home path"),
         )
+        .env_remove("POLARIS_DATA_DIR")
         .env("POLARIS_API_KEY", "dummy-key")
         .env("POLARIS_BASE_URL", "http://127.0.0.1:1")
         .output()

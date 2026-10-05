@@ -455,7 +455,58 @@ pub fn parse(line: &str) -> Option<Action> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn m3c_saved_and_read_routes_keep_arguments_and_mutation_clearance() {
+        for command in [
+            "/session configure codex gpt-5.6-sol",
+            "/goal set finish",
+            "/memory configure on",
+            "/tool-memory endpoint http://127.0.0.1:8080/v1 embed",
+            "/compact threshold 1000",
+        ] {
+            let action = parse(command).unwrap();
+            assert!(
+                matches!(&action, Action::SessionControl(value) if format!("/{value}") == command)
+            );
+            assert!(action.needs_management_clearance());
+        }
+        for command in [
+            "/session current",
+            "/goal",
+            "/history 20",
+            "/browse read src/main.rs",
+            "/attachment notes.txt",
+            "/input status input-id",
+            "/subagents wait child attempt",
+            "/run details",
+        ] {
+            assert!(!parse(command).unwrap().needs_management_clearance());
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(parse("/models"), Some(Action::Model)));
+        #[cfg(target_os = "linux")]
+        assert!(
+            matches!(parse("/models"), Some(Action::WorkspaceControl(value)) if value == "models")
+        );
+        assert!(matches!(
+            parse("/models install x"),
+            Some(Action::WorkspaceControl(_))
+        ));
+    }
 
+    #[test]
+    fn m2d_sync_routes_read_apply_and_exact_recovery_arguments() {
+        for line in ["/sync", "/sync status"] {
+            let action = parse(line).unwrap();
+            assert!(matches!(&action, Action::Sync(_)));
+            assert!(!action.needs_management_clearance());
+        }
+        assert!(parse("/sync apply").unwrap().needs_management_clearance());
+        let action = parse("/sync recover 0123").unwrap();
+        assert!(!action.needs_management_clearance());
+        assert!(matches!(action, Action::Sync(value) if value == "recover 0123"));
+        assert_eq!(matching("syn")[0].name, "sync");
+    }
 
     #[test]
     fn a_bare_slash_matches_every_command() {
@@ -488,6 +539,15 @@ mod tests {
     fn known_commands_parse_to_their_action() {
         assert!(matches!(parse("/help"), Some(Action::Help)));
         assert!(matches!(parse("/status"), Some(Action::Status)));
+        assert!(matches!(parse("/doctor"), Some(Action::Doctor)));
+        assert!(matches!(parse("/account list"), Some(Action::Account(value)) if value == "list"));
+        assert!(
+            matches!(parse("/memory search a"), Some(Action::Memory(value)) if value == "search a")
+        );
+        assert!(matches!(parse("/decided list"), Some(Action::Decided(value)) if value == "list"));
+        assert!(
+            matches!(parse("/compare a | b"), Some(Action::Compare(value)) if value == "a | b")
+        );
         assert!(matches!(parse("/phase"), Some(Action::Phase(value)) if value.is_empty()));
         assert!(
             matches!(parse("/workflow mode adaptive"), Some(Action::Workflow(value)) if value == "mode adaptive")

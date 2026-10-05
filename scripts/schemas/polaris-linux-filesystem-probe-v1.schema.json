@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Polaris Linux filesystem probe v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "parent", "parent_identity", "host_execution_record_id", "mount_namespace", "self_test_passed", "mount", "preflight", "capabilities", "mode_observations", "hash_observations", "cleanup", "classification", "error"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "parent": {"const": "/run/media/example/USBSSD/projects/codex"},
+    "parent_identity": {"$ref": "#/$defs/identity"},
+    "host_execution_record_id": {"type": "string", "minLength": 1},
+    "mount_namespace": {"type": "string", "pattern": "^mnt:\\[[0-9]+\\]$"},
+    "self_test_passed": {"const": true},
+    "mount": {"$ref": "#/$defs/mount"},
+    "preflight": {
+      "type": "object", "additionalProperties": false,
+      "required": ["result", "host_namespace", "host_mount", "error"],
+      "properties": {
+        "result": {"enum": ["pass", "rejected"]},
+        "host_namespace": {"type": "string", "pattern": "^mnt:\\[[0-9]+\\]$"},
+        "host_mount": {"$ref": "#/$defs/mount"},
+        "error": {"type": ["string", "null"]}
+      }
+    },
+    "capabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["exclusive_child", "no_clobber_collision", "no_clobber_success", "directory_fsync", "file_mode", "directory_mode", "same_device"],
+      "properties": {
+        "exclusive_child": {"$ref": "#/$defs/capability"},
+        "no_clobber_collision": {"$ref": "#/$defs/capability"},
+        "no_clobber_success": {"$ref": "#/$defs/capability"},
+        "directory_fsync": {"$ref": "#/$defs/capability"},
+        "file_mode": {"$ref": "#/$defs/capability"},
+        "directory_mode": {"$ref": "#/$defs/capability"},
+        "same_device": {"$ref": "#/$defs/capability"}
+      }
+    },
+    "mode_observations": {
+      "type": "object", "additionalProperties": false,
+      "required": ["requested_file", "effective_file", "requested_directory", "effective_directory", "current_mask_options"],
+      "properties": {
+        "requested_file": {"const": "0600"},
+        "effective_file": {"type": ["string", "null"], "pattern": "^[0-7]{4}$"},
+        "requested_directory": {"const": "0700"},
+        "effective_directory": {"type": ["string", "null"], "pattern": "^[0-7]{4}$"},
+        "current_mask_options": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "hash_observations": {
+      "type": "object", "additionalProperties": false,
+      "required": ["collision_source_before", "collision_source_after", "collision_destination_before", "collision_destination_after", "moved_destination_after"],
+      "properties": {
+        "collision_source_before": {"$ref": "#/$defs/nullable_hash"},
+        "collision_source_after": {"$ref": "#/$defs/nullable_hash"},
+        "collision_destination_before": {"$ref": "#/$defs/nullable_hash"},
+        "collision_destination_after": {"$ref": "#/$defs/nullable_hash"},
+        "moved_destination_after": {"$ref": "#/$defs/nullable_hash"}
+      }
+    },
+    "cleanup": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "retained_child", "error"],
+      "properties": {
+        "state": {"enum": ["not_started", "removed", "retained", "failed"]},
+        "retained_child": {"type": ["string", "null"]},
+        "error": {"type": ["string", "null"]}
+      }
+    },
+    "classification": {"enum": ["A:capabilities_and_privacy_pass", "P:capabilities_pass_privacy_blocked_by_current_mask", "B:native_filesystem_required", "C:inconclusive"]},
+    "error": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "preflight": {
+            "properties": {"result": {"const": "pass"}},
+            "required": ["result"]
+          }
+        },
+        "required": ["preflight"]
+      },
+      "then": {
+        "properties": {
+          "mount": {"$ref": "#/$defs/complete_mount"},
+          "preflight": {
+            "properties": {
+              "host_mount": {"$ref": "#/$defs/complete_mount"}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "complete_mount": {
+      "type": "object",
+      "required": ["source", "uuid", "fstype", "target", "options", "maj_min"],
+      "properties": {
+        "source": {"type": "string", "minLength": 1},
+        "uuid": {"type": "string", "minLength": 1},
+        "fstype": {"type": "string", "minLength": 1},
+        "target": {"type": "string", "minLength": 1},
+        "options": {"type": "string", "minLength": 1},
+        "maj_min": {"type": "string", "pattern": "^[0-9]+:[0-9]+$"}
+      }
+    },
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["device", "inode", "owner", "mode"],
+      "properties": {
+        "device": {"type": "integer", "minimum": 0},
+        "inode": {"type": "integer", "minimum": 1},
+        "owner": {"type": "integer", "minimum": 0},
+        "mode": {"type": "string", "pattern": "^[0-7]{4}$"}
+      }
+    },
+    "mount": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "uuid", "fstype", "target", "options", "maj_min", "label"],
+      "properties": {
+        "source": {"type": ["string", "null"]},
+        "uuid": {"type": ["string", "null"]},
+        "fstype": {"type": ["string", "null"]},
+        "target": {"type": ["string", "null"]},
+        "options": {"type": ["string", "null"]},
+        "maj_min": {"type": ["string", "null"], "pattern": "^[0-9]+:[0-9]+$"},
+        "label": {"type": ["string", "null"]}
+      }
+    },
+    "capability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["syscall", "result", "errno", "detail"],
+      "properties": {
+        "syscall": {"type": "string", "minLength": 1},
+        "result": {"enum": ["pass", "fail", "inconclusive", "not_run"]},
+        "errno": {"type": ["integer", "null"], "minimum": 1},
+        "detail": {"type": "string"}
+      }
+    },
+    "nullable_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -31,6 +31,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 jsonschema = { version = "0.51", default-features = false }
 similar = "2"
 unicode-width = "0.2"
+zeroize = "1.9"
 
 # Native debug apps verify large local models and packaged helper bytes before Hello.
 # Keep the complete SHA-256 checks fast without changing the application debug profile.

@@ -6,6 +6,7 @@
 pub mod catalog;
 pub mod content;
 pub mod registration;
+pub mod secret_input;
 pub mod store;
 mod template;
 #[cfg(feature = "test-support")]

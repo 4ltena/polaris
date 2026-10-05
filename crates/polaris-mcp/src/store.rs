@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use polaris_auth::protection::protect_store;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::Error;
 use crate::catalog::index::{CatalogIndex, MAX_INDEX_BYTES, ServerIndex};
@@ -24,12 +25,22 @@ const CATALOG: &str = "catalog.json";
 /// Secret values deliberately have no Debug implementation or public serializer.
 pub struct Secrets(SecretDocument);
 
-/// One credential from a trusted surface; Debug never shows the value.
-pub struct SecretValue(String);
+/// One credential from a trusted surface. Its in-memory bytes are wiped when
+/// this value is dropped; Debug never shows the value.
+pub struct SecretValue(Zeroizing<String>);
 
 impl SecretValue {
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(Zeroizing::new(value.into()))
+    }
+
+    /// Copies valid UTF-8 secret bytes from the masked input buffer. The source
+    /// buffer is then dropped and wiped. This stays crate-private so no
+    /// ordinary caller can obtain a plaintext view of a secret.
+    pub(crate) fn from_secret_bytes(value: Zeroizing<Vec<u8>>) -> Self {
+        let value = String::from_utf8(value.as_slice().to_vec())
+            .expect("SecretInputV1 only constructs valid UTF-8");
+        Self(Zeroizing::new(value))
     }
 }
 
@@ -52,6 +63,14 @@ struct SecretDocument {
     schema_version: u32,
     revision: u64,
     values: BTreeMap<String, String>,
+}
+
+impl Drop for SecretDocument {
+    fn drop(&mut self) {
+        for value in self.values.values_mut() {
+            value.zeroize();
+        }
+    }
 }
 
 impl Secrets {
@@ -361,17 +380,25 @@ impl Store {
         changes: Vec<(String, Option<SecretValue>)>,
     ) -> Result<(), Error> {
         let mut values = match self.load_secrets()? {
-            Some(current) if current.revision() == expected_revision => current.0.values,
+            Some(mut current) if current.revision() == expected_revision => {
+                std::mem::take(&mut current.0.values)
+            }
             None if expected_revision == 0 => BTreeMap::new(),
             _ => return Err(Error::RevisionConflict),
         };
         for (reference, value) in changes {
             match value {
                 Some(value) => {
-                    values.insert(reference, value.0);
+                    // This is the persistence boundary. The stored document
+                    // deliberately retains the credential until it is removed;
+                    // transient trusted input remains zeroizing before here.
+                    if let Some(mut replaced) = values.insert(reference, value.0.to_string()) {
+                        replaced.zeroize();
+                    }
                 }
                 None => {
-                    values.remove(&reference).ok_or(Error::Auth)?;
+                    let mut removed = values.remove(&reference).ok_or(Error::Auth)?;
+                    removed.zeroize();
                 }
             }
         }
@@ -516,6 +543,7 @@ impl Store {
         let Some(bytes) = self.read_bytes(name, protection, MAX_STORE_BYTES)? else {
             return Ok(None);
         };
+        let bytes = Zeroizing::new(bytes);
         let value: T = serde_json::from_slice(&bytes).map_err(|_| Error::Storage)?;
         value.validate()?;
         Ok(Some(value))
@@ -554,7 +582,7 @@ impl Store {
         if expected.checked_add(1) != Some(next.revision()) {
             return Err(Error::RevisionConflict);
         }
-        let bytes = bounded_json(next, MAX_STORE_BYTES)?;
+        let bytes = Zeroizing::new(bounded_json(next, MAX_STORE_BYTES)?);
         let _writer = self.writer_lock()?;
         let mut protection = protect_store(&self.path.join(name)).map_err(|_| Error::Protection)?;
         self.require_no_temp(name)?;

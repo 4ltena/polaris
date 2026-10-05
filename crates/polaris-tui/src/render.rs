@@ -1300,50 +1300,71 @@ pub fn render_resume_picker(
 ) {
     let area = frame.area();
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            "resume a conversation",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-
-    if groups.is_empty() {
-        lines.push(Line::from(Span::styled("no saved conversations yet", dim)));
-    }
-
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let show_header = inner_height >= 5;
+    let show_footer = inner_height >= 2;
+    let visible_rows = inner_height
+        .saturating_sub(usize::from(show_header) * 2 + usize::from(show_footer))
+        .max(1);
+    let total = groups.iter().map(|g| g.sessions.len()).sum::<usize>();
+    let selected = selected.min(total.saturating_sub(1));
+    let mut rows: Vec<Line> = Vec::new();
+    let mut selected_row = 0usize;
+    let mut selected_group = "";
     let mut idx = 0usize;
     for group in groups {
-        lines.push(Line::from(Span::styled(
-            sanitize(&group.cwd),
+        rows.push(Line::from(Span::styled(
+            sanitize(&group.cwd).escape_debug().to_string(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
         for s in &group.sessions {
             let is_selected = idx == selected;
+            if is_selected {
+                selected_row = rows.len();
+                selected_group = &group.cwd;
+            }
             let marker = if is_selected { "\u{276f} " } else { "  " };
             let when = crate::time::format_relative(s.started_at_millis, now_millis);
             let text = format!(
                 "{marker}{when}  {} message(s)  {}",
                 s.message_count,
-                sanitize(&s.preview)
+                sanitize(&s.preview).escape_debug()
             );
             let style = if is_selected {
                 Style::default().add_modifier(Modifier::BOLD)
             } else {
                 dim
             };
-            lines.push(Line::from(Span::styled(text, style)));
+            rows.push(Line::from(Span::styled(text, style)));
             idx += 1;
         }
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "enter to resume \u{b7} esc to cancel",
-        dim,
-    )));
+    if total == 0 {
+        rows.clear();
+        rows.push(Line::from(Span::styled("no saved conversations yet", dim)));
+    }
+    let page_start = selected_row.saturating_sub(visible_rows.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    if show_header {
+        lines.push(Line::from(Span::styled(
+            "resume a conversation",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            sanitize(selected_group).escape_debug().to_string(),
+            dim,
+        )));
+    }
+    lines.extend(rows.into_iter().skip(page_start).take(visible_rows));
+    if show_footer {
+        lines.push(Line::from(Span::styled(
+            "enter to resume \u{b7} esc to cancel",
+            dim,
+        )));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
@@ -1379,14 +1400,33 @@ pub fn render_model_picker(
     selected: usize,
 ) {
     let area = frame.area();
-    let mut lines: Vec<Line> = vec![
-        Line::styled(
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let show_header = inner_height >= 5;
+    let show_footer = inner_height >= 2;
+    let local_index = MODEL_CATALOG.len();
+    let show_gaps = inner_height
+        >= usize::from(show_header) * 2 + local_index + 1 + usize::from(show_footer) + 2;
+    let visible_rows = inner_height
+        .saturating_sub(
+            usize::from(show_header) * 2 + usize::from(show_footer) + usize::from(show_gaps) * 2,
+        )
+        .max(1);
+    let selected = selected.min(local_index);
+    let page_start = selected / visible_rows * visible_rows;
+    let mut lines: Vec<Line> = Vec::new();
+    if show_header {
+        lines.push(Line::styled(
             "choose what model to use",
             Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-    ];
-    for (i, name) in MODEL_CATALOG.iter().enumerate() {
+        ));
+        lines.push(Line::from(""));
+    }
+    for (i, name) in MODEL_CATALOG
+        .iter()
+        .enumerate()
+        .skip(page_start)
+        .take(visible_rows)
+    {
         let is_selected = i == selected;
         let marker = if is_selected { "\u{276f} " } else { "  " };
         let recommended = *name == RECOMMENDED_MODEL;
@@ -1409,30 +1449,37 @@ pub fn render_model_picker(
             Span::styled(format!("{}. {}{suffix}", i + 1, sanitize(name)), style),
         ]));
     }
-    lines.push(Line::from(""));
-    let local_index = MODEL_CATALOG.len();
-    let local_selected = selected == local_index;
-    let local_marker = if local_selected { "\u{276f} " } else { "  " };
-    let local_suffix = if current_is_local { " (current)" } else { "" };
-    let local_style = if local_selected {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::BOLD)
-    };
-    lines.push(Line::from(vec![
-        Span::raw(local_marker),
-        Span::styled(
-            format!("{}. {}{local_suffix}", local_index + 1, LOCAL_MODEL_LABEL),
-            local_style,
-        ),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "enter to confirm \u{b7} esc to cancel",
-        Style::default().add_modifier(Modifier::DIM),
-    ));
+    if (page_start..page_start + visible_rows).contains(&local_index) {
+        if show_gaps {
+            lines.push(Line::from(""));
+        }
+        let local_selected = selected == local_index;
+        let local_marker = if local_selected { "\u{276f} " } else { "  " };
+        let local_suffix = if current_is_local { " (current)" } else { "" };
+        let local_style = if local_selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(local_marker),
+            Span::styled(
+                format!("{}. {}{local_suffix}", local_index + 1, LOCAL_MODEL_LABEL),
+                local_style,
+            ),
+        ]));
+    }
+    if show_gaps {
+        lines.push(Line::from(""));
+    }
+    if show_footer {
+        lines.push(Line::styled(
+            "enter to confirm \u{b7} esc to cancel",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
@@ -1448,20 +1495,34 @@ pub fn render_local_model_picker(
     selected: usize,
 ) {
     let area = frame.area();
-    let mut lines: Vec<Line> = vec![
-        Line::styled(
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let show_header = inner_height >= 5;
+    let show_footer = inner_height >= 2;
+    let visible_rows = inner_height
+        .saturating_sub(usize::from(show_header) * 2 + usize::from(show_footer))
+        .max(1);
+    let selected = selected.min(models.len().saturating_sub(1));
+    let page_start = selected / visible_rows * visible_rows;
+    let mut lines: Vec<Line> = Vec::new();
+    if show_header {
+        lines.push(Line::styled(
             "choose a connected local model",
             Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-    ];
+        ));
+        lines.push(Line::from(""));
+    }
     if models.is_empty() {
         lines.push(Line::styled(
             "no connected local models",
             Style::default().add_modifier(Modifier::DIM),
         ));
     } else {
-        for (i, model) in models.iter().enumerate() {
+        for (i, model) in models
+            .iter()
+            .enumerate()
+            .skip(page_start)
+            .take(visible_rows)
+        {
             let is_selected = i == selected;
             let marker = if is_selected { "\u{276f} " } else { "  " };
             let suffix = if current == Some(model.as_str()) {
@@ -1478,15 +1539,19 @@ pub fn render_local_model_picker(
             };
             lines.push(Line::from(vec![
                 Span::raw(marker),
-                Span::styled(format!("{}. {}{suffix}", i + 1, sanitize(model)), style),
+                Span::styled(
+                    format!("{}. {}{suffix}", i + 1, sanitize(model).escape_debug()),
+                    style,
+                ),
             ]));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "enter to confirm \u{b7} esc to go back",
-        Style::default().add_modifier(Modifier::DIM),
-    ));
+    if show_footer {
+        lines.push(Line::styled(
+            "enter to confirm \u{b7} esc to go back",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
         area,
@@ -1521,22 +1586,47 @@ pub fn effort_display_name(wire: &str) -> &str {
 /// it. Still worth its own full-screen view rather than the one-line,
 /// six-name-then-"+N more" `Status::Notice` it replaces: with more than a
 /// handful of skills, that line either got truncated or just didn't fit.
+/// The selected skill's page stays visible on short terminals.
 pub fn render_skills_picker(frame: &mut Frame, skills: &[polaris_skills::Skill], selected: usize) {
     let area = frame.area();
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut lines: Vec<Line> = vec![
-        Line::styled(
-            "skills discovered in this project",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-    ];
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let show_header = inner_height >= 4;
+    let show_footer = inner_height >= 6;
+    let skill_rows = inner_height - usize::from(show_header) * 2 - usize::from(show_footer) * 2;
+    let page_size = skill_rows.div_ceil(2).max(1);
+    let selected = selected.min(skills.len().saturating_sub(1));
+    let page_start = selected / page_size * page_size;
+    let mut lines: Vec<Line> = Vec::new();
 
-    if skills.is_empty() {
+    if show_header {
+        let heading = if skills.is_empty() {
+            "skills discovered in this project".to_string()
+        } else {
+            format!(
+                "skills discovered in this project ({}/{})",
+                selected + 1,
+                skills.len()
+            )
+        };
+        lines.push(Line::styled(
+            heading,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(""));
+    }
+
+    if skills.is_empty() && skill_rows > 0 {
         lines.push(Line::styled("no skills discovered", dim));
     }
 
-    for (i, s) in skills.iter().enumerate() {
+    for (row, (i, s)) in skills
+        .iter()
+        .enumerate()
+        .skip(page_start)
+        .take(page_size)
+        .enumerate()
+    {
         let is_selected = i == selected;
         let marker = if is_selected { "\u{276f} " } else { "  " };
         let name_style = if is_selected {
@@ -1546,18 +1636,24 @@ pub fn render_skills_picker(frame: &mut Frame, skills: &[polaris_skills::Skill],
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        lines.push(Line::from(vec![
-            Span::raw(marker),
-            Span::styled(sanitize(&s.name), name_style),
-        ]));
-        lines.push(Line::styled(
-            format!("     {}", sanitize(&s.description)),
-            dim,
-        ));
+        if row * 2 < skill_rows {
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(sanitize(&s.name), name_style),
+            ]));
+        }
+        if row * 2 + 1 < skill_rows {
+            lines.push(Line::styled(
+                format!("     {}", sanitize(&s.description)),
+                dim,
+            ));
+        }
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::styled("enter or esc to close", dim));
+    if show_footer {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("enter or esc to close", dim));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
@@ -2298,6 +2394,49 @@ mod tests {
     }
 
     #[test]
+    fn the_resume_picker_keeps_the_selected_session_visible_on_a_short_terminal() {
+        let now = 1_705_311_000_000u128;
+        let cwd = "/tmp/eight\ninjected\t\u{1b}[31m";
+        let groups = vec![crate::sessions::DirGroup {
+            cwd: cwd.to_string(),
+            sessions: (0..8)
+                .map(|i| crate::sessions::SessionSummary {
+                    id: format!("s{i}"),
+                    path: std::path::PathBuf::new(),
+                    cwd: cwd.to_string(),
+                    started_at_millis: now - 42_000,
+                    message_count: 1,
+                    preview: if i == 7 {
+                        format!("conversation {i}\nforged\t\u{1b}[31m")
+                    } else {
+                        format!("conversation {i}")
+                    },
+                    kind: crate::sessions::SessionKind::Legacy,
+                })
+                .collect(),
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(70, 8)).expect("terminal");
+        terminal
+            .draw(|f| render_resume_picker(f, &groups, 7, now))
+            .expect("draw");
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            content.contains("/tmp/eight\\ninjected\\t�[31m"),
+            "selected group must remain visible on one line: {content:?}"
+        );
+        assert!(content.contains("❯ 42s ago  1 message(s)  conversation 7\\nforged"));
+        assert!(content.contains("\\t�[31m"));
+        assert!(!content.chars().any(|c| matches!(c, '\n' | '\t' | '\u{1b}')));
+        assert!(content.contains("enter to resume"));
+    }
+    #[test]
     fn the_model_picker_marks_the_current_model_and_highlights_the_selection() {
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2341,6 +2480,30 @@ mod tests {
     }
 
     #[test]
+    fn the_model_picker_keeps_the_selected_option_visible_on_a_short_terminal() {
+        let mut terminal = Terminal::new(TestBackend::new(70, 8)).expect("terminal");
+        for (selected, expected) in [
+            (MODEL_CATALOG.len(), "❯ 5. Local model"),
+            (MODEL_CATALOG.len() - 1, "❯ 4. gpt-5.6-luna"),
+        ] {
+            terminal
+                .draw(|f| render_model_picker(f, "gpt-6-astra", false, selected))
+                .expect("draw");
+            let content = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                content.contains(expected),
+                "selected option must remain visible: {content:?}"
+            );
+            assert!(content.contains("enter to confirm"));
+        }
+    }
+    #[test]
     fn the_local_model_picker_lists_connected_runtime_models() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2360,6 +2523,36 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Ollama · qwen3:4b (current)"));
         assert!(content.contains("LM Studio · gemma"));
+    }
+    #[test]
+    fn the_local_model_picker_keeps_the_selected_model_visible_on_a_short_terminal() {
+        let models = (0..8)
+            .map(|i| {
+                if i == 7 {
+                    format!("Ollama · local-{i}\nforged\t\u{1b}[31m")
+                } else {
+                    format!("Ollama · local-{i}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("terminal");
+        terminal
+            .draw(|f| render_local_model_picker(f, &models, None, 7))
+            .expect("draw");
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            content.contains("❯ 8. Ollama · local-7\\nforged\\t�[31m"),
+            "selected model must remain visible on one line: {content:?}"
+        );
+        assert!(!content.chars().any(|c| matches!(c, '\n' | '\t' | '\u{1b}')));
+        assert!(content.contains("enter to confirm"));
     }
 
     #[test]
@@ -2418,6 +2611,34 @@ mod tests {
         assert!(content.contains("breaks work into steps"));
     }
 
+    #[test]
+    fn the_skills_picker_keeps_the_selected_skill_visible_on_a_short_screen() {
+        let skills = (0..8)
+            .map(|index| polaris_skills::Skill {
+                name: format!("skill-{index}"),
+                description: format!("description-{index}"),
+                body: String::new(),
+                path: std::path::PathBuf::new(),
+            })
+            .collect::<Vec<_>>();
+        let backend = TestBackend::new(70, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_skills_picker(frame, &skills, 7))
+            .expect("draw");
+
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(70)
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter().any(|row| row.contains("❯ skill-7")),
+            "selected skill is not visible: {rows:?}"
+        );
+    }
     #[test]
     fn the_skills_picker_shows_a_message_when_there_are_none() {
         let backend = TestBackend::new(70, 14);

@@ -69,6 +69,8 @@ impl RegisteredDirectory {
             selection: None,
             manifest: Vec::new(),
             exclusions: Vec::new(),
+            deadline: None,
+            exclude_build_caches: false,
         };
         walker.walk(&current, Path::new(""), 0)?;
         if !walker.exclusions.is_empty() {

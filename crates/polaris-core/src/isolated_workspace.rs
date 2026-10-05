@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 use tempfile::TempDir;
 
 mod registered;
@@ -55,6 +56,8 @@ pub struct ManifestEntry {
     // Preserve special permission bits for source conflict detection only.
     // They must never be applied to the output workspace.
     observed_mode: u32,
+    observed_mtime: (i64, i64),
+    observed_ctime: (i64, i64),
 }
 
 impl ManifestEntry {
@@ -62,6 +65,14 @@ impl ManifestEntry {
     /// Use `mode` for installing output; special bits must not be restored.
     pub fn observed_mode(&self) -> u32 {
         self.observed_mode
+    }
+
+    pub(crate) fn observed_mtime(&self) -> (i64, i64) {
+        self.observed_mtime
+    }
+
+    pub(crate) fn observed_ctime(&self) -> (i64, i64) {
+        self.observed_ctime
     }
 }
 
@@ -74,6 +85,8 @@ pub enum ExclusionReason {
     SpecialFile,
     /// Git metadata, or an ancestor change that would affect protected metadata.
     RepositoryMetadata,
+    /// Ephemeral build output deliberately omitted from rewind checkpoints.
+    BuildCache,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +103,7 @@ pub enum ErrorKind {
     Limit,
     SourceChanged,
     DestinationInsideSource,
+    Deadline,
 }
 
 /// Diagnostics deliberately retain no input contents or arbitrary error messages.
@@ -187,6 +201,12 @@ impl RegisteredSecrets {
         self.paths.iter().any(|secret| path.starts_with(secret))
             || self.identities.contains(&Identity::of(m))
     }
+
+    pub(crate) fn reserves(&self, path: &Path) -> bool {
+        self.paths
+            .iter()
+            .any(|secret| path.starts_with(secret) || secret.starts_with(path))
+    }
 }
 
 /// Owns a private temporary root containing workspace, home and tmp siblings.
@@ -203,6 +223,7 @@ pub struct Snapshot {
     pub source_identity: Identity,
     pub manifest: Vec<ManifestEntry>,
     pub exclusions: Vec<Exclusion>,
+    exclude_build_caches: bool,
 }
 impl Snapshot {
     /// Sanitized workspace; only this directory participates in change scans.
@@ -287,7 +308,7 @@ impl Drop for Directory {
 /// ancestors. Output is created under the OS temp directory, outside source.
 /// Bounds or detected races fail the entire operation and discard partial output.
 pub fn snapshot(source: &Path, secrets: &RegisteredSecrets, limits: Limits) -> Result<Snapshot> {
-    snapshot_inner(source, secrets, limits, || {})
+    snapshot_inner(source, secrets, limits, None, false, || {})
 }
 
 /// Authentication locations must be registered by their loader before this call.
@@ -298,6 +319,29 @@ pub fn protected_snapshot(source: &Path, limits: Limits) -> Result<Snapshot> {
         snapshot(source, &secrets, limits)
     })
     .map_err(|_| error(source, ErrorKind::ProtectionUnavailable))?
+}
+
+/// Rewind capture uses the same no-follow protected walk, but enforces the
+/// admission deadline while omitting well-known ephemeral build directories.
+pub(crate) fn protected_rewind_snapshot(
+    source: &Path,
+    limits: Limits,
+    deadline: Option<Instant>,
+) -> Result<Snapshot> {
+    polaris_auth::protection::with_protected_paths(|registered| {
+        let secrets = RegisteredSecrets::from_auth_registry(registered)?;
+        rewind_snapshot(source, &secrets, limits, deadline)
+    })
+    .map_err(|_| error(source, ErrorKind::ProtectionUnavailable))?
+}
+
+pub(crate) fn rewind_snapshot(
+    source: &Path,
+    secrets: &RegisteredSecrets,
+    limits: Limits,
+    deadline: Option<Instant>,
+) -> Result<Snapshot> {
+    snapshot_inner(source, secrets, limits, deadline, true, || {})
 }
 
 /// Capture candidate metadata under the authentication registry lock. Callers
@@ -315,6 +359,8 @@ fn snapshot_inner(
     source: &Path,
     secrets: &RegisteredSecrets,
     limits: Limits,
+    deadline: Option<Instant>,
+    exclude_build_caches: bool,
     after_open: impl FnOnce(),
 ) -> Result<Snapshot> {
     // Refresh identities for previously absent paths before any content read.
@@ -368,6 +414,7 @@ fn snapshot_inner(
         source_identity: Identity::of(&initial),
         manifest: Vec::new(),
         exclusions: Vec::new(),
+        exclude_build_caches,
     };
     after_open();
     let mut copier = Copier {
@@ -383,6 +430,8 @@ fn snapshot_inner(
         selection: None,
         manifest: Vec::new(),
         exclusions: Vec::new(),
+        deadline,
+        exclude_build_caches,
     };
     copier.walk(&source_fd, Path::new(""), 0)?;
     let manifest = copier.manifest;
@@ -410,11 +459,19 @@ struct Copier<'a> {
     selection: Option<&'a Selection>,
     manifest: Vec<ManifestEntry>,
     exclusions: Vec<Exclusion>,
+    deadline: Option<Instant>,
+    exclude_build_caches: bool,
 }
 
 impl Copier<'_> {
     fn walk(&mut self, dir: &File, relative: &Path, depth: usize) -> Result<()> {
         let absolute = self.root_path.join(relative);
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(error(&absolute, ErrorKind::Deadline));
+        }
         let before = io(&absolute, dir.metadata())?;
         // A fresh open has an independent directory cursor and remains anchored.
         let stream_fd = open_at(dir, OsStr::new("."), true, &absolute)?;
@@ -480,30 +537,33 @@ impl Copier<'_> {
                 return Err(error(&path, ErrorKind::InvalidPath));
             }
             let kind = stat.st_mode & libc::S_IFMT;
-            let reason = if polaris_tools::path_policy::is_denied(&policy_path)
-                || polaris_tools::path_policy::is_denied(&path)
-            {
-                Some(ExclusionReason::SecretName)
-            } else if self
-                .secrets
-                .paths
-                .iter()
-                .any(|secret| path.starts_with(secret) || policy_path.starts_with(secret))
-            {
-                Some(ExclusionReason::RegisteredSecret)
-            } else if kind == libc::S_IFLNK {
-                Some(ExclusionReason::Symlink)
-            } else if kind != libc::S_IFREG && kind != libc::S_IFDIR {
-                Some(ExclusionReason::SpecialFile)
-            } else if kind == libc::S_IFREG && stat.st_nlink != 1 {
-                Some(ExclusionReason::MultipleLinks)
-            } else if is_repository_metadata(&policy_path) || is_repository_metadata(&path) {
-                // Do not open even an ordinary .git file/directory: history and
-                // config may retain secrets excluded from the working tree.
-                Some(ExclusionReason::RepositoryMetadata)
-            } else {
-                None
-            };
+            let reason =
+                if self.exclude_build_caches && kind == libc::S_IFDIR && is_build_cache(&rel) {
+                    Some(ExclusionReason::BuildCache)
+                } else if polaris_tools::path_policy::is_denied(&policy_path)
+                    || polaris_tools::path_policy::is_denied(&path)
+                {
+                    Some(ExclusionReason::SecretName)
+                } else if self
+                    .secrets
+                    .paths
+                    .iter()
+                    .any(|secret| path.starts_with(secret) || policy_path.starts_with(secret))
+                {
+                    Some(ExclusionReason::RegisteredSecret)
+                } else if kind == libc::S_IFLNK {
+                    Some(ExclusionReason::Symlink)
+                } else if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+                    Some(ExclusionReason::SpecialFile)
+                } else if kind == libc::S_IFREG && stat.st_nlink != 1 {
+                    Some(ExclusionReason::MultipleLinks)
+                } else if is_repository_metadata(&policy_path) || is_repository_metadata(&path) {
+                    // Do not open even an ordinary .git file/directory: history and
+                    // config may retain secrets excluded from the working tree.
+                    Some(ExclusionReason::RepositoryMetadata)
+                } else {
+                    None
+                };
             if let Some(reason) = reason {
                 self.exclusions.push(Exclusion {
                     relative_path: rel,
@@ -566,6 +626,8 @@ impl Copier<'_> {
                     mode,
                     sha256: None,
                     observed_mode: metadata.mode() & 0o7777,
+                    observed_mtime: (metadata.mtime(), metadata.mtime_nsec()),
+                    observed_ctime: (metadata.ctime(), metadata.ctime_nsec()),
                 });
             } else {
                 if self.files >= self.limits.max_files
@@ -583,6 +645,12 @@ impl Copier<'_> {
                 let mut count = 0u64;
                 let mut buffer = [0u8; 16 * 1024];
                 loop {
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        return Err(error(&path, ErrorKind::Deadline));
+                    }
                     let read = io(&path, file.read(&mut buffer))?;
                     if read == 0 {
                         break;
@@ -613,6 +681,8 @@ impl Copier<'_> {
                     mode,
                     sha256: Some(hash.finalize().into()),
                     observed_mode: metadata.mode() & 0o7777,
+                    observed_mtime: (metadata.mtime(), metadata.mtime_nsec()),
+                    observed_ctime: (metadata.ctime(), metadata.ctime_nsec()),
                 });
             }
         }
@@ -668,6 +738,15 @@ fn is_repository_metadata(path: &Path) -> bool {
             .as_os_str()
             .as_bytes()
             .eq_ignore_ascii_case(b".git")
+    })
+}
+
+fn is_build_cache(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("target" | "node_modules" | ".build" | ".cache" | "DerivedData")
+        )
     })
 }
 
@@ -737,6 +816,7 @@ fn scan(
     secrets: &RegisteredSecrets,
     limits: Limits,
     selection: Option<&Selection>,
+    exclude_build_caches: bool,
 ) -> Result<Scan> {
     let (fd, ancestors) = open_root_with_ancestors(root)?;
     let before = io(root, fd.metadata())?;
@@ -765,6 +845,8 @@ fn scan(
         selection,
         manifest: Vec::new(),
         exclusions: Vec::new(),
+        deadline: None,
+        exclude_build_caches,
     };
     walker.walk(&fd, Path::new(""), 0)?;
     let (current, current_ancestors) = open_root_with_ancestors(root)?;
@@ -865,6 +947,7 @@ pub fn collect_changes(
         &secrets,
         limits,
         None,
+        snapshot.exclude_build_caches,
     )?;
     let before: BTreeMap<_, _> = snapshot
         .manifest
@@ -1086,6 +1169,7 @@ pub fn check_source_conflicts(
             &secrets,
             limits,
             Some(&selection),
+            snapshot.exclude_build_caches,
         ) {
             Ok(current) => current,
             Err(e) if e.kind == ErrorKind::SourceChanged => {

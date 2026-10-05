@@ -183,7 +183,7 @@ fn rejects_root_replacement_after_fd_open() {
     let source = parent.join("source");
     fs::create_dir(&source).unwrap();
     fs::write(source.join("ok"), b"original").unwrap();
-    let result = snapshot_inner(&source, &empty(), limits(), || {
+    let result = snapshot_inner(&source, &empty(), limits(), None, false, || {
         fs::rename(&source, parent.join("old")).unwrap();
         fs::create_dir(&source).unwrap();
         fs::write(source.join("ok"), b"replacement").unwrap();

@@ -96,6 +96,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "inspect a run or change its next turn limit",
     },
     SlashCommand {
+        name: "sandbox",
+        description: "inspect the fixed startup authority",
+    },
+    SlashCommand {
         name: "help",
         description: "list available commands",
     },

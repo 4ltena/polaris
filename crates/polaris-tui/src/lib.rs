@@ -30,6 +30,8 @@ mod runtime_commands;
 #[cfg(unix)]
 mod runtime_effects;
 #[cfg(unix)]
+mod sandbox_commands;
+#[cfg(unix)]
 mod session_commands;
 #[cfg(target_os = "linux")]
 mod workspace_commands;
@@ -4209,6 +4211,27 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 }
                                 continue;
                             }
+                            if request.starts_with("sandbox ") && request != "sandbox status" {
+                                match sandbox_commands::handle(
+                                    &request,
+                                    &terminal,
+                                    &mut key_reader,
+                                    &session,
+                                    rewind_workspace.as_ref().expect("startup owner"),
+                                    &management_effects,
+                                    &args.sandbox,
+                                    has_pending_inputs,
+                                ) {
+                                    Ok(lines) => {
+                                        local_lines.extend(lines);
+                                        status = Status::Notice(
+                                            "sandboxの実行結果を表示しました".into(),
+                                        );
+                                    }
+                                    Err(error) => status = Status::Error(error),
+                                }
+                                continue;
+                            }
                             let result = handle_runtime_command(
                                 &request,
                                 session.delegation_control.as_ref(),
@@ -5058,6 +5081,25 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 local_lines.extend(lines);
                                 refresh_saved_settings = true;
                                 status = Status::Notice("role bindingの結果を表示しました".into());
+                            }
+                            Err(error) => status = Status::Error(error),
+                        }
+                        continue;
+                    }
+                    if request.starts_with("sandbox ") && request != "sandbox status" {
+                        match sandbox_commands::handle(
+                            &request,
+                            &terminal,
+                            &mut key_reader,
+                            &session,
+                            rewind_workspace.as_ref().expect("startup owner"),
+                            &management_effects,
+                            &args.sandbox,
+                            has_pending_inputs,
+                        ) {
+                            Ok(lines) => {
+                                local_lines.extend(lines);
+                                status = Status::Notice("sandboxの実行結果を表示しました".into());
                             }
                             Err(error) => status = Status::Error(error),
                         }

@@ -133,7 +133,17 @@ impl MemoryStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         #[cfg(unix)]
         if path.as_ref() != Path::new(":memory:") {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+            match std::fs::symlink_metadata(path.as_ref()) {
+                Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                    return Err(Error::InvalidInput(
+                        "memory database must be a regular file",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -141,9 +151,22 @@ impl MemoryStore {
                 .truncate(false)
                 .mode(0o600)
                 .open(path.as_ref())?;
+            let metadata = file.metadata()?;
+            let named = std::fs::symlink_metadata(path.as_ref())?;
+            if !metadata.is_file()
+                || !named.is_file()
+                || named.file_type().is_symlink()
+                || metadata.nlink() != 1
+                || (metadata.dev(), metadata.ino()) != (named.dev(), named.ino())
+            {
+                return Err(Error::InvalidInput("memory database identity changed"));
+            }
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        let mut connection = Connection::open(path)?;
+        let mut connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         let transaction = connection.transaction()?;
@@ -185,8 +208,10 @@ impl MemoryStore {
 
     /// Opens an existing writable index without creation, schema repair or permission changes.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
-        let connection =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(Self { connection })

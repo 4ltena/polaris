@@ -6,6 +6,7 @@
 
 #![cfg(unix)]
 
+pub mod account_change;
 mod store;
 pub mod workflow_change;
 

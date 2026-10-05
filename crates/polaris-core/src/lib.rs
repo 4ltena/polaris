@@ -88,6 +88,8 @@ pub mod handoff;
 pub mod isolated_run;
 #[cfg(unix)]
 pub mod isolated_workspace;
+#[cfg(target_os = "linux")]
+pub mod linux_l04_parent;
 pub mod llama_server;
 pub mod local_execution;
 #[cfg(unix)]

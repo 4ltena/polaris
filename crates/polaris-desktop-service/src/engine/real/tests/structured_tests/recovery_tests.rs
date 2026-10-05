@@ -104,7 +104,14 @@ pub(super) fn resume_failure_in_child(
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("structured_failure_recovery "));
-    print!("{stdout}");
+    // Forward the fixture receipt without nesting its test-harness totals.
+    println!(
+        "{}",
+        stdout
+            .lines()
+            .find(|line| line.starts_with("structured_failure_recovery "))
+            .unwrap()
+    );
     let reopened = DesktopService::open(config.clone()).unwrap();
     let after = reopened.engine.as_ref().unwrap().store.snapshot().unwrap();
     assert_recovered(before, &after, unknown);

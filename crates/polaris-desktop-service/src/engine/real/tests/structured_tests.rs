@@ -81,7 +81,8 @@ fn real_engine_structured10_initializes_absent_index_before_first_request() {
     assert_eq!(
         main.lock().unwrap().len(),
         1,
-        "cold Structured10 must reach the main provider"
+        "cold Structured10 must reach the main provider; runs: {:?}",
+        saved.state.runs
     );
     assert!(
         summaries.lock().unwrap().is_empty(),
@@ -313,7 +314,14 @@ fn real_engine_structured10_compresses_metered_envelope_and_continues_after_reop
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("structured_process_resume "));
-    print!("{stdout}");
+    // Forward the fixture receipt without nesting its test-harness totals.
+    println!(
+        "{}",
+        stdout
+            .lines()
+            .find(|line| line.starts_with("structured_process_resume "))
+            .unwrap()
+    );
     let reopened = DesktopService::open(f.config.clone()).unwrap();
     let restored = reopened.engine.as_ref().unwrap().store.snapshot().unwrap();
     assert_eq!(

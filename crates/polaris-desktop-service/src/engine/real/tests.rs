@@ -755,7 +755,8 @@ fn workflow_configure_uses_cas_preserves_disabled_and_snapshot_phase() {
     ));
 }
 fn until(engine: &mut Engine, predicate: impl Fn(&Engine) -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Durable fsync and concurrent fixture children may exceed five seconds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         engine.step_real(None, false).unwrap();
         if predicate(engine) {
@@ -833,7 +834,20 @@ fn real_engine_strict10_uses_v3_raw_owner_and_keeps_only_recent_request_turns() 
             .iter()
             .filter(|raw| raw.message.role == Role::User)
             .count(),
-        11
+        11,
+        "run states: {:?}; memory: {:?}",
+        saved
+            .state
+            .runs
+            .iter()
+            .map(|run| run.run.state)
+            .collect::<Vec<_>>(),
+        saved
+            .state
+            .runs
+            .iter()
+            .map(|run| &run.memory)
+            .collect::<Vec<_>>()
     );
     assert!(
         saved

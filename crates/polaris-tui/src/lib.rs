@@ -2228,6 +2228,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &terminal,
                                 &mut key_reader,
                                 &mut approval_policy,
+                                args.approval_policy,
+                                &args.sandbox,
                                 &mut status,
                             );
                             continue;
@@ -2575,6 +2577,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &terminal,
                         &mut key_reader,
                         &mut approval_policy,
+                        args.approval_policy,
+                        &args.sandbox,
                         &mut status,
                     );
                     continue;
@@ -3910,6 +3914,15 @@ fn handle_fork(
     *meta_path = new_meta_path;
     *session_started_at_millis = started;
 }
+fn approval_within_startup_ceiling(ceiling: ApprovalPolicy, picked: ApprovalPolicy) -> bool {
+    // `Always` adds mandatory prompts for in-scope work, but also maps to a
+    // higher child-delegation capability. Neither axis may widen at runtime.
+    match ceiling {
+        ApprovalPolicy::Never => picked == ApprovalPolicy::Never,
+        ApprovalPolicy::OnRequest => picked != ApprovalPolicy::Always,
+        ApprovalPolicy::Always => picked == ApprovalPolicy::Always,
+    }
+}
 
 /// Runs the `/permissions` picker as its own small blocking loop, the
 /// same shape as `run_resume_picker` (three fixed rows instead of a
@@ -3919,6 +3932,8 @@ fn run_permissions_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
     current: ApprovalPolicy,
+    ceiling: ApprovalPolicy,
+    sandbox: &SandboxPolicy,
 ) -> Option<ApprovalPolicy> {
     const OPTIONS: [ApprovalPolicy; 3] = [
         ApprovalPolicy::Never,
@@ -3929,7 +3944,7 @@ fn run_permissions_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     loop {
         if terminal
             .borrow_mut()
-            .draw(|f| render::render_permissions_picker(f, current, selected))
+            .draw(|f| render::render_permissions_picker(f, current, ceiling, sandbox, selected))
             .is_err()
         {
             return None;
@@ -3938,7 +3953,14 @@ fn run_permissions_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
         match reader.read_key() {
             Ok(KeyCode::Down) => selected = (selected + 1) % OPTIONS.len(),
             Ok(KeyCode::Up) => selected = (selected + OPTIONS.len() - 1) % OPTIONS.len(),
-            Ok(KeyCode::Enter) => return Some(OPTIONS[selected]),
+            Ok(KeyCode::Enter)
+                if terminal.borrow().size().is_ok_and(|area| {
+                    area.width >= render::PERMISSIONS_MIN_WIDTH
+                        && area.height >= render::PERMISSIONS_MIN_HEIGHT
+                }) =>
+            {
+                return Some(OPTIONS[selected]);
+            }
             Ok(KeyCode::Esc) => return None,
             Ok(_) => continue,
             Err(_) => return None,
@@ -3955,11 +3977,30 @@ fn handle_permissions<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
     approval_policy: &mut ApprovalPolicy,
+    approval_ceiling: ApprovalPolicy,
+    sandbox: &SandboxPolicy,
     status: &mut Status,
 ) {
-    if let Some(picked) = run_permissions_picker(terminal, reader, *approval_policy) {
-        *approval_policy = picked;
-        *status = Status::Notice(format!("permissions set to {picked:?}"));
+    if let Some(picked) = run_permissions_picker(
+        terminal,
+        reader,
+        *approval_policy,
+        approval_ceiling,
+        sandbox,
+    ) {
+        #[cfg(target_os = "linux")]
+        if signal::pending_linux_process_shutdown().is_some() {
+            return;
+        }
+        if approval_within_startup_ceiling(approval_ceiling, picked) {
+            *approval_policy = picked;
+            *status = Status::Notice(format!("permissions set to {picked:?}"));
+        } else {
+            *status = Status::Notice(format!(
+                "起動時の承認境界と両立しません。--approval {} で再起動してください",
+                render::approval_cli_value(picked)
+            ));
+        }
     }
 }
 
@@ -7509,21 +7550,126 @@ mod tests {
     }
 
     #[test]
-    fn handle_permissions_switches_to_the_picked_policy() {
+    fn permissions_ceiling_uses_the_two_axis_transition_table() {
+        use ApprovalPolicy::{Always, Never, OnRequest};
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
+        for (ceiling, allowed) in [
+            (Never, [true, false, false]),
+            (OnRequest, [true, true, false]),
+            (Always, [false, false, true]),
+        ] {
+            for (picked, expected) in [Never, OnRequest, Always].into_iter().zip(allowed) {
+                assert_eq!(
+                    approval_within_startup_ceiling(ceiling, picked),
+                    expected,
+                    "ceiling={ceiling:?}, picked={picked:?}"
+                );
+                if expected {
+                    assert!(
+                        delegation_capabilities(&sandbox, picked, false, &[])
+                            .does_not_escalate_from(&delegation_capabilities(
+                                &sandbox,
+                                ceiling,
+                                false,
+                                &[]
+                            )),
+                        "delegation escalated: ceiling={ceiling:?}, picked={picked:?}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn handle_permissions_rejects_a_policy_above_startup_never() {
         let backend = TestBackend::new(70, 14);
         let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
         // Down from Never (index 0) to OnRequest (index 1), then Enter.
         let mut reader = ScriptedReader(VecDeque::from([KeyCode::Down, KeyCode::Enter]));
         let mut approval_policy = ApprovalPolicy::Never;
         let mut status = Status::Idle;
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
 
-        handle_permissions(&terminal, &mut reader, &mut approval_policy, &mut status);
+        handle_permissions(
+            &terminal,
+            &mut reader,
+            &mut approval_policy,
+            ApprovalPolicy::Never,
+            &sandbox,
+            &mut status,
+        );
 
-        assert_eq!(approval_policy, ApprovalPolicy::OnRequest);
+        assert_eq!(approval_policy, ApprovalPolicy::Never);
         match status {
-            Status::Notice(n) => assert!(n.contains("OnRequest")),
+            Status::Notice(n) => assert!(n.contains("--approval on-request")),
             _ => panic!("expected a Notice"),
         }
+    }
+    #[test]
+    fn handle_permissions_can_narrow_and_restore_startup_on_request() {
+        let backend = TestBackend::new(70, 14);
+        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
+        let mut approval_policy = ApprovalPolicy::OnRequest;
+        let mut status = Status::Idle;
+        let mut to_never = ScriptedReader(VecDeque::from([KeyCode::Up, KeyCode::Enter]));
+        handle_permissions(
+            &terminal,
+            &mut to_never,
+            &mut approval_policy,
+            ApprovalPolicy::OnRequest,
+            &sandbox,
+            &mut status,
+        );
+        assert_eq!(approval_policy, ApprovalPolicy::Never);
+
+        let mut restore = ScriptedReader(VecDeque::from([KeyCode::Down, KeyCode::Enter]));
+        handle_permissions(
+            &terminal,
+            &mut restore,
+            &mut approval_policy,
+            ApprovalPolicy::OnRequest,
+            &sandbox,
+            &mut status,
+        );
+        assert_eq!(approval_policy, ApprovalPolicy::OnRequest);
+    }
+    #[test]
+    fn handle_permissions_keeps_delegation_within_startup_on_request() {
+        let backend = TestBackend::new(70, 14);
+        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
+        let mut approval_policy = ApprovalPolicy::OnRequest;
+        let mut status = Status::Idle;
+        let mut reader = ScriptedReader(VecDeque::from([KeyCode::Down, KeyCode::Enter]));
+        handle_permissions(
+            &terminal,
+            &mut reader,
+            &mut approval_policy,
+            ApprovalPolicy::OnRequest,
+            &sandbox,
+            &mut status,
+        );
+        assert_eq!(approval_policy, ApprovalPolicy::OnRequest);
+        assert!(matches!(status, Status::Notice(_)));
+    }
+    #[test]
+    fn handle_permissions_keeps_startup_always_confirmations() {
+        let backend = TestBackend::new(70, 14);
+        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
+        let mut approval_policy = ApprovalPolicy::Always;
+        let mut status = Status::Idle;
+        let mut reader = ScriptedReader(VecDeque::from([KeyCode::Down, KeyCode::Enter]));
+        handle_permissions(
+            &terminal,
+            &mut reader,
+            &mut approval_policy,
+            ApprovalPolicy::Always,
+            &sandbox,
+            &mut status,
+        );
+        assert_eq!(approval_policy, ApprovalPolicy::Always);
+        assert!(matches!(status, Status::Notice(_)));
     }
 
     #[test]
@@ -7533,13 +7679,40 @@ mod tests {
         let mut reader = ScriptedReader(VecDeque::from([KeyCode::Down, KeyCode::Esc]));
         let mut approval_policy = ApprovalPolicy::Never;
         let mut status = Status::Idle;
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
 
-        handle_permissions(&terminal, &mut reader, &mut approval_policy, &mut status);
+        handle_permissions(
+            &terminal,
+            &mut reader,
+            &mut approval_policy,
+            ApprovalPolicy::Never,
+            &sandbox,
+            &mut status,
+        );
 
         assert_eq!(approval_policy, ApprovalPolicy::Never);
         assert!(matches!(status, Status::Idle));
     }
 
+    #[test]
+    fn handle_permissions_does_not_accept_a_selection_when_limits_cannot_be_shown() {
+        let backend = TestBackend::new(39, 7);
+        let terminal = RefCell::new(Terminal::new(backend).expect("terminal"));
+        let mut reader = ScriptedReader(VecDeque::from([KeyCode::Enter, KeyCode::Esc]));
+        let mut approval_policy = ApprovalPolicy::OnRequest;
+        let mut status = Status::Idle;
+        let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
+        handle_permissions(
+            &terminal,
+            &mut reader,
+            &mut approval_policy,
+            ApprovalPolicy::OnRequest,
+            &sandbox,
+            &mut status,
+        );
+        assert_eq!(approval_policy, ApprovalPolicy::OnRequest);
+        assert!(matches!(status, Status::Idle));
+    }
     #[test]
     fn diff_reports_no_changes_outside_a_git_repository() {
         // `cwd` here is a bare tempdir, not a git repo — `git diff` exits

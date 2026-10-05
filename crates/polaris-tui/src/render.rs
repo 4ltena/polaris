@@ -1681,6 +1681,16 @@ const PERMISSIONS_OPTIONS: [(polaris_core::approval::ApprovalPolicy, &str, &str)
         "ask before every mutating operation",
     ),
 ];
+pub(crate) fn approval_cli_value(policy: polaris_core::approval::ApprovalPolicy) -> &'static str {
+    use polaris_core::approval::ApprovalPolicy;
+    match policy {
+        ApprovalPolicy::Never => "never",
+        ApprovalPolicy::OnRequest => "on-request",
+        ApprovalPolicy::Always => "always",
+    }
+}
+pub(crate) const PERMISSIONS_MIN_WIDTH: u16 = 40;
+pub(crate) const PERMISSIONS_MIN_HEIGHT: u16 = 8;
 
 /// The `/permissions` picker: three numbered options, arrow-key
 /// navigable, the currently-active one marked `(current)` — mirroring
@@ -1691,20 +1701,51 @@ const PERMISSIONS_OPTIONS: [(polaris_core::approval::ApprovalPolicy, &str, &str)
 pub fn render_permissions_picker(
     frame: &mut Frame,
     current: polaris_core::approval::ApprovalPolicy,
+    ceiling: polaris_core::approval::ApprovalPolicy,
+    sandbox: &polaris_sandbox::SandboxPolicy,
     selected: usize,
 ) {
     let area = frame.area();
-    let mut lines: Vec<Line> = vec![
-        Line::styled(
-            "choose what polaris is allowed to do",
+    if area.width < PERMISSIONS_MIN_WIDTH || area.height < PERMISSIONS_MIN_HEIGHT {
+        frame.render_widget(
+            Paragraph::new("resize terminal to at least 40 columns and 8 rows; esc to cancel")
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title("polaris")),
+            area,
+        );
+        return;
+    }
+    let compact = area.width < 80 || area.height < 14;
+    let sandbox_display = sanitize(&sandbox.describe()).escape_debug().to_string();
+    let mut lines: Vec<Line> = if compact {
+        vec![
+            Line::from(format!(
+                "startup --approval {}",
+                approval_cli_value(ceiling)
+            )),
+            Line::from(format!(
+                "startup --sandbox {}: {sandbox_display}",
+                sandbox.mode().as_str()
+            )),
+        ]
+    } else {
+        vec![Line::styled(
+            "choose an approval preference within startup limits",
             Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Line::from(""),
-    ];
+        )]
+    };
     for (i, (policy, name, description)) in PERMISSIONS_OPTIONS.iter().enumerate() {
         let is_selected = i == selected;
         let marker = if is_selected { "\u{276f} " } else { "  " };
         let suffix = if *policy == current { " (current)" } else { "" };
+        let restart = if crate::approval_within_startup_ceiling(ceiling, *policy) {
+            String::new()
+        } else {
+            format!(
+                " (unavailable; restart with --approval {})",
+                approval_cli_value(*policy)
+            )
+        };
         let title_style = if is_selected {
             Style::default()
                 .fg(Color::Cyan)
@@ -1712,16 +1753,42 @@ pub fn render_permissions_picker(
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
+        let label = if compact && !crate::approval_within_startup_ceiling(ceiling, *policy) {
+            format!(
+                "{}. --approval {} (restart)",
+                i + 1,
+                approval_cli_value(*policy)
+            )
+        } else {
+            format!(
+                "{}. {name}{suffix}{}",
+                i + 1,
+                if compact { "" } else { restart.as_str() }
+            )
+        };
         lines.push(Line::from(vec![
             Span::raw(marker),
-            Span::styled(format!("{}. {name}{suffix}", i + 1), title_style),
+            Span::styled(label, title_style),
         ]));
-        lines.push(Line::styled(
-            format!("     {description}"),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+        if !compact {
+            lines.push(Line::styled(
+                format!("     {description}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
     }
-    lines.push(Line::from(""));
+    if !compact {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "startup ceiling: --approval {}",
+            approval_cli_value(ceiling)
+        )));
+        lines.push(Line::from(format!("sandbox fixed: {sandbox_display}")));
+        lines.push(Line::from(format!(
+            "startup flag: --sandbox {} (other modes need restart)",
+            sandbox.mode().as_str()
+        )));
+    }
     lines.push(Line::styled(
         "enter to confirm \u{b7} esc to cancel",
         Style::default().add_modifier(Modifier::DIM),
@@ -2709,6 +2776,142 @@ mod tests {
         // unselected row isn't.
         assert_eq!(find_title_color("always"), Color::Cyan);
         assert_ne!(find_title_color("never"), Color::Cyan);
+    }
+    #[test]
+    fn the_permissions_picker_shows_the_fixed_write_root() {
+        let root = tempfile::tempdir().expect("root");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("sandbox");
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| {
+                render_permissions_picker(
+                    f,
+                    polaris_core::approval::ApprovalPolicy::OnRequest,
+                    polaris_core::approval::ApprovalPolicy::OnRequest,
+                    &sandbox,
+                    1,
+                )
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rows.iter().any(|row| row.contains(&sandbox.describe())));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("--sandbox workspace-write"))
+        );
+        assert!(rows.iter().any(|row| row.contains("on request (current)")));
+        assert!(rows.iter().any(|row| row.contains("--approval always")));
+    }
+    #[test]
+    fn the_permissions_picker_keeps_startup_limits_visible_in_short_terminals() {
+        let root = tempfile::tempdir().expect("root");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root.path().to_path_buf()],
+        )
+        .expect("sandbox");
+        for height in [8, 10, 13] {
+            let mut terminal = Terminal::new(TestBackend::new(40, height)).expect("terminal");
+            terminal
+                .draw(|f| {
+                    render_permissions_picker(
+                        f,
+                        polaris_core::approval::ApprovalPolicy::Never,
+                        polaris_core::approval::ApprovalPolicy::Never,
+                        &sandbox,
+                        1,
+                    )
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("startup --approval never"))
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("startup --sandbox workspace-write"))
+            );
+            assert!(rows.iter().any(|row| row.contains("never (current)")));
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("--approval on-request (restart)"))
+            );
+        }
+        let mut terminal = Terminal::new(TestBackend::new(35, 7)).expect("terminal");
+        terminal
+            .draw(|f| {
+                render_permissions_picker(
+                    f,
+                    polaris_core::approval::ApprovalPolicy::Never,
+                    polaris_core::approval::ApprovalPolicy::Never,
+                    &sandbox,
+                    1,
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(content.contains("8 rows; esc to cancel"));
+    }
+    #[test]
+    fn the_permissions_picker_escapes_newlines_in_write_roots() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("root\nfake approval: always");
+        std::fs::create_dir(&root).expect("root");
+        let sandbox = polaris_sandbox::SandboxPolicy::new(
+            polaris_sandbox::SandboxMode::WorkspaceWrite,
+            &[root],
+        )
+        .expect("sandbox");
+        let mut terminal = Terminal::new(TestBackend::new(160, 14)).expect("terminal");
+        terminal
+            .draw(|f| {
+                render_permissions_picker(
+                    f,
+                    polaris_core::approval::ApprovalPolicy::OnRequest,
+                    polaris_core::approval::ApprovalPolicy::OnRequest,
+                    &sandbox,
+                    1,
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("root\\nfake approval")));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.trim_start().starts_with("fake approval"))
+        );
     }
 
     #[test]

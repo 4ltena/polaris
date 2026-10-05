@@ -5,6 +5,8 @@ pub mod agent;
 pub mod answer_finalizer;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod apply_intent;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod apply_owner;
 pub mod approval;
 pub mod audit;
 pub mod budget;

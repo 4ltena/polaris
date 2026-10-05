@@ -321,7 +321,121 @@ impl JoinedManagementEffectRecoveryV1 {
 }
 
 impl ManagementEffectInspectV1 {
+    pub(crate) fn joined_terminal_store(
+        self,
+        intent: &crate::apply_intent::InspectedApplyIntentV1,
+    ) -> Result<ManagementEffectStoreV1, crate::apply_owner::ApplyOwnerError> {
+        self.verify_pins()?;
+        if self.tail != ManagementEffectTailV1::Complete || !intent.latest().phase.is_terminal() {
+            return Err(crate::apply_owner::ApplyOwnerError::EvidenceMismatch);
+        }
+        let operation = intent.descriptor().management_operation_id;
+        if let Some(snapshot) = self.snapshots.get(&operation) {
+            let event = self
+                .latest_event_evidence(operation, snapshot)?
+                .ok_or(crate::apply_owner::ApplyOwnerError::EvidenceMismatch)?;
+            crate::apply_owner::ApplyOwnerV1::verify_generic_join(intent, snapshot, &event)?;
+        } else if intent.latest().evidence.generic_evidence().is_some() {
+            return Err(crate::apply_owner::ApplyOwnerError::EvidenceMismatch);
+        }
+        drop(self._owner_guard);
+        Ok(self.store)
+    }
 
+    pub(crate) fn joined_completed_readback(
+        self,
+        intent: &crate::apply_intent::InspectedApplyIntentV1,
+        readback: ManagementEffectHashV1,
+    ) -> Result<
+        (ManagementEffectStoreV1, VerifiedManagementEffectEventV1),
+        crate::apply_owner::ApplyOwnerError,
+    > {
+        use crate::apply_owner::{ApplyOwnerError, ApplyOwnerV1};
+        self.verify_pins()?;
+        if self.tail != ManagementEffectTailV1::Complete
+            || !(intent.latest().phase == crate::apply_intent::ApplyPhaseV1::ParticipationCommitted
+                || intent.latest().phase == crate::apply_intent::ApplyPhaseV1::OutcomeUnknown
+                    && intent.generations.iter().any(|e| {
+                        matches!(
+                            e.generation.evidence,
+                            crate::apply_intent::ApplyEvidenceV1::ParticipationCommitted { .. }
+                        )
+                    }))
+        {
+            return Err(ApplyOwnerError::EvidenceMismatch);
+        }
+        let request = ApplyOwnerV1::management_request(intent.descriptor())?;
+        let snapshot = self
+            .snapshots
+            .get(&request.operation_id)
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        let event = self
+            .latest_event_evidence(request.operation_id, snapshot)?
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        if snapshot.request != request
+            || event.event
+                != (JournalEventV1::Completed {
+                    operation_id: request.operation_id,
+                    evidence_hash: readback,
+                })
+        {
+            return Err(ApplyOwnerError::EvidenceMismatch);
+        }
+        if let crate::apply_intent::ApplyEvidenceV1::OutcomeUnknown {
+            reason,
+            generic_generation,
+            generic_event_hash,
+            generic_sequence,
+            ..
+        } = intent.latest().evidence
+        {
+            self.event_evidence(
+                request.operation_id,
+                ManagementEffectEventEvidenceV1 {
+                    generation: generic_generation,
+                    event_hash: generic_event_hash,
+                    sequence: generic_sequence,
+                },
+                &JournalEventV1::OutcomeUnknown {
+                    operation_id: request.operation_id,
+                    reason,
+                },
+            )?
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        }
+        let prior = intent
+            .generations
+            .iter()
+            .rev()
+            .find_map(|e| match e.generation.evidence {
+                crate::apply_intent::ApplyEvidenceV1::EffectStarted {
+                    generic_generation,
+                    generic_event_hash,
+                    generic_sequence,
+                } => Some(ManagementEffectEventEvidenceV1 {
+                    generation: generic_generation,
+                    event_hash: generic_event_hash,
+                    sequence: generic_sequence,
+                }),
+                _ => None,
+            })
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        self.event_evidence(
+            request.operation_id,
+            prior,
+            &JournalEventV1::EffectStarted {
+                operation_id: request.operation_id,
+            },
+        )?
+        .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        if (prior.generation, prior.sequence)
+            >= (event.evidence.generation, event.evidence.sequence)
+        {
+            return Err(ApplyOwnerError::EvidenceMismatch);
+        }
+        drop(self._owner_guard);
+        Ok((self.store, event))
+    }
 
     /// Admission may recycle a terminal generation, but never a pending one.
     pub(crate) fn fresh_admission_limits(
@@ -358,7 +472,135 @@ impl ManagementEffectInspectV1 {
         ))
     }
 
+    pub(crate) fn admit_fresh(
+        self,
+        lease: &ProjectMutationLeaseV1,
+        intent: &crate::apply_intent::InspectedApplyIntentV1,
+    ) -> Result<ManagementEffectStoreV1, ManagementEffectStoreError> {
+        self.fresh_admission_limits()?;
+        self.store.check_lease(lease)?;
+        let request = crate::apply_owner::ApplyOwnerV1::management_request(intent.descriptor())
+            .map_err(|_| ManagementEffectStoreError::RequestConflict)?;
+        if intent.latest().phase != crate::apply_intent::ApplyPhaseV1::Prepared
+            || intent.latest().sequence != 0
+            || request.scope.project != self.store.project_scope
+            || self.snapshots.contains_key(&request.operation_id)
+        {
+            return Err(ManagementEffectStoreError::RequestConflict);
+        }
+        let next = self
+            .state
+            .generation
+            .checked_add(1)
+            .ok_or(ManagementEffectStoreError::StoreFull)?;
+        if !self.store.has_prepare_reserve(&self.state)?
+            || self
+                .directories
+                .contains_key(&format!("generations/.seal-{next}.v1.tmp"))
+            || self
+                .directories
+                .contains_key(&format!("generations/{next}"))
+            || self.files.contains_key(&format!(".CURRENT-{next}.v1.tmp"))
+        {
+            self.store
+                .seal_generation_joined(lease, &self.root_directory, &self.state)?;
+        }
+        if !self.store.has_prepare_reserve(&self.store.load()?)? {
+            return Err(ManagementEffectStoreError::StoreFull);
+        }
+        drop(self._owner_guard);
+        Ok(self.store)
+    }
 
+    pub(crate) fn join_recovery(
+        self,
+        intent: &crate::apply_intent::InspectedApplyIntentV1,
+    ) -> Result<JoinedManagementEffectRecoveryV1, crate::apply_owner::ApplyOwnerError> {
+        use crate::apply_owner::{ApplyOwnerError, ApplyOwnerV1};
+        if intent.latest().phase.is_terminal() {
+            return Err(ApplyOwnerError::EvidenceMismatch);
+        }
+        let operation_id = intent.descriptor().management_operation_id;
+        if self.snapshots.values().any(|effect| {
+            effect.request.operation_id != operation_id && effect.state.blocks_new_work()
+        }) {
+            return Err(ApplyOwnerError::EvidenceMismatch);
+        }
+        let snapshot = self
+            .snapshots
+            .get(&operation_id)
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        let verified = self
+            .latest_event_evidence(operation_id, snapshot)?
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        if ApplyOwnerV1::verify_generic_join(intent, snapshot, &verified).is_err() {
+            use crate::apply_intent::ApplyPhaseV1;
+            let request = ApplyOwnerV1::management_request(intent.descriptor())?;
+            if snapshot.request != request {
+                return Err(ApplyOwnerError::EvidenceMismatch);
+            }
+            let prior_event = match (&verified.event, intent.latest().phase) {
+                (
+                    JournalEventV1::OutcomeUnknown {
+                        reason: ManagementUnknownReasonV1::ProcessRestart,
+                        ..
+                    },
+                    ApplyPhaseV1::EffectStarted,
+                ) => JournalEventV1::EffectStarted { operation_id },
+                (
+                    JournalEventV1::Denied { .. },
+                    ApplyPhaseV1::Prepared | ApplyPhaseV1::RecoveryPrepared,
+                ) => JournalEventV1::Prepared {
+                    request: request.clone(),
+                },
+                _ => return Err(ApplyOwnerError::EvidenceMismatch),
+            };
+            let prior = if let Some((generation, event_hash, sequence)) = intent
+                .generations
+                .iter()
+                .rev()
+                .find_map(|record| record.generation.evidence.generic_evidence())
+            {
+                self.event_evidence(
+                    operation_id,
+                    ManagementEffectEventEvidenceV1 {
+                        generation,
+                        event_hash,
+                        sequence,
+                    },
+                    &prior_event,
+                )?
+                .ok_or(ApplyOwnerError::EvidenceMismatch)?
+            } else if intent.latest().phase == ApplyPhaseV1::Prepared {
+                self.events
+                    .values()
+                    .find(|event| event.event == prior_event)
+                    .cloned()
+                    .ok_or(ApplyOwnerError::EvidenceMismatch)?
+            } else {
+                return Err(ApplyOwnerError::EvidenceMismatch);
+            };
+            if (prior.evidence.generation, prior.evidence.sequence)
+                >= (verified.evidence.generation, verified.evidence.sequence)
+            {
+                return Err(ApplyOwnerError::EvidenceMismatch);
+            }
+        }
+        let generic_request = snapshot.request.clone();
+        let token = JoinedManagementEffectRecoveryV1 {
+            operation_id,
+            descriptor_hash: intent.descriptor().descriptor_hash()?,
+            intent_sequence: intent.latest().sequence,
+            intent_record_hash: intent.latest().record_hash()?,
+            generic_request,
+            generic_verified_event: verified,
+            inspect_cursor: self.cursor(),
+            complete_prefix_hash: self.complete_prefix_hash,
+            tail: self.tail,
+            inspected: self,
+        };
+        Ok(token)
+    }
     pub fn cursor(&self) -> ManagementEffectCursorV1 {
         self.state.cursor()
     }
@@ -450,6 +692,64 @@ impl ManagementEffectInspectV1 {
 }
 
 impl ManagementEffectStoreV1 {
+    /// Creation is authorized only by the owner's already durable generation zero.
+    /// Existing bytes go through inspect/admit; normal open's repairs are avoided.
+    pub(crate) fn initialize_fresh_joined(
+        project: &Path,
+        state: &Path,
+        lease: &ProjectMutationLeaseV1,
+        intent: &crate::apply_intent::InspectedApplyIntentV1,
+    ) -> Result<Self, ManagementEffectStoreError> {
+        use crate::project_mutation::open_directory_nofollow;
+        let request = crate::apply_owner::ApplyOwnerV1::management_request(intent.descriptor())
+            .map_err(|_| ManagementEffectStoreError::RequestConflict)?;
+        if intent.latest().sequence != 0
+            || intent.latest().phase != crate::apply_intent::ApplyPhaseV1::Prepared
+            || request.scope.project
+                != ManagementEffectHashV1::digest(project.as_os_str().as_encoded_bytes())
+            || lease.store_root() != state.join("rewind-workspace")
+        {
+            return Err(ManagementEffectStoreError::WrongProjectLease);
+        }
+        let parent = open_directory_nofollow(state)?;
+        let metadata = parent.metadata()?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
+            return Err(ManagementEffectStoreError::InvalidStore);
+        }
+        let name = CString::new(STORE_NAME).expect("fixed component");
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let root = management_child_directory(&parent, STORE_NAME)?;
+        for name in [OWNER_LOCK_NAME, JOURNAL_NAME] {
+            let name = CString::new(name).expect("fixed component");
+            let fd = unsafe {
+                libc::openat(
+                    root.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            file.sync_all()?;
+        }
+        root.sync_all()?;
+        parent.sync_all()?;
+        match Self::inspect_open_at_state_dir(project, state, lease)? {
+            ManagementEffectInspectOpenV1::Present(inspected) => {
+                inspected.admit_fresh(lease, intent)
+            }
+            ManagementEffectInspectOpenV1::Absent => Err(ManagementEffectStoreError::InvalidStore),
+        }
+    }
 
     pub fn inspect_open_at_state_dir(
         project_root: &Path,

@@ -4485,6 +4485,28 @@ fn mcp_state_lines(cwd: &std::path::Path) -> Vec<String> {
     lines
 }
 
+fn cat_diagnostic_lines(
+    owner: Option<&polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner>,
+) -> Vec<ratatui::text::Line<'static>> {
+    let line = match owner {
+        None => {
+            "CAT: configured=shadow ownerなし; installed=未照合; verified=未確認; observed=未取得"
+                .into()
+        }
+        Some(owner) => match owner.translation_observation() {
+            Ok((requested, installed, verified, attempted)) => format!(
+                "CAT: configured={requested}; installed={}; verified={verified}; observed={attempted} attempts (保存済み観測)。実行の成功とは別です。",
+                match installed {
+                    Some(true) => "導入確認",
+                    Some(false) => "未導入",
+                    None => "未照合",
+                },
+            ),
+            Err(_) => "CAT: 状態を読めません。可用性は未確認です。".into(),
+        },
+    };
+    vec![line.into()]
+}
 #[allow(clippy::too_many_arguments)]
 fn apply_slash_action(
     action: slash::Action,

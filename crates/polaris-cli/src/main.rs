@@ -1959,6 +1959,7 @@ async fn build_tui_answer_finalizer(
         .translation
         .activation
         .is_requested();
+    let mut installed = None;
     let (translator, unavailable) = if config.answer_finalizer.mode != AnswerFinalizerMode::Shadow
         || !translation_requested
     {
@@ -1986,7 +1987,10 @@ async fn build_tui_answer_finalizer(
                 .map_err(|error| format!("管理モデルのOSユーザホームを特定できません: {error}"))?;
             &resolved_home
         };
-        match polaris_core::translation::ManagedCatTranslate::open(home) {
+        match polaris_core::translation::ManagedCatTranslate::open_with_installation(
+            home,
+            &mut installed,
+        ) {
             Ok(translator) if translator.preflight().await.is_ok() => (
                 Some(std::sync::Arc::new(translator)
                     as std::sync::Arc<
@@ -2000,7 +2004,7 @@ async fn build_tui_answer_finalizer(
             ),
         }
     };
-    polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner::open_configured(
+    let mut owner = polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner::open_configured(
         state_dir.join("answer-finalizer-shadow-v1.json"),
         config.presentation.clone(),
         config.answer_finalizer.clone(),
@@ -2008,7 +2012,13 @@ async fn build_tui_answer_finalizer(
         translator,
         unavailable,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if let Some(owner) = owner.as_mut() {
+        std::sync::Arc::get_mut(owner)
+            .ok_or("finalizer startup observation is already shared")?
+            .record_translation_installation(installed);
+    }
+    Ok(owner)
 }
 
 /// The provider handle everything downstream holds. Named so the three

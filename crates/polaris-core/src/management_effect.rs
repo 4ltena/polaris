@@ -7,6 +7,7 @@
 #![cfg(unix)]
 
 mod store;
+pub mod workflow_change;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,10 @@ pub use store::{
     JoinedManagementEffectRecoveryV1, ManagementEffectCapacityV1, ManagementEffectInspectOpenV1,
     ManagementEffectInspectV1, ManagementEffectInspectedFileV1, ManagementEffectLimitsV1,
     ManagementEffectStoreError, ManagementEffectStoreV1, ManagementEffectTailV1,
+};
+pub use workflow_change::{
+    WorkflowChangeError, WorkflowChangeOwner, WorkflowChangePreviewV1, WorkflowEffectInventoryV1,
+    WorkflowPreparedChangeV1,
 };
 
 const HASH_BYTES: usize = 32;

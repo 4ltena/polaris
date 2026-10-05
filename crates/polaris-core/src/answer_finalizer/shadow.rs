@@ -298,6 +298,7 @@ pub struct ShadowFinalizerOwner {
     translation_profile_hash: Option<String>,
     presentation_language: LanguageV1,
     translation_requested: bool,
+    translation_installed: Option<bool>,
     translator: Option<Arc<dyn TranslationBackendV1>>,
     decider: Option<Arc<dyn Decider>>,
     decider_name: Option<String>,
@@ -418,6 +419,7 @@ impl ShadowFinalizerOwner {
             translation_profile_hash,
             presentation_language,
             translation_requested,
+            translation_installed: None,
             translator,
             decider,
             decider_name,
@@ -1131,6 +1133,36 @@ impl ShadowFinalizerOwner {
             .journal
             .records
             .clone())
+    }
+
+    /// Record the host startup observation without granting activation.
+    pub fn record_translation_installation(&mut self, installed: Option<bool>) {
+        self.translation_installed = installed;
+    }
+
+    /// Read selection, installation, host preflight and bounded attempt metadata.
+    pub fn translation_observation(&self) -> io::Result<(bool, Option<bool>, bool, usize)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("shadow lock"))?;
+        let attempted = state
+            .journal
+            .records
+            .iter()
+            .filter(|record| {
+                record
+                    .observation
+                    .as_ref()
+                    .is_some_and(|value| value.translation_attempted)
+            })
+            .count();
+        Ok((
+            self.translation_requested,
+            self.translation_installed,
+            self.translator.is_some() && self.translation_unavailable.is_none(),
+            attempted,
+        ))
     }
 
     fn persist(&self) -> io::Result<()> {

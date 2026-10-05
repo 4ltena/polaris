@@ -250,7 +250,15 @@ pub struct ManagedCatTranslate {
 
 impl ManagedCatTranslate {
     pub fn open(home: &Path) -> io::Result<Self> {
+        Self::open_with_installation(home, &mut None)
+    }
+
+    /// Preserve model-installation evidence separately from runtime readiness.
+    /// Failure leaves it unknown; no second hash pass or fallback is used.
+    pub fn open_with_installation(home: &Path, installed: &mut Option<bool>) -> io::Result<Self> {
+        *installed = None;
         let (files, mut directories) = verify_model_installation(home, BUNDLED_RUNTIME_MANIFEST)?;
+        *installed = Some(true);
         let runtime =
             crate::managed_runtime::ManagedRuntimeLease::acquire(home).map_err(io::Error::other)?;
         let polaris = home.join(".polaris");

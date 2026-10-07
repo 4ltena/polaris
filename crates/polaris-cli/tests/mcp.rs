@@ -1,6 +1,9 @@
 //! `polaris mcp` against a synthetic home; no server or model is contacted.
+#[path = "support/product_binary.rs"]
+mod product_binary;
+
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 fn polaris(
     home: &std::path::Path,
@@ -10,7 +13,7 @@ fn polaris(
 ) -> Output {
     // The child's synthetic HOME must not redirect project identity upward.
     std::fs::create_dir_all(project.join(".git")).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_polaris"))
+    let mut child = product_binary::command()
         .env("HOME", home)
         .env_remove("POLARIS_DATA_DIR")
         .current_dir(project)
@@ -328,7 +331,7 @@ fn one_shot_preselects_once_with_an_independent_model_and_counts_its_usage() {
     let checked = polaris(&home_path, project.path(), &["mcp", "check", "docs"], "");
     assert!(checked.status.success(), "{checked:?}");
     let (url, requests) = serve_recorded_model();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_polaris"))
+    let mut child = product_binary::command()
         .args(["--mcp-external", "-p", "look it up"])
         .current_dir(project.path())
         .env("HOME", &home_path)
@@ -389,7 +392,7 @@ fn one_shot_runs_ask_at_the_terminal_before_an_mcp_tool_call() {
                 },
             )
             .unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_polaris"))
+        let mut child = product_binary::command()
             .args(["--mcp-external", "-p", "look it up"])
             .current_dir(project.path())
             .env("HOME", home.path().canonicalize().unwrap())

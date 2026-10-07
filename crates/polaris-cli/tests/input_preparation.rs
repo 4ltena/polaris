@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -12,6 +12,9 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
+
+#[path = "support/product_binary.rs"]
+mod product_binary;
 
 use polaris_core::{
     conversation_state::RawEventV2, session::Session, session_store::PersistedSession,
@@ -44,6 +47,7 @@ impl RecordedModel {
                     }
                     Err(error) => return Err(error),
                 };
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(Duration::from_secs(5)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(5)))?;
                 recorded.lock().unwrap().push(read_request(&mut stream)?);
@@ -216,7 +220,7 @@ fn real_cli_projects_only_when_enabled_and_preserves_raw_across_reopen() {
             "input_preparation = \"{mode}\"\n[workflow]\nenabled = true\nmode = \"manual\"\nalways = []\nphase_skills = {{}}\n[files_md]\nauto_regenerate = false\n[decision]\nenabled = false\n"
         )).unwrap();
         let model = RecordedModel::start();
-        let output = Command::new(env!("CARGO_BIN_EXE_polaris"))
+        let output = product_binary::command()
             .env_clear()
             .env("HOME", &home)
             .env("TMPDIR", &temporary)

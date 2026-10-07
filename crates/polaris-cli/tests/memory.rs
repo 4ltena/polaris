@@ -1,11 +1,12 @@
 //! Exercises project memory through the real CLI without model calls.
 
-use std::process::Command;
+#[path = "support/product_binary.rs"]
+mod product_binary;
 
 fn run(home: &std::path::Path, project: &std::path::Path, args: &[&str]) -> std::process::Output {
     // Keep each synthetic project distinct when another HOME is its ancestor.
     std::fs::create_dir_all(project.join(".git")).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_polaris"))
+    product_binary::command()
         .env("HOME", home)
         .current_dir(project)
         .args(args)

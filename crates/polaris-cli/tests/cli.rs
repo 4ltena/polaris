@@ -1,6 +1,7 @@
 //! Integration tests for the CLI binary. Launches the real process to verify behavior.
 
-use std::process::Command;
+#[path = "support/product_binary.rs"]
+mod product_binary;
 
 /// Launching without an API key should exit stating plainly that the key
 /// is missing. No actual network call is made.
@@ -12,9 +13,8 @@ use std::process::Command;
 /// request to `https://api.openai.com/v1`.
 #[test]
 fn reports_missing_api_key() {
-    let exe = env!("CARGO_BIN_EXE_polaris");
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(exe)
+    let out = product_binary::command()
         .args(["-p", "hello"])
         .env(
             "HOME",
@@ -40,7 +40,6 @@ fn reports_missing_api_key() {
 /// discovery and then fail later, on its own terms, at the network call.
 #[test]
 fn reports_a_broken_agent_type_without_crashing() {
-    let exe = env!("CARGO_BIN_EXE_polaris");
     let home = tempfile::tempdir().expect("temp directory");
     let project = tempfile::tempdir().expect("temp directory");
     std::fs::create_dir(project.path().join(".polaris")).expect("could not create project marker");
@@ -52,7 +51,7 @@ fn reports_a_broken_agent_type_without_crashing() {
     )
     .expect("could not write SKILL.md");
 
-    let out = Command::new(exe)
+    let out = product_binary::command()
         .args(["-p", "hello"])
         .current_dir(project.path())
         .env(
@@ -77,8 +76,7 @@ fn reports_a_broken_agent_type_without_crashing() {
 /// discover them without reading the source.
 #[test]
 fn help_mentions_the_three_environment_variables() {
-    let exe = env!("CARGO_BIN_EXE_polaris");
-    let out = Command::new(exe)
+    let out = product_binary::command()
         .arg("--help")
         .output()
         .expect("could not launch");
@@ -93,7 +91,6 @@ fn help_mentions_the_three_environment_variables() {
 /// A project config alone cannot start the experimental structured10 mode.
 #[test]
 fn project_config_cannot_start_structured10_without_the_explicit_flag() {
-    let exe = env!("CARGO_BIN_EXE_polaris");
     let home = tempfile::tempdir().expect("temp directory");
     let project = tempfile::tempdir().expect("temp directory");
     std::fs::create_dir_all(project.path().join(".polaris")).unwrap();
@@ -114,7 +111,7 @@ fn project_config_cannot_start_structured10_without_the_explicit_flag() {
         &["-p", "hello"][..],
         &["--resume", "legacy-1", "-p", "hello"],
     ] {
-        let out = Command::new(exe)
+        let out = product_binary::command()
             .args(args)
             .current_dir(project.path())
             .env("HOME", home.path().canonicalize().unwrap())

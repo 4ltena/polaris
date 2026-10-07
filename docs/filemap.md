@@ -156,6 +156,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `subcommands.rs` — Pins down that subcommands are actually reachable.
 - `sync.rs` — Two local devices exchanging through a bare repository; no network.
 
+## `crates/polaris-cli/tests/support`
+
+- `product_binary.rs` — Holds a private executable package for real CLI integration-test children.
+
 ## `crates/polaris-core`
 
 - `Cargo.toml` — manifest for the polaris-core crate

@@ -8,11 +8,8 @@
 //! `HOME` is pointed at a temp directory, so this never touches the real
 //! `~/.polaris` or `~/.codex`.
 
-use std::process::Command;
-
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_polaris")
-}
+#[path = "support/product_binary.rs"]
+mod product_binary;
 
 #[test]
 fn common_tests_runs_a_valid_bounded_plan_or_reports_unavailable() {
@@ -29,7 +26,7 @@ fn common_tests_runs_a_valid_bounded_plan_or_reports_unavailable() {
     )
     .expect("write plan");
 
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .current_dir(workspace.path())
         .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
         .output()
@@ -56,7 +53,7 @@ fn common_tests_rejects_a_plan_larger_than_the_decode_limit() {
         vec![b'x'; polaris_core::common_tests::MAX_PLAN_BYTES + 1],
     )
     .expect("write plan");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .current_dir(workspace.path())
         .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
         .output()
@@ -82,7 +79,7 @@ fn common_tests_never_returns_a_host_home_sentinel() {
         .to_string(),
     )
     .expect("write plan");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .current_dir(workspace.path())
         .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
         .output()
@@ -115,7 +112,7 @@ fn common_tests_never_exposes_workspace_secrets_to_a_case_program() {
     )
     .expect("write plan");
 
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .current_dir(workspace.path())
         .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
         .output()
@@ -143,7 +140,7 @@ fn common_tests_rejects_an_invalid_plan_before_execution() {
     )
     .expect("write invalid plan");
 
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .current_dir(workspace.path())
         .args(["common-tests", plan.to_str().expect("utf-8 plan path")])
         .output()
@@ -164,7 +161,7 @@ fn hidden_static_component_manifest_returns_only_the_typed_fixed_contract() {
         "[package]\nname = \"static-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )
     .expect("write manifest");
-    let clean = Command::new(bin())
+    let clean = product_binary::command()
         .current_dir(component.path())
         .arg("static-component-manifest")
         .output()
@@ -180,7 +177,7 @@ fn hidden_static_component_manifest_returns_only_the_typed_fixed_contract() {
     assert_eq!(clean["findings"], serde_json::json!([]));
 
     std::fs::write(component.path().join("Cargo.toml"), "[workspace]\n").expect("replace manifest");
-    let violated = Command::new(bin())
+    let violated = product_binary::command()
         .current_dir(component.path())
         .arg("static-component-manifest")
         .output()
@@ -193,7 +190,7 @@ fn hidden_static_component_manifest_returns_only_the_typed_fixed_contract() {
         "component-cargo-manifest-v1"
     );
 
-    let widened = Command::new(bin())
+    let widened = product_binary::command()
         .current_dir(component.path())
         .args(["static-component-manifest", "--path", "/tmp/other"])
         .output()
@@ -205,7 +202,7 @@ fn hidden_static_component_manifest_returns_only_the_typed_fixed_contract() {
 /// means it never opens a browser or reaches the network.
 #[test]
 fn the_login_subcommand_is_reachable_without_a_prompt() {
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .args(["login", "--help"])
         .output()
         .expect("could not launch");
@@ -221,7 +218,7 @@ fn the_login_subcommand_is_reachable_without_a_prompt() {
 #[test]
 fn the_logout_subcommand_runs_without_a_prompt() {
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .arg("logout")
         .env(
             "HOME",
@@ -255,7 +252,7 @@ fn logout_never_touches_the_codex_store() {
     )
     .expect("cannot write");
 
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .arg("logout")
         .env(
             "HOME",
@@ -284,7 +281,7 @@ fn the_normal_path_without_a_prompt_refuses_the_tui_on_a_non_interactive_termina
     // Provider construction now runs unconditionally, even without a
     // prompt, so a real key must be present or the process would fail
     // there instead of reaching the TUI's own guard.
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .env("POLARIS_PROVIDER", "openai")
         .env("POLARIS_API_KEY", "sk-test-not-a-real-key")
         .output()
@@ -309,7 +306,7 @@ fn the_normal_path_without_a_prompt_refuses_the_tui_on_a_non_interactive_termina
 #[test]
 fn the_default_provider_is_still_openai() {
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .args(["-p", "x"])
         .env(
             "HOME",
@@ -334,7 +331,7 @@ fn the_default_provider_is_still_openai() {
 #[test]
 fn a_logged_out_codex_run_names_the_login_command() {
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .args(["-p", "a few lines"])
         .env(
             "HOME",
@@ -363,7 +360,7 @@ fn a_logged_out_codex_run_names_the_login_command() {
 /// running, via "the model isn't responding", is too late.
 #[test]
 fn an_unknown_provider_name_fails_fast() {
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .args(["-p", "x"])
         .env("POLARIS_PROVIDER", "nonesuch")
         .env("POLARIS_API_KEY", "dummy")
@@ -390,7 +387,7 @@ fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
     std::fs::create_dir_all(key_path.parent().unwrap()).expect("mkdir");
     std::fs::write(&key_path, r#"{"key":"sk-from-file"}"#).expect("write key file");
 
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .args(["-p", "x"])
         .env(
             "HOME",
@@ -423,7 +420,7 @@ fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
 #[test]
 fn tui_mode_with_no_key_anywhere_reaches_onboarding() {
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .env(
             "HOME",
             home.path().canonicalize().expect("physical home path"),
@@ -461,7 +458,7 @@ fn saved_codex_credentials_are_used_without_an_explicit_provider() {
     )
     .expect("cannot write");
 
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .env(
             "HOME",
             home.path().canonicalize().expect("physical home path"),
@@ -490,7 +487,7 @@ fn saved_codex_credentials_are_used_without_an_explicit_provider() {
 #[test]
 fn exec_with_an_argument_reaches_the_one_shot_path() {
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .args(["exec", "do the thing"])
         .env(
             "HOME",
@@ -520,7 +517,7 @@ fn exec_with_no_argument_reads_the_prompt_from_stdin() {
     use std::process::Stdio;
 
     let home = tempfile::tempdir().expect("temp directory");
-    let mut child = Command::new(bin())
+    let mut child = product_binary::command()
         .arg("exec")
         .env(
             "HOME",
@@ -556,7 +553,7 @@ fn exec_with_no_argument_reads_the_prompt_from_stdin() {
 #[test]
 fn sandbox_runs_a_command_under_confinement_and_reports_its_output() {
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .args(["sandbox", "--", "echo", "hello-from-sandbox"])
         .env(
             "HOME",
@@ -580,7 +577,7 @@ fn sandbox_runs_a_command_under_confinement_and_reports_its_output() {
 #[test]
 fn sandbox_propagates_the_childs_exit_code() {
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .args(["sandbox", "--", "sh", "-c", "exit 7"])
         .env(
             "HOME",
@@ -597,7 +594,7 @@ fn sandbox_propagates_the_childs_exit_code() {
 #[test]
 fn doctor_runs_successfully_with_no_credentials() {
     let home = tempfile::tempdir().expect("temp directory");
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .arg("doctor")
         .env(
             "HOME",
@@ -639,7 +636,7 @@ fn doctor_reports_codex_as_default_when_only_codex_credentials_are_saved() {
     )
     .expect("cannot write");
 
-    let out = Command::new(bin())
+    let out = product_binary::command()
         .arg("doctor")
         .env(
             "HOME",
@@ -662,7 +659,7 @@ fn doctor_reports_codex_as_default_when_only_codex_credentials_are_saved() {
 #[test]
 fn completion_generates_a_script_for_every_supported_shell() {
     for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
-        let out = Command::new(bin())
+        let out = product_binary::command()
             .args(["completion", shell])
             .output()
             .unwrap_or_else(|e| panic!("could not launch for {shell}: {e}"));
@@ -684,7 +681,7 @@ fn an_explicit_account_is_refused_without_a_registration_or_outside_codex() {
     let home = tempfile::tempdir().expect("temp directory");
     let home = home.path().canonicalize().expect("physical home path");
     let run = |provider: &str| {
-        Command::new(bin())
+        product_binary::command()
             .args(["-p", "x", "--account", "reg-missing"])
             .env("HOME", &home)
             .env("POLARIS_PROVIDER", provider)

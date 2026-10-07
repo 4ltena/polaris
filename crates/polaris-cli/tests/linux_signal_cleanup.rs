@@ -3,6 +3,9 @@
 //! project. The raw PTY and result record remain under /tmp after the test.
 #![cfg(target_os = "linux")]
 
+#[path = "support/product_binary.rs"]
+mod product_binary;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
@@ -288,7 +291,7 @@ impl PtyCase {
             .write(true)
             .create_new(true)
             .open(dir.join("result.json"))?;
-        let binary = Path::new(env!("CARGO_BIN_EXE_polaris"));
+        let binary = product_binary::product_binary();
         let mut case = Self {
             name,
             dir,
@@ -298,7 +301,7 @@ impl PtyCase {
             master: None,
             slave: None,
             child: None,
-            binary_sha256: sha256(&fs::read(binary)?),
+            binary_sha256: sha256(&fs::read(&binary)?),
             pid: None,
             scene,
             before: None,
@@ -313,13 +316,12 @@ impl PtyCase {
             git_reparented_ppid: None,
             finalized: false,
         };
-        case.start_inner(binary, base_url, prepare)?;
+        case.start_inner(base_url, prepare)?;
         Ok(case)
     }
 
     fn start_inner(
         &mut self,
-        binary: &Path,
         base_url: &str,
         prepare: impl FnOnce(&Path) -> io::Result<()>,
     ) -> io::Result<()> {
@@ -345,7 +347,7 @@ impl PtyCase {
         prepare(&project)?;
         let (master, slave) = open_pty()?;
         self.before = Some(TermiosEvidence::read(slave.as_raw_fd())?);
-        let mut command = Command::new(binary);
+        let mut command = product_binary::command();
         command
             .env_clear()
             .env("HOME", &home)

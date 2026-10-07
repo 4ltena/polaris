@@ -758,6 +758,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `linux_apply_intent_restart.rs` — Local XFS restart acceptance. Phase fixtures use the public canonical wire
 - `linux_filesystem_acceptance.rs` — Explicit, disposable-root acceptance probe for Linux filesystem primitives.
 
+## `crates/polaris-core/tests/support`
+
+- `repository_files.rs` — Reads the repository file ledger from Git or an explicitly prefetched listing.
+
 ## `crates/polaris-desktop-protocol`
 
 - `Cargo.toml` — manifest for the polaris-desktop-protocol crate

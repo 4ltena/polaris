@@ -7,7 +7,9 @@
 //! to grep for, and nothing at all reconstructs the crate graph by hand. If
 //! the document drifts it stops being that answer, so drift fails loudly.
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+#[path = "support/repository_files.rs"]
+mod repository_files;
 
 /// A kind of outside contact, and how to recognise it in source.
 struct Boundary {
@@ -87,22 +89,8 @@ fn repo_root() -> PathBuf {
 /// the outside does so under its own fixture, which is not the boundary a
 /// reader is looking for.
 fn production_files(root: &Path) -> Vec<String> {
-    let output = Command::new("git")
-        .args([
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "*.rs",
-        ])
-        .current_dir(root)
-        .output()
-        .expect("git ls-files runs");
-    assert!(output.status.success(), "git ls-files failed");
-    String::from_utf8(output.stdout)
-        .expect("utf-8 paths")
-        .lines()
-        .map(str::to_owned)
+    repository_files::repository_files(root, true)
+        .into_iter()
         .filter(|path| {
             !path.contains("/tests/") && !path.ends_with("tests.rs") && !path.contains("/examples/")
         })

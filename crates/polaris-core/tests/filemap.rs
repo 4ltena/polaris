@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+#[path = "support/repository_files.rs"]
+mod repository_files;
 
 /// `CARGO_MANIFEST_DIR` points to `crates/polaris-core`. The repository
 /// root is 2 levels above that.
@@ -19,27 +21,11 @@ fn repo_root() -> PathBuf {
 }
 
 /// Gets the file listing that serves as the ledger. Fails the test outright
-/// if `git` is missing, or if this isn't a git repository. Skipping isn't
-/// allowed, since that would be a false pass.
+/// if neither Git nor an explicitly prefetched listing is available. Skipping
+/// isn't allowed, since that would be a false pass.
 fn list_files(root: &Path) -> Vec<String> {
-    let output = Command::new("git")
-        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
-        .current_dir(root)
-        .output()
-        .unwrap_or_else(|e| panic!("cannot run git: {e}. Check whether git is installed"));
-
-    if !output.status.success() {
-        panic!(
-            "git ls-files failed ({} might not be a git repository): {}",
-            root.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let stdout = String::from_utf8(output.stdout).expect("git ls-files' output is not UTF-8");
-    let mut files: Vec<String> = stdout
-        .lines()
-        .map(str::to_string)
+    let mut files: Vec<String> = repository_files::repository_files(root, false)
+        .into_iter()
         .filter(|path| root.join(path).is_file())
         // AppleDouble sidecars contain filesystem metadata, not source text.
         .filter(|path| !file_name_of(path).starts_with("._"))

@@ -1,6 +1,7 @@
 //! Sanitized snapshots, excluded secrets, source conflicts, and copy limits.
 use super::*;
 use std::os::unix::fs::symlink;
+use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
 fn limits() -> Limits {
     Limits {

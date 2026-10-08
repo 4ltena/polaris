@@ -46,7 +46,7 @@ use polaris_provider::decision::{Answer, Decider, Decision, DecisionError, Quest
 const CORPUS: &[u8] =
     include_bytes!("../../polaris-core/tests/fixtures/preselection_corpus_large.json");
 const ORDER: &[u8] =
-    include_bytes!("../../../.polaris/notes/checks/2026-09-18-e5-luna-large/e5_order.json");
+    include_bytes!("../../polaris-core/tests/fixtures/preselection_e5_order_large.json");
 
 /// The model the selector slot holds when the stage is not given a cheaper
 /// one. It is the same model the run itself uses, which is the whole point

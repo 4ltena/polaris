@@ -37,7 +37,7 @@ use polaris_mcp::catalog::index::ServerIndex;
 const CORPUS: &[u8] =
     include_bytes!("../../polaris-core/tests/fixtures/preselection_corpus_large.json");
 const ORDER: &[u8] =
-    include_bytes!("../../../.polaris/notes/checks/2026-09-18-e5-luna-large/e5_order.json");
+    include_bytes!("../../polaris-core/tests/fixtures/preselection_e5_order_large.json");
 
 struct Ordering {
     /// Which corpus the ordering was measured against. An ordering paired

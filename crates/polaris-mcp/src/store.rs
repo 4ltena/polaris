@@ -4,22 +4,42 @@
 //! held from descriptor inspection until durable replacement; paths and retired
 //! inodes remain excluded from model-visible snapshots.
 
+pub mod documents_v2;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod ledger_v1;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) mod migration_v2;
+
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::CString;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(any(unix, test))]
+use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use polaris_auth::protection::protect_store;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::Error;
-use crate::catalog::index::{CatalogIndex, MAX_INDEX_BYTES, ServerIndex};
-use crate::registration::{Destination, MAX_STORE_BYTES, Registry, bounded_json, valid_id};
+#[cfg(unix)]
+use crate::catalog::index::MAX_INDEX_BYTES;
+use crate::catalog::index::{CatalogIndex, ServerIndex};
+use crate::registration::{Destination, Registry, valid_id};
+#[cfg(unix)]
+use crate::registration::{MAX_STORE_BYTES, bounded_json};
 
+#[cfg(unix)]
 const CATALOG: &str = "catalog.json";
 
 /// Secret values deliberately have no Debug implementation or public serializer.
@@ -62,19 +82,62 @@ pub struct Snapshot {
 struct SecretDocument {
     schema_version: u32,
     revision: u64,
-    values: BTreeMap<String, String>,
+    values: BTreeMap<String, StoredSecretValue>,
 }
 
-impl Drop for SecretDocument {
+// Each successfully parsed value owns its wipe guard immediately, even when
+// a later map value or required document field makes deserialization fail.
+struct StoredSecretValue(Zeroizing<String>);
+impl std::ops::Deref for StoredSecretValue {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+impl PartialEq for StoredSecretValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+impl Eq for StoredSecretValue {}
+impl Serialize for StoredSecretValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+impl<'de> Deserialize<'de> for StoredSecretValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static STORED_SECRET_WIPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+impl Drop for StoredSecretValue {
     fn drop(&mut self) {
-        for value in self.values.values_mut() {
-            value.zeroize();
+        self.0.zeroize();
+        #[cfg(test)]
+        if self.0.is_empty() {
+            STORED_SECRET_WIPES.with(|count| count.set(count.get() + 1));
         }
     }
 }
 
 impl Secrets {
     pub fn new(revision: u64, values: BTreeMap<String, String>) -> Result<Self, Error> {
+        Self::from_stored(
+            revision,
+            values
+                .into_iter()
+                .map(|(key, value)| (key, StoredSecretValue(Zeroizing::new(value))))
+                .collect(),
+        )
+    }
+    fn from_stored(
+        revision: u64,
+        values: BTreeMap<String, StoredSecretValue>,
+    ) -> Result<Self, Error> {
         let result = Self(SecretDocument {
             schema_version: 1,
             revision,
@@ -98,14 +161,16 @@ impl Secrets {
         self.0
             .values
             .get(reference)
-            .map(String::as_str)
+            .map(|value| value.0.as_str())
             .ok_or(Error::Auth)
     }
 }
 
 trait Document: Serialize + DeserializeOwned {
+    #[cfg(unix)]
     fn revision(&self) -> u64;
     fn validate(&self) -> Result<(), Error>;
+    #[cfg(unix)]
     fn validate_links(
         &self,
         store: &Store,
@@ -114,12 +179,14 @@ trait Document: Serialize + DeserializeOwned {
 }
 
 impl Document for Registry {
+    #[cfg(unix)]
     fn revision(&self) -> u64 {
         self.revision
     }
     fn validate(&self) -> Result<(), Error> {
         Registry::validate(self)
     }
+    #[cfg(unix)]
     fn validate_links(
         &self,
         store: &Store,
@@ -132,6 +199,7 @@ impl Document for Registry {
 }
 
 impl Document for SecretDocument {
+    #[cfg(unix)]
     fn revision(&self) -> u64 {
         self.revision
     }
@@ -148,6 +216,7 @@ impl Document for SecretDocument {
         }
         Ok(())
     }
+    #[cfg(unix)]
     fn validate_links(
         &self,
         store: &Store,
@@ -177,19 +246,24 @@ fn check_references(registry: &Registry, secrets: Option<&SecretDocument>) -> Re
     Ok(())
 }
 
+// Retain the real handles while construction is unavailable on non-Unix.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct Store {
     home: File,
     directory: File,
     path: PathBuf,
 }
 
+#[cfg(unix)]
 struct WriterLock(File);
+#[cfg(unix)]
 impl Drop for WriterLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
 }
 
+#[cfg(any(unix, test))]
 fn write_protected(
     file: &mut File,
     bytes: &[u8],
@@ -200,6 +274,7 @@ fn write_protected(
     file.sync_all().map_err(|_| Error::Storage)
 }
 
+#[cfg(unix)]
 fn metadata(file: &File, directory: bool) -> Result<(), Error> {
     let m = file.metadata().map_err(|_| Error::Storage)?;
     // SAFETY: geteuid has no arguments or memory effects.
@@ -213,6 +288,7 @@ fn metadata(file: &File, directory: bool) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn open_at(parent: &File, name: &str, flags: i32) -> Result<File, std::io::Error> {
     let name = CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
     // SAFETY: parent owns a live descriptor and name is terminated. A successful
@@ -231,6 +307,7 @@ fn open_at(parent: &File, name: &str, flags: i32) -> Result<File, std::io::Error
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[cfg(unix)]
 fn private_directory(parent: &File, name: &str, private: bool) -> Result<File, Error> {
     let c_name = CString::new(name).map_err(|_| Error::Storage)?;
     // SAFETY: bounded, terminated component and a live parent descriptor.
@@ -249,6 +326,7 @@ fn private_directory(parent: &File, name: &str, private: bool) -> Result<File, E
     Ok(dir)
 }
 
+#[cfg(unix)]
 fn parent_metadata(file: &File) -> Result<(), Error> {
     let m = file.metadata().map_err(|_| Error::Storage)?;
     if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o022 != 0 {
@@ -264,7 +342,10 @@ impl Store {
             .symlink_metadata()
             .is_ok_and(|metadata| metadata.is_dir())
     }
+}
 
+#[cfg(unix)]
+impl Store {
     /// `home` must be the trusted OS-resolved canonical home, never project input.
     /// Reserve store paths before calling any model-visible reader.
     pub fn open(home: &Path) -> Result<Self, Error> {
@@ -389,20 +470,16 @@ impl Store {
         for (reference, value) in changes {
             match value {
                 Some(value) => {
-                    // This is the persistence boundary. The stored document
-                    // deliberately retains the credential until it is removed;
-                    // transient trusted input remains zeroizing before here.
-                    if let Some(mut replaced) = values.insert(reference, value.0.to_string()) {
-                        replaced.zeroize();
-                    }
+                    // Move the trusted wipe guard into the document. An old
+                    // value is wiped when the overwritten wrapper is dropped.
+                    values.insert(reference, StoredSecretValue(value.0));
                 }
                 None => {
-                    let mut removed = values.remove(&reference).ok_or(Error::Auth)?;
-                    removed.zeroize();
+                    drop(values.remove(&reference).ok_or(Error::Auth)?);
                 }
             }
         }
-        let next = Secrets::new(
+        let next = Secrets::from_stored(
             expected_revision.checked_add(1).ok_or(Error::Limit)?,
             values,
         )?;
@@ -633,7 +710,67 @@ impl Store {
     }
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+impl Store {
+    pub fn open(_home: &Path) -> Result<Self, Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn load_registry(&self) -> Result<Option<Registry>, Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn load_secrets(&self) -> Result<Option<Secrets>, Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn load_snapshot(&self) -> Result<Snapshot, Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn save_registry(&self, _expected_revision: u64, _next: &Registry) -> Result<(), Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn save_secrets(&self, _expected_revision: u64, _next: &Secrets) -> Result<(), Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn update_secret(
+        &self,
+        _expected_revision: u64,
+        _reference: &str,
+        _value: Option<SecretValue>,
+    ) -> Result<(), Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn update_secrets(
+        &self,
+        _expected_revision: u64,
+        _changes: Vec<(String, Option<SecretValue>)>,
+    ) -> Result<(), Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn server_directory(&self, _server_id: &str) -> Result<PathBuf, Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn load_catalog_index(&self) -> Result<Option<CatalogIndex>, Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn save_catalog_entry(
+        &self,
+        _server_id: &str,
+        _entry: ServerIndex,
+    ) -> Result<(usize, bool), Error> {
+        Err(Error::Protection)
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::registration::{Capabilities, Destination, ProtocolProfile, Server, Timeouts};
@@ -803,19 +940,6 @@ mod tests {
             .unwrap();
         std::fs::write(orphan.path.join("secrets.json"), b"not JSON").unwrap();
         assert!(matches!(orphan.load_snapshot(), Err(Error::Storage)));
-    }
-
-    #[test]
-    fn failed_inode_registration_prevents_first_secret_byte() {
-        let mut file = tempfile::tempfile().unwrap();
-        let result = write_protected(&mut file, b"synthetic-secret", |file| {
-            assert_eq!(file.metadata().unwrap().len(), 0);
-            Err(Error::Protection)
-        });
-        assert_eq!(result, Err(Error::Protection));
-        assert_eq!(file.metadata().unwrap().len(), 0);
-        write_protected(&mut file, b"synthetic-secret", |_| Ok(())).unwrap();
-        assert_eq!(file.metadata().unwrap().len(), 16);
     }
 
     #[test]
@@ -1160,8 +1284,6 @@ mod tests {
             "synthetic-secret"
         );
         assert!(store.load_registry().unwrap().is_none());
-        assert_eq!(format!("{}", Error::Auth), "mcp_auth");
-        assert!(Secrets::new(2, BTreeMap::from([("credential".into(), "a\r\nb".into())])).is_err());
     }
 
     #[test]
@@ -1258,5 +1380,164 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.load_registry(), Err(Error::Storage));
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn failed_inode_registration_prevents_first_secret_byte() {
+        let mut file = tempfile::tempfile().unwrap();
+        let result = write_protected(&mut file, b"synthetic-secret", |file| {
+            assert_eq!(file.metadata().unwrap().len(), 0);
+            Err(Error::Protection)
+        });
+        assert_eq!(result, Err(Error::Protection));
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        write_protected(&mut file, b"synthetic-secret", |_| Ok(())).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn secret_values_validate_in_memory_and_debug_stays_redacted() {
+        let secrets = Secrets::new(
+            7,
+            BTreeMap::from([("credential".into(), "synthetic-value".into())]),
+        )
+        .unwrap();
+        assert_eq!(secrets.revision(), 7);
+        assert_eq!(secrets.references().collect::<Vec<_>>(), vec!["credential"]);
+        assert_eq!(secrets.resolve("credential"), Ok("synthetic-value"));
+        assert_eq!(secrets.resolve("missing"), Err(Error::Auth));
+        assert_eq!(
+            format!("{:?}", SecretValue::new("synthetic-value")),
+            "SecretValue(<redacted>)"
+        );
+        assert!(Secrets::new(0, BTreeMap::new()).is_err());
+        assert!(Secrets::new(1, BTreeMap::from([("bad id".into(), "value".into())])).is_err());
+        assert_eq!(format!("{}", Error::Auth), "mcp_auth");
+        assert!(Secrets::new(2, BTreeMap::from([("credential".into(), "a\r\nb".into())])).is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::fs;
+
+    fn contents(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            assert!(metadata.is_file() || metadata.is_dir());
+            entries.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                metadata.is_file().then(|| fs::read(path).unwrap()),
+            );
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), entries);
+                }
+            }
+        }
+        let mut entries = BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[test]
+    fn windows_mcp_store_unavailable_open_preserves_existing_and_missing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join(".polaris/mcp")).unwrap();
+        fs::write(
+            home.join(".polaris/mcp/servers.json"),
+            b"invalid fixture JSON",
+        )
+        .unwrap();
+        fs::write(root.path().join("file"), b"fixture file").unwrap();
+        let before = contents(root.path());
+        for path in [
+            home,
+            root.path().to_path_buf(),
+            root.path().join("missing"),
+            root.path().join("file"),
+            PathBuf::from("relative-fixture-home"),
+        ] {
+            assert!(matches!(Store::open(&path), Err(Error::Protection)));
+            assert_eq!(contents(root.path()), before);
+        }
+    }
+
+    #[test]
+    fn windows_mcp_store_unavailable_methods_refuse_without_reading_or_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let home_file = root.path().join("home-handle");
+        let directory_file = root.path().join("directory-handle");
+        fs::write(&home_file, b"home fixture").unwrap();
+        fs::write(&directory_file, b"directory fixture").unwrap();
+        let path = root.path().join("store");
+        fs::create_dir(&path).unwrap();
+        for name in ["servers.json", "secrets.json", "catalog.json", "owner.lock"] {
+            fs::write(path.join(name), b"not a valid stored document").unwrap();
+        }
+        // Only this private test assembles handles. It does not acquire a
+        // protected Windows owner; public construction must remain unavailable.
+        let store = Store {
+            home: File::open(home_file).unwrap(),
+            directory: File::open(directory_file).unwrap(),
+            path,
+        };
+        let registry = Registry {
+            schema_version: 1,
+            revision: 1,
+            servers: vec![],
+        };
+        let secrets = Secrets::new(1, BTreeMap::new()).unwrap();
+        let before = contents(root.path());
+        assert!(matches!(store.load_registry(), Err(Error::Protection)));
+        assert!(matches!(store.load_secrets(), Err(Error::Protection)));
+        assert!(matches!(store.load_snapshot(), Err(Error::Protection)));
+        assert_eq!(store.save_registry(0, &registry), Err(Error::Protection));
+        assert_eq!(store.save_secrets(0, &secrets), Err(Error::Protection));
+        assert_eq!(
+            store.update_secret(0, "credential", Some(SecretValue::new("synthetic-value"))),
+            Err(Error::Protection)
+        );
+        assert_eq!(
+            store.update_secrets(0, vec![("credential".into(), None)]),
+            Err(Error::Protection)
+        );
+        assert_eq!(store.server_directory("fixture"), Err(Error::Protection));
+        assert!(matches!(store.load_catalog_index(), Err(Error::Protection)));
+        assert_eq!(
+            store.save_catalog_entry(
+                "fixture",
+                ServerIndex {
+                    destination_hash: "fixture".into(),
+                    partial: false,
+                    tools: vec![],
+                }
+            ),
+            Err(Error::Protection)
+        );
+        assert_eq!(contents(root.path()), before);
+    }
+
+    #[test]
+    fn windows_mcp_store_metadata_presence_is_observed_without_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("existing");
+        fs::create_dir_all(existing.join(".polaris/mcp")).unwrap();
+        let file = root.path().join("file");
+        fs::create_dir_all(file.join(".polaris")).unwrap();
+        fs::write(file.join(".polaris/mcp"), b"not a directory").unwrap();
+        let before = contents(root.path());
+        assert!(Store::exists(&existing));
+        assert!(!Store::exists(&file));
+        assert!(!Store::exists(&root.path().join("missing")));
+        assert_eq!(contents(root.path()), before);
     }
 }

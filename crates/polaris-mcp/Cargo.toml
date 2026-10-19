@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+polaris-tools = { path = "../polaris-tools" }
 rmcp = { version = "=3.3.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest"] }
 polaris-auth = { path = "../polaris-auth" }
 polaris-sandbox = { path = "../polaris-sandbox" }

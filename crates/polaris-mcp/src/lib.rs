@@ -3,8 +3,20 @@
 //! SDK types remain private to this crate. A registration permits a connection,
 //! not an operation; callers must obtain a separate host operation grant.
 
+#[cfg(unix)]
+pub mod account_home;
+#[cfg(unix)]
+pub mod admission;
 pub mod catalog;
 pub mod content;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod entry_gate;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod native_mount;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use native_mount::NativeMountIdentityV2;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod migration_observation;
 pub mod registration;
 pub mod secret_input;
 pub mod store;

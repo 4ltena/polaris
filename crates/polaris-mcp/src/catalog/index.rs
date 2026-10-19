@@ -94,7 +94,7 @@ impl ServerIndex {
 }
 
 impl CatalogIndex {
-    pub(crate) fn validate(&self) -> Result<(), Error> {
+    pub fn validate(&self) -> Result<(), Error> {
         if self.schema_version != 1 {
             return Err(Error::Storage);
         }

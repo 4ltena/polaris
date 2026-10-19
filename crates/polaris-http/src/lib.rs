@@ -112,6 +112,7 @@ mod tests {
     async fn unknown_ca_is_denied_and_bundle_trusts_every_certificate() {
         let address = tls_server().await;
         let untrusted = reqwest::Client::builder()
+            .no_proxy()
             .resolve("foobar.com", address)
             .build()
             .expect("client");
@@ -134,6 +135,7 @@ mod tests {
         std::fs::write(&bundle_path, format!("{CHAIN}{ROOT}")).expect("write test CA bundle");
         let trusted = client_builder_with_ca_file(&bundle_path)
             .expect("valid CA bundle")
+            .no_proxy()
             .resolve("foobar.com", address)
             .build()
             .expect("client");

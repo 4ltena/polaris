@@ -177,8 +177,9 @@ fn structured_failure_recovery_child() {
     }
     let after = engine.store.snapshot().unwrap();
     assert_recovered(&before, &after, unknown);
+    // libtest may leave its test-name prefix on the current stdout line.
     println!(
-        "structured_failure_recovery {}",
+        "\nstructured_failure_recovery {}",
         serde_json::json!({
             "child_pid":std::process::id(),"parent_pid":parent_pid,"unknown":unknown,
             "main_calls":main_count,"summary_calls":summaries.len(),"raw_user_turns":12,"live_provider":false

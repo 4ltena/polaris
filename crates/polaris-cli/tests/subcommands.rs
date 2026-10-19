@@ -289,7 +289,9 @@ fn the_normal_path_without_a_prompt_refuses_the_tui_on_a_non_interactive_termina
     // Provider construction now runs unconditionally, even without a
     // prompt, so a real key must be present or the process would fail
     // there instead of reaching the TUI's own guard.
+    let workspace = tempfile::tempdir().expect("temporary workspace");
     let out = product_binary::command()
+        .current_dir(workspace.path())
         .env("POLARIS_PROVIDER", "openai")
         .env("POLARIS_API_KEY", "sk-test-not-a-real-key")
         .output()
@@ -341,7 +343,9 @@ fn the_default_provider_is_still_openai() {
 #[test]
 fn a_logged_out_codex_run_names_the_login_command() {
     let home = tempfile::tempdir().expect("temp directory");
+    let workspace = tempfile::tempdir().expect("temporary workspace");
     let out = product_binary::command()
+        .current_dir(workspace.path())
         .args(["-p", "a few lines"])
         .env(
             "HOME",
@@ -464,6 +468,7 @@ fn tui_mode_with_no_key_anywhere_reaches_onboarding() {
 #[test]
 fn saved_codex_credentials_are_used_without_an_explicit_provider() {
     let home = tempfile::tempdir().expect("temp directory");
+    let workspace = tempfile::tempdir().expect("temporary workspace");
     let polaris_dir = home.path().join(".polaris");
     std::fs::create_dir_all(&polaris_dir).expect("cannot create");
     std::fs::write(
@@ -473,6 +478,7 @@ fn saved_codex_credentials_are_used_without_an_explicit_provider() {
     .expect("cannot write");
 
     let out = product_binary::command()
+        .current_dir(workspace.path())
         .env(
             "HOME",
             home.path().canonicalize().expect("physical home path"),

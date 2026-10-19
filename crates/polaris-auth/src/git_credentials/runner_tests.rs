@@ -159,25 +159,20 @@ fn runner_enforces_independent_stdout_and_stderr_64kib_limits() {
          esac\n",
     );
     let owner = fixture.owner();
+    // Output boundaries must not also depend on sub-second process startup.
     for argument in ["stdout", "stderr"] {
+        let result = run(&owner, &[OsString::from(argument)], CHILD_TIMEOUT);
         assert!(
-            run(
-                &owner,
-                &[OsString::from(argument)],
-                Duration::from_millis(400)
-            )
-            .is_ok()
+            result.is_ok(),
+            "{argument} must accept exactly 64 KiB: {result:?}"
         );
     }
     for argument in ["stdout-over", "stderr-over"] {
-        assert!(matches!(
-            run(
-                &owner,
-                &[OsString::from(argument)],
-                Duration::from_millis(400)
-            ),
-            Err(GitCredentialErrorV1::Protection)
-        ));
+        let result = run(&owner, &[OsString::from(argument)], CHILD_TIMEOUT);
+        assert!(
+            matches!(&result, Err(GitCredentialErrorV1::Protection)),
+            "{argument} must reject 64 KiB plus one byte: {result:?}"
+        );
     }
 }
 
@@ -465,30 +460,44 @@ fn bound_material_missing_fingerprint_key_never_creates_state() {
 
 #[test]
 fn typed_runner_terminates_closed_output_descendants_on_every_exit_kind() {
+    // Keep descendants alive beyond the runner's normal deadline so a PID can
+    // disappear only through cleanup, even when process startup is slow.
+    let descendant_lifetime = CHILD_TIMEOUT.as_secs() * 2;
     for (terminal, expected_code) in [
         ("exit 0", Some(0)),
         ("exit 7", Some(7)),
         ("kill -TERM $$", None),
     ] {
         let script = format!(
-            "#!/bin/sh\n/bin/cat <&3 >/dev/null\n/bin/cat <&4 >/dev/null\n/bin/sleep 5 </dev/null >/dev/null 2>&1 &\nprintf '%s' \"$!\" > \"$1\"\n{terminal}\n"
+            "#!/bin/sh\n/bin/cat <&3 >/dev/null\n/bin/cat <&4 >/dev/null\n/bin/sleep {descendant_lifetime} </dev/null >/dev/null 2>&1 &\nprintf '%s' \"$!\" > \"$1\"\n{terminal}\n"
         );
         let fixture = fixture(&script);
         let owner = fixture.owner();
         let pid_file = fixture.root.path().join("closed-output-descendant.pid");
         let material = material();
+        let started = Instant::now();
         let result = run_git_child(
             &owner.git,
             Some(&owner.askpass),
             Some(&material),
             &[pid_file.as_os_str().to_owned()],
             None,
-            Duration::from_millis(900),
+            CHILD_TIMEOUT,
         );
+        let outcome = result
+            .as_ref()
+            .map(GitChildOutputV1::exit_code)
+            .map_err(|failure| failure.phase());
         let pid = std::fs::read_to_string(&pid_file)
-            .unwrap()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{terminal}: fixture must record descendant PID: {error}; \
+                     runner outcome {outcome:?}, elapsed {:?}",
+                    started.elapsed()
+                )
+            })
             .parse::<i32>()
-            .unwrap();
+            .expect("numeric descendant PID");
         assert_pid_gone(pid);
         match expected_code {
             Some(code) => assert_eq!(result.unwrap().exit_code(), Some(code)),

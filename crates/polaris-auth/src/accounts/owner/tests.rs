@@ -163,31 +163,50 @@ async fn a_late_unauthorized_uses_the_newer_token_and_a_future_revision_is_refus
 }
 
 #[tokio::test]
-async fn logout_during_a_refresh_is_immediate_and_the_late_token_is_discarded() {
+async fn logout_does_not_wait_for_a_refresh_and_the_late_token_is_discarded() {
     let (_temp, home) = home();
     let (id, generation) = expired(&home, "acct-a");
     let server = MockServer::start().await;
-    token_endpoint(
-        &server,
-        "synthetic-refresh-acct-a",
-        ResponseTemplate::new(200)
-            .set_body_json(refreshed("acct-a", "fresh-a"))
-            .set_delay(Duration::from_millis(800)),
-        1,
-    )
-    .await;
+    let request_received = Arc::new(tokio::sync::Notify::new());
+    // Declared after the server so unwind drops the sender and releases the
+    // response before server teardown. Wiremock runs its own server thread.
+    let (release_response, response_release) = std::sync::mpsc::channel::<()>();
+    let response_release = Mutex::new(response_release);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("synthetic-refresh-acct-a"))
+        .respond_with({
+            let request_received = Arc::clone(&request_received);
+            move |_request: &wiremock::Request| {
+                request_received.notify_one();
+                // A disconnected sender also releases the response on failure.
+                let _ = response_release.lock().unwrap().recv();
+                ResponseTemplate::new(200).set_body_json(refreshed("acct-a", "fresh-a"))
+            }
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
     let owner = owner(&home, &server);
     let pending = {
         let (owner, id) = (Arc::clone(&owner), id.clone());
         tokio::spawn(async move { owner.token(&id, generation).await })
     };
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let started = Instant::now();
-    AccountStore::open_at(&home)
-        .unwrap()
-        .logout(&id, generation)
-        .unwrap();
-    assert!(started.elapsed() < Duration::from_millis(300));
+    tokio::time::timeout(Duration::from_secs(10), request_received.notified())
+        .await
+        .expect("refresh POST must arrive before testing logout");
+    let logout = {
+        let (home, id) = (home.clone(), id.clone());
+        tokio::task::spawn_blocking(move || AccountStore::open_at(&home)?.logout(&id, generation))
+    };
+    tokio::time::timeout(Duration::from_secs(10), logout)
+        .await
+        .expect("logout must finish while the refresh response is held")
+        .expect("logout worker must not panic")
+        .expect("logout must succeed before the refresh response is released");
+    assert_eq!(state(&home, &id).state, AccountState::Disconnected);
+    assert!(!pending.is_finished(), "refresh response is still held");
+    release_response.send(()).unwrap();
     assert!(matches!(
         pending.await.unwrap(),
         Err(AuthError::NotLoggedIn)

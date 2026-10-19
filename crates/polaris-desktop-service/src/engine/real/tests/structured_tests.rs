@@ -533,8 +533,9 @@ fn structured_process_reopen_child() {
             .get(),
         1
     );
+    // libtest may leave its test-name prefix on the current stdout line.
     println!(
-        "structured_process_resume {}",
+        "\nstructured_process_resume {}",
         serde_json::json!({"child_pid":std::process::id(),"parent_pid":parent_pid,"main_calls":1,"summary_calls":1,"raw_user_turns":13,"phase":"ready","live_provider":false})
     );
 }

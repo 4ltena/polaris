@@ -191,17 +191,30 @@ fn published_branch_with_reads(
         child,
         &mut |path| publication_read(reads, path),
     )?;
-    let post: ManifestId = verified
-        .workspace_post_manifest_id
-        .parse()
-        .map_err(io::Error::other)?;
     let pre: ManifestId = verified
         .workspace_pre_manifest_id
         .parse()
         .map_err(io::Error::other)?;
-    owner
-        .committed_branch_transaction_bounded(candidate_id, &post, &pre, reads)
+    let transaction = owner
+        .committed_branch_transaction_for_candidate_bounded(candidate_id, reads)
         .map_err(io::Error::other)?;
+    if transaction.target_pre != pre {
+        return Err(invalid("候補会話のworkspace transactionが一致しません"));
+    }
+    let activity = owner.try_activity_quiescent().map_err(io::Error::other)?;
+    match owner
+        .verify_rewind_management_with_activity(
+            &activity,
+            &transaction.expected_post,
+            &transaction.target_pre,
+        )
+        .map_err(io::Error::other)?
+    {
+        crate::management_effect::ManagementRewindCrossingV1::Clear => {}
+        crate::management_effect::ManagementRewindCrossingV1::Blocked { .. } => {
+            return Err(invalid("候補会話は管理effectを越えて巻き戻せません"));
+        }
+    }
     Ok(Some(verified))
 }
 
@@ -545,6 +558,7 @@ mod tests {
         conversation_state::RewindEffectStatusV1, conversation_state::RewindEligibilityV1,
     };
     use polaris_provider::Message;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn diagnostics_keep_unattributable_id_and_skip_normal_session() {
@@ -553,9 +567,12 @@ mod tests {
         let data_root = temp.path().join("data");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&data_root).unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &temp.path().join("rewind-workspace"),
+            &state.join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -618,9 +635,12 @@ mod tests {
         fs::create_dir(&project).unwrap();
         fs::create_dir(&data_root).unwrap();
         fs::write(project.join("file.txt"), b"before").unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &temp.path().join("rewind-workspace"),
+            &state.join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -682,6 +702,7 @@ mod tests {
             .unwrap();
         let restored = owner.restore_for_branch(&post, &pre, accepted_id).unwrap();
         owner.commit(&restored.transaction_id).unwrap();
+        let active_execution = owner.try_activity_quiescent().unwrap();
         assert_eq!(
             published_branch(&owner, &accepted)
                 .unwrap()
@@ -689,6 +710,7 @@ mod tests {
                 .origin_session_id,
             source_id
         );
+        drop(active_execution);
         let bounded =
             published_branch_bounded(&owner, &accepted, &mut PublicationReadBudgetV1::default())
                 .unwrap()

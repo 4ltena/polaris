@@ -98,7 +98,7 @@ impl Writer {
         frozen::with_receipts(self, target, expected, &db, |owners| {
             let mut context =
                 self.prepare_structured_memory_from_receipts(expected, &db, owners)?;
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             super::tests::after_mandatory_read();
             if context.accepts_related() {
                 match self.related_memory_candidates_from_receipts(expected, &db, owners, None) {

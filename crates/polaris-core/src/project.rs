@@ -123,7 +123,14 @@ fn state_dir_at(storage_root: &Path, cwd: &Path) -> std::io::Result<PathBuf> {
     let root = resolve_root(cwd);
     let id = project_id(&root);
     let dir = storage_root.join("state").join(id);
-    std::fs::create_dir_all(&dir)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir)?;
     Ok(dir)
 }
 
@@ -188,6 +195,24 @@ pub fn desktop_store_root() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn new_project_state_is_private_without_repairing_existing_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let state = state_dir_at(storage.path(), project.path()).unwrap();
+        for path in [storage.path().join("state"), state.clone()] {
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o7777, 0o700);
+        }
+        let before = std::fs::metadata(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(state_dir_at(storage.path(), project.path()).unwrap(), state);
+        let after = std::fs::metadata(&state).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode() & 0o7777, 0o755);
+    }
 
     #[test]
     fn a_subdirectory_resolves_to_the_repository_root() {

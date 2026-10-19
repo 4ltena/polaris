@@ -186,6 +186,7 @@ pub fn directory(
 /// `None` when it cannot be read. A share of an unknown total is not a cap,
 /// and guessing one would delete against a number nobody measured — so the
 /// share is simply dropped and the absolute cap, if any, decides alone.
+#[cfg(unix)]
 pub fn filesystem_bytes(path: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let held = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -196,6 +197,11 @@ pub fn filesystem_bytes(path: &std::path::Path) -> Option<u64> {
         (libc::statvfs(held.as_ptr(), &mut stat) == 0).then_some(stat)?
     };
     u64::from(stat.f_blocks).checked_mul(stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+pub fn filesystem_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
 }
 
 /// What a sweep did, in the terms a person checks it by.
@@ -224,6 +230,7 @@ impl Swept {
 ///
 /// Symbolic links are counted but never followed: a link out of the build
 /// directory must not make something outside it a candidate.
+#[cfg(unix)]
 pub fn measure(root: &std::path::Path, now_unix_seconds: u64) -> std::io::Result<Vec<Candidate>> {
     fn walk(
         directory: &std::path::Path,
@@ -258,6 +265,14 @@ pub fn measure(root: &std::path::Path, now_unix_seconds: u64) -> std::io::Result
     Ok(held)
 }
 
+#[cfg(not(unix))]
+pub fn measure(_root: &std::path::Path, _now_unix_seconds: u64) -> std::io::Result<Vec<Candidate>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "build cache link identity is unavailable on this platform",
+    ))
+}
+
 /// Whether what the plan named is still what the plan measured.
 ///
 /// The measurement and the removal are different moments. In between, a build
@@ -266,6 +281,7 @@ pub fn measure(root: &std::path::Path, now_unix_seconds: u64) -> std::io::Result
 /// Observed on 2026-09-18: a session that had checked for a running `cargo`
 /// an instant earlier removed a shared tree out from under a build that was
 /// about to start. **A plan is a proposal, not a warrant.**
+#[cfg(unix)]
 fn still_removable(held: &std::fs::Metadata, now_unix_seconds: u64) -> bool {
     let modified = held
         .modified()
@@ -284,6 +300,7 @@ fn still_removable(held: &std::fs::Metadata, now_unix_seconds: u64) -> bool {
 /// same rules the plan used. The measurement and the removal are not the same
 /// moment, and in between a build may have touched a file or linked it — the
 /// plan is a proposal, not a warrant.
+#[cfg(unix)]
 pub fn sweep(
     root: &std::path::Path,
     cap: Cap,
@@ -311,4 +328,17 @@ pub fn sweep(
         swept.freed_bytes += held.len();
     }
     Ok(swept)
+}
+
+#[cfg(not(unix))]
+pub fn sweep(
+    _root: &std::path::Path,
+    _cap: Cap,
+    _total_bytes: Option<u64>,
+    _now_unix_seconds: u64,
+) -> std::io::Result<Swept> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "build cache cleanup is unavailable on this platform",
+    ))
 }

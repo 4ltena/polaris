@@ -2790,10 +2790,35 @@ impl InspectedApplyIntentV1 {
 pub(crate) struct ApplyIntentStoreV1<'lease> {
     state: IntentDirectory,
     root: Option<IntentDirectory>,
-    lease: &'lease ProjectMutationLeaseV1,
+    lease: crate::project_mutation::ProjectReadLeaseV1<'lease>,
+}
+/// Exposes only idle inspection; writers retain their actual EX constructor.
+pub(crate) struct ApplyIntentIdleReadV1<'a>(ApplyIntentStoreV1<'a>);
+impl<'a> ApplyIntentIdleReadV1<'a> {
+    pub(crate) fn inspect(
+        state: &Path,
+        lease: crate::project_mutation::ProjectReadLeaseV1<'a>,
+    ) -> Result<Self> {
+        Ok(Self(ApplyIntentStoreV1::inspect_read(state, lease)?))
+    }
+    pub(crate) fn require_idle(&self) -> Result<()> {
+        self.0.require_idle()
+    }
 }
 impl<'lease> ApplyIntentStoreV1<'lease> {
     pub(crate) fn inspect(state: &Path, lease: &'lease ProjectMutationLeaseV1) -> Result<Self> {
+        Self::inspect_read(
+            state,
+            crate::project_mutation::ProjectReadLeaseV1::Mutation(lease),
+        )
+    }
+    fn inspect_read(
+        state: &Path,
+        lease: crate::project_mutation::ProjectReadLeaseV1<'lease>,
+    ) -> Result<Self> {
+        lease
+            .verify(state)
+            .map_err(|_| ApplyIntentError::Invalid("project read lease"))?;
         let state = IntentDirectory::open(state)?;
         let lock_root = IntentDirectory::open(lease.store_root())?;
         let (device, inode) = lease.store_identity();
@@ -2815,6 +2840,9 @@ impl<'lease> ApplyIntentStoreV1<'lease> {
         Ok(Self { state, root, lease })
     }
     fn verify(&self) -> Result<()> {
+        self.lease
+            .verify(&self.state.path)
+            .map_err(|_| ApplyIntentError::Invalid("project read lease"))?;
         self.state.verify()?;
         let lock_root = IntentDirectory::open(self.lease.store_root())?;
         let (device, inode) = self.lease.store_identity();
@@ -2826,8 +2854,14 @@ impl<'lease> ApplyIntentStoreV1<'lease> {
         }
         Ok(())
     }
+    fn require_mutation(&self) -> Result<()> {
+        self.lease
+            .mutation()
+            .map_err(|_| ApplyIntentError::Invalid("exclusive project lease required"))?;
+        self.verify()
+    }
     fn initialize(&mut self) -> Result<()> {
-        self.verify()?;
+        self.require_mutation()?;
         if self.root.is_none() {
             let root = self.state.child("apply-intents-v1", true)?;
             for name in ["staging", "active", "archive"] {
@@ -2838,6 +2872,22 @@ impl<'lease> ApplyIntentStoreV1<'lease> {
         }
         Ok(())
     }
+    /// Read-only admission used by sync writers under the same EX lease.
+    /// A staging or active intent is retained evidence even without management.
+    pub(crate) fn require_idle(&self) -> Result<()> {
+        self.verify()?;
+        if let Some(root) = &self.root {
+            if !root.child("staging", false)?.names(Some(1))?.is_empty() {
+                return Err(ApplyIntentError::Invalid("staging apply intent"));
+            }
+        }
+        if self.active()?.is_some() {
+            return Err(ApplyIntentError::Invalid("active apply intent"));
+        }
+        self.archive_inventory()?;
+        self.verify()
+    }
+
     pub(crate) fn active(&self) -> Result<Option<InspectedApplyIntentV1>> {
         self.verify()?;
         let Some(root) = &self.root else {
@@ -2906,6 +2956,7 @@ impl<'lease> ApplyIntentStoreV1<'lease> {
         before: &ObservedSourceV1,
         binding: Option<&D27SourceBindingV1>,
     ) -> Result<()> {
+        self.require_mutation()?;
         // All payloads and the fixed-width generation bound are checked before
         // creating any store/staging entry.
         let generation_bytes = envelope.canonical_bytes()?;
@@ -2965,6 +3016,7 @@ impl<'lease> ApplyIntentStoreV1<'lease> {
         )
     }
     pub(crate) fn append(&self, key: Hash, generation: ApplyGenerationV1) -> Result<()> {
+        self.require_mutation()?;
         let current = self
             .active()?
             .ok_or(ApplyIntentError::Invalid("no active intent"))?;
@@ -3003,8 +3055,10 @@ impl<'lease> ApplyIntentStoreV1<'lease> {
     /// Caller must first verify generic terminal, report, marker and readback.
     /// A failed publication retains active/seal evidence and never frees a slot.
     pub(crate) fn archive_terminal(&self, key: Hash, seal: &ArchiveSealV1) -> Result<()> {
-        // Validate and bound the payload before opening any persistent entry.
+        // Validate and bound the payload before opening any persistent entry,
+        // including the mutation lease's named-directory verification.
         let bytes = seal.canonical_bytes()?;
+        self.require_mutation()?;
         let current = self
             .active()?
             .ok_or(ApplyIntentError::Invalid("no active intent"))?;
@@ -3243,6 +3297,13 @@ fn inspect_intent_directory(
 mod tests {
     use super::*;
     use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+
+    fn private_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
 
     thread_local! {
         static FAILURE: std::cell::Cell<Option<(&'static str, i32, bool)>> = const {
@@ -3606,7 +3667,7 @@ mod tests {
     }
     #[test]
     fn unsupported_root_encoding_is_typed_and_never_opens_or_creates_a_store() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         for (kind, name) in [
             (RootKindV1::Project, "project"),
             (RootKindV1::Source, "source"),
@@ -3746,7 +3807,7 @@ mod tests {
         };
         assert_eq!(produced.canonical_bytes().unwrap(), zero_raw);
         let key = produced.descriptor.as_ref().unwrap().operation_key;
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         {
             let root_dir = IntentDirectory::open(root.path()).unwrap();
             let staging = root_dir.child("staging", true).unwrap();
@@ -4197,9 +4258,9 @@ mod tests {
 
     #[test]
     fn pinned_capacity_sampler_reads_once_per_device_and_refuses_nonprivate_roots() {
-        let state = tempfile::tempdir().unwrap();
-        let recovery = tempfile::tempdir().unwrap();
-        let desktop = tempfile::tempdir().unwrap();
+        let state = private_tempdir();
+        let recovery = private_tempdir();
+        let desktop = private_tempdir();
         let state_fd = File::open(state.path()).unwrap();
         let recovery_fd = File::open(recovery.path()).unwrap();
         let desktop_fd = File::open(desktop.path()).unwrap();
@@ -4631,7 +4692,7 @@ mod tests {
     }
     impl StoreFixture {
         fn new() -> Self {
-            let root = tempfile::tempdir().unwrap();
+            let root = private_tempdir();
             let state = root.path().join("state");
             let recovery = root.path().join("recovery");
             for path in [&state, &recovery] {
@@ -5179,7 +5240,7 @@ mod tests {
     }
     #[test]
     fn pinned_file_publication_keeps_collision_bytes_and_rejects_foreign_prefix() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let directory = IntentDirectory::open(root.path()).unwrap();
         directory.write_exact_new("saved", b"old", 3).unwrap();
         assert!(directory.publish_exact("saved", b"new", 3).is_err());
@@ -5193,7 +5254,7 @@ mod tests {
     }
     #[test]
     fn publication_resumes_exact_prefix_in_place_and_retains_unsafe_entries() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let directory = IntentDirectory::open(root.path()).unwrap();
         directory.write_exact_new(".saved.tmp", b"ta", 6).unwrap();
         let before = std::fs::metadata(root.path().join(".saved.tmp")).unwrap();
@@ -5381,7 +5442,7 @@ mod tests {
                 ApplyIntentEnvelopeV1::from_canonical_bytes(&canonical).unwrap(),
                 *shape
             );
-            let root = tempfile::tempdir().unwrap();
+            let root = private_tempdir();
             let directory = IntentDirectory::open(root.path()).unwrap();
             let name = format!("g{i:02}.v1.json");
             // The approved interpretation tests the raw production size gate
@@ -5424,7 +5485,7 @@ mod tests {
         for shape in maximum_shape_generations() {
             let mut bytes = shape.canonical_bytes().unwrap();
             bytes.resize(MAX_INTENT_GENERATION_BYTES as usize + 1, b' ');
-            let root = tempfile::tempdir().unwrap();
+            let root = private_tempdir();
             let path = root.path().join("private");
             std::fs::create_dir(&path).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -5468,7 +5529,7 @@ mod tests {
     #[test]
     fn d27_store_publication_and_durable_join_reject_each_changed_binding() {
         let fixture = StoreFixture::new();
-        let desktop = tempfile::tempdir().unwrap();
+        let desktop = private_tempdir();
         let roots = CapacityRootsV1::from_pinned_files(
             &File::open(&fixture.state).unwrap(),
             &File::open(&fixture.recovery).unwrap(),
@@ -5678,10 +5739,14 @@ mod tests {
         let retained = fixture.state.join("retained-intents");
         std::fs::rename(&original, &retained).unwrap();
         std::fs::create_dir(&original).unwrap();
-        assert!(matches!(
-            store.archive_terminal(key, &seal),
-            Err(ApplyIntentError::Invalid("archive seal fields"))
-        ));
+        let result = store.archive_terminal(key, &seal);
+        assert!(
+            matches!(
+                result,
+                Err(ApplyIntentError::Invalid("archive seal fields"))
+            ),
+            "{result:?}"
+        );
         assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
         let saved = std::fs::read(
             retained
@@ -6212,7 +6277,7 @@ mod tests {
 
     #[test]
     fn payload_too_large_does_not_create_any_entry() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let directory = IntentDirectory::open(root.path()).unwrap();
         assert!(matches!(
             directory.publish_exact("saved", b"1234", 3),
@@ -6225,7 +6290,7 @@ mod tests {
     }
     #[test]
     fn directory_replacement_is_refused_without_touching_the_replacement() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_tempdir();
         let path = root.path().join("private");
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();

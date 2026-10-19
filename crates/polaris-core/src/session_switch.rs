@@ -71,7 +71,24 @@ impl SessionSwitchOwner<'_> {
         database: &Path,
         project_id: &str,
     ) -> Result<(), SessionSwitchError> {
-        let Some(effect) = self.effects.blocker()? else {
+        // An unrelated pending operation needs no session-switch writes.
+        // Leave it for its owner so startup can still show recovery commands.
+        let Some(pending) = self.effects.blocker()? else {
+            return Ok(());
+        };
+        if !matches!(
+            pending.request.inventory.encoded().as_str(),
+            "T06" | "T16" | "F18"
+        ) {
+            return Ok(());
+        }
+        let Some(effect) = crate::sync::composite::C10CompositeBlockerV1::inspect_with_mutation(
+            Path::new(project_id),
+            self.state_dir,
+            self.lease,
+        )
+        .map_err(|_| ManagementEffectStoreError::UnresolvedEffect)?
+        else {
             return Ok(());
         };
         let inventory = effect.request.inventory.encoded();
@@ -187,6 +204,12 @@ impl SessionSwitchOwner<'_> {
             return Err(ManagementEffectStoreError::InvalidInventoryContract.into());
         }
         let snapshot = source.snapshot()?;
+        crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+            Path::new(&snapshot.state.project_id),
+            self.state_dir,
+            self.lease,
+        )
+        .map_err(|_| ManagementEffectStoreError::UnresolvedEffect)?;
         let source_id = SessionId::new(snapshot.state.session_id.clone())
             .map_err(|error| io::Error::other(error.to_string()))?;
         let operation_id = new_operation_id()?;
@@ -277,6 +300,12 @@ impl SessionSwitchOwner<'_> {
         {
             return Err(io::Error::other("新規会話のprojectがsourceと一致しません").into());
         }
+        crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+            Path::new(project_id),
+            self.state_dir,
+            self.lease,
+        )
+        .map_err(|_| ManagementEffectStoreError::UnresolvedEffect)?;
         let operation_id = new_operation_id()?;
         let child_id = SessionId::new(operation_id.child_session_id())
             .map_err(|error| io::Error::other(error.to_string()))?;
@@ -775,11 +804,19 @@ mod tests {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
             let project = temp.path().join("project");
-            let state = project.join(".polaris");
+            let state = temp.path().join("state");
             let data = temp.path().join("data");
             fs::create_dir(&project).unwrap();
+            fs::create_dir(project.join(".polaris")).unwrap();
             fs::create_dir(&state).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
             fs::create_dir(&data).unwrap();
+            crate::rewind_workspace::WorkspaceOwner::open(
+                &project,
+                &state.join("rewind-workspace"),
+                Default::default(),
+            )
+            .unwrap();
             let lease = ProjectMutationOwnerV1::at_store_root(&state.join("rewind-workspace"))
                 .unwrap()
                 .try_mutation()

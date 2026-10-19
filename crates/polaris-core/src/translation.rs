@@ -107,6 +107,7 @@ impl TrustedFileMarker {
             options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let mut file = options.open(&self.path)?;
+        #[cfg(unix)]
         let opened = file.metadata()?;
         #[cfg(unix)]
         {
@@ -116,6 +117,7 @@ impl TrustedFileMarker {
             }
         }
         let actual = sha256_reader(&mut file)?;
+        #[cfg(unix)]
         let after = std::fs::symlink_metadata(&self.path)?;
         #[cfg(unix)]
         {
@@ -141,6 +143,7 @@ struct ManagedTranslationIdentity {
 
 impl ManagedTranslationIdentity {
     fn validate(&self) -> io::Result<()> {
+        require_translation_platform()?;
         for path in &self.directories {
             let metadata = std::fs::symlink_metadata(path)?;
             if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
@@ -248,6 +251,16 @@ pub struct ManagedCatTranslate {
     identity: ManagedTranslationIdentity,
 }
 
+fn require_translation_platform() -> io::Result<()> {
+    if cfg!(windows) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed translation is unavailable on Windows",
+        ));
+    }
+    Ok(())
+}
+
 impl ManagedCatTranslate {
     pub fn open(home: &Path) -> io::Result<Self> {
         Self::open_with_installation(home, &mut None)
@@ -257,6 +270,7 @@ impl ManagedCatTranslate {
     /// Failure leaves it unknown; no second hash pass or fallback is used.
     pub fn open_with_installation(home: &Path, installed: &mut Option<bool>) -> io::Result<Self> {
         *installed = None;
+        require_translation_platform()?;
         let (files, mut directories) = verify_model_installation(home, BUNDLED_RUNTIME_MANIFEST)?;
         *installed = Some(true);
         let runtime =
@@ -585,6 +599,7 @@ impl LocalCatTranslate {
     /// Materialize the reviewed helper under a caller-owned private directory.
     /// Existing bytes must be identical; a replacement or symlink fails closed.
     pub fn install_bundled_helper(private_root: &Path) -> io::Result<PathBuf> {
+        require_translation_platform()?;
         if !private_root.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -749,6 +764,7 @@ impl LocalCatTranslate {
         use std::process::Stdio;
         use tokio::{io::AsyncWriteExt, process::Command};
 
+        require_translation_platform()?;
         let call_temp = tempfile::Builder::new()
             .prefix("translation-call-")
             .tempdir_in(&self.run_temp)?;
@@ -868,6 +884,92 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_translation_unavailable_managed_open_before_io() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("existing.txt");
+        std::fs::write(&marker, b"keep model state").unwrap();
+        let missing = root.path().join("missing-home");
+
+        for home in [root.path(), missing.as_path()] {
+            let mut installed = Some(true);
+            let error = ManagedCatTranslate::open_with_installation(home, &mut installed)
+                .err()
+                .expect("Windows translation must be unavailable");
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(installed, None);
+            assert_eq!(
+                ManagedCatTranslate::open(home).err().unwrap().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep model state");
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_translation_unavailable_helper_install_before_write() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("translation-helper");
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("existing.py");
+        std::fs::write(&marker, b"keep helper state").unwrap();
+        let missing = root.path().join("missing-private");
+
+        for private in [root.path(), missing.as_path()] {
+            assert_eq!(
+                LocalCatTranslate::install_bundled_helper(private)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep helper state");
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_translation_unavailable_local_execution_before_temp_or_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("existing.txt");
+        std::fs::write(&marker, b"keep execution state").unwrap();
+        // Public fields also permit direct construction, without `new`.
+        let backend = LocalCatTranslate {
+            python: root.path().join("missing-python.exe"),
+            helper: root.path().join("missing-helper.py"),
+            model_path: root.path().join("missing-model"),
+            run_temp: root.path().join("missing-run-temp"),
+            cpu_threads: 1,
+            timeout: Duration::from_secs(1),
+        };
+        assert_eq!(
+            backend.preflight().await.unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            backend
+                .translate(TranslationRequestV1 {
+                    direction: TranslationDirection::EnToJa,
+                    text: "fixture text".to_owned(),
+                })
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep execution state");
+        assert!(!backend.run_temp.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 
     fn managed_model_fixture(root: &Path) -> (PathBuf, Vec<u8>, PathBuf) {
         let home = root.join("home");

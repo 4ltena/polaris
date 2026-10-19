@@ -3668,6 +3668,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn owned_mutation_uses_typed_grant_and_keeps_ungranted_requests_ordinary() {
         use crate::desktop_execution::{ExecutionPort, ExecutionResult};
         use polaris_desktop_protocol::ids::RunId;
@@ -3927,6 +3928,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn isolated_read_uses_trusted_grant_and_rejects_mismatched_helper() {
         use crate::desktop_execution::{ExecutionPort, SandboxMode, SandboxPolicy};
         use std::os::unix::fs::PermissionsExt;
@@ -5151,9 +5153,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let inside = project.path().join("inside.rs");
         let outside_file = outside.path().join("outside.rs");
+        #[cfg(unix)]
         let link = project.path().join("link.rs");
         std::fs::write(&inside, "inside\n").unwrap();
         std::fs::write(&outside_file, "outside\n").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside_file, &link).unwrap();
 
         let mut session = Session::new();
@@ -5196,6 +5200,7 @@ mod tests {
             Some(inside.canonicalize().unwrap())
         );
         assert!(delegated_review_path(&session, &call(&outside_file)).is_none());
+        #[cfg(unix)]
         assert!(delegated_review_path(&session, &call(&link)).is_none());
         assert!(delegated_review_path(&session, &call(project.path())).is_none());
     }
@@ -5423,6 +5428,7 @@ mod tests {
     /// file outside itself and have its contents summarised into the
     /// prompt.
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_map_that_is_a_symlink_is_not_followed() {
         // The judge adopts what the *target* documents. Were it looking for
         // something only the real map holds, this would pass whether or not
@@ -5444,6 +5450,7 @@ mod tests {
         assert!(!systems[0].contains("key.pem"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn root_mcp_setup_lists_candidates_without_values_outside_mcp_dispatch() {
         struct Capture {
@@ -8057,6 +8064,7 @@ mod tests {
     /// everything around it. The helper uses a minimal shell script rather
     /// than the real polaris helper binary. What we want to see here is the
     /// loop's wiring, not the helper's own correctness.
+    #[cfg(unix)]
     fn write_helper(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("helper.sh");
         std::fs::write(
@@ -8103,95 +8111,99 @@ print("wrote")
             "write's required arguments are not 2: {required:?}"
         );
 
-        let root = tempfile::tempdir().expect("temp directory");
-        let helper_dir = tempfile::tempdir().expect("temp directory");
-        let helper = write_helper(helper_dir.path());
-        let sandbox = polaris_sandbox::SandboxPolicy::new(
-            polaris_sandbox::SandboxMode::WorkspaceWrite,
-            &[root.path().to_path_buf()],
-        )
-        .expect("policy");
-        let target = sandbox.writable_roots()[0].join("out.txt");
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir().expect("temp directory");
+            let helper_dir = tempfile::tempdir().expect("temp directory");
+            let helper = write_helper(helper_dir.path());
+            let sandbox = polaris_sandbox::SandboxPolicy::new(
+                polaris_sandbox::SandboxMode::WorkspaceWrite,
+                &[root.path().to_path_buf()],
+            )
+            .expect("policy");
+            let target = sandbox.writable_roots()[0].join("out.txt");
 
-        // Build the arguments using only the names the schema declares. If
-        // either one had been renamed away from "path", it would receive
-        // the value meant for content, the write target would mismatch,
-        // and the assert below would fail.
-        let mut args = serde_json::Map::new();
-        for name in &required {
-            let value = if name.contains("path") {
-                target.display().to_string()
-            } else {
-                "body".to_string()
+            // Build the arguments using only the names the schema declares. If
+            // either one had been renamed away from "path", it would receive
+            // the value meant for content, the write target would mismatch,
+            // and the assert below would fail.
+            let mut args = serde_json::Map::new();
+            for name in &required {
+                let value = if name.contains("path") {
+                    target.display().to_string()
+                } else {
+                    "body".to_string()
+                };
+                args.insert(name.clone(), serde_json::Value::String(value));
+            }
+
+            let p = Scripted {
+                replies: Mutex::new(vec![
+                    CompletionResponse {
+                        hosted_web_search: Vec::new(),
+                        url_citations: Vec::new(),
+                        text: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "c1".into(),
+                            name: "write".into(),
+                            arguments: serde_json::Value::Object(args),
+                        }],
+                        ..Default::default()
+                    },
+                    CompletionResponse {
+                        hosted_web_search: Vec::new(),
+                        url_citations: Vec::new(),
+                        text: "wrote it".into(),
+                        tool_calls: vec![],
+                        ..Default::default()
+                    },
+                ]),
             };
-            args.insert(name.clone(), serde_json::Value::String(value));
+
+            let dir = tempfile::tempdir().expect("temp directory");
+            let mut session = Session::new();
+            session.push_user("create a.txt");
+            let audit = shared_audit(&dir.path().join("audit.jsonl"));
+            let mut stop = StopTracker::new(10);
+            let always_on = crate::prompt::assemble_always_on("", "", &[]);
+            let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
+            let mut approver = AlwaysAllow { asked: 0 };
+            let mut ctx = ToolContext {
+                sandbox: &sandbox,
+                helper: &helper,
+                gate: &mut gate,
+                approver: &mut approver,
+            };
+
+            let out = run(
+                &p,
+                &mut session,
+                audit.clone(),
+                &mut stop,
+                &always_on,
+                &[],
+                &[],
+                unused_provider_pool(),
+                crate::spawn::DEFAULT_CONCURRENCY,
+                crate::spawn::DEFAULT_WRITE_CONCURRENCY,
+                None,
+                &mut ctx,
+            )
+            .await
+            .expect("the loop failed")
+            .text;
+
+            assert_eq!(out, "wrote it");
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("not written"),
+                "body",
+                "dispatch does not read the argument name the schema declares"
+            );
         }
-
-        let p = Scripted {
-            replies: Mutex::new(vec![
-                CompletionResponse {
-                    hosted_web_search: Vec::new(),
-                    url_citations: Vec::new(),
-                    text: String::new(),
-                    tool_calls: vec![ToolCall {
-                        id: "c1".into(),
-                        name: "write".into(),
-                        arguments: serde_json::Value::Object(args),
-                    }],
-                    ..Default::default()
-                },
-                CompletionResponse {
-                    hosted_web_search: Vec::new(),
-                    url_citations: Vec::new(),
-                    text: "wrote it".into(),
-                    tool_calls: vec![],
-                    ..Default::default()
-                },
-            ]),
-        };
-
-        let dir = tempfile::tempdir().expect("temp directory");
-        let mut session = Session::new();
-        session.push_user("create a.txt");
-        let audit = shared_audit(&dir.path().join("audit.jsonl"));
-        let mut stop = StopTracker::new(10);
-        let always_on = crate::prompt::assemble_always_on("", "", &[]);
-        let mut gate = crate::approval::Gate::new(crate::approval::ApprovalPolicy::OnRequest);
-        let mut approver = AlwaysAllow { asked: 0 };
-        let mut ctx = ToolContext {
-            sandbox: &sandbox,
-            helper: &helper,
-            gate: &mut gate,
-            approver: &mut approver,
-        };
-
-        let out = run(
-            &p,
-            &mut session,
-            audit.clone(),
-            &mut stop,
-            &always_on,
-            &[],
-            &[],
-            unused_provider_pool(),
-            crate::spawn::DEFAULT_CONCURRENCY,
-            crate::spawn::DEFAULT_WRITE_CONCURRENCY,
-            None,
-            &mut ctx,
-        )
-        .await
-        .expect("the loop failed")
-        .text;
-
-        assert_eq!(out, "wrote it");
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("not written"),
-            "body",
-            "dispatch does not read the argument name the schema declares"
-        );
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_denied_write_comes_back_as_a_tool_result_not_a_loop_failure() {
         // A sandbox denial is not an exception. It comes back in a form the
         // model can understand, and the loop continues. Turning this into
@@ -8300,6 +8312,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_write_to_a_hardlinked_path_inside_the_root_is_stopped_by_the_gate_before_anything_runs()
      {
         // Fix round 1's point: the `a_denied_write_comes_back_...` test
@@ -8448,6 +8461,7 @@ print("wrote")
     /// contents did not change" reliably takes effect (a stand-in that
     /// parses JSON could fail to parse, write nothing, and end up with
     /// intact contents despite having slipped through).
+    #[cfg(unix)]
     fn clobber_helper(dir: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("clobber-helper.sh");
         std::fs::write(
@@ -8464,6 +8478,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn an_edit_to_a_hardlinked_path_inside_the_root_is_stopped_by_the_gate_before_anything_runs()
      {
         // The counterpart to the write version above. The spec imposes
@@ -8981,6 +8996,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_successful_write_s_audit_record_carries_the_policy_and_the_target() {
         // Fix round 1's point: there was no test checking, through the
         // call path in `agent.rs`, the claim from Tasks 11-12 that the
@@ -10258,6 +10274,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_root_write_into_a_not_yet_existing_directory_regenerates_for_that_new_directory() {
         // `polaris_sandbox`'s helper runs `create_dir_all` before writing,
         // so a `write` to `sub/new.txt` genuinely creates `sub`. Watching
@@ -10417,6 +10434,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn batched_writes_regenerate_once_before_read() {
         let root = tempfile::tempdir().expect("temp directory");
         let helper_dir = tempfile::tempdir().expect("temp directory");
@@ -11130,6 +11148,7 @@ print("wrote")
     /// 返す。diff用の事前readがその隙を突いて`.env`の中身を端末に流さない
     /// ことを固定する。
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_write_to_a_denied_path_does_not_echo_its_old_content_in_the_diff() {
         let dir = tempfile::tempdir().expect("temp directory");
         let target = dir.path().join(".env");
@@ -11233,6 +11252,7 @@ print("wrote")
     /// `old`/`new` in the tool call's own arguments, not from the file the
     /// helper writes, so the helper's own semantics don't matter here —
     /// only that it exits 0.
+    #[cfg(unix)]
     fn edit_success_helper(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("fake-edit-success-helper");
         std::fs::write(&p, "#!/bin/sh\nset -e\ncat > /dev/null\necho edited\n")
@@ -11243,6 +11263,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn writing_a_new_file_reports_a_diff_with_only_added_lines() {
         let root = tempfile::tempdir().expect("temp directory");
         let helper_dir = tempfile::tempdir().expect("temp directory");
@@ -11325,6 +11346,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn writing_over_an_existing_file_reports_a_diff_against_its_old_content() {
         let root = tempfile::tempdir().expect("temp directory");
         let helper_dir = tempfile::tempdir().expect("temp directory");
@@ -11408,6 +11430,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn editing_a_file_reports_a_diff_computed_from_the_old_and_new_arguments() {
         let root = tempfile::tempdir().expect("temp directory");
         let helper_dir = tempfile::tempdir().expect("temp directory");
@@ -11497,6 +11520,7 @@ print("wrote")
     /// plain `Err` by the time it reaches `dispatch`, which is all this
     /// test needs: the gate allows the call through, but the mutation
     /// itself still fails.
+    #[cfg(unix)]
     fn always_fails_helper(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("fake-write-failure-helper");
         std::fs::write(&p, "#!/bin/sh\ncat > /dev/null\necho boom >&2\nexit 1\n")
@@ -11507,6 +11531,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_failed_write_reports_no_diff() {
         // The gate allows the call through (the target is inside the
         // sandbox root), but the mutation itself fails. No diff should be
@@ -11591,6 +11616,7 @@ print("wrote")
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_gate_denied_write_still_sends_a_tool_finished_event() {
         // `?` inside a `match` arm early-returns the whole `dispatch`
         // function, skipping the `ToolFinished` send that comes after the

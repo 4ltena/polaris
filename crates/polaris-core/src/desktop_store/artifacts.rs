@@ -10,11 +10,14 @@ use crate::workflow::{
     ImplementationPlanV1, MAX_WORKFLOW_ARTIFACT_BODY_BYTES, ProjectPrinciplesV1, TaskGraphV1,
     WorkflowArtifactGraphV1, WorkflowArtifactKindV1, validate_hash,
 };
+#[cfg(all(test, windows))]
+use polaris_auth::protection::WindowsFamilyFile as File;
 use polaris_desktop_protocol::ids::ProjectId;
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+#[cfg(not(all(test, windows)))]
+use std::fs::File;
 use std::{
-    fs::File,
     io::{Read, Write},
     sync::{
         Arc,
@@ -43,6 +46,12 @@ impl WorkflowArtifactStore {
         Self::from_root(root, project)
     }
 
+    #[cfg(all(test, windows))]
+    pub(super) fn from_root(_: Arc<Directory>, _: &ProjectId) -> StoreResult<Self> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(all(test, windows)))]
     pub(super) fn from_root(root: Arc<Directory>, project: &ProjectId) -> StoreResult<Self> {
         root.verify()?;
         let artifacts = root.ensure_child(ARTIFACTS_DIRECTORY)?;
@@ -360,6 +369,58 @@ impl WorkflowArtifactStore {
     }
 }
 
+/// Passive migration validation; no object creation or execution authority.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::desktop_store) fn validate_migration_object(
+    name: &str,
+    bytes: &[u8],
+) -> StoreResult<()> {
+    fn matches<T: Serialize + DeserializeOwned>(
+        name: &str,
+        bytes: &[u8],
+        validate: impl Fn(&T) -> Result<(), String>,
+        reference: impl Fn(&T) -> ArtifactRefV1,
+    ) -> bool {
+        let Ok(value) = serde_json::from_slice::<T>(bytes) else {
+            return false;
+        };
+        validate(&value).is_ok()
+            && object_name(&reference(&value).content_hash).ok().as_deref() == Some(name)
+            && canonical_body_bytes(&value).ok().as_deref() == Some(bytes)
+    }
+    if matches(
+        name,
+        bytes,
+        ChangeContractV1::validate,
+        ChangeContractV1::reference,
+    ) || matches(
+        name,
+        bytes,
+        ProjectPrinciplesV1::validate,
+        ProjectPrinciplesV1::reference,
+    ) || matches(
+        name,
+        bytes,
+        IdeaDecisionV1::validate,
+        IdeaDecisionV1::reference,
+    ) || matches(
+        name,
+        bytes,
+        FeatureSpecV1::validate,
+        FeatureSpecV1::reference,
+    ) || matches(
+        name,
+        bytes,
+        ImplementationPlanV1::validate,
+        ImplementationPlanV1::reference,
+    ) || matches(name, bytes, TaskGraphV1::validate, TaskGraphV1::reference)
+    {
+        Ok(())
+    } else {
+        Err(StoreError::Corrupt("workflow artifact migration body/name"))
+    }
+}
+
 fn project_bucket(project: &ProjectId) -> String {
     format!("{:x}", Sha256::digest(project.as_str().as_bytes()))
 }
@@ -639,5 +700,58 @@ mod tests {
                 .read_idea_decision(&WorkflowArtifactGraphV1::default(), &decision_ref)
                 .is_err()
         );
+    }
+    #[test]
+    fn migration_artifact_validates_all_six_canonical_bodies_and_exact_names() {
+        let contract = contract();
+        let (feature, plan, tasks) = typed_artifacts();
+        let principles = ProjectPrinciplesV1::draft(
+            "migration-principles",
+            vec![ProjectPrincipleV1 {
+                id: "privacy".into(),
+                statement: "Keep bodies private".into(),
+                feature_ids: Vec::new(),
+                task_ids: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let decision = IdeaDecisionV1::draft(
+            "migration-decision",
+            "Persist decision",
+            Vec::new(),
+            Vec::new(),
+            vec![DecisionAlternativeV1 {
+                id: "none".into(),
+                description: "Keep existing".into(),
+            }],
+            vec!["Read-only validation".into()],
+            IdeaDecisionOutcomeV1::Clarify,
+            vec![UnresolvedDecisionV1 {
+                id: "retention".into(),
+                question: "When to remove?".into(),
+            }],
+        )
+        .unwrap();
+        macro_rules! check {
+            ($body:expr) => {{
+                let body = $body;
+                let bytes = canonical_body_bytes(&body).unwrap();
+                let name = object_name(&body.reference().content_hash).unwrap();
+                validate_migration_object(&name, &bytes).unwrap();
+                assert!(
+                    validate_migration_object(&format!("{}.json", "f".repeat(64)), &bytes).is_err()
+                );
+                let mut noncanonical = bytes.clone();
+                noncanonical.push(b'\n');
+                assert!(validate_migration_object(&name, &noncanonical).is_err());
+                assert!(validate_migration_object(&name, b"{}").is_err());
+            }};
+        }
+        check!(contract);
+        check!(feature);
+        check!(plan);
+        check!(tasks);
+        check!(principles);
+        check!(decision);
     }
 }

@@ -20,6 +20,7 @@ impl Fixture {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let project = root.path().join("project");
         fs::create_dir(&project).unwrap();
+        fs::create_dir(project.join(".polaris")).unwrap();
         let data = root.path().join("data");
         let state = data
             .join("state")

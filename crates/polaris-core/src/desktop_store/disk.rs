@@ -6,10 +6,24 @@ use polaris_desktop_protocol::ids::{DecimalU64, ProjectId, SessionId};
 use polaris_provider::Role;
 use serde::Serialize;
 use std::{
-    fs::{self, File},
+    fs,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
+
+#[cfg(all(test, windows))]
+use polaris_auth::protection::{WindowsFamilyDirectory, WindowsFamilyFile as File};
+#[cfg(not(all(test, windows)))]
+use std::fs::File;
+
+#[cfg(all(test, windows))]
+fn windows_error(error: polaris_auth::AuthError) -> StoreError {
+    match error {
+        polaris_auth::AuthError::Io(error) => StoreError::Io(error),
+        polaris_auth::AuthError::Busy => StoreError::Busy,
+        _ => StoreError::RecoveryRequired,
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -42,12 +56,42 @@ pub(super) fn supported() -> StoreResult<()> {
 }
 
 /// An owned directory capability. All child I/O is relative to its pinned fd.
-#[derive(Debug)]
 pub(super) struct Directory {
     path: std::path::PathBuf,
+    #[cfg(not(all(test, windows)))]
     file: File,
+    #[cfg(all(test, windows))]
+    file: WindowsFamilyDirectory,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    migration_mount: Option<std::sync::Arc<polaris_mcp::NativeMountIdentityV2>>,
+}
+impl std::fmt::Debug for Directory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Directory")
+            .field("path", &self.path)
+            .field("file", &self.file)
+            .finish()
+    }
 }
 impl Directory {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn with_migration_mount(
+        mut self,
+        mount: std::sync::Arc<polaris_mcp::NativeMountIdentityV2>,
+    ) -> StoreResult<Self> {
+        self.migration_mount = Some(mount);
+        self.verify()?;
+        Ok(self)
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn verify_migration_mount(&self, file: &File) -> StoreResult<()> {
+        if let Some(expected) = &self.migration_mount {
+            if super::writer::migration::native_mount(file)? != **expected {
+                return Err(StoreError::RecoveryRequired);
+            }
+        }
+        Ok(())
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn retained_file_m2a(&self) -> StoreResult<File> {
         self.verify()?;
@@ -100,53 +144,27 @@ impl Directory {
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
+    #[cfg(all(test, windows))]
+    pub(super) fn rename_child_no_clobber(&self, source: &str, target: &str) -> StoreResult<()> {
+        self.verify()?;
+        self.file
+            .rename_child_no_clobber(std::ffi::OsStr::new(source), std::ffi::OsStr::new(target))
+            .map_err(windows_error)
+    }
     #[cfg(unix)]
     pub(super) fn open_owned(path: &Path) -> StoreResult<Self> {
-        use std::os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::ffi::OsStrExt,
-        };
-        if !path.is_absolute()
-            || path.components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            })
-            || fs::canonicalize(path)?.as_os_str() != path.as_os_str()
-        {
-            return Err(StoreError::Corrupt(
-                "保存rootは絶対canonical pathが必要です",
-            ));
-        }
-        let mut file = File::open("/")?;
-        for component in path.components() {
-            if let std::path::Component::Normal(name) = component {
-                let name = std::ffi::CString::new(name.as_bytes())
-                    .map_err(|_| StoreError::Corrupt("保存path"))?;
-                // SAFETY: valid live directory fd and NUL-terminated component; owned result.
-                let fd = unsafe {
-                    libc::openat(
-                        file.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    return Err(open_error());
-                }
-                file = unsafe { File::from_raw_fd(fd) };
-            }
-        }
+        let file = canonical_directory_file(path)?;
         owned_metadata(&file.metadata()?, true)?;
         let this = Self {
             path: path.to_owned(),
             file,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            migration_mount: None,
         };
         this.check_path_identity()?;
         Ok(this)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn open_owned(_: &Path) -> StoreResult<Self> {
         Err(StoreError::UnsupportedPlatform)
     }
@@ -159,12 +177,18 @@ impl Directory {
         owned_metadata(&metadata, true)?;
         Ok((metadata.dev(), metadata.ino()))
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn identity(&self) -> StoreResult<(u64, u64)> {
         Err(StoreError::UnsupportedPlatform)
     }
+    #[cfg(not(all(test, windows)))]
     pub(super) fn verify(&self) -> StoreResult<()> {
         let current = Self::open_owned(&self.path)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.verify_migration_mount(&self.file)?;
+            self.verify_migration_mount(&current.file)?;
+        }
         same(&self.file, &current.file)
     }
     #[cfg(unix)]
@@ -207,6 +231,8 @@ impl Directory {
         let child = Self {
             path: self.path.join(name),
             file,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            migration_mount: self.migration_mount.clone(),
         };
         self.verify()?;
         child.verify()?;
@@ -230,11 +256,11 @@ impl Directory {
         }
         self.child(name, false)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn ensure_child(&self, _: &str) -> StoreResult<Self> {
         Err(StoreError::UnsupportedPlatform)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn child(&self, _: &str, _: bool) -> StoreResult<Self> {
         Err(StoreError::UnsupportedPlatform)
     }
@@ -262,10 +288,12 @@ impl Directory {
         }
         let file = unsafe { File::from_raw_fd(fd) };
         owned_metadata(&file.metadata()?, false)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.verify_migration_mount(&file)?;
         self.verify()?;
         Ok(file)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn open(&self, _: &str, _: bool, _: bool) -> StoreResult<File> {
         Err(StoreError::UnsupportedPlatform)
     }
@@ -285,7 +313,7 @@ impl Directory {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn remove_next(&self) -> StoreResult<()> {
         Err(StoreError::UnsupportedPlatform)
     }
@@ -329,14 +357,15 @@ impl Directory {
         }
         self.verify()
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn replace(&self, _: &str, _: &str) -> StoreResult<()> {
         Err(StoreError::UnsupportedPlatform)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn publish_next(&self) -> StoreResult<()> {
         Err(StoreError::UnsupportedPlatform)
     }
+    #[cfg(not(all(test, windows)))]
     pub(super) fn sync(&self) -> StoreResult<()> {
         self.verify()?;
         record_m2a_mutation(1);
@@ -375,7 +404,7 @@ impl Directory {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn link_no_replace(&self, _: &str, _: &str) -> StoreResult<bool> {
         Err(StoreError::UnsupportedPlatform)
     }
@@ -391,9 +420,122 @@ impl Directory {
         }
         self.verify()
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     pub(super) fn unlink_file(&self, _: &str) -> StoreResult<()> {
         Err(StoreError::UnsupportedPlatform)
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn open_owned(path: &Path) -> StoreResult<Self> {
+        Ok(Self {
+            path: path.to_owned(),
+            file: WindowsFamilyDirectory::open_existing(path).map_err(windows_error)?,
+        })
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn verify(&self) -> StoreResult<()> {
+        self.file.revalidate().map_err(windows_error)
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn identity(&self) -> StoreResult<(u64, u64)> {
+        self.file.legacy_identity().map_err(windows_error)
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn child(&self, name: &str, create: bool) -> StoreResult<Self> {
+        self.verify()?;
+        if create {
+            record_m2a_mutation(2);
+        }
+        let file = self
+            .file
+            .child(std::ffi::OsStr::new(name), create)
+            .map_err(windows_error)?;
+        if create {
+            self.sync()?;
+        }
+        Ok(Self {
+            path: self.path.join(name),
+            file,
+        })
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn ensure_child(&self, name: &str) -> StoreResult<Self> {
+        match self.child(name, true) {
+            Ok(child) => Ok(child),
+            Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.child(name, false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn open(&self, name: &str, write: bool, create: bool) -> StoreResult<File> {
+        if create {
+            record_m2a_mutation(2);
+        }
+        self.file
+            .open_file(std::ffi::OsStr::new(name), write, create)
+            .map_err(windows_error)
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn open_mutable(&self, name: &str) -> StoreResult<File> {
+        self.file
+            .open_mutable_file(std::ffi::OsStr::new(name))
+            .map_err(windows_error)
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn sync(&self) -> StoreResult<()> {
+        self.verify()?;
+        record_m2a_mutation(1);
+        self.file.sync_all().map_err(windows_error)
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn family_children(&self, maximum: usize) -> StoreResult<Vec<Self>> {
+        self.file
+            .entries(maximum)
+            .map_err(windows_error)?
+            .into_iter()
+            .filter_map(|entry| {
+                entry.child.map(|file| {
+                    Ok(Self {
+                        path: self.path.join(entry.name),
+                        file,
+                    })
+                })
+            })
+            .collect()
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn remove_next(&self) -> StoreResult<()> {
+        M2A_REMOVE_NEXT_CALLS.with(|n| n.set(n.get() + 1));
+        match self.unlink_file("state.next") {
+            Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn publish_next(&self) -> StoreResult<()> {
+        self.replace("state.next", "state.json")
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn replace(&self, source: &str, target: &str) -> StoreResult<()> {
+        record_m2a_mutation(2);
+        self.file
+            .replace(std::ffi::OsStr::new(source), std::ffi::OsStr::new(target))
+            .map_err(windows_error)
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn link_no_replace(&self, source: &str, target: &str) -> StoreResult<bool> {
+        record_m2a_mutation(2);
+        self.file
+            .link_no_replace(std::ffi::OsStr::new(source), std::ffi::OsStr::new(target))
+            .map_err(windows_error)
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn unlink_file(&self, name: &str) -> StoreResult<()> {
+        record_m2a_mutation(2);
+        self.file
+            .unlink_file(std::ffi::OsStr::new(name))
+            .map_err(windows_error)
     }
 }
 #[cfg(unix)]
@@ -403,6 +545,47 @@ fn component(name: &str) -> StoreResult<std::ffi::CString> {
     }
     std::ffi::CString::new(name).map_err(|_| StoreError::Corrupt("保存component"))
 }
+#[cfg(unix)]
+fn canonical_directory_file(path: &Path) -> StoreResult<File> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+    if !path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || fs::canonicalize(path)?.as_os_str() != path.as_os_str()
+    {
+        return Err(StoreError::Corrupt(
+            "保存rootは絶対canonical pathが必要です",
+        ));
+    }
+    let mut file = File::open("/")?;
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            let name = std::ffi::CString::new(name.as_bytes())
+                .map_err(|_| StoreError::Corrupt("保存path"))?;
+            // SAFETY: valid live directory fd and NUL-terminated component; owned result.
+            let fd = unsafe {
+                libc::openat(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(open_error());
+            }
+            file = unsafe { File::from_raw_fd(fd) };
+        }
+    }
+    Ok(file)
+}
+
 #[cfg(unix)]
 fn owned_metadata(meta: &fs::Metadata, directory: bool) -> StoreResult<()> {
     use std::os::unix::fs::MetadataExt;
@@ -418,6 +601,13 @@ fn owned_metadata(meta: &fs::Metadata, directory: bool) -> StoreResult<()> {
     Ok(())
 }
 pub(super) fn same(a: &File, b: &File) -> StoreResult<()> {
+    #[cfg(all(test, windows))]
+    {
+        if a.identity()? != b.identity()? {
+            return Err(StoreError::RecoveryRequired);
+        }
+        Ok(())
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -428,7 +618,7 @@ pub(super) fn same(a: &File, b: &File) -> StoreResult<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(all(test, windows))))]
     {
         let _ = (a, b);
         Err(StoreError::UnsupportedPlatform)
@@ -438,15 +628,18 @@ pub(super) fn same(a: &File, b: &File) -> StoreResult<()> {
 pub(super) fn read_marker(dir: &Directory) -> StoreResult<Marker> {
     let mut bytes = Vec::new();
     dir.open(MARKER, false, false)?.read_to_end(&mut bytes)?;
+    decode_marker_bytes(&bytes)
+}
+fn decode_marker_bytes(bytes: &[u8]) -> StoreResult<Marker> {
     #[derive(serde::Deserialize)]
     struct Version {
         schema_version: u32,
     }
-    let version: Version = serde_json::from_slice(&bytes)?;
+    let version: Version = serde_json::from_slice(bytes)?;
     if version.schema_version != 3 {
         return Err(StoreError::UnsupportedVersion(version.schema_version));
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 pub(super) fn prefix(
@@ -482,6 +675,26 @@ pub(super) fn load(
     let raw_bytes = prefix(dir, RAW, marker.raw_offset, &marker.raw_hash)?;
     let side_bytes = prefix(dir, SIDECAR, marker.sidecar_offset, &marker.sidecar_hash)?;
     decode_prefixes_m2a(marker, &raw_bytes, &side_bytes)
+}
+
+/// Decode held bytes only; no filesystem or execution authority.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn decode_migration_published(
+    marker_bytes: &[u8],
+    raw: &[u8],
+    sidecar: &[u8],
+) -> StoreResult<Published> {
+    let marker = decode_marker_bytes(marker_bytes)?;
+    if marker.raw_offset.get() != raw.len() as u64
+        || marker.sidecar_offset.get() != sidecar.len() as u64
+        || content_hash(raw) != marker.raw_hash
+        || content_hash(sidecar) != marker.sidecar_hash
+        || (!raw.is_empty() && !raw.ends_with(b"\n"))
+        || (!sidecar.is_empty() && !sidecar.ends_with(b"\n"))
+    {
+        return Err(StoreError::RecoveryRequired);
+    }
+    decode_prefixes_m2a(marker, raw, sidecar)
 }
 
 fn decode_prefixes_m2a(
@@ -1037,67 +1250,80 @@ impl Directory {
     }
 
     pub(super) fn names_m2a(&self) -> StoreResult<Vec<String>> {
-        use std::os::fd::AsRawFd;
+        self.names_bounded_migration(1024)
+    }
+
+    pub(super) fn names_bounded_migration(&self, maximum: usize) -> StoreResult<Vec<String>> {
         self.verify()?;
-        // SAFETY: opening "." obtains an independent directory stream offset.
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let stream = unsafe { libc::fdopendir(fd) };
-        if stream.is_null() {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(std::io::Error::last_os_error().into());
-        }
-        struct Stream(*mut libc::DIR);
-        impl Drop for Stream {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::closedir(self.0);
-                }
-            }
-        }
-        let stream = Stream(stream);
-        let mut names = Vec::new();
-        loop {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                *libc::__errno_location() = 0;
-            }
-            #[cfg(target_os = "macos")]
-            unsafe {
-                *libc::__error() = 0;
-            }
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error().unwrap_or(0) != 0 {
-                    return Err(error.into());
-                }
-                break;
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
-                .to_str()
-                .map_err(|_| StoreError::Corrupt("desktop entry encoding"))?;
-            if name != "." && name != ".." {
-                names.push(name.to_owned());
-            }
-            if names.len() > 1024 {
-                return Err(StoreError::Capacity("desktop inspect entries"));
-            }
-        }
-        names.sort();
+        let names = bounded_directory_names(&self.file, maximum)?;
         self.verify()?;
         Ok(names)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn bounded_directory_names(file: &File, maximum: usize) -> StoreResult<Vec<String>> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: opening "." obtains an independent directory stream offset.
+    let fd = unsafe {
+        libc::openat(
+            file.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(std::io::Error::last_os_error().into());
+    }
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let stream = Stream(stream);
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) != 0 {
+                return Err(error.into());
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+            .to_str()
+            .map_err(|_| StoreError::Corrupt("desktop entry encoding"))?;
+        if name != "." && name != ".." {
+            names
+                .try_reserve(1)
+                .map_err(|_| StoreError::Capacity("desktop inspect entries"))?;
+            names.push(name.to_owned());
+        }
+        if names.len() > maximum {
+            return Err(StoreError::Capacity("desktop inspect entries"));
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1464,3 +1690,130 @@ fn open_error() -> StoreError {
         StoreError::Io(error)
     }
 }
+
+/// No-create local container observation; never an execution or activation grant.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) struct OwnerControlledContainer {
+    path: std::path::PathBuf,
+    file: File,
+    mount: std::sync::Arc<polaris_mcp::NativeMountIdentityV2>,
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl OwnerControlledContainer {
+    pub(super) fn open_migration(path: &Path) -> StoreResult<Self> {
+        let file = canonical_directory_file(path)?;
+        owner_controlled_container(&file.metadata()?)?;
+        let mount = std::sync::Arc::new(super::writer::migration::native_mount(&file)?);
+        let value = Self {
+            path: path.to_owned(),
+            file,
+            mount,
+        };
+        value.verify()?;
+        Ok(value)
+    }
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(super) fn retained_file_m2a(&self) -> StoreResult<File> {
+        self.verify()?;
+        self.file.try_clone().map_err(StoreError::Io)
+    }
+    pub(super) fn verify(&self) -> StoreResult<()> {
+        let named = canonical_directory_file(&self.path)?;
+        for file in [&self.file, &named] {
+            owner_controlled_container(&file.metadata()?)?;
+            self.verify_migration_mount(file)?;
+        }
+        same(&self.file, &named)
+    }
+    fn verify_migration_mount(&self, file: &File) -> StoreResult<()> {
+        if super::writer::migration::native_mount(file)? != *self.mount {
+            return Err(StoreError::RecoveryRequired);
+        }
+        Ok(())
+    }
+    pub(super) fn names_bounded_migration(&self, maximum: usize) -> StoreResult<Vec<String>> {
+        self.verify()?;
+        let names = bounded_directory_names(&self.file, maximum)?;
+        self.verify()?;
+        Ok(names)
+    }
+    /// Existing-only observation of the fixed local container; absence creates nothing.
+    pub(super) fn local_container_migration(&self) -> StoreResult<Option<Self>> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        self.verify()?;
+        // SAFETY: live parent FD and fixed NUL-terminated component; owned result.
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                c"sessions-v2".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            self.verify()?;
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        owner_controlled_container(&file.metadata()?)?;
+        self.verify_migration_mount(&file)?;
+        let named = Self::open_migration(&self.path.join("sessions-v2"))?;
+        self.verify_migration_mount(&named.file)?;
+        same(&file, &named.file)?;
+        self.verify()?;
+        Ok(Some(named))
+    }
+    /// Observe the normal local layout below a retained owner-controlled data root.
+    /// The container may be 0755; every session keeps the ordinary private rule.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn existing_local_session_migration(
+        &self,
+        session: &str,
+    ) -> StoreResult<(File, Directory)> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        self.verify()?;
+        let name = component(session)?;
+        let container = self
+            .local_container_migration()?
+            .ok_or_else(|| StoreError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)))?
+            .retained_file_m2a()?;
+        let fd = unsafe {
+            libc::openat(
+                container.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(open_error());
+        }
+        let child = unsafe { File::from_raw_fd(fd) };
+        owned_metadata(&child.metadata()?, true)?;
+        self.verify_migration_mount(&child)?;
+        let directory = Directory::open_owned(&self.path.join("sessions-v2").join(session))?
+            .with_migration_mount(self.mount.clone())?;
+        same(&child, &directory.file)?;
+        self.verify()?;
+        Ok((container, directory))
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn owner_controlled_container(metadata: &fs::Metadata) -> StoreResult<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(StoreError::RecoveryRequired);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+#[path = "disk/windows_tests.rs"]
+mod windows_tests;

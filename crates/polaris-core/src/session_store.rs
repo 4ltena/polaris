@@ -56,6 +56,7 @@ impl PersistedSession {
     pub fn verification_store_root(&self) -> PathBuf {
         self.data_root.clone()
     }
+    #[cfg(any(unix, all(test, windows)))]
     pub fn create(
         data_root: &Path,
         database: &Path,
@@ -73,10 +74,25 @@ impl PersistedSession {
         )
     }
 
+    #[cfg(not(any(unix, all(test, windows))))]
+    pub fn create(
+        _data_root: &Path,
+        _database: &Path,
+        _project_id: &str,
+        _mode: HistoryMode,
+        _workflow: Option<&SessionWorkflow>,
+    ) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformではセッション保存の保護を確認できません",
+        ))
+    }
+
     /// Create an empty durable conversation named by a host-owned admission.
     /// Ordinary callers should use [`Self::create`]; accepting an explicit ID
     /// lets the session-manager ledger and raw store share one recoverable
     /// sidechat identity.
+    #[cfg(any(unix, all(test, windows)))]
     pub fn create_with_id(
         data_root: &Path,
         database: &Path,
@@ -86,7 +102,9 @@ impl PersistedSession {
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<Self> {
         let state = Self::new_state(project_id, session_id, mode, workflow)?;
-        let mut memory = MemoryStore::open(database).map_err(io::Error::other)?;
+        #[cfg(all(test, windows))]
+        let _creation_guard = windows_creation_guard(data_root, &state)?;
+        let mut memory = open_session_memory(database, true)?;
         // A structured session is saved only after its index migration reads back.
         if mode == HistoryMode::Structured10 {
             memory
@@ -112,6 +130,21 @@ impl PersistedSession {
         })
     }
 
+    #[cfg(not(any(unix, all(test, windows))))]
+    pub fn create_with_id(
+        _data_root: &Path,
+        _database: &Path,
+        _project_id: &str,
+        _session_id: &str,
+        _mode: HistoryMode,
+        _workflow: Option<&SessionWorkflow>,
+    ) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformではセッション保存の保護を確認できません",
+        ))
+    }
+
     /// Pure bootstrap state used by the switch owner's pre-start descriptor.
     pub(crate) fn new_state(
         project_id: &str,
@@ -119,6 +152,10 @@ impl PersistedSession {
         mode: HistoryMode,
         workflow: Option<&SessionWorkflow>,
     ) -> io::Result<ConversationStateV2> {
+        #[cfg(all(test, windows))]
+        if workflow.is_some() {
+            windows_refuse_owner()?;
+        }
         let mut state = ConversationStateV2::new(project_id.into(), session_id.into())?;
         state.history_mode = mode;
         if let Some(workflow) = workflow {
@@ -161,7 +198,7 @@ impl PersistedSession {
                 "別の書き込みでセッションが更新されました。再開し直してください",
             ));
         }
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         memory
             .with_conversation_marker(&published_view(&snapshot.state)?, || Ok(()))
             .map_err(io::Error::other)?;
@@ -196,7 +233,7 @@ impl PersistedSession {
         }
         let lock = self.store.lock()?;
         lock.check_snapshot(expected)?;
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         memory
             .with_conversation_marker(&published_view(&expected.state)?, || Ok(()))
             .map_err(io::Error::other)?;
@@ -298,6 +335,8 @@ impl PersistedSession {
         before_state_hash: &str,
         candidate: ConversationStateV2,
     ) -> io::Result<ConversationSnapshot> {
+        #[cfg(all(test, windows))]
+        windows_refuse_owner()?;
         let mut cursor = self.cursor()?;
         let mut lock = self.store.lock()?;
         let before = lock.snapshot()?;
@@ -335,7 +374,7 @@ impl PersistedSession {
             ));
         }
         candidate.validate()?;
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         memory
             .with_conversation_marker(&published_view(&before.state)?, || {
                 lock.publish(&before, candidate)?;
@@ -365,6 +404,8 @@ impl PersistedSession {
         before_state_hash: &str,
         candidate: ConversationStateV2,
     ) -> io::Result<ConversationSnapshot> {
+        #[cfg(all(test, windows))]
+        crate::conversation_state::windows_state_admission(&candidate)?;
         let mut cursor = self.cursor()?;
         let mut lock = self.store.lock()?;
         let before = lock.snapshot()?;
@@ -400,7 +441,7 @@ impl PersistedSession {
         let expected_next = expected_generation
             .checked_add(1)
             .ok_or_else(|| io::Error::other("保存世代が上限です"))?;
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         if changes_mode && candidate.history_mode == HistoryMode::Structured10 {
             memory
                 .enable_structured_memory()
@@ -888,7 +929,7 @@ impl PersistedSession {
         if next == before.state {
             return Ok(output);
         }
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         memory
             .with_conversation_marker(&published_view(&before.state)?, || {
                 lock.publish(&before, next)?;
@@ -909,6 +950,10 @@ impl PersistedSession {
         workflow: Option<&SessionWorkflow>,
         admission: Option<(&str, &str)>,
     ) -> io::Result<Option<crate::request_input::SourceBinding>> {
+        #[cfg(all(test, windows))]
+        if workflow.is_some() {
+            windows_refuse_owner()?;
+        }
         let mut cursor = self.cursor()?;
         let mut lock = self.store.lock()?;
         let before = lock.snapshot()?;
@@ -1051,13 +1096,13 @@ impl PersistedSession {
                         .is_some_and(|config| config.config == workflow.config)
             })
         {
-            let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+            let mut memory = open_session_memory(&self.database, false)?;
             return memory
                 .with_conversation_marker(&published_view(&before.state)?, || Ok(()))
                 .map(|_| None)
                 .map_err(io::Error::other);
         }
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         // The old writer's forget is serialized with both raw append and marker.
         let mut source = None;
         memory
@@ -1118,7 +1163,7 @@ impl PersistedSession {
         if before.state.generation != *cursor {
             return Err(io::Error::other("保存世代が変わりました"));
         }
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         memory
             .with_conversation_marker(&published_view(&before.state)?, || {
                 lock.clear_epoch()?;
@@ -1142,7 +1187,7 @@ impl PersistedSession {
         if snapshot.state.generation != *cursor {
             return Err(io::Error::other("保存世代が変わりました"));
         }
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         let mut child = None;
         memory
             .with_conversation_marker(&published_view(&snapshot.state)?, || {
@@ -1250,6 +1295,24 @@ impl PersistedSession {
             return Err(io::Error::other("保存世代が変わりました"));
         }
         let plan = lock.plan_rewind_branch(boundary_id, &new_session_id()?)?;
+        let (_, pre) = plan.workspace_manifests();
+        let boundaries = lock.list_rewind_boundaries()?;
+        let post = boundaries
+            .last()
+            .and_then(|boundary| boundary.completion.as_ref())
+            .ok_or_else(|| io::Error::other("現在の巻き戻し境界が未完了です"))?
+            .workspace_post_manifest_id
+            .parse()
+            .map_err(io::Error::other)?;
+        let pre = pre.parse().map_err(io::Error::other)?;
+        let preview = workspace
+            .preview_with_management_with_lease(&lease, &post, &pre)
+            .map_err(io::Error::other)?;
+        if !preview.restorable {
+            return Err(io::Error::other(
+                "管理操作または保存状態が巻き戻しを許可しません",
+            ));
+        }
         crate::rewind_candidate_capacity::preflight_rewind_candidate_capacity(
             workspace,
             &lease,
@@ -1257,7 +1320,7 @@ impl PersistedSession {
             &snapshot.state.project_id,
             plan.estimated_file_bytes(),
         )?;
-        let mut memory = MemoryStore::open(&self.database).map_err(io::Error::other)?;
+        let mut memory = open_session_memory(&self.database, false)?;
         let mut child = None;
         memory
             .with_conversation_marker(&published_view(&snapshot.state)?, || {
@@ -1284,6 +1347,8 @@ impl PersistedSession {
         workflow: Option<&SessionWorkflow>,
         messages: &[Message],
     ) -> io::Result<Self> {
+        #[cfg(all(test, windows))]
+        windows_refuse_owner()?;
         let this = Self::create(data_root, database, project_id, mode, workflow)?;
         let events: Vec<_> = messages
             .iter()
@@ -1336,6 +1401,8 @@ impl PersistedSession {
         &self,
         mut config: WorkflowConfig,
     ) -> io::Result<(SessionWorkflow, bool)> {
+        #[cfg(all(test, windows))]
+        windows_refuse_owner()?;
         let state = self.snapshot()?.state;
         if let Some(reference) = &state.workflow.active_change_contract {
             let store = WorkflowArtifactStore::open(&self.data_root, &state.project_id)?;
@@ -1495,7 +1562,57 @@ fn validate_owner_convergence_for_state(
     Ok(())
 }
 
-#[cfg(test)]
+fn open_session_memory(database: &Path, _create: bool) -> io::Result<MemoryStore> {
+    #[cfg(all(test, windows))]
+    let memory = MemoryStore::open_windows_protected(database, _create);
+    #[cfg(not(all(test, windows)))]
+    let memory = MemoryStore::open(database);
+    memory.map_err(io::Error::other)
+}
+
+#[cfg(all(test, windows))]
+fn windows_refuse_owner() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "このWindows試験ではprivate artifact/workflow保存を利用できません",
+    ))
+}
+
+#[cfg(all(test, windows))]
+fn windows_creation_guard(
+    data_root: &Path,
+    state: &ConversationStateV2,
+) -> io::Result<(
+    polaris_auth::protection::WindowsFamilyDirectory,
+    Option<polaris_auth::protection::WindowsFamilyDirectory>,
+)> {
+    use polaris_auth::{AuthError, protection::WindowsFamilyDirectory};
+    use std::ffi::OsStr;
+    let unavailable = || {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformではセッション保存の保護を確認できません",
+        )
+    };
+    state.validate()?;
+    crate::conversation_state::windows_state_admission(state)?;
+    let root = WindowsFamilyDirectory::open_existing(data_root).map_err(|_| unavailable())?;
+    // Keep the qualified ancestors alive across schema creation and publication.
+    let sessions = match root.child(OsStr::new("sessions-v2"), false) {
+        Ok(sessions) => {
+            match sessions.child(OsStr::new(&state.session_id), false) {
+                Err(AuthError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => return Err(unavailable()),
+            }
+            Some(sessions)
+        }
+        Err(AuthError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err(unavailable()),
+    };
+    Ok((root, sessions))
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::session::Session;
@@ -2270,3 +2387,6 @@ mod tests {
         assert_eq!(persistence.snapshot().unwrap().events.len(), 2);
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests;

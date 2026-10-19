@@ -19,6 +19,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(unix)]
 const STORE_DIRECTORY: &str = "workflow-artifacts-v1";
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -28,6 +29,7 @@ pub struct WorkflowArtifactStore {
 }
 
 impl WorkflowArtifactStore {
+    #[cfg(unix)]
     pub fn open(data_root: &Path, project_id: &str) -> io::Result<Self> {
         if project_id.trim().is_empty() || project_id.contains('\0') {
             return Err(invalid("project IDが不正です"));
@@ -39,6 +41,14 @@ impl WorkflowArtifactStore {
         let project_directory = root.join(project_hash);
         ensure_private_directory(&project_directory)?;
         Ok(Self { project_directory })
+    }
+
+    #[cfg(not(unix))]
+    pub fn open(_data_root: &Path, _project_id: &str) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformではartifact保存の保護を確認できません",
+        ))
     }
 
     /// Publishes exactly one immutable contract body.  Repeating the same body
@@ -417,6 +427,7 @@ impl WorkflowArtifactStore {
     }
 }
 
+#[cfg(unix)]
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     if path.exists() {
         validate_private_directory(path)
@@ -534,7 +545,7 @@ fn invalid_string(message: String) -> io::Error {
     invalid(&message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::workflow::{
@@ -735,3 +746,6 @@ mod tests {
         assert!(store.load_idea_decision(&graph, &decision_ref).is_err());
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests;

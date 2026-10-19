@@ -24,6 +24,8 @@ pub enum ApplyOwnerError {
     #[error(transparent)]
     Participation(#[from] crate::sync::participation::C12MutationErrorV1),
     #[error(transparent)]
+    StrictParticipation(#[from] crate::sync::participation::ParticipationErrorV2),
+    #[error(transparent)]
     Admission(#[from] crate::apply_intent::ApplyAdmissionErrorV1),
     #[error(transparent)]
     Desktop(#[from] crate::desktop_store::StoreError),
@@ -279,31 +281,23 @@ impl ApplyOwnerV1 {
     /// Normal sync commands retain this lease across staging and participation
     /// publication, so another apply cannot change the agreed candidate.
     pub fn ensure_sync_idle(&self) -> Result<(), ApplyOwnerError> {
-        if self.active()?.is_some() {
-            return Err(ApplyOwnerError::EvidenceMismatch);
-        }
-        if let ManagementEffectInspectOpenV1::Present(inspected) = self.inspect_management()? {
-            if inspected
-                .effects()
-                .any(|effect| effect.state.blocks_new_work())
-            {
-                return Err(ApplyOwnerError::EvidenceMismatch);
-            }
-        }
-        Ok(())
+        crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+            &self.project_root,
+            &self.state_dir,
+            &self.lease,
+        )
+        .map_err(|_| ApplyOwnerError::EvidenceMismatch)
     }
 
     pub fn join_participation(
         &self,
-        share: crate::sync::share::ShareLink,
-        manifest: crate::sync::share::ShareManifest,
-        now_unix_seconds: u64,
+        _share: crate::sync::share::ShareLink,
+        _manifest: crate::sync::share::ShareManifest,
+        _now_unix_seconds: u64,
     ) -> Result<crate::sync::participation::Participation, ApplyOwnerError> {
-        use crate::sync::participation;
-        self.ensure_sync_idle()?;
-        let target = participation::prepare_join(share, manifest, now_unix_seconds)?;
-        let inventory = participation::C12GenerationOwnerV1::open(&self.state_dir, &self.lease)?;
-        Ok(participation::join_under_owner(&inventory, target)?)
+        // C08 join/rebind writes belong exclusively to CredentialRebindOwnerV1.
+        // This legacy apply adapter has neither its binding nor intent proof.
+        Err(ApplyOwnerError::EvidenceMismatch)
     }
 
     pub fn write_participation(
@@ -314,6 +308,23 @@ impl ApplyOwnerV1 {
         self.ensure_sync_idle()?;
         let inventory = participation::C12GenerationOwnerV1::open(&self.state_dir, &self.lease)?;
         Ok(participation::write_under_owner(&inventory, target)?)
+    }
+
+    /// Retain the current participation schema and credential binding while
+    /// constructing a C12 target under the same project lease.
+    pub fn participation_target_bytes(
+        &self,
+        target: &crate::sync::participation::Participation,
+    ) -> Result<Vec<u8>, ApplyOwnerError> {
+        use crate::sync::participation;
+        self.ensure_sync_idle()?;
+        let inventory = participation::C12GenerationOwnerV1::open(&self.state_dir, &self.lease)?;
+        let current = inventory
+            .current_body()?
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        Ok(participation::updated_participation_bytes_v2(
+            &current, target,
+        )?)
     }
 
     pub fn leave_participation(&self) -> Result<bool, ApplyOwnerError> {
@@ -370,8 +381,19 @@ impl ApplyOwnerV1 {
         let started = effects.start(&self.lease, &prepared)?;
         match change() {
             Ok(value) => {
-                let receipt = crate::sync::participation::read(&self.state_dir);
-                let proof = serde_json::to_vec(&receipt).map_err(std::io::Error::other)?;
+                let receipt = match crate::sync::participation::read_snapshot(&self.state_dir) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        effects.mark_outcome_unknown(
+                            &self.lease,
+                            &started,
+                            ManagementUnknownReasonV1::UnclassifiedEffect,
+                        )?;
+                        return Err(error.into());
+                    }
+                };
+                let proof =
+                    serde_json::to_vec(&receipt.exact_digest).map_err(std::io::Error::other)?;
                 effects.complete_started(
                     &self.lease,
                     &started,
@@ -392,29 +414,22 @@ impl ApplyOwnerV1 {
 
     pub fn join_confirmed(
         &self,
-        share: crate::sync::share::ShareLink,
-        manifest: crate::sync::share::ShareManifest,
-        now: u64,
-        accepted: bool,
+        _share: crate::sync::share::ShareLink,
+        _manifest: crate::sync::share::ShareManifest,
+        _now: u64,
+        _accepted: bool,
     ) -> Result<Option<crate::sync::participation::Participation>, ApplyOwnerError> {
-        use crate::sync::participation;
-        // Rebinding is a separate contract: this route creates participation only.
-        if participation::read(&self.state_dir).is_some() {
-            return Err(ApplyOwnerError::EvidenceMismatch);
-        }
-        let target = participation::prepare_join(share, manifest, now)?;
-        let bytes = serde_json::to_vec(&target).map_err(std::io::Error::other)?;
-        self.sync_change("C08", &bytes, accepted, || {
-            let inventory =
-                participation::C12GenerationOwnerV1::open(&self.state_dir, &self.lease)?;
-            Ok(participation::join_under_owner(&inventory, target)?)
-        })
+        // Do not create a terminal C08 effect without the C08 intent owner.
+        Err(ApplyOwnerError::EvidenceMismatch)
     }
 
     pub fn leave_confirmed(&self, accepted: bool) -> Result<Option<bool>, ApplyOwnerError> {
         use crate::sync::participation;
-        let held = participation::read(&self.state_dir).ok_or(ApplyOwnerError::EvidenceMismatch)?;
-        let bytes = serde_json::to_vec(&held).map_err(std::io::Error::other)?;
+        let held = participation::read_snapshot(&self.state_dir)?;
+        if held.classification.participation().is_none() {
+            return Err(ApplyOwnerError::EvidenceMismatch);
+        }
+        let bytes = serde_json::to_vec(&held.exact_digest).map_err(std::io::Error::other)?;
         self.sync_change("C13", &bytes, accepted, || {
             let inventory =
                 participation::C12GenerationOwnerV1::open(&self.state_dir, &self.lease)?;
@@ -427,9 +442,13 @@ impl ApplyOwnerV1 {
         accepted: bool,
     ) -> Result<Option<crate::sync::exchange::Exchange>, ApplyOwnerError> {
         use crate::sync::{participation, repository::SyncRepository, share::SyncPaths};
-        let mut held =
-            participation::read(&self.state_dir).ok_or(ApplyOwnerError::EvidenceMismatch)?;
-        let bytes = serde_json::to_vec(&held).map_err(std::io::Error::other)?;
+        let snapshot = participation::read_snapshot(&self.state_dir)?;
+        let mut held = snapshot
+            .classification
+            .participation()
+            .cloned()
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        let bytes = serde_json::to_vec(&snapshot.exact_digest).map_err(std::io::Error::other)?;
         self.sync_change("C11", &bytes, accepted, || {
             let repository = SyncRepository::open(SyncPaths::under(&self.state_dir))?;
             repository.stage_from(&self.project_root, &held.manifest)?;
@@ -483,6 +502,7 @@ impl ApplyOwnerV1 {
         use crate::sync::participation::*;
         use crate::workspace_apply as workspace;
         use std::os::unix::fs::MetadataExt;
+        self.ensure_sync_idle()?;
         if self.active()?.is_some()
             || snapshot.source_path != self.project_root
             || !changes.is_applicable()
@@ -517,14 +537,18 @@ impl ApplyOwnerV1 {
         let current_bytes = inventory
             .current_body()?
             .ok_or(ApplyOwnerError::EvidenceMismatch)?;
-        let current: Participation = serde_json::from_slice(&current_bytes)
-            .map_err(|_| ApplyOwnerError::EvidenceMismatch)?;
-        let target: Participation = serde_json::from_slice(&admission.target_participation)
-            .map_err(|_| ApplyOwnerError::EvidenceMismatch)?;
+        let current_snapshot = decode_participation_v2(&current_bytes)?;
+        let current = current_snapshot
+            .participation()
+            .cloned()
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
+        let target = decode_participation_v2(&admission.target_participation)?;
         let mut expected = current.clone();
         expected.applied_commit = current.agreed_commit.clone();
+        let expected_snapshot =
+            decode_participation_v2(&updated_participation_bytes_v2(&current_bytes, &expected)?)?;
         if !current.unresolved.is_empty()
-            || target != expected
+            || target != expected_snapshot
             || current.agreed_commit.as_deref() != Some(admission.agreed_revision.value.as_str())
             || current.applied_commit.as_deref()
                 != admission
@@ -660,7 +684,11 @@ impl ApplyOwnerV1 {
                 target_marker_hash: target_marker.marker_hash()?,
             },
             share_source_manifest_digest: ManagementEffectHashV1::from_hex(
-                &target.manifest.digest(),
+                &target
+                    .participation()
+                    .ok_or(ApplyOwnerError::EvidenceMismatch)?
+                    .manifest
+                    .digest(),
             )
             .map_err(|_| ApplyOwnerError::EvidenceMismatch)?,
             changed_path_count: request.entries.len() as u64,
@@ -2217,8 +2245,10 @@ impl ApplyOwnerV1 {
         let body = inventory
             .current_body()?
             .ok_or(ApplyOwnerError::EvidenceMismatch)?;
-        let participation: Participation =
-            serde_json::from_slice(&body).map_err(|_| ApplyOwnerError::EvidenceMismatch)?;
+        let snapshot = decode_participation_v2(&body)?;
+        let participation = snapshot
+            .participation()
+            .ok_or(ApplyOwnerError::EvidenceMismatch)?;
         if marker.generation != target_generation
             || marker.mutation_id != Some(descriptor.operation_key)
             || marker.marker_hash()? != target_marker_hash
@@ -3731,13 +3761,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn m3b_confirmed_join_pull_leave_preserve_source_and_peer() {
+    fn m3b_legacy_join_refuses_while_confirmed_pull_leave_preserve_source_and_peer() {
         // The auth path guard owns HOME for this process.
         if std::env::var_os("POLARIS_M3B_SYNC_CHILD").is_none() {
             let home = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "apply_owner::tests::m3b_confirmed_join_pull_leave_preserve_source_and_peer",
+                    "apply_owner::tests::m3b_legacy_join_refuses_while_confirmed_pull_leave_preserve_source_and_peer",
                     "--exact",
                     "--nocapture",
                 ])
@@ -3779,29 +3809,38 @@ mod tests {
             invitation_id: "fixture-invite".into(),
             expires_unix_seconds: u64::MAX,
         };
+        let before_join = fixture_bytes(&owner.state_dir);
+        for accepted in [false, true] {
+            assert!(
+                owner
+                    .join_confirmed(share.clone(), ShareManifest::default(), 1, accepted)
+                    .is_err()
+            );
+            assert_eq!(fixture_bytes(&owner.state_dir), before_join);
+        }
         assert!(
             owner
-                .join_confirmed(share.clone(), ShareManifest::default(), 1, false)
-                .unwrap()
-                .is_none()
-        );
-        assert!(participation::read(&owner.state_dir).is_none());
-        let mut expired = share.clone();
-        expired.expires_unix_seconds = 1;
-        assert!(
-            owner
-                .join_confirmed(expired, ShareManifest::default(), 1, true)
+                .join_participation(share.clone(), ShareManifest::default(), 1)
                 .is_err()
         );
-        owner
-            .join_confirmed(share.clone(), ShareManifest::default(), 1, true)
-            .unwrap()
-            .unwrap();
-        assert!(
-            owner
-                .join_confirmed(share, ShareManifest::default(), 1, true)
-                .is_err()
-        );
+        assert_eq!(fixture_bytes(&owner.state_dir), before_join);
+        // Historical V1 participation is input data for C11/C13, not a C08
+        // write through the obsolete apply adapter.
+        let held = participation::Participation {
+            share,
+            manifest: ShareManifest::default(),
+            joined_unix_seconds: 1,
+            agreed_commit: None,
+            applied_commit: None,
+            unresolved: vec![],
+        };
+        let sync = owner.state_dir.join("sync");
+        std::fs::create_dir(&sync).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = sync.join("participation.json");
+        std::fs::write(&path, serde_json::to_vec(&held).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(owner.pull_confirmed(false).unwrap().is_none());
         let exchange = owner.pull_confirmed(true).unwrap().unwrap();
         assert!(!exchange.unresolved);
@@ -3809,9 +3848,17 @@ mod tests {
         assert!(!project.join("received.txt").exists());
         assert_eq!(peer.head(), peer_head);
         assert!(owner.leave_confirmed(false).unwrap().is_none());
-        assert!(participation::read(&owner.state_dir).is_some());
+        assert!(
+            participation::read(&owner.state_dir)
+                .unwrap()
+                .participation()
+                .is_some()
+        );
         assert_eq!(owner.leave_confirmed(true).unwrap(), Some(true));
-        assert!(participation::read(&owner.state_dir).is_none());
+        assert!(matches!(
+            participation::read(&owner.state_dir).unwrap(),
+            participation::ParticipationReadV2::Missing
+        ));
         assert_eq!(peer.head(), peer_head);
         owner.ensure_sync_idle().unwrap();
     }
@@ -3908,6 +3955,12 @@ mod tests {
                 max_total_bytes: 65536,
                 max_depth: 8,
             };
+            crate::rewind_workspace::WorkspaceOwner::open(
+                &project,
+                &state.join("rewind-workspace"),
+                Default::default(),
+            )
+            .unwrap();
             let lease_owner =
                 ProjectMutationOwnerV1::at_store_root(&state.join("rewind-workspace")).unwrap();
             let owner =
@@ -4071,6 +4124,12 @@ mod tests {
             max_total_bytes: 65536,
             max_depth: 8,
         };
+        crate::rewind_workspace::WorkspaceOwner::open(
+            &project,
+            &state.join("rewind-workspace"),
+            Default::default(),
+        )
+        .unwrap();
         let lease_owner =
             ProjectMutationOwnerV1::at_store_root(&state.join("rewind-workspace")).unwrap();
         let owner = ApplyOwnerV1::with_lease(&project, &state, lease_owner.try_mutation().unwrap())
@@ -4204,7 +4263,12 @@ mod tests {
                 .unwrap();
             assert!(report.failure.is_none(), "{:?}", report.failure);
             assert_eq!(std::fs::read(project.join("main.rs")).unwrap(), contents);
-            assert_eq!(read(&state).unwrap(), participation);
+            assert_eq!(
+                read(&state).unwrap(),
+                crate::sync::participation::ParticipationReadV2::LegacyParticipationOnly(
+                    participation.clone()
+                )
+            );
             assert!(owner.active().unwrap().is_none());
             let key = crate::apply_intent::c12_operation_key(
                 ManagementEffectHashV1::digest(project.as_os_str().as_encoded_bytes()),

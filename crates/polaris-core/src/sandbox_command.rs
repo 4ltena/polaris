@@ -44,6 +44,116 @@ pub struct SandboxCommandPreviewV1 {
     before: ConversationSnapshot,
     executable_hash: String,
     request_hash: ManagementEffectHashV1,
+    #[cfg(target_os = "macos")]
+    scratch: Option<CommandScratch>,
+}
+
+#[cfg(target_os = "macos")]
+struct CommandScratch {
+    directory: Option<tempfile::TempDir>,
+    pins: Vec<(PathBuf, fs::File)>,
+    preserve: std::cell::Cell<bool>,
+}
+
+#[cfg(target_os = "macos")]
+impl CommandScratch {
+    fn prepare(
+        policy: SandboxPolicy,
+        data_root: &Path,
+    ) -> Result<(SandboxPolicy, Self), SandboxCommandError> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        let boundary = policy
+            .isolated_boundary()
+            .ok_or_else(|| invalid("isolated policy is missing"))?;
+        let parent = std::env::temp_dir().canonicalize()?;
+        let data_root = data_root.canonicalize()?;
+        if parent.starts_with(&boundary.workspace)
+            || parent.starts_with(&data_root)
+            || boundary
+                .readable_roots
+                .iter()
+                .any(|root| parent.starts_with(root))
+            || polaris_tools::path_policy::is_denied(&parent)
+        {
+            return Err(invalid("private scratch parent overlaps command authority").into());
+        }
+        let directory = polaris_auth::protection::with_protected_paths(|registered| {
+            let secrets =
+                crate::isolated_workspace::RegisteredSecrets::from_auth_registry(registered)
+                    .map_err(|_| invalid("scratch protection is unavailable"))?;
+            let metadata = parent.symlink_metadata()?;
+            if !metadata.is_dir()
+                || secrets.denies(&parent, &metadata)
+                || registered
+                    .paths()
+                    .iter()
+                    .any(|path| path.parent() == Some(parent.as_path()))
+            {
+                return Err(invalid("scratch parent is protected"));
+            }
+            tempfile::Builder::new()
+                .prefix("polaris-command-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(&parent)
+        })
+        .map_err(|_| invalid("scratch protection is unavailable"))??;
+        let container = directory.path().canonicalize()?;
+        if container.starts_with(&data_root) || data_root.starts_with(&container) {
+            return Err(invalid("private scratch overlaps session storage").into());
+        }
+        let home = container.join("home");
+        let tmp = container.join("tmp");
+        for path in [&home, &tmp] {
+            fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        let policy = policy.with_isolated_private_environment(&container, &home, &tmp)?;
+        let pins = [container, home, tmp]
+            .into_iter()
+            .map(|path| {
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&path)?;
+                Ok((path, file))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let scratch = Self {
+            directory: Some(directory),
+            pins,
+            preserve: std::cell::Cell::new(false),
+        };
+        scratch.revalidate()?;
+        Ok((policy, scratch))
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        for (path, pinned) in &self.pins {
+            let named = path.symlink_metadata()?;
+            let held = pinned.metadata()?;
+            if !named.is_dir()
+                || path.canonicalize()? != *path
+                || (named.dev(), named.ino()) != (held.dev(), held.ino())
+                || named.uid() != unsafe { libc::geteuid() }
+                || named.mode() & 0o7777 != 0o700
+            {
+                return Err(invalid("private command scratch changed"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CommandScratch {
+    fn drop(&mut self) {
+        // Never remove a changed namespace or scratch still used by an unconfirmed child.
+        if self.preserve.get() || self.revalidate().is_err() {
+            if let Some(directory) = self.directory.take() {
+                let _ = directory.keep();
+            }
+        }
+    }
 }
 
 impl SandboxCommandPreviewV1 {
@@ -108,6 +218,16 @@ impl SandboxCommandOwnerV1<'_> {
             return Err(invalid("programが承認されたproject/runtimeの外にあります").into());
         }
         let executable_hash = executable_hash(&program)?;
+        #[cfg(target_os = "macos")]
+        let (policy, scratch) = if policy
+            .isolated_boundary()
+            .is_some_and(|boundary| boundary.environment.is_none())
+        {
+            let (policy, scratch) = CommandScratch::prepare(policy, &session.data_root)?;
+            (policy, Some(scratch))
+        } else {
+            (policy, None)
+        };
         let request_hash = ManagementEffectHashV1::digest(
             &serde_json::to_vec(&(
                 &argv,
@@ -123,6 +243,8 @@ impl SandboxCommandOwnerV1<'_> {
             before,
             executable_hash,
             request_hash,
+            #[cfg(target_os = "macos")]
+            scratch,
         })
     }
 
@@ -190,6 +312,10 @@ impl SandboxCommandOwnerV1<'_> {
             return Err(error);
         }
         let started = self.effects.start(self.lease, &prepared.effect)?;
+        #[cfg(target_os = "macos")]
+        if let Some(scratch) = &prepared.preview.scratch {
+            scratch.preserve.set(true);
+        }
         let result = polaris_sandbox::run_confined_controlled_in_dir(
             &prepared.preview.policy,
             Path::new(&prepared.preview.argv[0]),
@@ -221,6 +347,10 @@ impl SandboxCommandOwnerV1<'_> {
                 ManagementUnknownReasonV1::DetachedEffect,
             )?;
         } else {
+            #[cfg(target_os = "macos")]
+            if let Some(scratch) = &prepared.preview.scratch {
+                scratch.preserve.set(false);
+            }
             let evidence = ManagementEffectHashV1::digest(
                 &serde_json::to_vec(&(
                     prepared.effect.operation_id().as_hex(),
@@ -253,6 +383,10 @@ impl SandboxCommandOwnerV1<'_> {
         session: &PersistedSession,
         preview: &SandboxCommandPreviewV1,
     ) -> Result<(), SandboxCommandError> {
+        #[cfg(target_os = "macos")]
+        if let Some(scratch) = &preview.scratch {
+            scratch.revalidate()?;
+        }
         let current = session.snapshot()?;
         let project = self.project.canonicalize()?;
         if current.state != preview.before.state
@@ -371,4 +505,166 @@ fn executable_hash(program: &Path) -> io::Result<String> {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod scratch_tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    fn prepared() -> (tempfile::TempDir, SandboxPolicy, CommandScratch) {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let data = root.path().join("data");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&data).unwrap();
+        let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, &project, &[]).unwrap();
+        let (policy, scratch) = CommandScratch::prepare(policy, &data).unwrap();
+        (root, policy, scratch)
+    }
+
+    fn remove_empty_scratch(container: &Path) {
+        fs::remove_dir(container.join("home")).unwrap();
+        fs::remove_dir(container.join("tmp")).unwrap();
+        fs::remove_dir(container).unwrap();
+    }
+
+    #[test]
+    fn private_scratch_is_owned_through_preview_and_cleaned_after_confirmed_stop() {
+        let (_root, policy, scratch) = prepared();
+        let environment = policy
+            .isolated_boundary()
+            .unwrap()
+            .environment
+            .as_ref()
+            .unwrap();
+        let container = environment.home.parent().unwrap().to_owned();
+        for path in [&container, &environment.home, &environment.tmpdir] {
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o7777, 0o700);
+        }
+        scratch.revalidate().unwrap();
+        drop(scratch);
+        assert!(!container.exists());
+    }
+
+    #[test]
+    fn failed_owner_dispatch_retains_scratch_and_unknown_receipt() {
+        use crate::{
+            conversation_state::HistoryMode, management_effect::ManagementEffectStateV1,
+            rewind_workspace::WorkspaceOwner,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let data = root.path().join("data");
+        let state = root.path().join("state");
+        for path in [&project, &data, &state] {
+            fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        }
+        let project = project.canonicalize().unwrap();
+        let program = PathBuf::from("/usr/bin/printf").canonicalize().unwrap();
+        let session = PersistedSession::create(
+            &data,
+            &state.join("memory.sqlite3"),
+            project.to_str().unwrap(),
+            HistoryMode::Legacy,
+            None,
+        )
+        .unwrap();
+        let workspace = WorkspaceOwner::open(
+            &project,
+            &state.join("rewind-workspace"),
+            Default::default(),
+        )
+        .unwrap();
+        let lease = workspace.try_mutation().unwrap();
+        let effects = ManagementEffectStoreV1::open_at_state_dir(&project, &state, &lease).unwrap();
+        let owner = SandboxCommandOwnerV1 {
+            effects: &effects,
+            lease: &lease,
+            project: &project,
+        };
+        let startup = SandboxPolicy::new(SandboxMode::ReadOnly, &[]).unwrap();
+        let preview = SandboxCommandOwnerV1::preview(
+            &session,
+            &project,
+            &startup,
+            vec![program.to_str().unwrap().into()],
+        )
+        .unwrap();
+        let container = preview
+            .policy()
+            .isolated_boundary()
+            .unwrap()
+            .environment
+            .as_ref()
+            .unwrap()
+            .home
+            .parent()
+            .unwrap()
+            .to_owned();
+        let prepared = owner.prepare(&session, preview).unwrap();
+        let home = container.join("home");
+        let retained_home = container.join("retained-home");
+        let mut faulted = false;
+        assert!(
+            owner
+                .execute(&session, &prepared, || {
+                    if !faulted {
+                        fs::rename(&home, &retained_home).unwrap();
+                        faulted = true;
+                    }
+                    false
+                })
+                .is_err()
+        );
+        assert!(faulted);
+        // Restore the pinned inode so retention depends on the dispatch error,
+        // rather than Drop's separate namespace-change protection.
+        fs::rename(&retained_home, &home).unwrap();
+        prepared
+            .preview
+            .scratch
+            .as_ref()
+            .unwrap()
+            .revalidate()
+            .unwrap();
+        assert!(matches!(
+            effects.effects().unwrap()[0].state,
+            ManagementEffectStateV1::OutcomeUnknown { .. }
+        ));
+        assert!(owner.execute(&session, &prepared, || false).is_err());
+        assert_eq!(effects.effects().unwrap().len(), 1);
+        drop(prepared);
+        assert!(container.join("home").is_dir());
+        assert!(container.join("tmp").is_dir());
+        remove_empty_scratch(&container);
+    }
+
+    #[test]
+    fn replaced_scratch_namespace_is_refused_and_not_deleted() {
+        let (_root, policy, scratch) = prepared();
+        let environment = policy
+            .isolated_boundary()
+            .unwrap()
+            .environment
+            .as_ref()
+            .unwrap();
+        let container = environment.home.parent().unwrap().to_owned();
+        let retained = container.join("retained-home");
+        fs::rename(&environment.home, &retained).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&environment.home)
+            .unwrap();
+        fs::write(environment.home.join("replacement"), b"must remain").unwrap();
+        assert!(scratch.revalidate().is_err());
+        drop(scratch);
+        assert_eq!(
+            fs::read(environment.home.join("replacement")).unwrap(),
+            b"must remain"
+        );
+        fs::remove_file(environment.home.join("replacement")).unwrap();
+        fs::remove_dir(retained).unwrap();
+        remove_empty_scratch(&container);
+    }
 }

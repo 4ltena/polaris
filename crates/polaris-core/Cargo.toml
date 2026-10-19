@@ -38,3 +38,6 @@ async-trait = { workspace = true }
 polaris-mcp = { path = "../polaris-mcp", features = ["test-support"] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 async-trait = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

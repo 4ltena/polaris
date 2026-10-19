@@ -19,13 +19,19 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 #[path = "session_manager_family.rs"]
-mod family;
+pub(super) mod family;
 #[path = "session_manager_generation.rs"]
 mod generation;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "session_manager_migration.rs"]
+pub(super) mod migration;
+#[cfg(all(test, windows))]
+use polaris_auth::protection::WindowsFamilyFile as File;
+#[cfg(not(all(test, windows)))]
+use std::fs::File;
 use std::{
     cell::Cell,
     collections::BTreeMap,
-    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{
@@ -410,7 +416,9 @@ impl SessionManagerStore {
             return Err(StoreError::Corrupt("session manager journal size"));
         }
         let mut bytes = Vec::with_capacity(length as usize);
-        journal.read_to_end(&mut bytes)?;
+        Read::by_ref(&mut journal)
+            .take(length + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() as u64 != length {
             return Err(StoreError::Corrupt("session manager journal length"));
         }
@@ -475,7 +483,9 @@ impl SessionManagerStore {
             return Err(StoreError::Corrupt("session manager state size"));
         }
         let mut bytes = Vec::with_capacity(length as usize);
-        state.read_to_end(&mut bytes)?;
+        Read::by_ref(&mut state)
+            .take(length + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() as u64 != length || content_hash(&bytes) != commit.content_hash {
             return Err(StoreError::Corrupt("session manager state hash"));
         }

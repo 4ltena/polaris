@@ -1,11 +1,14 @@
 //! Approved proposals: the approval text, its payload binding and the save order.
 use super::*;
-use crate::{isolated_workspace::Limits, mcp::runtime::RuntimeConfig};
-use polaris_mcp::{
-    registration::{Registry, canonical_hash},
-    store::Store,
-};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::isolated_workspace::Limits;
+#[cfg(unix)]
+use crate::mcp::runtime::RuntimeConfig;
+#[cfg(unix)]
+use polaris_mcp::registration::Registry;
+use polaris_mcp::{registration::canonical_hash, store::Store};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::BTreeSet;
 
 /// Owner startup's stdio rules, applied again before a proposal is saved.
 pub struct Admission<'a> {
@@ -16,6 +19,7 @@ pub struct Admission<'a> {
     pub limits: Limits,
 }
 
+#[cfg(unix)]
 fn references(server: &Server) -> BTreeSet<String> {
     match &server.transport {
         Destination::Stdio { secret_env, .. } => secret_env.values().cloned().collect(),
@@ -25,6 +29,7 @@ fn references(server: &Server) -> BTreeSet<String> {
     }
 }
 
+#[cfg(unix)]
 fn remove(store: &Store, stale: BTreeSet<String>) -> Result<(), polaris_mcp::Error> {
     if stale.is_empty() {
         return Ok(());
@@ -196,6 +201,7 @@ impl Proposal {
     }
 }
 
+#[cfg(unix)]
 impl Detector {
     /// Values are re-read and must match their MACs. Both documents must still
     /// be at the detected revisions; secrets precede the registry CAS and a

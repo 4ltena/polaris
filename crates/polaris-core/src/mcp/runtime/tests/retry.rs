@@ -1,6 +1,7 @@
 //! Retry only pre-operation metadata failures, preserving cancellation and bounds.
 use super::*;
 
+#[cfg(unix)]
 async fn failed_server(
     method: &'static str,
     statuses: Vec<u16>,
@@ -19,6 +20,7 @@ async fn failed_server(
     .await
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn metadata_retry_recovers_discovery_and_catalog_on_a_new_connection() {
     for method in ["server/discover", "tools/list"] {
@@ -47,6 +49,7 @@ async fn metadata_retry_recovers_discovery_and_catalog_on_a_new_connection() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn metadata_auth_failure_is_never_classified_as_retryable_transport() {
     for method in ["server/discover", "tools/list"] {
@@ -75,6 +78,7 @@ async fn metadata_auth_failure_is_never_classified_as_retryable_transport() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn metadata_retry_limit_is_shared_by_all_attempts_and_not_reset_by_a_new_search() {
     for retries in [0, 2, 5] {
@@ -117,6 +121,7 @@ fn metadata_retry_clock_has_bounded_backoff_and_injectable_jitter() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn metadata_retry_cancel_or_abandon_backoff_never_releases_a_fresh_attempt() {
     for abandon in [false, true] {
@@ -171,6 +176,7 @@ async fn metadata_retry_cancel_or_abandon_backoff_never_releases_a_fresh_attempt
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn metadata_retry_rejects_protocol_failures_without_changing_lifecycle() {
     for method in ["server/discover", "tools/list"] {

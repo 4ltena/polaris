@@ -1224,16 +1224,22 @@ mod tests {
 
     #[test]
     fn managed_finalizer_preferences_fail_closed_on_unsafe_or_invalid_files() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
         let managed = directory.path().join("managed-preferences.toml");
-        let target = directory.path().join("target.toml");
-        std::fs::write(&target, "[presentation]\nlanguage='ja'\n").unwrap();
-        symlink(&target, &managed).unwrap();
-        assert!(try_load_answer_finalizer_with_managed_from(Some(&managed), None, None).is_err());
+        #[cfg(unix)]
+        {
+            let target = directory.path().join("target.toml");
+            std::fs::write(&target, "[presentation]\nlanguage='ja'\n").unwrap();
+            symlink(&target, &managed).unwrap();
+            assert!(
+                try_load_answer_finalizer_with_managed_from(Some(&managed), None, None).is_err()
+            );
 
-        std::fs::remove_file(&managed).unwrap();
+            std::fs::remove_file(&managed).unwrap();
+        }
         std::fs::create_dir(&managed).unwrap();
         assert!(try_load_answer_finalizer_with_managed_from(Some(&managed), None, None).is_err());
 
@@ -1761,6 +1767,7 @@ mod tests {
         let helper = dir.path().join("semif-helper");
         std::fs::write(&helper, "#!/bin/sh\n").unwrap();
         let helper = helper.display();
+        let helper_toml = toml::Value::String(helper.to_string()).to_string();
 
         assert_eq!(
             Config::default().decision.backend,
@@ -1770,7 +1777,7 @@ mod tests {
 
         let ok = write(
             dir.path(),
-            &format!("[decision]\nenabled = true\nbackend = \"semif\"\nhelper = \"{helper}\"\n"),
+            &format!("[decision]\nenabled = true\nbackend = \"semif\"\nhelper = {helper_toml}\n"),
         );
         let held = try_load_from(None, Some(&ok)).expect("a valid semif配置");
         assert_eq!(held.decision.backend, DecisionBackend::SemIf);
@@ -1786,7 +1793,7 @@ mod tests {
         for (body, expected) in [
             ("[decision]\nbackend = \"semiff\"\n".to_owned(), "unknown"),
             ("[decision]\nbackend = \"semif\"\n".to_owned(), "missing"),
-            (format!("[decision]\nhelper = \"{helper}\"\n"), "unused"),
+            (format!("[decision]\nhelper = {helper_toml}\n"), "unused"),
             (
                 "[decision]\nbackend = \"semif\"\nhelper = \"semif-helper\"\n".to_owned(),
                 "relative",

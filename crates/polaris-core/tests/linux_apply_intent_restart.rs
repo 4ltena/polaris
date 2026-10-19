@@ -627,7 +627,11 @@ fn verify_phase(root: &Path, phase: &str) {
         fs::write(snapshot.path().join("main.rs"), b"second candidate\n").unwrap();
         let changes = protected_collect_changes(&snapshot, limits()).unwrap();
         assert!(changes.is_applicable());
-        let mut target = polaris_core::sync::participation::read(&state).unwrap();
+        let mut target = polaris_core::sync::participation::read(&state)
+            .unwrap()
+            .participation()
+            .unwrap()
+            .clone();
         target.applied_commit = target.agreed_commit.clone();
         let revision = RevisionV1 {
             kind: RevisionKindV1::GitSha1,
@@ -702,7 +706,11 @@ fn verify_phase(root: &Path, phase: &str) {
         // The durable blocker also protects legacy mutations after the
         // process holding the apply lease has exited.
         let frozen = snapshot_bytes(root);
-        let held = polaris_core::sync::participation::read(&state).unwrap();
+        let held = polaris_core::sync::participation::read(&state)
+            .unwrap()
+            .participation()
+            .unwrap()
+            .clone();
         assert!(polaris_core::sync::participation::write(&state, &held).is_err());
         assert!(polaris_core::sync::participation::leave(&state).is_err());
         assert_eq!(

@@ -92,6 +92,29 @@ struct Envelope {
     failure: Option<String>,
 }
 
+/// Decode persisted local evidence without recreating an execution grant.
+pub(in crate::desktop_store) fn inspect_local_terminal(
+    messages: &[Message],
+    result: &Message,
+) -> StoreResult<McpDisposition> {
+    if result.role != polaris_provider::Role::Tool || result.content.len() > MAX_VISIBLE_BYTES {
+        return Err(StoreError::RunConflict);
+    }
+    let envelope: Envelope = serde_json::from_str(&result.content)?;
+    envelope
+        .intent
+        .validate()
+        .map_err(|_| StoreError::RunConflict)?;
+    validate_envelope(&envelope)?;
+    check_call(messages, &envelope.intent, true)?;
+    if result.tool_call_id.as_deref() != Some(envelope.intent.model_call_id.as_str())
+        || serde_json::to_string(&envelope)? != result.content
+    {
+        return Err(StoreError::RunConflict);
+    }
+    Ok(envelope.disposition)
+}
+
 /// Reserve the exact durable proof framing before projecting any reply.
 /// InputRequired is the longest disposition that carries a reply. The null
 /// placeholder is replaced by the serialized projection, not added to it.

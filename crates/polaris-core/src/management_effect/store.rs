@@ -2,30 +2,58 @@
 
 use super::*;
 use crate::project_mutation::{ProjectActivityLeaseV1, ProjectMutationLeaseV1};
+#[cfg(any(unix, all(test, windows)))]
 #[path = "generation.rs"]
-mod generation;
+pub(crate) mod generation;
+#[cfg(any(unix, all(test, windows)))]
 use generation::ActiveGenerationV1;
+#[cfg(all(test, windows))]
+#[path = "store/windows_backend.rs"]
+mod windows_backend;
+#[cfg(all(test, windows))]
+use windows_backend::PinnedManagementFileV1;
+#[cfg(all(test, windows))]
+type ManagementDirectoryV1 = std::sync::Arc<polaris_auth::protection::WindowsFamilyDirectory>;
+#[cfg(not(all(test, windows)))]
+type ManagementDirectoryV1 = File;
+#[cfg(all(test, windows))]
+type ManagementJournalFileV1 = polaris_auth::protection::WindowsFamilyFile;
+#[cfg(not(all(test, windows)))]
+type ManagementJournalFileV1 = File;
 use serde::{Deserialize, Serialize};
-use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(all(test, windows))]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    ffi::CString,
+    fs::{self, File},
     path::{Path, PathBuf},
+};
+#[cfg(unix)]
+use std::{
+    fs::OpenOptions,
+    io::{Read, Seek, SeekFrom, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    },
 };
 
 // Private capability: public project mutators continue to require EX leases.
+#[cfg(any(unix, all(test, windows)))]
 #[derive(Clone, Copy)]
 enum JournalLeaseV1<'a> {
     Mutation(&'a ProjectMutationLeaseV1),
     Runtime(&'a ProjectActivityLeaseV1),
 }
 
+#[cfg(any(unix, all(test, windows)))]
 const JOURNAL_VERSION: u32 = 1;
+#[cfg(any(unix, all(test, windows)))]
 const STORE_NAME: &str = "management-effects-v1";
+#[cfg(any(unix, all(test, windows)))]
 const JOURNAL_NAME: &str = "journal.v1.jsonl";
+#[cfg(any(unix, all(test, windows)))]
 const OWNER_LOCK_NAME: &str = "owner.lock";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +136,8 @@ pub struct ManagementEffectStoreV1 {
     expected_lease_root: PathBuf,
     project_scope: ManagementEffectHashV1,
     limits: ManagementEffectLimitsV1,
+    #[cfg(all(test, windows))]
+    windows: Option<std::sync::Arc<windows_backend::WindowsStoreV1>>,
 }
 
 #[derive(Debug)]
@@ -135,6 +165,7 @@ pub enum ManagementEffectTailV1 {
     },
 }
 
+#[cfg(not(all(test, windows)))]
 #[derive(Debug)]
 struct PinnedManagementFileV1 {
     parent: File,
@@ -142,13 +173,15 @@ struct PinnedManagementFileV1 {
     file: File,
     evidence: ManagementEffectInspectedFileV1,
     bytes: Vec<u8>,
+    metadata: fs::Metadata,
+    migration_mount: MigrationMountV2,
 }
 
 #[derive(Debug)]
 pub struct ManagementEffectInspectV1 {
     store: ManagementEffectStoreV1,
-    root_directory: File,
-    _owner_guard: File,
+    root_directory: ManagementDirectoryV1,
+    _owner_guard: ManagementJournalFileV1,
     files: BTreeMap<String, PinnedManagementFileV1>,
     directories: BTreeMap<String, (u64, u64)>,
     state: JournalStateV1,
@@ -156,10 +189,18 @@ pub struct ManagementEffectInspectV1 {
     events: BTreeMap<(u64, u64), VerifiedManagementEffectEventV1>,
     tail: ManagementEffectTailV1,
     complete_prefix_hash: ManagementEffectHashV1,
+    migration_inspection: bool,
+    migration_mount: MigrationMountV2,
+    migration_state_directory: Option<(File, fs::Metadata)>,
+    migration_root_metadata: Option<fs::Metadata>,
+    migration_directories: BTreeMap<String, (File, fs::Metadata)>,
+    #[cfg(all(test, windows))]
+    windows_directories: BTreeMap<String, ManagementDirectoryV1>,
 }
 
 /// Only the shared owner can construct a token after the full intent join.
 #[derive(Debug)]
+#[cfg(unix)]
 pub struct JoinedManagementEffectRecoveryV1 {
     inspected: ManagementEffectInspectV1,
     operation_id: ManagementOperationIdV1,
@@ -173,6 +214,7 @@ pub struct JoinedManagementEffectRecoveryV1 {
     tail: ManagementEffectTailV1,
 }
 
+#[cfg(unix)]
 impl JoinedManagementEffectRecoveryV1 {
     pub(crate) fn requires_generation_seal(&self) -> Result<bool, ManagementEffectStoreError> {
         let inspected = &self.inspected;
@@ -321,6 +363,7 @@ impl JoinedManagementEffectRecoveryV1 {
 }
 
 impl ManagementEffectInspectV1 {
+    #[cfg(unix)]
     pub(crate) fn joined_terminal_store(
         self,
         intent: &crate::apply_intent::InspectedApplyIntentV1,
@@ -342,6 +385,7 @@ impl ManagementEffectInspectV1 {
         Ok(self.store)
     }
 
+    #[cfg(unix)]
     pub(crate) fn joined_completed_readback(
         self,
         intent: &crate::apply_intent::InspectedApplyIntentV1,
@@ -438,6 +482,7 @@ impl ManagementEffectInspectV1 {
     }
 
     /// Admission may recycle a terminal generation, but never a pending one.
+    #[cfg(unix)]
     pub(crate) fn fresh_admission_limits(
         &self,
     ) -> Result<(u64, u64, u64), ManagementEffectStoreError> {
@@ -463,6 +508,7 @@ impl ManagementEffectInspectV1 {
                     .length,
             )
         } else {
+            generation::preflight_seal_capacity(&self.state)?;
             (0, 0)
         };
         Ok((
@@ -472,6 +518,14 @@ impl ManagementEffectInspectV1 {
         ))
     }
 
+    /// Synthetic cumulative-counter fault; never changes durable inspection data.
+    #[cfg(test)]
+    #[cfg(unix)]
+    pub(super) fn test_seal_capacity_counter_overflow(&mut self) {
+        self.state.archived_effects = u64::MAX;
+    }
+
+    #[cfg(unix)]
     pub(crate) fn admit_fresh(
         self,
         lease: &ProjectMutationLeaseV1,
@@ -512,6 +566,7 @@ impl ManagementEffectInspectV1 {
         Ok(self.store)
     }
 
+    #[cfg(unix)]
     pub(crate) fn join_recovery(
         self,
         intent: &crate::apply_intent::InspectedApplyIntentV1,
@@ -604,6 +659,7 @@ impl ManagementEffectInspectV1 {
     pub fn cursor(&self) -> ManagementEffectCursorV1 {
         self.state.cursor()
     }
+    #[cfg(unix)]
     pub fn root_identity(&self) -> Result<(u64, u64), ManagementEffectStoreError> {
         let meta = self.root_directory.metadata()?;
         Ok((meta.dev(), meta.ino()))
@@ -621,6 +677,7 @@ impl ManagementEffectInspectV1 {
         self.complete_prefix_hash
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn latest_event_evidence(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -644,6 +701,7 @@ impl ManagementEffectInspectV1 {
         self.event_evidence(operation_id, latest.evidence, &latest.event)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn event_evidence(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -663,10 +721,122 @@ impl ManagementEffectInspectV1 {
         Ok(Some(found.clone()))
     }
 
+    #[cfg(any(unix, all(test, windows)))]
+    pub(crate) fn verify_read_snapshot(&self) -> Result<(), ManagementEffectStoreError> {
+        self.verify_pins()?;
+        if self.tail != ManagementEffectTailV1::Complete {
+            return Err(ManagementEffectStoreError::TornTail);
+        }
+        Ok(())
+    }
+
+    /// Read-only continuation after the coordinator's physical rename. Keep
+    /// the original root, child pins and owner lock; never reacquire a reader.
+    #[cfg(unix)]
+    pub(crate) fn rebind_retired_for_migration(
+        mut self,
+        state_directory: &File,
+        migration_id: ManagementEffectHashV1,
+    ) -> Result<Self, ManagementEffectStoreError> {
+        if !self.migration_inspection
+            || self.tail != ManagementEffectTailV1::Complete
+            || migration_id == ManagementEffectHashV1::zero()
+            || self.store.root != self.store.state_dir.join(STORE_NAME)
+        {
+            return Err(ManagementEffectStoreError::InvalidStore);
+        }
+        let named_state = crate::project_mutation::open_directory_nofollow(&self.store.state_dir)?;
+        for directory in [state_directory, &named_state] {
+            self.verify_migration_state(directory)?;
+        }
+        let state_stamp = management_stamp(&named_state.metadata()?);
+        if management_stamp(&state_directory.metadata()?) != state_stamp {
+            return Err(ManagementEffectStoreError::InvalidStore);
+        }
+        let name = format!("{STORE_NAME}.retired-{}", migration_id.as_hex());
+        let named_root = management_child_directory(state_directory, &name)?;
+        self.migration_mount.verify(&named_root)?;
+        self.migration_mount.verify(&self.root_directory)?;
+        let expected = self
+            .migration_root_metadata
+            .as_ref()
+            .ok_or(ManagementEffectStoreError::InvalidStore)?;
+        let current = self.root_directory.metadata()?;
+        let mut retired_stamp = management_stamp(&current);
+        let original_stamp = management_stamp(expected);
+        // Rename changes ctime. Every other original field remains binding.
+        retired_stamp.8 = original_stamp.8;
+        retired_stamp.9 = original_stamp.9;
+        if retired_stamp != original_stamp
+            || management_stamp(&named_root.metadata()?) != management_stamp(&current)
+        {
+            return Err(ManagementEffectStoreError::InvalidStore);
+        }
+        self.store.root = self.store.state_dir.join(name);
+        self.store.journal_path = self.store.root.join(JOURNAL_NAME);
+        self.migration_root_metadata = Some(current);
+        // Reinventory closes every original child stamp/body and named entry,
+        // including the held owner lock, before this new binding can escape.
+        self.verify_read_snapshot()?;
+        self.verify_migration_state(state_directory)?;
+        let closing_state =
+            crate::project_mutation::open_directory_nofollow(&self.store.state_dir)?;
+        self.verify_migration_state(&closing_state)?;
+        if management_stamp(&closing_state.metadata()?) != state_stamp
+            || management_stamp(&state_directory.metadata()?) != state_stamp
+        {
+            return Err(ManagementEffectStoreError::InvalidStore);
+        }
+        Ok(self)
+    }
+
+    #[cfg(unix)]
+    fn verify_migration_state(&self, named: &File) -> Result<(), ManagementEffectStoreError> {
+        let (held, expected) = self
+            .migration_state_directory
+            .as_ref()
+            .ok_or(ManagementEffectStoreError::InvalidStore)?;
+        // State membership changes during cutover; its original physical
+        // identity and owner/mode must remain unchanged throughout.
+        let identity = |meta: &fs::Metadata| (meta.dev(), meta.ino(), meta.uid(), meta.mode());
+        for file in [held, named] {
+            self.migration_mount.verify(file)?;
+            if identity(&file.metadata()?) != identity(expected) {
+                return Err(ManagementEffectStoreError::InvalidStore);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn verify_pins(&self) -> Result<(), ManagementEffectStoreError> {
-        let root =
-            crate::project_mutation::open_directory_nofollow(&self.store.root)?.metadata()?;
+        if self.migration_inspection {
+            self.verify_migration_state(&crate::project_mutation::open_directory_nofollow(
+                &self.store.state_dir,
+            )?)?;
+        }
+        self.migration_mount
+            .verify(&crate::project_mutation::open_directory_nofollow(
+                &self.store.state_dir,
+            )?)?;
+        let named_root = crate::project_mutation::open_directory_nofollow(&self.store.root)?;
+        self.migration_mount.verify(&named_root)?;
+        self.migration_mount.verify(&self.root_directory)?;
+        let root = named_root.metadata()?;
         let pinned = self.root_directory.metadata()?;
+        if let Some(expected) = &self.migration_root_metadata {
+            if management_stamp(&root) != management_stamp(expected)
+                || management_stamp(&pinned) != management_stamp(expected)
+            {
+                return Err(ManagementEffectStoreError::InvalidStore);
+            }
+        }
+        for (file, expected) in self.migration_directories.values() {
+            self.migration_mount.verify(file)?;
+            if management_stamp(&file.metadata()?) != management_stamp(expected) {
+                return Err(ManagementEffectStoreError::InvalidStore);
+            }
+        }
         if root.uid() != unsafe { libc::geteuid() } || root.mode() & 0o7777 != 0o700 {
             return Err(ManagementEffectStoreError::InvalidStore);
         }
@@ -676,8 +846,21 @@ impl ManagementEffectInspectV1 {
         for file in self.files.values() {
             verify_management_file(file)?;
         }
-        let fresh = management_inventory(&self.root_directory, self.store.limits)?;
+        #[cfg(test)]
+        if self.migration_inspection {
+            management_migration_hook(&BEFORE_MIGRATION_REFRESH);
+        }
+        let fresh = management_inventory_mode(
+            &self.root_directory,
+            self.store.limits,
+            self.migration_inspection,
+        )?;
         if fresh.directories != self.directories
+            || fresh.migration_directories.iter().any(|(name, (_, meta))| {
+                self.migration_directories
+                    .get(name)
+                    .is_none_or(|(_, old)| management_stamp(meta) != management_stamp(old))
+            })
             || fresh.files.len() != self.files.len()
             || fresh.files.iter().any(|(name, file)| {
                 self.files
@@ -687,6 +870,38 @@ impl ManagementEffectInspectV1 {
         {
             return Err(ManagementEffectStoreError::InvalidStore);
         }
+        if self.migration_inspection {
+            // Fresh inventory must not leave earlier pins stale, even when
+            // body bytes or directory names have been restored by a race.
+            let named = crate::project_mutation::open_directory_nofollow(&self.store.root)?;
+            for file in [&named, &self.root_directory] {
+                self.migration_mount.verify(file)?;
+                let current = file.metadata()?;
+                if self
+                    .migration_root_metadata
+                    .as_ref()
+                    .is_none_or(|old| management_stamp(&current) != management_stamp(old))
+                {
+                    return Err(ManagementEffectStoreError::InvalidStore);
+                }
+            }
+            for (file, old) in self.migration_directories.values() {
+                self.migration_mount.verify(file)?;
+                if management_stamp(&file.metadata()?) != management_stamp(old) {
+                    return Err(ManagementEffectStoreError::InvalidStore);
+                }
+            }
+            for pin in self.files.values() {
+                pin.migration_mount.verify(&pin.file)?;
+                verify_management_entry(&pin.parent, &pin.name, &pin.file)?;
+                if management_stamp(&pin.file.metadata()?) != management_stamp(&pin.metadata) {
+                    return Err(ManagementEffectStoreError::InvalidStore);
+                }
+            }
+            self.verify_migration_state(&crate::project_mutation::open_directory_nofollow(
+                &self.store.state_dir,
+            )?)?;
+        }
         Ok(())
     }
 }
@@ -694,6 +909,7 @@ impl ManagementEffectInspectV1 {
 impl ManagementEffectStoreV1 {
     /// Creation is authorized only by the owner's already durable generation zero.
     /// Existing bytes go through inspect/admit; normal open's repairs are avoided.
+    #[cfg(unix)]
     pub(crate) fn initialize_fresh_joined(
         project: &Path,
         state: &Path,
@@ -751,6 +967,7 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(unix)]
     pub fn inspect_open_at_state_dir(
         project_root: &Path,
         state_dir: &Path,
@@ -767,27 +984,165 @@ impl ManagementEffectStoreV1 {
         )
     }
 
+    #[cfg(unix)]
+    pub(crate) fn inspect_open_with_read_lease(
+        project: &Path,
+        state: &Path,
+        lease: crate::project_mutation::ProjectReadLeaseV1<'_>,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        lease
+            .verify(state)
+            .map_err(|_| ManagementEffectStoreError::WrongProjectLease)?;
+        let project = canonical_project_root(project)?;
+        let scope = ManagementEffectHashV1::digest(project.as_os_str().as_encoded_bytes());
+        Self::inspect_named_at_lease_identity(
+            state,
+            scope,
+            (lease.store_root(), lease.store_identity()),
+            ManagementEffectLimitsV1::default(),
+            false,
+            STORE_NAME,
+        )
+    }
+
+    /// Read-only inventory of the exact retired root. The cutover owner
+    /// supplies its durable migration ID and holds the project lease.
+    /// This never opens or repairs the old tombstone path.
+    #[cfg(unix)]
+    pub fn inspect_retired_for_migration_at_state_dir(
+        project_root: &Path,
+        state_dir: &Path,
+        migration_id: ManagementEffectHashV1,
+        lease: &ProjectMutationLeaseV1,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        if migration_id == ManagementEffectHashV1::zero() {
+            return Err(ManagementEffectStoreError::InvalidStore);
+        }
+        let project = canonical_project_root(project_root)?;
+        let scope = ManagementEffectHashV1::digest(project.as_os_str().as_encoded_bytes());
+        let name = format!("{STORE_NAME}.retired-{}", migration_id.as_hex());
+        Self::inspect_named_at(
+            state_dir,
+            scope,
+            lease,
+            ManagementEffectLimitsV1::default(),
+            true,
+            &name,
+        )
+    }
+
+    #[cfg(unix)]
     fn inspect_at(
         state_dir: &Path,
         project_scope: ManagementEffectHashV1,
         lease: &ProjectMutationLeaseV1,
         limits: ManagementEffectLimitsV1,
     ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Self::inspect_at_mode(state_dir, project_scope, lease, limits, false)
+    }
+
+    #[cfg(unix)]
+    fn inspect_at_mode(
+        state_dir: &Path,
+        project_scope: ManagementEffectHashV1,
+        lease: &ProjectMutationLeaseV1,
+        limits: ManagementEffectLimitsV1,
+        migration_inspection: bool,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Self::inspect_named_at(
+            state_dir,
+            project_scope,
+            lease,
+            limits,
+            migration_inspection,
+            STORE_NAME,
+        )
+    }
+
+    #[cfg(unix)]
+    fn inspect_named_at(
+        state_dir: &Path,
+        project_scope: ManagementEffectHashV1,
+        lease: &ProjectMutationLeaseV1,
+        limits: ManagementEffectLimitsV1,
+        migration_inspection: bool,
+        root_name: &str,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Self::inspect_named_at_lease_identity(
+            state_dir,
+            project_scope,
+            (lease.store_root(), lease.store_identity()),
+            limits,
+            migration_inspection,
+            root_name,
+        )
+    }
+
+    #[cfg(unix)]
+    fn inspect_named_at_lease_identity(
+        state_dir: &Path,
+        project_scope: ManagementEffectHashV1,
+        lease_binding: (&Path, (u64, u64)),
+        limits: ManagementEffectLimitsV1,
+        migration_inspection: bool,
+        root_name: &str,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Self::inspect_named_scoped_at_lease_identity(
+            state_dir,
+            Some(project_scope),
+            lease_binding,
+            limits,
+            migration_inspection,
+            root_name,
+        )
+    }
+    /// Existing-only historical reader; its optional input is not an authority.
+    /// An empty source without a namespace-derived scope fails closed.
+    #[cfg(unix)]
+    pub(crate) fn inspect_migration_history(
+        state_dir: &Path,
+        lease: &ProjectMutationLeaseV1,
+        scope: Option<ManagementEffectHashV1>,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Self::inspect_named_scoped_at_lease_identity(
+            state_dir,
+            scope,
+            (lease.store_root(), lease.store_identity()),
+            ManagementEffectLimitsV1::default(),
+            true,
+            STORE_NAME,
+        )
+    }
+    #[cfg(unix)]
+    fn inspect_named_scoped_at_lease_identity(
+        state_dir: &Path,
+        project_scope: Option<ManagementEffectHashV1>,
+        lease_binding: (&Path, (u64, u64)),
+        limits: ManagementEffectLimitsV1,
+        migration_inspection: bool,
+        root_name: &str,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        if project_scope.is_none() && !migration_inspection {
+            return Err(ManagementEffectStoreError::WrongProjectScope);
+        }
         let state_directory = crate::project_mutation::open_directory_nofollow(state_dir)?;
+        let migration_mount = MigrationMountV2::inspect(&state_directory, migration_inspection)?;
         let state_meta = state_directory.metadata()?;
         if state_meta.uid() != unsafe { libc::geteuid() } || state_meta.mode() & 0o7077 != 0 {
             return Err(ManagementEffectStoreError::InvalidStore);
         }
         let expected_lease_root = state_dir.join("rewind-workspace");
-        if lease.store_root() != expected_lease_root {
+        if lease_binding.0 != expected_lease_root {
             return Err(ManagementEffectStoreError::WrongProjectLease);
         }
-        let lock_root =
-            crate::project_mutation::open_directory_nofollow(&expected_lease_root)?.metadata()?;
-        if lease.store_identity() != (lock_root.dev(), lock_root.ino()) {
+        let lock_directory =
+            crate::project_mutation::open_directory_nofollow(&expected_lease_root)?;
+        migration_mount.verify(&lock_directory)?;
+        let lock_root = lock_directory.metadata()?;
+        if lease_binding.1 != (lock_root.dev(), lock_root.ino()) {
             return Err(ManagementEffectStoreError::WrongProjectLease);
         }
-        let root_directory = match management_child_directory(&state_directory, STORE_NAME) {
+        let root_directory = match management_child_directory(&state_directory, root_name) {
             Err(ManagementEffectStoreError::Io(error))
                 if error.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -795,19 +1150,62 @@ impl ManagementEffectStoreV1 {
             }
             other => other?,
         };
-        let store = Self {
+        migration_mount.verify(&root_directory)?;
+        let migration_root_metadata = migration_inspection
+            .then(|| root_directory.metadata())
+            .transpose()?;
+        let mut store = Self {
             state_dir: state_dir.to_owned(),
-            root: state_dir.join(STORE_NAME),
-            journal_path: state_dir.join(STORE_NAME).join(JOURNAL_NAME),
+            root: state_dir.join(root_name),
+            journal_path: state_dir.join(root_name).join(JOURNAL_NAME),
             expected_lease_root,
-            project_scope,
+            project_scope: project_scope.unwrap_or(ManagementEffectHashV1::zero()),
             limits,
         };
         // The existing lock is opened without O_CREAT and remains held until
         // inspection is discarded or an explicitly joined recovery finishes.
-        let owner = pin_management_file(&root_directory, OWNER_LOCK_NAME, OWNER_LOCK_NAME, 4096)?;
-        owner.file.lock()?;
-        let inventory = management_inventory(&root_directory, limits)?;
+        let owner = pin_management_file_mounted(
+            &root_directory,
+            OWNER_LOCK_NAME,
+            OWNER_LOCK_NAME,
+            4096,
+            &migration_mount,
+        )?;
+        if migration_inspection {
+            owner.file.try_lock().map_err(|error| match error {
+                std::fs::TryLockError::WouldBlock => {
+                    std::io::Error::from(std::io::ErrorKind::WouldBlock)
+                }
+                std::fs::TryLockError::Error(error) => error,
+            })?;
+        } else {
+            owner.file.lock()?;
+        }
+        let inventory = management_inventory_mode(&root_directory, limits, migration_inspection)?;
+        Self::inspect_inventory(
+            store,
+            project_scope,
+            root_directory,
+            owner,
+            inventory,
+            migration_inspection,
+            migration_mount,
+            migration_inspection.then_some((state_directory, state_meta)),
+            migration_root_metadata,
+        )
+    }
+    #[cfg(any(unix, all(test, windows)))]
+    fn inspect_inventory(
+        mut store: Self,
+        project_scope: Option<ManagementEffectHashV1>,
+        root_directory: ManagementDirectoryV1,
+        owner: PinnedManagementFileV1,
+        inventory: ManagementInventoryV1,
+        migration_inspection: bool,
+        migration_mount: MigrationMountV2,
+        migration_state_directory: Option<(File, fs::Metadata)>,
+        migration_root_metadata: Option<fs::Metadata>,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
         let files = inventory.files;
         let read =
             |relative: &str, max: u64| -> Result<Option<Vec<u8>>, ManagementEffectStoreError> {
@@ -817,7 +1215,9 @@ impl ManagementEffectStoreV1 {
                     None => Ok(None),
                 }
             };
-        let chain = store.verified_generations_reading(read)?;
+        let chain = store.verified_generations_reading_scoped(read, project_scope)?;
+        let mut scopes = std::collections::BTreeSet::new();
+        let mut prepared_operations = std::collections::BTreeSet::new();
         let mut snapshots = BTreeMap::new();
         let mut events = BTreeMap::new();
         let mut latest_state = None;
@@ -837,11 +1237,22 @@ impl ManagementEffectStoreV1 {
             if prefix != file.bytes.len() && !is_current {
                 return Err(ManagementEffectStoreError::TornTail);
             }
-            let state = store.parse_journal_bytes(active, &file.bytes[..prefix])?;
+            let state =
+                store.parse_journal_bytes_scoped(active, &file.bytes[..prefix], project_scope)?;
+            for effect in state.effects.values() {
+                scopes.insert(effect.request.scope.project);
+            }
             for (key, effect) in &state.effects {
                 snapshots.insert(*key, effect.clone());
             }
             for verified in state.events.values() {
+                // Check new preparations, not carried pending snapshots: a
+                // checkpoint legitimately repeats its original operation.
+                if let ManagementEffectEventV1::Prepared { request } = &verified.event {
+                    if !prepared_operations.insert(request.operation_id) {
+                        return Err(ManagementEffectStoreError::CorruptJournal);
+                    }
+                }
                 if events
                     .insert(
                         (verified.evidence.generation, verified.evidence.sequence),
@@ -864,6 +1275,30 @@ impl ManagementEffectStoreV1 {
                 latest_state = Some(state);
             }
         }
+        if migration_inspection {
+            if scopes.len() > 1 {
+                return Err(ManagementEffectStoreError::WrongProjectScope);
+            }
+            let historical = project_scope
+                .or_else(|| scopes.first().copied())
+                .ok_or(ManagementEffectStoreError::WrongProjectScope)?;
+            if historical == ManagementEffectHashV1::zero()
+                || scopes.iter().any(|scope| *scope != historical)
+            {
+                return Err(ManagementEffectStoreError::WrongProjectScope);
+            }
+            store.project_scope = historical;
+            // Re-run the ordinary bound chain validator on exactly the held
+            // bytes. Orphan inventory never selects the historical scope.
+            store.verified_generations_reading(|relative, max| match files.get(relative) {
+                Some(file) if file.bytes.len() as u64 <= max => Ok(Some(file.bytes.clone())),
+                Some(_) => Err(ManagementEffectStoreError::StoreFull),
+                None => Ok(None),
+            })?;
+            for effect in snapshots.values() {
+                validate_request_shape(historical, &effect.request)?;
+            }
+        }
         let inspected = ManagementEffectInspectV1 {
             store,
             root_directory,
@@ -875,9 +1310,18 @@ impl ManagementEffectStoreV1 {
             events,
             tail,
             complete_prefix_hash,
+            migration_inspection,
+            migration_mount,
+            migration_state_directory,
+            migration_root_metadata,
+            migration_directories: inventory.migration_directories,
+            #[cfg(all(test, windows))]
+            windows_directories: inventory.windows_directories,
         };
         inspected.verify_pins()?;
-        inspected.store.validate_inspected_seal_layout(&inspected)?;
+        if !migration_inspection {
+            inspected.store.validate_inspected_seal_layout(&inspected)?;
+        }
         for snapshot in inspected.snapshots.values() {
             inspected
                 .latest_event_evidence(snapshot.request.operation_id, snapshot)?
@@ -885,11 +1329,13 @@ impl ManagementEffectStoreV1 {
         }
         Ok(ManagementEffectInspectOpenV1::Present(inspected))
     }
+
     /// Opens the project store while holding the one shared mutation lease.
     ///
     /// Opening repairs only an incomplete final write. A complete invalid
     /// record is corruption. Any effect that had started before this process
     /// opened the store is durably advanced to `OutcomeUnknown`.
+    #[cfg(unix)]
     pub fn open(
         project_root: &Path,
         lease: &ProjectMutationLeaseV1,
@@ -902,6 +1348,7 @@ impl ManagementEffectStoreV1 {
     /// Trusted-host entry point for a state directory already selected by
     /// the CLI/TUI host. The project identity is still derived independently,
     /// and the supplied lease must be the lock inside this exact state root.
+    #[cfg(unix)]
     pub fn open_at_state_dir(
         project_root: &Path,
         state_dir: &Path,
@@ -921,6 +1368,7 @@ impl ManagementEffectStoreV1 {
         )
     }
 
+    #[cfg(unix)]
     fn open_at(
         state_dir: &Path,
         expected_lease_root: PathBuf,
@@ -978,11 +1426,11 @@ impl ManagementEffectStoreV1 {
         &self.state_dir
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn capacity(&self) -> Result<ManagementEffectCapacityV1, ManagementEffectStoreError> {
         let _owner = self.lock_owner()?;
         let state = self.load()?;
-        let current_journal_bytes =
-            fs::symlink_metadata(self.journal_for_generation(state.generation))?.len();
+        let current_journal_bytes = self.m_length(self.journal_for_generation(state.generation))?;
         let mut retained_archive_bytes = 0_u64;
         for number in 1..=state.generation {
             let archive = self
@@ -991,7 +1439,7 @@ impl ManagementEffectStoreV1 {
                 .join(number.to_string())
                 .join("archive.v1.json");
             retained_archive_bytes = retained_archive_bytes
-                .checked_add(fs::symlink_metadata(archive)?.len())
+                .checked_add(self.m_length(archive)?)
                 .ok_or(ManagementEffectStoreError::StoreFull)?;
         }
         Ok(ManagementEffectCapacityV1 {
@@ -1004,21 +1452,25 @@ impl ManagementEffectStoreV1 {
     }
 
     #[cfg(test)]
+    #[cfg(any(unix, all(test, windows)))]
     pub(crate) fn test_fail_seal_once_at(&self, point: u8) {
         generation::fail_seal_once_at(point);
     }
 
     #[cfg(test)]
+    #[cfg(any(unix, all(test, windows)))]
     pub(crate) fn test_reset_file_sequence_for_restart(&self) {
         generation::reset_file_sequence_for_restart();
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn cursor(&self) -> Result<ManagementEffectCursorV1, ManagementEffectStoreError> {
         let _owner = self.lock_owner()?;
         let state = self.load()?;
         Ok(state.cursor())
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn effects(&self) -> Result<Vec<ManagementEffectSnapshotV1>, ManagementEffectStoreError> {
         let _owner = self.lock_owner()?;
         Ok(self.load()?.effects.into_values().collect())
@@ -1028,6 +1480,7 @@ impl ManagementEffectStoreV1 {
     /// in the active generation (generation + 1). The caller must retain the
     /// cursor and pass the last returned operation id as `after` for the next
     /// page. A rollover or append invalidates the cursor.
+    #[cfg(any(unix, all(test, windows)))]
     pub fn effects_page(
         &self,
         expected: ManagementEffectCursorV1,
@@ -1056,6 +1509,7 @@ impl ManagementEffectStoreV1 {
             .collect())
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn effect(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -1067,6 +1521,7 @@ impl ManagementEffectStoreV1 {
         self.archived_effect(operation_id)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn event_evidence(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -1077,6 +1532,7 @@ impl ManagementEffectStoreV1 {
         self.event_evidence_unlocked(operation_id, expected_evidence, expected_event)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn event_evidence_unlocked(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -1103,6 +1559,7 @@ impl ManagementEffectStoreV1 {
         Ok(Some(verified.clone()))
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn latest_event_evidence(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -1112,6 +1569,7 @@ impl ManagementEffectStoreV1 {
         self.latest_event_evidence_unlocked(operation_id, expected_snapshot)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn latest_event_evidence_unlocked(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -1149,6 +1607,7 @@ impl ManagementEffectStoreV1 {
         Ok(targeted)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn latest_event_for_operation_unlocked(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -1165,6 +1624,7 @@ impl ManagementEffectStoreV1 {
 
     /// Returns the oldest non-terminal effect. Callers must refuse new turns,
     /// retries and management operations while this returns a value.
+    #[cfg(any(unix, all(test, windows)))]
     pub fn blocker(
         &self,
     ) -> Result<Option<ManagementEffectSnapshotV1>, ManagementEffectStoreError> {
@@ -1179,6 +1639,7 @@ impl ManagementEffectStoreV1 {
 
     /// Re-acquires the capability needed to explicitly deny a preparation
     /// that survived a process restart. Other states return `None`.
+    #[cfg(any(unix, all(test, windows)))]
     pub fn prepared_effect(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -1204,6 +1665,7 @@ impl ManagementEffectStoreV1 {
 
     /// Re-acquires only the reconciliation capability for an unresolved
     /// outcome. It cannot be used to restart the original side effect.
+    #[cfg(any(unix, all(test, windows)))]
     pub fn unknown_effect(
         &self,
         operation_id: ManagementOperationIdV1,
@@ -1227,6 +1689,7 @@ impl ManagementEffectStoreV1 {
         )
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn prepare(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1237,6 +1700,7 @@ impl ManagementEffectStoreV1 {
     }
 
     /// Restricts shared-activity journal writes to runtime-local session controls.
+    #[cfg(unix)]
     pub fn prepare_runtime(
         &self,
         lease: &ProjectActivityLeaseV1,
@@ -1246,6 +1710,7 @@ impl ManagementEffectStoreV1 {
         self.prepare_with_lease(JournalLeaseV1::Runtime(lease), expected, request)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn prepare_with_lease(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -1325,6 +1790,7 @@ impl ManagementEffectStoreV1 {
         ))
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn deny(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1335,6 +1801,7 @@ impl ManagementEffectStoreV1 {
     }
 
     /// Restricts shared-activity journal writes to runtime-local session controls.
+    #[cfg(unix)]
     pub fn deny_runtime(
         &self,
         lease: &ProjectActivityLeaseV1,
@@ -1344,6 +1811,7 @@ impl ManagementEffectStoreV1 {
         self.deny_with_lease(JournalLeaseV1::Runtime(lease), effect, reason)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn deny_with_lease(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -1397,6 +1865,7 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn start(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1406,6 +1875,7 @@ impl ManagementEffectStoreV1 {
     }
 
     /// Restricts shared-activity journal writes to runtime-local session controls.
+    #[cfg(unix)]
     pub fn start_runtime(
         &self,
         lease: &ProjectActivityLeaseV1,
@@ -1414,6 +1884,7 @@ impl ManagementEffectStoreV1 {
         self.start_with_lease(JournalLeaseV1::Runtime(lease), effect)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn start_with_lease(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -1465,6 +1936,7 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn complete_started(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1476,6 +1948,7 @@ impl ManagementEffectStoreV1 {
         self.complete_from_started_or_replay(JournalLeaseV1::Mutation(lease), effect, evidence_hash)
     }
 
+    #[cfg(unix)]
     pub fn complete_started_runtime(
         &self,
         lease: &ProjectActivityLeaseV1,
@@ -1487,6 +1960,7 @@ impl ManagementEffectStoreV1 {
         self.complete_from_started_or_replay(JournalLeaseV1::Runtime(lease), effect, evidence_hash)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn mark_outcome_unknown(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1497,6 +1971,7 @@ impl ManagementEffectStoreV1 {
     }
 
     /// Restricts shared-activity journal writes to runtime-local session controls.
+    #[cfg(unix)]
     pub fn mark_outcome_unknown_runtime(
         &self,
         lease: &ProjectActivityLeaseV1,
@@ -1506,6 +1981,7 @@ impl ManagementEffectStoreV1 {
         self.mark_outcome_unknown_with_lease(JournalLeaseV1::Runtime(lease), effect, reason)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn mark_outcome_unknown_with_lease(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -1561,6 +2037,7 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn complete_unknown(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1616,6 +2093,7 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     pub fn reconcile_abandon(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1671,6 +2149,7 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn complete_from_started_or_replay(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -1727,6 +2206,7 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn checked_effect_state(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1742,6 +2222,7 @@ impl ManagementEffectStoreV1 {
         )
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn checked_effect_state_with_lease(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -1765,6 +2246,7 @@ impl ManagementEffectStoreV1 {
         Ok(state)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn recover_interrupted(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1788,11 +2270,12 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn has_prepare_reserve(
         &self,
         state: &JournalStateV1,
     ) -> Result<bool, ManagementEffectStoreError> {
-        let bytes = fs::symlink_metadata(self.journal_for_generation(state.generation))?.len();
+        let bytes = self.m_length(self.journal_for_generation(state.generation))?;
         Ok(state.effects.len() < self.limits.max_effects
             && state
                 .records
@@ -1803,6 +2286,7 @@ impl ManagementEffectStoreV1 {
                 .is_some_and(|length| length <= self.limits.max_journal_bytes))
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn has_pending_reserve(
         &self,
         state: &JournalStateV1,
@@ -1819,7 +2303,7 @@ impl ManagementEffectStoreV1 {
                 })
             })
             .ok_or(ManagementEffectStoreError::StoreFull)?;
-        let bytes = fs::symlink_metadata(self.journal_for_generation(state.generation))?.len();
+        let bytes = self.m_length(self.journal_for_generation(state.generation))?;
         Ok(state
             .records
             .checked_add(needed)
@@ -1829,6 +2313,7 @@ impl ManagementEffectStoreV1 {
                 .is_some_and(|length| length <= self.limits.max_journal_bytes))
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn append(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1838,6 +2323,7 @@ impl ManagementEffectStoreV1 {
         self.append_with_lease(JournalLeaseV1::Mutation(lease), state, event)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn append_with_lease(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -1889,15 +2375,15 @@ impl ManagementEffectStoreV1 {
             return Err(ManagementEffectStoreError::StoreFull);
         }
         let journal_path = self.journal_for_generation(state.generation);
-        let current_bytes = fs::symlink_metadata(&journal_path)?.len();
+        let current_bytes = self.m_length(&journal_path)?;
         if current_bytes.saturating_add(bytes.len() as u64) > self.limits.max_journal_bytes {
             return Err(ManagementEffectStoreError::StoreFull);
         }
-        let mut file = open_journal(&journal_path, true)?;
+        let mut file = self.m_open(&journal_path, true)?;
         file.seek(SeekFrom::End(0))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        sync_directory(
+        self.m_sync(
             journal_path
                 .parent()
                 .ok_or(ManagementEffectStoreError::InvalidStore)?,
@@ -1920,6 +2406,7 @@ impl ManagementEffectStoreV1 {
         })
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn repair_torn_tail(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -1927,17 +2414,17 @@ impl ManagementEffectStoreV1 {
         self.check_lease(lease)?;
         let active = self.active_generation()?;
         let journal_path = active.journal_path.clone();
-        let bytes = read_bounded(&journal_path, self.limits.max_journal_bytes)?;
+        let bytes = self.m_read(&journal_path, self.limits.max_journal_bytes)?;
         let valid = complete_prefix_len(&bytes);
         if valid == bytes.len() {
             return Ok(());
         }
         self.parse_journal_bytes(&active, &bytes[..valid])?;
-        let mut file = open_journal(&journal_path, true)?;
+        let mut file = self.m_open(&journal_path, true)?;
         file.set_len(valid as u64)?;
         file.seek(SeekFrom::Start(valid as u64))?;
         file.sync_all()?;
-        sync_directory(
+        self.m_sync(
             journal_path
                 .parent()
                 .ok_or(ManagementEffectStoreError::InvalidStore)?,
@@ -1945,34 +2432,46 @@ impl ManagementEffectStoreV1 {
         Ok(())
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn load(&self) -> Result<JournalStateV1, ManagementEffectStoreError> {
-        validate_private_directory(&self.root)?;
+        self.m_validate_directory(&self.root)?;
         let active = self.active_generation()?;
         self.load_at(&active)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn load_at(
         &self,
         active: &ActiveGenerationV1,
     ) -> Result<JournalStateV1, ManagementEffectStoreError> {
-        validate_private_directory(
+        self.m_validate_directory(
             active
                 .journal_path
                 .parent()
                 .ok_or(ManagementEffectStoreError::InvalidStore)?,
         )?;
-        validate_private_file(&active.journal_path)?;
-        let bytes = read_bounded(&active.journal_path, self.limits.max_journal_bytes)?;
+        self.m_validate_file(&active.journal_path)?;
+        let bytes = self.m_read(&active.journal_path, self.limits.max_journal_bytes)?;
         if complete_prefix_len(&bytes) != bytes.len() {
             return Err(ManagementEffectStoreError::TornTail);
         }
         self.parse_journal_bytes(active, &bytes)
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn parse_journal_bytes(
         &self,
         active: &ActiveGenerationV1,
         bytes: &[u8],
+    ) -> Result<JournalStateV1, ManagementEffectStoreError> {
+        self.parse_journal_bytes_scoped(active, bytes, Some(self.project_scope))
+    }
+    #[cfg(any(unix, all(test, windows)))]
+    fn parse_journal_bytes_scoped(
+        &self,
+        active: &ActiveGenerationV1,
+        bytes: &[u8],
+        scope: Option<ManagementEffectHashV1>,
     ) -> Result<JournalStateV1, ManagementEffectStoreError> {
         let mut state = JournalStateV1 {
             generation: active.number,
@@ -2000,16 +2499,23 @@ impl ManagementEffectStoreV1 {
         if state.effects.len() > self.limits.max_effects {
             return Err(ManagementEffectStoreError::StoreFull);
         }
-        if state
-            .effects
-            .values()
-            .any(|effect| validate_request_shape(self.project_scope, &effect.request).is_err())
-        {
+        if state.effects.values().any(|effect| {
+            validate_request_shape(
+                scope.unwrap_or(effect.request.scope.project),
+                &effect.request,
+            )
+            .is_err()
+        }) {
             return Err(ManagementEffectStoreError::CorruptJournal);
+        }
+        #[cfg(all(test, windows))]
+        for effect in state.effects.values() {
+            windows_backend::require_inventory(&effect.request)?;
         }
         Ok(state)
     }
 
+    #[cfg(unix)]
     fn check_runtime_request(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -2032,6 +2538,7 @@ impl ManagementEffectStoreV1 {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn check_journal_lease(
         &self,
         lease: JournalLeaseV1<'_>,
@@ -2076,6 +2583,7 @@ impl ManagementEffectStoreV1 {
         }
     }
 
+    #[cfg(unix)]
     fn check_lease(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -2086,6 +2594,7 @@ impl ManagementEffectStoreV1 {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn lock_owner(&self) -> Result<File, ManagementEffectStoreError> {
         let file = open_journal(&self.root.join(OWNER_LOCK_NAME), true)?;
         file.lock()?;
@@ -2093,6 +2602,7 @@ impl ManagementEffectStoreV1 {
     }
 
     #[cfg(test)]
+    #[cfg(any(unix, all(test, windows)))]
     pub(super) fn test_open(
         state_dir: &Path,
         expected_lease_root: PathBuf,
@@ -2104,11 +2614,13 @@ impl ManagementEffectStoreV1 {
     }
 
     #[cfg(test)]
+    #[cfg(any(unix, all(test, windows)))]
     pub(super) fn test_journal_path(&self) -> &Path {
         &self.journal_path
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn test_joined_seal(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -2120,7 +2632,22 @@ impl ManagementEffectStoreV1 {
         self.seal_generation_joined(lease, &root, &state)
     }
 
+    /// Exercises ordinary seal ordering with one synthetic in-memory counter.
     #[cfg(test)]
+    #[cfg(unix)]
+    pub(super) fn test_ordinary_seal_capacity_counter_overflow(
+        &self,
+        lease: &ProjectMutationLeaseV1,
+    ) -> Result<(), ManagementEffectStoreError> {
+        self.check_lease(lease)?;
+        let _guard = self.lock_owner()?;
+        let mut state = self.load()?;
+        state.archived_effects = u64::MAX;
+        self.seal_generation(lease, &state, false)
+    }
+
+    #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn test_joined_seal_prefix(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -2133,6 +2660,7 @@ impl ManagementEffectStoreV1 {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn test_inspect(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -2142,6 +2670,17 @@ impl ManagementEffectStoreV1 {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
+    pub(super) fn test_inspect_migration(
+        &self,
+        lease: &ProjectMutationLeaseV1,
+        limits: ManagementEffectLimitsV1,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Self::inspect_at_mode(&self.state_dir, self.project_scope, lease, limits, true)
+    }
+
+    #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn test_append_zero_evidence(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -2166,6 +2705,7 @@ impl ManagementEffectStoreV1 {
     }
 
     #[cfg(test)]
+    #[cfg(any(unix, all(test, windows)))]
     pub(super) fn test_append_legacy_prepared(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -2228,6 +2768,7 @@ impl JournalStateV1 {
         }
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn apply(&mut self, envelope: JournalEnvelopeV1) -> Result<(), ManagementEffectStoreError> {
         if envelope.version != JOURNAL_VERSION
             || envelope.sequence != self.sequence + 1
@@ -2262,6 +2803,7 @@ impl JournalStateV1 {
         Ok(())
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn apply_event(
         &mut self,
         sequence: u64,
@@ -2341,6 +2883,7 @@ impl JournalStateV1 {
         Ok(())
     }
 
+    #[cfg(any(unix, all(test, windows)))]
     fn transition(
         &mut self,
         operation_id: ManagementOperationIdV1,
@@ -2361,6 +2904,7 @@ impl JournalStateV1 {
     }
 }
 
+#[cfg(unix)]
 fn management_child_directory(
     parent: &File,
     name: &str,
@@ -2385,6 +2929,7 @@ fn management_child_directory(
     Ok(file)
 }
 
+#[cfg(unix)]
 fn verify_management_entry(
     parent: &File,
     name: &CString,
@@ -2410,6 +2955,91 @@ fn verify_management_entry(
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct MigrationMountV2 {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    native: Option<std::sync::Arc<polaris_mcp::NativeMountIdentityV2>>,
+}
+impl std::fmt::Debug for MigrationMountV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MigrationMountV2")
+    }
+}
+#[cfg(unix)]
+impl MigrationMountV2 {
+    fn inspect(file: &File, enabled: bool) -> Result<Self, ManagementEffectStoreError> {
+        if !enabled {
+            return Ok(Self::default());
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            Ok(Self {
+                native: Some(std::sync::Arc::new(management_native_mount(file)?)),
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = file;
+            Err(ManagementEffectStoreError::InvalidStore)
+        }
+    }
+    fn verify(&self, file: &File) -> Result<(), ManagementEffectStoreError> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(expected) = &self.native {
+            if management_native_mount(file)? != **expected {
+                return Err(ManagementEffectStoreError::InvalidStore);
+            }
+        }
+        let _ = file;
+        Ok(())
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(unix)]
+fn management_native_mount(
+    file: &File,
+) -> Result<polaris_mcp::NativeMountIdentityV2, ManagementEffectStoreError> {
+    #[cfg(test)]
+    let metadata = file.metadata()?;
+    #[cfg(test)]
+    if REJECT_MIGRATION_MOUNT.with(|slot| slot.get() == Some((metadata.dev(), metadata.ino()))) {
+        return Err(ManagementEffectStoreError::InvalidStore);
+    }
+    polaris_mcp::NativeMountIdentityV2::inspect(file)
+        .map_err(|_| ManagementEffectStoreError::InvalidStore)
+}
+#[cfg(unix)]
+fn management_stamp(meta: &fs::Metadata) -> (u64, u64, u32, u32, u64, u64, i64, i64, i64, i64) {
+    (
+        meta.dev(),
+        meta.ino(),
+        meta.uid(),
+        meta.mode(),
+        meta.nlink(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    )
+}
+#[cfg(all(test, unix))]
+thread_local! {
+    static REJECT_MIGRATION_MOUNT: std::cell::Cell<Option<(u64,u64)>> = const { std::cell::Cell::new(None) };
+    static BEFORE_MIGRATION_REFRESH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_MIGRATION_CENSUS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+#[cfg(unix)]
+fn management_migration_hook(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>,
+) {
+    if let Some(hook) = slot.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(unix)]
 fn management_file_bytes(file: &File, max: u64) -> Result<Vec<u8>, ManagementEffectStoreError> {
     use std::os::unix::fs::FileExt;
     let meta = file.metadata()?;
@@ -2426,17 +3056,29 @@ fn management_file_bytes(file: &File, max: u64) -> Result<Vec<u8>, ManagementEff
     let length = usize::try_from(meta.len()).map_err(|_| ManagementEffectStoreError::StoreFull)?;
     let mut data = vec![0; length];
     file.read_exact_at(&mut data, 0)?;
-    if file.metadata()?.len() != meta.len() {
+    if management_stamp(&file.metadata()?) != management_stamp(&meta) {
         return Err(ManagementEffectStoreError::InvalidStore);
     }
     Ok(data)
 }
 
+#[cfg(unix)]
 fn pin_management_file(
     parent: &File,
     name: &str,
     relative: &str,
     max: u64,
+) -> Result<PinnedManagementFileV1, ManagementEffectStoreError> {
+    pin_management_file_mounted(parent, name, relative, max, &MigrationMountV2::default())
+}
+
+#[cfg(unix)]
+fn pin_management_file_mounted(
+    parent: &File,
+    name: &str,
+    relative: &str,
+    max: u64,
+    migration_mount: &MigrationMountV2,
 ) -> Result<PinnedManagementFileV1, ManagementEffectStoreError> {
     let name = CString::new(name).map_err(|_| ManagementEffectStoreError::InvalidStore)?;
     let fd = unsafe {
@@ -2450,6 +3092,9 @@ fn pin_management_file(
         return Err(std::io::Error::last_os_error().into());
     }
     let file = unsafe { File::from_raw_fd(fd) };
+    migration_mount.verify(parent)?;
+    migration_mount.verify(&file)?;
+    let metadata = file.metadata()?;
     verify_management_entry(parent, &name, &file)?;
     let bytes = management_file_bytes(&file, max)?;
     let meta = file.metadata()?;
@@ -2466,14 +3111,22 @@ fn pin_management_file(
         file,
         evidence,
         bytes,
+        metadata,
+        migration_mount: migration_mount.clone(),
     };
     verify_management_file(&pinned)?;
     Ok(pinned)
 }
 
+#[cfg(unix)]
 fn verify_management_file(file: &PinnedManagementFileV1) -> Result<(), ManagementEffectStoreError> {
+    file.migration_mount.verify(&file.parent)?;
+    file.migration_mount.verify(&file.file)?;
     verify_management_entry(&file.parent, &file.name, &file.file)?;
     let meta = file.file.metadata()?;
+    if management_stamp(&meta) != management_stamp(&file.metadata) {
+        return Err(ManagementEffectStoreError::InvalidStore);
+    }
     let bytes = management_file_bytes(&file.file, file.evidence.length)?;
     if (meta.dev(), meta.ino()) != (file.evidence.device, file.evidence.inode)
         || bytes != file.bytes
@@ -2487,15 +3140,23 @@ fn verify_management_file(file: &PinnedManagementFileV1) -> Result<(), Managemen
 struct ManagementInventoryV1 {
     files: BTreeMap<String, PinnedManagementFileV1>,
     directories: BTreeMap<String, (u64, u64)>,
+    migration_directories: BTreeMap<String, (File, fs::Metadata)>,
+    #[cfg(all(test, windows))]
+    windows_directories: BTreeMap<String, ManagementDirectoryV1>,
 }
 
-fn management_inventory(
+#[cfg(unix)]
+fn management_inventory_mode(
     root: &File,
     limits: ManagementEffectLimitsV1,
+    migration_inspection: bool,
 ) -> Result<ManagementInventoryV1, ManagementEffectStoreError> {
     use crate::project_mutation::directory_names_bounded;
+    let mount = MigrationMountV2::inspect(root, migration_inspection)?;
+    let root_metadata = root.metadata()?;
     let mut files = BTreeMap::new();
     let mut directories = BTreeMap::new();
+    let mut migration_directories = BTreeMap::new();
     for name in directory_names_bounded(root, limits.max_records)? {
         let name = name
             .into_string()
@@ -2506,16 +3167,39 @@ fn management_inventory(
             "CURRENT" => 4096,
             "generations" => {
                 let generations = management_child_directory(root, &name)?;
+                mount.verify(&generations)?;
                 let meta = generations.metadata()?;
+                if migration_inspection {
+                    migration_directories
+                        .insert(name.clone(), (generations.try_clone()?, meta.clone()));
+                }
                 directories.insert(name.clone(), (meta.dev(), meta.ino()));
                 for number in directory_names_bounded(&generations, limits.max_records)? {
                     let number = number
                         .into_string()
                         .map_err(|_| ManagementEffectStoreError::InvalidStore)?;
-                    let decimal = number
-                        .strip_prefix(".seal-")
-                        .and_then(|n| n.strip_suffix(".v1.tmp"))
-                        .unwrap_or(&number);
+                    let orphan = if migration_inspection {
+                        number
+                            .strip_prefix(".orphan-")
+                            .and_then(|name| name.split_once('-'))
+                    } else {
+                        None
+                    };
+                    if let Some((_, suffix)) = orphan {
+                        if suffix
+                            .parse::<u64>()
+                            .ok()
+                            .is_none_or(|n| n.to_string() != suffix)
+                        {
+                            return Err(ManagementEffectStoreError::CorruptJournal);
+                        }
+                    }
+                    let decimal = orphan.map(|(number, _)| number).unwrap_or_else(|| {
+                        number
+                            .strip_prefix(".seal-")
+                            .and_then(|n| n.strip_suffix(".v1.tmp"))
+                            .unwrap_or(&number)
+                    });
                     let parsed = decimal
                         .parse::<u64>()
                         .map_err(|_| ManagementEffectStoreError::CorruptJournal)?;
@@ -2523,7 +3207,14 @@ fn management_inventory(
                         return Err(ManagementEffectStoreError::CorruptJournal);
                     }
                     let directory = management_child_directory(&generations, &number)?;
+                    mount.verify(&directory)?;
                     let meta = directory.metadata()?;
+                    if migration_inspection {
+                        migration_directories.insert(
+                            format!("generations/{number}"),
+                            (directory.try_clone()?, meta.clone()),
+                        );
+                    }
                     directories.insert(format!("generations/{number}"), (meta.dev(), meta.ino()));
                     for entry in directory_names_bounded(&directory, 4)? {
                         let entry = entry
@@ -2539,7 +3230,9 @@ fn management_inventory(
                         let relative = format!("generations/{number}/{entry}");
                         files.insert(
                             relative.clone(),
-                            pin_management_file(&directory, &entry, &relative, max)?,
+                            pin_management_file_mounted(
+                                &directory, &entry, &relative, max, &mount,
+                            )?,
                         );
                     }
                     verify_management_entry(
@@ -2566,11 +3259,38 @@ fn management_inventory(
             }
             _ => return Err(ManagementEffectStoreError::CorruptJournal),
         };
-        files.insert(name.clone(), pin_management_file(root, &name, &name, max)?);
+        files.insert(
+            name.clone(),
+            pin_management_file_mounted(root, &name, &name, max, &mount)?,
+        );
     }
-    Ok(ManagementInventoryV1 { files, directories })
+    #[cfg(test)]
+    if migration_inspection {
+        management_migration_hook(&AFTER_MIGRATION_CENSUS);
+    }
+    for file in files.values() {
+        verify_management_file(file)?;
+    }
+    mount.verify(root)?;
+    if migration_inspection
+        && management_stamp(&root.metadata()?) != management_stamp(&root_metadata)
+    {
+        return Err(ManagementEffectStoreError::InvalidStore);
+    }
+    for (file, metadata) in migration_directories.values() {
+        mount.verify(file)?;
+        if management_stamp(&file.metadata()?) != management_stamp(metadata) {
+            return Err(ManagementEffectStoreError::InvalidStore);
+        }
+    }
+    Ok(ManagementInventoryV1 {
+        files,
+        directories,
+        migration_directories,
+    })
 }
 
+#[cfg(any(unix, all(test, windows)))]
 fn event_from_snapshot(effect: &ManagementEffectSnapshotV1) -> ManagementEffectEventV1 {
     let operation_id = effect.request.operation_id;
     match effect.state {
@@ -2599,6 +3319,7 @@ fn event_from_snapshot(effect: &ManagementEffectSnapshotV1) -> ManagementEffectE
     }
 }
 
+#[cfg(any(unix, all(test, windows)))]
 fn ensure_cursor(
     state: &JournalStateV1,
     expected: ManagementEffectCursorV1,
@@ -2610,7 +3331,7 @@ fn ensure_cursor(
     }
 }
 
-fn validate_request_shape(
+pub(super) fn validate_request_shape(
     project_scope: ManagementEffectHashV1,
     request: &PrepareManagementEffectV1,
 ) -> Result<(), ManagementEffectStoreError> {
@@ -2651,7 +3372,7 @@ impl FieldPresenceV1 {
     }
 }
 
-fn validate_new_inventory_contract(
+pub(super) fn validate_new_inventory_contract(
     request: &PrepareManagementEffectV1,
 ) -> Result<(), ManagementEffectStoreError> {
     use FieldPresenceV1::{Forbidden, Optional, Required};
@@ -2709,6 +3430,7 @@ fn validate_new_inventory_contract(
     Ok(())
 }
 
+#[cfg(any(unix, all(test, windows)))]
 fn validate_evidence_hash(
     evidence_hash: ManagementEffectHashV1,
 ) -> Result<(), ManagementEffectStoreError> {
@@ -2719,6 +3441,7 @@ fn validate_evidence_hash(
     }
 }
 
+#[cfg(any(unix, all(test, windows)))]
 fn validate_limits(limits: ManagementEffectLimitsV1) -> Result<(), ManagementEffectStoreError> {
     if limits.max_journal_bytes == 0
         || limits.max_records == 0
@@ -2731,11 +3454,13 @@ fn validate_limits(limits: ManagementEffectLimitsV1) -> Result<(), ManagementEff
     Ok(())
 }
 
+#[cfg(unix)]
 fn canonical_project_root(project_root: &Path) -> Result<PathBuf, ManagementEffectStoreError> {
     let resolved = crate::project::resolve_root(project_root);
     Ok(fs::canonicalize(resolved)?)
 }
 
+#[cfg(unix)]
 fn ensure_private_directory(path: &Path) -> Result<(), ManagementEffectStoreError> {
     match fs::symlink_metadata(path) {
         Ok(_) => validate_private_directory(path),
@@ -2760,6 +3485,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), ManagementEffectStoreErro
     }
 }
 
+#[cfg(unix)]
 fn ensure_private_file(path: &Path) -> Result<(), ManagementEffectStoreError> {
     match fs::symlink_metadata(path) {
         Ok(_) => validate_private_file(path),
@@ -2790,6 +3516,7 @@ fn ensure_private_file(path: &Path) -> Result<(), ManagementEffectStoreError> {
     }
 }
 
+#[cfg(unix)]
 fn validate_private_directory(path: &Path) -> Result<(), ManagementEffectStoreError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink()
@@ -2802,6 +3529,7 @@ fn validate_private_directory(path: &Path) -> Result<(), ManagementEffectStoreEr
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_private_file(path: &Path) -> Result<(), ManagementEffectStoreError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink()
@@ -2815,6 +3543,7 @@ fn validate_private_file(path: &Path) -> Result<(), ManagementEffectStoreError> 
     Ok(())
 }
 
+#[cfg(unix)]
 fn open_journal(path: &Path, write: bool) -> Result<File, ManagementEffectStoreError> {
     validate_private_file(path)?;
     let mut options = OpenOptions::new();
@@ -2834,6 +3563,7 @@ fn open_journal(path: &Path, write: bool) -> Result<File, ManagementEffectStoreE
     Ok(file)
 }
 
+#[cfg(unix)]
 fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, ManagementEffectStoreError> {
     let file = open_journal(path, false)?;
     let length = file.metadata()?.len();
@@ -2848,6 +3578,7 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, ManagementEffectStoreE
     Ok(bytes)
 }
 
+#[cfg(any(unix, all(test, windows)))]
 fn complete_prefix_len(bytes: &[u8]) -> usize {
     if bytes.is_empty() || bytes.last() == Some(&b'\n') {
         bytes.len()
@@ -2859,7 +3590,715 @@ fn complete_prefix_len(bytes: &[u8]) -> usize {
     }
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), ManagementEffectStoreError> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
+
+impl ManagementEffectStoreV1 {
+    #[cfg(unix)]
+    pub fn rewind_checkpoint_for_project_at_state_dir(
+        project: &Path,
+        state_dir: &Path,
+        lease: &ProjectMutationLeaseV1,
+    ) -> Result<ManagementRewindCheckpointV1, ManagementEffectStoreError> {
+        let canonical = canonical_project_root(project)?;
+        let project_scope =
+            ManagementEffectHashV1::digest(canonical.as_os_str().as_encoded_bytes());
+        match Self::inspect_open_at_state_dir(project, state_dir, lease)? {
+            ManagementEffectInspectOpenV1::Absent => Ok(empty_rewind_checkpoint(project_scope)),
+            ManagementEffectInspectOpenV1::Present(inspected) => {
+                inspected.rewind_checkpoint_if_quiescent()
+            }
+        }
+    }
+
+    /// Historical proof only. A running input may already hold an activity
+    /// lease; it must not reacquire the exclusive project writer lease.
+    /// Shared activity does not authorize capture, restore or any mutation.
+    #[cfg(unix)]
+    pub fn verify_rewind_crossing_for_project_at_state_dir_with_activity(
+        project: &Path,
+        state_dir: &Path,
+        lease: &crate::project_mutation::ProjectActivityLeaseV1,
+        from: &ManagementRewindCheckpointV1,
+        through: &ManagementRewindCheckpointV1,
+    ) -> Result<ManagementRewindCrossingV1, ManagementEffectStoreError> {
+        let canonical = canonical_project_root(project)?;
+        let scope = ManagementEffectHashV1::digest(canonical.as_os_str().as_encoded_bytes());
+        match Self::inspect_named_at_lease_identity(
+            state_dir,
+            scope,
+            (lease.store_root(), lease.store_identity()),
+            ManagementEffectLimitsV1::default(),
+            false,
+            STORE_NAME,
+        )? {
+            ManagementEffectInspectOpenV1::Absent => {
+                let empty = empty_rewind_checkpoint(scope);
+                if *from != empty || *through != empty {
+                    return Err(ManagementEffectStoreError::CorruptJournal);
+                }
+                Ok(ManagementRewindCrossingV1::Clear)
+            }
+            ManagementEffectInspectOpenV1::Present(inspected) => {
+                inspected.verify_rewind_crossing(from, through, false)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn verify_rewind_crossing_for_project_at_state_dir(
+        project: &Path,
+        state_dir: &Path,
+        lease: &ProjectMutationLeaseV1,
+        from: &ManagementRewindCheckpointV1,
+        through: &ManagementRewindCheckpointV1,
+        require_current_head: bool,
+    ) -> Result<ManagementRewindCrossingV1, ManagementEffectStoreError> {
+        let canonical = canonical_project_root(project)?;
+        let project_scope =
+            ManagementEffectHashV1::digest(canonical.as_os_str().as_encoded_bytes());
+        match Self::inspect_open_at_state_dir(project, state_dir, lease)? {
+            ManagementEffectInspectOpenV1::Absent => {
+                let empty = empty_rewind_checkpoint(project_scope);
+                if *from != empty || *through != empty {
+                    return Err(ManagementEffectStoreError::CorruptJournal);
+                }
+                Ok(ManagementRewindCrossingV1::Clear)
+            }
+            ManagementEffectInspectOpenV1::Present(inspected) => {
+                inspected.verify_rewind_crossing(from, through, require_current_head)
+            }
+        }
+    }
+}
+#[cfg(unix)]
+fn empty_rewind_checkpoint(project: ManagementEffectHashV1) -> ManagementRewindCheckpointV1 {
+    ManagementRewindCheckpointV1 {
+        version: 1,
+        project,
+        cursor: ManagementEffectCursorV1 {
+            generation: 0,
+            chain_hash: ManagementEffectHashV1::zero(),
+            sequence: 0,
+            journal_hash: ManagementEffectHashV1::zero(),
+        },
+    }
+}
+impl ManagementEffectInspectV1 {
+    #[cfg(unix)]
+    pub fn rewind_checkpoint_if_quiescent(
+        &self,
+    ) -> Result<ManagementRewindCheckpointV1, ManagementEffectStoreError> {
+        self.verify_pins()?;
+        if self.tail != ManagementEffectTailV1::Complete
+            || self
+                .snapshots
+                .values()
+                .any(|effect| !effect.state.is_terminal())
+        {
+            return Err(ManagementEffectStoreError::CorruptJournal);
+        }
+        Ok(ManagementRewindCheckpointV1 {
+            version: 1,
+            project: self.store.project_scope,
+            cursor: self.cursor(),
+        })
+    }
+
+    #[cfg(unix)]
+    pub fn verify_rewind_crossing(
+        &self,
+        from: &ManagementRewindCheckpointV1,
+        through: &ManagementRewindCheckpointV1,
+        require_current_head: bool,
+    ) -> Result<ManagementRewindCrossingV1, ManagementEffectStoreError> {
+        self.verify_pins()?;
+        if self.tail != ManagementEffectTailV1::Complete
+            || from.version != 1
+            || through.version != 1
+            || from.project != self.store.project_scope
+            || through.project != self.store.project_scope
+            || (from.cursor.generation, from.cursor.sequence)
+                > (through.cursor.generation, through.cursor.sequence)
+            || (require_current_head && through.cursor != self.cursor())
+        {
+            return Err(ManagementEffectStoreError::CorruptJournal);
+        }
+        let chain =
+            self.store
+                .verified_generations_reading(|name, max| match self.files.get(name) {
+                    Some(file) if file.bytes.len() as u64 <= max => Ok(Some(file.bytes.clone())),
+                    Some(_) => Err(ManagementEffectStoreError::StoreFull),
+                    None => Ok(None),
+                })?;
+        let mut prepared_ids = std::collections::BTreeSet::new();
+        for active in &chain {
+            let name = if active.number == 0 {
+                JOURNAL_NAME.to_owned()
+            } else {
+                format!("generations/{}/{JOURNAL_NAME}", active.number)
+            };
+            let file = self
+                .files
+                .get(&name)
+                .ok_or(ManagementEffectStoreError::CorruptJournal)?;
+            let state = self.store.parse_journal_bytes(active, &file.bytes)?;
+            for event in state.events.values() {
+                if matches!(event.event, ManagementEffectEventV1::Prepared { .. })
+                    && !prepared_ids.insert(event.event.operation_id())
+                {
+                    return Err(ManagementEffectStoreError::CorruptJournal);
+                }
+            }
+        }
+        for checkpoint in [from, through] {
+            let active = chain
+                .iter()
+                .find(|active| active.number == checkpoint.cursor.generation)
+                .ok_or(ManagementEffectStoreError::CorruptJournal)?;
+            if checkpoint.cursor.chain_hash != active.chain_hash {
+                return Err(ManagementEffectStoreError::CorruptJournal);
+            }
+            let name = if active.number == 0 {
+                JOURNAL_NAME.to_owned()
+            } else {
+                format!("generations/{}/{JOURNAL_NAME}", active.number)
+            };
+            let file = self
+                .files
+                .get(&name)
+                .ok_or(ManagementEffectStoreError::CorruptJournal)?;
+            let full = self.store.parse_journal_bytes(active, &file.bytes)?;
+            let mut prefix = JournalStateV1 {
+                generation: active.number,
+                chain_hash: active.chain_hash,
+                effects: active.pending.clone(),
+                ..Default::default()
+            };
+            let count = usize::try_from(checkpoint.cursor.sequence)
+                .map_err(|_| ManagementEffectStoreError::CorruptJournal)?;
+            for event in full.events.values().take(count) {
+                prefix.apply_event(event.evidence.sequence, event.event.clone())?;
+                prefix.sequence = event.evidence.sequence;
+                prefix.journal_hash = event.evidence.event_hash;
+            }
+            if prefix.cursor() != checkpoint.cursor
+                || prefix
+                    .effects
+                    .values()
+                    .any(|effect| !effect.state.is_terminal())
+            {
+                return Err(ManagementEffectStoreError::CorruptJournal);
+            }
+        }
+        // The entire project journal participates, including session=None.
+        let lower = (from.cursor.generation, from.cursor.sequence);
+        let upper = (through.cursor.generation, through.cursor.sequence);
+        for (position, verified) in &self.events {
+            if *position <= lower
+                || *position > upper
+                || !matches!(
+                    verified.event,
+                    ManagementEffectEventV1::EffectStarted { .. }
+                )
+            {
+                continue;
+            }
+            let id = verified.event.operation_id();
+            let effect = self
+                .snapshots
+                .get(&id)
+                .ok_or(ManagementEffectStoreError::CorruptJournal)?;
+            if effect.request.rewind != ManagementRewindDispositionV1::CapturedRestorable {
+                return Ok(ManagementRewindCrossingV1::Blocked {
+                    operation_id: id,
+                    inventory: effect.request.inventory.clone(),
+                    rewind: effect.request.rewind,
+                    state: effect.state.clone(),
+                });
+            }
+        }
+        self.verify_pins()?;
+        Ok(ManagementRewindCrossingV1::Clear)
+    }
+}
+
+#[cfg(not(unix))]
+fn unsupported() -> ManagementEffectStoreError {
+    ManagementEffectStoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "management effect storage is unavailable on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+impl ManagementEffectStoreV1 {
+    #[cfg(not(all(test, windows)))]
+    pub fn inspect_open_at_state_dir(
+        _project_root: &Path,
+        _state_dir: &Path,
+        _lease: &ProjectMutationLeaseV1,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub(crate) fn inspect_open_with_read_lease(
+        _project: &Path,
+        _state: &Path,
+        _lease: crate::project_mutation::ProjectReadLeaseV1<'_>,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn inspect_retired_for_migration_at_state_dir(
+        _project_root: &Path,
+        _state_dir: &Path,
+        _migration_id: ManagementEffectHashV1,
+        _lease: &ProjectMutationLeaseV1,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn inspect_migration_history(
+        _state_dir: &Path,
+        _lease: &ProjectMutationLeaseV1,
+        _scope: Option<ManagementEffectHashV1>,
+    ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn open(
+        _project_root: &Path,
+        _lease: &ProjectMutationLeaseV1,
+    ) -> Result<Self, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn open_at_state_dir(
+        _project_root: &Path,
+        _state_dir: &Path,
+        _lease: &ProjectMutationLeaseV1,
+    ) -> Result<Self, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn capacity(&self) -> Result<ManagementEffectCapacityV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn cursor(&self) -> Result<ManagementEffectCursorV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn effects(&self) -> Result<Vec<ManagementEffectSnapshotV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn effects_page(
+        &self,
+        _expected: ManagementEffectCursorV1,
+        _archive_or_active: u64,
+        _after: Option<ManagementOperationIdV1>,
+        _limit: usize,
+    ) -> Result<Vec<ManagementEffectSnapshotV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn effect(
+        &self,
+        _operation_id: ManagementOperationIdV1,
+    ) -> Result<Option<ManagementEffectSnapshotV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn event_evidence(
+        &self,
+        _operation_id: ManagementOperationIdV1,
+        _expected_evidence: ManagementEffectEventEvidenceV1,
+        _expected_event: &ManagementEffectEventV1,
+    ) -> Result<Option<VerifiedManagementEffectEventV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn latest_event_evidence(
+        &self,
+        _operation_id: ManagementOperationIdV1,
+        _expected_snapshot: &ManagementEffectSnapshotV1,
+    ) -> Result<Option<VerifiedManagementEffectEventV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn blocker(
+        &self,
+    ) -> Result<Option<ManagementEffectSnapshotV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn prepared_effect(
+        &self,
+        _operation_id: ManagementOperationIdV1,
+    ) -> Result<Option<PreparedManagementEffectV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn unknown_effect(
+        &self,
+        _operation_id: ManagementOperationIdV1,
+    ) -> Result<Option<UnknownManagementEffectV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn prepare(
+        &self,
+        _lease: &ProjectMutationLeaseV1,
+        _expected: ManagementEffectCursorV1,
+        _request: PrepareManagementEffectV1,
+    ) -> Result<PrepareManagementEffectOutcomeV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn prepare_runtime(
+        &self,
+        _lease: &ProjectActivityLeaseV1,
+        _expected: ManagementEffectCursorV1,
+        _request: PrepareManagementEffectV1,
+    ) -> Result<PrepareManagementEffectOutcomeV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn deny(
+        &self,
+        _lease: &ProjectMutationLeaseV1,
+        _effect: &PreparedManagementEffectV1,
+        _reason: ManagementDenialReasonV1,
+    ) -> Result<DeniedManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn deny_runtime(
+        &self,
+        _lease: &ProjectActivityLeaseV1,
+        _effect: &PreparedManagementEffectV1,
+        _reason: ManagementDenialReasonV1,
+    ) -> Result<DeniedManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn start(
+        &self,
+        _lease: &ProjectMutationLeaseV1,
+        _effect: &PreparedManagementEffectV1,
+    ) -> Result<StartedManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn start_runtime(
+        &self,
+        _lease: &ProjectActivityLeaseV1,
+        _effect: &PreparedManagementEffectV1,
+    ) -> Result<StartedManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn complete_started(
+        &self,
+        _lease: &ProjectMutationLeaseV1,
+        _effect: &StartedManagementEffectV1,
+        _evidence_hash: ManagementEffectHashV1,
+    ) -> Result<CompletedManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn complete_started_runtime(
+        &self,
+        _lease: &ProjectActivityLeaseV1,
+        _effect: &StartedManagementEffectV1,
+        _evidence_hash: ManagementEffectHashV1,
+    ) -> Result<CompletedManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn mark_outcome_unknown(
+        &self,
+        _lease: &ProjectMutationLeaseV1,
+        _effect: &StartedManagementEffectV1,
+        _reason: ManagementUnknownReasonV1,
+    ) -> Result<UnknownManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn mark_outcome_unknown_runtime(
+        &self,
+        _lease: &ProjectActivityLeaseV1,
+        _effect: &StartedManagementEffectV1,
+        _reason: ManagementUnknownReasonV1,
+    ) -> Result<UnknownManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn complete_unknown(
+        &self,
+        _lease: &ProjectMutationLeaseV1,
+        _effect: &UnknownManagementEffectV1,
+        _evidence_hash: ManagementEffectHashV1,
+    ) -> Result<CompletedManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn reconcile_abandon(
+        &self,
+        _lease: &ProjectMutationLeaseV1,
+        _effect: &UnknownManagementEffectV1,
+        _evidence_hash: ManagementEffectHashV1,
+    ) -> Result<AbandonedManagementEffectV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn rewind_checkpoint_for_project_at_state_dir(
+        _project: &Path,
+        _state_dir: &Path,
+        _lease: &ProjectMutationLeaseV1,
+    ) -> Result<ManagementRewindCheckpointV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn verify_rewind_crossing_for_project_at_state_dir_with_activity(
+        _project: &Path,
+        _state_dir: &Path,
+        _lease: &crate::project_mutation::ProjectActivityLeaseV1,
+        _from: &ManagementRewindCheckpointV1,
+        _through: &ManagementRewindCheckpointV1,
+    ) -> Result<ManagementRewindCrossingV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn verify_rewind_crossing_for_project_at_state_dir(
+        _project: &Path,
+        _state_dir: &Path,
+        _lease: &ProjectMutationLeaseV1,
+        _from: &ManagementRewindCheckpointV1,
+        _through: &ManagementRewindCheckpointV1,
+        _require_current_head: bool,
+    ) -> Result<ManagementRewindCrossingV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+}
+
+#[cfg(not(unix))]
+impl ManagementEffectInspectV1 {
+    pub(crate) fn fresh_admission_limits(
+        &self,
+    ) -> Result<(u64, u64, u64), ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn root_identity(&self) -> Result<(u64, u64), ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn latest_event_evidence(
+        &self,
+        _operation_id: ManagementOperationIdV1,
+        _expected_snapshot: &ManagementEffectSnapshotV1,
+    ) -> Result<Option<VerifiedManagementEffectEventV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub fn event_evidence(
+        &self,
+        _operation_id: ManagementOperationIdV1,
+        _expected: ManagementEffectEventEvidenceV1,
+        _event: &ManagementEffectEventV1,
+    ) -> Result<Option<VerifiedManagementEffectEventV1>, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    #[cfg(not(all(test, windows)))]
+    pub(crate) fn verify_read_snapshot(&self) -> Result<(), ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn rebind_retired_for_migration(
+        self,
+        _state_directory: &File,
+        _migration_id: ManagementEffectHashV1,
+    ) -> Result<Self, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn rewind_checkpoint_if_quiescent(
+        &self,
+    ) -> Result<ManagementRewindCheckpointV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+
+    pub fn verify_rewind_crossing(
+        &self,
+        _from: &ManagementRewindCheckpointV1,
+        _through: &ManagementRewindCheckpointV1,
+        _require_current_head: bool,
+    ) -> Result<ManagementRewindCrossingV1, ManagementEffectStoreError> {
+        Err(unsupported())
+    }
+}
+
+#[cfg(any(unix, all(test, windows)))]
+impl ManagementEffectStoreV1 {
+    fn m_open(
+        &self,
+        path: &Path,
+        write: bool,
+    ) -> Result<ManagementJournalFileV1, ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            open_journal(path, write)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_open(path, write)
+        }
+    }
+    fn m_read(&self, path: &Path, max: u64) -> Result<Vec<u8>, ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            read_bounded(path, max)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_read(path, max)
+        }
+    }
+    fn m_bounded(&self, path: &Path, max: u64) -> Result<Vec<u8>, ManagementEffectStoreError> {
+        self.m_read(path, max).map_err(|error| match error {
+            ManagementEffectStoreError::StoreFull => ManagementEffectStoreError::CorruptJournal,
+            other => other,
+        })
+    }
+    fn m_validate_directory(&self, path: &Path) -> Result<(), ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            validate_private_directory(path)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_directory(path)
+        }
+    }
+    fn m_validate_file(&self, path: &Path) -> Result<(), ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            validate_private_file(path)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_open(path, false).map(|_| ())
+        }
+    }
+    fn m_ensure_directory(&self, path: &Path) -> Result<(), ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            ensure_private_directory(path)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_ensure(path)
+        }
+    }
+    fn m_length(&self, path: impl AsRef<Path>) -> Result<u64, ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            Ok(fs::symlink_metadata(path)?.len())
+        }
+        #[cfg(all(test, windows))]
+        {
+            Ok(self.w_open(path.as_ref(), false)?.metadata()?.len())
+        }
+    }
+    fn m_sync(&self, path: &Path) -> Result<(), ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            sync_directory(path)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_sync(path)
+        }
+    }
+    fn m_write_new(&self, path: &Path, bytes: &[u8]) -> Result<(), ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            generation::write_new(path, bytes)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_write_new(path, bytes)
+        }
+    }
+    fn m_directory_present(&self, path: &Path) -> Result<bool, ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            match fs::symlink_metadata(path) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_present(path)
+        }
+    }
+    fn m_rename_directory(
+        &self,
+        source: &Path,
+        target: &Path,
+    ) -> Result<(), ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            fs::rename(source, target).map_err(Into::into)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_rename(source, target)
+        }
+    }
+    fn m_replace(&self, source: &Path, target: &Path) -> Result<(), ManagementEffectStoreError> {
+        #[cfg(unix)]
+        {
+            fs::rename(source, target).map_err(Into::into)
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.w_replace(source, target)
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests;

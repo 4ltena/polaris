@@ -1,17 +1,26 @@
 //! Loopback runtime ownership, bounded catalog selection and durable dispatch.
+#[cfg(unix)]
 use super::test_fixture as fixture;
 use super::*;
-use crate::{
-    approval::ApprovalPolicy, execution_owner::RunExecution, mcp::operation::ExternalCeiling,
-};
+use crate::mcp::operation::ExternalCeiling;
+#[cfg(unix)]
+use crate::{approval::ApprovalPolicy, execution_owner::RunExecution};
+#[cfg(unix)]
 use polaris_desktop_protocol::{ids::*, request::RunTarget};
+#[cfg(unix)]
 use polaris_mcp::catalog::Kind;
+#[cfg(unix)]
 use serde_json::json;
-use std::{future::pending, sync::atomic::AtomicBool, time::Duration};
+use std::time::Duration;
+#[cfg(unix)]
+use std::{future::pending, sync::atomic::AtomicBool};
+#[cfg(unix)]
 mod budget;
+#[cfg(unix)]
 mod prompt;
 mod retry;
 
+#[cfg(unix)]
 fn read_call(runtime: &RunRuntime, template: bool) -> ToolCall {
     let entry = &runtime.connections[0];
     let catalog = entry.connection.catalog(1).unwrap();
@@ -27,6 +36,7 @@ fn read_call(runtime: &RunRuntime, template: bool) -> ToolCall {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn resource_and_template_read_use_capability_without_a_tool_approval_and_reopen_once() {
     for template in [false, true] {
@@ -111,6 +121,7 @@ async fn resource_and_template_read_use_capability_without_a_tool_approval_and_r
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn disabled_read_capability_cannot_be_supplied_by_meta_arguments() {
     let (mut server, methods, fixture) = fixture::server_fixture("").await;
@@ -139,6 +150,7 @@ async fn disabled_read_capability_cannot_be_supplied_by_meta_arguments() {
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn resource_read_drop_after_send_is_unknown_and_never_replayed() {
     use polaris_desktop_protocol::run_state::Observation;
@@ -207,6 +219,7 @@ async fn resource_read_drop_after_send_is_unknown_and_never_replayed() {
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn dedicated_check_projects_one_server_catalog_without_selection_or_calls() {
     let (server, methods, fixture) = fixture::server_fixture("").await;
@@ -235,6 +248,7 @@ async fn dedicated_check_projects_one_server_catalog_without_selection_or_calls(
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn preselection_is_rematched_per_request_and_changed_items_are_dropped() {
     let (server, methods, fixture) = fixture::server_fixture("").await;
@@ -272,6 +286,7 @@ async fn preselection_is_rematched_per_request_and_changed_items_are_dropped() {
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 async fn pick_for(config: &RuntimeConfig, server: &str) -> crate::mcp::preselection::Pick {
     let (_t, _o, port) = owner();
     let mut probe = RunRuntime::new(config.clone(), port).unwrap();
@@ -285,6 +300,7 @@ async fn pick_for(config: &RuntimeConfig, server: &str) -> crate::mcp::preselect
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn an_expired_unreachable_preselected_server_leaves_only_that_request() {
     let (first, _methods, first_task) = fixture::server_fixture("").await;
@@ -325,9 +341,11 @@ async fn an_expired_unreachable_preselected_server_leaves_only_that_request() {
     let _ = first_task.await;
 }
 
+#[cfg(unix)]
 fn owner() -> (RunTarget, RunExecution, McpPort) {
     owner_with_policy(ExternalCeiling::Allowed, ApprovalPolicy::Always)
 }
+#[cfg(unix)]
 fn owner_with_policy(
     ceiling: ExternalCeiling,
     policy: ApprovalPolicy,
@@ -362,6 +380,7 @@ fn config(servers: Vec<Server>) -> RuntimeConfig {
     .unwrap()
 }
 
+#[cfg(unix)]
 fn choose(runtime: &mut RunRuntime, server: &str) {
     let found = runtime
         .candidates("fixture", Some(server), "implement")
@@ -381,22 +400,46 @@ fn choose(runtime: &mut RunRuntime, server: &str) {
 
 #[tokio::test]
 async fn configuration_is_pure_and_rejects_unbound_or_missing_secret_before_connection() {
+    #[cfg(unix)]
     let (server, methods, fixture) = fixture::server_fixture("").await;
+    #[cfg(not(unix))]
+    let server = Server {
+        server_id: "fixture".into(),
+        enabled_projects: BTreeSet::from(["project".into()]),
+        transport: Destination::StreamableHttp {
+            url: "http://127.0.0.1:9/mcp".into(),
+            secret_headers: BTreeMap::new(),
+        },
+        protocol_profile: Default::default(),
+        capabilities: polaris_mcp::registration::Capabilities {
+            catalog_metadata: true,
+            ..Default::default()
+        },
+        timeouts: Default::default(),
+    };
+    #[cfg(unix)]
     let (_, _owner, port) = owner();
+    #[cfg(not(unix))]
+    let port = McpPort::local("session", "run", "attempt", ExternalCeiling::Denied);
     let mut runtime = RunRuntime::new(config(vec![server.clone()]), port).unwrap();
+    #[cfg(unix)]
     assert!(methods.lock().unwrap().is_empty());
     assert!(runtime.connections.is_empty());
     assert_eq!(runtime.server_ids(), vec!["fixture"]);
-    assert!(matches!(
-        runtime.ensure_catalog("unregistered", pending()).await,
-        Err(Error::Transport(polaris_mcp::Error::Auth))
-    ));
-    assert!(matches!(
-        runtime
-            .ensure_catalog("fixture", std::future::ready(()))
-            .await,
-        Err(Error::Owner(McpCallError::Cancelled))
-    ));
+    #[cfg(unix)]
+    {
+        assert!(matches!(
+            runtime.ensure_catalog("unregistered", pending()).await,
+            Err(Error::Transport(polaris_mcp::Error::Auth))
+        ));
+        assert!(matches!(
+            runtime
+                .ensure_catalog("fixture", std::future::ready(()))
+                .await,
+            Err(Error::Owner(McpCallError::Cancelled))
+        ));
+    }
+    #[cfg(unix)]
     assert!(methods.lock().unwrap().is_empty());
     let mut secret_server = server.clone();
     if let Destination::StreamableHttp { secret_headers, .. } = &mut secret_server.transport {
@@ -419,10 +462,14 @@ async fn configuration_is_pure_and_rejects_unbound_or_missing_secret_before_conn
     disabled.enabled_projects = BTreeSet::from(["another-project".into()]);
     assert!(config(vec![disabled]).server_ids().is_empty());
     runtime.shutdown().await.unwrap();
-    fixture.abort();
-    let _ = fixture.await;
+    #[cfg(unix)]
+    {
+        fixture.abort();
+        let _ = fixture.await;
+    }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn metadata_uses_the_tool_permit_and_cancelled_loading_is_never_retried() {
     let (server, methods, fixture) = fixture::server_fixture("tools/list").await;
@@ -467,6 +514,7 @@ async fn metadata_uses_the_tool_permit_and_cancelled_loading_is_never_retried() 
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn abandoned_initialize_retains_connection_for_outer_shutdown() {
     let (server, methods, fixture) = fixture::server_fixture("server/discover").await;
@@ -498,6 +546,7 @@ async fn abandoned_initialize_retains_connection_for_outer_shutdown() {
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn four_connection_limit_preserves_current_and_pending_selection_then_allows_explicit_discovery()
  {
@@ -562,6 +611,7 @@ async fn four_connection_limit_preserves_current_and_pending_selection_then_allo
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn failed_request_view_consumes_selection_and_never_restores_it() {
     let (server, _, fixture) = fixture::server_fixture("").await;
@@ -579,6 +629,7 @@ async fn failed_request_view_consumes_selection_and_never_restores_it() {
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn panic_boundary_keeps_runtime_owned_until_shutdown() {
     let (server, _, fixture) = fixture::server_fixture("").await;
@@ -599,6 +650,7 @@ async fn panic_boundary_keeps_runtime_owned_until_shutdown() {
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_previous_request_snapshot_is_rejected_before_approval_or_traffic() {
     let (server, methods, fixture) = fixture::server_fixture("").await;
@@ -626,6 +678,7 @@ async fn a_previous_request_snapshot_is_rejected_before_approval_or_traffic() {
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 fn store(
     target: &RunTarget,
 ) -> (
@@ -634,6 +687,7 @@ fn store(
 ) {
     store_with_prompt(target, None)
 }
+#[cfg(unix)]
 fn store_with_prompt(
     target: &RunTarget,
     mcp_prompt: Option<polaris_desktop_protocol::request::McpPromptChoice>,
@@ -688,6 +742,7 @@ fn store_with_prompt(
     (root, writer)
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn runtime_dispatch_waits_for_approval_and_returns_the_exact_durable_result_once() {
     use polaris_desktop_protocol::{request::*, snapshot::ApprovalDecision};
@@ -779,6 +834,7 @@ async fn runtime_dispatch_waits_for_approval_and_returns_the_exact_durable_resul
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn resource_intent_ack_fault_never_grants_or_sends_the_read() {
     for point in ["raw_sync", "marker_rename", "directory_sync"] {
@@ -847,11 +903,13 @@ async fn resource_intent_ack_fault_never_grants_or_sends_the_read() {
     }
 }
 
+#[cfg(unix)]
 struct Answers {
     decision: crate::approval::Decision,
     asked: Vec<String>,
 }
 
+#[cfg(unix)]
 impl crate::approval::Approver for Answers {
     fn ask(&mut self, reason: &str) -> crate::approval::Decision {
         self.asked.push(reason.into());
@@ -859,6 +917,7 @@ impl crate::approval::Approver for Answers {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn local_runtime_asks_the_gate_for_the_exact_operation_and_sends_once() {
     use crate::approval::{Decision, Gate};
@@ -939,6 +998,7 @@ async fn local_runtime_asks_the_gate_for_the_exact_operation_and_sends_once() {
     let _ = fixture.await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn preselection_keeps_three_picks_and_room_for_one_explicit_selection() {
     let mut servers = Vec::new();

@@ -215,6 +215,7 @@ fn age(path: &std::path::Path, hours_ago: u64) {
 
 /// Measuring reaches into subdirectories and reports what the decision needs.
 #[test]
+#[cfg(unix)]
 fn measuring_walks_the_tree_and_reads_age_and_links() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("deps")).unwrap();
@@ -242,6 +243,7 @@ fn measuring_walks_the_tree_and_reads_age_and_links() {
 
 /// The whole thing, on a real directory.
 #[test]
+#[cfg(unix)]
 fn a_sweep_removes_the_oldest_and_says_what_it_did() {
     let dir = tempfile::tempdir().unwrap();
     for (name, hours) in [("old", 99), ("older", 200), ("fresh", 1)] {
@@ -270,6 +272,7 @@ fn a_sweep_removes_the_oldest_and_says_what_it_did() {
 /// When everything left is in use, the sweep says so rather than reporting
 /// a success it did not have.
 #[test]
+#[cfg(unix)]
 fn a_sweep_that_cannot_reach_the_cap_reports_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("held"), vec![0; 1_000]).unwrap();
@@ -287,6 +290,7 @@ fn a_sweep_that_cannot_reach_the_cap_reports_it() {
 
 /// Nothing configured means nothing is touched, whatever is in the directory.
 #[test]
+#[cfg(unix)]
 fn a_sweep_without_a_cap_touches_nothing() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("big"), vec![0; 10_000]).unwrap();
@@ -303,6 +307,7 @@ fn a_sweep_without_a_cap_touches_nothing() {
 /// tested directly: what the plan named must still be a lone, old, ordinary
 /// file at the moment it is removed.
 #[test]
+#[cfg(unix)]
 fn the_recheck_refuses_anything_that_changed_since_it_was_measured() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("artefact");
@@ -377,6 +382,7 @@ fn the_swept_directory_is_target_unless_the_project_names_another() {
 /// The share needs a real total. An unreadable one drops the share rather
 /// than deleting against a number nobody measured.
 #[test]
+#[cfg(unix)]
 fn the_filesystem_total_is_read_or_the_share_is_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let total = filesystem_bytes(dir.path()).expect("a real filesystem");
@@ -385,7 +391,10 @@ fn the_filesystem_total_is_read_or_the_share_is_dropped() {
         filesystem_bytes(std::path::Path::new("/does/not/exist")),
         None
     );
+}
 
+#[test]
+fn an_unknown_filesystem_total_is_distinct_from_zero() {
     // A share of an unknown total is no cap at all. Reading it as zero would
     // make the smaller-wins rule choose it and empty the directory — the
     // exact opposite of what a share is written to do.
@@ -402,4 +411,82 @@ fn the_filesystem_total_is_read_or_the_share_is_dropped() {
     assert_eq!(both.effective(None), Some(1_000));
     // A genuinely empty filesystem is a different thing from an unknown one.
     assert_eq!(share_only.effective(Some(0)), Some(0));
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_build_cache_unavailable_capacity_is_unknown() {
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(filesystem_bytes(root.path()), None);
+    assert_eq!(filesystem_bytes(&root.path().join("absent")), None);
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_build_cache_unavailable_refuses_before_root_lookup() {
+    let root = tempfile::tempdir().unwrap();
+    let absent = root.path().join("absent");
+    assert_eq!(
+        measure(&absent, NOW).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        sweep(&absent, Cap::default(), Some(1_000), NOW)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert!(!absent.exists());
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_build_cache_unavailable_preserves_aged_tree_for_every_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("old.rlib");
+    let nested = root.path().join("deps");
+    let deep = nested.join("older.rlib");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(&artifact, b"old\0\xffcache").unwrap();
+    std::fs::write(&deep, b"nested\0\xffcache").unwrap();
+    age(&artifact, 99);
+    age(&deep, 200);
+    let names = |directory: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before_root = names(root.path());
+    let before_nested = names(&nested);
+    let before_artifact = std::fs::read(&artifact).unwrap();
+    let before_deep = std::fs::read(&deep).unwrap();
+    for cap in [
+        Cap::OFF,
+        Cap {
+            bytes: Some(0),
+            percent: None,
+        },
+        Cap {
+            bytes: Some(5),
+            percent: Some(20),
+        },
+    ] {
+        assert_eq!(
+            measure(root.path(), NOW).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            sweep(root.path(), cap, Some(1_000), NOW)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(names(root.path()), before_root);
+        assert_eq!(names(&nested), before_nested);
+        assert_eq!(std::fs::read(&artifact).unwrap(), before_artifact);
+        assert_eq!(std::fs::read(&deep).unwrap(), before_deep);
+    }
 }

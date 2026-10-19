@@ -382,6 +382,11 @@ mod tests {
     impl CapacityFixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
+            fs::set_permissions(
+                temp.path(),
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .unwrap();
             let project = temp.path().join("project");
             let data_root = temp.path().join("data");
             fs::create_dir(&project).unwrap();

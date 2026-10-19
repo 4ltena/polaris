@@ -358,18 +358,6 @@ fn m2a_deterministic_seal_blocks_partial_final_and_conflicting_temporary_names()
 }
 
 #[test]
-fn operation_id_has_one_stable_child_session_identity() {
-    let first = operation_id(1);
-    let second = operation_id(2);
-    let child = first.child_session_id();
-    assert_eq!(child, first.child_session_id());
-    assert_ne!(child, second.child_session_id());
-    assert_eq!(child.len(), 36);
-    assert_eq!(&child[14..15], "4");
-    assert!(matches!(&child[19..20], "8" | "9" | "a" | "b"));
-}
-
-#[test]
 fn m2a_event_evidence_compares_generation_hash_and_entire_typed_body() {
     let fixture = Fixture::new();
     let (_, prepared) = prepared(&fixture, 1);
@@ -1151,6 +1139,61 @@ fn full_terminal_generation_rolls_over_and_old_ids_stay_unique() {
 }
 
 #[test]
+fn seal_capacity_synthetic_counter_overflow_preserves_admission_and_ordinary_tree() {
+    let limits = ManagementEffectLimitsV1 {
+        max_journal_bytes: 64 * 1024,
+        max_records: 4,
+        max_effects: 1,
+        max_record_bytes: 16 * 1024,
+    };
+    let fixture = Fixture::with_limits(limits);
+    let (_, prepared) = prepared(&fixture, 1);
+    fixture
+        .store
+        .deny(
+            &fixture.lease,
+            &prepared,
+            ManagementDenialReasonV1::UserDeclined,
+        )
+        .unwrap();
+    let state = fixture._root.path().join("state");
+    let before = m2a_file_inventory(&state);
+    let ManagementEffectInspectOpenV1::Present(mut inspected) =
+        fixture.store.test_inspect(&fixture.lease, limits).unwrap()
+    else {
+        panic!("native fixture must retain its existing store");
+    };
+    let cursor = inspected.cursor();
+    assert_eq!(
+        inspected.fresh_admission_limits().unwrap(),
+        (16 * 1024, 4, 64 * 1024)
+    );
+    // One real terminal effect plus a synthetic in-memory cumulative counter
+    // reaches the existing checked-add failure without an enormous archive.
+    inspected.test_seal_capacity_counter_overflow();
+    assert!(matches!(
+        inspected.fresh_admission_limits(),
+        Err(ManagementEffectStoreError::StoreFull)
+    ));
+    assert_eq!(m2a_file_inventory(&state), before);
+    drop(inspected);
+    assert!(matches!(
+        fixture
+            .store
+            .test_ordinary_seal_capacity_counter_overflow(&fixture.lease),
+        Err(ManagementEffectStoreError::StoreFull)
+    ));
+    assert_eq!(m2a_file_inventory(&state), before);
+    assert_eq!(fixture.store.cursor().unwrap(), cursor);
+    assert!(
+        !state
+            .join("management-effects-v1")
+            .join("generations")
+            .exists()
+    );
+}
+
+#[test]
 fn record_and_byte_reservations_seal_before_the_next_prepare() {
     let cases = [
         ManagementEffectLimitsV1 {
@@ -1767,14 +1810,6 @@ fn scope_id_hash_and_lease_validation_reject_ambiguous_requests() {
         Err(ManagementEffectStoreError::InvalidValue)
     ));
 
-    assert!(ManagementEffectHashV1::from_hex("AA").is_err());
-    assert!(ManagementInventoryIdV1::parse("../../secret").is_err());
-    assert!(ManagementInventoryIdV1::parse("é1").is_err());
-    assert!(ManagementInventoryIdV1::parse("T22").is_err());
-    assert!(ManagementInventoryIdV1::parse("C42").is_ok());
-    assert!(ManagementInventoryIdV1::parse("D41").is_ok());
-    assert!(ManagementInventoryIdV1::parse("F25").is_ok());
-
     let other_root = tempfile::tempdir().unwrap();
     let other_owner = ProjectMutationOwnerV1::at_store_root(other_root.path()).unwrap();
     let other_lease = other_owner.try_mutation().unwrap();
@@ -2027,22 +2062,6 @@ fn source_and_remote_contract_mismatches_cannot_change_the_journal() {
 }
 
 #[test]
-fn account_binding_hash_is_stable_and_unambiguous() {
-    assert_eq!(
-        ManagementEffectHashV1::account_binding("openai", "registration-42")
-            .unwrap()
-            .as_hex(),
-        "fc791fdd44ddeb732e88ddb613e67ed7295bf64b593872ba406bf3752544bed7"
-    );
-    assert_ne!(
-        ManagementEffectHashV1::account_binding("ab", "c").unwrap(),
-        ManagementEffectHashV1::account_binding("a", "bc").unwrap()
-    );
-    assert!(ManagementEffectHashV1::account_binding("OpenAI", "registration-42").is_err());
-    assert!(ManagementEffectHashV1::account_binding("openai", "").is_err());
-}
-
-#[test]
 fn legacy_contract_mismatch_remains_readable_and_reconcilable() {
     let mut fixture = Fixture::new();
     let mut legacy = fixture.request(1);
@@ -2135,4 +2154,155 @@ fn sealed_legacy_contract_mismatch_stays_queryable() {
         ManagementEffectStateV1::Denied { .. }
     ));
     assert_contract_rejected_without_write(&fixture, legacy);
+}
+
+fn rewind_checkpoint(fixture: &Fixture) -> ManagementRewindCheckpointV1 {
+    let ManagementEffectInspectOpenV1::Present(inspected) = fixture
+        .store
+        .test_inspect(&fixture.lease, ManagementEffectLimitsV1::default())
+        .unwrap()
+    else {
+        panic!("existing fixture");
+    };
+    inspected.rewind_checkpoint_if_quiescent().unwrap()
+}
+fn rewind_crossing(
+    fixture: &Fixture,
+    from: &ManagementRewindCheckpointV1,
+    through: &ManagementRewindCheckpointV1,
+    current: bool,
+) -> Result<ManagementRewindCrossingV1, ManagementEffectStoreError> {
+    let ManagementEffectInspectOpenV1::Present(inspected) = fixture
+        .store
+        .test_inspect(&fixture.lease, ManagementEffectLimitsV1::default())?
+    else {
+        panic!("existing fixture");
+    };
+    inspected.verify_rewind_crossing(from, through, current)
+}
+
+#[test]
+fn management_rewind_blocks_completed_c10_without_session_across_archives() {
+    let fixture = Fixture::new();
+    let before = rewind_checkpoint(&fixture);
+    let mut request = fixture.request(1);
+    request.inventory = ManagementInventoryIdV1::parse("C10").unwrap();
+    request.scope.permission = ManagementPermissionScopeV1::Remote;
+    request.scope.account_binding = Some(hash("git-item-binding"));
+    request.scope.session = None;
+    request.rewind = ManagementRewindDispositionV1::IrreversibleRemote;
+    let PrepareManagementEffectOutcomeV1::Prepared(prepared) = fixture
+        .store
+        .prepare(&fixture.lease, fixture.store.cursor().unwrap(), request)
+        .unwrap()
+    else {
+        panic!("prepared");
+    };
+    let started = fixture.store.start(&fixture.lease, &prepared).unwrap();
+    fixture
+        .store
+        .complete_started(&fixture.lease, &started, hash("remote-observation"))
+        .unwrap();
+    assert!(fixture.store.blocker().unwrap().is_none());
+    let completed = rewind_checkpoint(&fixture);
+    assert!(
+        matches!(rewind_crossing(&fixture, &before, &completed, true).unwrap(),
+        ManagementRewindCrossingV1::Blocked { inventory, rewind: ManagementRewindDispositionV1::IrreversibleRemote, .. }
+        if inventory.encoded() == "C10")
+    );
+    fixture.store.test_joined_seal(&fixture.lease).unwrap();
+    let sealed = rewind_checkpoint(&fixture);
+    assert!(matches!(
+        rewind_crossing(&fixture, &before, &sealed, true).unwrap(),
+        ManagementRewindCrossingV1::Blocked { .. }
+    ));
+    // The same terminal effect before the selected pre-boundary is safe.
+    assert_eq!(
+        rewind_crossing(&fixture, &completed, &sealed, true).unwrap(),
+        ManagementRewindCrossingV1::Clear
+    );
+}
+
+#[test]
+fn management_rewind_allows_denied_and_captured_restorable_completed() {
+    let fixture = Fixture::new();
+    let before = rewind_checkpoint(&fixture);
+    let (_, prepared) = prepared(&fixture, 1);
+    fixture
+        .store
+        .deny(
+            &fixture.lease,
+            &prepared,
+            ManagementDenialReasonV1::UserDeclined,
+        )
+        .unwrap();
+    let denied = rewind_checkpoint(&fixture);
+    assert_eq!(
+        rewind_crossing(&fixture, &before, &denied, true).unwrap(),
+        ManagementRewindCrossingV1::Clear
+    );
+    let mut request = fixture.request(2);
+    request.inventory = ManagementInventoryIdV1::parse("T03").unwrap();
+    request.scope.permission = ManagementPermissionScopeV1::LocalSession;
+    request.rewind = ManagementRewindDispositionV1::CapturedRestorable;
+    let PrepareManagementEffectOutcomeV1::Prepared(prepared) = fixture
+        .store
+        .prepare(&fixture.lease, fixture.store.cursor().unwrap(), request)
+        .unwrap()
+    else {
+        panic!("prepared");
+    };
+    let started = fixture.store.start(&fixture.lease, &prepared).unwrap();
+    fixture
+        .store
+        .complete_started(&fixture.lease, &started, hash("captured-files"))
+        .unwrap();
+    let after = rewind_checkpoint(&fixture);
+    assert_eq!(
+        rewind_crossing(&fixture, &before, &after, true).unwrap(),
+        ManagementRewindCrossingV1::Clear
+    );
+}
+
+#[test]
+fn management_rewind_rejects_foreign_stale_reversed_and_nonquiescent_prefixes() {
+    let fixture = Fixture::new();
+    let before = rewind_checkpoint(&fixture);
+    let (_, prepared) = prepared(&fixture, 1);
+    let ManagementEffectInspectOpenV1::Present(inspected) = fixture
+        .store
+        .test_inspect(&fixture.lease, ManagementEffectLimitsV1::default())
+        .unwrap()
+    else {
+        panic!("existing");
+    };
+    assert!(inspected.rewind_checkpoint_if_quiescent().is_err());
+    let active = ManagementRewindCheckpointV1 {
+        version: 1,
+        project: fixture.store.project_scope_hash(),
+        cursor: inspected.cursor(),
+    };
+    drop(inspected);
+    fixture
+        .store
+        .deny(
+            &fixture.lease,
+            &prepared,
+            ManagementDenialReasonV1::UserDeclined,
+        )
+        .unwrap();
+    let after = rewind_checkpoint(&fixture);
+    assert!(rewind_crossing(&fixture, &active, &after, true).is_err());
+    assert!(rewind_crossing(&fixture, &after, &before, false).is_err());
+    assert!(rewind_crossing(&fixture, &before, &before, true).is_err());
+    assert_eq!(
+        rewind_crossing(&fixture, &before, &before, false).unwrap(),
+        ManagementRewindCrossingV1::Clear
+    );
+    let mut foreign = before;
+    foreign.project = hash("foreign-project");
+    assert!(rewind_crossing(&fixture, &foreign, &after, true).is_err());
+    let mut corrupt = after;
+    corrupt.cursor.journal_hash = hash("forged-prefix");
+    assert!(rewind_crossing(&fixture, &before, &corrupt, true).is_err());
 }

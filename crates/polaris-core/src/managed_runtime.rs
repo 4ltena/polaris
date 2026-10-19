@@ -5,13 +5,19 @@
 //! trust decision.  The shipped lock deliberately has no image until a signed
 //! release DMG and its complete tree manifest are produced.
 
+#[cfg(any(unix, test))]
 use serde::{Deserialize, Serialize};
+#[cfg(any(unix, test))]
 use sha2::{Digest, Sha256};
+#[cfg(any(unix, test))]
+use std::{collections::BTreeSet, path::Component};
+#[cfg(unix)]
 use std::{
-    collections::BTreeSet,
     fs::{File, OpenOptions},
     os::unix::{fs::FileExt, fs::MetadataExt, fs::OpenOptionsExt},
-    path::{Component, Path, PathBuf},
+};
+use std::{
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -26,12 +32,17 @@ use std::{
 #[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
 
+#[cfg(any(unix, test))]
 const EMBEDDED_LOCK: &[u8] = include_bytes!(
     "../../../apps/macos/Sources/PolarisDesktop/Resources/readonly-runtime-images-v2.json"
 );
+#[cfg(any(unix, test))]
 const IMAGE_ID: &str = "python-e5-cat";
+#[cfg(any(unix, test))]
 const MAX_LOCK_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(any(unix, test))]
 const MAX_FILES: usize = 100_000;
+#[cfg(any(unix, test))]
 const MAX_TREE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_PLIST_BYTES: usize = 1024 * 1024;
@@ -50,6 +61,7 @@ pub enum ManagedRuntimeError {
     Mount,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeImageLockV2 {
@@ -57,6 +69,7 @@ struct RuntimeImageLockV2 {
     images: Vec<RuntimeImageV2>,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeImageV2 {
@@ -75,6 +88,7 @@ struct RuntimeImageV2 {
     bundled_resource: Option<String>,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeTreeManifestV2 {
@@ -82,6 +96,7 @@ struct RuntimeTreeManifestV2 {
     files: Vec<RuntimeTreeFileV2>,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeTreeFileV2 {
@@ -91,6 +106,7 @@ struct RuntimeTreeFileV2 {
     executable: bool,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct AttachedMount {
     mount_point: PathBuf,
@@ -99,6 +115,7 @@ struct AttachedMount {
     readonly: bool,
 }
 
+#[cfg(unix)]
 trait MountBackend: Send + Sync {
     fn attach(&self, image: &File) -> Result<AttachedMount, ManagedRuntimeError>;
     fn validate_mount(&self, mount_point: &Path, device_number: u64) -> bool;
@@ -109,7 +126,7 @@ trait MountBackend: Send + Sync {
 #[derive(Debug)]
 struct HdiutilBackend;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[derive(Debug)]
 struct UnsupportedMountBackend;
 
@@ -217,7 +234,7 @@ impl MountBackend for HdiutilBackend {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 impl MountBackend for UnsupportedMountBackend {
     fn attach(&self, _image: &File) -> Result<AttachedMount, ManagedRuntimeError> {
         Err(ManagedRuntimeError::Unavailable)
@@ -231,22 +248,36 @@ impl MountBackend for UnsupportedMountBackend {
 }
 
 struct RuntimeInner {
+    #[cfg(unix)]
     image_path: PathBuf,
+    #[cfg(unix)]
     image_identity: (u64, u64),
+    #[cfg(unix)]
     image_size: u64,
+    #[cfg(unix)]
     image_sha256: String,
+    #[cfg(unix)]
     image: File,
+    #[cfg(unix)]
     mount_root_identity: (u64, u64),
+    #[cfg(unix)]
     mount_root: File,
+    #[cfg(unix)]
     python_identity: (u64, u64),
+    #[cfg(unix)]
     python: File,
     mount_point: PathBuf,
+    #[cfg(unix)]
     device: String,
+    #[cfg(unix)]
     device_number: u64,
+    #[cfg(unix)]
     manifest: RuntimeTreeManifestV2,
+    #[cfg(unix)]
     backend: Arc<dyn MountBackend>,
 }
 
+#[cfg(unix)]
 impl Drop for RuntimeInner {
     fn drop(&mut self) {
         self.backend.detach(&self.device);
@@ -259,6 +290,7 @@ impl Drop for RuntimeInner {
 pub struct ManagedRuntimeLease(Arc<RuntimeInner>);
 
 impl ManagedRuntimeLease {
+    #[cfg(unix)]
     pub fn acquire(home: &Path) -> Result<Self, ManagedRuntimeError> {
         #[cfg(target_os = "macos")]
         let backend: Arc<dyn MountBackend> = Arc::new(HdiutilBackend);
@@ -267,6 +299,12 @@ impl ManagedRuntimeLease {
         Self::acquire_with(EMBEDDED_LOCK, home, backend)
     }
 
+    #[cfg(not(unix))]
+    pub fn acquire(_home: &Path) -> Result<Self, ManagedRuntimeError> {
+        Err(ManagedRuntimeError::Unavailable)
+    }
+
+    #[cfg(unix)]
     fn acquire_with(
         lock_bytes: &[u8],
         home: &Path,
@@ -359,6 +397,12 @@ impl ManagedRuntimeLease {
         self.0.mount_point.join("runtime/bin/python3.11")
     }
 
+    #[cfg(not(unix))]
+    pub fn validate_before_spawn(&self) -> Result<(), ManagedRuntimeError> {
+        Err(ManagedRuntimeError::Unavailable)
+    }
+
+    #[cfg(unix)]
     pub fn validate_before_spawn(&self) -> Result<(), ManagedRuntimeError> {
         check_path_identity(&self.0.image_path, self.0.image_identity)?;
         let image = self
@@ -404,6 +448,7 @@ impl ManagedRuntimeLease {
     }
 }
 
+#[cfg(any(unix, test))]
 fn select_image(bytes: &[u8]) -> Result<RuntimeImageV2, ManagedRuntimeError> {
     if bytes.len() > MAX_LOCK_BYTES {
         return Err(ManagedRuntimeError::Integrity);
@@ -441,6 +486,7 @@ fn select_image(bytes: &[u8]) -> Result<RuntimeImageV2, ManagedRuntimeError> {
     Ok(entry)
 }
 
+#[cfg(any(unix, test))]
 fn current_platform_architecture() -> Result<(&'static str, &'static str), ManagedRuntimeError> {
     let platform = if cfg!(target_os = "macos") {
         "macos"
@@ -459,6 +505,7 @@ fn current_platform_architecture() -> Result<(&'static str, &'static str), Manag
     Ok((platform, architecture))
 }
 
+#[cfg(any(unix, test))]
 fn validate_manifest(manifest: &RuntimeTreeManifestV2) -> Result<(), ManagedRuntimeError> {
     let mut paths = BTreeSet::new();
     let mut total = 0_u64;
@@ -491,6 +538,7 @@ fn validate_manifest(manifest: &RuntimeTreeManifestV2) -> Result<(), ManagedRunt
     Ok(())
 }
 
+#[cfg(unix)]
 fn verify_tree(root: &Path, manifest: &RuntimeTreeManifestV2) -> Result<(), ManagedRuntimeError> {
     let expected = manifest
         .files
@@ -573,6 +621,7 @@ fn verify_tree(root: &Path, manifest: &RuntimeTreeManifestV2) -> Result<(), Mana
     Ok(())
 }
 
+#[cfg(unix)]
 fn open_regular_nofollow(path: &Path, directory: bool) -> Result<File, ManagedRuntimeError> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -593,6 +642,7 @@ fn open_regular_nofollow(path: &Path, directory: bool) -> Result<File, ManagedRu
     Ok(file)
 }
 
+#[cfg(unix)]
 fn check_path_identity(path: &Path, expected: (u64, u64)) -> Result<(), ManagedRuntimeError> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| ManagedRuntimeError::Integrity)?;
     if metadata.file_type().is_symlink()
@@ -604,6 +654,7 @@ fn check_path_identity(path: &Path, expected: (u64, u64)) -> Result<(), ManagedR
     Ok(())
 }
 
+#[cfg(unix)]
 fn path_has_directory_identity(path: &Path, expected: (u64, u64)) -> bool {
     std::fs::symlink_metadata(path)
         .ok()
@@ -614,6 +665,7 @@ fn path_has_directory_identity(path: &Path, expected: (u64, u64)) -> bool {
         })
 }
 
+#[cfg(unix)]
 fn sha256_reader(file: &File) -> Result<String, ManagedRuntimeError> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
@@ -633,14 +685,17 @@ fn sha256_reader(file: &File) -> Result<String, ManagedRuntimeError> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+#[cfg(unix)]
 fn sha256_path(path: &Path) -> Result<String, ManagedRuntimeError> {
     sha256_reader(&open_regular_nofollow(path, false)?)
 }
 
+#[cfg(any(unix, test))]
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(any(unix, test))]
 fn valid_hash(value: &str) -> bool {
     value.len() == 64
         && value
@@ -648,6 +703,7 @@ fn valid_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+#[cfg(any(unix, test))]
 fn valid_component(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -730,6 +786,65 @@ fn mount_is_readonly(path: &Path) -> Result<bool, ManagedRuntimeError> {
 }
 
 #[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn production_lock_is_valid_and_unavailable() {
+        assert_eq!(
+            select_image(EMBEDDED_LOCK).unwrap_err(),
+            ManagedRuntimeError::Unavailable
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_unavailable_acquire_preserves_existing_and_missing_home() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("existing.txt");
+        std::fs::write(&marker, b"keep runtime state").unwrap();
+        let missing = root.path().join("missing-home");
+
+        for home in [root.path(), missing.as_path()] {
+            assert_eq!(
+                ManagedRuntimeLease::acquire(home).err(),
+                Some(ManagedRuntimeError::Unavailable)
+            );
+        }
+
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep runtime state");
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_unavailable_pre_spawn_preserves_path_and_clone_contract() {
+        fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
+        assert_send_sync_clone::<ManagedRuntimeLease>();
+
+        let root = tempfile::tempdir().unwrap();
+        let mount_point = root.path().join("missing-mount");
+        let lease = ManagedRuntimeLease(Arc::new(RuntimeInner {
+            mount_point: mount_point.clone(),
+        }));
+        let cloned = lease.clone();
+        assert_eq!(
+            cloned.python_path(),
+            mount_point.join("runtime/bin/python3.11")
+        );
+        for candidate in [&lease, &cloned] {
+            assert_eq!(
+                candidate.validate_before_spawn(),
+                Err(ManagedRuntimeError::Unavailable)
+            );
+        }
+        assert!(!mount_point.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt, sync::Mutex};
@@ -806,14 +921,6 @@ mod tests {
             }]
         }))
         .unwrap()
-    }
-
-    #[test]
-    fn production_lock_is_valid_and_unavailable() {
-        assert_eq!(
-            select_image(EMBEDDED_LOCK).unwrap_err(),
-            ManagedRuntimeError::Unavailable
-        );
     }
 
     struct NoSpawnBackend;

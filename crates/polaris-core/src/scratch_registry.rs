@@ -4,15 +4,20 @@
 //! immediately before removal, and anything that does not match exactly is
 //! kept. This performs no general search of the temporary directory.
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::fs;
+use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::{fs, io};
 
 /// The registry lives beside the other per-installation state.
 pub const FILE: &str = "scratch.json";
 /// The name every recorded copy must still carry.
+#[cfg(unix)]
 const PREFIX: &str = "polaris-workspace-";
+#[cfg(unix)]
 const MAX_ENTRIES: usize = 64;
 /// A copy younger than this is assumed to belong to a live preparation even
 /// when its process cannot be seen.
@@ -50,6 +55,7 @@ pub struct Swept {
     pub refused: Vec<PathBuf>,
 }
 
+#[cfg(unix)]
 fn read(path: &Path) -> Registry {
     fs::read(path)
         .ok()
@@ -57,6 +63,7 @@ fn read(path: &Path) -> Registry {
         .unwrap_or_default()
 }
 
+#[cfg(unix)]
 fn write(path: &Path, registry: &Registry) -> io::Result<()> {
     let body = serde_json::to_vec(registry).map_err(io::Error::other)?;
     let temporary = path.with_extension("tmp");
@@ -66,6 +73,7 @@ fn write(path: &Path, registry: &Registry) -> io::Result<()> {
 
 /// Records one private copy. A failure to record is not a reason to fail the
 /// preparation: the copy is still removed when its owner exits normally.
+#[cfg(unix)]
 pub fn record(path: &Path, now: u64) {
     let Some(registry_path) = REGISTRY.get() else {
         return;
@@ -85,6 +93,7 @@ pub fn record(path: &Path, now: u64) {
 
 /// Removes the recorded copies that no live process can still be using.
 /// `alive` reports whether a process id is still running.
+#[cfg(unix)]
 pub fn sweep(now: u64, retention_seconds: u64, alive: impl Fn(u32) -> bool) -> io::Result<Swept> {
     let Some(registry_path) = REGISTRY.get() else {
         return Ok(Swept::default());
@@ -122,8 +131,21 @@ pub fn sweep(now: u64, retention_seconds: u64, alive: impl Fn(u32) -> bool) -> i
     Ok(swept)
 }
 
+#[cfg(not(unix))]
+pub fn sweep(
+    _now: u64,
+    _retention_seconds: u64,
+    _alive: impl Fn(u32) -> bool,
+) -> io::Result<Swept> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "scratch registry cleanup is unavailable on this platform",
+    ))
+}
+
 /// Every condition the copy had when it was created must still hold. A path
 /// that fails any of them is left alone, not repaired.
+#[cfg(unix)]
 fn removable(path: &Path) -> Result<(), ()> {
     let name = path.file_name().and_then(|name| name.to_str()).ok_or(())?;
     if !name.starts_with(PREFIX) {
@@ -143,10 +165,15 @@ fn removable(path: &Path) -> Result<(), ()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn nix_uid() -> u32 {
     // SAFETY: getuid is always successful and has no side effects.
     unsafe { libc::getuid() }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, windows))]
+#[path = "scratch_registry/windows_tests.rs"]
+mod windows_tests;

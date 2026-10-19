@@ -37,7 +37,7 @@ pub mod filemap;
 mod files_md;
 mod gitignore;
 pub mod input_preparation;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod managed_runtime;
 pub mod measurement;
 #[cfg(unix)]
@@ -49,7 +49,6 @@ pub mod project_analysis;
 /// Unix only: the call binds to an open directory FD and spawns a child.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod project_git;
-#[cfg(unix)]
 pub mod project_mutation;
 pub mod prompt;
 pub mod recipe;
@@ -81,6 +80,8 @@ pub mod tool_memory;
 pub mod translation;
 pub mod turn_intent;
 pub mod verification;
+#[cfg(windows)]
+mod windows_fs;
 pub mod workflow;
 pub mod workflow_artifact_store;
 
@@ -88,16 +89,18 @@ pub use events::{AgentEvent, Diff, DiffHunk, DiffLine, compute_diff};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod handoff;
 pub mod isolated_run;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod isolated_workspace;
 #[cfg(target_os = "linux")]
 pub mod linux_l04_parent;
 pub mod llama_server;
 pub mod local_execution;
-#[cfg(unix)]
 pub mod management_effect;
 pub mod mcp;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod workspace_apply;
+#[cfg(windows)]
+#[path = "workspace_apply/report.rs"]
 pub mod workspace_apply;
 
 #[cfg(unix)]

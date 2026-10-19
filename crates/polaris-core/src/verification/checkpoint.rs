@@ -2821,6 +2821,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn static_test_adapter(root: &Path, command: &str, timeout: Duration) -> FixedStaticAdapterV1 {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2883,6 +2884,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn static_observed() -> HostObservedVerificationV1 {
         HostObservedVerificationV1 {
             subject_hash: hash('1'),
@@ -2892,6 +2894,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn record_static_fixture(
         adapter: &FixedStaticAdapterV1,
         store: &super::super::store::VerificationStore,
@@ -2924,6 +2927,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn registered_static_adapter_persists_complete_satisfied_and_violated_results() {
         let root = tempfile::tempdir().unwrap();
         let store_root = tempfile::tempdir().unwrap();
@@ -2973,6 +2977,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn static_timeout_and_execution_failure_are_unavailable_not_satisfied() {
         let root = tempfile::tempdir().unwrap();
         let store_root = tempfile::tempdir().unwrap();
@@ -3002,6 +3007,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn satisfied_static_evidence_reaches_the_durable_phase_gate() {
         use crate::{
             conversation_state::HistoryMode,
@@ -3134,6 +3140,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn static_adapter_rejects_tampered_executable_config_binding_and_schema() {
         use std::os::unix::fs::PermissionsExt;
 

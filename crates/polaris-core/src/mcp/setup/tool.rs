@@ -1,21 +1,27 @@
 //! Root-run `mcp_setup`. Arguments carry an operation and a candidate ID only;
 //! results never include URLs, commands, paths or values.
 use super::*;
+#[cfg(unix)]
+use crate::execution_owner::{RegistrationApproval, RegistrationError};
 use crate::{
     approval::{Approver, Gate},
-    execution_owner::{RegistrationApproval, RegistrationError, RegistrationPort},
+    execution_owner::RegistrationPort,
     isolated_workspace::Limits,
     mcp::operation::ExternalCeiling,
 };
+#[cfg(unix)]
 use polaris_mcp::store::{Snapshot, Store};
+#[cfg(unix)]
 use serde::Deserialize;
 use serde_json::json;
 use std::{future::Future, sync::Mutex};
 
+#[cfg(unix)]
 const MAX_CANDIDATES: usize = 64;
 /// Fixed host PATH; never the process or project environment.
 pub const HOST_PATH: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
@@ -31,6 +37,7 @@ pub enum Authorization {
 }
 
 pub struct SetupTool {
+    #[cfg(unix)]
     detector: Detector,
     home: PathBuf,
     runtime_roots: Vec<PathBuf>,
@@ -45,9 +52,21 @@ fn error(code: &str) -> String {
     json!({ "error": code }).to_string()
 }
 
+#[cfg(unix)]
 const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
 
 impl SetupTool {
+    #[cfg(not(unix))]
+    pub async fn call(
+        &self,
+        _arguments: &serde_json::Value,
+        _cancelled: impl Future<Output = ()>,
+        _gate: &mut Gate,
+        _approver: &mut dyn Approver,
+    ) -> Result<String, String> {
+        Err(error("unavailable"))
+    }
+
     pub fn new(
         home: PathBuf,
         runtime_roots: Vec<PathBuf>,
@@ -57,6 +76,7 @@ impl SetupTool {
         authorization: Authorization,
     ) -> Self {
         Self {
+            #[cfg(unix)]
             detector: Detector::new(home.clone(), HOST_PATH.iter().map(PathBuf::from).collect()),
             home,
             runtime_roots,
@@ -69,6 +89,7 @@ impl SetupTool {
     }
 
     /// Detection reads a store only if one exists; only an approved save creates it.
+    #[cfg(unix)]
     fn current(&self) -> Result<Snapshot, String> {
         if !Store::exists(&self.home) {
             return Ok(Snapshot {
@@ -83,6 +104,7 @@ impl SetupTool {
 
     /// Both arms are JSON tool results; only `Ok` counts as success. A new
     /// detection replaces earlier candidate IDs.
+    #[cfg(unix)]
     pub async fn call(
         &self,
         arguments: &serde_json::Value,

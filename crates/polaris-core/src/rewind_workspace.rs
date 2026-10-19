@@ -7,6 +7,9 @@
 #![cfg(unix)]
 
 use crate::isolated_workspace::{self, ExclusionReason, Limits, RegisteredSecrets, Snapshot};
+use crate::management_effect::{
+    ManagementEffectStoreV1, ManagementRewindCheckpointV1, ManagementRewindCrossingV1,
+};
 use polaris_sandbox::{SandboxMode, SandboxPolicy};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -22,7 +25,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 const TRANSACTION_VERSION: u32 = 1;
 const NAMESPACE_VERSION: u32 = 1;
 
@@ -173,6 +176,7 @@ pub enum PreviewBlockedReason {
     CorruptBlob,
     PendingTransaction,
     UnsafeTopology,
+    ManagementCrossing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -230,6 +234,8 @@ pub enum RewindTransactionPhase {
 pub struct RewindBranchTransactionEvidence {
     pub transaction_id: TransactionId,
     pub restored_manifest_id: ManifestId,
+    pub expected_post: ManifestId,
+    pub target_pre: ManifestId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -348,6 +354,10 @@ struct StoredManifest {
     root_device: u64,
     root_inode: u64,
     captured_unix_ms: u128,
+    /// v1 manifests predate management-effect rewind evidence. They remain
+    /// readable for diagnostics, but cannot authorize an executable rewind.
+    #[serde(default)]
+    management_checkpoint: Option<ManagementRewindCheckpointV1>,
     entries: Vec<StoredEntry>,
     exclusions: Vec<StoredExclusion>,
 }
@@ -578,12 +588,35 @@ impl WorkspaceOwner {
 
     pub fn capture(&self, policy: &SandboxPolicy) -> Result<ManifestId, WorkspaceError> {
         self.validate_policy(policy)?;
-        let _lease = self.lease()?;
+        let lease = self.lease()?;
         self.require_no_pending()?;
         if self.legacy_binding_reservation()?.is_some() {
             return Err(WorkspaceError::new(ErrorKind::Busy));
         }
-        self.capture_under_lease()
+        let checkpoint = self.management_checkpoint_with_lease(&lease)?;
+        self.capture_under_lease(checkpoint)
+    }
+
+    /// Persists a workspace manifest that is bound to the caller's already
+    /// held project mutation lease. The caller obtains the checkpoint under
+    /// that same lease before invoking this method; this API must never try to
+    /// acquire it again.
+    pub fn capture_with_management_checkpoint_with_lease(
+        &self,
+        lease: &ProjectLease,
+        policy: &SandboxPolicy,
+        checkpoint: ManagementRewindCheckpointV1,
+    ) -> Result<ManifestId, WorkspaceError> {
+        self.validate_policy(policy)?;
+        self.validate_lease(lease)?;
+        self.require_no_pending()?;
+        if self.legacy_binding_reservation()?.is_some() {
+            return Err(WorkspaceError::new(ErrorKind::Busy));
+        }
+        if self.management_checkpoint_with_lease(lease)? != checkpoint {
+            return Err(WorkspaceError::new(ErrorKind::IneligiblePolicy));
+        }
+        self.capture_under_lease(checkpoint)
     }
 
     /// The first explicit resume of an unbound legacy conversation may bind
@@ -616,7 +649,8 @@ impl WorkspaceOwner {
                 )?;
             }
         }
-        let manifest = self.capture_under_lease()?;
+        let checkpoint = self.management_checkpoint_with_lease(&lease)?;
+        let manifest = self.capture_under_lease(checkpoint)?;
         if !self.matches_manifest(&manifest)? {
             return Err(WorkspaceError::new(ErrorKind::Conflict));
         }
@@ -666,7 +700,10 @@ impl WorkspaceOwner {
             .is_some_and(|reservation| reservation.session_id == session_id))
     }
 
-    fn capture_under_lease(&self) -> Result<ManifestId, WorkspaceError> {
+    fn capture_under_lease(
+        &self,
+        checkpoint: ManagementRewindCheckpointV1,
+    ) -> Result<ManifestId, WorkspaceError> {
         let deadline = Instant::now()
             .checked_add(self.limits.capture_deadline)
             .ok_or_else(|| WorkspaceError::new(ErrorKind::CaptureDeadline))?;
@@ -676,7 +713,7 @@ impl WorkspaceOwner {
             Some(deadline),
         )
         .map_err(map_snapshot_error)?;
-        self.persist_snapshot(&snapshot, Some(deadline))
+        self.persist_snapshot(&snapshot, Some(deadline), Some(checkpoint))
     }
 
     pub fn has_workspace_identity(&self) -> Result<bool, WorkspaceError> {
@@ -729,6 +766,102 @@ impl WorkspaceOwner {
         })
     }
 
+    /// Computes a preview only when both durable manifests prove that their
+    /// project-wide management interval is rewindable at the current ledger
+    /// head. This takes the caller's lease to avoid a second exclusive-lock
+    /// acquisition while a rewind flow is already linearized.
+    pub fn preview_with_management_with_lease(
+        &self,
+        lease: &ProjectLease,
+        expected_post: &ManifestId,
+        target_pre: &ManifestId,
+    ) -> Result<Preview, WorkspaceError> {
+        self.validate_lease(lease)?;
+        let mut preview = self.preview(expected_post, target_pre)?;
+        if crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+            &self.project_root,
+            self.management_state_dir()?,
+            lease,
+        )
+        .is_err()
+        {
+            preview.restorable = false;
+            preview.blocked_reason = Some(PreviewBlockedReason::ManagementCrossing);
+            return Ok(preview);
+        }
+        match self.verify_rewind_management_with_lease(lease, expected_post, target_pre, true)? {
+            ManagementRewindCrossingV1::Clear => Ok(preview),
+            ManagementRewindCrossingV1::Blocked { .. } => {
+                preview.restorable = false;
+                preview.blocked_reason = Some(PreviewBlockedReason::ManagementCrossing);
+                Ok(preview)
+            }
+        }
+    }
+
+    /// Verifies the complete project management journal between target_pre and
+    /// expected_post. A missing checkpoint is legacy/unknown evidence, never
+    /// an empty journal baseline.
+    pub fn verify_rewind_management_with_lease(
+        &self,
+        lease: &ProjectLease,
+        expected_post: &ManifestId,
+        target_pre: &ManifestId,
+        require_current_head: bool,
+    ) -> Result<ManagementRewindCrossingV1, WorkspaceError> {
+        self.validate_lease(lease)?;
+        let expected = self.load_manifest(expected_post)?;
+        let target = self.load_manifest(target_pre)?;
+        let from = target
+            .management_checkpoint
+            .as_ref()
+            .ok_or_else(|| WorkspaceError::new(ErrorKind::IneligiblePolicy))?;
+        let through = expected
+            .management_checkpoint
+            .as_ref()
+            .ok_or_else(|| WorkspaceError::new(ErrorKind::IneligiblePolicy))?;
+        let state_dir = self.management_state_dir()?;
+        ManagementEffectStoreV1::verify_rewind_crossing_for_project_at_state_dir(
+            &self.project_root,
+            &state_dir,
+            lease,
+            from,
+            through,
+            require_current_head,
+        )
+        .map_err(|_| WorkspaceError::new(ErrorKind::IneligiblePolicy))
+    }
+
+    /// Historical admission runs while a root turn already holds a shared
+    /// activity lease. It deliberately does not require the current journal
+    /// head, but it still verifies the complete pinned interval.
+    pub fn verify_rewind_management_with_activity(
+        &self,
+        lease: &crate::project_mutation::ProjectActivityLeaseV1,
+        expected_post: &ManifestId,
+        target_pre: &ManifestId,
+    ) -> Result<ManagementRewindCrossingV1, WorkspaceError> {
+        self.validate_activity_lease(lease)?;
+        let expected = self.load_manifest(expected_post)?;
+        let target = self.load_manifest(target_pre)?;
+        let from = target
+            .management_checkpoint
+            .as_ref()
+            .ok_or_else(|| WorkspaceError::new(ErrorKind::IneligiblePolicy))?;
+        let through = expected
+            .management_checkpoint
+            .as_ref()
+            .ok_or_else(|| WorkspaceError::new(ErrorKind::IneligiblePolicy))?;
+        ManagementEffectStoreV1::verify_rewind_crossing_for_project_at_state_dir_with_activity(
+            &self.project_root,
+            self.management_state_dir()?,
+            lease,
+            from,
+            through,
+        )
+        .map_err(|_| WorkspaceError::new(ErrorKind::IneligiblePolicy))
+    }
+
     pub fn restore(
         &self,
         expected_post: &ManifestId,
@@ -759,10 +892,22 @@ impl WorkspaceOwner {
         target_pre: &ManifestId,
         candidate_session_id: Option<String>,
     ) -> Result<RestoreOutcome, WorkspaceError> {
-        let _lease = self.lease()?;
+        let lease = self.lease()?;
+        crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+            &self.project_root,
+            self.management_state_dir()?,
+            &lease,
+        )
+        .map_err(|_| WorkspaceError::new(ErrorKind::IneligiblePolicy))?;
         self.require_no_pending()?;
         let expected = self.load_manifest(expected_post)?;
         let target = self.load_manifest(target_pre)?;
+        if !matches!(
+            self.verify_rewind_management_with_lease(&lease, expected_post, target_pre, true)?,
+            ManagementRewindCrossingV1::Clear
+        ) {
+            return Err(WorkspaceError::new(ErrorKind::IneligiblePolicy));
+        }
         if let Some(reason) = self.preview_block(&expected, &target)? {
             return Err(WorkspaceError::new(match reason {
                 PreviewBlockedReason::ProjectMismatch => ErrorKind::CorruptManifest,
@@ -771,6 +916,7 @@ impl WorkspaceOwner {
                 PreviewBlockedReason::CorruptBlob => ErrorKind::CorruptBlob,
                 PreviewBlockedReason::PendingTransaction => ErrorKind::PendingTransaction,
                 PreviewBlockedReason::UnsafeTopology => ErrorKind::Conflict,
+                PreviewBlockedReason::ManagementCrossing => ErrorKind::IneligiblePolicy,
             }));
         }
         let current = isolated_workspace::protected_rewind_snapshot(
@@ -779,7 +925,7 @@ impl WorkspaceOwner {
             None,
         )
         .map_err(map_snapshot_error)?;
-        let observed = manifest_from_snapshot(ManifestId::random()?, &current)?;
+        let observed = manifest_from_snapshot(ManifestId::random()?, &current, None)?;
         let observed_post_manifest = if same_observation(&expected, &observed) {
             None
         } else {
@@ -843,7 +989,7 @@ impl WorkspaceOwner {
                 None,
             )
             .map_err(map_snapshot_error)?;
-            let latest = manifest_from_snapshot(ManifestId::random()?, &latest)?;
+            let latest = manifest_from_snapshot(ManifestId::random()?, &latest, None)?;
             if !same_observation(&observed, &latest) {
                 return Err(WorkspaceError::new(ErrorKind::Conflict));
             }
@@ -857,11 +1003,11 @@ impl WorkspaceOwner {
             None,
         )
         .map_err(map_snapshot_error)?;
-        let restored_observation = manifest_from_snapshot(ManifestId::random()?, &restored)?;
+        let restored_observation = manifest_from_snapshot(ManifestId::random()?, &restored, None)?;
         if !same_value(&target, &restored_observation) {
             return Err(WorkspaceError::new(ErrorKind::Conflict));
         }
-        let restored_id = self.persist_snapshot(&restored, None)?;
+        let restored_id = self.persist_snapshot(&restored, None, expected.management_checkpoint)?;
         marker.restored_manifest = Some(restored_id);
         marker.phase = TransactionPhase::PendingActivation;
         self.write_marker(&marker)?;
@@ -891,6 +1037,24 @@ impl WorkspaceOwner {
         transaction_id: &TransactionId,
     ) -> Result<(), WorkspaceError> {
         self.validate_lease(lease)?;
+        crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+            &self.project_root,
+            self.management_state_dir()?,
+            lease,
+        )
+        .map_err(|_| WorkspaceError::new(ErrorKind::IneligiblePolicy))?;
+        let marker = self.load_marker(transaction_id)?;
+        if !matches!(
+            self.verify_rewind_management_with_lease(
+                lease,
+                &marker.expected_post,
+                &marker.target_pre,
+                true,
+            )?,
+            ManagementRewindCrossingV1::Clear
+        ) {
+            return Err(WorkspaceError::new(ErrorKind::IneligiblePolicy));
+        }
         self.commit_locked(transaction_id)
     }
 
@@ -930,7 +1094,7 @@ impl WorkspaceOwner {
             None,
         )
         .map_err(map_snapshot_error)?;
-        let observed = manifest_from_snapshot(ManifestId::random()?, &current)?;
+        let observed = manifest_from_snapshot(ManifestId::random()?, &current, None)?;
         if !same_observation(&restored, &observed) {
             return Err(WorkspaceError::new(ErrorKind::Conflict));
         }
@@ -1199,6 +1363,71 @@ impl WorkspaceOwner {
         Ok(RewindBranchTransactionEvidence {
             transaction_id: marker.id,
             restored_manifest_id: restored_id,
+            expected_post: marker.expected_post,
+            target_pre: marker.target_pre,
+        })
+    }
+
+    /// Finds the sole committed transaction for a candidate without assuming
+    /// that its source boundary's own post manifest was the latest head when
+    /// the child was prepared. Multi-turn rewind records the true range on
+    /// the transaction marker.
+    pub(crate) fn committed_branch_transaction_for_candidate_bounded(
+        &self,
+        candidate_session_id: &str,
+        reads: &mut Option<&mut crate::rewind_admission::PublicationReadBudgetV1>,
+    ) -> Result<RewindBranchTransactionEvidence, WorkspaceError> {
+        if !valid_candidate_session_id(candidate_session_id) {
+            return Err(WorkspaceError::new(ErrorKind::InvalidCandidateSession));
+        }
+        let transactions = self.store_root.join("transactions");
+        let paths = match reads.as_deref_mut() {
+            Some(reads) => reads
+                .paths(&transactions)
+                .map_err(|_| WorkspaceError::at(ErrorKind::InvalidStore, &transactions))?,
+            None => fs::read_dir(&transactions)
+                .map_err(|_| WorkspaceError::at(ErrorKind::InvalidStore, &transactions))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|_| WorkspaceError::new(ErrorKind::Io))?,
+        };
+        let mut matching = None;
+        for path in paths {
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let id: TransactionId = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| WorkspaceError::at(ErrorKind::InvalidTransaction, &path))?
+                .parse()
+                .map_err(|_| WorkspaceError::at(ErrorKind::InvalidTransaction, &path))?;
+            let marker = self.load_marker_bounded(&id, reads)?;
+            if marker.candidate_session_id.as_deref() != Some(candidate_session_id) {
+                continue;
+            }
+            if matching.replace(marker).is_some() {
+                return Err(WorkspaceError::new(ErrorKind::InvalidTransaction));
+            }
+        }
+        let marker = matching.ok_or_else(|| WorkspaceError::new(ErrorKind::InvalidTransaction))?;
+        if marker.phase != TransactionPhase::Committed {
+            return Err(WorkspaceError::new(ErrorKind::InvalidTransaction));
+        }
+        let _ = self.observed_post_manifest_bounded(&marker, reads)?;
+        let restored_manifest_id = marker
+            .restored_manifest
+            .ok_or_else(|| WorkspaceError::new(ErrorKind::InvalidTransaction))?;
+        let restored = self.load_manifest_bounded(&restored_manifest_id, reads)?;
+        let target = self.load_manifest_bounded(&marker.target_pre, reads)?;
+        if !same_value(&restored, &target) {
+            return Err(WorkspaceError::new(ErrorKind::InvalidTransaction));
+        }
+        Ok(RewindBranchTransactionEvidence {
+            transaction_id: marker.id,
+            restored_manifest_id,
+            expected_post: marker.expected_post,
+            target_pre: marker.target_pre,
         })
     }
 
@@ -1295,7 +1524,7 @@ impl WorkspaceOwner {
             None,
         )
         .map_err(map_snapshot_error)?;
-        let observed = manifest_from_snapshot(ManifestId::random()?, &current)?;
+        let observed = manifest_from_snapshot(ManifestId::random()?, &current, None)?;
         Ok(same_value(&expected, &observed))
     }
 
@@ -1319,7 +1548,7 @@ impl WorkspaceOwner {
             None,
         )
         .map_err(map_snapshot_error)?;
-        let observed = manifest_from_snapshot(ManifestId::random()?, &current)?;
+        let observed = manifest_from_snapshot(ManifestId::random()?, &current, None)?;
         if startup && !known_partial_state(&expected, &target, &observed, &marker) {
             return Err(WorkspaceError::new(ErrorKind::Conflict));
         }
@@ -1349,7 +1578,7 @@ impl WorkspaceOwner {
                 None,
             )
             .map_err(map_snapshot_error)?;
-            let latest = manifest_from_snapshot(ManifestId::random()?, &latest)?;
+            let latest = manifest_from_snapshot(ManifestId::random()?, &latest, None)?;
             if !same_observation(&observed, &latest) {
                 return Err(WorkspaceError::new(ErrorKind::Conflict));
             }
@@ -1362,11 +1591,12 @@ impl WorkspaceOwner {
             None,
         )
         .map_err(map_snapshot_error)?;
-        let rolled_observation = manifest_from_snapshot(ManifestId::random()?, &rolled)?;
+        let rolled_observation = manifest_from_snapshot(ManifestId::random()?, &rolled, None)?;
         if !same_value(&expected, &rolled_observation) {
             return Err(WorkspaceError::new(ErrorKind::Conflict));
         }
-        let workspace_manifest_id = self.persist_snapshot(&rolled, None)?;
+        let workspace_manifest_id =
+            self.persist_snapshot(&rolled, None, expected.management_checkpoint)?;
         marker.rollback_manifest = Some(workspace_manifest_id);
         marker.phase = TransactionPhase::RolledBack;
         self.write_marker(&marker)?;
@@ -1430,6 +1660,21 @@ impl WorkspaceOwner {
     }
 
     fn validate_lease(&self, lease: &ProjectLease) -> Result<(), WorkspaceError> {
+        if lease.store_root() != self.store_root {
+            return Err(WorkspaceError::new(ErrorKind::InvalidStore));
+        }
+        let root = fs::metadata(&self.store_root)
+            .map_err(|_| WorkspaceError::at(ErrorKind::InvalidStore, &self.store_root))?;
+        if lease.store_identity() != (root.dev(), root.ino()) {
+            return Err(WorkspaceError::new(ErrorKind::InvalidStore));
+        }
+        Ok(())
+    }
+
+    fn validate_activity_lease(
+        &self,
+        lease: &crate::project_mutation::ProjectActivityLeaseV1,
+    ) -> Result<(), WorkspaceError> {
         if lease.store_root() != self.store_root {
             return Err(WorkspaceError::new(ErrorKind::InvalidStore));
         }
@@ -1506,9 +1751,10 @@ impl WorkspaceOwner {
         &self,
         snapshot: &Snapshot,
         deadline: Option<Instant>,
+        management_checkpoint: Option<ManagementRewindCheckpointV1>,
     ) -> Result<ManifestId, WorkspaceError> {
         let id = ManifestId::random()?;
-        let manifest = manifest_from_snapshot(id, snapshot)?;
+        let manifest = manifest_from_snapshot(id, snapshot, management_checkpoint)?;
         self.validate_manifest(&manifest)?;
         let existing_bytes = self.blob_bytes()?;
         let mut required = 0u64;
@@ -1562,7 +1808,9 @@ impl WorkspaceOwner {
     }
 
     fn validate_manifest(&self, manifest: &StoredManifest) -> Result<(), WorkspaceError> {
-        if manifest.version != MANIFEST_VERSION
+        if !matches!(manifest.version, 1 | MANIFEST_VERSION)
+            || (manifest.version == 1 && manifest.management_checkpoint.is_some())
+            || (manifest.version == MANIFEST_VERSION && manifest.management_checkpoint.is_none())
             || manifest.project_root != self.project_root
             || manifest
                 .entries
@@ -1610,6 +1858,33 @@ impl WorkspaceOwner {
             valid_relative(&exclusion.path, self.limits.max_depth)?;
         }
         Ok(())
+    }
+
+    fn management_checkpoint_with_lease(
+        &self,
+        lease: &ProjectLease,
+    ) -> Result<ManagementRewindCheckpointV1, WorkspaceError> {
+        self.validate_lease(lease)?;
+        let state_dir = self.management_state_dir()?;
+        ManagementEffectStoreV1::rewind_checkpoint_for_project_at_state_dir(
+            &self.project_root,
+            &state_dir,
+            lease,
+        )
+        .map_err(|_| WorkspaceError::new(ErrorKind::IneligiblePolicy))
+    }
+
+    /// The rewind and management owners share a state directory. Deriving it
+    /// from the already-open rewind store is read-only; `project::state_dir`
+    /// would create missing state while merely validating a checkpoint.
+    fn management_state_dir(&self) -> Result<&Path, WorkspaceError> {
+        if self.store_root.file_name().and_then(|name| name.to_str()) != Some("rewind-workspace") {
+            return Err(WorkspaceError::new(ErrorKind::InvalidStore));
+        }
+        self.store_root
+            .parent()
+            .filter(|state| state.is_absolute())
+            .ok_or_else(|| WorkspaceError::new(ErrorKind::InvalidStore))
     }
 
     fn load_manifest(&self, id: &ManifestId) -> Result<StoredManifest, WorkspaceError> {
@@ -2069,6 +2344,7 @@ fn project_mutation_error(error: crate::project_mutation::ProjectMutationError) 
 fn manifest_from_snapshot(
     id: ManifestId,
     snapshot: &Snapshot,
+    management_checkpoint: Option<ManagementRewindCheckpointV1>,
 ) -> Result<StoredManifest, WorkspaceError> {
     let root = fs::metadata(&snapshot.source_path)
         .map_err(|_| WorkspaceError::at(ErrorKind::InvalidProject, &snapshot.source_path))?;
@@ -2111,7 +2387,14 @@ fn manifest_from_snapshot(
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(StoredManifest {
-        version: MANIFEST_VERSION,
+        // Recovery may persist an observation derived from a pre-v2
+        // transaction. Preserve that unknown provenance as v1 instead of
+        // fabricating an empty management checkpoint in a v2 manifest.
+        version: if management_checkpoint.is_some() {
+            MANIFEST_VERSION
+        } else {
+            1
+        },
         id,
         project_root: snapshot.source_path.clone(),
         root_device: root.dev(),
@@ -2119,6 +2402,7 @@ fn manifest_from_snapshot(
         captured_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
+        management_checkpoint,
         entries,
         exclusions,
     })
@@ -2859,6 +3143,46 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn completed_c10(fixture: &Fixture, lease: &ProjectLease) {
+        use crate::management_effect::{
+            ManagementEffectHashV1, ManagementEffectScopeV1, ManagementInventoryIdV1,
+            ManagementOperationIdV1, ManagementPermissionScopeV1, ManagementRewindDispositionV1,
+            PrepareManagementEffectOutcomeV1, PrepareManagementEffectV1,
+        };
+
+        let state = fixture.store.parent().unwrap();
+        let effects =
+            ManagementEffectStoreV1::open_at_state_dir(&fixture.project, state, lease).unwrap();
+        let request = PrepareManagementEffectV1 {
+            operation_id: ManagementOperationIdV1::random().unwrap(),
+            inventory: ManagementInventoryIdV1::parse("C10").unwrap(),
+            scope: ManagementEffectScopeV1 {
+                project: effects.project_scope_hash(),
+                session: None,
+                generation: 0,
+                revision: 0,
+                permission: ManagementPermissionScopeV1::Remote,
+                account_binding: Some(ManagementEffectHashV1::digest(b"account")),
+            },
+            request_hash: ManagementEffectHashV1::digest(b"c10 request"),
+            rewind: ManagementRewindDispositionV1::IrreversibleRemote,
+        };
+        let PrepareManagementEffectOutcomeV1::Prepared(prepared) = effects
+            .prepare(lease, effects.cursor().unwrap(), request)
+            .unwrap()
+        else {
+            panic!("fresh C10 must prepare");
+        };
+        let started = effects.start(lease, &prepared).unwrap();
+        effects
+            .complete_started(
+                lease,
+                &started,
+                ManagementEffectHashV1::digest(b"c10 receipt"),
+            )
+            .unwrap();
+    }
+
     fn store_snapshot(root: &Path) -> BTreeMap<PathBuf, (u32, SystemTime, Option<Vec<u8>>)> {
         let mut result = BTreeMap::new();
         let mut pending = vec![root.to_path_buf()];
@@ -2892,7 +3216,10 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
             let project = root.join("project");
-            let store = root.join("store");
+            let state = root.join("state");
+            fs::create_dir(&state).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+            let store = state.join("rewind-workspace");
             fs::create_dir(&project).unwrap();
             let owner = WorkspaceOwner::open(
                 &project,
@@ -2955,6 +3282,129 @@ mod tests {
             self.owner.write_marker(&marker).unwrap();
             id
         }
+    }
+
+    #[test]
+    fn completed_project_wide_c10_blocks_restore_before_transaction_or_file_write() {
+        let fixture = Fixture::new();
+        fs::write(fixture.project.join("file.txt"), b"pre").unwrap();
+        let pre = fixture.owner.capture(&fixture.policy()).unwrap();
+        let lease = fixture.owner.try_mutation().unwrap();
+        completed_c10(&fixture, &lease);
+        let checkpoint = fixture
+            .owner
+            .management_checkpoint_with_lease(&lease)
+            .unwrap();
+        fs::write(fixture.project.join("file.txt"), b"post").unwrap();
+        let post = fixture
+            .owner
+            .capture_with_management_checkpoint_with_lease(&lease, &fixture.policy(), checkpoint)
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .owner
+                .verify_rewind_management_with_lease(&lease, &post, &pre, true)
+                .unwrap(),
+            ManagementRewindCrossingV1::Blocked { .. }
+        ));
+        assert!(matches!(
+            fixture
+                .owner
+                .verify_rewind_management_with_lease(&lease, &post, &pre, false)
+                .unwrap(),
+            ManagementRewindCrossingV1::Blocked { .. }
+        ));
+        drop(lease);
+        let transactions = fixture.store.join("transactions");
+        let before = store_snapshot(&transactions);
+        assert_eq!(
+            fixture.owner.restore(&post, &pre).unwrap_err().kind,
+            ErrorKind::IneligiblePolicy
+        );
+        assert_eq!(store_snapshot(&transactions), before);
+        assert_eq!(fs::read(fixture.project.join("file.txt")).unwrap(), b"post");
+    }
+
+    #[test]
+    fn terminal_c10_before_pre_checkpoint_does_not_block_a_later_range() {
+        let fixture = Fixture::new();
+        let lease = fixture.owner.try_mutation().unwrap();
+        completed_c10(&fixture, &lease);
+        let pre_checkpoint = fixture
+            .owner
+            .management_checkpoint_with_lease(&lease)
+            .unwrap();
+        let pre = fixture
+            .owner
+            .capture_with_management_checkpoint_with_lease(
+                &lease,
+                &fixture.policy(),
+                pre_checkpoint,
+            )
+            .unwrap();
+        fs::write(fixture.project.join("file.txt"), b"later").unwrap();
+        let post_checkpoint = fixture
+            .owner
+            .management_checkpoint_with_lease(&lease)
+            .unwrap();
+        let post = fixture
+            .owner
+            .capture_with_management_checkpoint_with_lease(
+                &lease,
+                &fixture.policy(),
+                post_checkpoint,
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .owner
+                .verify_rewind_management_with_lease(&lease, &post, &pre, true)
+                .unwrap(),
+            ManagementRewindCrossingV1::Clear
+        ));
+    }
+
+    #[test]
+    fn legacy_manifest_without_management_checkpoint_cannot_verify_rewind() {
+        let fixture = Fixture::new();
+        let pre = fixture.owner.capture(&fixture.policy()).unwrap();
+        let path = fixture.owner.manifest_path(&pre);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["version"] = serde_json::Value::from(1);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("management_checkpoint");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let lease = fixture.owner.try_mutation().unwrap();
+        assert_eq!(
+            fixture
+                .owner
+                .verify_rewind_management_with_lease(&lease, &pre, &pre, false)
+                .unwrap_err()
+                .kind,
+            ErrorKind::IneligiblePolicy
+        );
+    }
+
+    #[test]
+    fn supplied_capture_checkpoint_must_still_be_the_current_lease_checkpoint() {
+        let fixture = Fixture::new();
+        let lease = fixture.owner.try_mutation().unwrap();
+        let stale = fixture
+            .owner
+            .management_checkpoint_with_lease(&lease)
+            .unwrap();
+        completed_c10(&fixture, &lease);
+        assert_eq!(
+            fixture
+                .owner
+                .capture_with_management_checkpoint_with_lease(&lease, &fixture.policy(), stale,)
+                .unwrap_err()
+                .kind,
+            ErrorKind::IneligiblePolicy
+        );
     }
 
     #[test]
@@ -3730,7 +4180,10 @@ mod tests {
                 let temp = tempfile::tempdir().unwrap();
                 let root = temp.path().canonicalize().unwrap();
                 let project = root.join("project");
-                let store = root.join("store");
+                let state = root.join("state");
+                fs::create_dir(&state).unwrap();
+                fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+                let store = state.join("rewind-workspace");
                 fs::create_dir(&project).unwrap();
                 let owner =
                     WorkspaceOwner::open(&project, &store, RewindLimits::default()).unwrap();

@@ -2,25 +2,30 @@
 //! Sources are fixed files under the trusted home; values stay host-side and
 //! are bound to a proposal by a per-owner HMAC. Nothing here saves or grants.
 
+use polaris_mcp::registration::{Destination, Server};
+#[cfg(unix)]
 use polaris_mcp::{
-    registration::{
-        Capabilities, Destination, ProtocolProfile, Server, Timeouts, normalize_http_url,
-    },
+    registration::{Capabilities, ProtocolProfile, Timeouts, normalize_http_url},
     store::Snapshot,
 };
+#[cfg(unix)]
 use serde_json::Value;
+#[cfg(any(unix, test))]
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs,
-    io::Read,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
+#[cfg(unix)]
+use std::{fs, io::Read, os::unix::fs::OpenOptionsExt};
 
+#[cfg(unix)]
 const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(unix)]
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(unix)]
 const BROAD_PREFIXES: &[&str] = &["/usr", "/usr/local", "/opt", "/opt/homebrew", "/opt/local"];
+#[cfg(any(unix, test))]
 const CREDENTIAL_FLAGS: &[&str] = &[
     "token",
     "secret",
@@ -32,6 +37,7 @@ const CREDENTIAL_FLAGS: &[&str] = &[
     "credential",
     "bearer",
 ];
+#[cfg(any(unix, test))]
 const TOKEN_PREFIXES: &[&str] = &[
     "sk-",
     "ghp_",
@@ -49,11 +55,15 @@ const TOKEN_PREFIXES: &[&str] = &[
 ];
 pub mod launcher;
 
+#[cfg(unix)]
 const LAUNCHERS: &[&str] = &[
     "npx", "npm", "pnpm", "yarn", "bunx", "bun", "uvx", "uv", "pipx", "deno", "docker",
 ];
+#[cfg(unix)]
 const SHIM_MARKERS: &[&str] = &["/shims/", "/.asdf/", "/.mise/", "/.volta/"];
+#[cfg(unix)]
 const RUNTIME_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib", "/System/Library"];
+#[cfg(unix)]
 const ENV: &str = "/usr/bin/env";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,12 +162,14 @@ pub struct Detector {
 }
 
 /// Detection target and the registry revision that names new secret references.
+#[cfg(unix)]
 struct Scope<'a> {
     project: &'a str,
     revision: u64,
 }
 
 /// Registers the fixed sources before any model-visible read in this process.
+#[cfg(unix)]
 pub fn protect_sources(home: &Path) -> Result<(), polaris_mcp::Error> {
     // Register every source even when one of them cannot be registered.
     let results = [home.join(".codex/config.toml"), home.join(".claude.json")]
@@ -168,6 +180,12 @@ pub fn protect_sources(home: &Path) -> Result<(), polaris_mcp::Error> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn protect_sources(_home: &Path) -> Result<(), polaris_mcp::Error> {
+    Err(polaris_mcp::Error::Protection)
+}
+
+#[cfg(unix)]
 fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0; N];
     fs::File::open("/dev/urandom")
@@ -176,10 +194,12 @@ fn random<const N: usize>() -> [u8; N] {
     bytes
 }
 
+#[cfg(any(unix, test))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+#[cfg(any(unix, test))]
 fn hmac(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
     let mut inner = Sha256::new();
     let mut outer = Sha256::new();
@@ -193,6 +213,7 @@ fn hmac(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
+#[cfg(any(unix, test))]
 fn sanitized_id(name: &str, identity: &str) -> String {
     let hash = hex(&Sha256::digest(identity.as_bytes()));
     let base: String = name
@@ -212,6 +233,7 @@ fn sanitized_id(name: &str, identity: &str) -> String {
 /// Credentials cannot be stored as plain registry fields. Refuse flag/value
 /// pairs, credential-named header lines, known token prefixes in any token,
 /// userinfo and long opaque values.
+#[cfg(any(unix, test))]
 fn credential_like(args: &[String]) -> bool {
     let opaque = |text: &str| {
         text.len() >= 32
@@ -257,6 +279,7 @@ fn credential_like(args: &[String]) -> bool {
     })
 }
 
+#[cfg(any(unix, test))]
 fn url_credential_like(url: &str) -> bool {
     credential_like(&[url.to_owned()])
         || url
@@ -274,6 +297,7 @@ fn url_credential_like(url: &str) -> bool {
 }
 
 /// A regular, bounded file opened without following the final link.
+#[cfg(unix)]
 fn open_regular(path: &Path) -> Result<fs::File, Reason> {
     let file = fs::OpenOptions::new()
         .read(true)
@@ -287,6 +311,7 @@ fn open_regular(path: &Path) -> Result<fs::File, Reason> {
     Ok(file)
 }
 
+#[cfg(unix)]
 fn file_digest(path: &Path) -> Result<String, Reason> {
     let mut hasher = Sha256::new();
     std::io::copy(
@@ -297,6 +322,7 @@ fn file_digest(path: &Path) -> Result<String, Reason> {
     Ok(hex(&hasher.finalize()))
 }
 
+#[cfg(unix)]
 impl Detector {
     pub fn new(home: PathBuf, path: Vec<PathBuf>) -> Self {
         let _ = protect_sources(&home);
@@ -964,4 +990,8 @@ pub use register::Admission;
 pub use tool::{Authorization, HOST_PATH, SetupTool};
 
 #[cfg(test)]
+mod data_tests;
+#[cfg(all(test, unix))]
 mod tests;
+#[cfg(all(test, windows))]
+mod windows_tests;

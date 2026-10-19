@@ -154,6 +154,13 @@ pub(crate) struct RewindCandidatePlan {
 }
 
 impl RewindCandidatePlan {
+    pub(crate) fn workspace_manifests(&self) -> (&str, &str) {
+        (
+            &self.metadata.workspace_post_manifest_id,
+            &self.metadata.workspace_pre_manifest_id,
+        )
+    }
+
     pub(crate) fn estimated_file_bytes(&self) -> u64 {
         self.expected
             .raw_offset
@@ -457,10 +464,17 @@ pub(crate) fn validate_complete_turn_events<'a>(
     if !events.peek().is_some_and(|event| event.starts_turn) {
         return Err(invalid("原文ターンがありません"));
     }
+    validate_complete_messages(events.map(|event| &event.message))
+}
+
+/// Structural round-trip validation only; Message-only history carries no
+/// starts-turn or prompt authorization provenance.
+pub(crate) fn validate_complete_messages<'a>(
+    messages: impl Iterator<Item = &'a Message>,
+) -> io::Result<()> {
     let mut pending = BTreeSet::new();
     let mut seen = BTreeSet::new();
-    for event in events {
-        let msg = &event.message;
+    for msg in messages {
         if !pending.is_empty() && msg.role != Role::Tool {
             return Err(invalid("tool結果が未完了です"));
         }
@@ -493,9 +507,76 @@ pub struct ConversationStore {
     directory: PathBuf,
     project_id: String,
     session_id: String,
+    #[cfg(all(test, windows))]
+    windows: Option<WindowsConversationStore>,
 }
 
 impl ConversationStore {
+    #[cfg(all(test, windows))]
+    pub fn create(data_root: &Path, state: ConversationStateV2) -> io::Result<Self> {
+        state.validate()?;
+        windows_state_admission(&state)?;
+        if state.generation != 0
+            || state.raw_commit_offset != 0
+            || state.raw_commit_hash != content_hash(&[])
+            || !state.recent_turn_ids.is_empty()
+            || !state.visible_summary_ids.is_empty()
+            || !state.visible_structured_publication_ids.is_empty()
+            || state.structured_coverage.is_some()
+        {
+            return Err(invalid("新規セッションの状態が不正です"));
+        }
+        let windows = WindowsConversationStore::create(data_root, &state.session_id)?;
+        windows.atomic_write("state.json", &serde_json::to_vec(&state)?)?;
+        windows.directory.sync_all().map_err(windows_error)?;
+        Ok(Self {
+            directory: data_root.join("sessions-v2").join(&state.session_id),
+            project_id: state.project_id,
+            session_id: state.session_id,
+            windows: Some(windows),
+        })
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn open_with_reader(
+        data_root: &Path,
+        project_id: &str,
+        session_id: &str,
+        read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Self> {
+        if !valid_session_id(session_id) {
+            return Err(invalid("セッションIDが不正です"));
+        }
+        let store = Self {
+            directory: data_root.join("sessions-v2").join(session_id),
+            project_id: project_id.into(),
+            session_id: session_id.into(),
+            windows: Some(WindowsConversationStore::open(data_root, session_id)?),
+        };
+        store.lock()?.snapshot_with_reader(read)?;
+        Ok(store)
+    }
+
+    #[cfg(all(test, windows))]
+    fn windows(&self) -> io::Result<&WindowsConversationStore> {
+        self.windows.as_ref().ok_or_else(windows_unsupported)
+    }
+
+    #[cfg(all(test, windows))]
+    pub fn lock(&self) -> io::Result<LockedConversation<'_>> {
+        let file = self
+            .windows()?
+            .directory
+            .open_file(std::ffi::OsStr::new("writer.lock"), true, false)
+            .map_err(windows_error)?;
+        file.try_lock().map_err(io::Error::other)?;
+        Ok(LockedConversation {
+            store: self,
+            _lock: file,
+        })
+    }
+
+    #[cfg(unix)]
     pub fn create(data_root: &Path, state: ConversationStateV2) -> io::Result<Self> {
         state.validate()?;
         if state.generation != 0
@@ -527,11 +608,20 @@ impl ConversationStore {
             session_id: state.session_id,
         })
     }
+    #[cfg(all(not(unix), not(all(test, windows))))]
+    pub fn create(_data_root: &Path, _state: ConversationStateV2) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformでは会話保存の保護を確認できません",
+        ))
+    }
+
     pub fn open(data_root: &Path, project_id: &str, session_id: &str) -> io::Result<Self> {
         Self::open_with_reader(data_root, project_id, session_id, &mut |path| {
             fs::read(path)
         })
     }
+    #[cfg(unix)]
     pub(crate) fn open_with_reader(
         data_root: &Path,
         project_id: &str,
@@ -552,12 +642,26 @@ impl ConversationStore {
         store.lock()?.snapshot_with_reader(read)?;
         Ok(store)
     }
+
+    #[cfg(all(not(unix), not(all(test, windows))))]
+    pub(crate) fn open_with_reader(
+        _data_root: &Path,
+        _project_id: &str,
+        _session_id: &str,
+        _read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformでは会話保存の保護を確認できません",
+        ))
+    }
     pub fn directory(&self) -> &Path {
         &self.directory
     }
     pub fn rewind_branch_metadata(&self) -> io::Result<Option<RewindBranchMetadataV1>> {
         self.rewind_branch_metadata_with_reader(&mut |path| fs::read(path))
     }
+    #[cfg(not(all(test, windows)))]
     pub(crate) fn rewind_branch_metadata_with_reader(
         &self,
         read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
@@ -580,6 +684,23 @@ impl ConversationStore {
         validate_rewind_branch_metadata(&metadata)?;
         Ok(Some(metadata))
     }
+    #[cfg(all(test, windows))]
+    pub(crate) fn rewind_branch_metadata_with_reader(
+        &self,
+        _read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Option<RewindBranchMetadataV1>> {
+        self.windows()?.require_absent("rewind-branch-v1.json")?;
+        Ok(None)
+    }
+
+    #[cfg(all(test, windows))]
+    pub fn workspace_head_binding(&self) -> io::Result<Option<WorkspaceHeadBindingV1>> {
+        self.windows()?
+            .require_absent("workspace-head-binding-v1.json")?;
+        Ok(None)
+    }
+
+    #[cfg(not(all(test, windows)))]
     pub fn workspace_head_binding(&self) -> io::Result<Option<WorkspaceHeadBindingV1>> {
         let path = self.directory.join("workspace-head-binding-v1.json");
         if !path.exists() {
@@ -686,43 +807,22 @@ impl ConversationStore {
             .directory
             .join("snapshots")
             .join(format!("{generation}-{raw_hash}.json"));
-        reject_symlink(&path)?;
-        let snapshot: ConversationSnapshot = serde_json::from_slice(&fs::read(path)?)?;
-        if snapshot.state.project_id != self.project_id
-            || snapshot.state.session_id != self.session_id
-            || snapshot.state.generation != generation
-            || snapshot.raw_hash != raw_hash
-            || snapshot.raw_offset > u64::try_from(usize::MAX).unwrap_or(u64::MAX)
-        {
-            return Err(invalid("原文snapshotの所属・世代・hashが一致しません"));
-        }
-        let mut raw = Vec::new();
-        for event in &snapshot.events {
-            serde_json::to_writer(&mut raw, event)?;
-            raw.push(b'\n');
-        }
-        if raw.len() as u64 != snapshot.raw_offset || content_hash(&raw) != snapshot.raw_hash {
-            return Err(invalid("原文snapshot本文のhash・長さが一致しません"));
-        }
-        snapshot.state.validate()?;
-        for (index, event) in snapshot.events.iter().enumerate() {
-            validate_event(
-                event,
-                index.checked_sub(1).and_then(|i| snapshot.events.get(i)),
-            )?;
-            if event.epoch > snapshot.state.epoch {
-                return Err(invalid("原文snapshotのepochが不正です"));
-            }
-        }
-        if let Some(coverage) = &snapshot.state.structured_coverage {
-            validate_coverage_boundary(
-                &raw,
-                &snapshot,
-                snapshot.state.raw_commit_offset,
-                coverage,
-            )?;
-        }
-        Ok(snapshot)
+        #[cfg(not(all(test, windows)))]
+        let bytes = {
+            reject_symlink(&path)?;
+            fs::read(&path)?
+        };
+        #[cfg(all(test, windows))]
+        let bytes = self
+            .windows()?
+            .read_snapshot(path.file_name().ok_or_else(windows_unsupported)?)?;
+        decode_saved_snapshot(
+            &bytes,
+            &self.project_id,
+            &self.session_id,
+            generation,
+            raw_hash,
+        )
     }
     /// The v2 root inferred from this session's fixed directory layout.
     pub fn data_root(&self) -> io::Result<&Path> {
@@ -731,6 +831,7 @@ impl ConversationStore {
             .and_then(Path::parent)
             .ok_or_else(|| invalid("セッション保存先が不正です"))
     }
+    #[cfg(unix)]
     pub fn lock(&self) -> io::Result<LockedConversation<'_>> {
         reject_symlink(&self.directory.join("writer.lock"))?;
         let file = private_file(&self.directory.join("writer.lock"), false)?;
@@ -740,13 +841,24 @@ impl ConversationStore {
             _lock: file,
         })
     }
+
+    #[cfg(all(not(unix), not(all(test, windows))))]
+    pub fn lock(&self) -> io::Result<LockedConversation<'_>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformでは会話保存の保護を確認できません",
+        ))
+    }
 }
 
 /// Dropping the guard explicitly releases the OS lock, including cancellation.
 /// Do not retain this across provider calls.
 pub struct LockedConversation<'a> {
     store: &'a ConversationStore,
+    #[cfg(not(all(test, windows)))]
     _lock: File,
+    #[cfg(all(test, windows))]
+    _lock: polaris_auth::protection::WindowsFamilyFile,
 }
 impl Drop for LockedConversation<'_> {
     fn drop(&mut self) {
@@ -1089,6 +1201,7 @@ impl ConversationStore {
         Ok(metadata)
     }
 
+    #[cfg(unix)]
     fn create_rewind_candidate(
         data_root: &Path,
         expected: ConversationSnapshot,
@@ -1136,12 +1249,25 @@ impl ConversationStore {
         child.lock()?.check_snapshot(&expected)?;
         Ok(child)
     }
+
+    #[cfg(not(unix))]
+    fn create_rewind_candidate(
+        _data_root: &Path,
+        _expected: ConversationSnapshot,
+        _metadata: &RewindBranchMetadataV1,
+    ) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformでは会話保存の保護を確認できません",
+        ))
+    }
 }
 
 impl LockedConversation<'_> {
     fn load_rewind_boundaries(&self) -> io::Result<Vec<RewindBoundaryV1>> {
         self.load_rewind_boundaries_with_reader(&mut |path| fs::read(path))
     }
+    #[cfg(not(all(test, windows)))]
     fn load_rewind_boundaries_with_reader(
         &self,
         read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
@@ -1151,24 +1277,18 @@ impl LockedConversation<'_> {
             return Ok(Vec::new());
         }
         reject_symlink(&path)?;
-        let boundaries: Vec<RewindBoundaryV1> = serde_json::from_slice(&read(&path)?)?;
-        let mut ids = BTreeSet::new();
-        let mut previous: Option<&RewindBoundaryV1> = None;
-        for boundary in &boundaries {
-            validate_rewind_boundary(boundary)?;
-            if !ids.insert(&boundary.boundary_id) {
-                return Err(invalid("rewind境界IDが重複しています"));
-            }
-            if let Some(previous) = previous
-                && previous.project_id == boundary.project_id
-                && previous.session_id == boundary.session_id
-                && previous.source_generation > boundary.source_generation
-            {
-                return Err(invalid("rewind境界の順序が不正です"));
-            }
-            previous = Some(boundary);
-        }
-        Ok(boundaries)
+        decode_rewind_boundaries(&read(&path)?)
+    }
+
+    #[cfg(all(test, windows))]
+    fn load_rewind_boundaries_with_reader(
+        &self,
+        _read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Vec<RewindBoundaryV1>> {
+        self.store
+            .windows()?
+            .require_absent("rewind-boundaries-v1.json")?;
+        Ok(Vec::new())
     }
 
     fn save_rewind_boundaries(&self, boundaries: &[RewindBoundaryV1]) -> io::Result<()> {
@@ -1211,56 +1331,35 @@ impl LockedConversation<'_> {
         read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
     ) -> io::Result<ConversationSnapshot> {
         let state_path = self.store.directory.join("state.json");
-        reject_symlink(&state_path)?;
-        let state: ConversationStateV2 = serde_json::from_slice(&read(&state_path)?)?;
+        #[cfg(not(all(test, windows)))]
+        let state_bytes = {
+            reject_symlink(&state_path)?;
+            read(&state_path)?
+        };
+        #[cfg(all(test, windows))]
+        let state_bytes = {
+            let _ = (read, &state_path);
+            self.store.windows()?.read("state.json")?
+        };
+        let state: ConversationStateV2 = serde_json::from_slice(&state_bytes)?;
         state.validate()?;
+        #[cfg(all(test, windows))]
+        windows_state_admission(&state)?;
         if state.project_id != self.store.project_id || state.session_id != self.store.session_id {
             return Err(invalid("セッションの所属が一致しません"));
         }
         let raw_path = self.store.directory.join("raw.jsonl");
-        reject_symlink(&raw_path)?;
-        let bytes = read(&raw_path)?;
-        let committed =
-            usize::try_from(state.raw_commit_offset).map_err(|_| invalid("原文範囲が不正です"))?;
-        if committed > bytes.len()
-            || content_hash(&bytes[..committed]) != state.raw_commit_hash
-            || (committed > 0 && bytes[committed - 1] != b'\n')
-        {
-            return Err(invalid("保存済み原文のhashが一致しません"));
-        }
-        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-            return Err(invalid(
-                "原文の末尾が未完了です。原文を保持して停止しました",
-            ));
-        }
-        let mut events = Vec::<RawEventV2>::new();
-        for line in bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            let event: RawEventV2 = serde_json::from_slice(line)?;
-            validate_event(&event, events.last())?;
-            if event.epoch > state.epoch {
-                return Err(invalid("未公開epochの原文があります"));
-            }
-            events.push(event);
-        }
-        let snapshot = ConversationSnapshot {
-            state,
-            raw_hash: content_hash(&bytes),
-            raw_offset: bytes.len() as u64,
-            events,
+        #[cfg(not(all(test, windows)))]
+        let bytes = {
+            reject_symlink(&raw_path)?;
+            read(&raw_path)?
         };
-        snapshot.validate_admission_receipts()?;
-        if let Some(coverage) = &snapshot.state.structured_coverage {
-            validate_coverage_boundary(
-                &bytes,
-                &snapshot,
-                snapshot.state.raw_commit_offset,
-                coverage,
-            )?;
-        }
-        Ok(snapshot)
+        #[cfg(all(test, windows))]
+        let bytes = {
+            let _ = raw_path;
+            self.store.windows()?.read("raw.jsonl")?
+        };
+        decode_raw_snapshot(state, bytes)
     }
     pub fn append(
         &mut self,
@@ -1305,8 +1404,16 @@ impl LockedConversation<'_> {
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
         let path = self.store.directory.join("raw.jsonl");
-        reject_symlink(&path)?;
-        let mut file = OpenOptions::new().append(true).open(path)?;
+        #[cfg(not(all(test, windows)))]
+        let mut file = {
+            reject_symlink(&path)?;
+            OpenOptions::new().append(true).open(path)?
+        };
+        #[cfg(all(test, windows))]
+        let mut file = {
+            let _ = path;
+            self.store.windows()?.append_file()?
+        };
         file.write_all(&line)?;
         fail_point("raw-sync")?;
         file.sync_all()?;
@@ -1322,6 +1429,11 @@ impl LockedConversation<'_> {
             expected.state.generation, expected.raw_hash
         ));
         let body = serde_json::to_vec(expected)?;
+        #[cfg(all(test, windows))]
+        self.store
+            .windows()?
+            .save_snapshot(path.file_name().ok_or_else(windows_unsupported)?, &body)?;
+        #[cfg(not(all(test, windows)))]
         if path.exists() {
             reject_symlink(&path)?;
             if fs::read(&path)? != body {
@@ -1368,6 +1480,8 @@ impl LockedConversation<'_> {
         expected: &ConversationSnapshot,
         mut next: ConversationStateV2,
     ) -> io::Result<()> {
+        #[cfg(all(test, windows))]
+        windows_state_admission(&next)?;
         next.generation = next
             .generation
             .checked_add(1)
@@ -1378,7 +1492,10 @@ impl LockedConversation<'_> {
         next.recent_turn_ids = turns.into_iter().rev().take(REAL_TURN_WINDOW).collect();
         next.recent_turn_ids.reverse();
         if let Some(coverage) = &next.structured_coverage {
+            #[cfg(not(all(test, windows)))]
             let bytes = fs::read(self.store.directory.join("raw.jsonl"))?;
+            #[cfg(all(test, windows))]
+            let bytes = self.store.windows()?.read("raw.jsonl")?;
             validate_coverage_boundary(&bytes, expected, expected.raw_offset, coverage)?;
         }
         next.validate()?;
@@ -1400,10 +1517,15 @@ impl LockedConversation<'_> {
                 binding
             });
         fail_point("marker")?;
+        #[cfg(not(all(test, windows)))]
         atomic_write(
             &self.store.directory.join("state.json"),
             &serde_json::to_vec(&next)?,
         )?;
+        #[cfg(all(test, windows))]
+        self.store
+            .windows()?
+            .atomic_write("state.json", &serde_json::to_vec(&next)?)?;
         if let Some(binding) = carried_binding {
             atomic_write(
                 &self.store.directory.join("workspace-head-binding-v1.json"),
@@ -1465,10 +1587,19 @@ impl LockedConversation<'_> {
         next.visible_structured_publication_ids.clear();
         next.structured_coverage = None;
         next.ancestors.clear();
-        atomic_write(
-            &self.store.directory.join("state.json"),
-            &serde_json::to_vec(&next)?,
-        )
+        #[cfg(not(all(test, windows)))]
+        {
+            atomic_write(
+                &self.store.directory.join("state.json"),
+                &serde_json::to_vec(&next)?,
+            )
+        }
+        #[cfg(all(test, windows))]
+        {
+            self.store
+                .windows()?
+                .atomic_write("state.json", &serde_json::to_vec(&next)?)
+        }
     }
 }
 
@@ -1529,7 +1660,7 @@ pub(crate) fn validate_event(event: &RawEventV2, previous: Option<&RawEventV2>) 
     }
     Ok(())
 }
-fn valid_session_id(id: &str) -> bool {
+pub(crate) fn valid_session_id(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(i, byte)| {
             if [8, 13, 18, 23].contains(&i) {
@@ -1645,7 +1776,138 @@ fn validate_rewind_boundary_for_branch(
     }
     Ok(())
 }
-fn validate_rewind_branch_metadata(metadata: &RewindBranchMetadataV1) -> io::Result<()> {
+
+/// Decoded observations only; these functions grant no filesystem or migration authority.
+pub(crate) fn decode_saved_snapshot(
+    bytes: &[u8],
+    project_id: &str,
+    session_id: &str,
+    generation: u64,
+    raw_hash: &str,
+) -> io::Result<ConversationSnapshot> {
+    if !valid_hash(raw_hash) {
+        return Err(invalid("原文snapshot hashが不正です"));
+    }
+    let snapshot: ConversationSnapshot = serde_json::from_slice(bytes)?;
+    if snapshot.state.project_id != project_id
+        || snapshot.state.session_id != session_id
+        || snapshot.state.generation != generation
+        || snapshot.raw_hash != raw_hash
+        || snapshot.raw_offset > u64::try_from(usize::MAX).unwrap_or(u64::MAX)
+    {
+        return Err(invalid("原文snapshotの所属・世代・hashが一致しません"));
+    }
+    let mut raw = Vec::new();
+    for event in &snapshot.events {
+        serde_json::to_writer(&mut raw, event)?;
+        raw.push(b'\n');
+    }
+    if raw.len() as u64 != snapshot.raw_offset || content_hash(&raw) != snapshot.raw_hash {
+        return Err(invalid("原文snapshot本文のhash・長さが一致しません"));
+    }
+    snapshot.state.validate()?;
+    for (index, event) in snapshot.events.iter().enumerate() {
+        validate_event(
+            event,
+            index.checked_sub(1).and_then(|i| snapshot.events.get(i)),
+        )?;
+        if event.epoch > snapshot.state.epoch {
+            return Err(invalid("原文snapshotのepochが不正です"));
+        }
+    }
+    if let Some(coverage) = &snapshot.state.structured_coverage {
+        validate_coverage_boundary(&raw, &snapshot, snapshot.state.raw_commit_offset, coverage)?;
+    }
+    Ok(snapshot)
+}
+pub(crate) fn decode_raw_snapshot(
+    state: ConversationStateV2,
+    bytes: Vec<u8>,
+) -> io::Result<ConversationSnapshot> {
+    state.validate()?;
+    let committed =
+        usize::try_from(state.raw_commit_offset).map_err(|_| invalid("原文範囲が不正です"))?;
+    if committed > bytes.len()
+        || content_hash(&bytes[..committed]) != state.raw_commit_hash
+        || (committed > 0 && bytes[committed - 1] != b'\n')
+    {
+        return Err(invalid("保存済み原文のhashが一致しません"));
+    }
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        return Err(invalid(
+            "原文の末尾が未完了です。原文を保持して停止しました",
+        ));
+    }
+    let mut events = Vec::<RawEventV2>::new();
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let event: RawEventV2 = serde_json::from_slice(line)?;
+        validate_event(&event, events.last())?;
+        if event.epoch > state.epoch {
+            return Err(invalid("未公開epochの原文があります"));
+        }
+        events.push(event);
+    }
+    let snapshot = ConversationSnapshot {
+        state,
+        raw_hash: content_hash(&bytes),
+        raw_offset: bytes.len() as u64,
+        events,
+    };
+    snapshot.validate_admission_receipts()?;
+    if let Some(coverage) = &snapshot.state.structured_coverage {
+        validate_coverage_boundary(
+            &bytes,
+            &snapshot,
+            snapshot.state.raw_commit_offset,
+            coverage,
+        )?;
+    }
+    Ok(snapshot)
+}
+/// Migration also checks receipts and the committed prefix of historical snapshots.
+pub(crate) fn validate_migration_snapshot(snapshot: &ConversationSnapshot) -> io::Result<()> {
+    snapshot.validate_admission_receipts()?;
+    let mut raw = Vec::new();
+    for event in &snapshot.events {
+        serde_json::to_writer(&mut raw, event)?;
+        raw.push(b'\n');
+    }
+    let committed = usize::try_from(snapshot.state.raw_commit_offset)
+        .map_err(|_| invalid("原文範囲が不正です"))?;
+    if committed > raw.len()
+        || content_hash(&raw[..committed]) != snapshot.state.raw_commit_hash
+        || (committed > 0 && raw[committed - 1] != b"\n"[0])
+    {
+        return Err(invalid("保存済み原文のhashが一致しません"));
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_rewind_boundaries(bytes: &[u8]) -> io::Result<Vec<RewindBoundaryV1>> {
+    let boundaries: Vec<RewindBoundaryV1> = serde_json::from_slice(bytes)?;
+    let mut ids = BTreeSet::new();
+    let mut previous: Option<&RewindBoundaryV1> = None;
+    for boundary in &boundaries {
+        validate_rewind_boundary(boundary)?;
+        if !ids.insert(&boundary.boundary_id) {
+            return Err(invalid("rewind境界IDが重複しています"));
+        }
+        if let Some(previous) = previous
+            && previous.project_id == boundary.project_id
+            && previous.session_id == boundary.session_id
+            && previous.source_generation > boundary.source_generation
+        {
+            return Err(invalid("rewind境界の順序が不正です"));
+        }
+        previous = Some(boundary);
+    }
+    Ok(boundaries)
+}
+
+pub(crate) fn validate_rewind_branch_metadata(metadata: &RewindBranchMetadataV1) -> io::Result<()> {
     if metadata.schema_version != REWIND_BOUNDARY_SCHEMA_VERSION
         || !valid_session_id(&metadata.origin_session_id)
         || !valid_hash(&metadata.branch_initial_raw_hash)
@@ -1665,7 +1927,7 @@ fn validate_rewind_branch_metadata(metadata: &RewindBranchMetadataV1) -> io::Res
     )?;
     validate_memory_raw_object_ids(&metadata.visible_memory_raw_object_ids)
 }
-fn validate_workspace_head_binding(binding: &WorkspaceHeadBindingV1) -> io::Result<()> {
+pub(crate) fn validate_workspace_head_binding(binding: &WorkspaceHeadBindingV1) -> io::Result<()> {
     if binding.schema_version != 1
         || !valid_session_id(&binding.session_id)
         || binding.project_id.is_empty()
@@ -1978,6 +2240,7 @@ fn reject_symlink(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn private_directory(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -1987,6 +2250,15 @@ fn private_directory(path: &Path) -> io::Result<()> {
     }
     builder.create(path)
 }
+
+#[cfg(not(unix))]
+fn private_directory(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "このplatformでは会話保存の保護を確認できません",
+    ))
+}
+#[cfg(not(all(test, windows)))]
 fn private_file(path: &Path, create: bool) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(create);
@@ -1996,6 +2268,10 @@ fn private_file(path: &Path, create: bool) -> io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
+}
+#[cfg(all(test, windows))]
+fn private_file(_path: &Path, _create: bool) -> io::Result<File> {
+    Err(windows_unsupported())
 }
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2017,18 +2293,220 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+#[cfg(all(test, windows))]
+fn windows_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "このWindows保存経路の保護は未対応です",
+    )
+}
+#[cfg(all(test, windows))]
+fn windows_error(error: polaris_auth::AuthError) -> io::Error {
+    match error {
+        polaris_auth::AuthError::Io(error) => error,
+        _ => windows_unsupported(),
+    }
+}
+#[cfg(all(test, windows))]
+pub(crate) fn windows_state_admission(state: &ConversationStateV2) -> io::Result<()> {
+    // Structured receipts and workflow/workspace owners retain their refusal.
+    if state.history_mode == HistoryMode::Structured10
+        || state.workflow_config.is_some()
+        || state.structured_coverage.is_some()
+        || !state.visible_structured_publication_ids.is_empty()
+    {
+        return Err(windows_unsupported());
+    }
+    Ok(())
+}
+#[cfg(all(test, windows))]
+#[derive(Clone, Debug)]
+struct WindowsConversationStore {
+    directory: std::sync::Arc<polaris_auth::protection::WindowsFamilyDirectory>,
+    snapshots: std::sync::Arc<polaris_auth::protection::WindowsFamilyDirectory>,
+}
+#[cfg(all(test, windows))]
+impl WindowsConversationStore {
+    fn root(path: &Path) -> io::Result<polaris_auth::protection::WindowsFamilyDirectory> {
+        polaris_auth::protection::WindowsFamilyDirectory::open_existing(path)
+            .map_err(|_| windows_unsupported())
+    }
+    fn child(
+        root: &polaris_auth::protection::WindowsFamilyDirectory,
+        name: &str,
+    ) -> io::Result<polaris_auth::protection::WindowsFamilyDirectory> {
+        let name = std::ffi::OsStr::new(name);
+        match root.child(name, false) {
+            Ok(value) => Ok(value),
+            Err(polaris_auth::AuthError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                match root.child(name, true) {
+                    Ok(value) => Ok(value),
+                    Err(polaris_auth::AuthError::Io(error))
+                        if error.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        root.child(name, false).map_err(windows_error)
+                    }
+                    Err(error) => Err(windows_error(error)),
+                }
+            }
+            Err(error) => Err(windows_error(error)),
+        }
+    }
+    fn create(data_root: &Path, id: &str) -> io::Result<Self> {
+        let root = Self::root(data_root)?;
+        let sessions = Self::child(&root, "sessions-v2")?;
+        root.sync_all().map_err(windows_error)?;
+        let directory = sessions
+            .child(std::ffi::OsStr::new(id), true)
+            .map_err(windows_error)?;
+        let snapshots = directory
+            .child(std::ffi::OsStr::new("snapshots"), true)
+            .map_err(windows_error)?;
+        for name in ["raw.jsonl", "writer.lock"] {
+            directory
+                .open_file(std::ffi::OsStr::new(name), true, true)
+                .map_err(windows_error)?
+                .sync_all()?;
+        }
+        snapshots.sync_all().map_err(windows_error)?;
+        directory.sync_all().map_err(windows_error)?;
+        sessions.sync_all().map_err(windows_error)?;
+        Ok(Self {
+            directory: std::sync::Arc::new(directory),
+            snapshots: std::sync::Arc::new(snapshots),
+        })
+    }
+    fn open(data_root: &Path, id: &str) -> io::Result<Self> {
+        let root = Self::root(data_root)?;
+        let sessions = root
+            .child(std::ffi::OsStr::new("sessions-v2"), false)
+            .map_err(windows_error)?;
+        let directory = sessions
+            .child(std::ffi::OsStr::new(id), false)
+            .map_err(windows_error)?;
+        let snapshots = directory
+            .child(std::ffi::OsStr::new("snapshots"), false)
+            .map_err(windows_error)?;
+        Ok(Self {
+            directory: std::sync::Arc::new(directory),
+            snapshots: std::sync::Arc::new(snapshots),
+        })
+    }
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        Self::read_at(&self.directory, std::ffi::OsStr::new(name))
+    }
+    fn read_at(
+        dir: &polaris_auth::protection::WindowsFamilyDirectory,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<Vec<u8>> {
+        let mut file = dir.open_file(name, false, false).map_err(windows_error)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)?;
+        Ok(bytes)
+    }
+    fn read_snapshot(&self, name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+        Self::read_at(&self.snapshots, name)
+    }
+    fn require_absent(&self, name: &str) -> io::Result<()> {
+        match self
+            .directory
+            .open_file(std::ffi::OsStr::new(name), false, false)
+        {
+            Err(polaris_auth::AuthError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            _ => Err(windows_unsupported()),
+        }
+    }
+    fn append_file(&self) -> io::Result<polaris_auth::protection::WindowsFamilyFile> {
+        let mut file = self
+            .directory
+            .open_file(std::ffi::OsStr::new("raw.jsonl"), true, false)
+            .map_err(windows_error)?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0))?;
+        Ok(file)
+    }
+    fn temporary() -> std::ffi::OsString {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        format!(
+            ".pending-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+        .into()
+    }
+    fn atomic_write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let temporary = Self::temporary();
+        let mut file = self
+            .directory
+            .open_file(&temporary, true, true)
+            .map_err(windows_error)?;
+        file.write_all(bytes)?;
+        fail_point("atomic_file_sync")?;
+        file.sync_all()?;
+        drop(file);
+        fail_point("atomic_rename")?;
+        self.directory
+            .replace(&temporary, std::ffi::OsStr::new(name))
+            .map_err(windows_error)?;
+        fail_point("atomic_directory_sync")?;
+        self.directory.sync_all().map_err(windows_error)
+    }
+    fn save_snapshot(&self, name: &std::ffi::OsStr, body: &[u8]) -> io::Result<()> {
+        match Self::read_at(&self.snapshots, name) {
+            Ok(existing) if existing == body => return Ok(()),
+            Ok(_) => return Err(invalid("同じsnapshot IDの内容が異なります")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let temporary = Self::temporary();
+        let mut file = self
+            .snapshots
+            .open_file(&temporary, true, true)
+            .map_err(windows_error)?;
+        file.write_all(body)?;
+        fail_point("atomic_file_sync")?;
+        file.sync_all()?;
+        drop(file);
+        fail_point("atomic_rename")?;
+        if !self
+            .snapshots
+            .link_no_replace(&temporary, name)
+            .map_err(windows_error)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "snapshot公開先が既にあります",
+            ));
+        }
+        self.snapshots
+            .unlink_file(&temporary)
+            .map_err(windows_error)?;
+        fail_point("atomic_directory_sync")?;
+        self.snapshots.sync_all().map_err(windows_error)?;
+        if Self::read_at(&self.snapshots, name)? != body {
+            return Err(invalid("snapshot公開後の内容が異なります"));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     const ID: &str = "00000000-0000-4000-8000-000000000001";
+    #[cfg(unix)]
     fn store(root: &Path) -> ConversationStore {
         store_with_mode(root, HistoryMode::Legacy)
     }
+    #[cfg(unix)]
     fn store_with_mode(root: &Path, history_mode: HistoryMode) -> ConversationStore {
         let mut state = ConversationStateV2::new("project".into(), ID.into()).unwrap();
         state.history_mode = history_mode;
         ConversationStore::create(root, state).unwrap()
     }
+    #[cfg(unix)]
     #[test]
     fn workspace_head_binding_is_durable_and_refuses_a_different_tree() {
         let dir = tempfile::tempdir().unwrap();
@@ -2075,6 +2553,7 @@ mod tests {
             lock.snapshot().unwrap().state.generation
         );
     }
+    #[cfg(unix)]
     #[test]
     fn roundtrip_publishes_gates_and_detects_stale_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -2104,6 +2583,7 @@ mod tests {
         assert!(lock.publish(&old, old.state.clone()).is_err());
         assert!(!dir.path().join("sessions").exists());
     }
+    #[cfg(unix)]
     #[test]
     fn structured_marker_is_opt_in_and_fork_freezes_exact_v3_publication_ids() {
         let dir = tempfile::tempdir().unwrap();
@@ -2138,6 +2618,7 @@ mod tests {
         );
         assert!(child_state.structured_coverage.is_none());
     }
+    #[cfg(unix)]
     #[test]
     fn coverage_requires_a_committed_raw_boundary_and_mode_never_changes() {
         let dir = tempfile::tempdir().unwrap();
@@ -2219,6 +2700,7 @@ mod tests {
             assert!(state.validate().is_err());
         }
     }
+    #[cfg(unix)]
     #[test]
     fn new_structured_sessions_cannot_pregrant_publications_or_coverage() {
         let dir = tempfile::tempdir().unwrap();
@@ -2249,6 +2731,7 @@ mod tests {
             assert!(!dir.path().join("sessions-v2").join(id).exists());
         }
     }
+    #[cfg(unix)]
     #[test]
     fn structured_clear_removes_v3_grants_and_coverage_but_retains_raw() {
         let dir = tempfile::tempdir().unwrap();
@@ -2279,6 +2762,7 @@ mod tests {
         assert!(cleared.state.ancestors.is_empty());
         assert_eq!(fs::read(store.directory().join("raw.jsonl")).unwrap(), raw);
     }
+    #[cfg(unix)]
     #[test]
     fn ten_real_turns_exclude_examples_and_retain_raw() {
         let dir = tempfile::tempdir().unwrap();
@@ -2302,6 +2786,7 @@ mod tests {
         let new = lock.append(Message::user("new epoch"), true).unwrap();
         assert_eq!(new.active_turns(), vec![13]);
     }
+    #[cfg(unix)]
     #[test]
     fn raw_corruption_is_never_repaired_by_truncation() {
         let dir = tempfile::tempdir().unwrap();
@@ -2318,6 +2803,7 @@ mod tests {
         assert!(lock.snapshot().is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), changed);
     }
+    #[cfg(unix)]
     #[test]
     fn unpublished_raw_is_recoverable_but_incomplete_tail_stops() {
         let dir = tempfile::tempdir().unwrap();
@@ -2343,6 +2829,7 @@ mod tests {
         assert!(store.lock().unwrap().snapshot().is_err());
         assert_eq!(fs::read(path).unwrap(), before);
     }
+    #[cfg(unix)]
     #[test]
     fn pending_tool_calls_cannot_cross_real_user_boundary() {
         let dir = tempfile::tempdir().unwrap();
@@ -2366,6 +2853,7 @@ mod tests {
             .unwrap();
         lock.append(Message::user("next"), true).unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn wrong_scope_version_and_path_are_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -2386,6 +2874,7 @@ mod tests {
         fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(store.lock().unwrap().snapshot().is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().unwrap();
@@ -2415,6 +2904,7 @@ mod tests {
         drop(next_writer);
         assert!(store.lock().is_ok());
     }
+    #[cfg(unix)]
     #[test]
     fn failed_sync_snapshot_and_marker_never_publish_or_erase_raw() {
         for point in ["raw-sync", "snapshot", "marker"] {
@@ -2437,6 +2927,7 @@ mod tests {
             assert_eq!(snapshot.events[0].message.content, "retain original");
         }
     }
+    #[cfg(unix)]
     #[test]
     fn a_forged_snapshot_body_cannot_be_saved_under_a_valid_raw_hash() {
         let dir = tempfile::tempdir().unwrap();
@@ -2447,6 +2938,7 @@ mod tests {
         assert!(lock.save_snapshot(&snapshot).is_err());
         assert!(lock.publish(&snapshot, snapshot.state.clone()).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn fork_copies_only_ten_turns_and_freezes_parent_generation_without_grants() {
         use crate::workflow::{ExternalGrant, VerificationEvidence};
@@ -2501,6 +2993,7 @@ mod tests {
         assert_eq!(child.lock().unwrap().snapshot().unwrap().events.len(), 10);
         assert_eq!(lock.snapshot().unwrap().events.len(), 13);
     }
+    #[cfg(unix)]
     #[test]
     fn rewind_branch_uses_the_saved_full_prefix_and_visibility_after_ten_turns() {
         let dir = tempfile::tempdir().unwrap();
@@ -2596,6 +3089,7 @@ mod tests {
             child_snapshot.raw_hash
         );
     }
+    #[cfg(unix)]
     #[test]
     fn strict10_rewind_keeps_older_raw_turns_without_the_later_turn() {
         let dir = tempfile::tempdir().unwrap();
@@ -2638,6 +3132,7 @@ mod tests {
         assert_eq!(restored.events[0].message.content, "turn 1");
         assert_eq!(restored.events.last().unwrap().message.content, "answer 11");
     }
+    #[cfg(unix)]
     #[test]
     fn rewind_branch_before_the_first_turn_keeps_an_empty_initial_raw_head() {
         let dir = tempfile::tempdir().unwrap();
@@ -2672,6 +3167,7 @@ mod tests {
         assert_eq!(metadata.branch_initial_raw_hash, content_hash(&[]));
     }
 
+    #[cfg(unix)]
     #[test]
     fn rewind_candidate_keeps_metadata_when_creation_stops_before_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -2728,6 +3224,7 @@ mod tests {
         assert!(conversation.rewind_branch_metadata().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn rewind_candidate_rewrites_epoch_and_accepts_a_later_child_turn() {
         let dir = tempfile::tempdir().unwrap();
@@ -2784,6 +3281,7 @@ mod tests {
         drop(child_lock);
         ConversationStore::validate_rewind_branch_candidate(&parent, &child).unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn rewind_listing_rejects_incomplete_and_later_irreversible_boundaries() {
         let dir = tempfile::tempdir().unwrap();
@@ -2839,6 +3337,7 @@ mod tests {
             .unwrap();
         assert!(next.completion.is_none());
     }
+    #[cfg(unix)]
     #[test]
     fn rewind_listing_requires_the_latest_completed_boundary_to_match_raw_head() {
         let dir = tempfile::tempdir().unwrap();
@@ -2864,6 +3363,7 @@ mod tests {
             .unwrap();
         assert!(lock.list_rewind_boundaries().unwrap().is_empty());
     }
+    #[cfg(unix)]
     #[test]
     fn rewind_listing_rejects_a_later_abandoned_boundary() {
         let dir = tempfile::tempdir().unwrap();
@@ -2895,6 +3395,7 @@ mod tests {
             .unwrap();
         assert!(lock.list_rewind_boundaries().unwrap().is_empty());
     }
+    #[cfg(unix)]
     #[test]
     fn startup_recovery_abandons_only_pending_rewind_boundaries() {
         let dir = tempfile::tempdir().unwrap();
@@ -2938,3 +3439,6 @@ mod tests {
         assert!(next.completion.is_none());
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_store_tests;

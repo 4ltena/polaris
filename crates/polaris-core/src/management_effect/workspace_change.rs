@@ -70,6 +70,12 @@ impl WorkspaceChangeOwnerV1<'_> {
         self.workspace
             .require_quiescent_with_lease(&lease)
             .map_err(|_| "復旧待ちの操作があります")?;
+        crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+            self.workspace.project_root(),
+            self.effects.state_dir(),
+            &lease,
+        )
+        .map_err(|error| error.to_string())?;
         let cursor = self
             .effects
             .cursor()

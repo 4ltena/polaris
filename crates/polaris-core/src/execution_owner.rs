@@ -1039,6 +1039,7 @@ fn excerpt(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     pub(super) fn read_owner() -> (
         crate::desktop_store::PrototypeRoot,
         Writer,
@@ -1051,6 +1052,7 @@ mod tests {
             attempt_id: polaris_desktop_protocol::ids::AttemptId::new("attempt").unwrap(),
         })
     }
+    #[cfg(unix)]
     fn read_owner_for_target(
         target: RunTarget,
     ) -> (
@@ -1062,6 +1064,7 @@ mod tests {
     ) {
         read_owner_with_prompt(target, None)
     }
+    #[cfg(unix)]
     pub(super) fn read_owner_with_prompt(
         target: RunTarget,
         mcp_prompt: Option<polaris_desktop_protocol::request::McpPromptChoice>,
@@ -1182,25 +1185,28 @@ mod tests {
                 )
                 .unwrap()
             );
-            let (_root, mut writer, target, mut owner, _dir) = read_owner_for_target(target);
-            let waiting = owner
-                .port
-                .submit(ExecutionCommand {
-                    policy: SandboxPolicy::new(SandboxMode::ReadOnly, &[]).unwrap(),
-                    program: "/missing".into(),
-                    args: vec![],
-                    stdin: None,
-                })
-                .unwrap();
-            owner.step(&mut writer, &target).unwrap();
-            assert_eq!(owner.awaiting.len(), 1);
-            assert_eq!(owner.awaiting[0].approval.operation_id, first);
-            assert_eq!(
-                writer.snapshot().unwrap().state.unresolved_approvals.len(),
-                1
-            );
-            assert!(owner.slots.is_empty());
-            drop(waiting);
+            #[cfg(unix)]
+            {
+                let (_root, mut writer, target, mut owner, _dir) = read_owner_for_target(target);
+                let waiting = owner
+                    .port
+                    .submit(ExecutionCommand {
+                        policy: SandboxPolicy::new(SandboxMode::ReadOnly, &[]).unwrap(),
+                        program: "/missing".into(),
+                        args: vec![],
+                        stdin: None,
+                    })
+                    .unwrap();
+                owner.step(&mut writer, &target).unwrap();
+                assert_eq!(owner.awaiting.len(), 1);
+                assert_eq!(owner.awaiting[0].approval.operation_id, first);
+                assert_eq!(
+                    writer.snapshot().unwrap().state.unresolved_approvals.len(),
+                    1
+                );
+                assert!(owner.slots.is_empty());
+                drop(waiting);
+            }
         }
         let target = RunTarget {
             run_id: RunId::new("read-run").unwrap(),
@@ -1213,6 +1219,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn invalid_mutation_stamp_never_publishes_approval_or_intent() {
         for change_runtime in [true, false] {
             let (_root, mut writer, target, mut owner, dir) = read_owner();
@@ -1280,6 +1287,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn fixed_ceiling_refuses_injected_generic_even_with_allow() {
         let (_root, mut writer, target, mut owner, _dir) = read_owner();
         owner
@@ -1317,6 +1325,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn invalid_execution_stamp_never_publishes_approval_or_intent() {
         for change_runtime in [true, false] {
             let (_root, mut writer, target, mut owner, dir) = read_owner();
@@ -1382,6 +1391,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn trusted_read_saves_intent_without_approval_and_rechecks_start() {
         for disconnect in [false, true] {
             let (_root, mut writer, target, mut owner, _dir) = read_owner();
@@ -1416,6 +1426,7 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn mutation_grant_saves_intent_without_approval_and_cancels_before_spawn() {
         for disconnect in [false, true] {
             let (_root, mut writer, target, mut owner, dir) = read_owner();
@@ -1473,6 +1484,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn execution_grant_saves_intent_without_approval_and_cancels_before_spawn() {
         for disconnect in [false, true] {
             let (_root, mut writer, target, mut owner, dir) = read_owner();
@@ -1527,6 +1539,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn trusted_read_existing_intent_never_replays() {
         let (_root, mut writer, target, mut owner, _dir) = read_owner();
         writer
@@ -1544,6 +1557,7 @@ mod tests {
         assert_eq!(writer.snapshot().unwrap().state.runs[0].operations.len(), 1);
     }
     #[test]
+    #[cfg(unix)]
     fn trusted_read_cancel_before_intent_and_ordinary_submit_still_require_approval() {
         let (_root, mut writer, target, mut owner, dir) = read_owner();
         let waiting = owner

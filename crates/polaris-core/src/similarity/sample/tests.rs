@@ -12,16 +12,17 @@ fn write(root: &Path, relative: &str, body: &str) {
 #[test]
 fn names_and_sizes_come_back_and_nothing_else() {
     let dir = tempfile::tempdir().expect("a temporary folder");
+    let main_key = Path::new("src").join("main.rs").display().to_string();
     write(dir.path(), "src/main.rs", "fn main() {}");
     write(dir.path(), "README.md", "hello");
     let sampled = folder("one", dir.path()).expect("the folder samples");
     assert!(!sampled.truncated);
     assert_eq!(
         sampled.folder.entries.keys().collect::<Vec<_>>(),
-        vec!["README.md", "src/main.rs"]
+        vec!["README.md", main_key.as_str()]
     );
     assert_eq!(sampled.folder.entries["README.md"], 5);
-    assert_eq!(sampled.folder.entries["src/main.rs"], 12);
+    assert_eq!(sampled.folder.entries[main_key.as_str()], 12);
     assert_eq!(sampled.folder.id, "one");
 }
 
@@ -41,6 +42,7 @@ fn a_missing_or_non_directory_root_is_not_an_empty_sample() {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_unreadable_root_is_an_error_when_permissions_are_enforced() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("a temporary folder");
@@ -63,6 +65,7 @@ fn an_unreadable_root_is_an_error_when_permissions_are_enforced() {
 #[test]
 fn what_a_build_left_behind_is_not_what_the_project_is() {
     let dir = tempfile::tempdir().expect("a temporary folder");
+    let main_key = Path::new("src").join("main.rs").display().to_string();
     write(dir.path(), "src/main.rs", "fn main() {}");
     for skipped in SKIPPED {
         write(dir.path(), &format!("{skipped}/thing.js"), "x");
@@ -70,12 +73,13 @@ fn what_a_build_left_behind_is_not_what_the_project_is() {
     let sampled = folder("one", dir.path()).expect("the folder samples");
     assert_eq!(
         sampled.folder.entries.keys().collect::<Vec<_>>(),
-        vec!["src/main.rs"],
+        vec![main_key.as_str()],
         "including build output would make every project resemble every other"
     );
 }
 
 #[test]
+#[cfg(unix)]
 fn a_symlink_out_of_the_folder_is_not_sampled_as_part_of_it() {
     let dir = tempfile::tempdir().expect("a temporary folder");
     let elsewhere = tempfile::tempdir().expect("another folder");
@@ -110,18 +114,24 @@ fn a_folder_larger_than_the_bound_says_so_rather_than_comparing_a_slice() {
 fn sampling_stops_at_the_depth_bound() {
     let dir = tempfile::tempdir().expect("a temporary folder");
     let deep = "a/b/c/d/e/f/g/h/deep.txt";
+    let deep_key = Path::new(deep)
+        .components()
+        .collect::<std::path::PathBuf>()
+        .display()
+        .to_string();
     write(dir.path(), deep, "x");
     write(dir.path(), "shallow.txt", "x");
     let sampled = folder("one", dir.path()).expect("the folder samples");
     assert!(sampled.folder.entries.contains_key("shallow.txt"));
     assert!(
-        !sampled.folder.entries.contains_key(deep),
+        !sampled.folder.entries.contains_key(deep_key.as_str()),
         "{:?}",
         sampled.folder.entries.keys().collect::<Vec<_>>()
     );
 }
 
 #[test]
+#[cfg(unix)]
 fn an_unreadable_corner_does_not_make_the_folder_uncomparable() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("a temporary folder");

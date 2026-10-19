@@ -32,6 +32,7 @@ impl RunRuntime {
             .await
     }
 
+    #[cfg(unix)]
     pub(super) async fn ensure_catalog_with_delay(
         &mut self,
         server_id: &str,
@@ -170,6 +171,16 @@ impl RunRuntime {
         unreachable!("bounded attempts always return on the last failure")
     }
 
+    #[cfg(not(unix))]
+    pub(super) async fn ensure_catalog_with_delay(
+        &mut self,
+        _server_id: &str,
+        _cancelled: impl Future<Output = ()>,
+        _delay: impl FnMut(u8) -> Duration,
+    ) -> Result<(), Error> {
+        Err(polaris_mcp::Error::Protection.into())
+    }
+
     /// Dedicated catalog check: tool summaries only, never a selection or a
     /// grant. The caller still owns shutdown.
     pub async fn index_entry(
@@ -190,6 +201,7 @@ impl RunRuntime {
         )?)
     }
 
+    #[cfg(unix)]
     async fn close_metadata_connection(&mut self, index: usize) -> Result<(), Error> {
         self.connections[index].phase = Phase::Closing;
         if let Err(error) = self.connections[index].connection.shutdown().await {

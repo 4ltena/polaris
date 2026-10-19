@@ -1,5 +1,6 @@
 //! Host prompt acceptance, raw provenance and confirm-only recovery.
 use super::*;
+use crate::conversation_state::RawEventV2;
 use crate::mcp::results::{ProjectedPart, ReplyProjection, Source, SourceOrigin};
 use polaris_desktop_protocol::run_details::RunDetailKind;
 use polaris_mcp::{
@@ -610,4 +611,142 @@ fn prompt_ledger_rejects_extra_provider_metadata_on_saved_supplement() {
     fs::write(directory.join(disk::MARKER), original_marker).unwrap();
     let writer = root.open(&project(), &session()).unwrap();
     unchanged(&original, &writer.snapshot().unwrap());
+}
+
+fn migration_prompt_turn(supplement: Message) -> Vec<RawEventV2> {
+    [Message::user("accepted input"), supplement]
+        .into_iter()
+        .enumerate()
+        .map(|(i, message)| RawEventV2 {
+            schema_version: 2,
+            sequence: i as u64 + 1,
+            epoch: 1,
+            turn_id: 1,
+            starts_turn: i == 0,
+            message,
+        })
+        .collect()
+}
+fn migration_prompt_run() -> crate::mcp::results::RunBinding {
+    crate::mcp::results::RunBinding {
+        session: "local-session".into(),
+        run: "local-run".into(),
+        attempt: "local-attempt".into(),
+    }
+}
+#[test]
+fn migration_local_prompt_rejects_unknown_and_keeps_completed_envelope() {
+    for unknown in [false, true] {
+        let response = reply();
+        let input = if unknown {
+            McpTerminalInput::Failure(OperationFailure::OutcomeUnknown(
+                polaris_mcp::Error::Transport,
+            ))
+        } else {
+            McpTerminalInput::Reply(&response)
+        };
+        let message = super::super::local_mcp_prompt_terminal(
+            &migration_prompt_run(),
+            "local-project",
+            &binding(),
+            input,
+        )
+        .unwrap()
+        .message;
+        let result = super::super::writer::migration::validate_local_turn(
+            &migration_prompt_turn(message),
+            "local-project",
+            "local-session",
+        );
+        assert_eq!(result.is_ok(), !unknown);
+    }
+}
+#[test]
+fn migration_local_prompt_rejects_context_binding_and_canonical_wire_drift() {
+    for mutation in 0..7 {
+        let mut message = super::super::local_mcp_prompt_terminal(
+            &migration_prompt_run(),
+            "local-project",
+            &binding(),
+            McpTerminalInput::Reply(&reply()),
+        )
+        .unwrap()
+        .message;
+        match mutation {
+            0 => message.content.push(' '),
+            1 => message.content = "{\"schema_version\":".into(),
+            _ => {
+                let mut value: Value = serde_json::from_str(&message.content).unwrap();
+                match mutation {
+                    2 => value["intent"]["session"] = json!("foreign-session"),
+                    3 => value["intent"]["project"] = json!("foreign-project"),
+                    4 => value["intent"]["binding"]["destination_hash"] = json!("invalid-hash"),
+                    5 => value["reply"]["source"]["selection_id"] = json!("foreign-selection"),
+                    _ => {
+                        value.as_object_mut().unwrap().remove("disposition");
+                    }
+                }
+                message.content = serde_json::to_string(&value).unwrap();
+            }
+        }
+        assert!(
+            super::super::writer::migration::validate_local_turn(
+                &migration_prompt_turn(message),
+                "local-project",
+                "local-session"
+            )
+            .is_err()
+        );
+    }
+}
+#[test]
+fn migration_real_user_prompt_shaped_json_is_not_host_evidence() {
+    let message = super::super::local_mcp_prompt_terminal(
+        &migration_prompt_run(),
+        "local-project",
+        &binding(),
+        McpTerminalInput::Failure(OperationFailure::OutcomeUnknown(
+            polaris_mcp::Error::Transport,
+        )),
+    )
+    .unwrap()
+    .message;
+    let events = vec![RawEventV2 {
+        schema_version: 2,
+        sequence: 1,
+        epoch: 1,
+        turn_id: 1,
+        starts_turn: true,
+        message,
+    }];
+    super::super::writer::migration::validate_local_turn(&events, "local-project", "local-session")
+        .unwrap();
+    let events = migration_prompt_turn(Message::user("ordinary host supplement"));
+    super::super::writer::migration::validate_local_turn(&events, "local-project", "local-session")
+        .unwrap();
+}
+#[test]
+fn migration_local_prompt_wire_matches_existing_binding_serializer() {
+    let binding = binding();
+    let message = super::super::local_mcp_prompt_terminal(
+        &migration_prompt_run(),
+        "local-project",
+        &binding,
+        McpTerminalInput::Failure(OperationFailure::BeforeSend(polaris_mcp::Error::Transport)),
+    )
+    .unwrap()
+    .message;
+    let legacy_binding = serde_json::to_string(&binding).unwrap();
+    // Compare against the prior borrowed intent framing, independently of the
+    // new owned DTO serializer. The existing binding serializer is unchanged.
+    let expected = format!(
+        r#"{{"schema_version":1,"intent":{{"session":"local-session","run":"local-run","attempt":"local-attempt","project":"local-project","binding":{legacy_binding}}},"disposition":"before_send","reply":null,"failure":"mcp_transport"}}"#
+    );
+    assert_eq!(message.content, expected);
+    super::super::writer::migration::validate_local_turn(
+        &migration_prompt_turn(message),
+        "local-project",
+        "local-session",
+    )
+    .unwrap();
 }

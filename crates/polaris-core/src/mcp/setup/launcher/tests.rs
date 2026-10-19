@@ -382,3 +382,80 @@ fn the_written_entry_imports_what_was_declared_and_calls_it() {
     // A dotted attribute is walked, not imported, so `cli:app.run` works.
     assert!(python_entry_source("pkg", "app.run").contains("\"app.run\".split(\".\")"));
 }
+
+#[test]
+#[cfg(windows)]
+fn windows_mcp_launcher_unavailable_refuses_before_lookup_or_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("packages");
+    let missing_runtime = root.path().join("missing-runtime");
+    for (command, arguments) in [
+        ("npx", args(&["-y", "@scope/package@1.2.3"])),
+        ("uvx", args(&["package==1.2.3"])),
+        ("not-a-launcher", args(&["--unknown"])),
+    ] {
+        for runtime in [
+            None,
+            Some(std::path::Path::new("relative-runtime")),
+            Some(missing_runtime.as_path()),
+        ] {
+            assert_eq!(
+                materialise(&directory, command, &arguments, runtime),
+                Err(Refused::ManagerNotSupported)
+            );
+            assert!(!directory.exists());
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_mcp_launcher_unavailable_preserves_existing_pin_and_tree() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("packages");
+    let nested = directory.join("retained");
+    let pin = directory.join("pinned.json");
+    let partial = directory.join("pinned.json.partial");
+    let artifact = nested.join("artifact.bin");
+    let runtime = root.path().join("runtime.exe");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(&pin, b"existing-pin\0\xff").unwrap();
+    std::fs::write(&partial, b"existing-partial\0\xff").unwrap();
+    std::fs::write(&artifact, b"retained-artifact\0\xff").unwrap();
+    std::fs::write(&runtime, b"runtime-marker").unwrap();
+    let names = |path: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before_root = names(root.path());
+    let before_directory = names(&directory);
+    let before_nested = names(&nested);
+    let before: Vec<_> = [&pin, &partial, &artifact, &runtime]
+        .into_iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    for (command, arguments) in [
+        ("npx", args(&["-y", "@scope/package@1.2.3"])),
+        ("uvx", args(&["package==1.2.3"])),
+    ] {
+        for runtime_path in [None, Some(runtime.as_path())] {
+            assert_eq!(
+                materialise(&directory, command, &arguments, runtime_path),
+                Err(Refused::ManagerNotSupported)
+            );
+            assert_eq!(names(root.path()), before_root);
+            assert_eq!(names(&directory), before_directory);
+            assert_eq!(names(&nested), before_nested);
+            let after: Vec<_> = [&pin, &partial, &artifact, &runtime]
+                .into_iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            assert_eq!(after, before);
+        }
+    }
+}

@@ -11,10 +11,13 @@ use crate::{
     conversation_state::content_hash,
     subagent_control::{ChildControlPlaneV1, RootAttemptId, RootRunId, TaskId},
 };
+#[cfg(all(test, windows))]
+use polaris_auth::protection::WindowsFamilyFile as File;
 use polaris_desktop_protocol::ids::{ProjectId, SessionId};
 use serde::{Deserialize, Serialize};
+#[cfg(not(all(test, windows)))]
+use std::fs::File;
 use std::{
-    fs::File,
     io::{Read, Write},
     path::Path,
     sync::Arc,
@@ -80,6 +83,12 @@ impl SubagentControlOwner {
         Self::from_root(root, binding)
     }
 
+    #[cfg(all(test, windows))]
+    pub(super) fn from_root(_: Arc<Directory>, _: SubagentControlBindingV1) -> StoreResult<Self> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(all(test, windows)))]
     pub(super) fn from_root(
         root: Arc<Directory>,
         binding: SubagentControlBindingV1,
@@ -206,6 +215,66 @@ fn validate_stored(stored: &StoredControlPlaneV1) -> StoreResult<()> {
             || child.binding.active_task_id != stored.binding.active_task_id
     }) {
         return Err(StoreError::TargetMismatch);
+    }
+    Ok(())
+}
+
+/// Decoded observation of an existing control plane, not a restored owner.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::desktop_store) fn validate_migration_state(
+    coordinates: &[String],
+    bytes: &[u8],
+) -> StoreResult<()> {
+    use crate::subagent_control::{
+        CapabilitySnapshotV1, ChildStateV1, FailureClassV1, McpCapabilityV1,
+    };
+    if bytes.is_empty() || bytes.len() > MAX_STATE_BYTES {
+        return Err(StoreError::RecoveryRequired);
+    }
+    let stored: StoredControlPlaneV1 = serde_json::from_slice(bytes)?;
+    validate_stored(&stored)?;
+    let binding = &stored.binding;
+    let expected = [
+        binding.project_id.as_str(),
+        binding.session_id.as_str(),
+        &binding.root_run_id.0,
+        &binding.root_attempt_id.0,
+        &binding.active_task_id.0,
+    ]
+    .into_iter()
+    .map(bucket)
+    .collect::<Vec<_>>();
+    if coordinates != expected {
+        return Err(StoreError::TargetMismatch);
+    }
+    let may_use_mcp = |capabilities: &CapabilitySnapshotV1| {
+        capabilities.mcp != McpCapabilityV1::None
+            || capabilities.tool_names.iter().any(|name| {
+                name == "mcp_catalog"
+                    || name.strip_prefix("mcp_").is_some_and(|hash| {
+                        hash.len() == 60
+                            && hash
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+            })
+    };
+    for child in &stored.control_plane.children {
+        for attempt in &child.attempts {
+            if (!attempt.state.is_terminal()
+                || matches!(
+                    attempt.state,
+                    ChildStateV1::OutcomeUnknown
+                        | ChildStateV1::Failed {
+                            class: FailureClassV1::ExternalWriteOutcomeUnknown
+                        }
+                ))
+                && (may_use_mcp(&child.capabilities)
+                    || attempt.retry_capabilities.as_ref().is_some_and(may_use_mcp))
+            {
+                return Err(StoreError::RecoveryRequired);
+            }
+        }
     }
     Ok(())
 }
@@ -460,5 +529,68 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn migration_control_preserves_known_local_states_and_blocks_mcp_unknowns() {
+        use crate::subagent_control::{ChildStateV1, FailureClassV1};
+        for state in [
+            ChildStateV1::Queued,
+            ChildStateV1::Running,
+            ChildStateV1::OutcomeUnknown,
+            ChildStateV1::Failed {
+                class: FailureClassV1::ExternalWriteOutcomeUnknown,
+            },
+            ChildStateV1::Succeeded,
+            ChildStateV1::Cancelled,
+        ] {
+            for capability in [0, 1, 2, 3] {
+                let root = root();
+                let control_owner = owner(&root);
+                let snapshot = control_owner.snapshot().unwrap();
+                let mut registration = child(&snapshot.binding);
+                match capability {
+                    1 => registration.capabilities.mcp = McpCapabilityV1::ReadSnapshotsOnly,
+                    2 => {
+                        registration.capabilities.tool_names =
+                            vec![format!("mcp_{}", "a".repeat(60))]
+                    }
+                    3 => registration.capabilities.tool_names = vec!["mcp_catalog".into()],
+                    _ => (),
+                }
+                let mut plane = snapshot.control_plane;
+                plane.register_before_start(registration).unwrap();
+                plane.children[0].attempts[0].state = state.clone();
+                let stored = StoredControlPlaneV1 {
+                    schema_version: 1,
+                    revision: 0,
+                    binding: snapshot.binding,
+                    control_plane: plane,
+                };
+                validate_stored(&stored).unwrap();
+                let coords = [
+                    stored.binding.project_id.as_str(),
+                    stored.binding.session_id.as_str(),
+                    &stored.binding.root_run_id.0,
+                    &stored.binding.root_attempt_id.0,
+                    &stored.binding.active_task_id.0,
+                ]
+                .into_iter()
+                .map(bucket)
+                .collect::<Vec<_>>();
+                let bytes = serde_json::to_vec(&stored).unwrap();
+                let known = matches!(state, ChildStateV1::Succeeded | ChildStateV1::Cancelled);
+                assert_eq!(
+                    validate_migration_state(&coords, &bytes).is_ok(),
+                    capability == 0 || known,
+                    "{state:?} capability={capability}"
+                );
+                let mut foreign = coords;
+                foreign[0] = "f".repeat(64);
+                assert!(matches!(
+                    validate_migration_state(&foreign, &bytes),
+                    Err(StoreError::TargetMismatch)
+                ));
+            }
+        }
     }
 }

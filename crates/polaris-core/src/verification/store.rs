@@ -24,6 +24,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(unix)]
 const STORE_DIRECTORY: &str = "verification-records-v1";
 const MAX_RECORD_BYTES: usize = 512 * 1024;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
@@ -126,6 +127,7 @@ pub struct VerificationStore {
 }
 
 impl VerificationStore {
+    #[cfg(unix)]
     pub fn open(data_root: &Path, project_id: &str) -> io::Result<Self> {
         if project_id.trim().is_empty() || project_id.contains('\0') {
             return Err(invalid("verification project IDが不正です"));
@@ -135,6 +137,14 @@ impl VerificationStore {
         let project_directory = root.join(content_hash(project_id.as_bytes()));
         ensure_private_directory(&project_directory)?;
         Ok(Self { project_directory })
+    }
+
+    #[cfg(not(unix))]
+    pub fn open(_data_root: &Path, _project_id: &str) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "このplatformではverification保存の保護を確認できません",
+        ))
     }
 
     pub fn put_need(
@@ -663,6 +673,7 @@ fn validate_decision(
     Ok(())
 }
 
+#[cfg(unix)]
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     if path.exists() {
         return validate_private_directory(path);
@@ -786,7 +797,7 @@ fn verification_error(error: VerificationError) -> io::Error {
     invalid(&error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
@@ -1063,3 +1074,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests;

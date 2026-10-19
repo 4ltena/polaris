@@ -6,6 +6,8 @@ use crate::workflow::{
     ActiveEvidenceArtifactsV1, ConvergenceInputV1, ObservedEvidenceSubjectV1,
     build_owner_convergence, validate_owner_convergence,
 };
+#[cfg(all(test, windows))]
+use polaris_auth::protection::WindowsFamilyFile as File;
 use polaris_desktop_protocol::{
     ids::*,
     request::{Request, RequestBody, RunTarget},
@@ -13,16 +15,15 @@ use polaris_desktop_protocol::{
     snapshot::{ApprovalDecision, Draft, PendingApproval, Run},
 };
 use polaris_provider::Message;
-use std::{
-    fs::{self, File},
-    io::Write,
-    sync::Arc,
-};
+#[cfg(not(all(test, windows)))]
+use std::fs::File;
+use std::{fs, io::Write, sync::Arc};
 use tempfile::TempDir;
 
 pub(super) mod details;
 mod history;
 pub(super) mod mcp;
+pub(in crate::desktop_store) mod migration;
 pub(super) mod prompt;
 pub(super) mod recipe;
 pub use details::{RunDetailEntry, RunDetails};
@@ -678,6 +679,12 @@ impl DesktopRoot {
         self.backing.directory.identity()
     }
 
+    #[cfg(all(test, windows))]
+    pub fn open_owned(_: &std::path::Path) -> StoreResult<Self> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(all(test, windows)))]
     pub fn open_owned(path: &std::path::Path) -> StoreResult<Self> {
         Ok(Self {
             backing: StoreRoot {

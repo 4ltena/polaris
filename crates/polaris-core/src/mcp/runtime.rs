@@ -13,6 +13,7 @@ use crate::{
     execution_owner::{McpCall, McpCallError, McpPort},
     mcp::results::{Chunk, ResultStore},
 };
+#[cfg(unix)]
 use futures_util::FutureExt;
 use polaris_mcp::{
     Connection,
@@ -49,6 +50,7 @@ pub struct RuntimeConfig {
     secrets: Option<Arc<Secrets>>,
     policies: BTreeMap<String, SandboxPolicy>,
     // Cloned into the run, and also retained by the factory through Engine drain.
+    #[cfg(unix)]
     stdio_resources: BTreeMap<String, Arc<resources::StdioResources>>,
     quarantined: BTreeMap<String, polaris_mcp::Error>,
 }
@@ -118,6 +120,7 @@ impl RuntimeConfig {
             project,
             secrets,
             policies,
+            #[cfg(unix)]
             stdio_resources: BTreeMap::new(),
             quarantined: BTreeMap::new(),
         })

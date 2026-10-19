@@ -764,6 +764,7 @@ impl Drop for ExecutionWait {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     fn mutation_fixture() -> (
         tempfile::TempDir,
         PathBuf,
@@ -797,6 +798,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn execution_ceiling_preserves_read_and_rejects_generic_requests() {
         for build in [false, true] {
             let (_dir, helper, scope, run, mut port, mut receiver) = mutation_fixture();
@@ -824,6 +826,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(unix)]
     fn execution_grant_binds_payload_runtime_scope_helper_run_and_expiry() {
         let (dir, helper, scope, run, mut port, mut receiver) = mutation_fixture();
         let selected = dir
@@ -878,6 +881,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn execution_grant_normalizes_full_access_and_rejects_expansion() {
         let (_dir, helper, scope, run, mut port, mut receiver) = mutation_fixture();
         let boundary = scope.isolated_boundary().unwrap();
@@ -915,6 +919,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn mutation_grant_binds_payload_run_helper_policy_and_expiry() {
         let (_dir, helper, scope, run, port, mut receiver) = mutation_fixture();
         for variant in 0..7 {
@@ -965,6 +970,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn mutation_grant_enforces_child_scope_and_rejects_sensitive_aliases() {
         let (dir, helper, scope, run, port, mut receiver) = mutation_fixture();
         let workspace = &scope.isolated_boundary().unwrap().workspace;
@@ -1036,6 +1042,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn mutation_grant_rejects_scope_expansion_and_plain_submit() {
         let (_dir, helper, scope, run, _port, _receiver) = mutation_fixture();
         let workspace = &scope.isolated_boundary().unwrap().workspace;
@@ -1079,6 +1086,7 @@ mod tests {
             stdin: None,
         }
     }
+    #[cfg(unix)]
     fn read_fixture() -> (tempfile::TempDir, PathBuf, SandboxPolicy) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -1100,6 +1108,7 @@ mod tests {
         (dir, helper, policy)
     }
     #[test]
+    #[cfg(unix)]
     fn trusted_read_grant_is_private_and_binds_all_execution_values() {
         let (_dir, helper, policy) = read_fixture();
         let run = RunId::new("read-run").unwrap();
@@ -1173,6 +1182,7 @@ mod tests {
         assert!(port.submit_confined_read(&input).is_err());
     }
     #[test]
+    #[cfg(unix)]
     fn trusted_read_grant_rejects_noncanonical_or_unconfined_helper() {
         let (_dir, helper, policy) = read_fixture();
         let run = RunId::new("read-run").unwrap();

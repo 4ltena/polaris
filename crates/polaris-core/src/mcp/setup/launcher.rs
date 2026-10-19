@@ -371,6 +371,7 @@ pub(super) fn entry_point(
 /// `None` when none is found. Nothing is installed to make one appear:
 /// fetching an interpreter is a larger thing than fetching a package and is
 /// the person's decision, not a side effect of this one.
+#[cfg(unix)]
 pub(super) fn default_runtime(manager: Manager) -> Option<std::path::PathBuf> {
     match manager {
         Manager::Npm => [
@@ -452,6 +453,7 @@ pub enum Refused {
 /// a node default is no use to a Python package. Either way the `PATH` is not
 /// searched: a version manager rewrites it, and the interpreter that resolves
 /// through one is not the interpreter that will be there at launch.
+#[cfg(unix)]
 pub fn materialise(
     directory: &std::path::Path,
     command: &str,
@@ -536,4 +538,14 @@ pub fn materialise(
     .map_err(|_| Refused::NotSaved)?;
     std::fs::rename(&temporary, &path).map_err(|_| Refused::NotSaved)?;
     Ok(held)
+}
+
+#[cfg(not(unix))]
+pub fn materialise(
+    _directory: &std::path::Path,
+    _command: &str,
+    _args: &[String],
+    _runtime: Option<&std::path::Path>,
+) -> Result<Pinned, Refused> {
+    Err(Refused::ManagerNotSupported)
 }

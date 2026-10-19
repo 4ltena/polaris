@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Real owner/Writer; the grant is the only authority to save.
 use super::*;
 use crate::execution_owner::RunExecution;

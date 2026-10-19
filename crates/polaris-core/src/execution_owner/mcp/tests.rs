@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Real owner/Writer and loopback transport; no model or production server.
 use super::*;
 use crate::execution_owner::RunExecution;

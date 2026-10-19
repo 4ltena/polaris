@@ -25,7 +25,10 @@ use std::{
 pub const MAX_HELPER_BYTES: u64 = 128 * 1024 * 1024;
 const SYSTEM_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib", "/System/Library"];
 
+mod helper_staging;
 pub mod toolchains;
+pub use helper_staging::PreparedConfinedHelper;
+use helper_staging::{EphemeralRuntimeHelper, RuntimeHelper};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrepareError {
@@ -38,6 +41,7 @@ pub enum PrepareError {
     Io,
     Snapshot,
     Policy,
+    EntryGate,
 }
 impl std::fmt::Display for PrepareError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,14 +83,15 @@ pub fn with_protected_helper_read<T>(
 }
 
 pub struct PreparedWorkspace {
+    // This field drops before Snapshot, restoring write access for cleanup.
+    runtime: EphemeralRuntimeHelper,
     snapshot: Snapshot,
     policy: SandboxPolicy,
-    helper: PathBuf,
-    // Restore directory owner-write permission before Snapshot's TempDir cleanup.
-    // Kept as an fd so cleanup does not chmod a rebound path.
-    runtime: File,
     // Separate copies are never part of the source change/apply manifest.
     _toolchains: toolchains::StagedToolchains,
+    // The helper independently reacquires admission after exec. This parent
+    // lease remains held through the caller's process cleanup.
+    _entry_lease: polaris_mcp::entry_gate::ProductionEntryLeaseV2,
 }
 impl PreparedWorkspace {
     pub fn prepare(
@@ -138,12 +143,7 @@ impl PreparedWorkspace {
         &self.policy
     }
     pub fn helper_path(&self) -> &Path {
-        &self.helper
-    }
-}
-impl Drop for PreparedWorkspace {
-    fn drop(&mut self) {
-        let _ = self.runtime.set_permissions(Permissions::from_mode(0o700));
+        &self.runtime.0.helper
     }
 }
 
@@ -201,35 +201,21 @@ fn prepare_with_toolchains_locked(
     if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
         return Err(PrepareError::InvalidPath);
     }
-    // Fixed sibling name, created relative to the privately owned root.
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), c"runtime".as_ptr(), 0o700) } != 0 {
-        return Err(PrepareError::Io);
-    }
+    let mut runtime = EphemeralRuntimeHelper(RuntimeHelper::create(root, &parent, &secrets)?);
+    runtime
+        .0
+        .populate_and_seal(&mut input, executable, &before, &secrets)?;
     let runtime_path = root.join("runtime");
-    let runtime = open_at(&parent, c"runtime", true, false)?;
-    let helper = runtime_path.join("polaris");
-    let mut output = open_at(&runtime, c"polaris", false, true)?;
-    let copied = io(std::io::copy(
-        &mut (&mut input).take(MAX_HELPER_BYTES + 1),
-        &mut output,
-    ))?;
-    if copied > MAX_HELPER_BYTES || copied != before.len() {
-        return Err(PrepareError::Limit);
-    }
-    io(output.flush())?;
-    io(output.sync_all())?;
-    if !stable(&before, &io(input.metadata())?)
-        || !stable(&before, &io(open_physical(executable, false)?.metadata())?)
-    {
-        return Err(PrepareError::Changed);
-    }
-    // No executable write or setid permission survives staging.
-    io(output.set_permissions(Permissions::from_mode(0o500)))?;
     let toolchains = toolchains::stage(plan, source, protected, &secrets)?;
     let mut readable = roots.to_vec();
     readable.push(runtime_path);
     readable.extend(toolchains.roots());
+    let home = crate::os_home::trusted_user_home().map_err(|_| PrepareError::EntryGate)?;
+    let entry_lease = polaris_mcp::entry_gate::ProductionEntryLeaseV2::enter(&home, executable)
+        .map_err(|_| PrepareError::EntryGate)?;
+    let gate_files = entry_lease.isolated_read_files();
     let policy = SandboxPolicy::isolated(mode, snapshot.path(), &readable)
+        .and_then(|p| p.with_isolated_readable_files(&gate_files))
         .and_then(|p| {
             p.with_isolated_sibling_environment(snapshot.scratch_home(), snapshot.scratch_tmp())
         })
@@ -239,17 +225,13 @@ fn prepare_with_toolchains_locked(
     if !identity(&meta, &io(open_physical(root, true)?.metadata())?) {
         return Err(PrepareError::Changed);
     }
-    let prepared = PreparedWorkspace {
+    Ok(PreparedWorkspace {
         snapshot,
         policy,
-        helper,
         runtime,
         _toolchains: toolchains,
-    };
-    io(prepared
-        .runtime
-        .set_permissions(Permissions::from_mode(0o500)))?;
-    Ok(prepared)
+        _entry_lease: entry_lease,
+    })
 }
 
 fn overlaps(a: &Path, b: &Path) -> bool {

@@ -125,6 +125,7 @@ fn a_configuration_file_and_a_build_directory_are_told_apart() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_symlink_standing_in_for_what_the_step_makes_is_not_accepted() {
     let dir = project();
     let elsewhere = tempfile::tempdir().expect("another directory");

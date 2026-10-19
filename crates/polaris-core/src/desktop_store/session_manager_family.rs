@@ -3,6 +3,9 @@
 use super::*;
 use crate::session_manager::SessionId;
 use std::collections::BTreeMap;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "session_manager_family_migration.rs"]
+pub(in crate::desktop_store) mod migration;
 
 const INDEX: &str = "family-index.v1.json";
 const INDEX_LOCK: &str = "family-index.lock";
@@ -68,6 +71,13 @@ impl SessionManagerStore {
         let root = Directory::open_owned(root_path)?;
         let _index_lock = Self::lock_family_index(&root)?;
         let index = Self::read_family_index(&root)?;
+        #[cfg(all(test, windows))]
+        let directory = match root.child(child.as_str(), false) {
+            Ok(_) => true,
+            Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        #[cfg(not(all(test, windows)))]
         let directory = match std::fs::symlink_metadata(root.path().join(child.as_str())) {
             Ok(metadata) => {
                 if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -100,6 +110,9 @@ impl SessionManagerStore {
             return Err(StoreError::Corrupt("session switch child family mismatch"));
         }
         let child_root = root.ensure_child(child.as_str())?;
+        #[cfg(all(test, windows))]
+        let store = Self::from_root(Arc::new(child_root))?;
+        #[cfg(not(all(test, windows)))]
         let store = Self::open_owned(child_root.path())?;
         match store.load()? {
             Some(state) if state.sessions.len() == 1 && state.sessions.contains_key(child) => {}
@@ -155,6 +168,9 @@ impl SessionManagerStore {
         }
         let result = publish(child, &state)?;
         let child_root = root.ensure_child(child.as_str())?;
+        #[cfg(all(test, windows))]
+        let child_store = Self::from_root(Arc::new(child_root))?;
+        #[cfg(not(all(test, windows)))]
         let child_store = Self::open_owned(child_root.path())?;
         child_store.initialize(&SessionManagerV1::new(child.clone()))?;
         index.sessions.insert(child.clone(), child.clone());
@@ -185,6 +201,9 @@ impl SessionManagerStore {
         }
         let result = publish(child)?;
         let child_root = root.ensure_child(child.as_str())?;
+        #[cfg(all(test, windows))]
+        let child_store = Self::from_root(Arc::new(child_root))?;
+        #[cfg(not(all(test, windows)))]
         let child_store = Self::open_owned(child_root.path())?;
         child_store.initialize(&SessionManagerV1::new(child.clone()))?;
         index.sessions.insert(child.clone(), child.clone());
@@ -192,7 +211,7 @@ impl SessionManagerStore {
         Ok(result)
     }
 
-    fn lock_family_index(root: &Directory) -> StoreResult<std::fs::File> {
+    fn lock_family_index(root: &Directory) -> StoreResult<File> {
         let lock = open_or_create(root, INDEX_LOCK)?;
         match lock.try_lock() {
             Ok(()) => Ok(lock),
@@ -210,6 +229,9 @@ impl SessionManagerStore {
             && let Some(family) = index.sessions.get(current)
         {
             let family = root.child(family.as_str(), false)?;
+            #[cfg(all(test, windows))]
+            let store = Self::from_root(Arc::new(family))?;
+            #[cfg(not(all(test, windows)))]
             let store = Self::open_owned(family.path())?;
             let state = store
                 .load()?
@@ -223,6 +245,9 @@ impl SessionManagerStore {
         let mut index = Self::scan_family_index(root)?;
         if let Some(family_id) = index.sessions.get(current) {
             let family = root.child(family_id.as_str(), false)?;
+            #[cfg(all(test, windows))]
+            let store = Self::from_root(Arc::new(family))?;
+            #[cfg(not(all(test, windows)))]
             let store = Self::open_owned(family.path())?;
             let state = store
                 .load()?
@@ -232,6 +257,9 @@ impl SessionManagerStore {
         }
 
         let family = root.ensure_child(current.as_str())?;
+        #[cfg(all(test, windows))]
+        let store = Self::from_root(Arc::new(family))?;
+        #[cfg(not(all(test, windows)))]
         let store = Self::open_owned(family.path())?;
         let state = SessionManagerV1::new(current.clone());
         store.initialize(&state)?;
@@ -245,22 +273,48 @@ impl SessionManagerStore {
             version: 1,
             sessions: BTreeMap::new(),
         };
-        for entry in std::fs::read_dir(root.path())? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                return Err(StoreError::Corrupt("session family symlink"));
-            }
-            if !file_type.is_dir() {
-                continue;
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| StoreError::Corrupt("session family name"))?;
+        #[cfg(all(test, windows))]
+        let entries = root.family_children(4096)?;
+        #[cfg(all(test, windows))]
+        let entries = entries
+            .into_iter()
+            .map(|family| {
+                let name = family
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(StoreError::Corrupt("session family name"))?
+                    .to_owned();
+                Ok((name, family))
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        #[cfg(not(all(test, windows)))]
+        let entries = std::fs::read_dir(root.path())?;
+        for entry in entries {
+            #[cfg(all(test, windows))]
+            let (name, family) = entry;
+            #[cfg(not(all(test, windows)))]
+            let name = {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    return Err(StoreError::Corrupt("session family symlink"));
+                }
+                if !file_type.is_dir() {
+                    continue;
+                }
+                entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| StoreError::Corrupt("session family name"))?
+            };
             let family_id =
                 SessionId::new(name).map_err(|_| StoreError::Corrupt("session family name"))?;
+            #[cfg(not(all(test, windows)))]
             let family = root.child(family_id.as_str(), false)?;
+            #[cfg(all(test, windows))]
+            let store = Self::from_root(Arc::new(family))?;
+            #[cfg(not(all(test, windows)))]
             let store = Self::open_owned(family.path())?;
             let Some(state) = store.load()? else {
                 continue;

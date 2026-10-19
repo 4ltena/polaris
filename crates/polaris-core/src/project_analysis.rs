@@ -210,6 +210,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlink_is_not_accepted_as_project_context() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();

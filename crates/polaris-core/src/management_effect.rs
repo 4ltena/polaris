@@ -4,24 +4,35 @@
 //! revisions and closed enums.  Prompts, secrets, filesystem paths and free
 //! form result text have no field in this contract.
 
-#![cfg(unix)]
-
+#[cfg(unix)]
 pub mod account_change;
+#[cfg(unix)]
 pub mod mcp_change;
+#[cfg(unix)]
 pub mod memory_change;
 mod store;
+#[cfg(unix)]
+pub(crate) use store::generation::{
+    ManagementMigrationAnchorV2, ManagementMigrationAnchorsV2, ManagementMigrationTreeV2,
+};
+pub mod v2;
+#[cfg(unix)]
 pub mod workflow_change;
+#[cfg(unix)]
 pub mod workspace_change;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
 
+#[cfg(unix)]
+pub use store::JoinedManagementEffectRecoveryV1;
 pub use store::{
-    JoinedManagementEffectRecoveryV1, ManagementEffectCapacityV1, ManagementEffectInspectOpenV1,
-    ManagementEffectInspectV1, ManagementEffectInspectedFileV1, ManagementEffectLimitsV1,
-    ManagementEffectStoreError, ManagementEffectStoreV1, ManagementEffectTailV1,
+    ManagementEffectCapacityV1, ManagementEffectInspectOpenV1, ManagementEffectInspectV1,
+    ManagementEffectInspectedFileV1, ManagementEffectLimitsV1, ManagementEffectStoreError,
+    ManagementEffectStoreV1, ManagementEffectTailV1,
 };
+#[cfg(unix)]
 pub use workflow_change::{
     WorkflowChangeError, WorkflowChangeOwner, WorkflowChangePreviewV1, WorkflowEffectInventoryV1,
     WorkflowPreparedChangeV1,
@@ -329,7 +340,8 @@ pub struct ManagementEffectSnapshotV1 {
     pub last_sequence: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagementEffectCursorV1 {
     generation: u64,
     chain_hash: ManagementEffectHashV1,
@@ -343,6 +355,26 @@ impl ManagementEffectCursorV1 {
     }
 }
 
+/// Verified, durable management prefix at a quiescent workspace boundary.
+/// Absence in legacy rewind metadata is never this typed empty baseline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementRewindCheckpointV1 {
+    version: u8,
+    project: ManagementEffectHashV1,
+    cursor: ManagementEffectCursorV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagementRewindCrossingV1 {
+    Clear,
+    Blocked {
+        operation_id: ManagementOperationIdV1,
+        inventory: ManagementInventoryIdV1,
+        rewind: ManagementRewindDispositionV1,
+        state: ManagementEffectStateV1,
+    },
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrepareManagementEffectOutcomeV1 {
     Prepared(PreparedManagementEffectV1),
@@ -517,5 +549,53 @@ impl<'de, const N: usize> Deserialize<'de> for HexIdV1<N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    fn operation_id(value: u8) -> ManagementOperationIdV1 {
+        ManagementOperationIdV1::from_str(&format!("{value:032x}")).unwrap()
+    }
+
+    #[test]
+    fn operation_id_has_one_stable_child_session_identity() {
+        let first = operation_id(1);
+        let second = operation_id(2);
+        let child = first.child_session_id();
+        assert_eq!(child, first.child_session_id());
+        assert_ne!(child, second.child_session_id());
+        assert_eq!(child.len(), 36);
+        assert_eq!(&child[14..15], "4");
+        assert!(matches!(&child[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    #[test]
+    fn account_binding_hash_is_stable_and_unambiguous() {
+        assert_eq!(
+            ManagementEffectHashV1::account_binding("openai", "registration-42")
+                .unwrap()
+                .as_hex(),
+            "fc791fdd44ddeb732e88ddb613e67ed7295bf64b593872ba406bf3752544bed7"
+        );
+        assert_ne!(
+            ManagementEffectHashV1::account_binding("ab", "c").unwrap(),
+            ManagementEffectHashV1::account_binding("a", "bc").unwrap()
+        );
+        assert!(ManagementEffectHashV1::account_binding("OpenAI", "registration-42").is_err());
+        assert!(ManagementEffectHashV1::account_binding("openai", "").is_err());
+    }
+
+    #[test]
+    fn management_model_hash_and_inventory_parse_boundaries() {
+        assert!(ManagementEffectHashV1::from_hex("AA").is_err());
+        assert!(ManagementInventoryIdV1::parse("../../secret").is_err());
+        assert!(ManagementInventoryIdV1::parse("é1").is_err());
+        assert!(ManagementInventoryIdV1::parse("T22").is_err());
+        assert!(ManagementInventoryIdV1::parse("C42").is_ok());
+        assert!(ManagementInventoryIdV1::parse("D41").is_ok());
+        assert!(ManagementInventoryIdV1::parse("F25").is_ok());
+    }
+}

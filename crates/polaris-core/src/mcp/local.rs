@@ -16,12 +16,12 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-const RUNTIME_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib"];
+pub(super) const RUNTIME_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib"];
 #[cfg(not(target_os = "linux"))]
-const RUNTIME_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib", "/System/Library"];
+pub(super) const RUNTIME_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib", "/System/Library"];
 #[cfg(test)]
 mod tests;
-const LIMITS: Limits = Limits {
+pub(super) const LIMITS: Limits = Limits {
     max_entries: 100_000,
     max_files: 50_000,
     max_file_bytes: 32 * 1024 * 1024,

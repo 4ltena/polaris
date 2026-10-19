@@ -121,7 +121,9 @@ impl SessionManagerStore {
             return Err(StoreError::Corrupt("session manager generation file size"));
         }
         let mut bytes = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut bytes)?;
+        Read::by_ref(&mut file)
+            .take(len + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() as u64 != len {
             return Err(StoreError::Corrupt(
                 "session manager generation file length",
@@ -453,6 +455,9 @@ impl SessionManagerStore {
                     suffix += 1;
                     continue;
                 }
+                #[cfg(all(test, windows))]
+                generations.rename_child_no_clobber("1", &orphan)?;
+                #[cfg(not(all(test, windows)))]
                 std::fs::rename(
                     generations.path().join("1"),
                     generations.path().join(orphan),
@@ -527,6 +532,9 @@ impl SessionManagerStore {
         write_immutable(&self.directory, &temporary, &bytes)?;
         #[cfg(test)]
         seal_fault(7)?;
+        #[cfg(all(test, windows))]
+        self.directory.replace(&temporary, CURRENT)?;
+        #[cfg(not(all(test, windows)))]
         std::fs::rename(
             self.directory.path().join(&temporary),
             self.directory.path().join(CURRENT),
@@ -583,5 +591,216 @@ impl SessionManagerStore {
         journal.write_all(&line)?;
         journal.sync_all()?;
         generation.sync()
+    }
+}
+
+/// Exact referenced object set for a read-only migration inspection. Unlike
+/// ordinary recovery, no torn suffix or unreferenced generation is accepted.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl SessionManagerStore {
+    pub(super) fn migration_layout(&self) -> StoreResult<BTreeMap<String, u64>> {
+        let mut files = BTreeMap::from([(OWNER_LOCK.into(), 0)]);
+        migration_journal(&self.directory, JOURNAL, &mut files)?;
+        let old_commits = self.read_commits()?;
+        for commit in &old_commits {
+            self.read_state(commit)?;
+            files.insert(
+                commit.state_name.clone(),
+                MAX_SESSION_MANAGER_STATE_BYTES as u64,
+            );
+        }
+        if self.read_pointer()?.is_none() {
+            return Ok(files);
+        }
+        files.insert(CURRENT.into(), 4096);
+        let (directory, manifest, archive) = self.generation_evidence()?;
+        let prefix = "generations/1/";
+        for (name, maximum) in [
+            (MANIFEST, 4096),
+            (ARCHIVE, MAX_ARCHIVE_BYTES),
+            (INDEX, MAX_INDEX_BYTES),
+            (BOOTSTRAP, MAX_SESSION_MANAGER_STATE_BYTES as u64),
+        ] {
+            files.insert(format!("{prefix}{name}"), maximum);
+        }
+        let mut journal = BTreeMap::new();
+        migration_journal(&directory, JOURNAL, &mut journal)?;
+        if !journal.contains_key(JOURNAL) {
+            return Err(StoreError::RecoveryRequired);
+        }
+        for (name, maximum) in journal {
+            files.insert(format!("{prefix}{name}"), maximum);
+        }
+        let commits =
+            Self::read_commits_from(&directory, FORMAT_VERSION, Some(&manifest.bootstrap_hash))?;
+        let mut states = vec![(
+            BOOTSTRAP.to_owned(),
+            manifest.bootstrap_hash,
+            manifest.previous_revision,
+        )];
+        states.extend(
+            commits
+                .into_iter()
+                .map(|commit| (commit.state_name, commit.content_hash, commit.revision)),
+        );
+        for (name, hash, revision) in states {
+            let bytes =
+                Self::read_bounded(&directory, &name, MAX_SESSION_MANAGER_STATE_BYTES as u64)?;
+            if content_hash(&bytes) != hash {
+                return Err(StoreError::RecoveryRequired);
+            }
+            let compact: CompactState = serde_json::from_slice(&bytes)?;
+            if serde_json::to_vec(&compact)? != bytes || compact.revision != revision {
+                return Err(StoreError::RecoveryRequired);
+            }
+            for admission in compact.live.values() {
+                files.insert(
+                    format!("{prefix}{}", Self::payload_name(&admission.payload_hash)?),
+                    64 * 1024,
+                );
+            }
+            self.expand(&directory, compact, &archive)?;
+            files.insert(
+                format!("{prefix}{name}"),
+                MAX_SESSION_MANAGER_STATE_BYTES as u64,
+            );
+        }
+        Ok(files)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn migration_journal(
+    directory: &Directory,
+    name: &str,
+    files: &mut BTreeMap<String, u64>,
+) -> StoreResult<()> {
+    let mut file = match directory.open(name, false, false) {
+        Ok(file) => file,
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let length = file.metadata()?.len();
+    if length > MAX_JOURNAL_BYTES as u64 {
+        return Err(StoreError::RecoveryRequired);
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    Read::by_ref(&mut file)
+        .take(length + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length || (!bytes.is_empty() && bytes.last() != Some(&b'\n')) {
+        return Err(StoreError::RecoveryRequired);
+    }
+    files.insert(name.to_owned(), MAX_JOURNAL_BYTES as u64);
+    Ok(())
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod migration_tests {
+    use super::super::migration::SessionManagerTransportInspectionV2;
+    use super::*;
+    use crate::session_manager::{DestinationMode, SubmitOutcomeV1};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    #[test]
+    fn migration_manager_rejects_missing_empty_sealed_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = Arc::new(Directory::open_owned(temp.path()).unwrap());
+        let store = SessionManagerStore::from_root(root.clone()).unwrap();
+        let state = SessionManagerV1::new(SessionId::new("current").unwrap());
+        store.initialize(&state).unwrap();
+        store.seal_rescue(&state).unwrap();
+        drop(store);
+        let path = root
+            .path()
+            .join(DIRECTORY)
+            .join("generations/1/commits.jsonl");
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        SessionManagerTransportInspectionV2::inspect(&root).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            SessionManagerTransportInspectionV2::inspect(&root),
+            Err(StoreError::RecoveryRequired)
+        ));
+        assert!(!path.exists());
+    }
+    #[test]
+    fn migration_manager_sealed_history_payload_tail_and_orphan() {
+        for mutation in 0..5 {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let root = Arc::new(Directory::open_owned(temp.path()).unwrap());
+            let store = SessionManagerStore::from_root(root.clone()).unwrap();
+            let current = SessionId::new("current").unwrap();
+            let mut state = SessionManagerV1::new(current.clone());
+            store.initialize(&state).unwrap();
+            let request = SubmitRequestV1 {
+                parent_session: current.clone(),
+                payload: SubmissionPayloadV1 {
+                    text: "historic payload".into(),
+                    attachment_ids: vec![],
+                    route: DestinationMode::Current,
+                    expected_session_revision: 0,
+                    expected_goal_revision: 0,
+                },
+                admission_id: None,
+            };
+            let SubmitOutcomeV1::Accepted { admission, .. } =
+                state.submit(request, state.revision).unwrap();
+            store.append_commit(&state).unwrap();
+            store.seal_rescue(&state).unwrap();
+            let old = store.load().unwrap().unwrap();
+            let mut next = old.clone();
+            next.revision += 1;
+            next.queue.retain(|id| id != &admission.id);
+            next.admissions.get_mut(&admission.id).unwrap().state = AdmissionState::Terminal {
+                session_id: None,
+                run_id: None,
+                status: TerminalStatus::Cancelled,
+            };
+            next.admissions.get_mut(&admission.id).unwrap().revision += 1;
+            store.persist_generation(&old, &next, false).unwrap();
+            drop(store);
+            let path = root.path().join(DIRECTORY).join("generations/1");
+            let payload = std::fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("payload-")
+                })
+                .unwrap();
+            match mutation {
+                1 => std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path.join(JOURNAL))
+                    .unwrap()
+                    .write_all(b"torn")
+                    .unwrap(),
+                2 => std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path.join("payload-orphan.json"))
+                    .unwrap()
+                    .write_all(b"orphan")
+                    .unwrap(),
+                3 => std::fs::write(&payload, b"changed historic payload").unwrap(),
+                4 => std::fs::remove_file(path.join(JOURNAL)).unwrap(),
+                _ => (),
+            }
+            let before = std::fs::read(path.join(JOURNAL)).ok();
+            let result = SessionManagerTransportInspectionV2::inspect(&root);
+            if mutation == 0 {
+                let view = result.unwrap();
+                assert_eq!(view.verified_state().unwrap().unwrap(), &next);
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(std::fs::read(path.join(JOURNAL)).ok(), before);
+        }
     }
 }

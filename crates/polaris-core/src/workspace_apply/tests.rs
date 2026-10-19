@@ -653,6 +653,7 @@ fn protected_fixture(case: &str) {
         ])
         .env_clear()
         .env("HOME", home.path().canonicalize().unwrap())
+        .env("TMPDIR", home.path().canonicalize().unwrap())
         .env("POLARIS_PROTECTED_APPLY_FIXTURE", case)
         .env(
             "POLARIS_PROTECTED_APPLY_MARKER",

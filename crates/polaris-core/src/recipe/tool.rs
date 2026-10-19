@@ -7,13 +7,17 @@
 //!
 //! Nothing is installed. `plan` only reads; `tidy` appends missing rules to
 //! `.gitignore` and goes through the ordinary write approval first.
+#[cfg(unix)]
 use super::{confirm, git, ignore_rules, session, template};
 use crate::approval::{Approver, Gate};
 use polaris_sandbox::SandboxPolicy;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// The rules `git_setting` keeps a project's ignore file holding. Fixed, so
 /// a model cannot ask for an arbitrary pattern to be ignored.
+#[cfg(unix)]
 const IGNORES: &[&str] = &[".next/", "node_modules/", "coverage/"];
 
 pub struct SettingTool {
@@ -21,6 +25,17 @@ pub struct SettingTool {
 }
 
 impl SettingTool {
+    #[cfg(not(unix))]
+    pub async fn call(
+        &self,
+        _arguments: &serde_json::Value,
+        _sandbox: &SandboxPolicy,
+        _gate: &mut Gate,
+        _approver: &mut dyn Approver,
+    ) -> Result<String, String> {
+        Err("このプラットフォームでは設定操作に必要な保護を確認できません。".into())
+    }
+
     /// `project_root` is the resolved project, not wherever the run started.
     pub fn new(project_root: PathBuf) -> Self {
         Self { root: project_root }
@@ -28,6 +43,7 @@ impl SettingTool {
 
     /// Runs one operation. Errors come back as a plain reason for the model
     /// to read; none of them names a path outside the project.
+    #[cfg(unix)]
     pub async fn call(
         &self,
         arguments: &serde_json::Value,
@@ -48,6 +64,7 @@ impl SettingTool {
     }
 
     /// What the recipes would do here, and what git looks like. Reads only.
+    #[cfg(unix)]
     fn plan(&self) -> Result<String, String> {
         let looked = super::observe(&self.root, &super::NEXT_JS, Vec::new(), false);
         let nextjs = match super::manager_for(&looked) {
@@ -91,6 +108,7 @@ impl SettingTool {
         Ok(serde_json::json!({ "nextjs": nextjs, "git": self.git_state() }).to_string())
     }
 
+    #[cfg(unix)]
     fn git_state(&self) -> serde_json::Value {
         let Ok(opened) = std::fs::File::open(&self.root) else {
             return serde_json::json!({ "readable": false });
@@ -113,6 +131,7 @@ impl SettingTool {
     }
 
     /// Appends the missing ignore rules. The only thing this tool changes.
+    #[cfg(unix)]
     async fn tidy(
         &self,
         sandbox: &SandboxPolicy,
@@ -151,6 +170,7 @@ impl SettingTool {
     /// A path that exists is left exactly as it is, including a symlink or
     /// a directory where a file was expected: overwriting what someone
     /// already put there is the one thing a scaffold must not do.
+    #[cfg(unix)]
     async fn scaffold(
         &self,
         sandbox: &SandboxPolicy,
@@ -182,6 +202,7 @@ impl SettingTool {
         self.record_scaffold(manager, &write, &skip)
     }
 
+    #[cfg(unix)]
     fn record_scaffold(
         &self,
         manager: super::Manager,
@@ -289,6 +310,7 @@ impl SettingTool {
     }
 
     /// Writes, reads back, and saves the step on the project's ledger.
+    #[cfg(unix)]
     fn record(&self, add: &[&str], path: &Path) -> Result<String, String> {
         let existing = std::fs::read_to_string(path).unwrap_or_default();
         let fail = |e: crate::desktop_store::StoreError| session::refusal(&e).to_owned();
@@ -367,5 +389,7 @@ impl SettingTool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
+#[cfg(all(test, windows))]
+mod windows_tests;

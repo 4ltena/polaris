@@ -51,25 +51,33 @@ fn a_project_that_already_has_the_file_keeps_its_own() {
 fn a_name_taken_by_something_that_is_not_a_plain_file_is_left_alone() {
     let dir = project();
     std::fs::create_dir(dir.path().join("next.config.mjs")).expect("a directory");
+    #[cfg(unix)]
     let elsewhere = project();
+    #[cfg(unix)]
     let target = elsewhere.path().join("elsewhere.tsx");
+    #[cfg(unix)]
     std::fs::write(&target, "// 別の場所").expect("a file");
+    #[cfg(unix)]
     std::fs::create_dir(dir.path().join("app")).expect("the app directory");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&target, dir.path().join("app/page.tsx")).expect("a symlink");
 
     let (write, skip) = plan(dir.path(), NEXT_JS);
     assert!(!write.iter().any(|held| held.path == "next.config.mjs"));
+    #[cfg(unix)]
     assert!(!write.iter().any(|held| held.path == "app/page.tsx"));
     assert!(
         skip.contains(&("next.config.mjs", Skipped::NotAPlainFile)),
         "{skip:?}"
     );
+    #[cfg(unix)]
     assert!(
         skip.contains(&("app/page.tsx", Skipped::NotAPlainFile)),
         "{skip:?}"
     );
     write_all(dir.path(), &write);
     // Writing through the link would have landed outside the project.
+    #[cfg(unix)]
     assert_eq!(
         std::fs::read_to_string(&target).expect("the other file"),
         "// 別の場所"
@@ -95,6 +103,7 @@ fn a_file_that_appeared_after_the_plan_is_not_overwritten() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_path_that_cannot_be_read_is_not_treated_as_absent() {
     use std::os::unix::fs::PermissionsExt;
     let dir = project();

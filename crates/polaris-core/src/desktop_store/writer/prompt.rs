@@ -167,47 +167,175 @@ struct Envelope {
     failure: Option<String>,
 }
 
-#[derive(Serialize)]
+// One owned wire shape is shared by the serializer and migration decoder.
+// This evidence cannot reconstruct a BoundOperation or grant a retry.
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LocalPromptIntent<'a> {
-    session: &'a str,
-    run: &'a str,
-    attempt: &'a str,
-    project: &'a str,
-    binding: &'a OperationBinding,
+struct LocalPromptBinding {
+    item: ItemId,
+    registry_revision: u64,
+    destination_hash: String,
+    connection_generation: String,
+    catalog_generation: String,
+    schema_hash: Option<String>,
+    arguments_hash: String,
+    selection_id: Option<String>,
+    resource_uri: Option<String>,
 }
-
-#[derive(Serialize)]
+impl From<&OperationBinding> for LocalPromptBinding {
+    fn from(value: &OperationBinding) -> Self {
+        // Exhaustive destructuring keeps this wire shape coupled to its source.
+        let OperationBinding {
+            item,
+            registry_revision,
+            destination_hash,
+            connection_generation,
+            catalog_generation,
+            schema_hash,
+            arguments_hash,
+            selection_id,
+            resource_uri,
+        } = value;
+        Self {
+            item: item.clone(),
+            registry_revision: *registry_revision,
+            destination_hash: destination_hash.clone(),
+            connection_generation: connection_generation.clone(),
+            catalog_generation: catalog_generation.clone(),
+            schema_hash: schema_hash.clone(),
+            arguments_hash: arguments_hash.clone(),
+            selection_id: selection_id.clone(),
+            resource_uri: resource_uri.clone(),
+        }
+    }
+}
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LocalPromptEnvelope<'a> {
+struct LocalPromptIntent {
+    session: String,
+    run: String,
+    attempt: String,
+    project: String,
+    binding: LocalPromptBinding,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalPromptEnvelope {
     schema_version: u8,
-    intent: LocalPromptIntent<'a>,
+    intent: LocalPromptIntent,
     disposition: McpDisposition,
     reply: Option<Value>,
     failure: Option<String>,
 }
+impl LocalPromptIntent {
+    fn validate(&self) -> StoreResult<()> {
+        let binding = &self.binding;
+        let choice = McpPromptChoice {
+            server: binding.item.server_id.clone(),
+            prompt: binding.item.key.clone(),
+            arguments: serde_json::Map::new(),
+        };
+        validate_choice(&choice)?;
+        if binding.item.kind != Kind::Prompt
+            || binding.schema_hash.is_some()
+            || binding.resource_uri.is_some()
+            || binding.connection_generation.len() != 32
+            || !ascii_id(&binding.connection_generation, 32)
+            || !binding
+                .selection_id
+                .as_ref()
+                .is_some_and(|id| id.len() == 32 && ascii_id(id, 32))
+            || [
+                &binding.destination_hash,
+                &binding.catalog_generation,
+                &binding.arguments_hash,
+            ]
+            .into_iter()
+            .any(|hash| !valid_hash(hash))
+            || [&self.session, &self.run, &self.attempt, &self.project]
+                .into_iter()
+                .any(|id| id.is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+        {
+            return Err(StoreError::RunConflict);
+        }
+        Ok(())
+    }
+}
+fn local_prompt_intent(
+    run: &RunBinding,
+    project: &str,
+    binding: &OperationBinding,
+) -> StoreResult<LocalPromptIntent> {
+    let value = LocalPromptIntent {
+        session: run.session.clone(),
+        run: run.run.clone(),
+        attempt: run.attempt.clone(),
+        project: project.into(),
+        binding: binding.into(),
+    };
+    value.validate()?;
+    Ok(value)
+}
 
-fn local_prompt_intent<'a>(
-    run: &'a RunBinding,
-    project: &'a str,
-    binding: &'a OperationBinding,
-) -> StoreResult<LocalPromptIntent<'a>> {
-    if binding.item.kind != Kind::Prompt
-        || binding.selection_id.is_none()
-        || run.session.is_empty()
-        || run.run.is_empty()
-        || run.attempt.is_empty()
-        || project.is_empty()
+pub(in crate::desktop_store) fn inspect_local_terminal(
+    message: &Message,
+    project: &str,
+    session: &str,
+) -> StoreResult<Option<McpDisposition>> {
+    if message.role != polaris_provider::Role::User {
+        return Err(StoreError::RunConflict);
+    }
+    // Other host supplements have no MCP framing. A reserved framing object
+    // must decode strictly; malformed evidence is never treated as absent.
+    let framing: Value = match serde_json::from_str(&message.content) {
+        Ok(value) => value,
+        Err(_)
+            if message
+                .content
+                .trim_start()
+                .starts_with("{\"schema_version\":") =>
+        {
+            return Err(StoreError::RunConflict);
+        }
+        Err(_) => return Ok(None),
+    };
+    let reserved = framing
+        .get("intent")
+        .and_then(|intent| intent.get("binding"))
+        .is_some()
+        || (framing.get("schema_version").is_some()
+            && (framing.get("intent").is_some() || framing.get("disposition").is_some()));
+    if !reserved {
+        return Ok(None);
+    }
+    if message.content.len() > MAX_VISIBLE_BYTES {
+        return Err(StoreError::Overflow);
+    }
+    let envelope: LocalPromptEnvelope = serde_json::from_str(&message.content)?;
+    envelope.intent.validate()?;
+    mcp::validate_terminal_payload(
+        envelope.disposition,
+        envelope.reply.as_ref(),
+        envelope.failure.as_deref(),
+    )?;
+    if envelope.schema_version != 1
+        || envelope.intent.project != project
+        || envelope.intent.session != session
+        || serde_json::to_string(&envelope)? != message.content
     {
         return Err(StoreError::RunConflict);
     }
-    Ok(LocalPromptIntent {
-        session: &run.session,
-        run: &run.run,
-        attempt: &run.attempt,
-        project,
-        binding,
-    })
+    if let Some(reply) = &envelope.reply {
+        let source = &reply["source"];
+        if source["server"].as_str() != Some(envelope.intent.binding.item.server_id.as_str())
+            || source["selection_id"].as_str() != envelope.intent.binding.selection_id.as_deref()
+            || source.get("model_call").is_some()
+            || !mcp::valid_result_generation(source)
+        {
+            return Err(StoreError::RunConflict);
+        }
+    }
+    Ok(Some(envelope.disposition))
 }
 
 /// Local CLI/TUI runs have no desktop writer. Reserve room for the exact

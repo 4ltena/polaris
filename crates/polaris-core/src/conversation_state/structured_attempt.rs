@@ -274,7 +274,7 @@ impl LockedConversation<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

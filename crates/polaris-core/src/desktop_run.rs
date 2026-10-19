@@ -222,13 +222,23 @@ fn execute(mut input: DesktopRunInput, sink: DesktopEventSink) -> DesktopRunComp
             let lease = project_owner.try_mutation()?;
             let store =
                 crate::management_effect::ManagementEffectStoreV1::open(source_project, &lease)?;
-            if store.blocker()?.is_some() {
-                return Err(DesktopRunError::UnresolvedManagementEffect);
-            }
+            crate::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+                source_project,
+                store.state_dir(),
+                &lease,
+            )
+            .map_err(|_| DesktopRunError::UnresolvedManagementEffect)?;
             store
         };
         let _project_activity = project_owner.try_activity()?;
-        if management_effects.blocker()?.is_some() {
+        if crate::sync::composite::C10CompositeBlockerV1::inspect_with_activity(
+            source_project,
+            management_effects.state_dir(),
+            &_project_activity,
+        )
+        .map_err(|_| DesktopRunError::UnresolvedManagementEffect)?
+        .is_some()
+        {
             return Err(DesktopRunError::UnresolvedManagementEffect);
         }
         // A desktop owner may serve several runs. Bind this run's copy rather

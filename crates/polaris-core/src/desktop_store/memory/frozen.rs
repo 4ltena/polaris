@@ -1,15 +1,18 @@
 //! Frozen memory evidence only; this never recovers or executes a parent ledger.
 use super::*;
 use crate::desktop_store::{disk, writer::MemoryDirectory};
+#[cfg(all(test, windows))]
+use polaris_auth::protection::WindowsFamilyFile as File;
 use polaris_memory::structured::{
     PublicationScope, StructuredPublication, StructuredPublicationView,
 };
 use polaris_provider::Role;
 use serde::de::DeserializeSeed;
 use sha2::{Digest, Sha256};
+#[cfg(not(all(test, windows)))]
+use std::fs::File;
 use std::{
     collections::BTreeMap,
-    fs::File,
     io::{BufReader, Read, Seek, SeekFrom},
 };
 

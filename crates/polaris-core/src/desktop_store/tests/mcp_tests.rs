@@ -1,5 +1,6 @@
 //! Durable MCP evidence, raw-call binding and uncertain-ACK recovery.
 use super::*;
+use crate::conversation_state::RawEventV2;
 use crate::mcp::{
     operation::{HostOperationIdentity, McpOperation},
     results::{ProjectedPart, ReplyProjection, Source, SourceOrigin},
@@ -1126,4 +1127,755 @@ fn host_prompt_saved_result_rejects_mixed_origins_even_with_matching_hashes() {
     fs::write(directory.join(disk::MARKER), original_marker).unwrap();
     let writer = root.open(&project(), &session()).unwrap();
     unchanged(&original, &writer.snapshot().unwrap());
+}
+
+fn migration_turn(messages: Vec<Message>) -> Vec<RawEventV2> {
+    std::iter::once(Message::user("fixture input"))
+        .chain(messages)
+        .enumerate()
+        .map(|(i, message)| RawEventV2 {
+            schema_version: 2,
+            sequence: i as u64 + 1,
+            epoch: 1,
+            turn_id: 1,
+            starts_turn: i == 0,
+            message,
+        })
+        .collect()
+}
+#[test]
+fn migration_local_tool_keeps_terminal_history_and_rejects_unknown() {
+    for disposition in [
+        McpDisposition::Completed,
+        McpDisposition::BeforeSend,
+        McpDisposition::InputRequired,
+        McpDisposition::OutcomeUnknown,
+    ] {
+        let (operation, mut messages) = evidence();
+        let mut response = reply();
+        if disposition == McpDisposition::InputRequired {
+            response.status = "input_required";
+        }
+        let input = match disposition {
+            McpDisposition::BeforeSend => McpTerminalInput::Failure(OperationFailure::BeforeSend(
+                polaris_mcp::Error::Transport,
+            )),
+            McpDisposition::OutcomeUnknown => McpTerminalInput::Failure(
+                OperationFailure::OutcomeUnknown(polaris_mcp::Error::Transport),
+            ),
+            _ => McpTerminalInput::Reply(&response),
+        };
+        messages.push(
+            super::super::local_mcp_terminal(&operation, input)
+                .unwrap()
+                .message,
+        );
+        let events = migration_turn(messages);
+        // A result exists even for Unknown: the generic round-trip validator passes.
+        crate::conversation_state::validate_complete_turn_events(events.iter()).unwrap();
+        let result =
+            super::super::writer::migration::validate_local_turn(&events, "project", "session");
+        assert_eq!(
+            result.is_ok(),
+            disposition != McpDisposition::OutcomeUnknown
+        );
+    }
+}
+#[test]
+fn migration_local_tool_rejects_malformed_binding_and_wire_drift() {
+    for mutation in 0..5 {
+        let (operation, mut messages) = evidence();
+        let mut result =
+            super::super::local_mcp_terminal(&operation, McpTerminalInput::Reply(&reply()))
+                .unwrap()
+                .message;
+        match mutation {
+            0 => result.content = "not an envelope".into(),
+            1 => result.content.push(' '),
+            2 => {
+                let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                value["intent"]["registry_revision"] = json!(99);
+                result.content = serde_json::to_string(&value).unwrap();
+            }
+            3 => messages[0].tool_calls[0].arguments = json!({"changed":true}),
+            _ => result.tool_call_id = Some("different-call".into()),
+        }
+        messages.push(result);
+        assert!(
+            super::super::writer::migration::validate_local_turn(
+                &migration_turn(messages),
+                "project",
+                "session"
+            )
+            .is_err()
+        );
+    }
+}
+#[test]
+fn migration_local_generic_calls_and_catalog_metadata_require_complete_round_trip() {
+    for name in ["file_reader", "mcp_catalog"] {
+        let call = Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "ordinary".into(),
+                name: name.into(),
+                arguments: json!({"op":"search","q":"fixture"}),
+            }],
+        );
+        assert!(
+            super::super::writer::migration::validate_local_turn(
+                &migration_turn(vec![call.clone()]),
+                "project",
+                "session"
+            )
+            .is_err()
+        );
+        let events = migration_turn(vec![call, Message::tool_result("ordinary", "metadata")]);
+        super::super::writer::migration::validate_local_turn(&events, "project", "session")
+            .unwrap();
+    }
+    let events = migration_turn(vec![Message::assistant("complete")]);
+    super::super::writer::migration::validate_local_turn(&events, "project", "session").unwrap();
+}
+#[test]
+fn migration_desktop_rejects_persisted_unknown_and_unfinished_mcp_without_recovery() {
+    let (_root, mut writer, operation, suffix) = approved();
+    writer
+        .consume_mcp_approval_intent(&target(), &pending().approval_id, &operation, suffix, 3)
+        .unwrap();
+    let snapshot = writer.snapshot().unwrap();
+    assert!(super::super::writer::migration::validate_desktop(&snapshot).is_err());
+    let publication = writer
+        .prepare_mcp_terminal(
+            &target(),
+            &op(),
+            McpTerminalInput::Failure(OperationFailure::OutcomeUnknown(
+                polaris_mcp::Error::Transport,
+            )),
+        )
+        .unwrap();
+    writer.publish_mcp_terminal(&publication).unwrap();
+    let snapshot = writer.snapshot().unwrap();
+    assert!(snapshot.state.runs[0].operations[0].result_id.is_some());
+    assert!(super::super::writer::migration::validate_desktop(&snapshot).is_err());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn migration_session_files(
+    path: &std::path::Path,
+) -> Vec<(String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64))> {
+    use std::os::unix::fs::MetadataExt;
+    let mut result = Vec::new();
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let meta = entry.path().symlink_metadata().unwrap();
+        if meta.is_file() {
+            result.push((
+                entry.file_name().into_string().unwrap(),
+                std::fs::read(entry.path()).unwrap(),
+                (
+                    meta.dev(),
+                    meta.ino(),
+                    meta.mode(),
+                    meta.nlink(),
+                    meta.mtime(),
+                    meta.mtime_nsec(),
+                    meta.ctime(),
+                    meta.ctime_nsec(),
+                ),
+            ));
+        }
+    }
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn migration_fd_session_inspection_is_read_only_and_keeps_shared_existing_lock() {
+    let (_root, writer) = setup();
+    let path = dir(&writer);
+    drop(writer);
+    let parent = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+    let bucket = path.file_name().unwrap().to_str().unwrap();
+    let before = migration_session_files(&path);
+    let view = super::super::writer::migration::DesktopSessionTransportInspectionV2::inspect(
+        &parent, bucket,
+    )
+    .unwrap();
+    assert_eq!(
+        view.verified_published().unwrap().marker.session_id,
+        session()
+    );
+    assert_eq!(before, migration_session_files(&path));
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(path.join("writer.lock"))
+        .unwrap();
+    assert!(matches!(
+        lock.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(view);
+    lock.try_lock().unwrap();
+    lock.unlock().unwrap();
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn migration_fd_session_inspection_rejects_active_owner_without_recovery() {
+    let (_root, writer) = setup();
+    let path = dir(&writer);
+    let before = migration_session_files(&path);
+    let parent = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+    let result = super::super::writer::migration::DesktopSessionTransportInspectionV2::inspect(
+        &parent,
+        path.file_name().unwrap().to_str().unwrap(),
+    );
+    assert!(matches!(result, Err(StoreError::Busy)));
+    assert_eq!(before, migration_session_files(&path));
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn migration_fd_session_inspection_rejects_unfinished_and_unknown_binding_without_repair() {
+    for unknown in [false, true] {
+        let (_root, mut writer, operation, suffix) = approved();
+        writer
+            .consume_mcp_approval_intent(&target(), &pending().approval_id, &operation, suffix, 3)
+            .unwrap();
+        if unknown {
+            let publication = writer
+                .prepare_mcp_terminal(
+                    &target(),
+                    &op(),
+                    McpTerminalInput::Failure(OperationFailure::OutcomeUnknown(
+                        polaris_mcp::Error::Transport,
+                    )),
+                )
+                .unwrap();
+            writer.publish_mcp_terminal(&publication).unwrap();
+        }
+        let path = dir(&writer);
+        drop(writer);
+        let before = migration_session_files(&path);
+        let parent = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+        assert!(
+            super::super::writer::migration::DesktopSessionTransportInspectionV2::inspect(
+                &parent,
+                path.file_name().unwrap().to_str().unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(before, migration_session_files(&path));
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn migration_fd_session_inspection_rejects_file_root_parent_and_child_set_drift() {
+    use std::os::unix::fs::PermissionsExt;
+    for mutation in 0..5 {
+        let (_root, writer) = setup();
+        let path = dir(&writer);
+        drop(writer);
+        let parent = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+        let view = super::super::writer::migration::DesktopSessionTransportInspectionV2::inspect(
+            &parent,
+            path.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        match mutation {
+            0 => {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path.join("raw.jsonl"))
+                    .unwrap();
+                file.write_all(b"changed").unwrap();
+            }
+            1 => {
+                let temporary = path.join("fixture-replacement");
+                std::fs::write(&temporary, std::fs::read(path.join("state.json")).unwrap())
+                    .unwrap();
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                std::fs::rename(temporary, path.join("state.json")).unwrap();
+            }
+            2 => {
+                std::fs::rename(&path, path.with_file_name("saved-session")).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            3 => {
+                let parent_path = path.parent().unwrap();
+                std::fs::rename(parent_path, parent_path.with_extension("saved-parent")).unwrap();
+                std::fs::create_dir(parent_path).unwrap();
+                std::fs::set_permissions(parent_path, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            _ => {
+                std::fs::write(path.join("state.next"), b"unfinished").unwrap();
+                std::fs::set_permissions(
+                    path.join("state.next"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        }
+        assert!(view.verified_published().is_err());
+        if mutation == 3 {
+            drop(view);
+            drop(parent);
+            let parent_path = path.parent().unwrap();
+            std::fs::remove_dir(parent_path).unwrap();
+            std::fs::rename(parent_path.with_extension("saved-parent"), parent_path).unwrap();
+        }
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn migration_fd_session_inspection_closes_changes_after_payload_decode() {
+    use super::super::writer::migration::AFTER_SESSION_DECODE;
+    use std::os::unix::fs::PermissionsExt;
+    for addition in [false, true] {
+        let (_root, writer) = setup();
+        let path = dir(&writer);
+        drop(writer);
+        let parent = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+        let captured = path.clone();
+        AFTER_SESSION_DECODE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                if addition {
+                    std::fs::write(captured.join("state.next"), b"unfinished").unwrap();
+                    std::fs::set_permissions(
+                        captured.join("state.next"),
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                } else {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(captured.join("raw.jsonl"))
+                        .unwrap();
+                    file.write_all(b"changed after decode").unwrap();
+                }
+            }))
+        });
+        assert!(
+            super::super::writer::migration::DesktopSessionTransportInspectionV2::inspect(
+                &parent,
+                path.file_name().unwrap().to_str().unwrap()
+            )
+            .is_err()
+        );
+        assert!(AFTER_SESSION_DECODE.with(|slot| slot.borrow().is_none()));
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn migration_fd_session_inspection_rejects_unpublished_tails_without_repair() {
+    for name in ["raw.jsonl", "desktop.jsonl"] {
+        let (_root, writer) = setup();
+        let path = dir(&writer);
+        drop(writer);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path.join(name))
+            .unwrap()
+            .write_all(b"unpublished-operation")
+            .unwrap();
+        let before = migration_session_files(&path);
+        let parent = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+        assert!(matches!(
+            super::super::writer::migration::DesktopSessionTransportInspectionV2::inspect(
+                &parent,
+                path.file_name().unwrap().to_str().unwrap()
+            ),
+            Err(StoreError::RecoveryRequired)
+        ));
+        assert_eq!(before, migration_session_files(&path));
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn migration_fd_session_inspection_rejects_foreign_bucket_and_unfinished_files() {
+    use std::os::unix::fs::PermissionsExt;
+    for mutation in 0..3 {
+        let (_root, writer) = setup();
+        let mut path = dir(&writer);
+        drop(writer);
+        match mutation {
+            0 => {
+                let renamed = path.with_file_name("f".repeat(64));
+                std::fs::rename(&path, &renamed).unwrap();
+                path = renamed;
+            }
+            1 => std::fs::remove_file(path.join("state.json")).unwrap(),
+            _ => {
+                std::fs::write(path.join("state.next"), b"unfinished").unwrap();
+                std::fs::set_permissions(
+                    path.join("state.next"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        }
+        let before = migration_session_files(&path);
+        let parent = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+        assert!(
+            super::super::writer::migration::DesktopSessionTransportInspectionV2::inspect(
+                &parent,
+                path.file_name().unwrap().to_str().unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(before, migration_session_files(&path));
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod desktop_root_migration_tests {
+    use super::super::super::writer::migration::root::{
+        AFTER_ROOT_DECODE, AFTER_ROOT_FINAL_NAMES, AFTER_ROOT_NAMES,
+        DesktopRootTransportInspectionV2,
+    };
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+    fn empty() -> (tempfile::TempDir, disk::Directory) {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = disk::Directory::open_owned(root.path()).unwrap();
+        (root, directory)
+    }
+    #[test]
+    fn migration_desktop_root_empty_does_not_create_children() {
+        let (root, directory) = empty();
+        let before =
+            super::super::super::writer::migration::file_stamp(&root.path().metadata().unwrap());
+        let view = DesktopRootTransportInspectionV2::inspect(&directory).unwrap();
+        assert!(view.verified_sessions().unwrap().is_empty());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(
+            before,
+            super::super::super::writer::migration::file_stamp(&root.path().metadata().unwrap())
+        );
+    }
+    #[test]
+    fn migration_desktop_root_retains_all_sessions_and_their_real_locks() {
+        let (root, writer) = setup();
+        let first = dir(&writer);
+        drop(writer);
+        let other = root
+            .create(
+                ProjectId::new("second-project").unwrap(),
+                SessionId::new("second-session").unwrap(),
+                initial(),
+            )
+            .unwrap();
+        let second = dir(&other);
+        drop(other);
+        let directory = disk::Directory::open_owned(first.parent().unwrap()).unwrap();
+        let before = [
+            migration_session_files(&first),
+            migration_session_files(&second),
+        ];
+        let view = DesktopRootTransportInspectionV2::inspect(&directory).unwrap();
+        let sessions = view.verified_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.values().any(|session| {
+            session.verified_published().unwrap().marker.project_id
+                == ProjectId::new("second-project").unwrap()
+        }));
+        let locks = [first.join("writer.lock"), second.join("writer.lock")]
+            .map(|path| fs::File::open(path).unwrap());
+        for lock in &locks {
+            assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        }
+        assert_eq!(
+            before,
+            [
+                migration_session_files(&first),
+                migration_session_files(&second)
+            ]
+        );
+        drop(view);
+        for lock in locks {
+            lock.try_lock().unwrap();
+            lock.unlock().unwrap();
+        }
+    }
+    #[test]
+    fn migration_desktop_root_failed_later_owner_releases_earlier_locks() {
+        let (root, writer) = setup();
+        let first = dir(&writer);
+        drop(writer);
+        let second = root
+            .create(
+                ProjectId::new("second-project").unwrap(),
+                SessionId::new("second-session").unwrap(),
+                initial(),
+            )
+            .unwrap();
+        let directory = disk::Directory::open_owned(first.parent().unwrap()).unwrap();
+        assert!(matches!(
+            DesktopRootTransportInspectionV2::inspect(&directory),
+            Err(StoreError::Busy)
+        ));
+        let lock = fs::File::open(first.join("writer.lock")).unwrap();
+        lock.try_lock().unwrap();
+        lock.unlock().unwrap();
+        drop(second);
+        DesktopRootTransportInspectionV2::inspect(&directory).unwrap();
+    }
+    #[test]
+    fn migration_desktop_root_rejects_unknown_symlink_and_incomplete_bucket() {
+        for kind in 0..3 {
+            let (root, directory) = empty();
+            let name = if kind == 0 {
+                "unknown".to_owned()
+            } else {
+                "a".repeat(64)
+            };
+            let path = root.path().join(name);
+            if kind == 1 {
+                symlink(root.path(), &path).unwrap();
+            } else {
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            assert!(DesktopRootTransportInspectionV2::inspect(&directory).is_err());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+    #[test]
+    fn migration_desktop_root_closes_insertions_at_each_observation_boundary() {
+        for hook in [
+            &AFTER_ROOT_NAMES,
+            &AFTER_ROOT_DECODE,
+            &AFTER_ROOT_FINAL_NAMES,
+        ] {
+            let (root, directory) = empty();
+            let path = root.path().join("unexpected");
+            hook.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    fs::write(path, b"x").unwrap();
+                }))
+            });
+            assert!(DesktopRootTransportInspectionV2::inspect(&directory).is_err());
+            assert!(hook.with(|slot| slot.borrow().is_none()));
+        }
+    }
+    #[test]
+    fn migration_desktop_root_rechecks_in_place_file_and_parent_mode() {
+        for mutate_root in [false, true] {
+            let (_root, writer) = setup();
+            let path = dir(&writer);
+            drop(writer);
+            let directory = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+            let view = DesktopRootTransportInspectionV2::inspect(&directory).unwrap();
+            if mutate_root {
+                fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                use std::io::Write;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(path.join("raw.jsonl"))
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+            }
+            assert!(view.verified_sessions().is_err());
+        }
+    }
+    #[test]
+    fn migration_desktop_root_charges_session_bytes_before_decode() {
+        let (_root, writer) = setup();
+        let path = dir(&writer);
+        drop(writer);
+        let directory = disk::Directory::open_owned(path.parent().unwrap()).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("raw.jsonl"))
+            .unwrap()
+            .set_len(256 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(matches!(
+            DesktopRootTransportInspectionV2::inspect(&directory),
+            Err(StoreError::Capacity("desktop root inspected bytes"))
+        ));
+    }
+    #[test]
+    fn migration_desktop_root_manager_is_observed_and_busy_is_not_repaired() {
+        use crate::desktop_store::session_manager::SessionManagerStore;
+        let (root, directory) = empty();
+        let manager = SessionManagerStore::from_root(std::sync::Arc::new(
+            disk::Directory::open_owned(directory.path()).unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            DesktopRootTransportInspectionV2::inspect(&directory),
+            Err(StoreError::Busy)
+        ));
+        drop(manager);
+        let before = migration_session_files(&root.path().join("session-manager-v1"));
+        let view = DesktopRootTransportInspectionV2::inspect(&directory).unwrap();
+        assert!(view.verified_sessions().unwrap().is_empty());
+        assert_eq!(
+            before,
+            migration_session_files(&root.path().join("session-manager-v1"))
+        );
+    }
+    #[test]
+    fn migration_desktop_root_manager_budget_precedes_journal_decode() {
+        use crate::desktop_store::session_manager::SessionManagerStore;
+        let (root, directory) = empty();
+        drop(
+            SessionManagerStore::from_root(std::sync::Arc::new(
+                disk::Directory::open_owned(directory.path()).unwrap(),
+            ))
+            .unwrap(),
+        );
+        let path = root.path().join("session-manager-v1").join("commits.jsonl");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        file.set_len(256 * 1024 * 1024 + 1).unwrap();
+        assert!(matches!(
+            DesktopRootTransportInspectionV2::inspect(&directory),
+            Err(StoreError::Capacity("desktop root inspected bytes"))
+        ));
+    }
+    #[test]
+    fn migration_desktop_root_artifact_object_is_validated_and_not_rewritten() {
+        use crate::desktop_store::artifacts::WorkflowArtifactStore;
+        use crate::workflow::{ChangeContractV1, RoutineEligibilityV1};
+        let (root, directory) = empty();
+        let store = WorkflowArtifactStore::open_owned(root.path(), &project()).unwrap();
+        let artifact = ChangeContractV1::draft(
+            "root-contract",
+            RoutineEligibilityV1::local_component("desktop_store"),
+            "existing body",
+            "private storage",
+            "read only migration",
+            vec!["validate exact bytes".into()],
+        )
+        .unwrap();
+        store.put_change_contract(&artifact).unwrap();
+        drop(store);
+        DesktopRootTransportInspectionV2::inspect(&directory).unwrap();
+        let objects = fs::read_dir(root.path().join("workflow-artifacts-v1"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("objects");
+        let object = fs::read_dir(&objects)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(&object, b"{}").unwrap();
+        assert!(DesktopRootTransportInspectionV2::inspect(&directory).is_err());
+        assert_eq!(fs::read(object).unwrap(), b"{}");
+    }
+    #[test]
+    fn migration_desktop_root_control_retains_owner_and_rejects_temporary_state() {
+        use crate::desktop_store::subagent_control::{
+            SubagentControlBindingV1, SubagentControlOwner,
+        };
+        use crate::subagent_control::{RootAttemptId, RootRunId, TaskId};
+        let (root, directory) = empty();
+        let binding = SubagentControlBindingV1 {
+            project_id: project(),
+            session_id: session(),
+            root_run_id: RootRunId::new("root-run").unwrap(),
+            root_attempt_id: RootAttemptId::new("root-attempt").unwrap(),
+            active_task_id: TaskId::new("active-task").unwrap(),
+        };
+        let owner = SubagentControlOwner::open_or_create_owned(root.path(), binding).unwrap();
+        assert!(matches!(
+            DesktopRootTransportInspectionV2::inspect(&directory),
+            Err(StoreError::Busy)
+        ));
+        drop(owner);
+        let view = DesktopRootTransportInspectionV2::inspect(&directory).unwrap();
+        fn leaf(path: &std::path::Path) -> std::path::PathBuf {
+            if path.join("owner.lock").exists() {
+                return path.to_owned();
+            }
+            leaf(&fs::read_dir(path).unwrap().next().unwrap().unwrap().path())
+        }
+        let control = leaf(&root.path().join("subagent-control-v1"));
+        let lock = fs::File::open(control.join("owner.lock")).unwrap();
+        assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        drop(view);
+        lock.try_lock().unwrap();
+        lock.unlock().unwrap();
+        fs::write(control.join("state.next"), b"unpublished").unwrap();
+        assert!(DesktopRootTransportInspectionV2::inspect(&directory).is_err());
+        assert_eq!(
+            fs::read(control.join("state.next")).unwrap(),
+            b"unpublished"
+        );
+    }
+    #[test]
+    fn migration_desktop_root_rejects_actual_persisted_mcp_control_unknown() {
+        use crate::desktop_store::subagent_control::{
+            SubagentControlBindingV1, SubagentControlOwner,
+        };
+        use crate::subagent_control::{
+            ApprovalCapabilityV1, CapabilitySnapshotV1, ChildAttemptId, ChildBindingV1,
+            ChildStateV1, FailureClassV1, LogicalChildId, McpCapabilityV1, ParentBindingV1,
+            RegisterChildV1, RootAttemptId, RootRunId, SandboxCapabilityV1, TaskId,
+        };
+        let (root, directory) = empty();
+        let binding = SubagentControlBindingV1 {
+            project_id: project(),
+            session_id: session(),
+            root_run_id: RootRunId::new("root-run").unwrap(),
+            root_attempt_id: RootAttemptId::new("root-attempt").unwrap(),
+            active_task_id: TaskId::new("active-task").unwrap(),
+        };
+        let mut owner =
+            SubagentControlOwner::open_or_create_owned(root.path(), binding.clone()).unwrap();
+        let snapshot = owner.snapshot().unwrap();
+        let mut plane = snapshot.control_plane;
+        plane
+            .register_before_start(RegisterChildV1 {
+                logical_child_id: LogicalChildId::new("child").unwrap(),
+                attempt_id: ChildAttemptId::new("attempt").unwrap(),
+                binding: ChildBindingV1 {
+                    root_run_id: binding.root_run_id,
+                    root_attempt_id: binding.root_attempt_id,
+                    active_task_id: binding.active_task_id,
+                    parent: ParentBindingV1::Root,
+                },
+                role: "reader".into(),
+                tier: "dwarf".into(),
+                model: "luna".into(),
+                effort: "low".into(),
+                capabilities: CapabilitySnapshotV1 {
+                    sandbox: SandboxCapabilityV1::ReadOnly,
+                    write_roots: Vec::new(),
+                    tool_names: vec!["read".into()],
+                    approval: ApprovalCapabilityV1::Never,
+                    mcp: McpCapabilityV1::ReadSnapshotsOnly,
+                },
+            })
+            .unwrap();
+        plane.children[0].attempts[0].state = ChildStateV1::Failed {
+            class: FailureClassV1::ExternalWriteOutcomeUnknown,
+        };
+        owner.replace(snapshot.revision, plane).unwrap();
+        drop(owner);
+        assert!(matches!(
+            DesktopRootTransportInspectionV2::inspect(&directory),
+            Err(StoreError::RecoveryRequired)
+        ));
+    }
 }

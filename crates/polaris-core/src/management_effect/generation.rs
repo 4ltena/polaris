@@ -1,6 +1,15 @@
 //! Durable management-effect generations, checkpoints and sealed archives.
 
 use super::*;
+#[cfg(unix)]
+#[path = "generation/migration_v2.rs"]
+mod migration_v2;
+#[cfg(unix)]
+pub use migration_v2::{
+    CurrentV2, ManagementMigrationAnchorV2, ManagementMigrationAnchorsV2,
+    ManagementMigrationTreeV2, ManifestV2, MigrationManifestV2,
+};
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const GENERATIONS: &str = "generations";
@@ -118,14 +127,17 @@ impl ManagementEffectStoreV1 {
     ) -> Result<Vec<ActiveGenerationV1>, ManagementEffectStoreError> {
         self.verified_generations_reading(|relative, max| {
             let path = self.root.join(relative);
-            validate_private_directory(
+            self.m_validate_directory(
                 path.parent()
                     .ok_or(ManagementEffectStoreError::InvalidStore)?,
             )?;
-            match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error.into()),
-                Ok(_) => bounded(&path, max).map(Some),
+            match self.m_bounded(&path, max) {
+                Err(ManagementEffectStoreError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(None)
+                }
+                other => other.map(Some),
             }
         })
     }
@@ -134,7 +146,17 @@ impl ManagementEffectStoreV1 {
     /// and transition validation as the ordinary reader.
     pub(super) fn verified_generations_reading(
         &self,
+        read: impl FnMut(&str, u64) -> Result<Option<Vec<u8>>, ManagementEffectStoreError>,
+    ) -> Result<Vec<ActiveGenerationV1>, ManagementEffectStoreError> {
+        self.verified_generations_reading_scoped(read, Some(self.project_scope))
+    }
+
+    // None is used only while observing opaque historical migration scope;
+    // every request still validates, and the owner must close a unique scope.
+    pub(super) fn verified_generations_reading_scoped(
+        &self,
         mut read: impl FnMut(&str, u64) -> Result<Option<Vec<u8>>, ManagementEffectStoreError>,
+        scope: Option<ManagementEffectHashV1>,
     ) -> Result<Vec<ActiveGenerationV1>, ManagementEffectStoreError> {
         let pointer: CurrentV1 = match read(CURRENT, MAX_POINTER_BYTES)? {
             None => return Ok(vec![self.legacy_generation()]),
@@ -151,7 +173,7 @@ impl ManagementEffectStoreV1 {
         if complete_prefix_len(&bytes) != bytes.len() {
             return Err(ManagementEffectStoreError::TornTail);
         }
-        let mut previous_state = self.parse_journal_bytes(&previous, &bytes)?;
+        let mut previous_state = self.parse_journal_bytes_scoped(&previous, &bytes, scope)?;
         for number in 1..=pointer.generation {
             let relative = |name: &str| format!("{GENERATIONS}/{number}/{name}");
             let manifest_bytes = read(&relative(MANIFEST), MAX_MANIFEST_BYTES)?
@@ -231,7 +253,7 @@ impl ManagementEffectStoreV1 {
                 if complete_prefix_len(&bytes) != bytes.len() {
                     return Err(ManagementEffectStoreError::TornTail);
                 }
-                previous_state = self.parse_journal_bytes(&previous, &bytes)?;
+                previous_state = self.parse_journal_bytes_scoped(&previous, &bytes, scope)?;
             }
         }
         if previous.chain_hash != pointer.manifest_hash {
@@ -252,7 +274,7 @@ impl ManagementEffectStoreV1 {
         BTreeMap<ManagementOperationIdV1, ManagementEffectSnapshotV1>,
         ManagementEffectStoreError,
     > {
-        let bytes = bounded(
+        let bytes = self.m_bounded(
             &self.generation_directory(number).join(ARCHIVE),
             MAX_ARCHIVE_BYTES,
         )?;
@@ -278,7 +300,7 @@ impl ManagementEffectStoreV1 {
         let active = self.active_generation()?;
         let mut found = None;
         for number in 1..=active.number {
-            let manifest: ManifestV1 = decode(&bounded(
+            let manifest: ManifestV1 = decode(&self.m_bounded(
                 &self.generation_directory(number).join(MANIFEST),
                 MAX_MANIFEST_BYTES,
             )?)?;
@@ -300,7 +322,7 @@ impl ManagementEffectStoreV1 {
         BTreeMap<ManagementOperationIdV1, ManagementEffectSnapshotV1>,
         ManagementEffectStoreError,
     > {
-        let manifest: ManifestV1 = decode(&bounded(
+        let manifest: ManifestV1 = decode(&self.m_bounded(
             &self.generation_directory(number).join(MANIFEST),
             MAX_MANIFEST_BYTES,
         )?)?;
@@ -326,6 +348,7 @@ impl ManagementEffectStoreV1 {
         if rescue == pending.is_empty() {
             return Err(ManagementEffectStoreError::UnresolvedEffect);
         }
+        preflight_seal_capacity(state)?;
         let archive = state
             .effects
             .iter()
@@ -337,33 +360,33 @@ impl ManagementEffectStoreV1 {
             .checked_add(1)
             .ok_or(ManagementEffectStoreError::StoreFull)?;
         let generations = self.root.join(GENERATIONS);
-        ensure_private_directory(&generations)?;
+        self.m_ensure_directory(&generations)?;
         let directory = self.generation_directory(next);
-        match fs::symlink_metadata(&directory) {
-            Ok(_) => {
-                validate_private_directory(&directory)?;
+        match self.m_directory_present(&directory) {
+            Ok(true) => {
+                self.m_validate_directory(&directory)?;
                 let mut suffix = FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
                 loop {
                     let orphan = generations.join(format!(".orphan-{next}-{suffix}"));
-                    match fs::symlink_metadata(&orphan) {
-                        Ok(_) => {
+                    match self.m_directory_present(&orphan) {
+                        Ok(true) => {
                             suffix = suffix
                                 .checked_add(1)
                                 .ok_or(ManagementEffectStoreError::StoreFull)?;
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            fs::rename(&directory, orphan)?;
+                        Ok(false) => {
+                            self.m_rename_directory(&directory, &orphan)?;
                             break;
                         }
                         Err(error) => return Err(error.into()),
                     }
                 }
-                sync_directory(&generations)?;
+                self.m_sync(&generations)?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(false) => {}
             Err(error) => return Err(error.into()),
         }
-        ensure_private_directory(&directory)?;
+        self.m_ensure_directory(&directory)?;
         let archive_bytes = serde_json::to_vec(&archive)?;
         let checkpoint_bytes = serde_json::to_vec(&CheckpointV1 {
             version: FORMAT_VERSION,
@@ -375,10 +398,10 @@ impl ManagementEffectStoreV1 {
         {
             return Err(ManagementEffectStoreError::StoreFull);
         }
-        write_new(&directory.join(ARCHIVE), &archive_bytes)?;
+        self.m_write_new(&directory.join(ARCHIVE), &archive_bytes)?;
         #[cfg(test)]
         seal_fault(1)?;
-        write_new(&directory.join(CHECKPOINT), &checkpoint_bytes)?;
+        self.m_write_new(&directory.join(CHECKPOINT), &checkpoint_bytes)?;
         #[cfg(test)]
         seal_fault(2)?;
         let manifest = ManifestV1 {
@@ -403,11 +426,11 @@ impl ManagementEffectStoreV1 {
         if manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
             return Err(ManagementEffectStoreError::StoreFull);
         }
-        write_new(&directory.join(MANIFEST), &manifest_bytes)?;
+        self.m_write_new(&directory.join(MANIFEST), &manifest_bytes)?;
         #[cfg(test)]
         seal_fault(3)?;
-        write_new(&directory.join(JOURNAL_NAME), b"")?;
-        sync_directory(&directory)?;
+        self.m_write_new(&directory.join(JOURNAL_NAME), b"")?;
+        self.m_sync(&directory)?;
         #[cfg(test)]
         seal_fault(4)?;
         let pointer = CurrentV1 {
@@ -421,7 +444,7 @@ impl ManagementEffectStoreV1 {
             let candidate = self
                 .root
                 .join(format!(".CURRENT-{}-{suffix}", std::process::id()));
-            match write_new(&candidate, &pointer_bytes) {
+            match self.m_write_new(&candidate, &pointer_bytes) {
                 Ok(()) => break candidate,
                 Err(ManagementEffectStoreError::Io(error))
                     if error.kind() == std::io::ErrorKind::AlreadyExists =>
@@ -435,15 +458,16 @@ impl ManagementEffectStoreV1 {
         };
         #[cfg(test)]
         seal_fault(5)?;
-        fs::rename(&temporary, self.root.join(CURRENT))?;
+        self.m_replace(&temporary, &self.root.join(CURRENT))?;
         #[cfg(test)]
         seal_fault(6)?;
-        sync_directory(&self.root)?;
+        self.m_sync(&self.root)?;
         Ok(())
     }
 
     /// Joined M2-A recovery uses one staging name and one pointer name. The
     /// ordinary compatibility opener retains its existing seal behavior.
+    #[cfg(unix)]
     pub(super) fn seal_generation_joined(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -662,6 +686,7 @@ impl ManagementEffectStoreV1 {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn test_stage_joined_prefix(
         &self,
         index: usize,
@@ -719,6 +744,13 @@ impl JoinedSealPayloadsV1 {
         ]
     }
 }
+/// Validate the next complete seal before admission budgets or filesystem writes.
+pub(super) fn preflight_seal_capacity(
+    state: &JournalStateV1,
+) -> Result<(), ManagementEffectStoreError> {
+    joined_seal_payloads(state).map(|_| ())
+}
+
 fn joined_seal_payloads(
     state: &JournalStateV1,
 ) -> Result<JoinedSealPayloadsV1, ManagementEffectStoreError> {
@@ -794,6 +826,7 @@ fn joined_payload_bound(
     Ok(())
 }
 
+#[cfg(unix)]
 fn optional_management_directory(
     parent: &File,
     name: &str,
@@ -808,6 +841,7 @@ fn optional_management_directory(
     }
 }
 
+#[cfg(unix)]
 fn create_management_directory(
     parent: &File,
     name: &str,
@@ -820,6 +854,7 @@ fn create_management_directory(
     management_child_directory(parent, name)
 }
 
+#[cfg(unix)]
 fn optional_management_bytes(
     parent: &File,
     name: &str,
@@ -835,6 +870,7 @@ fn optional_management_bytes(
     }
 }
 
+#[cfg(unix)]
 fn validate_joined_payload_prefixes(
     directory: &File,
     expected: &[(&'static str, &[u8], u64)],
@@ -866,6 +902,7 @@ fn validate_joined_payload_prefixes(
     Ok(())
 }
 
+#[cfg(unix)]
 fn resume_joined_exact_prefix(
     parent: &File,
     name: &'static str,
@@ -875,6 +912,7 @@ fn resume_joined_exact_prefix(
     resume_joined_prefix(parent, name, name, expected, max)
 }
 
+#[cfg(unix)]
 fn resume_joined_prefix(
     parent: &File,
     name: &str,
@@ -927,6 +965,7 @@ fn resume_joined_prefix(
     Ok(())
 }
 
+#[cfg(unix)]
 fn joined_rename_noreplace(
     from: &File,
     source: &str,
@@ -961,7 +1000,8 @@ fn joined_rename_noreplace(
     Ok(())
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), ManagementEffectStoreError> {
+#[cfg(unix)]
+pub(super) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), ManagementEffectStoreError> {
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -973,6 +1013,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), ManagementEffectStoreError
     Ok(())
 }
 
+#[cfg(unix)]
 fn bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, ManagementEffectStoreError> {
     read_bounded(path, maximum).map_err(|error| match error {
         ManagementEffectStoreError::StoreFull => ManagementEffectStoreError::CorruptJournal,

@@ -1,5 +1,7 @@
 //! Sanitized snapshots, excluded secrets, source conflicts, and copy limits.
 use super::*;
+use sha2::{Digest, Sha256};
+use std::ffi::{CString, OsStr};
 use std::os::unix::fs::symlink;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
@@ -1297,6 +1299,7 @@ fn protected_capture_fixture(case: &str) {
         ])
         .env_clear()
         .env("HOME", home.path().canonicalize().unwrap())
+        .env("TMPDIR", home.path().canonicalize().unwrap())
         .env("POLARIS_PROTECTED_CAPTURE_FIXTURE", case)
         .output()
         .unwrap();

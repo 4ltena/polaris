@@ -1,6 +1,7 @@
 //! Registered cwd admission, absent secrets, native confinement and scratch lifetime.
 use super::*;
 use polaris_mcp::registration::{Capabilities, ProtocolProfile};
+use polaris_sandbox::SandboxMode;
 use std::{collections::BTreeSet, future::pending, os::unix::fs::symlink, path::Path};
 
 const TEST_HOME: &str = "/var/empty/polaris-test-home";
@@ -19,7 +20,53 @@ fn directory(parent: &Path, name: &str) -> PathBuf {
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     path
 }
-fn fixture() -> (TempDir, PathBuf, Registry) {
+struct FixtureTemp {
+    root: TempDir,
+    _retained: Vec<TempDir>,
+}
+impl FixtureTemp {
+    fn path(&self) -> &Path {
+        self.root.path()
+    }
+}
+fn fixture_identity_collision(paths: &[PathBuf]) -> bool {
+    polaris_auth::protection::with_protected_paths(|registered| {
+        paths.iter().any(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            registered
+                .identities()
+                .contains(&polaris_auth::protection::ProtectedIdentity {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                })
+        })
+    })
+    .unwrap()
+}
+fn fixture() -> (FixtureTemp, PathBuf, Registry) {
+    let mut retained = Vec::new();
+    for generation in 1..=32 {
+        let (root, cwd, registry) = fixture_candidate();
+        if fixture_identity_collision(&[root.path().to_owned(), cwd.clone(), cwd.join("data.txt")])
+        {
+            eprintln!(
+                "runtime cwd fixture generation={generation} retired_identity_collision=true"
+            );
+            retained.push(root);
+            continue;
+        }
+        return (
+            FixtureTemp {
+                root,
+                _retained: retained,
+            },
+            cwd,
+            registry,
+        );
+    }
+    panic!("runtime cwd fixture exhausted 32 private tree candidates")
+}
+fn fixture_candidate() -> (TempDir, PathBuf, Registry) {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
     let cwd = directory(&base, "server");
@@ -456,17 +503,34 @@ fn unsafe_servers_are_quarantined_without_disabling_the_rest() {
 }
 
 fn pinned_tool(base: &Path) -> (PathBuf, PathBuf, String) {
-    let root = directory(base, "toolchain");
-    let bin = directory(&root, "bin");
-    fs::set_permissions(&root, Permissions::from_mode(0o755)).unwrap();
-    fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
-    let command = bin.join("server");
-    fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&command, Permissions::from_mode(0o755)).unwrap();
-    fs::write(root.join("module.js"), "export {}").unwrap();
-    fs::set_permissions(root.join("module.js"), Permissions::from_mode(0o644)).unwrap();
-    let digest = crate::conversation_state::content_hash(&fs::read(&command).unwrap());
-    (root, command, digest)
+    let root = base.join("toolchain");
+    assert!(!root.exists());
+    for generation in 1..=32 {
+        let candidate = tempfile::tempdir_in(base).unwrap();
+        let bin = directory(candidate.path(), "bin");
+        fs::set_permissions(candidate.path(), Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
+        let command = bin.join("server");
+        fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&command, Permissions::from_mode(0o755)).unwrap();
+        let module = candidate.path().join("module.js");
+        fs::write(&module, "export {}").unwrap();
+        fs::set_permissions(&module, Permissions::from_mode(0o644)).unwrap();
+        if fixture_identity_collision(&[candidate.path().to_owned(), bin, command, module]) {
+            eprintln!(
+                "runtime tool fixture generation={generation} retired_identity_collision=true"
+            );
+            // These synthetic siblings remain outside the admitted tool/CWD.
+            // The outer fixture removes them when its temporary root drops.
+            let _ = candidate.keep();
+            continue;
+        }
+        fs::rename(candidate.path(), &root).unwrap();
+        let command = root.join("bin/server");
+        let digest = crate::conversation_state::content_hash(&fs::read(&command).unwrap());
+        return (root, command, digest);
+    }
+    panic!("runtime tool fixture exhausted 32 candidates")
 }
 
 fn with_tool(registry: &mut Registry, command: &Path, roots: Vec<PathBuf>, digest: Option<String>) {
@@ -618,4 +682,247 @@ fn read_roots_refuse_home_and_overlapping_trees_and_scripts_are_pinned() {
     assert_eq!(reason(&interpreted, home, &[]), None);
     fs::write(&script, "export const changed = 1").unwrap();
     assert_eq!(reason(&interpreted, home, &[]), denied);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InventoryEntry {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    owner: u32,
+    group: u32,
+    links: u64,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    contents: Option<Vec<u8>>,
+    link_target: Option<PathBuf>,
+}
+
+fn inventory(root: &Path) -> BTreeMap<PathBuf, InventoryEntry> {
+    let mut entries = BTreeMap::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        let metadata = path.symlink_metadata().unwrap();
+        let contents = metadata.is_file().then(|| fs::read(&path).unwrap());
+        let link_target = metadata
+            .file_type()
+            .is_symlink()
+            .then(|| fs::read_link(&path).unwrap());
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        }
+        entries.insert(
+            path.strip_prefix(root).unwrap().to_owned(),
+            InventoryEntry {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                mode: metadata.mode(),
+                owner: metadata.uid(),
+                group: metadata.gid(),
+                links: metadata.nlink(),
+                bytes: metadata.len(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+                contents,
+                link_target,
+            },
+        );
+    }
+    entries
+}
+
+fn no_exec(
+    registry: &Registry,
+    excluded: &[PathBuf],
+) -> Result<Vec<StdioAdmission>, polaris_mcp::Error> {
+    RuntimeConfig::validate_servers_no_exec(
+        &registry.servers,
+        "project",
+        Path::new(TEST_HOME),
+        &runtimes(),
+        excluded,
+        limits(),
+    )
+}
+
+fn scratch_preparations() -> usize {
+    SCRATCH_PREPARATIONS.with(|count| count.get())
+}
+
+#[test]
+fn no_exec_admission_keeps_owned_inventory_and_never_prepares_scratch() {
+    let (temp, _cwd, mut registry) = fixture();
+    let base = temp.path().canonicalize().unwrap();
+    let (root, command, digest) = pinned_tool(&base);
+    with_tool(&mut registry, &command, vec![root.clone()], Some(digest));
+    let script = root.join("module.js");
+    let script_digest = crate::conversation_state::content_hash(&fs::read(&script).unwrap());
+    if let Destination::Stdio {
+        args,
+        script: entry,
+        script_sha256,
+        ..
+    } = &mut registry.servers[0].transport
+    {
+        *args = vec![script.to_str().unwrap().into()];
+        *entry = Some(script);
+        *script_sha256 = Some(script_digest);
+    }
+    let before = inventory(&base);
+    let scratch_before = scratch_preparations();
+    for (profile, mode, loopback) in [
+        ("read-only", SandboxMode::ReadOnly, false),
+        ("loopback", SandboxMode::ReadOnly, true),
+        ("workspace-write", SandboxMode::WorkspaceWrite, false),
+        ("full-access", SandboxMode::FullAccess, false),
+    ] {
+        if let Destination::Stdio {
+            sandbox_profile, ..
+        } = &mut registry.servers[0].transport
+        {
+            *sandbox_profile = profile.into();
+        }
+        let admissions = no_exec(&registry, &[]).unwrap();
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(admissions[0].pinned_file_count(), 2);
+        admissions[0].revalidate().unwrap();
+        let (policy, _) = admit_stdio(
+            &registry.servers[0],
+            Path::new(TEST_HOME),
+            &runtimes(),
+            &[],
+            limits(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(policy.mode(), mode);
+        let boundary = policy.isolated_boundary().unwrap();
+        assert_eq!(boundary.loopback_network, loopback);
+        assert!(boundary.environment.is_none());
+    }
+    assert_eq!(inventory(&base), before);
+    assert_eq!(scratch_preparations(), scratch_before);
+}
+
+#[test]
+fn no_exec_rejects_digest_resources_and_selected_exclusions_without_writes() {
+    for failure in ["digest", "cwd", "excluded"] {
+        let (temp, cwd, mut registry) = fixture();
+        let base = temp.path().canonicalize().unwrap();
+        let (root, command, digest) = pinned_tool(&base);
+        with_tool(&mut registry, &command, vec![root], Some(digest));
+        let excluded = match failure {
+            "digest" => {
+                if let Destination::Stdio {
+                    executable_sha256, ..
+                } = &mut registry.servers[0].transport
+                {
+                    *executable_sha256 = Some("0".repeat(64));
+                }
+                vec![]
+            }
+            "cwd" => {
+                fs::write(cwd.join(".env"), "synthetic-only").unwrap();
+                vec![]
+            }
+            "excluded" => vec![cwd],
+            _ => unreachable!(),
+        };
+        let before = inventory(&base);
+        let scratch_before = scratch_preparations();
+        assert_eq!(
+            no_exec(&registry, &excluded).err(),
+            Some(polaris_mcp::Error::Protection),
+            "{failure}"
+        );
+        assert_eq!(inventory(&base), before, "{failure}");
+        assert_eq!(scratch_preparations(), scratch_before, "{failure}");
+    }
+    let (temp, cwd, mut registry) = fixture();
+    let base = temp.path().canonicalize().unwrap();
+    let (root, command, digest) = pinned_tool(&base);
+    with_tool(&mut registry, &command, vec![root], Some(digest));
+    registry.servers[0].enabled_projects = BTreeSet::from(["elsewhere".into()]);
+    assert_eq!(
+        no_exec(&registry, std::slice::from_ref(&cwd))
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::write(cwd.join(".env"), "synthetic-only").unwrap();
+    let before = inventory(&base);
+    let scratch_before = scratch_preparations();
+    // Other projects omit these exclusions but still undergo resource admission.
+    assert_eq!(
+        no_exec(&registry, std::slice::from_ref(&cwd)).err(),
+        Some(polaris_mcp::Error::Protection)
+    );
+    assert_eq!(inventory(&base), before);
+    assert_eq!(scratch_preparations(), scratch_before);
+}
+
+#[test]
+fn no_exec_retains_witnesses_and_revalidates_early_servers_after_iteration() {
+    for changed in ["command", "cwd"] {
+        for retained in [true, false] {
+            let (temp, cwd, mut registry) = fixture();
+            let base = temp.path().canonicalize().unwrap();
+            let (root, command, digest) = pinned_tool(&base);
+            with_tool(&mut registry, &command, vec![root], Some(digest));
+            let change = || match changed {
+                "command" => fs::write(&command, "#!/bin/sh\nexit 1\n").unwrap(),
+                "cwd" => fs::write(cwd.join(".env"), "synthetic-only").unwrap(),
+                _ => unreachable!(),
+            };
+            let scratch_before = scratch_preparations();
+            if retained {
+                let admissions = no_exec(&registry, &[]).unwrap();
+                change();
+                assert_eq!(
+                    admissions[0].revalidate(),
+                    Err(polaris_mcp::Error::Protection)
+                );
+            } else {
+                let mut remote = registry.servers[0].clone();
+                remote.server_id = "remote".into();
+                remote.transport = Destination::StreamableHttp {
+                    url: "https://example.invalid/mcp".into(),
+                    secret_headers: BTreeMap::new(),
+                };
+                let servers = std::iter::once(&registry.servers[0])
+                    .chain(std::iter::once(&remote).inspect(|_| change()));
+                let admitted = RuntimeConfig::validate_servers_no_exec(
+                    servers,
+                    "project",
+                    Path::new(TEST_HOME),
+                    &runtimes(),
+                    &[],
+                    limits(),
+                );
+                assert_eq!(admitted.err(), Some(polaris_mcp::Error::Protection));
+            }
+            assert_eq!(scratch_preparations(), scratch_before);
+        }
+    }
+}
+
+#[test]
+fn no_exec_http_has_no_resource_witnesses_or_filesystem_effects() {
+    let (temp, cwd, mut registry) = fixture();
+    let base = temp.path().canonicalize().unwrap();
+    fs::write(cwd.join(".env"), "synthetic-only").unwrap();
+    registry.servers[0].transport = Destination::StreamableHttp {
+        url: "https://example.invalid/mcp".into(),
+        secret_headers: BTreeMap::new(),
+    };
+    let before = inventory(&base);
+    let scratch_before = scratch_preparations();
+    assert!(no_exec(&registry, &[base.clone()]).unwrap().is_empty());
+    assert_eq!(inventory(&base), before);
+    assert_eq!(scratch_preparations(), scratch_before);
 }

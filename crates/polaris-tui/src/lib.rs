@@ -3934,10 +3934,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             || active_instruction.is_some();
         #[cfg(not(unix))]
         let has_pending_inputs = !queued_inputs.is_empty();
-        let suggestions = if dispatching_queued_input {
+        let suggestions = if dispatching_queued_input || input_history.is_recalled(&input_buffer) {
             // Let the full command reach `slash::parse` below. The picker is
             // for interactive completion and would otherwise reinterpret a
-            // queued exact command as its first highlighted prefix match.
+            // queued or recalled command as its first highlighted prefix
+            // match, and consume keys meant for history navigation.
             Vec::new()
         } else {
             match input_buffer.strip_prefix('/') {
@@ -4353,6 +4354,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         status = Status::Error(error);
                         continue;
                     }
+                    // Completion may execute a different name than the typed
+                    // prefix. Record that command through the same guards as
+                    // normal Enter, preserving hidden drafts for new/quit.
+                    record_submission_before_dispatch(
+                        &mut input_history,
+                        &format!("/{}", suggestions[selected_suggestion].name),
+                        dispatching_queued_input,
+                    );
                     let pending_input = std::mem::take(&mut input_buffer);
                     let pending_cursor = input_cursor;
                     input_cursor = 0;
@@ -4856,6 +4865,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 continue;
                             }
                             queued_inputs_paused = false;
+                            record_submission(&mut input_history, "/new", dispatching_queued_input);
                             clear_mcp_prompt_on_session_change(
                                 &previous_session_path,
                                 &session_path,

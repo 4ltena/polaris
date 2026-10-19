@@ -108,6 +108,14 @@ impl History {
         }
     }
 
+    /// An unchanged recalled entry should execute as written instead of
+    /// reopening completion. Editing it leaves the saved draft intact.
+    pub(crate) fn is_recalled(&self, current: &str) -> bool {
+        self.index
+            .and_then(|index| self.entries.get(index))
+            .is_some_and(|entry| entry == current)
+    }
+
     /// Records a submitted line. Empty text and immediate repeats of the
     /// last entry are not recorded (matching typical shell history).
     /// Resets navigation back to the live draft.
@@ -331,6 +339,27 @@ mod tests {
         history.record("first");
         assert_eq!(history.older("unsent draft"), Some("first"));
         assert_eq!(history.newer(), Some("unsent draft"));
+    }
+
+    #[test]
+    fn recalled_commands_keep_navigation_and_the_independent_draft() {
+        let mut history = History::new();
+        history.record("/status");
+        history.record("/pwd");
+        assert!(!history.is_recalled("/pwd"));
+        assert_eq!(history.older("unsent draft"), Some("/pwd"));
+        assert!(history.is_recalled("/pwd"));
+        assert!(!history.is_recalled("/pw"));
+        assert_eq!(history.pending_draft("/pw"), "unsent draft");
+        assert!(history.has_hidden_draft());
+        assert_eq!(history.older("/pwd"), Some("/status"));
+        assert!(history.is_recalled("/status"));
+        assert!(!history.is_recalled("/pwd"));
+        assert_eq!(history.newer(), Some("/pwd"));
+        assert!(history.is_recalled("/pwd"));
+        assert_eq!(history.newer(), Some("unsent draft"));
+        assert!(!history.is_recalled("unsent draft"));
+        assert!(!history.has_hidden_draft());
     }
 
     #[test]

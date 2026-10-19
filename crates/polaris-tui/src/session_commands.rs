@@ -113,6 +113,12 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
     workspace
         .require_quiescent_with_lease(&lease)
         .map_err(|_| "未解決の巻き戻し操作があります")?;
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        effects.state_dir(),
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
     let mut staged = session.clone();
     if let Some(mode) = history_mode {
         crate::ensure_history_backend(&mut staged, mode, history_factory)?;

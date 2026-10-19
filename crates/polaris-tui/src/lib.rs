@@ -12,6 +12,12 @@ mod draft;
 pub mod input;
 #[cfg(test)]
 mod input_preparation_tests;
+#[cfg(all(test, windows))]
+mod windows_admission_tests;
+#[cfg(windows)]
+mod windows_read_only;
+#[cfg(windows)]
+pub use windows_read_only::run_windows_read_only;
 #[cfg(unix)]
 mod instruction_commands;
 #[cfg(unix)]
@@ -53,6 +59,7 @@ pub mod tool_memory;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -213,7 +220,7 @@ fn linux_start_terminal<T>(
     start().map_err(LinuxTerminalStartError::Failed)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxTerminalStep {
     Cursor,
@@ -224,7 +231,7 @@ enum LinuxTerminalStep {
 
 // Each lifetime owns only the state it successfully acquired. Even if one
 // restoration fails, the other acquired states are attempted once.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[derive(Default)]
 struct LinuxTerminalGuard {
     alternate: bool,
@@ -233,8 +240,9 @@ struct LinuxTerminalGuard {
     cursor: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl LinuxTerminalGuard {
+    #[cfg(target_os = "linux")]
     fn enter() -> Result<(Self, ratatui::DefaultTerminal), String> {
         let mut guard = Self::default();
         ratatui::crossterm::execute!(
@@ -257,6 +265,7 @@ impl LinuxTerminalGuard {
         Ok((guard, terminal))
     }
 
+    #[cfg(target_os = "linux")]
     fn start_failed(&mut self, error: String) -> String {
         match self.restore() {
             Ok(()) => error,
@@ -309,7 +318,7 @@ impl LinuxTerminalGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn linux_restore_terminal_step(step: LinuxTerminalStep) -> std::io::Result<()> {
     match step {
         LinuxTerminalStep::Cursor => ratatui::crossterm::execute!(
@@ -328,7 +337,7 @@ fn linux_restore_terminal_step(step: LinuxTerminalStep) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn linux_finish_guarded_terminal<T>(
     operation: Result<T, String>,
     guard: &mut LinuxTerminalGuard,
@@ -347,7 +356,7 @@ fn linux_finish_guarded_terminal<T>(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl Drop for LinuxTerminalGuard {
     fn drop(&mut self) {
         if let Err(error) = self.restore() {
@@ -896,6 +905,7 @@ async fn restore_prepared_continuation_inner(
 async fn new_workflow_session(
     args: WorkflowSessionArgs<'_>,
 ) -> Result<polaris_core::session::Session, String> {
+    require_turn_owner()?;
     let WorkflowSessionArgs {
         config,
         initial_phase,
@@ -1458,6 +1468,7 @@ async fn admit_tui_input(
         SubmitOutcomeV1, SubmitRequestV1,
     };
 
+    require_turn_owner()?;
     let persistence = session
         .persistence
         .as_ref()
@@ -2073,6 +2084,97 @@ fn begin_rewind_for_session(
         .map(Some)
 }
 
+#[cfg(unix)]
+fn capture_rewind_before_input(
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    policy: &SandboxPolicy,
+) -> std::io::Result<polaris_core::rewind_workspace::ManifestId> {
+    let lease = owner.try_mutation().map_err(std::io::Error::other)?;
+    ensure_rewind_unblocked_with_lease(owner.project_root(), effects, &lease)
+        .map_err(std::io::Error::other)?;
+    let checkpoint = polaris_core::management_effect::ManagementEffectStoreV1::
+        rewind_checkpoint_for_project_at_state_dir(owner.project_root(), effects.state_dir(), &lease)
+        .map_err(std::io::Error::other)?;
+    owner
+        .capture_with_management_checkpoint_with_lease(&lease, policy, checkpoint)
+        .map_err(std::io::Error::other)
+}
+
+#[cfg(unix)]
+fn finish_rewind_for_session(
+    owner: &polaris_core::rewind_workspace::WorkspaceOwner,
+    persistence: &polaris_core::session_store::PersistedSession,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    policy: &SandboxPolicy,
+    boundary: &polaris_core::conversation_state::RewindBoundaryV1,
+    external_unknown: Option<String>,
+    capture_can_complete: impl FnOnce() -> bool,
+) -> std::io::Result<polaris_core::conversation_state::RewindBoundaryV1> {
+    use polaris_core::{
+        conversation_state::{RewindEffectStatusV1, RewindEligibilityV1},
+        management_effect::{ManagementEffectStoreV1, ManagementRewindCrossingV1},
+    };
+    let captured = (|| {
+        let lease = owner.try_mutation().map_err(std::io::Error::other)?;
+        let checkpoint = ManagementEffectStoreV1::rewind_checkpoint_for_project_at_state_dir(
+            owner.project_root(),
+            effects.state_dir(),
+            &lease,
+        )
+        .map_err(std::io::Error::other)?;
+        let post = owner
+            .capture_with_management_checkpoint_with_lease(&lease, policy, checkpoint)
+            .map_err(std::io::Error::other)?;
+        let pre = boundary
+            .workspace_pre_manifest_id
+            .parse()
+            .map_err(std::io::Error::other)?;
+        let crossing = owner
+            .verify_rewind_management_with_lease(&lease, &post, &pre, true)
+            .map_err(std::io::Error::other)?;
+        Ok::<_, std::io::Error>((post, crossing, lease))
+    })();
+    match captured {
+        Ok((post, crossing, _lease)) => {
+            if !capture_can_complete() {
+                return persistence.abandon_rewind_boundary(
+                    &boundary.boundary_id,
+                    "停止要求を受けたため巻き戻し境界は未完了です".into(),
+                );
+            }
+            let reason = match crossing {
+                ManagementRewindCrossingV1::Clear => external_unknown,
+                ManagementRewindCrossingV1::Blocked { .. } => {
+                    Some("巻き戻せない管理操作が含まれています".into())
+                }
+            };
+            let (eligibility, effect) = match reason {
+                Some(description) => (
+                    RewindEligibilityV1::Ineligible {
+                        reason: description.clone(),
+                    },
+                    RewindEffectStatusV1::Unknown { description },
+                ),
+                None => (
+                    RewindEligibilityV1::Eligible,
+                    RewindEffectStatusV1::NoExternalMutation,
+                ),
+            };
+            persistence.finish_rewind_boundary(
+                &boundary.boundary_id,
+                post.to_string(),
+                eligibility,
+                effect,
+            )
+        }
+        Err(error) => persistence.abandon_rewind_boundary(
+            &boundary.boundary_id,
+            format!("ターン後の保存証拠を確認できません: {error}"),
+        ),
+    }
+}
+
 /// Collapses a leading `$HOME` to `~`, for the footer only (see
 /// `render::HeaderInfo::cwd_short`'s docs on why the header's own
 /// `directory:` row doesn't use this). Returns the path unabbreviated —
@@ -2145,7 +2247,83 @@ enum InflightInputAction {
     Continue,
     Queued,
     RejectedSecret,
+    RejectedUnavailable,
     Interrupt,
+}
+
+const WINDOWS_OWNER_UNAVAILABLE: &str =
+    "Windowsでは実行・変更に必要な保護機構が未対応です。変更していません。";
+
+fn require_turn_owner() -> Result<(), &'static str> {
+    if cfg!(windows) {
+        Err(WINDOWS_OWNER_UNAVAILABLE)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_action_owner(action: &slash::Action) -> Result<(), &'static str> {
+    if cfg!(windows) && !action.allowed_without_mutation_owner() {
+        Err(WINDOWS_OWNER_UNAVAILABLE)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_submission_owner(text: &str) -> Result<(), &'static str> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    match slash::parse(text) {
+        Some(action) => require_action_owner(&action),
+        None => require_turn_owner(),
+    }
+}
+
+fn apply_admitted_key(
+    buffer: &mut String,
+    cursor: &mut usize,
+    key: ratatui::crossterm::event::KeyEvent,
+) -> Result<InputAction, &'static str> {
+    #[cfg(windows)]
+    {
+        // Preserve the existing consume-and-scrub path for secret commands.
+        if is_secret_command(buffer) {
+            return Ok(apply_key(buffer, cursor, key));
+        }
+        let mut candidate = buffer.clone();
+        let mut candidate_cursor = *cursor;
+        let action = apply_key(&mut candidate, &mut candidate_cursor, key);
+        if let InputAction::Submit(text) = &action {
+            require_submission_owner(text)?;
+        }
+        *buffer = candidate;
+        *cursor = candidate_cursor;
+        Ok(action)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(apply_key(buffer, cursor, key))
+    }
+}
+
+fn promote_queued_input(
+    queue: &mut VecDeque<String>,
+    paused: bool,
+    buffer: &mut String,
+    cursor: &mut usize,
+) -> Result<Option<(String, usize)>, &'static str> {
+    if paused {
+        return Ok(None);
+    }
+    let Some(next) = queue.front() else {
+        return Ok(None);
+    };
+    require_submission_owner(next)?;
+    let saved_draft = (std::mem::take(buffer), *cursor);
+    *buffer = queue.pop_front().expect("checked queue front");
+    *cursor = buffer.len();
+    Ok(Some(saved_draft))
 }
 
 fn is_secret_command(text: &str) -> bool {
@@ -2213,7 +2391,11 @@ fn apply_inflight_key(
     if secret_value_key_is_blocked(input_buffer, &key) {
         return InflightInputAction::RejectedSecret;
     }
-    match apply_key(input_buffer, input_cursor, key) {
+    let action = match apply_admitted_key(input_buffer, input_cursor, key) {
+        Ok(action) => action,
+        Err(_) => return InflightInputAction::RejectedUnavailable,
+    };
+    match action {
         InputAction::Continue => {
             if redact_inline_secret_value(input_buffer, input_cursor, input_history) {
                 InflightInputAction::RejectedSecret
@@ -2768,6 +2950,37 @@ fn draw_frame(
     selected_suggestion: usize,
     selection: &Option<selection::Selection>,
 ) {
+    draw_frame_with_mode(
+        frame,
+        history,
+        history_wrap_cache,
+        scroll_offset,
+        input,
+        cursor,
+        status,
+        header,
+        suggestions,
+        selected_suggestion,
+        selection,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_frame_with_mode(
+    frame: &mut ratatui::Frame,
+    history: &[render::HistoryLine],
+    history_wrap_cache: &mut render::HistoryWrapCache,
+    scroll_offset: usize,
+    input: &str,
+    cursor: usize,
+    status: &Status,
+    header: &render::HeaderInfo,
+    suggestions: &[&crate::slash::SlashCommand],
+    selected_suggestion: usize,
+    selection: &Option<selection::Selection>,
+    read_only: bool,
+) {
     let area = frame.area();
     let footer_height = render::footer_height(suggestions.len());
     let [history_area, footer_area] = ratatui::layout::Layout::vertical([
@@ -2787,7 +3000,7 @@ fn draw_frame(
         render::apply_selection_highlight(frame.buffer_mut(), history_area, window, wrapped, sel);
     }
 
-    render::render_footer(
+    render::render_footer_with_mode(
         frame,
         footer_area,
         input,
@@ -2796,6 +3009,7 @@ fn draw_frame(
         header,
         suggestions,
         selected_suggestion,
+        read_only,
     );
 }
 
@@ -2834,6 +3048,10 @@ fn area_height_for_history(footer_height: u16, terminal_height: u16) -> u16 {
 }
 
 pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
+    if let Err(error) = require_turn_owner() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
     let usage_meter = polaris_provider::UsageMeter::default();
     args.provider = Arc::new(usage_meter.wrap(args.provider.clone()));
     let cloud_provider = args.provider.clone();
@@ -2884,7 +3102,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     // transactions have been resolved. Opening needs the same exclusive
     // project lease as rewind; ordinary turns take its shared side below.
     #[cfg(unix)]
-    let (management_effects, workflow_recovery_issue) = {
+    let (management_effects, workflow_recovery_issue, management_startup_blocker) = {
         let owner = rewind_workspace
             .as_ref()
             .expect("Unix TUI startup requires a rewind workspace owner");
@@ -2946,26 +3164,26 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             )
             .err()
             .map(|error| error.to_string());
-        (store, recovery_issue)
-    };
-
-    #[cfg(unix)]
-    let management_startup_blocker = match management_effects.blocker() {
-        Ok(blocker) => blocker.map(|effect| {
-            format!(
-                "未解決の管理操作 {} ({}) があります。新しい入力は開始できません{}",
-                effect.request.operation_id,
-                effect.request.inventory,
-                workflow_recovery_issue
-                    .as_ref()
-                    .map(|reason| format!("。復旧理由: {reason}"))
-                    .unwrap_or_default()
-            )
-        }),
-        Err(error) => {
-            eprintln!("管理操作の状態を確認できません: {error}");
-            return ExitCode::FAILURE;
-        }
+        let blocker =
+            match polaris_core::sync::composite::C10CompositeBlockerV1::inspect_with_mutation(
+                &project_root,
+                &args.state_dir,
+                &lease,
+            ) {
+                Ok(value) => value.map(|effect| {
+                    format!(
+                        "未解決の管理操作 {} ({}) があります。新しい入力は開始できません{}",
+                        effect.request.operation_id,
+                        effect.request.inventory,
+                        recovery_issue
+                            .as_ref()
+                            .map(|reason| format!("。復旧理由: {reason}"))
+                            .unwrap_or_default()
+                    )
+                }),
+                Err(error) => Some(format!("管理・同期の状態を確認できません: {error}")),
+            };
+        (store, recovery_issue, blocker)
     };
 
     #[cfg(unix)]
@@ -3445,10 +3663,62 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             })
     };
     let mut tool_memory_path: Option<PathBuf> = None;
+    #[cfg(target_os = "macos")]
+    let mut pending_c10_job: Option<C10TuiJob> = None;
+    #[cfg(target_os = "macos")]
+    let mut c10_exit_requested = false;
     let exit_code = 'outer: loop {
         #[cfg(target_os = "linux")]
         if let Some(code) = linux_pending_exit_code() {
             break code;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(job) = pending_c10_job.as_mut() {
+            let result = job.poll(
+                |view| {
+                    terminal
+                        .borrow_mut()
+                        .draw(|frame| render::render_c10_preview(frame, view))
+                        .is_ok()
+                },
+                |view| confirm_c10_sync(&terminal, &mut key_reader, view),
+            );
+            if let Some(result) = result {
+                pending_c10_job.take();
+                let failed = result.is_err();
+                record_c10_result(result, &mut status, &mut local_lines);
+                if c10_exit_requested {
+                    break if failed {
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    };
+                }
+                continue;
+            }
+            if terminal.borrow_mut().draw(render::render_c10_wait).is_err() {
+                // Dropping the owned job revokes UI, closes prompts and reaps.
+                break ExitCode::FAILURE;
+            }
+            match ratatui::crossterm::event::poll(Duration::from_millis(100)) {
+                Ok(true) => match ratatui::crossterm::event::read() {
+                    Ok(ratatui::crossterm::event::Event::Key(key))
+                        if key.code == ratatui::crossterm::event::KeyCode::Char('c')
+                            && key
+                                .modifiers
+                                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        c10_exit_requested = true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break ExitCode::FAILURE,
+                },
+                Ok(false) => {}
+                Err(_) => break ExitCode::FAILURE,
+            }
+            // This is the main event loop: redraw/resize/exit events continue
+            // while a network worker runs; no input enters history or a queue.
+            continue;
         }
         if redact_inline_secret_value(&mut input_buffer, &mut input_cursor, &mut input_history) {
             status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
@@ -3532,16 +3802,23 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             input_buffer = queued;
             input_cursor = input_buffer.len();
             true
-        } else if let Some(queued) = (!queued_inputs_paused)
-            .then(|| queued_inputs.pop_front())
-            .flatten()
-        {
-            draft_after_queued_dispatch = Some((std::mem::take(&mut input_buffer), input_cursor));
-            input_buffer = queued;
-            input_cursor = input_buffer.len();
-            true
         } else {
-            false
+            match promote_queued_input(
+                &mut queued_inputs,
+                queued_inputs_paused,
+                &mut input_buffer,
+                &mut input_cursor,
+            ) {
+                Ok(Some(draft)) => {
+                    draft_after_queued_dispatch = Some(draft);
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    status = Status::Error(error.into());
+                    false
+                }
+            }
         };
         if redact_inline_secret_value(&mut input_buffer, &mut input_cursor, &mut input_history) {
             status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
@@ -3902,7 +4179,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         status = Status::Notice(rewind_unavailable_reason.clone());
                         continue;
                     };
-                    if let Err(error) = ensure_rewind_unblocked(&management_effects) {
+                    if let Err(error) = ensure_rewind_unblocked(
+                        &polaris_core::project::resolve_root(&args.cwd),
+                        &management_effects,
+                    ) {
                         status = Status::Error(error);
                         continue;
                     }
@@ -4027,12 +4307,20 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 }
                 KeyCode::Enter => {
                     let action = slash::action_for(suggestions[selected_suggestion].name);
+                    if let Err(error) = require_action_owner(&action) {
+                        status = Status::Error(error.into());
+                        continue;
+                    }
                     #[cfg(unix)]
                     {
                         last_submission_was_local = true;
                     }
                     #[cfg(unix)]
-                    if let Some(error) = management_clearance_error(&management_effects, &action) {
+                    if let Some(error) = management_clearance_error(
+                        &polaris_core::project::resolve_root(&args.cwd),
+                        &management_effects,
+                        &action,
+                    ) {
                         status = Status::Error(error);
                         continue;
                     }
@@ -4387,6 +4675,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 fixed_effort: args.initial_effort_name.as_deref(),
                                 answer_finalizer: args.answer_finalizer.as_deref(),
                                 #[cfg(unix)]
+                                project_root: &polaris_core::project::resolve_root(&args.cwd),
+                                #[cfg(unix)]
                                 management_effects: &management_effects,
                                 #[cfg(unix)]
                                 recovery_issue: workflow_recovery_issue.as_deref(),
@@ -4405,6 +4695,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             ));
                             #[cfg(unix)]
                             local_lines.extend(management_effect_diagnostic(
+                                &polaris_core::project::resolve_root(&args.cwd),
                                 &management_effects,
                                 workflow_recovery_issue.as_deref(),
                             ));
@@ -4664,6 +4955,38 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         }
                         #[cfg(any(target_os = "linux", target_os = "macos"))]
                         slash::Action::Sync(requested) => {
+                            if is_c10_sync_request(&requested) {
+                                #[cfg(target_os = "macos")]
+                                match session
+                                    .check_persistence()
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|()| {
+                                        start_c10_sync_action(
+                                            &args.cwd,
+                                            &args.state_dir,
+                                            &requested,
+                                            has_pending_inputs || dispatching_queued_input,
+                                        )
+                                    }) {
+                                    Ok(job) => {
+                                        pending_c10_job = Some(job);
+                                        status = Status::Notice("C10操作を開始しました".into());
+                                    }
+                                    Err(error) => {
+                                        record_c10_result(Err(error), &mut status, &mut local_lines)
+                                    }
+                                }
+                                #[cfg(target_os = "linux")]
+                                record_c10_result(
+                                    c10_unavailable_action(
+                                        &requested,
+                                        has_pending_inputs || dispatching_queued_input,
+                                    ),
+                                    &mut status,
+                                    &mut local_lines,
+                                );
+                                continue;
+                            }
                             handle_sync_action(
                                 &terminal,
                                 &mut key_reader,
@@ -4920,6 +5243,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 .modifiers
                 .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
         {
+            if let Err(error) = require_action_owner(&slash::Action::Copy) {
+                status = Status::Error(error.into());
+                continue;
+            }
             #[cfg(unix)]
             {
                 status = match local_actions::handle(
@@ -4959,7 +5286,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         let text = if let Some(t) = review_text {
             t
         } else {
-            let typed = match apply_key(&mut input_buffer, &mut input_cursor, key) {
+            let action = match apply_admitted_key(&mut input_buffer, &mut input_cursor, key) {
+                Ok(action) => action,
+                Err(error) => {
+                    status = Status::Error(error.into());
+                    continue;
+                }
+            };
+            let typed = match action {
                 InputAction::Continue => {
                     #[cfg(unix)]
                     {
@@ -5037,10 +5371,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 slash::parse(&typed)
             };
             #[cfg(unix)]
-            if let Some(error) = parsed_action
-                .as_ref()
-                .and_then(|action| management_clearance_error(&management_effects, action))
-            {
+            if let Some(error) = parsed_action.as_ref().and_then(|action| {
+                management_clearance_error(
+                    &polaris_core::project::resolve_root(&args.cwd),
+                    &management_effects,
+                    action,
+                )
+            }) {
                 if dispatching_queued_input {
                     queued_inputs.push_front(typed);
                     queued_inputs_paused = true;
@@ -5391,6 +5728,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         fixed_effort: args.initial_effort_name.as_deref(),
                         answer_finalizer: args.answer_finalizer.as_deref(),
                         #[cfg(unix)]
+                        project_root: &polaris_core::project::resolve_root(&args.cwd),
+                        #[cfg(unix)]
                         management_effects: &management_effects,
                         #[cfg(unix)]
                         recovery_issue: workflow_recovery_issue.as_deref(),
@@ -5409,6 +5748,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     ));
                     #[cfg(unix)]
                     local_lines.extend(management_effect_diagnostic(
+                        &polaris_core::project::resolve_root(&args.cwd),
                         &management_effects,
                         workflow_recovery_issue.as_deref(),
                     ));
@@ -5686,6 +6026,38 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 }
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 Some(slash::Action::Sync(requested)) => {
+                    if is_c10_sync_request(&requested) {
+                        #[cfg(target_os = "macos")]
+                        match session
+                            .check_persistence()
+                            .map_err(|error| error.to_string())
+                            .and_then(|()| {
+                                start_c10_sync_action(
+                                    &args.cwd,
+                                    &args.state_dir,
+                                    &requested,
+                                    has_pending_inputs || dispatching_queued_input,
+                                )
+                            }) {
+                            Ok(job) => {
+                                pending_c10_job = Some(job);
+                                status = Status::Notice("C10操作を開始しました".into());
+                            }
+                            Err(error) => {
+                                record_c10_result(Err(error), &mut status, &mut local_lines)
+                            }
+                        }
+                        #[cfg(target_os = "linux")]
+                        record_c10_result(
+                            c10_unavailable_action(
+                                &requested,
+                                has_pending_inputs || dispatching_queued_input,
+                            ),
+                            &mut status,
+                            &mut local_lines,
+                        );
+                        continue;
+                    }
                     handle_sync_action(
                         &terminal,
                         &mut key_reader,
@@ -5877,6 +6249,20 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             }
         };
 
+        if let Err(error) = require_turn_owner() {
+            restore_rejected_new_submission(
+                text,
+                cursor_before_submit,
+                dispatching_queued_input,
+                &mut input_buffer,
+                &mut input_cursor,
+                &mut queued_inputs,
+                &mut queued_inputs_paused,
+            );
+            status = Status::Error(error.into());
+            continue;
+        }
+
         #[cfg(unix)]
         if session.persistence.is_some() && !dispatching_queued_input {
             if let Err(error) = draft::save(
@@ -5897,14 +6283,16 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         #[cfg(unix)]
         let rewind_pre_manifest_id = if session.persistence.is_some() {
             match rewind_workspace.as_ref() {
-                Some(owner) => match owner.capture(&args.sandbox) {
-                    Ok(id) => Some(id.to_string()),
-                    Err(error) => {
-                        rewind_unavailable_reason =
-                            format!("この入力のファイル保存を作成できません: {error}");
-                        None
+                Some(owner) => {
+                    match capture_rewind_before_input(owner, &management_effects, &args.sandbox) {
+                        Ok(id) => Some(id.to_string()),
+                        Err(error) => {
+                            rewind_unavailable_reason =
+                                format!("この入力のファイル保存を作成できません: {error}");
+                            None
+                        }
                     }
-                },
+                }
                 None => {
                     rewind_unavailable_reason =
                         "この作業場所はファイル巻き戻しの対象外です".to_owned();
@@ -5949,7 +6337,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         };
 
         #[cfg(unix)]
-        match management_effects.blocker() {
+        match polaris_core::sync::composite::C10CompositeBlockerV1::inspect_with_activity(
+            &polaris_core::project::resolve_root(&args.cwd),
+            &args.state_dir,
+            &_project_activity,
+        ) {
             Ok(Some(effect)) => {
                 if dispatching_queued_input {
                     queued_inputs.push_front(text);
@@ -6221,6 +6613,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 status = Status::Error(format!("routine authorityを接続できません: {error}"));
                 continue;
             }
+            #[cfg(unix)]
             match begin_rewind_for_session(
                 &session,
                 rewind_pre_manifest_id.as_deref(),
@@ -6847,7 +7240,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         #[cfg(unix)]
                                         { status = Status::Notice("コピーは実行終了後に /copy で確認してください".into()); }
                                         #[cfg(not(unix))]
-                                        { status = Status::Notice(clipboard::copy_text_with(reply_before_this_turn.as_deref(), clipboard::copy_to_clipboard)); }
+                                        {
+                                            status = match require_action_owner(&slash::Action::Copy) {
+                                                Ok(()) => Status::Notice(clipboard::copy_text_with(reply_before_this_turn.as_deref(), clipboard::copy_to_clipboard)),
+                                                Err(error) => Status::Error(error.into()),
+                                            };
+                                        }
                                         // Draw immediately so the
                                         // confirmation appears right away
                                         // rather than up to 100ms late,
@@ -6992,6 +7390,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             status = Status::Error(
                                                 "このTUIでは秘密情報の設定をまだ受け付けていません".into(),
                                             );
+                                            mid_turn_notice_until = Some(
+                                                Instant::now() + MID_TURN_NOTICE_DURATION,
+                                            );
+                                        }
+                                        InflightInputAction::RejectedUnavailable => {
+                                            status = Status::Error(WINDOWS_OWNER_UNAVAILABLE.into());
                                             mid_turn_notice_until = Some(
                                                 Instant::now() + MID_TURN_NOTICE_DURATION,
                                             );
@@ -7374,6 +7778,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         #[cfg(all(unix, not(target_os = "linux")))]
         let rewind_turn_completed = turn_completed;
         #[cfg(unix)]
+        drop(_project_activity);
+        #[cfg(unix)]
         if let Some(boundary) = rewind_boundary {
             let Some(persistence) = session.persistence.as_ref() else {
                 fatal_message = Some("巻き戻し境界の保存元が失われました".into());
@@ -7381,57 +7787,27 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             };
             let completion = if rewind_turn_completed && rewind_writers_stopped {
                 match rewind_workspace.as_ref() {
-                    Some(owner) => match owner.capture(&args.sandbox) {
-                        Ok(post) => {
-                            let effect = match rewind_effects.unknown_reason() {
-                                Some(description) => {
-                                    polaris_core::conversation_state::RewindEffectStatusV1::Unknown {
-                                        description,
-                                    }
-                                }
-                                None => polaris_core::conversation_state::RewindEffectStatusV1::NoExternalMutation,
-                            };
-                            let eligibility = if matches!(
-                                effect,
-                                polaris_core::conversation_state::RewindEffectStatusV1::NoExternalMutation
-                            ) {
-                                polaris_core::conversation_state::RewindEligibilityV1::Eligible
-                            } else {
-                                polaris_core::conversation_state::RewindEligibilityV1::Ineligible {
-                                    reason: "外部効果を巻き戻せません".into(),
-                                }
-                            };
-                            let post_manifest_id = post.to_string();
+                    Some(owner) => finish_rewind_for_session(
+                        owner,
+                        persistence,
+                        &management_effects,
+                        &args.sandbox,
+                        &boundary,
+                        rewind_effects.unknown_reason(),
+                        || {
                             #[cfg(target_os = "linux")]
-                            let capture_can_complete = linux_turn_completed_without_shutdown(
-                                true,
-                                signal::pending_linux_process_shutdown(),
-                            );
-                            #[cfg(not(target_os = "linux"))]
-                            let capture_can_complete = true;
-                            if capture_can_complete {
-                                persistence.finish_rewind_boundary(
-                                    &boundary.boundary_id,
-                                    post_manifest_id,
-                                    eligibility,
-                                    effect,
-                                )
-                            } else {
-                                persistence.abandon_rewind_boundary(
-                                    &boundary.boundary_id,
-                                    "停止要求を受けたため巻き戻し境界は未完了です".into(),
+                            {
+                                linux_turn_completed_without_shutdown(
+                                    true,
+                                    signal::pending_linux_process_shutdown(),
                                 )
                             }
-                        }
-                        Err(error) => {
-                            rewind_unavailable_reason =
-                                format!("ターン後のファイル保存を作成できません: {error}");
-                            persistence.abandon_rewind_boundary(
-                                &boundary.boundary_id,
-                                rewind_unavailable_reason.clone(),
-                            )
-                        }
-                    },
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                true
+                            }
+                        },
+                    ),
                     None => persistence.abandon_rewind_boundary(
                         &boundary.boundary_id,
                         "ファイル保存先が利用できません".into(),
@@ -7697,6 +8073,784 @@ fn confirm_rewind_preview<B: ratatui::backend::Backend, R: approver::KeyReader>(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[derive(Clone, Copy)]
+enum C10TuiInvocation {
+    Push,
+    Recover(polaris_core::management_effect::ManagementOperationIdV1),
+    Abandon(polaris_core::management_effect::ManagementOperationIdV1),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn c10_tui_invocation(requested: &str) -> Result<C10TuiInvocation, String> {
+    use polaris_core::management_effect::ManagementOperationIdV1;
+    use std::str::FromStr;
+    let words: Vec<_> = requested.split_whitespace().collect();
+    match words.as_slice() {
+        ["push"] => Ok(C10TuiInvocation::Push),
+        [action @ ("recover" | "abandon"), operation] => {
+            let operation = ManagementOperationIdV1::from_str(operation)
+                .map_err(|_| "C10 operation IDが不正です".to_string())?;
+            if *action == "recover" {
+                Ok(C10TuiInvocation::Recover(operation))
+            } else {
+                Ok(C10TuiInvocation::Abandon(operation))
+            }
+        }
+        _ => Err("使い方: /sync push · /sync recover <C10 operation ID> · /sync abandon <C10 operation ID>".into()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn is_c10_sync_request(requested: &str) -> bool {
+    let words: Vec<_> = requested.split_whitespace().collect();
+    match words.first() {
+        Some(&"push" | &"abandon") => true,
+        // C12 retains its 64-hex operation key; C10 uses the distinct typed
+        // 32-hex management operation ID. No ledger is inferred here.
+        Some(&"recover") => !matches!(words.as_slice(), ["recover", key]
+            if key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn c10_unavailable_action(requested: &str, has_queued_input: bool) -> Result<String, String> {
+    if has_queued_input {
+        return Err("送信待ちを空にしてから共有内容を操作してください".into());
+    }
+    match c10_tui_invocation(requested)? {
+        C10TuiInvocation::Push => {}
+        C10TuiInvocation::Recover(operation) | C10TuiInvocation::Abandon(operation) => {
+            let _ = operation;
+        }
+    }
+    Err(
+        "c10_unavailable_platform: 共有送信はmacOSのData Protection Keychainでのみ利用できます。"
+            .into(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn record_c10_result(
+    result: Result<String, String>,
+    status: &mut Status,
+    local_lines: &mut Vec<ratatui::text::Line<'static>>,
+) {
+    match result {
+        Ok(text) => {
+            local_lines.extend(
+                text.lines()
+                    .map(|line| ratatui::text::Line::from(render::sanitize(line))),
+            );
+            *status = Status::Notice("C10操作の結果を表示しました".into());
+        }
+        Err(error) => *status = Status::Error(render::sanitize(&error)),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+enum C10TuiEvent {
+    Preview(render::C10ConfirmView, std::sync::mpsc::SyncSender<bool>),
+    Confirm(render::C10ConfirmView, std::sync::mpsc::SyncSender<bool>),
+    Finished(Result<String, String>),
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct C10TuiHost {
+    invocation: C10TuiInvocation,
+    events: std::sync::mpsc::Sender<C10TuiEvent>,
+    ui_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abandon_consent: std::sync::Mutex<
+        Option<(
+            polaris_core::management_effect::ManagementOperationIdV1,
+            polaris_core::sync::remote_intent::SyncDigestV1,
+        )>,
+    >,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl C10TuiHost {
+    fn live(&self) -> Result<(), polaris_core::sync::push::SyncPushErrorV1> {
+        if self.ui_open.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(polaris_core::sync::push::SyncPushErrorV1::Permission)
+        }
+    }
+    fn ask(
+        &self,
+        view: render::C10ConfirmView,
+    ) -> Result<bool, polaris_core::sync::push::SyncPushErrorV1> {
+        use polaris_core::sync::push::SyncPushErrorV1;
+        self.live()?;
+        let (reply, response) = std::sync::mpsc::sync_channel(0);
+        self.events
+            .send(C10TuiEvent::Confirm(view, reply))
+            .map_err(|_| SyncPushErrorV1::Permission)?;
+        let accepted = response.recv().map_err(|_| SyncPushErrorV1::Permission)?;
+        self.live()?;
+        Ok(accepted)
+    }
+
+    fn show_preview(
+        &self,
+        mut view: render::C10ConfirmView,
+    ) -> Result<(), polaris_core::sync::push::SyncPushErrorV1> {
+        use polaris_core::sync::push::SyncPushErrorV1;
+        self.live()?;
+        view.title = "C10 preview（確定はprepare後）".into();
+        let (reply, response) = std::sync::mpsc::sync_channel(0);
+        self.events
+            .send(C10TuiEvent::Preview(view, reply))
+            .map_err(|_| SyncPushErrorV1::Permission)?;
+        if !response.recv().map_err(|_| SyncPushErrorV1::Permission)? {
+            return Err(SyncPushErrorV1::Permission);
+        }
+        self.live()
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl polaris_core::sync::push::SyncPushHostV1 for C10TuiHost {
+    fn require_confirmation_path(
+        &self,
+        _: &polaris_core::sync::push::SyncPushConfirmationSummaryV1,
+    ) -> Result<(), polaris_core::sync::push::SyncPushErrorV1> {
+        self.live()
+    }
+    fn require_recovery_invocation(
+        &self,
+        operation: polaris_core::management_effect::ManagementOperationIdV1,
+    ) -> Result<(), polaris_core::sync::push::SyncPushErrorV1> {
+        self.live()?;
+        if matches!(self.invocation, C10TuiInvocation::Recover(value) if value == operation) {
+            Ok(())
+        } else {
+            Err(polaris_core::sync::push::SyncPushErrorV1::Permission)
+        }
+    }
+    fn confirm_abandon(
+        &self,
+        operation: polaris_core::management_effect::ManagementOperationIdV1,
+        request: polaris_core::sync::remote_intent::SyncDigestV1,
+    ) -> Result<(), polaris_core::sync::push::SyncPushErrorV1> {
+        use polaris_core::sync::push::SyncPushErrorV1;
+        if !matches!(self.invocation, C10TuiInvocation::Abandon(value) if value == operation) {
+            return Err(SyncPushErrorV1::Permission);
+        }
+        if !self.ask(render::C10ConfirmView {
+            title: "C10操作を照合して中止".into(),
+            details: vec![
+                format!("operation={operation}"),
+                format!("request={request}"),
+                "送信されなかったことの証明にはなりません。".into(),
+            ],
+        })? {
+            return Err(SyncPushErrorV1::Permission);
+        }
+        *self
+            .abandon_consent
+            .lock()
+            .map_err(|_| SyncPushErrorV1::Permission)? = Some((operation, request));
+        Ok(())
+    }
+    fn require_abandon_invocation(
+        &self,
+        operation: polaris_core::management_effect::ManagementOperationIdV1,
+        request: polaris_core::sync::remote_intent::SyncDigestV1,
+    ) -> Result<(), polaris_core::sync::push::SyncPushErrorV1> {
+        use polaris_core::sync::push::SyncPushErrorV1;
+        self.live()?;
+        if matches!(self.invocation, C10TuiInvocation::Abandon(value) if value == operation)
+            && *self
+                .abandon_consent
+                .lock()
+                .map_err(|_| SyncPushErrorV1::Permission)?
+                == Some((operation, request))
+        {
+            Ok(())
+        } else {
+            Err(SyncPushErrorV1::Permission)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct C10TuiJob {
+    inbox: Option<std::sync::mpsc::Receiver<C10TuiEvent>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    ui_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    result: Option<Result<String, String>>,
+    confirmed: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl C10TuiJob {
+    fn start(
+        invocation: C10TuiInvocation,
+        work: impl FnOnce(C10TuiHost) -> Result<String, String> + Send + 'static,
+    ) -> Self {
+        let (events, inbox) = std::sync::mpsc::channel();
+        let ui_open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let host = C10TuiHost {
+            invocation,
+            events: events.clone(),
+            ui_open: ui_open.clone(),
+            abandon_consent: std::sync::Mutex::new(None),
+        };
+        let worker = std::thread::spawn(move || {
+            let result = work(host);
+            let _ = events.send(C10TuiEvent::Finished(result));
+        });
+        Self {
+            inbox: Some(inbox),
+            worker: Some(worker),
+            ui_open,
+            result: None,
+            confirmed: false,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        mut preview: impl FnMut(&render::C10ConfirmView) -> bool,
+        mut confirm: impl FnMut(&render::C10ConfirmView) -> bool,
+    ) -> Option<Result<String, String>> {
+        use std::sync::mpsc::TryRecvError;
+        if self.result.is_none() {
+            match self.inbox.as_ref()?.try_recv() {
+                Ok(C10TuiEvent::Preview(view, reply)) => {
+                    let _ = reply.send(preview(&view));
+                }
+                Ok(C10TuiEvent::Confirm(view, reply)) => {
+                    let accepted = !self.confirmed && confirm(&view);
+                    self.confirmed = true;
+                    let _ = reply.send(accepted);
+                }
+                Ok(C10TuiEvent::Finished(result)) => self.result = Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    self.result = Some(Err(
+                        "C10 workerが終了しました。再送せず状態を確認してください".into(),
+                    ))
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        // A network child never makes this poll join a running worker.
+        if self.result.is_none() || !self.worker.as_ref()?.is_finished() {
+            return None;
+        }
+        self.ui_open
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.inbox.take();
+        if self.worker.take().unwrap().join().is_err() {
+            return Some(Err(
+                "C10 workerが失敗しました。再送せず状態を確認してください".into(),
+            ));
+        }
+        Some(
+            self.result
+                .take()
+                .unwrap_or_else(|| Err("C10 workerの結果を確認できません".into())),
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for C10TuiJob {
+    fn drop(&mut self) {
+        self.ui_open
+            .store(false, std::sync::atomic::Ordering::Release);
+        // Close reply receivers before joining, including a pending prompt.
+        self.inbox.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(test)]
+fn c10_tui_worker(
+    invocation: C10TuiInvocation,
+    confirm: impl FnOnce(&render::C10ConfirmView) -> bool,
+    work: impl FnOnce(C10TuiHost) -> Result<String, String> + Send + 'static,
+) -> Result<String, String> {
+    let mut job = C10TuiJob::start(invocation, work);
+    let mut confirm = Some(confirm);
+    loop {
+        if let Some(result) = job.poll(
+            |_| true,
+            |view| confirm.take().is_some_and(|confirm| confirm(view)),
+        ) {
+            return result;
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn c10_tui_view(
+    summary: &polaris_core::sync::push::SyncPushConfirmationSummaryV1,
+) -> render::C10ConfirmView {
+    render::C10ConfirmView {
+        title: "C10共有送信の確認".into(),
+        details: vec![
+            format!("operation={}", summary.operation_id),
+            format!("request={}", summary.request_hash),
+            format!("project={}", summary.project),
+            format!("共有={}", summary.share_id),
+            format!("remote={}", summary.remote_label),
+            format!("ref={}", summary.remote_ref),
+            format!("manifest={}", summary.manifest_digest),
+            format!("payload={}", summary.payload_digest),
+            format!("expected remote={:?}", summary.expected_remote),
+            format!(
+                "対象={}件・除外={}件",
+                summary.file_count, summary.excluded_count
+            ),
+            format!("account registration={}", summary.account_registration_id),
+            format!("操作={:?}", summary.action),
+            "会話の巻き戻しでは共有送信を取り消せません。".into(),
+        ],
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn c10_tui_outcome(outcome: polaris_core::sync::push::SyncPushOutcomeV1) -> Result<String, String> {
+    use polaris_core::sync::push::SyncPushOutcomeV1;
+    match outcome {
+        SyncPushOutcomeV1::NoChanges => Ok("C10: 共有内容は一致しています".into()),
+        SyncPushOutcomeV1::Completed {
+            operation_id,
+            commit,
+        } => Ok(format!(
+            "C10送信完了: operation={operation_id} commit={commit}"
+        )),
+        SyncPushOutcomeV1::Denied { operation_id } => {
+            Ok(format!("C10操作を取り消しました: operation={operation_id}"))
+        }
+        SyncPushOutcomeV1::ReconciledAbandon { operation_id } => Ok(format!(
+            "C10操作を照合して中止しました: operation={operation_id}（未送信の証明ではありません）"
+        )),
+        SyncPushOutcomeV1::OutcomeUnknown { operation_id } => Err(format!(
+            "C10結果未確定: operation={operation_id}。再送せず /sync recover {operation_id} で照合してください"
+        )),
+        SyncPushOutcomeV1::PartialComplete { operation_id } => Err(format!(
+            "C10保存未完了: operation={operation_id}。再送せず /sync recover {operation_id} で照合してください"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_c10_sync_action(
+    project: &Path,
+    state: &Path,
+    requested: &str,
+    has_queued_input: bool,
+) -> Result<C10TuiJob, String> {
+    if has_queued_input {
+        return Err("送信待ちを空にしてから共有内容を操作してください".into());
+    }
+    let invocation = c10_tui_invocation(requested)?;
+    #[cfg(target_os = "macos")]
+    {
+        let project = std::fs::canonicalize(polaris_core::project::resolve_root(project))
+            .map_err(|_| "C10 projectを確認できません")?;
+        let expected =
+            polaris_core::project::state_dir(&project).map_err(|_| "C10 stateを確認できません")?;
+        if std::fs::canonicalize(state).map_err(|_| "C10 stateを確認できません")?
+            != std::fs::canonicalize(expected).map_err(|_| "C10 stateを確認できません")?
+        {
+            return Err("C10 projectと保存場所が一致しません".into());
+        }
+        Ok(C10TuiJob::start(invocation, move |host| {
+            use polaris_core::sync::push::SyncPushOwnerV1;
+            match invocation {
+                C10TuiInvocation::Push => {
+                    let ui = C10TuiHost {
+                        invocation,
+                        events: host.events.clone(),
+                        ui_open: host.ui_open.clone(),
+                        abandon_consent: std::sync::Mutex::new(None),
+                    };
+                    let owner = SyncPushOwnerV1::for_project(&project, Box::new(host))
+                        .map_err(|e| e.to_string())?;
+                    let preview = owner.preview().map_err(|e| e.to_string())?;
+                    ui.show_preview(c10_tui_view(preview.summary()))
+                        .map_err(|e| e.to_string())?;
+                    let token = owner.prepare(preview).map_err(|e| e.to_string())?;
+                    // The token stays exclusively on this worker until consumed.
+                    let accepted = ui
+                        .ask(c10_tui_view(token.summary()))
+                        .map_err(|e| e.to_string())?;
+                    c10_tui_outcome(
+                        if accepted {
+                            token.confirm()
+                        } else {
+                            token.deny()
+                        }
+                        .map_err(|e| e.to_string())?,
+                    )
+                }
+                C10TuiInvocation::Recover(operation) => {
+                    let owner = SyncPushOwnerV1::for_project(&project, Box::new(host))
+                        .map_err(|e| e.to_string())?;
+                    c10_tui_outcome(owner.recover(operation).map_err(|e| e.to_string())?)
+                }
+                C10TuiInvocation::Abandon(operation) => {
+                    let owner = SyncPushOwnerV1::for_project(&project, Box::new(host))
+                        .map_err(|e| e.to_string())?;
+                    c10_tui_outcome(owner.abandon(operation).map_err(|e| e.to_string())?)
+                }
+            }
+        }))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn confirm_c10_sync<B: ratatui::backend::Backend, R: approver::KeyReader>(
+    terminal: &RefCell<ratatui::Terminal<B>>,
+    reader: &mut R,
+    view: &render::C10ConfirmView,
+) -> bool {
+    let mut offset = 0usize;
+    loop {
+        let mut ready = false;
+        if terminal
+            .borrow_mut()
+            .draw(|frame| ready = render::render_c10_confirmation(frame, view, offset))
+            .is_err()
+        {
+            return false;
+        }
+        use ratatui::crossterm::event::KeyCode;
+        match reader.read_key() {
+            Ok(KeyCode::Char('y')) if ready => return true,
+            Ok(KeyCode::Down) => offset = offset.saturating_add(1),
+            Ok(KeyCode::Up) => offset = offset.saturating_sub(1),
+            Ok(KeyCode::Esc) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod c10_tui_adapter_tests {
+    use super::*;
+    use polaris_core::{
+        management_effect::ManagementOperationIdV1 as Operation,
+        sync::{
+            push::{SyncPushHostV1, SyncPushOutcomeV1},
+            remote_intent::SyncDigestV1,
+        },
+    };
+
+    #[test]
+    fn c10_parser_preserves_explicit_recovery_and_rejects_extra_arguments() {
+        let operation = Operation::random().unwrap();
+        assert!(is_c10_sync_request(&format!("recover {operation}")));
+        assert!(is_c10_sync_request(&format!("abandon {operation}")));
+        assert!(!is_c10_sync_request(&format!("recover {}", "a".repeat(64))));
+        assert!(matches!(
+            c10_tui_invocation("push").unwrap(),
+            C10TuiInvocation::Push
+        ));
+        assert!(
+            matches!(c10_tui_invocation(&format!("recover {operation}")).unwrap(), C10TuiInvocation::Recover(value) if value == operation)
+        );
+        assert!(
+            matches!(c10_tui_invocation(&format!("abandon {operation}")).unwrap(), C10TuiInvocation::Abandon(value) if value == operation)
+        );
+        for value in [
+            "push unknown",
+            "recover invalid",
+            "push yes",
+            "push recover",
+        ] {
+            assert!(c10_tui_invocation(value).is_err());
+        }
+        for value in [
+            "/sync push",
+            "/sync recover invalid",
+            "/sync abandon invalid",
+        ] {
+            assert!(!slash::parse(value).unwrap().needs_management_clearance());
+        }
+    }
+
+    #[test]
+    fn c10_owned_worker_recovery_binds_invocation_without_confirmation() {
+        let main_thread = std::thread::current().id();
+        let operation = Operation::random().unwrap();
+        let result = c10_tui_worker(
+            C10TuiInvocation::Recover(operation),
+            |_| panic!("recover must not ask consent"),
+            move |host| {
+                assert_ne!(std::thread::current().id(), main_thread);
+                host.require_recovery_invocation(operation).unwrap();
+                assert!(
+                    host.require_recovery_invocation(Operation::random().unwrap())
+                        .is_err()
+                );
+                assert!(
+                    host.require_abandon_invocation(operation, SyncDigestV1::digest(b"request"))
+                        .is_err()
+                );
+                Ok("reconciled without send".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, "reconciled without send");
+    }
+
+    #[test]
+    fn c10_owned_abandon_waits_for_exact_fresh_consent_and_retains_worker() {
+        let main_thread = std::thread::current().id();
+        let operation = Operation::random().unwrap();
+        let request = SyncDigestV1::digest(b"durable request");
+        let result = c10_tui_worker(
+            C10TuiInvocation::Abandon(operation),
+            |view| {
+                assert_eq!(std::thread::current().id(), main_thread);
+                assert!(
+                    view.details
+                        .iter()
+                        .any(|value| value.contains(&operation.as_hex()))
+                );
+                assert!(
+                    view.details
+                        .iter()
+                        .any(|value| value.contains(&request.to_string()))
+                );
+                true
+            },
+            move |host| {
+                assert_ne!(std::thread::current().id(), main_thread);
+                assert!(host.require_abandon_invocation(operation, request).is_err());
+                host.confirm_abandon(operation, request).unwrap();
+                host.require_abandon_invocation(operation, request).unwrap();
+                assert!(
+                    host.require_abandon_invocation(
+                        operation,
+                        SyncDigestV1::digest(b"other request")
+                    )
+                    .is_err()
+                );
+                assert!(host.require_recovery_invocation(operation).is_err());
+                Ok("owned worker completed".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, "owned worker completed");
+    }
+
+    #[test]
+    fn c10_worker_decline_or_failure_never_detaches_or_grants_consent() {
+        let operation = Operation::random().unwrap();
+        let error = c10_tui_worker(
+            C10TuiInvocation::Abandon(operation),
+            |_| false,
+            move |host| {
+                host.confirm_abandon(operation, SyncDigestV1::digest(b"request"))
+                    .map_err(|e| e.to_string())?;
+                panic!("declined request continued")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "c10_permission_unavailable");
+        assert!(
+            c10_tui_worker(
+                C10TuiInvocation::Push,
+                |_| panic!("worker failed before prompt"),
+                |_| { panic!("owned synthetic worker failure") }
+            )
+            .unwrap_err()
+            .contains("workerが失敗")
+        );
+    }
+
+    struct Keys(std::collections::VecDeque<ratatui::crossterm::event::KeyCode>);
+    impl approver::KeyReader for Keys {
+        fn read_key(&mut self) -> std::io::Result<ratatui::crossterm::event::KeyCode> {
+            self.0
+                .pop_front()
+                .ok_or_else(|| std::io::ErrorKind::UnexpectedEof.into())
+        }
+    }
+
+    #[test]
+    fn c10_narrow_confirmation_requires_complete_wrapped_details() {
+        use ratatui::crossterm::event::KeyCode;
+        let terminal = RefCell::new(
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 10)).unwrap(),
+        );
+        let view = render::C10ConfirmView {
+            title: "C10".into(),
+            details: vec!["a".repeat(64), "b".repeat(64), "request end".into()],
+        };
+        let mut premature = Keys([KeyCode::Char('y')].into());
+        assert!(!confirm_c10_sync(&terminal, &mut premature, &view));
+        let mut keys = std::collections::VecDeque::from([KeyCode::Char('y')]);
+        keys.extend(std::iter::repeat_n(KeyCode::Down, 12));
+        keys.push_back(KeyCode::Char('y'));
+        assert!(confirm_c10_sync(&terminal, &mut Keys(keys), &view));
+        let mut cancel = Keys([KeyCode::Esc].into());
+        assert!(!confirm_c10_sync(&terminal, &mut cancel, &view));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn c10_actual_gateway_rejects_queued_and_malformed_input_before_writes() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            assert!(start_c10_sync_action(root.path(), root.path(), "push", true).is_err());
+            assert_eq!(
+                start_c10_sync_action(root.path(), root.path(), "recover invalid", false)
+                    .err()
+                    .unwrap(),
+                "C10 operation IDが不正です"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(c10_unavailable_action("push", true).is_err());
+            assert_eq!(
+                c10_unavailable_action("recover invalid", false).unwrap_err(),
+                "C10 operation IDが不正です"
+            );
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let terminal = RefCell::new(
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap(),
+        );
+        let session = polaris_core::session::Session::default();
+        let mut status = Status::Notice(String::new());
+        let mut lines = Vec::new();
+        handle_sync_action(
+            &terminal,
+            &mut Keys([].into()),
+            root.path(),
+            root.path(),
+            "recover invalid",
+            false,
+            &session,
+            &mut status,
+            &mut lines,
+        );
+        assert!(matches!(status, Status::Error(_)));
+        assert!(session.messages.is_empty());
+        assert!(lines.is_empty());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn c10_unknown_and_partial_are_not_terminal_successes() {
+        let operation_id = Operation::random().unwrap();
+        assert!(c10_tui_outcome(SyncPushOutcomeV1::NoChanges).is_ok());
+        for outcome in [
+            SyncPushOutcomeV1::OutcomeUnknown { operation_id },
+            SyncPushOutcomeV1::PartialComplete { operation_id },
+        ] {
+            let error = c10_tui_outcome(outcome).unwrap_err();
+            assert!(error.contains(&format!("/sync recover {operation_id}")));
+        }
+    }
+
+    #[test]
+    fn c10_pending_network_job_returns_to_main_loop_without_waiting() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut job = C10TuiJob::start(C10TuiInvocation::Push, move |_| {
+            blocked.recv().unwrap();
+            Ok("terminal".into())
+        });
+        let mut redraws = 0;
+        for _ in 0..50 {
+            assert!(
+                job.poll(
+                    |_| panic!("unexpected preview"),
+                    |_| panic!("unexpected confirmation")
+                )
+                .is_none()
+            );
+            redraws += 1;
+        }
+        assert_eq!(redraws, 50);
+        assert!(!job.worker.as_ref().unwrap().is_finished());
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(result) = job.poll(|_| true, |_| false) {
+                assert_eq!(result.unwrap(), "terminal");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(job.worker.is_none());
+    }
+
+    #[test]
+    fn c10_preview_ack_is_separate_from_prepared_confirmation_and_drop_reaps() {
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_order = order.clone();
+        let mut job = C10TuiJob::start(C10TuiInvocation::Push, move |host| {
+            host.show_preview(render::C10ConfirmView {
+                title: String::new(),
+                details: vec!["preview".into()],
+            })
+            .unwrap();
+            worker_order.lock().unwrap().push("prepared");
+            assert!(
+                host.ask(render::C10ConfirmView {
+                    title: "prepared".into(),
+                    details: Vec::new()
+                })
+                .unwrap()
+            );
+            Ok("terminal".into())
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(result) = job.poll(
+                |_| {
+                    order.lock().unwrap().push("preview displayed");
+                    true
+                },
+                |_| {
+                    order.lock().unwrap().push("confirmed");
+                    true
+                },
+            ) {
+                assert_eq!(result.unwrap(), "terminal");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["preview displayed", "prepared", "confirmed"]
+        );
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_done = done.clone();
+        let abandoned = C10TuiJob::start(C10TuiInvocation::Push, move |host| {
+            assert!(
+                host.ask(render::C10ConfirmView {
+                    title: "pending".into(),
+                    details: Vec::new()
+                })
+                .is_err()
+            );
+            worker_done.store(true, std::sync::atomic::Ordering::Release);
+            Err("UI closed".into())
+        });
+        drop(abandoned);
+        assert!(done.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sync_action(
     project: &Path,
@@ -7742,7 +8896,8 @@ fn sync_action(
         owner
             .ensure_sync_idle()
             .map_err(|_| "未完了の共有操作を確認してください")?;
-        let held = participation::read(&state);
+        let classification = participation::read(&state).map_err(|e| e.to_string())?;
+        let held = classification.participation();
         let mut join = None;
         let (id, detail) = match words[0] {
             "join" if words.len() >= 5 => {
@@ -7770,7 +8925,7 @@ fn sync_action(
                     "共有: {}\n招待: {}\nremote: {}\n期限: {}\n除外: {:?}\n参加はこの端末の保存のみ。peer・sourceを変更しません。",
                     share.share_id,
                     share.invitation_id,
-                    share.remote,
+                    share.remote_display(),
                     share.expires_unix_seconds,
                     manifest.excluded
                 );
@@ -7784,7 +8939,7 @@ fn sync_action(
                     format!(
                         "共有: {}\nremote: {}\n合意revision: {}\n受信・local stagingだけを更新します。source適用は別の確認です。",
                         held.share.share_id,
-                        held.share.remote,
+                        held.share.remote_display(),
                         held.agreed_commit.as_deref().unwrap_or("なし")
                     ),
                 )
@@ -7887,7 +9042,8 @@ fn sync_action(
                 }
             }
         };
-        let held = participation::read(&state);
+        let classification = participation::read(&state).map_err(|e| e.to_string())?;
+        let held = classification.participation();
         return Ok(format!(
             "共有適用: {}\n合意revision: {}\n反映済みrevision: {}\n解消待ち: {}\n未完了: {}\n管理操作: {}\n復旧用の控え: {}\n/sync apply · /sync recover <操作ID>",
             if held.is_some() {
@@ -7948,7 +9104,11 @@ fn sync_action(
         ));
     }
     owner.ensure_sync_idle().map_err(|e| e.to_string())?;
-    let mut held = participation::read(&state).ok_or("このprojectは共有に参加していません")?;
+    let mut held = participation::read(&state)
+        .map_err(|e| e.to_string())?
+        .participation()
+        .cloned()
+        .ok_or("このprojectは共有に参加していません")?;
     if !held.unresolved.is_empty() {
         return Err(format!(
             "解消待ちが{}件あります。先に解消してください。",
@@ -8057,7 +9217,9 @@ fn sync_action(
         agreed_revision: agreed_revision.clone(),
         staged_revision: agreed_revision,
         previous_applied_revision,
-        target_participation: serde_json::to_vec_pretty(&held).map_err(|e| e.to_string())?,
+        target_participation: owner
+            .participation_target_bytes(&held)
+            .map_err(|e| e.to_string())?,
     };
     // Apply precisely the inspected snapshot; do not reconstruct it after y.
     let report = owner
@@ -8129,6 +9291,10 @@ fn handle_sync_action<B: ratatui::backend::Backend, R: approver::KeyReader>(
         Ok(())
     }
     .and_then(|()| {
+        if is_c10_sync_request(requested) {
+            c10_tui_invocation(requested)?;
+            return Err("C10操作にはmainが所有するpending jobが必要です".into());
+        }
         sync_action(project, state, requested, has_queued_input, |view| {
             confirm_sync(terminal, reader, view)
         })
@@ -8308,6 +9474,12 @@ fn apply_confirmed_workflow_change(
     workspace
         .require_quiescent_with_lease(&lease)
         .map_err(|error| error.to_string())?;
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        state_dir,
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
     let owner = WorkflowChangeOwner {
         effects,
         lease: &lease,
@@ -8491,9 +9663,12 @@ fn select_rewind_boundary<B: ratatui::backend::Backend, R: approver::KeyReader>(
         .workspace_pre_manifest_id
         .parse()
         .map_err(|error: polaris_core::rewind_workspace::IdParseError| error.to_string())?;
-    let preview = owner
-        .preview(&expected_post, &target_pre)
-        .map_err(|error| error.to_string())?;
+    let preview = {
+        let lease = owner.try_mutation().map_err(|error| error.to_string())?;
+        owner
+            .preview_with_management_with_lease(&lease, &expected_post, &target_pre)
+            .map_err(|error| error.to_string())?
+    };
     if !preview.restorable {
         return Err(format!(
             "ファイルを復元できません: {:?}",
@@ -8621,9 +9796,38 @@ struct RewindFailure {
 
 #[cfg(unix)]
 fn ensure_rewind_unblocked(
+    project: &Path,
     effects: &polaris_core::management_effect::ManagementEffectStoreV1,
 ) -> Result<(), String> {
-    match effects.blocker() {
+    rewind_composite_result(
+        polaris_core::sync::composite::C10CompositeBlockerV1::inspect_readonly(
+            project,
+            effects.state_dir(),
+        ),
+    )
+}
+#[cfg(unix)]
+fn ensure_rewind_unblocked_with_lease(
+    project: &Path,
+    effects: &polaris_core::management_effect::ManagementEffectStoreV1,
+    lease: &polaris_core::project_mutation::ProjectMutationLeaseV1,
+) -> Result<(), String> {
+    rewind_composite_result(
+        polaris_core::sync::composite::C10CompositeBlockerV1::inspect_with_mutation(
+            project,
+            effects.state_dir(),
+            lease,
+        ),
+    )
+}
+#[cfg(unix)]
+fn rewind_composite_result(
+    result: Result<
+        Option<polaris_core::management_effect::ManagementEffectSnapshotV1>,
+        polaris_core::sync::composite::C10CompositeErrorV1,
+    >,
+) -> Result<(), String> {
+    match result {
         Ok(Some(effect)) => Err(format!(
             "未解決の管理操作 {} ({}) があるため巻き戻せません",
             effect.request.operation_id, effect.request.inventory
@@ -8714,7 +9918,8 @@ fn commit_rewind_if_unblocked(
         message: format!("巻き戻し確定用のproject leaseを取得できません: {error}"),
         fatal: true,
     })?;
-    if let Err(blocker) = ensure_rewind_unblocked(effects) {
+    if let Err(blocker) = ensure_rewind_unblocked_with_lease(owner.project_root(), effects, &lease)
+    {
         let result = read_rewind_transaction(
             owner,
             &lease,
@@ -8802,10 +10007,12 @@ async fn perform_rewind(
     args: &RunArgs<'_>,
     mcp_ceiling: polaris_core::mcp::operation::ExternalCeiling,
 ) -> Result<RewindActivation, RewindFailure> {
-    ensure_rewind_unblocked(effects).map_err(|message| RewindFailure {
-        message,
-        fatal: false,
-    })?;
+    ensure_rewind_unblocked(&polaris_core::project::resolve_root(&args.cwd), effects).map_err(
+        |message| RewindFailure {
+            message,
+            fatal: false,
+        },
+    )?;
     let persistence = source.persistence.as_ref().ok_or_else(|| RewindFailure {
         message: "巻き戻し元の保存済みセッションがありません".into(),
         fatal: false,
@@ -9202,6 +10409,9 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
                             session.persistence.clone()
                         };
                         let lease = workspace.try_mutation().map_err(|e| e.to_string())?;
+                        polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+                            workspace.project_root(), effects.state_dir(), &lease,
+                        ).map_err(|e| e.to_string())?;
                         let owner = resume_effect::ResumeSelectionOwnerV1 {
                             effects,
                             lease: &lease,
@@ -10592,6 +11802,8 @@ struct StatusSnapshot<'a> {
     fixed_effort: Option<&'a str>,
     answer_finalizer: Option<&'a polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner>,
     #[cfg(unix)]
+    project_root: &'a Path,
+    #[cfg(unix)]
     management_effects: &'a polaris_core::management_effect::ManagementEffectStoreV1,
     #[cfg(unix)]
     recovery_issue: Option<&'a str>,
@@ -10611,6 +11823,8 @@ fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static
         turn_authority_present,
         fixed_effort,
         answer_finalizer,
+        #[cfg(unix)]
+        project_root,
         #[cfg(unix)]
         management_effects,
         #[cfg(unix)]
@@ -10673,6 +11887,7 @@ fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static
     rendered.extend(cat_diagnostic_lines(answer_finalizer));
     #[cfg(unix)]
     rendered.extend(management_effect_diagnostic(
+        project_root,
         management_effects,
         recovery_issue,
     ));
@@ -11034,10 +12249,14 @@ fn mcp_prompt_choice(request: &str) -> Result<polaris_core::mcp::runtime::McpPro
 
 #[cfg(unix)]
 fn management_effect_diagnostic(
+    project: &Path,
     store: &polaris_core::management_effect::ManagementEffectStoreV1,
     recovery_issue: Option<&str>,
 ) -> Vec<ratatui::text::Line<'static>> {
-    let mut result = match store.blocker() {
+    let mut result = match polaris_core::sync::composite::C10CompositeBlockerV1::inspect_readonly(
+        project,
+        store.state_dir(),
+    ) {
         Ok(Some(effect)) => format!(
             "管理操作: 未解決 {} ({}) / 状態 {:?} / 記録番号 {}",
             effect.request.operation_id,
@@ -11058,13 +12277,17 @@ fn management_effect_diagnostic(
 
 #[cfg(unix)]
 fn management_clearance_error(
+    project: &Path,
     store: &polaris_core::management_effect::ManagementEffectStoreV1,
     action: &slash::Action,
 ) -> Option<String> {
     if !action.needs_management_clearance() {
         return None;
     }
-    match store.blocker() {
+    match polaris_core::sync::composite::C10CompositeBlockerV1::inspect_readonly(
+        project,
+        store.state_dir(),
+    ) {
         Ok(Some(effect)) => Some(format!(
             "未解決の管理操作 {} ({}) があります。先に状態を確認してください",
             effect.request.operation_id, effect.request.inventory
@@ -11096,6 +12319,10 @@ fn apply_slash_action(
     mcp_external: bool,
     local_lines: &mut Vec<ratatui::text::Line<'static>>,
 ) -> SlashOutcome {
+    if let Err(error) = require_action_owner(&action) {
+        *status = Status::Error(error.into());
+        return SlashOutcome::Continue;
+    }
     match action {
         slash::Action::SessionControl(_)
         | slash::Action::WorkspaceControl(_)
@@ -11282,74 +12509,86 @@ fn apply_slash_action(
             SlashOutcome::Continue
         }
         slash::Action::Diff => {
-            #[cfg(not(target_os = "linux"))]
-            const MAX_DIFF_LINES: usize = 200;
-            let text = (|| -> Result<String, String> {
-                let project_root = polaris_core::project::resolve_root(cwd);
-                let root = std::fs::File::open(project_root)
-                    .map_err(|_| "Git情報を取得できません".to_string())?;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                let read = |args: &[&str]| {
-                    polaris_core::project_git::read_only_git(&root, args, deadline)
-                        .map_err(|error| error.to_string())
-                };
-                let mut text =
-                    String::from_utf8_lossy(&read(&["diff", "--no-ext-diff", "--no-textconv"])?)
-                        .into_owned();
-                let staged = read(&["diff", "--cached", "--no-ext-diff", "--no-textconv"])?;
-                if !staged.is_empty() {
-                    if !text.is_empty() && !text.ends_with('\n') {
-                        text.push('\n');
-                    }
-                    text.push_str(&String::from_utf8_lossy(&staged));
-                }
-                let untracked = read(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-                for path in untracked
-                    .split(|byte| *byte == 0)
-                    .filter(|path| !path.is_empty())
-                {
-                    if !text.is_empty() && !text.ends_with('\n') {
-                        text.push('\n');
-                    }
-                    text.push_str("?? ");
-                    text.push_str(&String::from_utf8_lossy(path).escape_debug().to_string());
-                    text.push('\n');
-                }
-                Ok(if text.is_empty() {
-                    "(no changes)".to_string()
-                } else {
-                    text
-                })
-            })()
-            .unwrap_or_else(|error| error);
-            #[cfg(target_os = "linux")]
-            if let Err(reason) = append_diff_result_after_read(
-                &text,
-                local_lines,
-                signal::pending_linux_process_shutdown,
-            ) {
-                return SlashOutcome::Shutdown(reason);
-            }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(unix))]
             {
-                local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
-                    "diff:",
-                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD),
-                )));
-                let all_lines: Vec<&str> = text.lines().collect();
-                let shown = all_lines.len().min(MAX_DIFF_LINES);
-                for raw_line in &all_lines[..shown] {
-                    local_lines.push(ratatui::text::Line::from(render::sanitize(raw_line)));
-                }
-                if all_lines.len() > MAX_DIFF_LINES {
-                    local_lines.push(ratatui::text::Line::from(format!(
-                        "... truncated, showing {shown} of {} lines",
-                        all_lines.len()
-                    )));
-                }
+                *status = Status::Error("Windowsでは /diff はまだ利用できません".into());
+                SlashOutcome::Continue
             }
-            *status = Status::Idle;
-            SlashOutcome::Continue
+            #[cfg(unix)]
+            {
+                #[cfg(not(target_os = "linux"))]
+                const MAX_DIFF_LINES: usize = 200;
+                let text = (|| -> Result<String, String> {
+                    let project_root = polaris_core::project::resolve_root(cwd);
+                    let root = std::fs::File::open(project_root)
+                        .map_err(|_| "Git情報を取得できません".to_string())?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    let read = |args: &[&str]| {
+                        polaris_core::project_git::read_only_git(&root, args, deadline)
+                            .map_err(|error| error.to_string())
+                    };
+                    let mut text = String::from_utf8_lossy(&read(&[
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                    ])?)
+                    .into_owned();
+                    let staged = read(&["diff", "--cached", "--no-ext-diff", "--no-textconv"])?;
+                    if !staged.is_empty() {
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str(&String::from_utf8_lossy(&staged));
+                    }
+                    let untracked = read(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+                    for path in untracked
+                        .split(|byte| *byte == 0)
+                        .filter(|path| !path.is_empty())
+                    {
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str("?? ");
+                        text.push_str(&String::from_utf8_lossy(path).escape_debug().to_string());
+                        text.push('\n');
+                    }
+                    Ok(if text.is_empty() {
+                        "(no changes)".to_string()
+                    } else {
+                        text
+                    })
+                })()
+                .unwrap_or_else(|error| error);
+                #[cfg(target_os = "linux")]
+                if let Err(reason) = append_diff_result_after_read(
+                    &text,
+                    local_lines,
+                    signal::pending_linux_process_shutdown,
+                ) {
+                    return SlashOutcome::Shutdown(reason);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    local_lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                        "diff:",
+                        ratatui::style::Style::default()
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )));
+                    let all_lines: Vec<&str> = text.lines().collect();
+                    let shown = all_lines.len().min(MAX_DIFF_LINES);
+                    for raw_line in &all_lines[..shown] {
+                        local_lines.push(ratatui::text::Line::from(render::sanitize(raw_line)));
+                    }
+                    if all_lines.len() > MAX_DIFF_LINES {
+                        local_lines.push(ratatui::text::Line::from(format!(
+                            "... truncated, showing {shown} of {} lines",
+                            all_lines.len()
+                        )));
+                    }
+                }
+                *status = Status::Idle;
+                SlashOutcome::Continue
+            }
         }
         slash::Action::Review(_)
         | slash::Action::Doctor
@@ -11912,6 +13151,11 @@ mod tests {
         std::fs::create_dir(&project).unwrap();
         let state_dir = root.path().join("state");
         std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(
+            &state_dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let owner = WorkspaceOwner::open(
             &project,
             &state_dir.join("rewind-workspace"),
@@ -11942,8 +13186,8 @@ mod tests {
             .unwrap();
         drop(lease);
 
-        assert!(management_clearance_error(&store, &slash::Action::Init).is_some());
-        assert!(management_clearance_error(&store, &slash::Action::Status).is_none());
+        assert!(management_clearance_error(&project, &store, &slash::Action::Init).is_some());
+        assert!(management_clearance_error(&project, &store, &slash::Action::Status).is_none());
         let write_root = root.path().join("write\nroot");
         std::fs::create_dir(&write_root).unwrap();
         let sandbox =
@@ -11963,6 +13207,8 @@ mod tests {
             turn_authority_present: false,
             fixed_effort: None,
             answer_finalizer: None,
+            project_root: &project,
+            #[cfg(unix)]
             management_effects: &store,
             recovery_issue: Some("復旧\n確認待ち"),
         });
@@ -12008,13 +13254,18 @@ mod tests {
         use polaris_core::session_store::PersistedSession;
 
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let project = root.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let file = project.join("task.txt");
         std::fs::write(&file, "original").unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &root.path().join("rewind-store"),
+            &root.path().join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -12055,6 +13306,151 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rewind_management_crossing_is_rechecked_before_completion_and_child_creation() {
+        use polaris_core::{
+            conversation_state::{HistoryMode, RewindEffectStatusV1, RewindEligibilityV1},
+            management_effect::*,
+            rewind_workspace::{RewindLimits, WorkspaceOwner},
+            session_store::PersistedSession,
+        };
+        use polaris_sandbox::{SandboxMode, SandboxPolicy};
+        use std::os::unix::fs::PermissionsExt;
+
+        for case in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let project = root.path().join("project");
+            let state = root.path().join("state");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::create_dir(project.join(".polaris")).unwrap();
+            std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let owner = WorkspaceOwner::open(
+                &project,
+                &state.join("rewind-workspace"),
+                RewindLimits::default(),
+            )
+            .unwrap();
+            let lease = owner.try_mutation().unwrap();
+            let effects =
+                ManagementEffectStoreV1::open_at_state_dir(&project, &state, &lease).unwrap();
+            drop(lease);
+            let policy =
+                SandboxPolicy::new(SandboxMode::WorkspaceWrite, std::slice::from_ref(&project))
+                    .unwrap();
+            let persistence = PersistedSession::create(
+                root.path(),
+                &state.join("memory.sqlite3"),
+                project.to_str().unwrap(),
+                HistoryMode::Legacy,
+                None,
+            )
+            .unwrap();
+            let complete_c10 = || {
+                let lease = owner.try_mutation().unwrap();
+                let request = PrepareManagementEffectV1 {
+                    operation_id: "00000000000000000000000000000001".parse().unwrap(),
+                    inventory: ManagementInventoryIdV1::parse("C10").unwrap(),
+                    scope: ManagementEffectScopeV1 {
+                        project: effects.project_scope_hash(),
+                        session: None,
+                        generation: 0,
+                        revision: 0,
+                        permission: ManagementPermissionScopeV1::Remote,
+                        account_binding: Some(ManagementEffectHashV1::digest(
+                            b"synthetic-keychain-binding",
+                        )),
+                    },
+                    request_hash: ManagementEffectHashV1::digest(b"synthetic-c10"),
+                    rewind: ManagementRewindDispositionV1::IrreversibleRemote,
+                };
+                let PrepareManagementEffectOutcomeV1::Prepared(prepared) = effects
+                    .prepare(&lease, effects.cursor().unwrap(), request)
+                    .unwrap()
+                else {
+                    panic!("new C10")
+                };
+                let started = effects.start(&lease, &prepared).unwrap();
+                effects
+                    .complete_started(
+                        &lease,
+                        &started,
+                        ManagementEffectHashV1::digest(b"synthetic-remote-observation"),
+                    )
+                    .unwrap();
+                assert!(effects.blocker().unwrap().is_none());
+            };
+            if case == 3 {
+                complete_c10();
+            }
+            let pre = owner.capture(&policy).unwrap();
+            let boundary = persistence
+                .begin_rewind_boundary(pre.to_string(), Vec::new())
+                .unwrap();
+            let mut session = polaris_core::session::Session::new();
+            session.attach(persistence.clone()).unwrap();
+            session.push_user("edit task");
+            std::fs::write(project.join("task.txt"), "after").unwrap();
+            session.push_assistant("done", Vec::new());
+            session.check_persistence().unwrap();
+            if case == 1 || case == 2 {
+                complete_c10();
+            }
+            let saved = if case == 2 {
+                let post = owner.capture(&policy).unwrap();
+                persistence
+                    .finish_rewind_boundary(
+                        &boundary.boundary_id,
+                        post.to_string(),
+                        RewindEligibilityV1::Eligible,
+                        RewindEffectStatusV1::NoExternalMutation,
+                    )
+                    .unwrap()
+            } else {
+                finish_rewind_for_session(
+                    &owner,
+                    &persistence,
+                    &effects,
+                    &policy,
+                    &boundary,
+                    None,
+                    || true,
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                matches!(
+                    saved.completion.unwrap().eligibility,
+                    RewindEligibilityV1::Eligible
+                ),
+                case != 1
+            );
+            let sessions = root.path().join("sessions-v2");
+            let before = std::fs::read_dir(&sessions).unwrap().count();
+            let candidate = persistence.prepare_rewind_branch(&owner, &boundary.boundary_id);
+            if case == 0 {
+                assert!(candidate.is_ok());
+            } else {
+                // Case 3 has a clear historical range but an orphan terminal
+                // C10 effect. P4 must refuse new work independently of crossing.
+                assert!(candidate.is_err());
+                assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), before);
+                let manifests = state.join("rewind-workspace/manifests");
+                let before_capture = std::fs::read_dir(&manifests).unwrap().count();
+                assert!(capture_rewind_before_input(&owner, &effects, &policy).is_err());
+                assert_eq!(
+                    std::fs::read_dir(&manifests).unwrap().count(),
+                    before_capture
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(project.join("task.txt")).unwrap(),
+                "after"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn resume_requires_the_workspace_recorded_at_the_conversation_head() {
         use polaris_core::conversation_state::{
             HistoryMode, RewindEffectStatusV1, RewindEligibilityV1,
@@ -12064,13 +13460,18 @@ mod tests {
         use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let project = root.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let file = project.join("task.txt");
         std::fs::write(&file, "before").unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &root.path().join("rewind-store"),
+            &root.path().join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -12118,13 +13519,18 @@ mod tests {
         use polaris_core::session_store::PersistedSession;
 
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let project = root.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let file = project.join("task.txt");
         std::fs::write(&file, "initial").unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &root.path().join("rewind-store"),
+            &root.path().join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -12154,13 +13560,18 @@ mod tests {
         use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let project = root.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let file = project.join("task.txt");
         std::fs::write(&file, "initial").unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &root.path().join("rewind-store"),
+            &root.path().join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -12203,11 +13614,16 @@ mod tests {
         use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let project = root.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &root.path().join("rewind-store"),
+            &root.path().join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -12323,6 +13739,11 @@ mod tests {
         use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let project = root.path().join("project");
         let state_dir = root.path().join("state");
         std::fs::create_dir(&project).unwrap();
@@ -12330,7 +13751,7 @@ mod tests {
         std::fs::write(&file, "before").unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &root.path().join("rewind-store"),
+            &root.path().join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -13645,6 +15066,7 @@ mod tests {
         assert_eq!(effort, "extra high");
     }
 
+    #[cfg(unix)]
     #[test]
     fn working_turn_accepts_and_queues_prompts_and_commands_in_order() {
         let mut buffer = String::new();
@@ -13891,6 +15313,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn m3e_confirmed_compaction_keeps_original_and_refuses_cancelled_send() {
         struct BoundSummary;
         #[async_trait::async_trait]
@@ -13911,6 +15334,11 @@ mod tests {
         let state = root.path().join("state");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(
+            &state,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let workspace = polaris_core::rewind_workspace::WorkspaceOwner::open(
             &project,
             &state.join("rewind-workspace"),
@@ -14036,6 +15464,7 @@ mod tests {
     /// `/resume` lists beside the intact session — same conversation,
     /// prefix replaced by a summary, no way to tell which is which.
     #[tokio::test]
+    #[cfg(unix)]
     async fn manual_compaction_does_not_write_a_legacy_log_for_a_v2_session() {
         let dir = tempfile::tempdir().expect("temp dir");
         let data_root = tempfile::tempdir().expect("temp dir");
@@ -14180,7 +15609,7 @@ mod tests {
         use polaris_core::sync::{
             participation,
             repository::SyncRepository,
-            share::{ShareManifest, SyncPaths},
+            share::{ShareLink, ShareManifest, SyncPaths},
         };
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         polaris_auth::protection::use_trusted_home(&home).unwrap();
@@ -14216,18 +15645,56 @@ mod tests {
             )
             .is_err()
         );
-        let cancelled = sync_action(&project, &state, &request, false, |view| {
-            assert!(view.revision.contains("fixture-share"));
-            false
-        })
+        fn state_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut files = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(root).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    files.insert(path.clone(), None);
+                    files.extend(state_files(&path));
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    files.insert(path.clone(), Some(std::fs::read(path).unwrap()));
+                }
+            }
+            files
+        }
+        drop(polaris_core::apply_owner::ApplyOwnerV1::acquire(&project).unwrap());
+        let before_join = state_files(&state);
+        for accepted in [false, true] {
+            assert!(
+                sync_action(&project, &state, &request, false, |view| {
+                    assert!(view.revision.contains("fixture-share"));
+                    accepted
+                })
+                .is_err()
+            );
+            assert_eq!(state_files(&state), before_join);
+            assert!(matches!(
+                participation::read(&state).unwrap(),
+                participation::ParticipationReadV2::Missing
+            ));
+            assert!(!project.join("received.txt").exists());
+            assert_eq!(peer.head(), head);
+        }
+        // Historical participation is input for C11/C13, not a C08 write
+        // through the retired apply adapter or a credential-binding success.
+        participation::join(
+            &state,
+            ShareLink {
+                remote: format!(
+                    "file://{}",
+                    home.join("peer-state/sync/repository").display()
+                ),
+                share_id: "fixture-share".into(),
+                invitation_id: "fixture-invite".into(),
+                expires_unix_seconds: u64::MAX,
+            },
+            ShareManifest::default(),
+            1,
+        )
         .unwrap();
-        assert!(cancelled.contains("取り消"));
-        assert!(participation::read(&state).is_none());
-        assert!(
-            sync_action(&project, &state, &request, false, |_| true)
-                .unwrap()
-                .contains("参加")
-        );
         assert!(sync_action(&project, &state, &request, false, |_| panic!("rebind")).is_err());
         let status = sync_action(&project, &state, "status", false, |_| {
             panic!("read confirmation")
@@ -14257,13 +15724,21 @@ mod tests {
                 .unwrap()
                 .contains("取り消")
         );
-        assert!(participation::read(&state).is_some());
+        assert!(
+            participation::read(&state)
+                .unwrap()
+                .participation()
+                .is_some()
+        );
         assert!(
             sync_action(&project, &state, "leave", false, |_| true)
                 .unwrap()
                 .contains("解除")
         );
-        assert!(participation::read(&state).is_none());
+        assert!(matches!(
+            participation::read(&state).unwrap(),
+            participation::ParticipationReadV2::Missing
+        ));
         assert_eq!(peer.head(), head);
     }
 
@@ -14327,7 +15802,11 @@ mod tests {
         std::fs::write(incoming.join("shared.txt"), b"agreed").unwrap();
         repository.stage_from(&incoming, &manifest).unwrap();
         let agreed = repository.commit("incoming fixture").unwrap().unwrap();
-        let mut held = participation::read(&state).unwrap();
+        let mut held = participation::read(&state)
+            .unwrap()
+            .participation()
+            .unwrap()
+            .clone();
         held.agreed_commit = Some(agreed.clone());
         participation::write(&state, &held).unwrap();
         let initial = std::fs::read(state.join("sync/participation.json")).unwrap();
@@ -14443,6 +15922,8 @@ mod tests {
         assert_eq!(
             participation::read(&state)
                 .unwrap()
+                .participation()
+                .unwrap()
                 .applied_commit
                 .as_deref(),
             Some(agreed.as_str())
@@ -14479,7 +15960,11 @@ mod tests {
             .commit("unknown fixture")
             .unwrap()
             .unwrap();
-        let mut joined = participation::read(&unknown_state).unwrap();
+        let mut joined = participation::read(&unknown_state)
+            .unwrap()
+            .participation()
+            .unwrap()
+            .clone();
         joined.agreed_commit = Some(incoming_revision);
         participation::write(&unknown_state, &joined).unwrap();
         let initial_participation =
@@ -14516,14 +16001,28 @@ mod tests {
             .unwrap()
         };
         assert!(
-            management_clearance_error(&effects, &slash::Action::Sync("apply".into())).is_some()
+            management_clearance_error(
+                &unknown_project,
+                &effects,
+                &slash::Action::Sync("apply".into())
+            )
+            .is_some()
         );
         assert!(
-            management_clearance_error(&effects, &slash::Action::Sync("status".into())).is_none()
+            management_clearance_error(
+                &unknown_project,
+                &effects,
+                &slash::Action::Sync("status".into())
+            )
+            .is_none()
         );
         assert!(
-            management_clearance_error(&effects, &slash::Action::Sync(format!("recover {key}")))
-                .is_none()
+            management_clearance_error(
+                &unknown_project,
+                &effects,
+                &slash::Action::Sync(format!("recover {key}"))
+            )
+            .is_none()
         );
         assert!(
             sync_action(
@@ -15470,6 +16969,7 @@ mod tests {
         assert!(content.contains("beta"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn init_creates_agents_md_in_cwd() {
         let mut session = Session::default();
@@ -15529,6 +17029,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn init_does_not_overwrite_an_existing_agents_md() {
         let mut session = Session::default();
@@ -15559,6 +17060,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn clear_empties_the_session_and_the_persisted_file_in_place() {
         let mut session = Session::default();
@@ -15589,6 +17091,7 @@ mod tests {
         assert!(matches!(status, Status::Idle));
     }
 
+    #[cfg(unix)]
     #[test]
     fn new_and_resume_are_never_actually_dispatched_through_apply_slash_action() {
         // `run()` intercepts every one of these before they'd ever reach
@@ -15669,6 +17172,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn workflow_session_defaults_to_builtin_skills_and_supports_explicit_opt_out() {
         let dir = tempfile::tempdir().unwrap();
@@ -15734,6 +17238,11 @@ mod tests {
         let sessions_dir = root.path().join("data/sessions");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(
+            &state_dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         std::fs::create_dir_all(&sessions_dir).unwrap();
         let owner = WorkspaceOwner::open(
             &project,
@@ -16104,6 +17613,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn prepared_resume_uses_the_selected_v2_identity_history_and_workflow() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -16262,6 +17772,11 @@ mod tests {
         for path in [&project, &state, &sessions] {
             std::fs::create_dir(path).unwrap();
         }
+        std::fs::set_permissions(
+            &state,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let owner = WorkspaceOwner::open(
             &project,
             &state.join("rewind-workspace"),
@@ -16500,6 +18015,11 @@ mod tests {
         for path in [&project, &state, &sessions] {
             std::fs::create_dir(path).unwrap();
         }
+        std::fs::set_permissions(
+            &state,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let owner = WorkspaceOwner::open(
             &project,
             &state.join("rewind-workspace"),
@@ -16803,6 +18323,11 @@ mod tests {
         use polaris_core::session_store::PersistedSession;
 
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let project = root.path().join("project");
         let sessions = root.path().join("sessions");
         let state_dir = root.path().join("state");
@@ -16812,7 +18337,7 @@ mod tests {
         std::fs::write(project.join("task.txt"), "current files").unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &root.path().join("rewind-store"),
+            &root.path().join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -16880,13 +18405,18 @@ mod tests {
         use polaris_sandbox::{SandboxMode, SandboxPolicy};
 
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let project = root.path().join("project");
         let sessions = root.path().join("sessions");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&sessions).unwrap();
         let owner = WorkspaceOwner::open(
             &project,
-            &root.path().join("rewind-store"),
+            &root.path().join("rewind-workspace"),
             RewindLimits::default(),
         )
         .unwrap();
@@ -17237,6 +18767,8 @@ mod tests {
             fixed_effort: None,
             answer_finalizer: None,
             #[cfg(unix)]
+            project_root: &root.path().join("project"),
+            #[cfg(unix)]
             management_effects: &store,
             #[cfg(unix)]
             recovery_issue: None,
@@ -17430,6 +18962,11 @@ mod tests {
         let state_dir = root.path().join("state");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(
+            &state_dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let workspace = WorkspaceOwner::open(
             &project,
             &state_dir.join("rewind-workspace"),
@@ -17621,6 +19158,7 @@ mod tests {
         assert!(matches!(status, Status::Idle));
     }
 
+    #[cfg(unix)]
     #[test]
     fn copy_with_no_assistant_reply_yet_reports_nothing_to_copy() {
         let mut session = Session::default();
@@ -17701,6 +19239,7 @@ mod tests {
         assert!(status.contains("no tty"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn export_writes_the_conversation_as_markdown() {
         let mut session = Session::default();
@@ -17735,6 +19274,7 @@ mod tests {
         assert!(written.contains("it's a coding agent"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn export_with_a_destination_argument_writes_there_instead() {
         let mut session = Session::default();
@@ -18023,6 +19563,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_reports_no_changes_outside_a_git_repository() {
         // A missing repository is reported as local content, not a crash.
         let mut session = Session::default();
@@ -18073,6 +19614,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_shows_no_changes_in_a_clean_git_repository() {
         let dir = tempfile::tempdir().expect("temp dir");
         let run = |args: &[&str]| {
@@ -18113,6 +19655,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_shows_an_actual_uncommitted_change() {
         let dir = tempfile::tempdir().expect("temp dir");
         let run = |args: &[&str]| {
@@ -18156,6 +19699,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_shows_untracked_file_in_an_unborn_repository() {
         let dir = tempfile::tempdir().expect("temp dir");
         let init = std::process::Command::new("git")
@@ -18191,6 +19735,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_shows_staged_file_in_an_unborn_repository() {
         let dir = tempfile::tempdir().expect("temp dir");
         let run = |args: &[&str]| {
@@ -18230,6 +19775,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_hostile_environment_child() {
         let Some(project) = std::env::var_os("POLARIS_T13_CHILD_TARGET") else {
             return;
@@ -18258,6 +19804,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_ignores_hostile_git_environment() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -18319,6 +19866,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_bounds_large_git_output() {
         let dir = tempfile::tempdir().expect("temp dir");
         let run = |args: &[&str]| {
@@ -18359,6 +19907,7 @@ mod tests {
         assert!(!rendered.contains("large.txt"), "{rendered}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn clear_also_empties_local_lines_from_a_previous_diff() {
         let mut session = Session::default();

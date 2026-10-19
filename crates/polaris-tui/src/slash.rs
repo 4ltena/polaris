@@ -142,7 +142,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "sync",
-        description: "join, receive, leave, inspect, confirm apply, or recover shared changes",
+        description: "join, receive, leave, inspect, apply, push, or reconcile shared changes",
     },
     SlashCommand {
         name: "phase",
@@ -318,6 +318,59 @@ pub enum Action {
 }
 
 impl Action {
+    /// Display-only forms that do not require a native mutation owner.
+    /// New actions and additional arguments stay closed until classified.
+    pub(super) fn allowed_without_mutation_owner(&self) -> bool {
+        match self {
+            Self::Help
+            | Self::Status
+            | Self::WebSearch(_)
+            | Self::Doctor
+            | Self::Skills
+            | Self::Pwd
+            | Self::Diff
+            | Self::Compare(_)
+            | Self::Quit
+            | Self::Unknown(_) => true,
+            Self::Account(value) | Self::Decided(value) | Self::Mcp(value) => {
+                matches!(value.as_str(), "" | "list")
+            }
+            Self::Phase(value) | Self::Workflow(value) => value.is_empty(),
+            Self::Memory(value) => matches!(
+                value.split_whitespace().next().unwrap_or(""),
+                "" | "search" | "get" | "source"
+            ),
+            Self::SessionControl(value) => matches!(
+                value.as_str(),
+                "session"
+                    | "session current"
+                    | "session history"
+                    | "goal"
+                    | "goal current"
+                    | "history"
+            ),
+            Self::WorkspaceControl(value) => matches!(
+                value.as_str(),
+                "browse" | "browse list" | "recipe" | "recipe list" | "setting nextjs"
+            ),
+            Self::RuntimeControl(value) => matches!(
+                value.as_str(),
+                "subagents"
+                    | "subagents list"
+                    | "roles"
+                    | "roles current"
+                    | "roles list"
+                    | "run"
+                    | "run settings"
+                    | "run details"
+                    | "sandbox"
+                    | "sandbox status"
+            ),
+            Self::Sync(value) => matches!(value.as_str(), "" | "status"),
+            _ => false,
+        }
+    }
+
     /// A pending durable management effect must be reconciled before these
     /// commands can change session, project, clipboard, or remote state.
     pub fn needs_management_clearance(&self) -> bool {
@@ -331,6 +384,10 @@ impl Action {
             }
             Self::WorkspaceControl(_) | Self::RuntimeControl(_) => false,
             Self::Sync(value) => {
+                // C10 owns composite admission and explicit recovery exceptions.
+                if value.split_whitespace().next() == Some("push") {
+                    return false;
+                }
                 value == "apply"
                     || value.starts_with("join ")
                     || matches!(value.as_str(), "pull" | "leave")

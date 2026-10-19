@@ -68,6 +68,12 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
     let lease = workspace
         .try_mutation()
         .map_err(|_| "実行中の操作があるため認証状態を変更できません")?;
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        effects.state_dir(),
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
     let (command, extra) = request
         .split_once(char::is_whitespace)
         .unwrap_or((request, ""));

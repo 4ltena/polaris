@@ -931,6 +931,10 @@ pub struct HeaderInfo<'a> {
 /// `history`). Shared by `header_history_lines` and by tests that want to
 /// check its content directly, without the border framing in the way.
 pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
+    header_lines_with_mode(header, false)
+}
+
+fn header_lines_with_mode(header: &HeaderInfo, read_only: bool) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     vec![
         // A north-star glyph, not codex's own `>_` terminal-prompt mark —
@@ -949,29 +953,37 @@ pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
             Span::styled("polaris", Style::default().add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("model:     ", dim),
-            Span::raw(sanitize(header.model_name)),
-            Span::raw(format!(" ({})   ", sanitize(header.provider_name))),
-            Span::styled("/model", Style::default().fg(Color::Cyan)),
-            Span::styled(" to change", dim),
-        ]),
+        if read_only {
+            Line::from("mode:      Windows 閲覧専用 (/help)")
+        } else {
+            Line::from(vec![
+                Span::styled("model:     ", dim),
+                Span::raw(sanitize(header.model_name)),
+                Span::raw(format!(" ({})   ", sanitize(header.provider_name))),
+                Span::styled("/model", Style::default().fg(Color::Cyan)),
+                Span::styled(" to change", dim),
+            ])
+        },
         Line::from(vec![
             Span::styled("directory: ", dim),
             Span::raw(sanitize(header.cwd)),
         ]),
-        Line::from(vec![
-            Span::styled("tokens:    ", dim),
-            Span::styled(
-                format!(
-                    "in {} / out {} / total {}",
-                    header.usage.input_tokens,
-                    header.usage.output_tokens,
-                    header.usage.total_tokens
+        if read_only {
+            Line::from("session:   未開始・保存なし・モデル接続なし")
+        } else {
+            Line::from(vec![
+                Span::styled("tokens:    ", dim),
+                Span::styled(
+                    format!(
+                        "in {} / out {} / total {}",
+                        header.usage.input_tokens,
+                        header.usage.output_tokens,
+                        header.usage.total_tokens
+                    ),
+                    dim,
                 ),
-                dim,
-            ),
-        ]),
+            ])
+        },
     ]
 }
 
@@ -983,6 +995,14 @@ pub fn header_lines(header: &HeaderInfo) -> Vec<Line<'static>> {
 /// print anymore — the header lives in `history` like everything else.
 /// Always returns exactly `HEADER_HEIGHT` rows.
 pub fn header_history_lines(header: &HeaderInfo, width: u16) -> Vec<HistoryLine> {
+    header_history_lines_with_mode(header, width, false)
+}
+
+pub(crate) fn header_history_lines_with_mode(
+    header: &HeaderInfo,
+    width: u16,
+    read_only: bool,
+) -> Vec<HistoryLine> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let w = width as usize;
     let inner = w.saturating_sub(2);
@@ -992,7 +1012,7 @@ pub fn header_history_lines(header: &HeaderInfo, width: u16) -> Vec<HistoryLine>
 
     let mut out = Vec::with_capacity(HEADER_HEIGHT as usize);
     out.push(HistoryLine::plain(Line::styled(top, dim)));
-    for content in header_lines(header) {
+    for content in header_lines_with_mode(header, read_only) {
         let content_width = content.width();
         let pad = inner.saturating_sub(content_width);
         let mut spans = vec![Span::styled("\u{2502}", dim)];
@@ -1074,6 +1094,31 @@ pub fn render_footer(
     header: &HeaderInfo,
     suggestions: &[&crate::slash::SlashCommand],
     selected_suggestion: usize,
+) {
+    render_footer_with_mode(
+        frame,
+        area,
+        input,
+        cursor,
+        status,
+        header,
+        suggestions,
+        selected_suggestion,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_footer_with_mode(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    input: &str,
+    cursor: usize,
+    status: &Status,
+    header: &HeaderInfo,
+    suggestions: &[&crate::slash::SlashCommand],
+    selected_suggestion: usize,
+    read_only: bool,
 ) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     // Zero height when there's nothing to show, so the layout collapses
@@ -1195,7 +1240,11 @@ pub fn render_footer(
                 Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
             ),
             Span::styled(
-                "Ask polaris to do anything",
+                if read_only {
+                    "/help で閲覧コマンドを表示"
+                } else {
+                    "Ask polaris to do anything"
+                },
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -1255,7 +1304,9 @@ pub fn render_footer(
     // Two-tone footer matching codex's own status line: the model name in
     // a warm tan, the working directory in a soft green, separated by a
     // dim middle dot.
-    let model_and_effort = if header.effort_name.is_empty() {
+    let model_and_effort = if read_only {
+        "Windows 閲覧専用".to_owned()
+    } else if header.effort_name.is_empty() {
         sanitize(header.model_name)
     } else {
         format!(
@@ -1601,6 +1652,73 @@ pub fn render_management_confirmation(
         frame.area(),
     );
     ready
+}
+
+pub struct C10ConfirmView {
+    pub title: String,
+    pub details: Vec<String>,
+}
+
+pub fn render_c10_preview(frame: &mut Frame, view: &C10ConfirmView) {
+    let lines: Vec<_> = view
+        .details
+        .iter()
+        .map(|text| HistoryLine::plain(Line::from(sanitize(text))))
+        .collect();
+    let mut text = vec![Line::from(sanitize(&view.title))];
+    text.extend(
+        wrap_history_lines(&lines, frame.area().width.saturating_sub(2))
+            .into_iter()
+            .take(frame.area().height.saturating_sub(4) as usize)
+            .map(|row| row.line),
+    );
+    text.push(Line::from("確定の確認はprepare後に表示します"));
+    frame.render_widget(
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("C10 preview")),
+        frame.area(),
+    );
+}
+
+pub fn render_c10_wait(frame: &mut Frame) {
+    frame.render_widget(Paragraph::new("C10操作を処理中です。\n送信・照合の結果を待っています。\nEscは送信取消にはなりません。\nCtrl-Cは処理終了後に終了します。")
+        .block(Block::default().borders(Borders::ALL).title("C10")), frame.area());
+}
+
+/// Reuse history reflow so long hashes remain inspectable on narrow terminals.
+/// Confirmation is available only after the last wrapped row is visible.
+pub fn render_c10_confirmation(frame: &mut Frame, view: &C10ConfirmView, offset: usize) -> bool {
+    let area = frame.area();
+    let width = area.width.saturating_sub(2);
+    let visible = area.height.saturating_sub(4) as usize;
+    let input: Vec<_> = view
+        .details
+        .iter()
+        .map(|text| HistoryLine {
+            line: Line::from(sanitize(text)),
+            shaded: false,
+        })
+        .collect();
+    let wrapped = wrap_history_lines(&input, width);
+    let offset = offset.min(wrapped.len().saturating_sub(1));
+    let complete = width > 0 && visible > 0 && offset + visible >= wrapped.len();
+    let mut lines = vec![Line::from(sanitize(&view.title))];
+    lines.extend(
+        wrapped
+            .iter()
+            .skip(offset)
+            .take(visible)
+            .map(|row| row.line.clone()),
+    );
+    lines.push(Line::from(if complete {
+        "y: 確定 · esc: 中止 · ↑↓: 詳細"
+    } else {
+        "↑↓: 全詳細を確認 · esc: 中止"
+    }));
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("C10")),
+        area,
+    );
+    complete
 }
 
 pub struct SyncConfirmView {

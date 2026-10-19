@@ -30,6 +30,11 @@ impl Fixture {
         let state = root.path().join("state");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(
+            &state,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let workspace = WorkspaceOwner::open(
             &project,
             &state.join("rewind-workspace"),
@@ -138,6 +143,30 @@ fn m3e_c38_helper_executes_argv_and_enforces_readonly_ceiling() {
         .unwrap();
     assert!(!target.exists());
     assert!(!lines[0].to_string().contains("exit 0"));
+    #[cfg(target_os = "macos")]
+    {
+        let lines = f
+            .call(
+                &[
+                    "/bin/sh",
+                    "-c",
+                    "printf 'home=%s tmp=%s\\n' \"$HOME\" \"$TMPDIR\"",
+                ],
+                SandboxMode::ReadOnly,
+                KeyCode::Char('y'),
+                false,
+            )
+            .unwrap();
+        let output = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(output.contains("exit 0"), "{output}");
+        assert!(output.contains("polaris-command-"), "{output}");
+        assert!(output.contains("/home tmp="), "{output}");
+        assert!(output.contains("/tmp"), "{output}");
+    }
 }
 
 #[test]

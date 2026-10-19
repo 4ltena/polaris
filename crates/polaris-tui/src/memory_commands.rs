@@ -164,10 +164,18 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
     workspace
         .require_quiescent_with_lease(&lease)
         .map_err(|e| e.to_string())?;
-    if !matches!(command, Command::Reconcile(_))
-        && effects.blocker().map_err(|e| e.to_string())?.is_some()
+    if let Some(effect) =
+        polaris_core::sync::composite::C10CompositeBlockerV1::inspect_with_mutation(
+            cwd, state_dir, &lease,
+        )
+        .map_err(|error| error.to_string())?
     {
-        return Err("未解決の管理操作があります。先に照合してください".into());
+        if !matches!(command, Command::Reconcile(operation)
+            if effect.request.inventory.encoded() != "C10"
+                && effect.request.operation_id == operation)
+        {
+            return Err("未解決の管理操作があります。先に照合してください".into());
+        }
     }
     let owner = MemoryChangeOwnerV1 {
         effects,

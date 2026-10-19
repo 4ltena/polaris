@@ -379,6 +379,12 @@ pub(crate) fn handle_host<B: Backend, R: KeyReader>(
     let lease = workspace
         .try_mutation()
         .map_err(|_| "実行中の操作があるためMCP登録を変更できません")?;
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        effects.state_dir(),
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
     let owner = McpRegistryChangeOwnerV1::new(host, effects, &lease, workspace.project_root())?;
     let prepared = owner.prepare(server_id, command == "enable")?;
     let accepted = confirm(

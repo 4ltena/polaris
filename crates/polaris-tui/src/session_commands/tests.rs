@@ -48,6 +48,11 @@ impl Fixture {
         let state = root.path().join("state");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(
+            &state,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let workspace = WorkspaceOwner::open(
             &project,
             &state.join("rewind-workspace"),

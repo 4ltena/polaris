@@ -216,6 +216,12 @@ pub(crate) fn handle_with_selection<B: Backend, R: KeyReader>(
     workspace
         .require_quiescent_with_lease(&lease)
         .map_err(|e| e.to_string())?;
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        effects.state_dir(),
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
     let detail = match action {
         Action::Clear => format!(
             "{}原文の現在epochをclearします。過去の証拠は保持されます。",
@@ -337,6 +343,11 @@ mod tests {
         let state = temp.path().join("state");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(
+            &state,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let workspace = WorkspaceOwner::open(
             &project,
             &state.join("rewind-workspace"),
@@ -472,6 +483,12 @@ pub(crate) async fn compact<B: Backend, R: KeyReader>(
     workspace
         .require_quiescent_with_lease(&lease)
         .map_err(|e| e.to_string())?;
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        effects.state_dir(),
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
     let payload = serde_json::to_vec(&(
         &before.state.session_id,
         before.state.generation,

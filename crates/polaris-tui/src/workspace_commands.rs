@@ -211,6 +211,12 @@ fn decided<B: Backend, R: KeyReader>(
     workspace
         .require_quiescent_with_lease(&lease)
         .map_err(|_| "復旧待ちの操作があります")?;
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        effects.state_dir(),
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
     let cursor = effects.cursor().map_err(|_| "管理効果を確認できません")?;
     let request = PrepareManagementEffectV1 {
         operation_id: ManagementOperationIdV1::random().map_err(|_| "操作IDを作れません")?,

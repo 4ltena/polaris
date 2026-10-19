@@ -434,6 +434,12 @@ async fn r33_picker_refuses_override_without_management_store() {
     std::fs::create_dir_all(project.join(".polaris")).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
     #[cfg(unix)]
+    std::fs::set_permissions(
+        &state_dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
+    #[cfg(unix)]
     let workspace = polaris_core::rewind_workspace::WorkspaceOwner::open(
         &project,
         &state_dir.join("rewind-workspace"),
@@ -550,6 +556,11 @@ async fn f15_resume_confirmation_cancellation_is_byte_invariant_then_records_the
     std::fs::create_dir(&project).unwrap();
     std::fs::create_dir(project.join(".git")).unwrap();
     std::fs::create_dir(&state_dir).unwrap();
+    std::fs::set_permissions(
+        &state_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     std::fs::create_dir(&sessions).unwrap();
     let workspace = WorkspaceOwner::open(
         &project,
@@ -629,7 +640,14 @@ async fn f15_resume_confirmation_cancellation_is_byte_invariant_then_records_the
     assert_eq!(session.messages[0].content, "current window");
     assert_eq!(path, original_path);
     assert_eq!(effects.effects().unwrap().len(), 0);
-    assert!(matches!(&status, Status::Notice(message) if message.contains("取り消")));
+    assert!(
+        matches!(&status, Status::Notice(message) if message.contains("取り消")),
+        "unexpected resume status: {}",
+        match &status {
+            Status::Notice(message) | Status::Error(message) => message.as_str(),
+            _ => "no result notice",
+        }
+    );
 
     handle_resume(
         &terminal,
@@ -727,6 +745,11 @@ fn unknown_f15_blocks_rewind_before_the_picker() {
     let state_dir = root.path().join("state");
     std::fs::create_dir(&project).unwrap();
     std::fs::create_dir(&state_dir).unwrap();
+    std::fs::set_permissions(
+        &state_dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
     let workspace = WorkspaceOwner::open(
         &project,
         &state_dir.join("rewind-workspace"),
@@ -764,7 +787,7 @@ fn unknown_f15_blocks_rewind_before_the_picker() {
         )
         .unwrap();
 
-    let error = ensure_rewind_unblocked(&effects).unwrap_err();
+    let error = ensure_rewind_unblocked_with_lease(&project, &effects, &lease).unwrap_err();
     assert!(error.contains(&request.operation_id.to_string()));
     assert!(error.contains("F15"));
 }
@@ -788,6 +811,11 @@ fn newly_unknown_f15_before_commit_rolls_back_the_rewind_transaction() {
     let state_dir = root.path().join("state");
     std::fs::create_dir(&project).unwrap();
     std::fs::create_dir(&state_dir).unwrap();
+    std::fs::set_permissions(
+        &state_dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
     let file = project.join("task.txt");
     let owner = WorkspaceOwner::open(
         &project,

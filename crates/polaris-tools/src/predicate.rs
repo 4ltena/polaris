@@ -314,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlink_pointing_outside_the_root_needs_approval() {
         // If a symlink located inside the root points outward, the
         // apparent path is inside but the actual write target is outside.

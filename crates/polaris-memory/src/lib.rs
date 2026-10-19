@@ -10,6 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 pub mod conversation;
 pub mod management;
 pub mod structured;
+#[cfg(windows)]
+mod windows_storage;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
@@ -133,6 +135,9 @@ pub struct RecordRange {
 
 pub struct MemoryStore {
     connection: Connection,
+    // Rust closes the connection before unregistering its private VFS.
+    #[cfg(windows)]
+    _windows_storage: Option<windows_storage::Storage>,
 }
 
 impl MemoryStore {
@@ -174,6 +179,43 @@ impl MemoryStore {
             path,
             rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
+        Self::initialize_connection(&mut connection)?;
+        Ok(Self {
+            connection,
+            #[cfg(windows)]
+            _windows_storage: None,
+        })
+    }
+
+    /// Opens an existing writable index without creation, schema repair or permission changes.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(Self {
+            connection,
+            #[cfg(windows)]
+            _windows_storage: None,
+        })
+    }
+
+    /// Opens an existing database without creation, schema initialization or
+    /// permission changes. Mutations on this handle fail with a SQLite error.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self {
+            connection,
+            #[cfg(windows)]
+            _windows_storage: None,
+        })
+    }
+
+    fn initialize_connection(connection: &mut Connection) -> Result<()> {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         let transaction = connection.transaction()?;
@@ -211,27 +253,32 @@ impl MemoryStore {
         conversation::initialize(&transaction)?;
         management::initialize(&transaction)?;
         transaction.commit()?;
-        Ok(Self { connection })
+        Ok(())
     }
 
-    /// Opens an existing writable index without creation, schema repair or permission changes.
-    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
-        let connection = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Ok(Self { connection })
-    }
-
-    /// Opens an existing database without creation, schema initialization or
-    /// permission changes. Mutations on this handle fail with a SQLite error.
-    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        let connection =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        Ok(Self { connection })
+    /// Explicit protected backend; core ordinary constructors do not select it.
+    #[cfg(windows)]
+    pub fn open_windows_protected(path: impl AsRef<Path>, create: bool) -> Result<Self> {
+        let storage = windows_storage::Storage::new(path.as_ref(), create)?;
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | if create {
+                rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            } else {
+                rusqlite::OpenFlags::empty()
+            };
+        let mut connection = Connection::open_with_flags_and_vfs(path, flags, storage.name())?;
+        storage.attach_authorizer(&connection)?;
+        if create {
+            Self::initialize_connection(&mut connection)?;
+        } else {
+            connection.busy_timeout(Duration::from_secs(5))?;
+            connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        }
+        Ok(Self {
+            connection,
+            _windows_storage: Some(storage),
+        })
     }
 
     /// Atomically inserts or replaces one stable ID and its optional embedding.

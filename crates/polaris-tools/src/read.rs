@@ -318,6 +318,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn refuses_symlink_to_denied_target() {
         // Create an entity that mimics a denied directory, and put a
         // symlink to it somewhere else (under a filename that looks

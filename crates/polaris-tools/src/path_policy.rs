@@ -392,3 +392,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(any(unix, windows))]
+pub mod tree_admission;

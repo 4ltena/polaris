@@ -59,6 +59,14 @@ pub struct Outcome {
     pub stderr: String,
 }
 
+/// Windows has no native confinement owner yet, including for broker requests.
+pub(crate) fn require_supported_platform() -> Result<(), SandboxError> {
+    if cfg!(windows) {
+        return Err(SandboxError::UnsupportedPlatform);
+    }
+    Ok(())
+}
+
 /// Launches `program` under confinement. If `stdin` is given, it's streamed
 /// into the child's standard input.
 pub fn run_confined(
@@ -67,6 +75,7 @@ pub fn run_confined(
     args: &[String],
     stdin: Option<&str>,
 ) -> Result<Outcome, SandboxError> {
+    require_supported_platform()?;
     let broker = crate::broker::from_environment()?;
     run_confined_with_broker(policy, program, args, stdin, broker.as_ref())
 }
@@ -81,6 +90,7 @@ pub(crate) fn run_confined_with_broker(
     stdin: Option<&str>,
     broker: Option<&crate::broker::BrokerConfig>,
 ) -> Result<Outcome, SandboxError> {
+    require_supported_platform()?;
     if let Some(broker) = broker {
         if policy.isolated_boundary().is_some() {
             return Err(SandboxError::NotEnforced(
@@ -373,7 +383,54 @@ pub(crate) fn classify_apply_failure(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::SandboxMode;
+
+    #[test]
+    fn windows_sandbox_unavailable_before_command_preparation() {
+        let program = Path::new("polaris-unavailable-fixture.exe");
+        for mode in [SandboxMode::ReadOnly, SandboxMode::FullAccess] {
+            let policy = SandboxPolicy::new(mode, &[]).unwrap();
+            assert!(matches!(
+                build_command(&policy, program, &[]),
+                Err(SandboxError::UnsupportedPlatform)
+            ));
+            assert!(matches!(
+                run_confined(&policy, program, &[], Some("fixture input")),
+                Err(SandboxError::UnsupportedPlatform)
+            ));
+            assert!(matches!(
+                run_confined_with_broker(&policy, program, &[], None, None),
+                Err(SandboxError::UnsupportedPlatform)
+            ));
+        }
+    }
+
+    #[test]
+    fn windows_sandbox_unavailable_with_invalid_broker_environment() {
+        // Isolate the partial opt-in in child test processes, without changing
+        // global environment while other tests run. Removing the early gate
+        // must turn these exact tests into NotEnforced failures.
+        for name in [
+            "confine::windows_tests::windows_sandbox_unavailable_before_command_preparation",
+            "controlled::windows_tests::windows_sandbox_unavailable_before_control_callbacks",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--format=pretty"])
+                .env("POLARIS_SANDBOX_BROKER", "incomplete-fixture")
+                .env_remove("POLARIS_SANDBOX_BROKER_TOKEN")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{name}: {stdout}");
+            assert!(stdout.contains("1 passed;"), "test did not run: {stdout}");
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
     use crate::policy::{SandboxMode, SandboxPolicy};

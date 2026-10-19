@@ -554,5 +554,5 @@ fn read_only_token_at(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

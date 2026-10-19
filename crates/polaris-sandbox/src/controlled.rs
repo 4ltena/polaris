@@ -82,6 +82,7 @@ fn run_confined_controlled_authorized_in_dir(
     cancelled: impl FnMut() -> bool,
     authorized: impl FnMut() -> bool,
 ) -> Result<ControlledOutcome, SandboxError> {
+    crate::confine::require_supported_platform()?;
     // v1 has no cancellation/ownership protocol: reject before connecting or
     // transmitting a command, never fall back from an opted-in broker.
     if crate::broker::from_environment()?.is_some() {
@@ -142,6 +143,48 @@ pub fn take_pending_cleanups() -> Vec<PendingCleanup> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn take_pending_cleanup_for(_child_id: u32) -> Option<PendingCleanup> {
     None
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::SandboxMode;
+
+    #[test]
+    fn windows_sandbox_unavailable_before_control_callbacks() {
+        let policy = SandboxPolicy::new(SandboxMode::FullAccess, &[]).unwrap();
+        let program = Path::new("polaris-unavailable-fixture.exe");
+        let cwd = Path::new("polaris-missing-fixture-directory");
+        let cancelled = || panic!("cancellation callback ran without confinement");
+        let authorized = || panic!("authorization callback ran without confinement");
+
+        assert!(matches!(
+            run_confined_controlled(&policy, program, &[], None, cancelled),
+            Err(SandboxError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            run_confined_controlled_in_dir(&policy, program, &[], None, Some(cwd), cancelled),
+            Err(SandboxError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            run_confined_controlled_authorized(&policy, program, &[], None, cancelled, authorized),
+            Err(SandboxError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            run_confined_controlled_authorized_in_dir(
+                &policy,
+                program,
+                &[],
+                None,
+                Some(cwd),
+                cancelled,
+                authorized,
+            ),
+            Err(SandboxError::UnsupportedPlatform)
+        ));
+        assert!(take_pending_cleanups().is_empty());
+        assert!(take_pending_cleanup_for(0).is_none());
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -236,6 +279,11 @@ mod native {
             if owned.status.is_none() {
                 owned.status = owned.child.try_wait()?;
             }
+            if owned.status.is_some() {
+                // Reaping releases the leader PID. Observation remains safe,
+                // but its former PGID is no longer a signal authority.
+                owned.may_signal = false;
+            }
             if owned.status.is_some() && group_absent(owned.pgid)? {
                 let status = owned.status;
                 self.owned = None;
@@ -252,9 +300,12 @@ mod native {
             let Some(owned) = self.owned.as_mut() else {
                 return Ok(None);
             };
-            // Keep the original group owner signal-capable until its absence
-            // is observed. A direct leader can exit while a same-PGID
-            // grandchild remains alive.
+            if owned.status.is_some() {
+                owned.may_signal = false;
+            }
+            // Only an unreaped direct leader pins the original PID/PGID for
+            // another signal attempt. A reaped owner is observation-only.
+            let mut stop_error = None;
             if owned.may_signal {
                 // `child` is still owned and unreaped, so its PID cannot be
                 // recycled.  The direct child may have left the original
@@ -267,22 +318,28 @@ mod native {
                 // Always make the original-group attempt too: a direct-child
                 // permission error must not skip cleanup of owned descendants.
                 let group_error = signal(owned.pgid, libc::SIGKILL).err();
-                if let Some(error) = child_error.or(group_error) {
-                    return Err(error);
-                }
+                stop_error = child_error.or(group_error);
             }
-            self.try_reap()
+            // A failed signal does not establish whether the child is still
+            // alive. Only reaping the child AND observing group absence can
+            // supersede that error; otherwise retain ownership.
+            let reaped = self.try_reap()?;
+            if reaped.is_some() {
+                return Ok(reaped);
+            }
+            match stop_error {
+                Some(error) => Err(error),
+                None => Ok(None),
+            }
         }
     }
     impl Drop for PendingCleanup {
         fn drop(&mut self) {
             if let Some(owned) = self.owned.take() {
-                // A live process group keeps its identity until it is absent;
-                // retain one last exact-group stop attempt for grandchildren.
-                if owned.may_signal {
-                    if owned.status.is_none() {
-                        let _ = signal_child(&owned.child, libc::SIGKILL);
-                    }
+                // The unreaped direct child pins this final signal attempt.
+                // Reaped owners remain parked for observation only.
+                if owned.may_signal && owned.status.is_none() {
+                    let _ = signal_child(&owned.child, libc::SIGKILL);
                     let _ = signal(owned.pgid, libc::SIGKILL);
                 }
                 PENDING
@@ -1229,6 +1286,46 @@ mod native {
                 std::thread::sleep(TICK);
             }
             assert!(handle.child_id().is_none());
+            assert!(PENDING.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn reaped_owner_never_signals_a_reused_group_on_retry_or_drop() {
+            let _serial = REGISTRY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+            let mut unrelated = std::process::Command::new("/bin/sleep")
+                .arg("10")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut child = std::process::Command::new("/usr/bin/true")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let child_id = child.id();
+            let status = child.wait().unwrap();
+            // Model PGID reuse deterministically with another fixture-owned
+            // group. No arbitrary system PID is selected by this test.
+            let mut handle = PendingCleanup {
+                owned: Some(Owned {
+                    _reservation: Reservation::acquire().unwrap(),
+                    child,
+                    pgid: unrelated.id() as libc::pid_t,
+                    status: Some(status),
+                    may_signal: true,
+                }),
+            };
+            assert!(handle.try_stop_and_reap().unwrap().is_none());
+            assert!(!handle.owned.as_ref().unwrap().may_signal);
+            assert!(unrelated.try_wait().unwrap().is_none());
+            // Exercise Drop's own status guard independently of the retry's
+            // flag update, as for an already-reaped owner transferred to it.
+            handle.owned.as_mut().unwrap().may_signal = true;
+            drop(handle);
+            assert!(unrelated.try_wait().unwrap().is_none());
+            unrelated.kill().unwrap();
+            unrelated.wait().unwrap();
+            let mut handle = take_pending_cleanup_for(child_id).unwrap();
+            assert!(handle.try_reap().unwrap().is_some());
             assert!(PENDING.lock().unwrap().is_empty());
         }
 

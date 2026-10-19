@@ -22,6 +22,7 @@ fn readable_ancestors(policy: &SandboxPolicy) -> Vec<&Path> {
             boundary
                 .readable_roots
                 .iter()
+                .chain(boundary.readable_files.iter())
                 .flat_map(|root| root.ancestors().skip(1))
         })
         .collect::<std::collections::BTreeSet<_>>()
@@ -33,6 +34,9 @@ fn readable_ancestors(policy: &SandboxPolicy) -> Vec<&Path> {
 pub fn build_profile(policy: &SandboxPolicy) -> String {
     if let Some(boundary) = policy.isolated_boundary() {
         let mut p = String::from("(version 1)\n(deny default)\n");
+        // OS account lookup and the system shell selector need exact service /
+        // metadata grants; neither grants access to the account home contents.
+        p.push_str("(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n(allow file-read-metadata (literal \"/private/var/select/sh\"))\n");
         if !policy.requires_process_containment() {
             p.push_str("(allow process-fork)\n");
         }
@@ -44,6 +48,11 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
         for i in 0..boundary.readable_roots.len() {
             p.push_str(&format!(
                 "(allow file-read* (subpath (param \"READABLE_ROOT_{i}\")))\n"
+            ));
+        }
+        for i in 0..boundary.readable_files.len() {
+            p.push_str(&format!(
+                "(allow file-read* (literal (param \"READABLE_FILE_{i}\")))\n"
             ));
         }
         // Toolchains canonicalize their executable/SDK paths. Metadata on exact
@@ -83,6 +92,7 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
     }
 
     p.push_str("(deny default)\n");
+    p.push_str("(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n");
     // The bare minimum a shell needs to behave as a shell.
     p.push_str("(allow process-fork)\n");
     p.push_str("(allow process-exec)\n");
@@ -197,6 +207,9 @@ pub fn build_args(policy: &SandboxPolicy, program: &Path, args: &[String]) -> Ve
         }
         for (i, root) in boundary.readable_roots.iter().enumerate() {
             out.push(format!("-DREADABLE_ROOT_{i}={}", root.display()));
+        }
+        for (i, file) in boundary.readable_files.iter().enumerate() {
+            out.push(format!("-DREADABLE_FILE_{i}={}", file.display()));
         }
     }
     for (i, root) in policy.writable_roots().iter().enumerate() {
@@ -375,6 +388,151 @@ mod tests {
             .expect("no --: the boundary between command and arguments is ambiguous");
         assert_eq!(args[sep + 1], "/bin/echo");
         assert_eq!(args[sep + 2], "hello");
+    }
+
+    #[test]
+    fn isolated_shell_selector_is_metadata_only_and_account_lookup_is_exact() {
+        let project = tempfile::tempdir().unwrap();
+        let profile = build_profile(
+            &SandboxPolicy::isolated(SandboxMode::ReadOnly, project.path(), &[]).unwrap(),
+        );
+        let selector: Vec<_> = profile
+            .lines()
+            .filter(|line| line.contains("/private/var/select"))
+            .collect();
+        assert_eq!(
+            selector,
+            ["(allow file-read-metadata (literal \"/private/var/select/sh\"))"]
+        );
+        let lookup: Vec<_> = profile
+            .lines()
+            .filter(|line| line.contains("mach-lookup"))
+            .collect();
+        assert_eq!(
+            lookup,
+            ["(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))"]
+        );
+        let regular = build_profile(&SandboxPolicy::new(SandboxMode::ReadOnly, &[]).unwrap());
+        assert_eq!(
+            regular
+                .lines()
+                .filter(|line| line.contains("mach-lookup"))
+                .collect::<Vec<_>>(),
+            lookup
+        );
+        assert!(!regular.contains("/private/var/select"));
+    }
+
+    #[test]
+    fn isolated_native_shell_is_quiet_and_exact_leaves_do_not_expose_parent_contents() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let allowed = outside.join("gate");
+        let denied = outside.join("unrelated");
+        std::fs::write(&allowed, b"owned gate fixture").unwrap();
+        std::fs::write(&denied, b"unrelated fixture").unwrap();
+        let runtime: Vec<_> = ["/bin", "/usr/lib", "/System/Library"]
+            .iter()
+            .map(|path| Path::new(path).canonicalize().unwrap())
+            .collect();
+        let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, project.path(), &runtime)
+            .unwrap()
+            .with_isolated_readable_files(std::slice::from_ref(&allowed))
+            .unwrap();
+        let run = |program: &str, args: &[String]| {
+            std::process::Command::new(SANDBOX_EXEC)
+                .args(build_args(&policy, Path::new(program), args))
+                .current_dir(&policy.isolated_boundary().unwrap().workspace)
+                .env_clear()
+                .env("HOME", "/invalid-poison-home")
+                .output()
+                .unwrap()
+        };
+        let shell = run(
+            "/bin/sh",
+            &["-c".into(), "printf '%s' '{\"schema_version\":1}'".into()],
+        );
+        assert!(shell.status.success());
+        assert_eq!(shell.stdout, br#"{"schema_version":1}"#);
+        assert!(
+            shell.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        let leaf = run("/bin/cat", &[allowed.display().to_string()]);
+        assert!(leaf.status.success());
+        assert_eq!(leaf.stdout, b"owned gate fixture");
+        for (program, target) in [
+            ("/bin/ls", outside.as_path()),
+            ("/bin/cat", denied.as_path()),
+            ("/bin/ls", Path::new("/private/var/select")),
+        ] {
+            let output = run(program, &[target.display().to_string()]);
+            assert!(
+                !output.status.success(),
+                "{program} {} must be denied",
+                target.display()
+            );
+            assert!(output.stdout.is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_readable_files_use_literal_parameters_and_metadata_only_ancestors() {
+        let workspace = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path().canonicalize().unwrap();
+        let binary = root.join("binary (verified)");
+        std::fs::write(&binary, b"binary").unwrap();
+        let gate = root.join(".polaris/mcp-entry-gate-v2.json");
+        let leaves = [binary.clone(), gate.clone()];
+        let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, workspace.path(), &[])
+            .unwrap()
+            .with_isolated_readable_files(&leaves)
+            .unwrap();
+        let child = policy.restrict(SandboxMode::ReadOnly, &[]).unwrap();
+        let profile = build_profile(&child);
+        for i in 0..leaves.len() {
+            assert!(profile.contains(&format!(
+                "(allow file-read* (literal (param \"READABLE_FILE_{i}\")))"
+            )));
+        }
+        assert!(!profile.contains("(subpath (param \"READABLE_FILE_"));
+        assert!(!profile.contains("(allow file-write* (literal (param \"READABLE_FILE_"));
+        assert!(!profile.contains(&root.display().to_string()));
+        let ancestors = readable_ancestors(&child);
+        assert!(ancestors.contains(&root.as_path()));
+        assert!(ancestors.contains(&gate.parent().unwrap()));
+        for i in 0..ancestors.len() {
+            let matching: Vec<_> = profile
+                .lines()
+                .filter(|line| line.contains(&format!("READABLE_ANCESTOR_{i}\"")))
+                .collect();
+            assert_eq!(
+                matching,
+                [format!(
+                    "(allow file-read-metadata (literal (param \"READABLE_ANCESTOR_{i}\")))"
+                )]
+            );
+        }
+        let args = build_args(&child, Path::new("/bin/echo"), &["ok".into()]);
+        for (i, file) in leaves.iter().enumerate() {
+            assert!(args.contains(&format!("-DREADABLE_FILE_{i}={}", file.display())));
+        }
+        for (i, ancestor) in ancestors.iter().enumerate() {
+            assert!(args.contains(&format!("-DREADABLE_ANCESTOR_{i}={}", ancestor.display())));
+        }
+        let default =
+            SandboxPolicy::isolated(SandboxMode::ReadOnly, workspace.path(), &[]).unwrap();
+        assert!(
+            default
+                .isolated_boundary()
+                .unwrap()
+                .readable_files
+                .is_empty()
+        );
+        assert!(!build_profile(&default).contains("READABLE_FILE_"));
     }
 
     /// The reason `workspace-write` grants the per-user `TMPDIR`, run

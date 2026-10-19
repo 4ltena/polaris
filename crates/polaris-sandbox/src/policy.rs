@@ -23,6 +23,82 @@ impl SandboxMode {
     }
 }
 
+/// A logical layout for resource validation, not an execution policy or a
+/// filesystem admission. It cannot be converted publicly into SandboxPolicy.
+/// A migration owner must separately pin and revalidate every mapped resource.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RegisteredBoundaryLayout {
+    mode: SandboxMode,
+    workspace: PathBuf,
+    readable_roots: Vec<PathBuf>,
+    writable_roots: Vec<PathBuf>,
+}
+
+impl RegisteredBoundaryLayout {
+    pub fn new(
+        mode: SandboxMode,
+        workspace: &Path,
+        runtime_roots: &[PathBuf],
+    ) -> Result<Self, SandboxError> {
+        let normalized = |path: &Path| {
+            let rebuilt: PathBuf = path.components().collect();
+            path.is_absolute()
+                && path.parent().is_some()
+                && rebuilt.as_os_str() == path.as_os_str()
+                && path.components().all(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::Prefix(_)
+                            | std::path::Component::RootDir
+                            | std::path::Component::Normal(_)
+                    )
+                })
+        };
+        if !normalized(workspace) {
+            return Err(SandboxError::NotEnforced(
+                "invalid isolated workspace".into(),
+            ));
+        }
+        let workspace = workspace.to_owned();
+        let mut readable_roots = vec![workspace.clone()];
+        for root in runtime_roots {
+            if !normalized(root) {
+                return Err(SandboxError::NotEnforced(
+                    "invalid isolated readable root".into(),
+                ));
+            }
+            if !readable_roots.contains(root) {
+                readable_roots.push(root.clone());
+            }
+        }
+        Ok(Self {
+            mode,
+            writable_roots: if mode == SandboxMode::ReadOnly {
+                vec![]
+            } else {
+                vec![workspace.clone()]
+            },
+            workspace,
+            readable_roots,
+        })
+    }
+
+    pub fn contains_readable(&self, path: &Path) -> bool {
+        self.readable_roots
+            .iter()
+            .any(|root| path.starts_with(root))
+    }
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+    pub fn readable_roots(&self) -> &[PathBuf] {
+        &self.readable_roots
+    }
+    pub fn writable_roots(&self) -> &[PathBuf] {
+        &self.writable_roots
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
     mode: SandboxMode,
@@ -31,10 +107,86 @@ pub struct SandboxPolicy {
     require_process_containment: bool,
 }
 
+#[cfg(all(test, unix))]
+mod registered_layout_tests {
+    use super::*;
+
+    #[test]
+    fn logical_layout_creates_no_resource_or_execution_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let workspace = root.join("not-published");
+        let runtime = root.join("not-installed");
+        let layout = RegisteredBoundaryLayout::new(
+            SandboxMode::WorkspaceWrite,
+            &workspace,
+            &[runtime.clone(), workspace.clone(), runtime.clone()],
+        )
+        .unwrap();
+        assert_eq!(layout.workspace(), workspace);
+        assert_eq!(
+            layout.readable_roots(),
+            &[workspace.clone(), runtime.clone()]
+        );
+        assert_eq!(layout.writable_roots(), &[workspace.clone()]);
+        assert!(layout.contains_readable(&workspace.join("index.js")));
+        assert!(!layout.contains_readable(&root.join("foreign/index.js")));
+        assert!(
+            SandboxPolicy::isolated_registered(
+                SandboxMode::WorkspaceWrite,
+                &workspace,
+                &[runtime.clone()],
+            )
+            .is_err()
+        );
+        assert!(!workspace.exists());
+        assert!(!runtime.exists());
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn logical_layout_rejects_aliases_and_matches_live_policy_topology() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let runtime = root.join("runtime");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        for mode in [
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::FullAccess,
+        ] {
+            let layout =
+                RegisteredBoundaryLayout::new(mode, &workspace, &[runtime.clone()]).unwrap();
+            let live =
+                SandboxPolicy::isolated_registered(mode, &workspace, &[runtime.clone()]).unwrap();
+            let boundary = live.isolated_boundary().unwrap();
+            assert_eq!(layout.workspace(), boundary.workspace);
+            assert_eq!(layout.readable_roots(), boundary.readable_roots);
+            assert_eq!(layout.writable_roots(), live.writable_roots());
+        }
+        for invalid in [
+            PathBuf::from("/"),
+            PathBuf::from("relative"),
+            workspace.join(".."),
+            PathBuf::from(format!("{}//workspace", root.display())),
+        ] {
+            assert!(RegisteredBoundaryLayout::new(SandboxMode::ReadOnly, &invalid, &[]).is_err());
+            assert!(
+                RegisteredBoundaryLayout::new(SandboxMode::ReadOnly, &workspace, &[invalid])
+                    .is_err()
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolatedBoundary {
     pub workspace: PathBuf,
     pub readable_roots: Vec<PathBuf>,
+    /// Exact read-only leaves; these never grant their parent or a subtree.
+    pub readable_files: Vec<PathBuf>,
     pub environment: Option<IsolatedEnvironment>,
     /// Connections to and listeners on loopback only; other hosts stay denied.
     pub loopback_network: bool,
@@ -54,6 +206,13 @@ pub struct IsolatedEnvironment {
 
 impl IsolatedEnvironment {
     pub(crate) fn validate(&self, workspace: &Path) -> Result<(), SandboxError> {
+        #[cfg(not(unix))]
+        if self.private_container.is_some() {
+            return Err(SandboxError::NotEnforced(
+                "private scratch is unsupported".into(),
+            ));
+        }
+        #[cfg(unix)]
         if let Some(container) = &self.private_container {
             #[cfg(unix)]
             {
@@ -71,10 +230,6 @@ impl IsolatedEnvironment {
                     }
                 }
             }
-            #[cfg(not(unix))]
-            return Err(SandboxError::NotEnforced(
-                "private scratch is unsupported".into(),
-            ));
             if container.starts_with(workspace)
                 || workspace.starts_with(container)
                 || self.home.parent() != Some(container)
@@ -112,6 +267,122 @@ impl IsolatedEnvironment {
         }
         Ok(())
     }
+}
+
+const MAX_ISOLATED_READABLE_FILES: usize = 16;
+
+fn is_fixed_entry_gate_file(path: &Path) -> bool {
+    path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".polaris"))
+        && matches!(
+            path.file_name().and_then(std::ffi::OsStr::to_str),
+            Some(
+                "mcp-entry-gate-v2.json"
+                    | "mcp-entry-gate-v2.lock"
+                    | "mcp-entry-identities-v2.json"
+            )
+        )
+}
+
+/// Validate spelling and every existing component without resolving an alias.
+/// Only the fixed entry-gate leaf and its .polaris parent may be absent.
+/// The entry owner must pin and revalidate identities immediately before launch.
+fn validate_isolated_readable_file(path: &Path) -> Result<(), SandboxError> {
+    use std::path::Component;
+
+    let text = path
+        .to_str()
+        .ok_or_else(|| SandboxError::NotEnforced("readable file path must be UTF-8".into()))?;
+    if !path.is_absolute()
+        || text.len() > 4096
+        || text.chars().any(char::is_control)
+        || path.parent().is_none()
+    {
+        return Err(SandboxError::NotEnforced(
+            "unsafe readable file path".into(),
+        ));
+    }
+    let mut spelling = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                spelling.push(component.as_os_str());
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(SandboxError::NotEnforced(
+                    "readable file path is not normalized".into(),
+                ));
+            }
+        }
+    }
+    if spelling.as_os_str() != path.as_os_str() {
+        return Err(SandboxError::NotEnforced(
+            "readable file path is not normalized".into(),
+        ));
+    }
+
+    let fixed_gate = is_fixed_entry_gate_file(path);
+    let mut physical = PathBuf::new();
+    let mut absent = false;
+    for component in path.components() {
+        physical.push(component.as_os_str());
+        if absent {
+            continue;
+        }
+        match physical.symlink_metadata() {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || (physical != path && !metadata.is_dir())
+                    || (physical == path && !metadata.is_file())
+                    || physical.canonicalize()?.as_os_str() != physical.as_os_str()
+                {
+                    return Err(SandboxError::NotEnforced(
+                        "readable file is not a physical regular file".into(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !fixed_gate || (physical != path && Some(physical.as_path()) != path.parent()) {
+                    return Err(SandboxError::NotEnforced("readable file is missing".into()));
+                }
+                absent = true;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_isolated_readable_files(
+    files: &[PathBuf],
+    writable_roots: &[PathBuf],
+    environment: Option<&IsolatedEnvironment>,
+) -> Result<(), SandboxError> {
+    if files.len() > MAX_ISOLATED_READABLE_FILES {
+        return Err(SandboxError::NotEnforced("too many readable files".into()));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for file in files {
+        validate_isolated_readable_file(file)?;
+        if !unique.insert(file) {
+            return Err(SandboxError::NotEnforced("duplicate readable file".into()));
+        }
+        let overlaps = |root: &Path| file.starts_with(root) || root.starts_with(file);
+        if writable_roots.iter().any(|root| overlaps(root))
+            || environment.is_some_and(|env| {
+                overlaps(&env.home)
+                    || overlaps(&env.tmpdir)
+                    || env
+                        .private_container
+                        .as_ref()
+                        .is_some_and(|root| overlaps(root))
+            })
+        {
+            return Err(SandboxError::NotEnforced(
+                "readable file overlaps writable or private scratch area".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl SandboxPolicy {
@@ -188,7 +459,7 @@ impl SandboxPolicy {
         runtime_roots: &[PathBuf],
     ) -> Result<Self, SandboxError> {
         let workspace = workspace.canonicalize()?;
-        let mut readable_roots = vec![workspace.clone()];
+        let mut canonical_roots = Vec::new();
         for root in runtime_roots {
             let root = root.canonicalize()?;
             if root.parent().is_none() {
@@ -196,25 +467,21 @@ impl SandboxPolicy {
                     "cannot expose filesystem root".into(),
                 ));
             }
-            if !readable_roots.contains(&root) {
-                readable_roots.push(root);
-            }
+            canonical_roots.push(root);
         }
         if workspace.parent().is_none() || !workspace.is_dir() {
             return Err(SandboxError::NotEnforced(
                 "invalid isolated workspace".into(),
             ));
         }
+        let layout = RegisteredBoundaryLayout::new(mode, &workspace, &canonical_roots)?;
         Ok(Self {
-            mode,
-            writable_roots: if mode == SandboxMode::ReadOnly {
-                vec![]
-            } else {
-                vec![workspace.clone()]
-            },
+            mode: layout.mode,
+            writable_roots: layout.writable_roots,
             isolated: Some(IsolatedBoundary {
-                workspace,
-                readable_roots,
+                workspace: layout.workspace,
+                readable_roots: layout.readable_roots,
+                readable_files: Vec::new(),
                 environment: None,
                 loopback_network: false,
             }),
@@ -224,6 +491,23 @@ impl SandboxPolicy {
 
     pub fn isolated_boundary(&self) -> Option<&IsolatedBoundary> {
         self.isolated.as_ref()
+    }
+
+    /// Register at most sixteen physical file paths for exact read-only access.
+    /// The host supplies verified entry-manifest files and fixed gate paths,
+    /// then revalidates identities before spawn. Only the three fixed gate
+    /// paths may be absent; parent contents and subtrees stay ungranted.
+    pub fn with_isolated_readable_files(mut self, files: &[PathBuf]) -> Result<Self, SandboxError> {
+        let boundary = self.isolated.as_mut().ok_or_else(|| {
+            SandboxError::NotEnforced("readable files require an isolated policy".into())
+        })?;
+        validate_isolated_readable_files(
+            files,
+            &self.writable_roots,
+            boundary.environment.as_ref(),
+        )?;
+        boundary.readable_files = files.to_vec();
+        Ok(self)
     }
 
     /// Common-case execution opts into a no-fork profile. This is required to
@@ -278,6 +562,11 @@ impl SandboxPolicy {
             runtime_bin_dirs: Vec::new(),
         };
         environment.validate(&boundary.workspace)?;
+        validate_isolated_readable_files(
+            &boundary.readable_files,
+            &self.writable_roots,
+            Some(&environment),
+        )?;
         boundary.environment = Some(environment);
         Ok(self)
     }
@@ -307,6 +596,11 @@ impl SandboxPolicy {
             ));
         }
         environment.validate(&boundary.workspace)?;
+        validate_isolated_readable_files(
+            &boundary.readable_files,
+            &self.writable_roots,
+            Some(&environment),
+        )?;
         boundary.environment = Some(environment);
         Ok(self)
     }
@@ -331,6 +625,11 @@ impl SandboxPolicy {
             runtime_bin_dirs: Vec::new(),
         };
         environment.validate(&boundary.workspace)?;
+        validate_isolated_readable_files(
+            &boundary.readable_files,
+            &self.writable_roots,
+            Some(&environment),
+        )?;
         if boundary
             .readable_roots
             .iter()
@@ -414,6 +713,11 @@ impl SandboxPolicy {
             if let Some(environment) = &boundary.environment {
                 environment.validate(&boundary.workspace)?;
             }
+            validate_isolated_readable_files(
+                &boundary.readable_files,
+                &self.writable_roots,
+                boundary.environment.as_ref(),
+            )?;
         }
         let construction_mode = if self.isolated.is_some() && mode == SandboxMode::FullAccess {
             SandboxMode::WorkspaceWrite
@@ -480,6 +784,313 @@ impl SandboxPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_sandbox_unavailable_private_environment_precedes_path_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let home = workspace.join("home");
+        let tmpdir = workspace.join("tmp");
+        let runtime = workspace.join("runtime");
+        for directory in [&home, &tmpdir, &runtime] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let retained = workspace.join("retained.bin");
+        let retained_bytes = b"retained\0fixture\xff";
+        std::fs::write(&retained, retained_bytes).unwrap();
+        fn contents(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+            fn visit(
+                root: &Path,
+                path: &Path,
+                files: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+            ) {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let kind = entry.file_type().unwrap();
+                    assert!(!kind.is_symlink());
+                    let relative = path.strip_prefix(root).unwrap().to_owned();
+                    if kind.is_dir() {
+                        files.insert(relative, None);
+                        visit(root, &path, files);
+                    } else {
+                        files.insert(relative, Some(std::fs::read(path).unwrap()));
+                    }
+                }
+            }
+            let mut files = std::collections::BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+        let before_contents = contents(&workspace);
+        let ordinary = IsolatedEnvironment {
+            home,
+            tmpdir,
+            private_siblings: false,
+            private_container: None,
+            runtime_bin_dirs: vec![runtime],
+        };
+        assert!(ordinary.validate(&workspace).is_ok());
+        for container in [
+            workspace.clone(),
+            workspace.join("missing-container"),
+            PathBuf::from("relative-container"),
+        ] {
+            let mut private = ordinary.clone();
+            private.private_container = Some(container);
+            private.home = workspace.join("missing-home");
+            private.tmpdir = workspace.join("missing-tmp");
+            private.runtime_bin_dirs = vec![workspace.join("missing-runtime")];
+            assert!(matches!(
+                private.validate(&workspace),
+                Err(SandboxError::NotEnforced(reason))
+                    if reason == "private scratch is unsupported"
+            ));
+            assert_eq!(contents(&workspace), before_contents);
+            assert_eq!(std::fs::read(&retained).unwrap(), retained_bytes);
+        }
+        assert!(ordinary.validate(&workspace).is_ok());
+        assert_eq!(contents(&workspace), before_contents);
+    }
+
+    #[test]
+    fn exact_readable_files_are_bounded_and_preserved_by_read_only_restrict() {
+        let workspace = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let file_root = files.path().canonicalize().unwrap();
+        let leaves: Vec<PathBuf> = (0..16)
+            .map(|i| file_root.join(format!("file-{i}")))
+            .collect();
+        for file in &leaves {
+            std::fs::write(file, b"nonsecret").unwrap();
+        }
+        let parent = SandboxPolicy::isolated(SandboxMode::WorkspaceWrite, workspace.path(), &[])
+            .unwrap()
+            .with_isolated_readable_files(&leaves)
+            .unwrap();
+        let child = parent.restrict(SandboxMode::ReadOnly, &[]).unwrap();
+        assert_eq!(child.isolated_boundary().unwrap().readable_files, leaves);
+        assert!(leaves.iter().all(|file| !child.contains(file)));
+        assert!(
+            parent
+                .clone()
+                .with_isolated_readable_files(&vec![leaves[0].clone(); 17])
+                .is_err()
+        );
+        assert!(
+            parent
+                .clone()
+                .with_isolated_readable_files(&[leaves[0].clone(), leaves[0].clone()])
+                .is_err()
+        );
+        assert!(
+            SandboxPolicy::new(SandboxMode::ReadOnly, &[])
+                .unwrap()
+                .with_isolated_readable_files(&leaves)
+                .is_err()
+        );
+        assert!(
+            SandboxPolicy::isolated(SandboxMode::WorkspaceWrite, files.path(), &[])
+                .unwrap()
+                .with_isolated_readable_files(&leaves)
+                .is_err()
+        );
+        assert!(
+            SandboxPolicy::isolated(SandboxMode::FullAccess, files.path(), &[])
+                .unwrap()
+                .with_isolated_readable_files(&leaves)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_readable_files_allow_only_fixed_absent_gate_leaves() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let gate_parent = root.join(".polaris");
+        let leaves = [
+            gate_parent.join("mcp-entry-gate-v2.json"),
+            gate_parent.join("mcp-entry-gate-v2.lock"),
+            gate_parent.join("mcp-entry-identities-v2.json"),
+        ];
+        let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, workspace.path(), &[]).unwrap();
+        // The physical HOME is enough when the fixed .polaris parent is absent.
+        let absent = policy
+            .clone()
+            .with_isolated_readable_files(&leaves)
+            .unwrap();
+        assert!(absent.restrict(SandboxMode::ReadOnly, &[]).is_ok());
+        std::fs::create_dir(&gate_parent).unwrap();
+        assert!(policy.clone().with_isolated_readable_files(&leaves).is_ok());
+        for file in [
+            gate_parent.join("unapproved.json"),
+            root.join("mcp-entry-gate-v2.json"),
+            root.join("missing-home/.polaris/mcp-entry-gate-v2.json"),
+            gate_parent.join("mcp-entry-gate-v2.json/child"),
+        ] {
+            assert!(
+                policy
+                    .clone()
+                    .with_isolated_readable_files(&[file])
+                    .is_err()
+            );
+        }
+        std::fs::write(&leaves[0], b"gate").unwrap();
+        assert!(policy.with_isolated_readable_files(&leaves).is_ok());
+    }
+
+    #[test]
+    fn exact_readable_files_reject_unsafe_spellings_and_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path().canonicalize().unwrap();
+        let file = root.join("leaf");
+        std::fs::write(&file, b"data").unwrap();
+        let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, workspace.path(), &[]).unwrap();
+        for path in [
+            PathBuf::from("leaf"),
+            PathBuf::from("/"),
+            root.clone(),
+            PathBuf::from(format!("{}/./leaf", root.display())),
+            PathBuf::from(format!("{}//leaf", root.display())),
+            PathBuf::from(format!("{}/leaf/", root.display())),
+            root.join("../leaf"),
+            root.join("control\nleaf"),
+            root.join("x".repeat(4097)),
+        ] {
+            assert!(
+                policy
+                    .clone()
+                    .with_isolated_readable_files(&[path])
+                    .is_err()
+            );
+        }
+        assert!(policy.with_isolated_readable_files(&[file]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_readable_files_reject_symlink_leaf_and_ancestors_on_registration_and_restrict() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path().canonicalize().unwrap();
+        let physical = root.join("physical");
+        std::fs::create_dir(&physical).unwrap();
+        let file = physical.join("leaf");
+        std::fs::write(&file, b"data").unwrap();
+        let alias = root.join("alias");
+        let leaf_alias = root.join("leaf-alias");
+        symlink(&physical, &alias).unwrap();
+        symlink(&file, &leaf_alias).unwrap();
+        let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, workspace.path(), &[]).unwrap();
+        for path in [
+            alias.join("leaf"),
+            leaf_alias,
+            alias.join(".polaris/mcp-entry-gate-v2.json"),
+        ] {
+            assert!(
+                policy
+                    .clone()
+                    .with_isolated_readable_files(&[path])
+                    .is_err()
+            );
+        }
+        let parent = policy
+            .with_isolated_readable_files(std::slice::from_ref(&file))
+            .unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert!(parent.restrict(SandboxMode::ReadOnly, &[]).is_err());
+        std::fs::create_dir(&file).unwrap();
+        assert!(parent.restrict(SandboxMode::ReadOnly, &[]).is_err());
+        std::fs::remove_dir(&file).unwrap();
+        symlink("/dev/null", &file).unwrap();
+        assert!(parent.restrict(SandboxMode::ReadOnly, &[]).is_err());
+    }
+
+    #[test]
+    fn exact_readable_files_reject_scratch_overlap_in_both_configuration_orders() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let sibling_home = root.join("home");
+        let sibling_tmp = root.join("tmp");
+        let child_home = workspace.join("home");
+        let child_tmp = workspace.join("tmp");
+        for dir in [
+            &workspace,
+            &sibling_home,
+            &sibling_tmp,
+            &child_home,
+            &child_tmp,
+        ] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        for (home, tmpdir, sibling) in [
+            (&sibling_home, &sibling_tmp, true),
+            (&child_home, &child_tmp, false),
+        ] {
+            for scratch in [home, tmpdir] {
+                let file = scratch.join("leaf");
+                std::fs::write(&file, b"data").unwrap();
+                let policy =
+                    SandboxPolicy::isolated(SandboxMode::ReadOnly, &workspace, &[]).unwrap();
+                let registered = policy
+                    .clone()
+                    .with_isolated_readable_files(std::slice::from_ref(&file))
+                    .unwrap();
+                let env_first = if sibling {
+                    assert!(
+                        registered
+                            .with_isolated_sibling_environment(home, tmpdir)
+                            .is_err()
+                    );
+                    policy
+                        .with_isolated_sibling_environment(home, tmpdir)
+                        .unwrap()
+                } else {
+                    assert!(registered.with_isolated_environment(home, tmpdir).is_err());
+                    policy.with_isolated_environment(home, tmpdir).unwrap()
+                };
+                assert!(env_first.with_isolated_readable_files(&[file]).is_err());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_readable_files_reject_private_container_overlap_in_both_configuration_orders() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let container = private.path().canonicalize().unwrap();
+        let home = container.join("home");
+        let tmpdir = container.join("tmp");
+        for dir in [&container, &home, &tmpdir] {
+            if dir != &container {
+                std::fs::create_dir(dir).unwrap();
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let file = container.join("outside-scratch-leaf");
+        std::fs::write(&file, b"data").unwrap();
+        let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, workspace.path(), &[]).unwrap();
+        let file_first = policy
+            .clone()
+            .with_isolated_readable_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert!(
+            file_first
+                .with_isolated_private_environment(&container, &home, &tmpdir)
+                .is_err()
+        );
+        let env_first = policy
+            .with_isolated_private_environment(&container, &home, &tmpdir)
+            .unwrap();
+        assert!(env_first.with_isolated_readable_files(&[file]).is_err());
+    }
 
     #[test]
     fn runtime_bins_require_disjoint_readable_directories_and_valid_path_elements() {
@@ -802,6 +1413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_root_reached_through_a_symlink_is_stored_canonicalised() {
         // macOS's /tmp is a symlink to /private/tmp, and tempfile::tempdir()
         // is also created under it. Without normalization, the enforcement

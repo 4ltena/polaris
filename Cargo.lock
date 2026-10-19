@@ -1570,9 +1570,13 @@ name = "polaris-auth"
 version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
+ "core-foundation",
  "libc",
  "polaris-http",
  "reqwest 0.12.28",
+ "ring",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -1580,7 +1584,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "url",
+ "windows-sys 0.61.2",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -1607,6 +1613,7 @@ dependencies = [
  "tokio",
  "toml",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -1636,6 +1643,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1690,6 +1698,7 @@ dependencies = [
  "libc",
  "polaris-auth",
  "polaris-sandbox",
+ "polaris-tools",
  "reqwest 0.13.5",
  "rmcp",
  "serde",
@@ -1707,6 +1716,7 @@ dependencies = [
 name = "polaris-memory"
 version = "0.12.0"
 dependencies = [
+ "polaris-auth",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1765,11 +1775,14 @@ name = "polaris-tools"
 version = "0.12.0"
 dependencies = [
  "jsonschema",
+ "libc",
+ "polaris-auth",
  "polaris-sandbox",
  "polaris-skills",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

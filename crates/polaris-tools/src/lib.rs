@@ -1,8 +1,14 @@
 //! polaris's built-in tools. The always-on tool set never exceeds 6 tools.
 
+#[cfg(unix)]
+pub mod account_home;
 pub mod bash;
 pub mod edit;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod entry_kernel;
 pub mod isolated_read;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod native_mount;
 pub mod path_policy;
 pub mod predicate;
 pub mod read;

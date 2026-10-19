@@ -151,6 +151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_state_dir_reached_through_a_symlink_into_a_writable_root_is_rejected() {
         // Even when state_dir's own path is outside the writable root, if
         // following a symlink lands inside the root, the same problem

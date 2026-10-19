@@ -335,6 +335,20 @@ mod tests {
 
     #[test]
     fn only_permission_errors_are_classified_as_a_refusal() {
+        use std::io::{Error, ErrorKind};
+        assert!(matches!(
+            classify_io(Error::from(ErrorKind::PermissionDenied)),
+            ApplyError::Refused(_)
+        ));
+        assert!(matches!(
+            classify_io(Error::from(ErrorKind::NotFound)),
+            ApplyError::Request(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_permission_errnos_are_classified_as_a_refusal() {
         // Pins down that errno is the only material that distinguishes a
         // denial from a request problem. EPERM(1) comes from Seatbelt,
         // EACCES(13) comes from landlock, and std maps both to

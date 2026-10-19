@@ -4,41 +4,68 @@
 //! establishes the directory, stable locks, and the inode journal which 2b
 //! must use before it writes a registry byte.
 
+#[cfg(any(unix, test))]
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::fs::File;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AuthError, protection::ProtectedIdentity};
+use crate::AuthError;
+#[cfg(any(unix, test))]
+use crate::protection::ProtectedIdentity;
 
 const DIRECTORY: &str = "accounts";
 const POLARIS: &str = ".polaris";
+#[cfg(unix)]
 const OWNER_LOCK: &str = "owner.lock";
+#[cfg(unix)]
 const JOURNAL: &str = "protected-inodes.json";
+#[cfg(unix)]
 const JOURNAL_TMP: &str = "protected-inodes.json.tmp";
+#[cfg(any(unix, test))]
 const MAX_IDENTITIES: usize = 65_536;
+#[cfg(unix)]
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(unix)]
 const SLOT_COUNT: usize = 16;
+#[cfg(unix)]
 const REGISTRY: &str = "registry.json";
+#[cfg(unix)]
 const REGISTRY_TMP: &str = "registry.json.tmp";
+#[cfg(unix)]
 const MAX_REGISTRY_BODY_BYTES: u64 = 1024 * 1024;
 
 /// Stable account directory rooted below one trusted, OS-resolved home.
 pub struct AccountDirectory {
+    #[cfg(unix)]
     home: File,
+    #[cfg(unix)]
     directory: File,
     home_path: PathBuf,
 }
 
 /// One slot's refresh or login lease, released on drop. It is taken before
 /// the owner lock and never replaced by PID or time.
+#[cfg(unix)]
 pub(crate) struct SlotLease(File);
 
+#[cfg(not(unix))]
+pub(crate) struct SlotLease {
+    _private: (),
+}
+
+#[cfg(unix)]
 impl Drop for SlotLease {
     fn drop(&mut self) {
         let _ = self.0.unlock();
@@ -47,14 +74,22 @@ impl Drop for SlotLease {
 
 /// An owner lock.  The process-local protection mutex is always acquired only
 /// after this guard is held.
+#[cfg(unix)]
 pub struct OwnerLock(File);
 
+#[cfg(not(unix))]
+pub struct OwnerLock {
+    _private: (),
+}
+
+#[cfg(unix)]
 impl Drop for OwnerLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
 }
 
+#[cfg(unix)]
 impl OwnerLock {
     fn verify(&self, directory: &File) -> Result<(), AuthError> {
         let current = open_at(directory, OWNER_LOCK, libc::O_RDWR)?;
@@ -70,13 +105,13 @@ impl OwnerLock {
 
 /// A newly-created descriptor whose identity is durable in the non-secret
 /// journal. Test-only: the product writer is `RegistryWriter`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub struct ProtectedTemp {
     file: File,
     _owner: OwnerLock,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl ProtectedTemp {
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
@@ -104,6 +139,7 @@ struct Journal {
     identities: Vec<JournalIdentity>,
 }
 
+#[cfg(any(unix, test))]
 impl Journal {
     fn initial() -> Self {
         Self {
@@ -179,11 +215,13 @@ impl Journal {
     }
 }
 
+#[cfg(unix)]
 fn owner() -> u32 {
     // SAFETY: `geteuid` has no arguments or memory effects.
     unsafe { libc::geteuid() }
 }
 
+#[cfg(unix)]
 fn private_directory(file: &File) -> Result<(), AuthError> {
     let metadata = file.metadata()?;
     if !metadata.is_dir() || metadata.uid() != owner() || metadata.mode() & 0o7777 != 0o700 {
@@ -192,6 +230,7 @@ fn private_directory(file: &File) -> Result<(), AuthError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn trusted_ancestor_directory(file: &File) -> Result<(), AuthError> {
     let metadata = file.metadata()?;
     if !metadata.is_dir() || metadata.uid() != owner() || metadata.mode() & 0o022 != 0 {
@@ -200,6 +239,7 @@ fn trusted_ancestor_directory(file: &File) -> Result<(), AuthError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn private_file(file: &File) -> Result<(), AuthError> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
@@ -212,6 +252,7 @@ fn private_file(file: &File) -> Result<(), AuthError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn component(name: &str) -> Result<CString, AuthError> {
     if name.is_empty() || name.contains('/') {
         return Err(AuthError::Protection);
@@ -219,6 +260,7 @@ fn component(name: &str) -> Result<CString, AuthError> {
     CString::new(name).map_err(|_| AuthError::Protection)
 }
 
+#[cfg(unix)]
 fn open_at(parent: &File, name: &str, flags: i32) -> Result<File, AuthError> {
     let name = component(name)?;
     // SAFETY: the parent FD is live and the component is NUL-terminated.
@@ -236,6 +278,7 @@ fn open_at(parent: &File, name: &str, flags: i32) -> Result<File, AuthError> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[cfg(unix)]
 fn mkdir_at(parent: &File, name: &str) -> Result<(), AuthError> {
     let name = component(name)?;
     // SAFETY: the parent FD is live and the component is NUL-terminated.
@@ -248,6 +291,7 @@ fn mkdir_at(parent: &File, name: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn path_is_physical_home(home: &Path) -> Result<(), AuthError> {
     if !home.is_absolute()
         || home
@@ -260,6 +304,7 @@ fn path_is_physical_home(home: &Path) -> Result<(), AuthError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn open_physical_directory(home: &Path) -> Result<File, AuthError> {
     path_is_physical_home(home)?;
     let mut directory = File::open("/")?;
@@ -273,12 +318,14 @@ fn open_physical_directory(home: &Path) -> Result<File, AuthError> {
     Ok(directory)
 }
 
+#[cfg(unix)]
 fn lock_file(directory: &File, name: &str) -> Result<File, AuthError> {
     let file = open_at(directory, name, libc::O_RDWR | libc::O_CREAT)?;
     private_file(&file)?;
     Ok(file)
 }
 
+#[cfg(unix)]
 fn acquire(file: File) -> Result<OwnerLock, AuthError> {
     match file.try_lock() {
         Ok(()) => Ok(OwnerLock(file)),
@@ -290,11 +337,13 @@ fn acquire(file: File) -> Result<OwnerLock, AuthError> {
 impl AccountDirectory {
     /// Creates only fixed, private metadata.  It never reads a credential or
     /// initializes the 2b registry document.
+    #[cfg(unix)]
     pub fn open() -> Result<Self, AuthError> {
         let home = crate::protection::trusted_home()?;
         Self::open_trusted(&home)
     }
 
+    #[cfg(unix)]
     fn open_trusted(home: &Path) -> Result<Self, AuthError> {
         let root = open_physical_directory(home)?;
         mkdir_at(&root, POLARIS)?;
@@ -317,12 +366,13 @@ impl AccountDirectory {
         Ok(result)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn open_for_test(home: &Path) -> Result<Self, AuthError> {
         Self::open_trusted(home)
     }
 
     /// Opens an already-complete directory without creating a path or lock.
+    #[cfg(unix)]
     fn open_reader(home: &Path) -> Result<Option<Self>, AuthError> {
         let root = open_physical_directory(home)?;
         let polaris = match open_at(&root, POLARIS, libc::O_RDONLY | libc::O_DIRECTORY) {
@@ -348,6 +398,7 @@ impl AccountDirectory {
         }))
     }
 
+    #[cfg(unix)]
     fn check_directory(&self) -> Result<(), AuthError> {
         let polaris = open_at(&self.home, POLARIS, libc::O_RDONLY | libc::O_DIRECTORY)
             .map_err(|_| AuthError::Protection)?;
@@ -363,6 +414,7 @@ impl AccountDirectory {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn owner_lock(&self) -> Result<OwnerLock, AuthError> {
         let lock = open_at(&self.directory, OWNER_LOCK, libc::O_RDWR)?;
         private_file(&lock)?;
@@ -372,6 +424,7 @@ impl AccountDirectory {
         Ok(lock)
     }
 
+    #[cfg(unix)]
     fn owner_lock_for_genesis(&self) -> Result<OwnerLock, AuthError> {
         if self.present(OWNER_LOCK)? {
             return self.owner_lock();
@@ -393,6 +446,7 @@ impl AccountDirectory {
         Ok(lock)
     }
 
+    #[cfg(unix)]
     fn reader_owner_lock(&self) -> Result<OwnerLock, AuthError> {
         let lock = open_at(&self.directory, OWNER_LOCK, libc::O_RDWR)?;
         private_file(&lock)?;
@@ -402,6 +456,7 @@ impl AccountDirectory {
         Ok(lock)
     }
 
+    #[cfg(unix)]
     fn ensure_fixed_files(&self) -> Result<(), AuthError> {
         let owner_lock = open_at(&self.directory, OWNER_LOCK, libc::O_RDWR)?;
         private_file(&owner_lock)?;
@@ -424,12 +479,14 @@ impl AccountDirectory {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn journal_file(&self, name: &str) -> Result<File, AuthError> {
         let file = open_at(&self.directory, name, libc::O_RDONLY)?;
         private_file(&file)?;
         Ok(file)
     }
 
+    #[cfg(unix)]
     fn read_journal(&self, name: &str) -> Result<Journal, AuthError> {
         let file = self.journal_file(name)?;
         let length = file.metadata()?.len();
@@ -447,6 +504,7 @@ impl AccountDirectory {
         Ok(journal)
     }
 
+    #[cfg(unix)]
     fn present(&self, name: &str) -> Result<bool, AuthError> {
         match open_at(&self.directory, name, libc::O_RDONLY) {
             Ok(file) => {
@@ -458,6 +516,7 @@ impl AccountDirectory {
         }
     }
 
+    #[cfg(unix)]
     fn publish_journal(&self, journal: &Journal, canonical_absent: bool) -> Result<(), AuthError> {
         let body = serde_json::to_vec(journal).map_err(|_| AuthError::RecoveryRequired)?;
         if body.len() as u64 > MAX_JOURNAL_BYTES {
@@ -500,6 +559,7 @@ impl AccountDirectory {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn ensure_journal(&self) -> Result<Journal, AuthError> {
         let canonical = self.present(JOURNAL)?;
         let temporary = self.present(JOURNAL_TMP)?;
@@ -571,7 +631,7 @@ impl AccountDirectory {
     /// Allocate the one registry tmp descriptor used by 2b.  The identity is
     /// durably journaled before this returns, so callers may then write secret
     /// bytes.  Existing tmp files always require explicit recovery.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn prepare_registry_tmp(&self) -> Result<ProtectedTemp, AuthError> {
         let owner = self.owner_lock()?;
         let mut journal = self.ensure_journal()?;
@@ -613,7 +673,7 @@ impl AccountDirectory {
     /// Atomically publish the prepared registry descriptor.  The retained
     /// owner lock keeps the journal identity and this rename in one writer
     /// critical section.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn publish_registry_tmp(&self, temp: ProtectedTemp) -> Result<(), AuthError> {
         temp._owner.verify(&self.directory)?;
         self.check_directory()?;
@@ -654,6 +714,7 @@ impl AccountDirectory {
     }
 
     /// Mutable owner: completes the journal, then reads both registry names.
+    #[cfg(unix)]
     pub(crate) fn registry_writer(&self) -> Result<RegistryWriter<'_>, AuthError> {
         let owner = self.owner_lock()?;
         let journal = self.ensure_journal()?;
@@ -672,6 +733,7 @@ impl AccountDirectory {
     }
 
     /// A registry name is readable only if its inode is journaled.
+    #[cfg(unix)]
     fn read_journaled(
         &self,
         name: &str,
@@ -704,6 +766,7 @@ impl AccountDirectory {
     }
 
     /// The communication lease of one slot, or `None` while another owner holds it.
+    #[cfg(unix)]
     pub(crate) fn try_slot_lease(&self, index: usize) -> Result<Option<SlotLease>, AuthError> {
         if index >= SLOT_COUNT {
             return Err(AuthError::AccountLimit);
@@ -728,6 +791,7 @@ impl AccountDirectory {
 
 /// Read-only callers: creates no directory, lock or journal and never
 /// recovers. Any tmp or incomplete infrastructure is `RecoveryRequired`.
+#[cfg(unix)]
 pub(crate) fn read_registry_read_only(home: &Path) -> Result<Option<Vec<u8>>, AuthError> {
     let Some(directory) = AccountDirectory::open_reader(home)? else {
         return Ok(None);
@@ -753,20 +817,23 @@ pub(crate) fn read_registry_read_only(home: &Path) -> Result<Option<Vec<u8>>, Au
 /// One owner-lock critical section over the registry names. Recovery, the
 /// transition check and the replacement all run before this lock is dropped.
 pub(crate) struct RegistryWriter<'a> {
+    #[cfg(unix)]
     directory: &'a AccountDirectory,
+    #[cfg(not(unix))]
+    _directory: &'a AccountDirectory,
     _owner: OwnerLock,
     journal: Journal,
     canonical: Option<Vec<u8>>,
     temporary: Option<(Vec<u8>, File)>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     pub(crate) static REGISTRY_FAULT: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn fault(point: &'static str) -> Result<(), AuthError> {
     if REGISTRY_FAULT.with(|f| f.get()) == Some(point) {
         return Err(AuthError::Io(std::io::Error::other(point)));
@@ -788,6 +855,7 @@ impl RegistryWriter<'_> {
     }
 
     /// Publishes the complete tmp the store has already matched to canonical.
+    #[cfg(unix)]
     pub(crate) fn publish_temporary(&mut self) -> Result<(), AuthError> {
         let (body, file) = self.temporary.take().ok_or(AuthError::RecoveryRequired)?;
         file.sync_all()?;
@@ -798,6 +866,7 @@ impl RegistryWriter<'_> {
 
     /// Creates a new tmp, journals its inode before any byte, then writes the
     /// body built for that journal revision, syncs and publishes it.
+    #[cfg(unix)]
     pub(crate) fn replace(
         &mut self,
         build: impl FnOnce(u64) -> Result<Vec<u8>, AuthError>,
@@ -822,13 +891,13 @@ impl RegistryWriter<'_> {
             self.directory.publish_journal(&self.journal, false)?;
         }
         crate::protection::merge_account_identities(&self.journal.protected_identities())?;
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         fault("registry_tmp_created")?;
         let body = build(self.journal.revision)?;
         if body.len() as u64 > MAX_REGISTRY_BODY_BYTES {
             return Err(AuthError::Protection);
         }
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if REGISTRY_FAULT.with(|f| f.get()) == Some("registry_tmp_partial") {
             file.write_all(&body[..body.len() / 2])?;
             file.sync_all()?;
@@ -836,13 +905,14 @@ impl RegistryWriter<'_> {
         }
         file.write_all(&body)?;
         file.sync_all()?;
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         fault("registry_tmp_synced")?;
         self.rename_registry_tmp(&file)?;
         self.canonical = Some(body);
         Ok(())
     }
 
+    #[cfg(unix)]
     fn rename_registry_tmp(&self, file: &File) -> Result<(), AuthError> {
         self._owner.verify(&self.directory.directory)?;
         self.directory.check_directory()?;
@@ -866,6 +936,7 @@ impl RegistryWriter<'_> {
     }
 }
 
+#[cfg(unix)]
 fn rename_fixed(directory: &File, from: &str, to: &str) -> Result<(), AuthError> {
     let old = component(from)?;
     let new = component(to)?;
@@ -886,6 +957,7 @@ fn rename_fixed(directory: &File, from: &str, to: &str) -> Result<(), AuthError>
 
 /// Hold the accounts owner lock through a non-secret reader copy.  An absent
 /// directory uses the old path only if it is still absent after the callback.
+#[cfg(unix)]
 pub(crate) fn with_reader_protection<R>(
     home: &Path,
     callback: impl FnOnce(&crate::protection::ProtectedPathsSnapshot) -> R,
@@ -908,7 +980,168 @@ pub(crate) fn with_reader_protection<R>(
     crate::protection::with_account_identities(&journal.protected_identities(), callback)
 }
 
+// Windows must not acquire a lease or create state without a native owner.
+#[cfg(not(unix))]
+impl AccountDirectory {
+    pub fn open() -> Result<Self, AuthError> {
+        Err(AuthError::Protection)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(_home: &Path) -> Result<Self, AuthError> {
+        Err(AuthError::Protection)
+    }
+
+    pub(crate) fn registry_writer(&self) -> Result<RegistryWriter<'_>, AuthError> {
+        Err(AuthError::Protection)
+    }
+
+    pub(crate) fn try_slot_lease(&self, _index: usize) -> Result<Option<SlotLease>, AuthError> {
+        Err(AuthError::Protection)
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_registry_read_only(_home: &Path) -> Result<Option<Vec<u8>>, AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(not(unix))]
+impl RegistryWriter<'_> {
+    pub(crate) fn publish_temporary(&mut self) -> Result<(), AuthError> {
+        Err(AuthError::Protection)
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        _build: impl FnOnce(u64) -> Result<Vec<u8>, AuthError>,
+    ) -> Result<(), AuthError> {
+        Err(AuthError::Protection)
+    }
+}
+
 #[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn journal_validation_preserves_revision_and_identity_contract() {
+        let mut journal = Journal::initial();
+        assert!(journal.validate().is_ok());
+        assert!(journal.can_prepare_tmp());
+        let identity = ProtectedIdentity { dev: 1, ino: 2 };
+        assert!(journal.insert(identity).unwrap());
+        assert!(!journal.insert(identity).unwrap());
+        assert!(journal.contains(identity));
+        assert_eq!(journal.protected_identities(), BTreeSet::from([identity]));
+        assert!(matches!(
+            journal.validate(),
+            Err(AuthError::RecoveryRequired)
+        ));
+        journal.previous_revision = 1;
+        journal.revision = 2;
+        assert!(journal.validate().is_ok());
+        journal.revision = 3;
+        assert!(matches!(
+            journal.validate(),
+            Err(AuthError::RecoveryRequired)
+        ));
+        journal.revision = 2;
+        journal.identities.push(journal.identities[0]);
+        assert!(matches!(
+            journal.validate(),
+            Err(AuthError::RecoveryRequired)
+        ));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_auth_unavailable_accounts_directory_preserves_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let account_path = root.path().join(".polaris").join("accounts");
+        std::fs::create_dir_all(&account_path).unwrap();
+        let names = [
+            "registry.json",
+            "registry.json.tmp",
+            "protected-inodes.json",
+            "owner.lock",
+        ];
+        for name in names {
+            std::fs::write(account_path.join(name), b"existing fixture").unwrap();
+        }
+        let missing = root.path().join("missing");
+        assert!(matches!(
+            AccountDirectory::open(),
+            Err(AuthError::Protection)
+        ));
+        for home in [root.path(), missing.as_path()] {
+            assert!(matches!(
+                AccountDirectory::open_for_test(home),
+                Err(AuthError::Protection)
+            ));
+            assert!(matches!(
+                read_registry_read_only(home),
+                Err(AuthError::Protection)
+            ));
+        }
+        for name in names {
+            assert_eq!(
+                std::fs::read(account_path.join(name)).unwrap(),
+                b"existing fixture"
+            );
+        }
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn windows_auth_unavailable_accounts_writer_never_invokes_builder() {
+        // Private synthetic state exercises refusal even if a caller holds a
+        // typed value. No native directory, lock or writer can be opened.
+        let directory = AccountDirectory {
+            home_path: PathBuf::from("fixture"),
+        };
+        assert_eq!(
+            directory.path(),
+            Path::new("fixture").join(".polaris/accounts")
+        );
+        assert!(matches!(
+            directory.registry_writer(),
+            Err(AuthError::Protection)
+        ));
+        assert!(matches!(
+            directory.try_slot_lease(0),
+            Err(AuthError::Protection)
+        ));
+        assert!(matches!(
+            directory.try_slot_lease(usize::MAX),
+            Err(AuthError::Protection)
+        ));
+        let mut writer = RegistryWriter {
+            _directory: &directory,
+            _owner: OwnerLock { _private: () },
+            journal: Journal::initial(),
+            canonical: Some(b"original fixture".to_vec()),
+            temporary: None,
+        };
+        assert!(matches!(
+            writer.replace(|_| panic!("builder called")),
+            Err(AuthError::Protection)
+        ));
+        assert!(matches!(
+            writer.publish_temporary(),
+            Err(AuthError::Protection)
+        ));
+        assert_eq!(writer.canonical(), Some(b"original fixture".as_slice()));
+        assert_eq!(writer.temporary(), None);
+        assert_eq!(writer.protection_revision(), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

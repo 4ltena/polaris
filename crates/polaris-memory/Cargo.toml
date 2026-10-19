@@ -15,3 +15,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+polaris-auth = { path = "../polaris-auth" }

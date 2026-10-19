@@ -333,5 +333,5 @@ impl std::fmt::Debug for BoundTokenSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

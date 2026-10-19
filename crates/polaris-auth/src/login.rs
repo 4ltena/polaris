@@ -12,9 +12,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::{
-    AuthError, CALLBACK_PORT, CLIENT_ID, Credentials, REDIRECT_URI, SCOPE, pkce, store, token,
-};
+#[cfg(not(windows))]
+use crate::{pkce, store, token};
+
+use crate::{AuthError, CALLBACK_PORT, CLIENT_ID, Credentials, REDIRECT_URI, SCOPE};
 
 /// Builds the authorization URL to open in the browser.
 pub fn authorize_url(challenge: &str, state: &str) -> String {
@@ -196,6 +197,7 @@ pub async fn wait_for_callback(
 }
 
 /// Opens the browser. Not opening isn't fatal. Prints the URL and continues.
+#[cfg(not(windows))]
 fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let program = "open";
@@ -208,6 +210,7 @@ fn open_browser(url: &str) {
 /// The full login sequence. Binds before opening the browser. In the
 /// reverse order, by the time the user finishes authorizing, we might not
 /// yet be listening, and miss the callback.
+#[cfg(not(windows))]
 pub async fn run(issuer: &str, store_path: &Path) -> Result<Credentials, AuthError> {
     let p = pkce::generate()?;
     let state = pkce::random_urlsafe(16)?;
@@ -223,9 +226,32 @@ pub async fn run(issuer: &str, store_path: &Path) -> Result<Credentials, AuthErr
     Ok(creds)
 }
 
+/// Windows credential storage is unavailable; refuse before login side effects.
+#[cfg(windows)]
+pub async fn run(_issuer: &str, _store_path: &Path) -> Result<Credentials, AuthError> {
+    Err(AuthError::Protection)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_auth_login_unavailable_before_callback_or_browser() {
+        for (issuer, store_path) in [
+            ("", Path::new("missing-relative-store")),
+            (
+                "invalid-issuer",
+                Path::new("C:/polaris-missing-fixture/credentials.json"),
+            ),
+        ] {
+            let result = tokio::time::timeout(Duration::from_millis(100), run(issuer, store_path))
+                .await
+                .expect("Windows login must refuse immediately");
+            assert!(matches!(result, Err(AuthError::Protection)));
+        }
+    }
 
     #[test]
     fn the_authorize_url_carries_every_parameter_the_flow_needs() {

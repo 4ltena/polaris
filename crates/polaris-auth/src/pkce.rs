@@ -1,8 +1,7 @@
 //! PKCE (RFC 7636) verifier and challenge.
 //!
-//! Randomness is read directly from `/dev/urandom`. polaris already assumes
-//! Unix (checking `st_nlink`, 0600 permissions), so there's no reason to add
-//! a dependency just for randomness.
+//! Windows uses the operating system RNG through ring. Other platforms
+//! retain direct `/dev/urandom` reads.
 
 use crate::AuthError;
 
@@ -14,12 +13,26 @@ pub struct Pkce {
 }
 
 /// Turns randomness read from `/dev/urandom` into base64url (no padding).
+#[cfg(not(windows))]
 pub fn random_urlsafe(bytes: usize) -> Result<String, AuthError> {
     use base64::Engine;
     use std::io::Read;
 
     let mut buf = vec![0u8; bytes];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf))
+}
+
+/// Encodes cryptographic OS randomness as unpadded base64url.
+#[cfg(windows)]
+pub fn random_urlsafe(bytes: usize) -> Result<String, AuthError> {
+    use base64::Engine;
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let mut buf = vec![0u8; bytes];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| std::io::Error::other("OS randomness unavailable"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf))
 }
 

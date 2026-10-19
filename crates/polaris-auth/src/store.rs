@@ -2,22 +2,31 @@
 //!
 //! Never reads `~/.codex/auth.json`. Never copies it either.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::{AuthError, Credentials};
 
 /// The default storage location. `~/.polaris/auth.json`.
+#[cfg(unix)]
 pub fn default_path() -> Result<PathBuf, AuthError> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| AuthError::Io(std::io::Error::other("HOME is not set")))?;
     Ok(Path::new(&home).join(".polaris").join("auth.json"))
 }
 
+/// A native private-storage owner is required before resolving a default path.
+#[cfg(not(unix))]
+pub fn default_path() -> Result<PathBuf, AuthError> {
+    Err(AuthError::Protection)
+}
+
 /// Saves. Creates the temp file newly at 0600 (when reopening an existing
 /// tmp, tightens it with set_permissions), writes, then renames. rename is
 /// atomic within the same directory, so even if we crash partway through,
 /// the real file never gets replaced with half-written content.
+#[cfg(unix)]
 pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
     use std::io::Write;
 
@@ -52,6 +61,7 @@ pub fn save_to(path: &Path, c: &Credentials) -> Result<(), AuthError> {
 }
 
 /// Reads. Nonexistence is not a failure. Corruption is.
+#[cfg(unix)]
 pub fn load_from(path: &Path) -> Result<Option<Credentials>, AuthError> {
     let mut protection = crate::protection::lock()?;
     let path = protection.register_store(path)?;
@@ -68,6 +78,7 @@ pub fn load_from(path: &Path) -> Result<Option<Credentials>, AuthError> {
 }
 
 /// Deletes. The return value is whether the file actually existed.
+#[cfg(unix)]
 pub fn delete_at(path: &Path) -> Result<bool, AuthError> {
     let mut protection = crate::protection::lock()?;
     let path = protection.register_store(path)?;
@@ -89,6 +100,7 @@ pub struct CredentialIdentity {
     changed_nanoseconds: i64,
 }
 
+#[cfg(unix)]
 fn identity(file: &std::fs::File) -> Result<CredentialIdentity, AuthError> {
     use std::os::unix::fs::MetadataExt;
     let data = file.metadata()?;
@@ -101,6 +113,7 @@ fn identity(file: &std::fs::File) -> Result<CredentialIdentity, AuthError> {
     })
 }
 
+#[cfg(unix)]
 pub fn credential_identity(path: &Path) -> Result<Option<CredentialIdentity>, AuthError> {
     let mut protection = crate::protection::lock()?;
     let path = protection.register_store(path)?;
@@ -116,6 +129,7 @@ pub fn credential_identity(path: &Path) -> Result<Option<CredentialIdentity>, Au
 
 /// Reject a refresh/replacement since confirmation. Cooperating writers use
 /// this same lock. A successful removal is durable before returning.
+#[cfg(unix)]
 pub fn delete_exact(path: &Path, expected: &CredentialIdentity) -> Result<(), AuthError> {
     let mut protection = crate::protection::lock()?;
     let path = protection.register_store(path)?;
@@ -129,7 +143,82 @@ pub fn delete_exact(path: &Path, expected: &CredentialIdentity) -> Result<(), Au
     Ok(())
 }
 
-#[cfg(test)]
+// Do not inspect paths or credential bytes without a native private-storage owner.
+#[cfg(not(unix))]
+pub fn save_to(_path: &Path, _c: &Credentials) -> Result<(), AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(not(unix))]
+pub fn load_from(_path: &Path) -> Result<Option<Credentials>, AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(not(unix))]
+pub fn delete_at(_path: &Path) -> Result<bool, AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(not(unix))]
+pub fn credential_identity(_path: &Path) -> Result<Option<CredentialIdentity>, AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(not(unix))]
+pub fn delete_exact(_path: &Path, _expected: &CredentialIdentity) -> Result<(), AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_auth_unavailable_store_preserves_files_and_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("auth.json");
+        let temporary = existing.with_extension("json.tmp");
+        std::fs::write(&existing, b"existing fixture").unwrap();
+        std::fs::write(&temporary, b"interrupted fixture").unwrap();
+        let missing = dir.path().join("missing").join("auth.json");
+        let credentials = Credentials {
+            access_token: "dummy-access".into(),
+            refresh_token: "dummy-refresh".into(),
+            account_id: "dummy-account".into(),
+            expires_at: None,
+        };
+        let identity = CredentialIdentity {
+            device: 1,
+            inode: 2,
+            bytes: 3,
+            changed_seconds: 4,
+            changed_nanoseconds: 5,
+        };
+
+        assert!(matches!(default_path(), Err(AuthError::Protection)));
+        for path in [&existing, &missing] {
+            assert!(matches!(
+                save_to(path, &credentials),
+                Err(AuthError::Protection)
+            ));
+            assert!(matches!(load_from(path), Err(AuthError::Protection)));
+            assert!(matches!(delete_at(path), Err(AuthError::Protection)));
+            assert!(matches!(
+                credential_identity(path),
+                Err(AuthError::Protection)
+            ));
+            assert!(matches!(
+                delete_exact(path, &identity),
+                Err(AuthError::Protection)
+            ));
+        }
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing fixture");
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"interrupted fixture");
+        assert!(!missing.parent().unwrap().exists());
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

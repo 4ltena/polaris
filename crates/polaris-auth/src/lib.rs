@@ -13,6 +13,7 @@
 
 pub mod accounts;
 pub mod api_key;
+pub mod git_credentials;
 pub mod login;
 pub mod pkce;
 pub mod protection;
@@ -228,6 +229,29 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_auth_storage_unavailable_before_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        let original = serde_json::to_vec(&creds(Some(0))).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        for policy in [RefreshPolicy::Allow, RefreshPolicy::ReadOnly] {
+            // A malformed issuer cannot reach a service even if the storage
+            // gate regresses; the result must be Protection, never Http.
+            assert!(matches!(
+                ensure_fresh_with_policy("invalid fixture issuer", &path, policy).await,
+                Err(AuthError::Protection)
+            ));
+            assert!(matches!(
+                force_refresh_with_policy("invalid fixture issuer", &path, policy).await,
+                Err(AuthError::Protection)
+            ));
+        }
+        assert!(matches!(logout(&path), Err(AuthError::Protection)));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
     /// Refresh every time when the expiry is unknown. Reusing it
     /// optimistically would make a 401 from an expired token the normal
     /// path, making an auth problem look like a model problem.
@@ -344,6 +368,7 @@ mod tests {
         assert_eq!(effort_for_plan_type(None), None);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn ensure_fresh_on_an_empty_store_says_not_logged_in() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -359,6 +384,7 @@ mod tests {
     /// A token with margin to spare is returned as-is, without touching the
     /// network. We pass an unreachable URL as the issuer, so trying to
     /// refresh would fail.
+    #[cfg(unix)]
     #[tokio::test]
     async fn ensure_fresh_returns_a_valid_token_without_touching_the_network() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -381,6 +407,7 @@ mod tests {
     /// and fails" rather than "returns as-is." If `ensure_fresh`'s guard
     /// leaked in here, this failure would silently become a "returns
     /// without refreshing" success.
+    #[cfg(unix)]
     #[tokio::test]
     async fn force_refresh_attempts_the_network_even_when_the_token_is_fresh() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -400,6 +427,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     async fn assert_no_token_request(server: &wiremock::MockServer) {
         assert!(
             server
@@ -411,6 +439,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn readonly_ensure_fresh_rejects_an_unknown_expiry_before_refreshing_or_saving() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -435,6 +464,7 @@ mod tests {
         assert_eq!(store::load_from(&p).expect("load"), Some(original));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn readonly_ensure_fresh_rejects_the_expiry_margin_before_refreshing_or_saving() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -460,6 +490,7 @@ mod tests {
         assert_eq!(store::load_from(&p).expect("load"), Some(original));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn readonly_ensure_fresh_returns_a_fresh_credential_without_a_refresh() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -480,6 +511,7 @@ mod tests {
         assert_no_token_request(&s).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn readonly_force_refresh_stops_before_token_post_or_store_save() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -506,6 +538,7 @@ mod tests {
 
     /// A fake server whose `/oauth/token` just returns `body`. Never hits
     /// the real API.
+    #[cfg(unix)]
     async fn token_server_returning(body: serde_json::Value) -> wiremock::MockServer {
         use wiremock::matchers::{method, path};
         let s = wiremock::MockServer::start().await;
@@ -518,6 +551,7 @@ mod tests {
     }
 
     /// Writes expired credentials and returns their storage path.
+    #[cfg(unix)]
     fn store_with_expired_credentials(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("auth.json");
         let now = std::time::SystemTime::now()
@@ -542,6 +576,7 @@ mod tests {
     /// against a fake server the refresh succeeds and the new access_token
     /// gets written back to disk. Until now this path only ever ran against
     /// an unreachable issuer, and always went through the failure side only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn ensure_fresh_keeps_the_old_account_id_when_the_response_omits_the_id_token() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -579,6 +614,7 @@ mod tests {
     /// counterpart to the case above. With only one of the two, an
     /// implementation that "always returns the existing value" would pass,
     /// missing an account switch.
+    #[cfg(unix)]
     #[tokio::test]
     async fn ensure_fresh_adopts_a_rotated_account_id() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -608,6 +644,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn logout_removes_the_store_and_reports_it() {
         let dir = tempfile::tempdir().expect("temp dir");

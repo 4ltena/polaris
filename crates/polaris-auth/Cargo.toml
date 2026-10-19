@@ -14,9 +14,19 @@ thiserror = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
+ring = "=0.17.14"
 base64 = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "=3.7.0", features = ["OSX_10_15"] }
+security-framework-sys = { version = "=2.17.0", features = ["OSX_10_15"] }
+core-foundation = "=0.10.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

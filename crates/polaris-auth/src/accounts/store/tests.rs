@@ -1,8 +1,11 @@
 //! Synthetic credentials and temporary homes only.
 use super::*;
+#[cfg(unix)]
 use crate::accounts::directory::REGISTRY_FAULT;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(unix)]
 fn home() -> (tempfile::TempDir, std::path::PathBuf) {
     let home = tempfile::tempdir().unwrap();
     std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -19,6 +22,7 @@ fn credentials(account: &str) -> Credentials {
     }
 }
 
+#[cfg(unix)]
 fn register(store: &AccountStore, label: &str, account: &str) -> Reservation {
     let reservation = store.begin_registration(Some(label.into())).unwrap();
     store.mark_exchange_pending(&reservation).unwrap();
@@ -28,6 +32,7 @@ fn register(store: &AccountStore, label: &str, account: &str) -> Reservation {
     reservation
 }
 
+#[cfg(unix)]
 fn with_fault<T>(point: &'static str, run: impl FnOnce() -> T) -> T {
     REGISTRY_FAULT.with(|f| f.set(Some(point)));
     let value = run();
@@ -35,6 +40,7 @@ fn with_fault<T>(point: &'static str, run: impl FnOnce() -> T) -> T {
     value
 }
 
+#[cfg(unix)]
 fn account(snapshot: &AccountSnapshot, id: &str) -> AccountSummary {
     snapshot
         .accounts
@@ -44,6 +50,7 @@ fn account(snapshot: &AccountSnapshot, id: &str) -> AccountSummary {
         .clone()
 }
 
+#[cfg(unix)]
 #[test]
 fn labels_logout_and_slot_reuse_never_move_a_credential_identity() {
     let (_temp, home) = home();
@@ -100,6 +107,7 @@ fn labels_logout_and_slot_reuse_never_move_a_credential_identity() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_cancelled_or_logged_out_attempt_cannot_save_a_late_result() {
     let (_temp, home) = home();
@@ -129,6 +137,7 @@ fn a_cancelled_or_logged_out_attempt_cannot_save_a_late_result() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn full_registry_duplicate_or_empty_accounts_change_nothing() {
     let (_temp, home) = home();
@@ -158,6 +167,7 @@ fn full_registry_duplicate_or_empty_accounts_change_nothing() {
     assert_eq!(store.snapshot().unwrap(), before);
 }
 
+#[cfg(unix)]
 #[test]
 fn reauthentication_restores_before_post_and_invalidates_after_it() {
     let (_temp, home) = home();
@@ -216,6 +226,7 @@ fn reauthentication_restores_before_post_and_invalidates_after_it() {
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_complete_tmp_is_published_and_any_other_tmp_waits_for_recovery() {
     let (_temp, home) = home();
@@ -250,6 +261,7 @@ fn a_complete_tmp_is_published_and_any_other_tmp_waits_for_recovery() {
     assert_eq!(std::fs::read(&registry).unwrap(), canonical);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_complete_tmp_for_another_revision_or_attempt_is_not_published() {
     let (_temp, home) = home();
@@ -295,6 +307,7 @@ fn a_complete_tmp_for_another_revision_or_attempt_is_not_published() {
     assert!(matches!(store.snapshot(), Err(AuthError::RecoveryRequired)));
 }
 
+#[cfg(unix)]
 #[test]
 fn read_only_snapshots_create_nothing_and_refuse_unresolved_tmp() {
     let (_temp, home) = home();
@@ -321,6 +334,7 @@ fn read_only_snapshots_create_nothing_and_refuse_unresolved_tmp() {
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn the_single_auth_file_is_never_read_or_changed() {
     let (_temp, home) = home();
@@ -379,4 +393,28 @@ fn generation_and_revision_overflow_are_refused() {
     // Credentials never appear in Debug output.
     let debug = format!("{:?}", StoredCredentials::from(credentials("acct-a")));
     assert!(!debug.contains("synthetic"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_auth_unavailable_accounts_store_open_and_snapshot_refuse() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    assert!(matches!(
+        AccountStore::open(),
+        Err(AuthError::Protection | AuthError::ReadOnly | AuthError::InvalidReadOnlyMode)
+    ));
+    assert!(matches!(
+        AccountStore::open_at(&missing),
+        Err(AuthError::Protection)
+    ));
+    assert!(matches!(
+        AccountStore::read_only_at(&missing),
+        Err(AuthError::Protection)
+    ));
+    assert!(matches!(
+        AccountStore::read_only_snapshot(),
+        Err(AuthError::Protection)
+    ));
+    assert!(!missing.exists());
 }

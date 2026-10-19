@@ -2,17 +2,20 @@
 //! Completely independent of `Credentials`/`auth.json` — the codex OAuth
 //! store is never read or written by this module, and vice versa.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::AuthError;
 
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Stored {
     key: String,
 }
 
 /// The default storage location. `~/.polaris/api_key.json`.
+#[cfg(unix)]
 pub fn default_path() -> Result<PathBuf, AuthError> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| AuthError::Io(std::io::Error::other("HOME is not set")))?;
@@ -22,6 +25,7 @@ pub fn default_path() -> Result<PathBuf, AuthError> {
 /// Saves. Same atomic tmp+rename, 0600-both-ways pattern as
 /// `store::save_to` — see that function's comments for why both the
 /// open-time mode and the post-write `set_permissions` call are needed.
+#[cfg(unix)]
 pub fn save_to(path: &Path, key: &str) -> Result<(), AuthError> {
     use std::io::Write;
 
@@ -52,6 +56,7 @@ pub fn save_to(path: &Path, key: &str) -> Result<(), AuthError> {
 }
 
 /// Reads. Nonexistence is not a failure. Corruption is.
+#[cfg(unix)]
 pub fn load_from(path: &Path) -> Result<Option<String>, AuthError> {
     let mut protection = crate::protection::lock()?;
     let path = protection.register_store(path)?;
@@ -67,7 +72,50 @@ pub fn load_from(path: &Path) -> Result<Option<String>, AuthError> {
     Ok(Some(stored.key))
 }
 
-#[cfg(test)]
+// Do not resolve a home or touch a store without a native private-storage owner.
+#[cfg(not(unix))]
+pub fn default_path() -> Result<PathBuf, AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(not(unix))]
+pub fn save_to(_path: &Path, _key: &str) -> Result<(), AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(not(unix))]
+pub fn load_from(_path: &Path) -> Result<Option<String>, AuthError> {
+    Err(AuthError::Protection)
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_auth_unavailable_api_key_preserves_files_and_missing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("api_key.json");
+        let temporary = existing.with_extension("json.tmp");
+        std::fs::write(&existing, b"existing fixture").unwrap();
+        std::fs::write(&temporary, b"interrupted fixture").unwrap();
+        let missing = dir.path().join("missing").join("api_key.json");
+
+        assert!(matches!(default_path(), Err(AuthError::Protection)));
+        for path in [&existing, &missing] {
+            assert!(matches!(
+                save_to(path, "dummy-key"),
+                Err(AuthError::Protection)
+            ));
+            assert!(matches!(load_from(path), Err(AuthError::Protection)));
+        }
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing fixture");
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"interrupted fixture");
+        assert!(!missing.parent().unwrap().exists());
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

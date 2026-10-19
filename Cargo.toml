@@ -32,6 +32,14 @@ jsonschema = { version = "0.51", default-features = false }
 similar = "2"
 unicode-width = "0.2"
 zeroize = "1.9"
+windows-sys = { version = "=0.61.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
 
 # Native debug apps verify large local models and packaged helper bytes before Hello.
 # Keep the complete SHA-256 checks fast without changing the application debug profile.

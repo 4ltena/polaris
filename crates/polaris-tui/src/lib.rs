@@ -7758,6 +7758,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         #[cfg(target_os = "linux")]
         let mut cleanup_failure = control_cleanup_error.clone();
         let turn_completed = matches!(&outcome, TurnOutcome::Done(Ok(_)));
+        #[cfg(unix)]
+        let turn_interrupted = matches!(&outcome, TurnOutcome::Interrupted);
         #[cfg(target_os = "linux")]
         let turn_completed = linux_turn_completed_without_shutdown(
             turn_completed,
@@ -7880,10 +7882,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     ),
                 }
             } else {
-                persistence.abandon_rewind_boundary(
-                    &boundary.boundary_id,
-                    "ターンまたはsubagentが正常終了していません".into(),
-                )
+                let reason = if turn_interrupted && rewind_writers_stopped {
+                    "中断したターンは巻き戻し対象外です（保存境界が未完了）"
+                } else {
+                    "ターンまたはsubagentが正常終了していません"
+                };
+                persistence.abandon_rewind_boundary(&boundary.boundary_id, reason.into())
             };
             match completion {
                 Ok(saved) => {
@@ -8087,12 +8091,13 @@ fn run_rewind_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
     reader: &mut R,
     rows: &[render::RewindPickerRow],
+    unavailable_reason: &str,
 ) -> Option<String> {
     let now = now_millis();
     if rows.is_empty() {
-        let _ = terminal
-            .borrow_mut()
-            .draw(|f| render::render_rewind_picker(f, rows, 0, now));
+        let _ = terminal.borrow_mut().draw(|f| {
+            render::render_rewind_picker_with_reason(f, rows, 0, now, unavailable_reason)
+        });
         let _ = reader.read_key();
         return None;
     }
@@ -8100,7 +8105,9 @@ fn run_rewind_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     loop {
         if terminal
             .borrow_mut()
-            .draw(|f| render::render_rewind_picker(f, rows, selected, now))
+            .draw(|f| {
+                render::render_rewind_picker_with_reason(f, rows, selected, now, unavailable_reason)
+            })
             .is_err()
         {
             return None;
@@ -9704,12 +9711,12 @@ fn select_rewind_boundary<B: ratatui::backend::Backend, R: approver::KeyReader>(
         })
         .collect::<Vec<_>>();
     if rows.is_empty() {
-        run_rewind_picker(terminal, reader, &rows);
+        run_rewind_picker(terminal, reader, &rows, unavailable_reason);
         return Err(format!(
             "検証済みの巻き戻し境界がありません: {unavailable_reason}"
         ));
     }
-    let Some(selected_id) = run_rewind_picker(terminal, reader, &rows) else {
+    let Some(selected_id) = run_rewind_picker(terminal, reader, &rows, unavailable_reason) else {
         return Ok(None);
     };
     let selected = boundaries

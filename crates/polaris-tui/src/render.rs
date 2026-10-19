@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// What the bottom-of-screen status line shows while a turn is in flight,
@@ -1516,6 +1516,16 @@ pub fn render_rewind_picker(
     selected: usize,
     now_millis: u128,
 ) {
+    render_rewind_picker_with_reason(frame, rows, selected, now_millis, "");
+}
+
+pub(crate) fn render_rewind_picker_with_reason(
+    frame: &mut Frame,
+    rows: &[RewindPickerRow],
+    selected: usize,
+    now_millis: u128,
+    unavailable_reason: &str,
+) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = vec![
         Line::from(Span::styled(
@@ -1529,6 +1539,9 @@ pub fn render_rewind_picker(
             "no complete, reversible checkpoint is available",
             dim,
         )));
+        if !unavailable_reason.is_empty() {
+            lines.push(Line::from(sanitize(unavailable_reason)));
+        }
     }
     for (index, row) in rows.iter().enumerate() {
         let marker = if index == selected { "\u{276f} " } else { "  " };
@@ -1546,13 +1559,21 @@ pub fn render_rewind_picker(
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "enter to preview file and context changes \u{b7} esc to cancel",
+        if rows.is_empty() {
+            "any key to close"
+        } else {
+            "enter to preview file and context changes \u{b7} esc to cancel"
+        },
         dim,
     )));
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris")),
-        frame.area(),
-    );
+    let paragraph =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("polaris"));
+    let paragraph = if rows.is_empty() {
+        paragraph.wrap(Wrap { trim: false })
+    } else {
+        paragraph
+    };
+    frame.render_widget(paragraph, frame.area());
 }
 
 pub struct RewindPreviewView {
@@ -2987,6 +3008,30 @@ mod tests {
         assert!(content.contains("first line second line"));
         assert!(content.contains("enter to preview"));
         assert!(content.contains("esc to cancel"));
+    }
+
+    #[test]
+    fn empty_rewind_picker_explains_the_reason_at_narrow_and_wide_widths() {
+        let reason = "中断したターンは巻き戻し対象外です（保存境界が未完了）\ncontrol\x1b[31m";
+        for width in [42, 100] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            terminal
+                .draw(|frame| render_rewind_picker_with_reason(frame, &[], 0, 0, reason))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let content = (1..buffer.area.height - 1)
+                .flat_map(|y| (1..buffer.area.width - 1).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            let compact = content.split_whitespace().collect::<String>();
+            assert!(
+                compact.contains("中断したターンは巻き戻し対象外です（保存境界が未完了）"),
+                "width={width}: {content:?}"
+            );
+            assert!(compact.contains("control�[31m"), "{content:?}");
+            assert!(content.contains("any key to close"));
+            assert!(!content.contains("enter to preview"));
+            assert!(!content.contains('\x1b'));
+        }
     }
 
     #[test]

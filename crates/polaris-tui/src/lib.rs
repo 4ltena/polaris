@@ -804,7 +804,9 @@ pub async fn restore_prepared_continuation_for_managed_override(
 }
 
 struct ContinuationWorkflowPublication {
+    #[cfg(target_os = "linux")]
     before: polaris_core::conversation_state::ConversationSnapshot,
+    #[cfg(target_os = "linux")]
     published: polaris_core::conversation_state::ConversationSnapshot,
 }
 
@@ -890,8 +892,12 @@ async fn restore_prepared_continuation_inner(
             .persistence
             .publish_workflow_change(before_workflow.state.generation, &before_hash, candidate)
             .map_err(|error| format!("workflow設定を保存できません: {error}"))?;
+        #[cfg(not(target_os = "linux"))]
+        drop(published);
         Some(ContinuationWorkflowPublication {
+            #[cfg(target_os = "linux")]
             before: before_workflow,
+            #[cfg(target_os = "linux")]
             published,
         })
     } else {
@@ -2336,6 +2342,29 @@ fn is_secret_command(text: &str) -> bool {
             .is_some_and(|word| word.eq_ignore_ascii_case("secret"))
 }
 
+fn refuse_secret_submission(text: &mut String, local_owner_available: bool) -> bool {
+    if !is_secret_command(text) {
+        return false;
+    }
+    // Inspect borrowed words only; forbidden inline values must not be copied.
+    let mut words = text.split_whitespace();
+    let supported = text.starts_with('/')
+        && words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("/mcp"))
+        && words.next() == Some("secret")
+        && match words.next() {
+            Some("set") => words.next().is_none(),
+            Some("delete") => words.next().is_some() && words.next().is_none(),
+            _ => false,
+        };
+    if local_owner_available && supported {
+        return false;
+    }
+    text.zeroize();
+    true
+}
+
 // A secret command can also be completed around text already in the composer
 // (for example by moving the cursor to the start). Check the complete buffer
 // before any draw, not only the next character typed after the command.
@@ -2422,7 +2451,7 @@ fn record_submission(
     text: &str,
     dispatching_queued_input: bool,
 ) {
-    if !dispatching_queued_input {
+    if !dispatching_queued_input && !is_secret_command(text) {
         input_history.record(text);
     }
 }
@@ -2432,8 +2461,7 @@ fn record_submission(
 fn refuse_quit_with_pending_work(
     queued_inputs: &VecDeque<String>,
     input_history: &mut input::History,
-    input_buffer: &mut String,
-    input_cursor: &mut usize,
+    (input_buffer, input_cursor): (&mut String, &mut usize),
     saved_draft: Option<(String, usize)>,
     submitted_command: &str,
     dispatching_queued_input: bool,
@@ -2661,16 +2689,15 @@ impl AgentActivityRows {
         };
         let name = name.chars().take(256).collect::<String>();
         let detail = detail.chars().take(256).collect::<String>();
-        if matches!(event, polaris_core::AgentEvent::ToolFinished { .. }) {
-            if let Some(row) = self
+        if matches!(event, polaris_core::AgentEvent::ToolFinished { .. })
+            && let Some(row) = self
                 .tools
                 .iter_mut()
                 .rev()
                 .find(|(n, d, s)| n == &name && d == &detail && *s == "開始を観測・完了未確認")
-            {
-                row.2 = state;
-                return;
-            }
+        {
+            row.2 = state;
+            return;
         }
         if self.tools.len() == 128 {
             self.tools.pop_front();
@@ -3637,7 +3664,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     let mut draft_candidate = String::new();
     #[cfg(unix)]
     let mut draft_saved_text = String::new();
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let mut draft_changed_at = Instant::now();
     let mut next_max_turns = args.max_turns;
     #[cfg(unix)]
@@ -3763,7 +3790,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             input_history = input::History::new();
                             draft_saved_text = input_buffer.clone();
                             draft_candidate = input_buffer.clone();
-                            draft_changed_at = Instant::now();
+                            #[cfg(target_os = "linux")]
+                            {
+                                draft_changed_at = Instant::now();
+                            }
                         }
                     }
                     Err(error) => {
@@ -4211,8 +4241,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     match perform_rewind(
                         &session,
                         &boundary,
-                        &expected_post,
-                        &target_pre,
+                        (&expected_post, &target_pre),
                         owner,
                         &management_effects,
                         &args,
@@ -4394,18 +4423,29 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &request,
                                 &terminal,
                                 &mut key_reader,
-                                rewind_workspace.as_ref().expect("startup owner"),
-                                &management_effects,
+                                (
+                                    rewind_workspace.as_ref().expect("startup owner"),
+                                    &management_effects,
+                                ),
                                 &args.cwd,
-                                args.mcp_external,
+                                (args.mcp_external, approval_policy),
                                 has_pending_inputs,
-                            );
+                            )
+                            .await;
                             match result {
                                 Ok(lines) => {
                                     local_lines.extend(lines);
                                     if matches!(
                                         request.split_whitespace().next(),
-                                        Some("enable" | "disable")
+                                        Some(
+                                            "enable"
+                                                | "disable"
+                                                | "check"
+                                                | "setup"
+                                                | "register"
+                                                | "materialize"
+                                                | "secret"
+                                        )
                                     ) {
                                         pending_mcp_prompt = None;
                                         mcp_prompt_requires_reselect = false;
@@ -5165,8 +5205,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     if refuse_quit_with_pending_work(
                                         &queued_inputs,
                                         &mut input_history,
-                                        &mut input_buffer,
-                                        &mut input_cursor,
+                                        (&mut input_buffer, &mut input_cursor),
                                         draft_after_queued_dispatch.take(),
                                         &pending_input,
                                         dispatching_queued_input,
@@ -5327,11 +5366,18 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         last_submission_was_local = text.trim_start().starts_with('/');
                     }
                     exit_confirmation.cancel();
-                    if is_secret_command(&text) {
-                        text.zeroize();
-                        status = Status::Error(
-                            "このTUIでは秘密情報の設定をまだ受け付けていません".into(),
-                        );
+                    let local_secret_owner_available = {
+                        #[cfg(unix)]
+                        {
+                            active_instruction.is_none()
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            false
+                        }
+                    };
+                    if refuse_secret_submission(&mut text, local_secret_owner_available) {
+                        status = Status::Error("秘密情報を通常の入力や送信待ちに渡せません".into());
                         continue;
                     }
                     if !dispatching_queued_input && submission_resumes_queued_inputs(&text) {
@@ -5452,18 +5498,29 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &request,
                         &terminal,
                         &mut key_reader,
-                        rewind_workspace.as_ref().expect("startup owner"),
-                        &management_effects,
+                        (
+                            rewind_workspace.as_ref().expect("startup owner"),
+                            &management_effects,
+                        ),
                         &args.cwd,
-                        args.mcp_external,
+                        (args.mcp_external, approval_policy),
                         has_pending_inputs,
-                    );
+                    )
+                    .await;
                     match result {
                         Ok(lines) => {
                             local_lines.extend(lines);
                             if matches!(
                                 request.split_whitespace().next(),
-                                Some("enable" | "disable")
+                                Some(
+                                    "enable"
+                                        | "disable"
+                                        | "check"
+                                        | "setup"
+                                        | "register"
+                                        | "materialize"
+                                        | "secret"
+                                )
                             ) {
                                 pending_mcp_prompt = None;
                                 mcp_prompt_requires_reselect = false;
@@ -6224,8 +6281,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             if refuse_quit_with_pending_work(
                                 &queued_inputs,
                                 &mut input_history,
-                                &mut input_buffer,
-                                &mut input_cursor,
+                                (&mut input_buffer, &mut input_cursor),
                                 None,
                                 &typed,
                                 dispatching_queued_input,
@@ -10000,8 +10056,10 @@ fn commit_rewind_if_unblocked(
 async fn perform_rewind(
     source: &polaris_core::session::Session,
     boundary: &polaris_core::conversation_state::RewindBoundaryV1,
-    expected_post: &polaris_core::rewind_workspace::ManifestId,
-    target_pre: &polaris_core::rewind_workspace::ManifestId,
+    (expected_post, target_pre): (
+        &polaris_core::rewind_workspace::ManifestId,
+        &polaris_core::rewind_workspace::ManifestId,
+    ),
     owner: &polaris_core::rewind_workspace::WorkspaceOwner,
     effects: &polaris_core::management_effect::ManagementEffectStoreV1,
     args: &RunArgs<'_>,
@@ -10608,7 +10666,7 @@ async fn handle_resume<B: ratatui::backend::Backend, R: approver::KeyReader>(
 /// file) without touching the one being left — unlike the old
 /// single-session-per-project model, it stays on disk and shows up in a
 /// later `/resume`.
-#[cfg(any(test, not(target_os = "linux")))]
+#[cfg(any(test, not(unix)))]
 fn handle_new_session(
     sessions_dir: &std::path::Path,
     session: &mut polaris_core::session::Session,
@@ -10716,7 +10774,7 @@ fn handle_new_session_with(
 /// only starts existing on disk lazily at the first new message) — a
 /// fork with no messages yet added since forking would otherwise vanish
 /// from `/resume`'s list, which defeats the point of forking one.
-#[cfg(any(test, not(target_os = "linux")))]
+#[cfg(any(test, not(unix)))]
 fn handle_fork(
     sessions_dir: &std::path::Path,
     cwd_display: &str,
@@ -11936,7 +11994,7 @@ fn account_list_lines() -> Result<Vec<ratatui::text::Line<'static>>, String> {
         lines.push(ratatui::text::Line::from(render::sanitize(&format!(
             "  {}  {state}  {}  {usage}",
             account.registration_id,
-            label.escape_debug().to_string()
+            label.escape_debug()
         ))));
     }
     Ok(lines)
@@ -13927,7 +13985,7 @@ mod tests {
         const MARKER: &str = "POLARIS_TUI_MCP_PROMPT_CHILD";
         if let Some(value) = std::env::var_os(MARKER) {
             assert!(
-                value == std::ffi::OsString::from(exact_test_name),
+                value == exact_test_name,
                 "unexpected MCP prompt child marker"
             );
             return false;
@@ -14760,8 +14818,7 @@ mod tests {
         assert!(refuse_quit_with_pending_work(
             &queued,
             &mut input_history,
-            &mut input,
-            &mut cursor,
+            (&mut input, &mut cursor),
             Some(("draft work".to_string(), 5)),
             "/quit",
             true,
@@ -14784,8 +14841,7 @@ mod tests {
         assert!(refuse_quit_with_pending_work(
             &queued,
             &mut input_history,
-            &mut input,
-            &mut cursor,
+            (&mut input, &mut cursor),
             None,
             "/quit",
             false,
@@ -14806,8 +14862,7 @@ mod tests {
         assert!(refuse_quit_with_pending_work(
             &queued,
             &mut input_history,
-            &mut input,
-            &mut cursor,
+            (&mut input, &mut cursor),
             None,
             "/quit",
             true,
@@ -14821,8 +14876,7 @@ mod tests {
         assert!(!refuse_quit_with_pending_work(
             &queued,
             &mut input_history,
-            &mut input,
-            &mut cursor,
+            (&mut input, &mut cursor),
             None,
             "/quit",
             false,
@@ -14868,8 +14922,7 @@ mod tests {
         assert!(refuse_quit_with_pending_work(
             &queued,
             &mut input_history,
-            &mut input_buffer,
-            &mut input_cursor,
+            (&mut input_buffer, &mut input_cursor),
             None,
             &submitted,
             false,
@@ -14909,8 +14962,7 @@ mod tests {
         assert!(refuse_quit_with_pending_work(
             &queued,
             &mut input_history,
-            &mut input_buffer,
-            &mut input_cursor,
+            (&mut input_buffer, &mut input_cursor),
             None,
             &submitted,
             false,
@@ -15131,6 +15183,32 @@ mod tests {
         assert_eq!(history.older(""), Some("/model"));
         assert_eq!(history.older(""), Some("next prompt"));
         assert_eq!(history.older(""), None);
+    }
+
+    #[test]
+    fn dedicated_secret_operations_dispatch_locally_without_entering_history() {
+        let mut history = input::History::new();
+        history.record("ordinary prompt");
+        for command in ["/mcp secret set", "/MCP secret delete synthetic-reference"] {
+            let mut text = command.to_owned();
+            assert!(!refuse_secret_submission(&mut text, true));
+            assert!(matches!(slash::parse(&text), Some(slash::Action::Mcp(_))));
+            record_submission_before_dispatch(&mut history, &text, false);
+        }
+        assert_eq!(history.older(""), Some("ordinary prompt"));
+        assert_eq!(history.older(""), None);
+        for command in [
+            "/mcp secret set synthetic-inline-value",
+            "/mcp secret delete reference extra",
+            "/mcp secret unknown synthetic-inline-value",
+        ] {
+            let mut text = command.to_owned();
+            assert!(refuse_secret_submission(&mut text, true));
+            assert!(text.is_empty());
+        }
+        let mut text = "/mcp secret set".to_owned();
+        assert!(refuse_secret_submission(&mut text, false));
+        assert!(text.is_empty());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+//! Windows desktop store directory, locking and generation persistence tests.
 use super::*;
 use polaris_auth::protection::{WindowsPinnedDirectory, WindowsPrivateRoot};
 use std::{

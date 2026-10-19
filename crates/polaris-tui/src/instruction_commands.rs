@@ -303,7 +303,7 @@ pub fn preflight(
     if snapshot.state.session_id != instruction.parent_session.as_str() {
         return Err("指示を別の会話へ適用できません".into());
     }
-    let admission = require_handle(manager, &instruction)?;
+    let admission = require_handle(manager, instruction)?;
     if !matches!(admission.state, AdmissionState::Reserved) {
         return Err("この指示は適用済みか復旧が必要です。再送しません".into());
     }

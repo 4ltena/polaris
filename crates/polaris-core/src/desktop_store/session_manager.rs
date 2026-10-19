@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 pub(super) mod family;
 #[path = "session_manager_generation.rs"]
 mod generation;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "session_manager_migration.rs"]
 pub(super) mod migration;
 #[cfg(all(test, windows))]

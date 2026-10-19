@@ -3,15 +3,13 @@
 //! production stop proof, external intent or entry-gate admission.
 use super::{
     CredentialLedgerEventV1, CredentialLedgerRecordV1, CredentialLedgerSnapshotV1, LedgerEpochV1,
-    MAX_LEDGER_BYTES, MAX_LEDGER_RECORD_BYTES, digest,
+    MAX_LEDGER_BYTES, MAX_LEDGER_RECORD_BYTES,
+    payload_head::{LedgerHeadV1, MAX_HEAD_BYTES, bytes_hash, empty_payload_head},
 };
 use crate::{
     Error,
     entry_gate::{EntryAnchorV2, child, owned_directory, physical_directory, private_file},
-    registration::bounded_json,
 };
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     ffi::CStr,
@@ -31,64 +29,11 @@ const EPOCH: &str = "epoch.json";
 const HISTORY: &str = "history.jsonl";
 const HEAD: &str = "head.json";
 const HEAD_TEMP: &str = "head.pending";
-// Includes the largest canonical numeric fields and both 64-byte hashes.
-const MAX_HEAD_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LedgerOpenModeV1 {
     ReadOnly,
     Mutating,
-}
-
-/// The initial head deliberately contains no epoch-file hash: it is created
-/// before final epoch bytes and belongs to the activation payload projection.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LedgerHeadV1 {
-    schema_version: u32,
-    ledger_epoch_id: String,
-    sequence: u64,
-    last_record_hash: Option<String>,
-    history_bytes: u64,
-    history_hash: String,
-}
-impl LedgerHeadV1 {
-    fn empty(epoch_id: &str) -> Result<Self, Error> {
-        if !digest(epoch_id) {
-            return Err(Error::Protocol);
-        }
-        Ok(Self {
-            schema_version: 1,
-            ledger_epoch_id: epoch_id.to_owned(),
-            sequence: 0,
-            last_record_hash: None,
-            history_bytes: 0,
-            history_hash: bytes_hash(&[]),
-        })
-    }
-    fn current(snapshot: &CredentialLedgerSnapshotV1, history: &[u8]) -> Self {
-        Self {
-            schema_version: 1,
-            ledger_epoch_id: snapshot.epoch.random_epoch_id.clone(),
-            sequence: snapshot.sequence,
-            last_record_hash: (snapshot.sequence != 0).then(|| snapshot.head_hash.clone()),
-            history_bytes: history.len() as u64,
-            history_hash: bytes_hash(history),
-        }
-    }
-    fn encode(&self) -> Result<Vec<u8>, Error> {
-        bounded_json(self, MAX_HEAD_BYTES)
-    }
-    fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.is_empty() || bytes.len() > MAX_HEAD_BYTES {
-            return Err(Error::Limit);
-        }
-        let head: Self = serde_json::from_slice(bytes).map_err(|_| Error::Protocol)?;
-        if head.encode()? != bytes {
-            return Err(Error::Protocol);
-        }
-        Ok(head)
-    }
 }
 
 struct DirectoryPin {
@@ -518,12 +463,6 @@ pub(crate) fn prepare_empty_payload(staging_root: &File, epoch_id: &str) -> Resu
     inventory(&ledger, &[HISTORY, HEAD])
 }
 
-/// Pure pre-epoch payload bytes; this grants no filesystem write or migration
-/// capability. The physical owner must independently validate and fsync them.
-pub fn empty_payload_head(epoch_id: &str) -> Result<Vec<u8>, Error> {
-    LedgerHeadV1::empty(epoch_id)?.encode()
-}
-
 fn decode_payload(
     epoch: &[u8],
     history: &[u8],
@@ -542,9 +481,6 @@ fn decode_payload(
         return Err(Error::RecoveryRequired);
     }
     Ok(snapshot)
-}
-fn bytes_hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 fn same_directory(a: &EntryAnchorV2, b: &EntryAnchorV2) -> bool {
     // Directory link counts differ by platform and can change when an external

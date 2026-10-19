@@ -521,14 +521,10 @@ mod tests {
         let parent = disk::OwnerControlledContainer::open_migration(temp.path()).unwrap();
         (temp, store, parent)
     }
-    fn snapshot(
-        path: &std::path::Path,
-    ) -> Vec<(String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64))> {
-        fn visit(
-            root: &std::path::Path,
-            path: &std::path::Path,
-            out: &mut Vec<(String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64))>,
-        ) {
+    type SnapshotEntry = (String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64));
+
+    fn snapshot(path: &std::path::Path) -> Vec<SnapshotEntry> {
+        fn visit(root: &std::path::Path, path: &std::path::Path, out: &mut Vec<SnapshotEntry>) {
             for entry in fs::read_dir(path).unwrap() {
                 let path = entry.unwrap().path();
                 let m = path.symlink_metadata().unwrap();

@@ -1,3 +1,4 @@
+//! Windows management-effect journal lifecycle, replay and storage refusal tests.
 use super::*;
 
 fn native_fixture(

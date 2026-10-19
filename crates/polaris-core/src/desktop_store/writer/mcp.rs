@@ -93,6 +93,7 @@ struct Envelope {
 }
 
 /// Decode persisted local evidence without recreating an execution grant.
+#[cfg(test)]
 pub(in crate::desktop_store) fn inspect_local_terminal(
     messages: &[Message],
     result: &Message,

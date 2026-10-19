@@ -1,7 +1,10 @@
 //! Non-secret, whole-chain evidence for the per-user MCP credential ledger.
 //! Parsing is read-only. Missing roots and incomplete tails are never empty ledgers.
 
+// Physical ledger I/O stays disconnected until migration authority is admitted.
+#[cfg(test)]
 pub(crate) mod file_store;
+pub(crate) mod payload_head;
 
 use super::documents_v2::{
     DocumentKindV2, DocumentMetadataV2, DocumentPresenceV2, DocumentReceiptV2,

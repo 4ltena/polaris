@@ -7,14 +7,29 @@ use std::cell::RefCell;
 use polaris_core::approval::{Approver, Decision};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use zeroize::Zeroizing;
 
 use crate::render::render_approval_modal;
+
+/// Pasted text stays in a zeroizing owner until the dedicated input consumes it.
+pub enum SecretInputEvent {
+    Key(KeyCode),
+    Paste(Zeroizing<String>),
+}
 
 /// Abstracts "block until the next key comes in" so `TuiApprover` can be
 /// tested without a real terminal.
 pub trait KeyReader {
     fn read_key(&mut self) -> std::io::Result<KeyCode>;
+
+    fn read_secret_key(&mut self) -> std::io::Result<KeyCode> {
+        self.read_key()
+    }
+
+    fn read_secret_input(&mut self) -> std::io::Result<SecretInputEvent> {
+        self.read_secret_key().map(SecretInputEvent::Key)
+    }
 }
 
 /// The real, blocking reader used outside tests.
@@ -29,6 +44,48 @@ impl KeyReader for CrosstermKeyReader {
                 return Ok(k.code);
             }
         }
+    }
+
+    fn read_secret_key(&mut self) -> std::io::Result<KeyCode> {
+        loop {
+            if let ratatui::crossterm::event::Event::Key(key) = ratatui::crossterm::event::read()?
+                && let Some(code) = secret_key_code(key)
+            {
+                return Ok(code);
+            }
+        }
+    }
+
+    fn read_secret_input(&mut self) -> std::io::Result<SecretInputEvent> {
+        loop {
+            if let Some(input) = secret_input_event(ratatui::crossterm::event::read()?) {
+                return Ok(input);
+            }
+        }
+    }
+}
+
+fn secret_input_event(event: ratatui::crossterm::event::Event) -> Option<SecretInputEvent> {
+    match event {
+        ratatui::crossterm::event::Event::Key(key) => {
+            secret_key_code(key).map(SecretInputEvent::Key)
+        }
+        ratatui::crossterm::event::Event::Paste(text) => {
+            Some(SecretInputEvent::Paste(Zeroizing::new(text)))
+        }
+        _ => None,
+    }
+}
+
+fn secret_key_code(key: KeyEvent) -> Option<KeyCode> {
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        Some(KeyCode::Esc)
+    } else {
+        Some(key.code)
     }
 }
 
@@ -82,6 +139,37 @@ mod tests {
         fn read_key(&mut self) -> std::io::Result<KeyCode> {
             Ok(self.0.pop_front().unwrap_or(KeyCode::Null))
         }
+    }
+
+    #[test]
+    fn secret_input_ctrl_c_cancels_without_changing_an_ordinary_c() {
+        assert_eq!(
+            secret_key_code(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(KeyCode::Esc)
+        );
+        assert_eq!(
+            secret_key_code(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Some(KeyCode::Char('c'))
+        );
+        let mut release = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(secret_key_code(release), None);
+    }
+
+    #[test]
+    fn secret_paste_is_owned_by_a_zeroizing_event() {
+        let event = ratatui::crossterm::event::Event::Paste("synthetic-paste".to_owned());
+        let Some(SecretInputEvent::Paste(value)) = secret_input_event(event) else {
+            panic!("paste must reach the dedicated input");
+        };
+        assert_eq!(value.as_str(), "synthetic-paste");
+        assert!(matches!(
+            secret_input_event(ratatui::crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))),
+            Some(SecretInputEvent::Key(KeyCode::Esc))
+        ));
     }
 
     #[test]

@@ -1,5 +1,11 @@
 //! Migration coordinator storage ownership and fresh-boundary regression tests.
-use super::super::{entry_gate::GATE_FILE, test_fixture::GuardFixture};
+use super::super::{
+    account_home::with_fixture_home,
+    entry_gate::{
+        GATE_FILE, ProductionBinaryIdentityV2, ProductionEntryIdentityV2, ProductionEntryKindV2,
+    },
+    test_fixture::GuardFixture,
+};
 use super::*;
 use crate::conversation_state::{ConversationStateV2, ConversationStore};
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
@@ -33,6 +39,37 @@ fn fixture_at_default(default: bool) -> (GuardFixture, PathBuf, ConversationStor
     (fixture, data, session)
 }
 #[test]
+fn coordinator_begin_rejects_missing_source_before_entry_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    directory(&home);
+    let parent = home.join(".polaris");
+    directory(&parent);
+    let binary = root.path().join("polaris");
+    fs::write(&binary, b"synthetic executable identity\n").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o500)).unwrap();
+    let manifest = ProductionEntryManifestV2 {
+        protocol_version: 2,
+        entries: vec![ProductionEntryIdentityV2 {
+            kind: ProductionEntryKindV2::Cli,
+            binary: ProductionBinaryIdentityV2::inspect(&binary).unwrap(),
+        }],
+        runtime_copy_source_hashes: vec![],
+    };
+    manifest.canonical_hash().unwrap();
+    with_fixture_home(&home, || {
+        let trusted = Arc::new(TrustedUserHomeV2::inspect().unwrap());
+        assert!(matches!(
+            MigrationAdmissionV2::begin(trusted, &"a".repeat(64), manifest, &[], &[]),
+            Err(Error::Protection)
+        ));
+    });
+    // A missing source must fail before creating the migrating gate or intent.
+    assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+}
+#[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn coordinator_default_data_root_allows_sibling_writes_but_closes_local_membership() {
     let (fixture, data, session) = fixture_at_default(true);
     let home = fixture.guard.verified_binding().unwrap().0.to_owned();
@@ -41,7 +78,7 @@ fn coordinator_default_data_root_allows_sibling_writes_but_closes_local_membersh
     let admission = MigrationAdmissionV2::assemble(
         source,
         fixture.guard,
-        TransportRootDiscoveryV2::inspect(&[data.clone()], &[]).unwrap(),
+        TransportRootDiscoveryV2::inspect(std::slice::from_ref(&data), &[]).unwrap(),
     )
     .unwrap();
     // Only this test's disposable siblings; durability/intent decoding is not
@@ -59,6 +96,7 @@ fn coordinator_default_data_root_allows_sibling_writes_but_closes_local_membersh
     drop(owner);
 }
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn coordinator_retains_storage_and_entry_exclusion_through_fresh_checks() {
     let (fixture, data, session) = fixture();
     let home = fixture.guard.verified_binding().unwrap().0.to_owned();
@@ -96,6 +134,7 @@ fn coordinator_retains_storage_and_entry_exclusion_through_fresh_checks() {
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn coordinator_closes_storage_change_during_native_stop_recheck() {
     let (fixture, data, session) = fixture();
     let home = fixture.guard.verified_binding().unwrap().0.to_owned();
@@ -104,7 +143,7 @@ fn coordinator_closes_storage_change_during_native_stop_recheck() {
     let admission = MigrationAdmissionV2::assemble(
         source,
         fixture.guard,
-        TransportRootDiscoveryV2::inspect(&[data.clone()], &[]).unwrap(),
+        TransportRootDiscoveryV2::inspect(std::slice::from_ref(&data), &[]).unwrap(),
     )
     .unwrap();
     let reached = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -125,6 +164,7 @@ fn coordinator_closes_storage_change_during_native_stop_recheck() {
     drop(owner);
 }
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn coordinator_closes_project_discovery_change_during_native_stop_recheck() {
     let (fixture, data, session) = fixture();
     directory(&data.join("state"));
@@ -132,7 +172,7 @@ fn coordinator_closes_project_discovery_change_during_native_stop_recheck() {
     let home = fixture.guard.verified_binding().unwrap().0.to_owned();
     let source = SourcePreflightV2::inspect(&home).unwrap();
     let owner = fixture._root;
-    let discovery = TransportRootDiscoveryV2::inspect(&[data.clone()], &[]).unwrap();
+    let discovery = TransportRootDiscoveryV2::inspect(std::slice::from_ref(&data), &[]).unwrap();
     let admission = MigrationAdmissionV2::assemble(source, fixture.guard, discovery).unwrap();
     let reached = std::rc::Rc::new(std::cell::Cell::new(false));
     let hit = reached.clone();
@@ -153,6 +193,7 @@ fn coordinator_closes_project_discovery_change_during_native_stop_recheck() {
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn coordinator_closes_source_and_gate_change_after_native_stop_recheck() {
     for source_changed in [true, false] {
         let (fixture, data, session) = fixture();
@@ -190,6 +231,7 @@ fn coordinator_closes_source_and_gate_change_after_native_stop_recheck() {
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn coordinator_closes_legacy_body_change_after_fresh_native_stop() {
     let (fixture, data, session) = fixture();
     let home = fixture.guard.verified_binding().unwrap().0.to_owned();
@@ -224,6 +266,7 @@ fn coordinator_closes_legacy_body_change_after_fresh_native_stop() {
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn coordinator_closes_management_body_change_after_fresh_native_stop() {
     use crate::{management_effect::*, project_mutation::ProjectMutationOwnerV1};
     use std::{os::unix::fs::MetadataExt, str::FromStr};

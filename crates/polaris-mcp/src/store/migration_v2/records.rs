@@ -1542,8 +1542,11 @@ fn pin_storage(_: io::Error) -> Error {
     Error::Storage
 }
 #[cfg(test)]
+type PinReadHook = Box<dyn FnMut(&File)>;
+
+#[cfg(test)]
 std::thread_local! {
-    static AFTER_PIN_READ: std::cell::RefCell<Option<Box<dyn FnMut(&File)>>> =
+    static AFTER_PIN_READ: std::cell::RefCell<Option<PinReadHook>> =
         const { std::cell::RefCell::new(None) };
 }
 

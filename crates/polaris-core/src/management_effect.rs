@@ -11,7 +11,7 @@ pub mod mcp_change;
 #[cfg(unix)]
 pub mod memory_change;
 mod store;
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) use store::generation::{
     ManagementMigrationAnchorV2, ManagementMigrationAnchorsV2, ManagementMigrationTreeV2,
 };
@@ -438,9 +438,12 @@ pub struct VerifiedManagementEffectEventV1 {
 
 macro_rules! typed_effect {
     ($name:ident) => {
+        typed_effect!($name, VerifiedManagementEffectEventV1);
+    };
+    ($name:ident, $event:ty) => {
         #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct $name {
-            verified_event: VerifiedManagementEffectEventV1,
+            verified_event: $event,
             request: PrepareManagementEffectV1,
             generation: u64,
             chain_hash: ManagementEffectHashV1,
@@ -471,7 +474,10 @@ macro_rules! typed_effect {
     };
 }
 
-typed_effect!(PreparedManagementEffectV1);
+typed_effect!(
+    PreparedManagementEffectV1,
+    Box<VerifiedManagementEffectEventV1>
+);
 typed_effect!(StartedManagementEffectV1);
 typed_effect!(UnknownManagementEffectV1);
 typed_effect!(CompletedManagementEffectV1);

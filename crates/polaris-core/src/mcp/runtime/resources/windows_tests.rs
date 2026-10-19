@@ -1,3 +1,4 @@
+//! Windows MCP resource and metadata refusal tests that preserve registered state.
 use super::*;
 use crate::mcp::operation::ExternalCeiling;
 use std::marker::PhantomData;

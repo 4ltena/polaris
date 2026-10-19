@@ -1,3 +1,4 @@
+//! Windows conversation storage, publication, locking and refusal regression tests.
 use super::*;
 use std::cell::Cell;
 

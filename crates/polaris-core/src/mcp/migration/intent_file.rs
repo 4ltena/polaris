@@ -375,9 +375,14 @@ fn exchange(parent: &File, left: &str, right: &str) -> Result<(), Error> {
     Ok(())
 }
 #[cfg(test)]
-thread_local! { static BEFORE_EXCHANGE: std::cell::RefCell<Option<Box<dyn FnOnce() -> Result<(), Error>>>> = const { std::cell::RefCell::new(None) }; }
+type BeforeExchangeHook = Box<dyn FnOnce() -> Result<(), Error>>;
 #[cfg(test)]
-thread_local! { pub(super) static MOUNT_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce(&File, &File) -> Result<(), Error>>>> = const { std::cell::RefCell::new(None) }; }
+type MountCheckHook = Box<dyn FnOnce(&File, &File) -> Result<(), Error>>;
+
+#[cfg(test)]
+thread_local! { static BEFORE_EXCHANGE: std::cell::RefCell<Option<BeforeExchangeHook>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { pub(super) static MOUNT_CHECK: std::cell::RefCell<Option<MountCheckHook>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
 #[path = "intent_file/tests.rs"]
 mod tests;

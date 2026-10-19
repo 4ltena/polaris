@@ -370,7 +370,7 @@ impl WorkflowArtifactStore {
 }
 
 /// Passive migration validation; no object creation or execution authority.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(in crate::desktop_store) fn validate_migration_object(
     name: &str,
     bytes: &[u8],

@@ -4,9 +4,9 @@
 mod recipe;
 pub use recipe::WorkspacePreparationRecipe;
 
-use crate::{
-    ConfirmedSourceGrant, CurrentSourcePolicy, ServiceError, TrustedRunFactory, TrustedRunInputs,
-};
+#[cfg(test)]
+use crate::CurrentSourcePolicy;
+use crate::{ConfirmedSourceGrant, ServiceError, TrustedRunFactory, TrustedRunInputs};
 use polaris_core::{
     audit::AuditLog,
     desktop_execution::{SandboxMode, SandboxPolicy},
@@ -831,7 +831,7 @@ impl TrustedRunFactory for ConfiguredRunFactory {
             }
             BootstrapTier::ReadCreateBuild | BootstrapTier::ReadCreateBuildExternal => {
                 polaris_core::desktop_execution::ConfirmedExecutionCapability::ConfinedCode {
-                    scope: staged.prepared.policy().clone(),
+                    scope: Box::new(staged.prepared.policy().clone()),
                 }
             }
         });

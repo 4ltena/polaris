@@ -172,7 +172,9 @@ pub(super) fn no_intent_record(id: Operation) -> C08StoredRecordV1 {
         evidence_hash: zero_hash().unwrap(),
     };
     evidence.evidence_hash = evidence.computed_hash().unwrap();
-    let stored = C08StoredRecordV1::NoIntentAbandon { evidence };
+    let stored = C08StoredRecordV1::NoIntentAbandon {
+        evidence: Box::new(evidence),
+    };
     stored.canonical_bytes().unwrap();
     stored
 }

@@ -169,10 +169,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `setting.rs` — The bundled setting commands from the terminal. Real directories and a
 - `subcommands.rs` — Pins down that subcommands are actually reachable.
 - `sync.rs` — Two local devices exchanging through a bare repository; no network.
+- `windows_execution.rs` — Windows refusal is tested at the real product entry before input or state I/O.
+- `windows_sync_apply.rs` — Real product entry; all input and state live under disposable fixtures.
 
 ## `crates/polaris-cli/tests/support`
 
 - `product_binary.rs` — Holds a private executable package for real CLI integration-test children.
+- `windows_fixture.rs` — Capture recursive fixture contents for Windows CLI preservation assertions.
 
 ## `crates/polaris-core`
 
@@ -255,6 +258,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `tool_memory.rs` — Opt-in recoverable tool-result retention; original output lives outside history.
 - `translation.rs` — Offline-only adapter for the pinned CAT-Translate 3.3B helper.
 - `turn_intent.rs` — What one user turn is, along several axes at once.
+- `windows_fs.rs` — Windows filesystem primitives remain private until owner integration.
 - `workflow.rs` — Explicit workflow focus, independent of tool permissions and completion evidence.
 - `workflow_artifact_store.rs` — Private immutable bodies for the durable workflow artifact graph.
 - `workspace_apply.rs` — Unix file-only apply-back with retained originals and a durable intent journal.
@@ -332,6 +336,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/conversation_state`
 
 - `structured_attempt.rs` — Durable structured-summary receipts owned by the existing conversation lock.
+- `windows_store_tests.rs` — Windows conversation storage, publication, locking and refusal regression tests.
 
 ## `crates/polaris-core/src/decision_bands`
 
@@ -389,6 +394,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/desktop_store/bootstrap`
 
 - `tests.rs` — Owner bootstrap metadata, identity, configuration and provider validation tests.
+
+## `crates/polaris-core/src/desktop_store/disk`
+
+- `windows_tests.rs` — Windows desktop store directory, locking and generation persistence tests.
 
 ## `crates/polaris-core/src/desktop_store/goal`
 
@@ -573,6 +582,11 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `tests.rs` — Memory-change effect tests for durable mutation and recovery.
 
+## `crates/polaris-core/src/management_effect/store`
+
+- `windows_backend.rs` — Qualified Windows I/O for the existing management journal algorithms.
+- `windows_tests.rs` — Windows management-effect journal lifecycle, replay and storage refusal tests.
+
 ## `crates/polaris-core/src/management_effect/v2`
 
 - `reducer.rs` — V2 lifecycle replay. The store supplies durable ledger proofs; this module
@@ -674,6 +688,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/mcp/runtime/resources`
 
 - `tests.rs` — Registered cwd admission, absent secrets, native confinement and scratch lifetime.
+- `windows_tests.rs` — Windows MCP resource and metadata refusal tests that preserve registered state.
 
 ## `crates/polaris-core/src/mcp/runtime/tests`
 
@@ -687,10 +702,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/mcp/setup`
 
+- `data_tests.rs` — MCP setup proposal hashing, authentication and credential data validation tests.
 - `launcher.rs` — What a launcher command is actually asking for.
+- `materialise_tests.rs` — Prepared package downloads bind the approval card before any fetch begins.
 - `register.rs` — Approved proposals: the approval text, its payload binding and the save order.
 - `tests.rs` — Host detection from Codex and Claude configs, with secrets bound by HMAC.
 - `tool.rs` — Root-run `mcp_setup`. Arguments carry an operation and a candidate ID only;
+- `windows_tests.rs` — Windows MCP setup refusal tests that preserve storage and avoid approval requests.
 
 ## `crates/polaris-core/src/mcp/setup/launcher`
 
@@ -717,6 +735,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/preselection_corpus`
 
 - `tests.rs` — The corpus is data the comparison depends on, so its shape is checked
+
+## `crates/polaris-core/src/project_mutation`
+
+- `windows_tests.rs` — Windows project mutation lease identity, exclusion and storage refusal tests.
 
 ## `crates/polaris-core/src/recipe`
 
@@ -751,6 +773,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/recipe/tool`
 
 - `tests.rs` — Real directories and a real ledger. Nothing is installed and no command
+- `windows_tests.rs` — Windows recipe setting refusal tests that preserve project state and avoid approval requests.
 
 ## `crates/polaris-core/src/request_input`
 
@@ -763,6 +786,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/scratch_registry`
 
 - `tests.rs` — Temporary directories only; the registry path is process-wide, so these
+- `windows_tests.rs` — Windows scratch registry refusal tests that preserve installed records and copies.
 
 ## `crates/polaris-core/src/secret_screen`
 
@@ -772,6 +796,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `owner.rs` — Preview and commit session settings through the management-effect owner.
 - `tests.rs` — Session-settings persistence, denial and recovery regression tests.
+
+## `crates/polaris-core/src/session_store`
+
+- `windows_tests.rs` — Windows session persistence, lifecycle and unsupported storage refusal tests.
 
 ## `crates/polaris-core/src/similarity`
 
@@ -811,15 +839,20 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/sync/composite`
 
 - `tests.rs` — Composite sync read ownership, intent history and recovery regression tests.
+- `windows_tests.rs` — Windows composite sync admission and namespace refusal tests that preserve state.
 
 ## `crates/polaris-core/src/sync/credential_rebind`
 
+- `data_tests.rs` — Pure C08 DTO fixtures: no credential owner, live executable or project lease.
 - `store_v1.rs` — Strict descriptor-relative storage for C08 history and no-intent evidence.
 - `tests.rs` — Disposable C08 owner tests. No HOME override, Keychain query or Git process.
+- `windows_tests.rs` — Windows credential rebind owner acquisition refusal and project preservation tests.
 
 ## `crates/polaris-core/src/sync/credential_rebind/store_v1`
 
+- `data_tests.rs` — Pure filename, capacity and inventory data checks; no store or lease is opened.
 - `tests.rs` — Credential rebind store ownership, archive and persistence regression tests.
+- `windows_tests.rs` — Windows credential rebind intent inspection refusal and storage preservation tests.
 
 ## `crates/polaris-core/src/sync/exchange`
 
@@ -828,9 +861,11 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/sync/owner`
 
 - `store_v2.rs` — C10 bounded descriptor-relative store. Inspection and reservation write nothing.
+- `windows_tests.rs` — Windows sync remote intent owner refusal and storage preservation tests.
 
 ## `crates/polaris-core/src/sync/owner/store_v2`
 
+- `data_tests.rs` — Pure C10 store data checks; no owner, reservation or project lease is acquired.
 - `tests.rs` — C10 owner store v2 identity, persistence and recovery regression tests.
 
 ## `crates/polaris-core/src/sync/participation`
@@ -845,8 +880,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/sync/push/owner_v1`
 
+- `data_tests.rs` — Sync push request, history, identity binding and spawn error data tests.
 - `recovery.rs` — Explicit recovery never resumes a send or reconstructs a confirm token.
 - `tests.rs` — Owner-only regression fixtures.  Every subprocess is an owned wrapper or
+- `windows_tests.rs` — Windows sync push factory refusal tests that preserve state and avoid host callbacks.
 
 ## `crates/polaris-core/src/sync/push/transport`
 
@@ -868,6 +905,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/sync/repository/c10`
 
 - `tests.rs` — Owned filesystem/Git fixtures only. Never contact Keychain or a remote.
+- `windows_tests.rs` — Windows C10 repository refusal tests that preserve project and state contents.
 
 ## `crates/polaris-core/src/sync/share`
 
@@ -897,14 +935,23 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `store.rs` — Private immutable verification records.
 - `tests.rs` — Regression tests for verification selection, execution, evidence, and convergence.
 
+## `crates/polaris-core/src/verification/store`
+
+- `windows_tests.rs` — Windows verification store refusal tests that preserve roots and existing records.
+
 ## `crates/polaris-core/src/workflow`
 
 - `artifacts.rs` — Versioned workflow artifacts. Bodies are immutable; stores publish only
 - `context.rs` — Pure, bounded projection of the currently active workflow task.
 - `evidence.rs` — Deterministic evidence and convergence records for durable workflow gates.
 
+## `crates/polaris-core/src/workflow_artifact_store`
+
+- `windows_tests.rs` — Windows workflow artifact store refusal tests that preserve roots and stored bodies.
+
 ## `crates/polaris-core/src/workspace_apply`
 
+- `report.rs` — Shared apply-report format; filesystem ownership stays in the native owner.
 - `tests.rs` — Conflict-safe apply-back, durable recovery artifacts, and failure injection tests.
 
 ## `crates/polaris-core/tests`
@@ -1124,6 +1171,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-mcp/src/store/ledger_v1`
 
 - `file_store.rs` — Descriptor-bound durable ledger payload. This layer checks a caller-supplied
+- `payload_head.rs` — Pure canonical head bytes shared by migration observations and ledger tests.
 - `tests.rs` — Ledger epoch, baseline and operation-record validation tests.
 
 ## `crates/polaris-mcp/src/store/ledger_v1/file_store`
@@ -1198,6 +1246,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `lib.rs` — Local, explicitly populated memory. Retrieved text is quoted historical evidence,
 - `management.rs` — Bounded atomic management batches, durable project revisions and receipts.
 - `structured.rs` — Version 3 structured-memory schema and host-owned domain values.
+- `windows_storage.rs` — Dedicated SQLite VFS. Filesystem callbacks never forward to a pathname VFS.
 
 ## `crates/polaris-memory/src/conversation`
 
@@ -1212,6 +1261,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `receipt_stream_tests.rs` — Receipt completeness and snapshot boundaries for an owner-driven scan.
 - `retrieval.rs` — Bounded, source-backed rows for one frozen structured-memory retrieval.
 - `sources.rs` — Frozen source authority for the core owner's raw snapshot reader.
+
+## `crates/polaris-memory/src/windows_storage`
+
+- `tests.rs` — Windows protected SQLite storage, journal, locking and publication regression tests.
 
 ## `crates/polaris-memory/tests`
 
@@ -1432,7 +1485,16 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `source_apply.rs` — Linux terminal adapter for the existing source-bound native owner.
 - `time.rs` — A tiny, dependency-free UTC timestamp formatter — just enough to
 - `tool_memory.rs` — Immutable, scoped tool output storage behind the reserved memory read path.
+- `windows_admission_tests.rs` — Windows TUI admission and slash command tests that preserve rejected work and state.
+- `windows_read_only.rs` — Provider-free Windows browsing while native mutation owners are unavailable.
 - `workspace_commands.rs` — Workspace projections remain UI-only and bound to the startup source.
+
+## `crates/polaris-tui/src/mcp_commands`
+
+- `journal.rs` — MCP management effects retain the existing irreversible rewind boundary.
+- `management_tests.rs` — End-to-end TUI coverage for the MCP management owners.
+- `operations.rs` — TUI MCP catalog and registration routes use the admitted domain owners.
+- `secret.rs` — Dedicated MCP credential editing never returns entered bytes to the composer.
 
 ## `crates/polaris-tui/src/role_commands`
 
@@ -1445,6 +1507,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-tui/src/session_commands`
 
 - `tests.rs` — TUI session settings and history controls without provider requests.
+
+## `crates/polaris-tui/src/windows_read_only`
+
+- `tests.rs` — Windows read-only TUI interaction, secret scrubbing and terminal restoration tests.
 
 ## `docs`
 

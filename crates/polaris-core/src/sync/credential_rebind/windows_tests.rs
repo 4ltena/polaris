@@ -1,3 +1,4 @@
+//! Windows credential rebind owner acquisition refusal and project preservation tests.
 use super::*;
 
 fn assert_unavailable(path: &Path) {

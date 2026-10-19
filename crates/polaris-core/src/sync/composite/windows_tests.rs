@@ -1,3 +1,4 @@
+//! Windows composite sync admission and namespace refusal tests that preserve state.
 use super::*;
 
 struct NativeFixture {

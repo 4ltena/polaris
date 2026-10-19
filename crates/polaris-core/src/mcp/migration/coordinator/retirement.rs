@@ -504,6 +504,9 @@ fn fault(_point: &'static str) -> Result<(), Error> {
     Ok(())
 }
 #[cfg(test)]
-thread_local! { static FAULT: std::cell::RefCell<Option<(&'static str, Box<dyn FnOnce() -> Result<(), Error>>)>> = const { std::cell::RefCell::new(None) }; }
+type RetirementFault = (&'static str, Box<dyn FnOnce() -> Result<(), Error>>);
+
+#[cfg(test)]
+thread_local! { static FAULT: std::cell::RefCell<Option<RetirementFault>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
 mod tests;

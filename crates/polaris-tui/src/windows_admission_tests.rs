@@ -1,3 +1,4 @@
+//! Windows TUI admission and slash command tests that preserve rejected work and state.
 use super::*;
 use polaris_core::session::Session;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

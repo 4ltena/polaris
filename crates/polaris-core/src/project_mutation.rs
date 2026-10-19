@@ -126,7 +126,7 @@ impl ProjectMutationOwnerV1 {
 
     /// Revalidate the actual held owner/EX lease and named lock for migration.
     /// Result<()> is an immediate check, never a stop or activation permit.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn verify_migration(
         &self,
         lease: &ProjectMutationLeaseV1,
@@ -276,7 +276,7 @@ pub fn open_directory_nofollow(path: &Path) -> std::io::Result<File> {
         }
         let child = unsafe { File::from_raw_fd(fd) };
         let meta = child.metadata()?;
-        if meta.dev() != entry.st_dev as u64 || meta.ino() != entry.st_ino as u64 {
+        if meta.dev() != entry.st_dev as u64 || meta.ino() != entry.st_ino {
             return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
         }
         directory = child;

@@ -65,6 +65,23 @@ fn successor(n: u8, predecessor: u8) -> ManagementEffectSnapshotV2 {
 }
 
 #[test]
+fn prepared_event_preserves_the_existing_json_bytes() {
+    let request = request(1);
+    let expected = format!(
+        "{{\"event\":\"prepared\",\"request\":{}}}",
+        serde_json::to_string(&request).unwrap()
+    );
+    let event = ManagementEffectEventV2::Prepared {
+        request: Box::new(request),
+    };
+    assert_eq!(serde_json::to_string(&event).unwrap(), expected);
+    assert_eq!(
+        serde_json::from_str::<ManagementEffectEventV2>(&expected).unwrap(),
+        event
+    );
+}
+
+#[test]
 fn current_request_binds_canonical_references_and_prepared_unarmed() {
     let valid = request(1);
     valid.validate_new(hash(1)).unwrap();
@@ -351,7 +368,7 @@ fn lifecycle_requires_reserved_and_receipt_proofs_and_retains_unknown_authorizat
         &mut effects,
         1,
         ManagementEffectEventV2::Prepared {
-            request: request(1),
+            request: Box::new(request(1)),
         },
         &good,
     )
@@ -441,7 +458,7 @@ fn unarmed_restart_zero_match_failure_preserves_prepared_and_unknown() {
             &mut effects,
             1,
             ManagementEffectEventV2::Prepared {
-                request: request(1),
+                request: Box::new(request(1)),
             },
             &good,
         )
@@ -464,7 +481,7 @@ fn unarmed_restart_zero_match_failure_preserves_prepared_and_unknown() {
             &mut effects,
             1,
             ManagementEffectEventV2::Prepared {
-                request: request(2),
+                request: Box::new(request(2)),
             },
             &good,
         )
@@ -599,7 +616,7 @@ fn global_cursor_rejects_gap_and_out_of_order_events_across_operations() {
         &mut replay,
         1,
         &ManagementEffectEventV2::Prepared {
-            request: request(1),
+            request: Box::new(request(1)),
         },
         &proofs,
     )
@@ -610,7 +627,7 @@ fn global_cursor_rejects_gap_and_out_of_order_events_across_operations() {
             &mut replay,
             3,
             &ManagementEffectEventV2::Prepared {
-                request: request(2),
+                request: Box::new(request(2)),
             },
             &proofs
         )
@@ -621,7 +638,7 @@ fn global_cursor_rejects_gap_and_out_of_order_events_across_operations() {
         &mut replay,
         2,
         &ManagementEffectEventV2::Prepared {
-            request: request(2),
+            request: Box::new(request(2)),
         },
         &proofs,
     )
@@ -659,7 +676,7 @@ fn terminal_transition_cannot_break_an_unresolved_successor_chain() {
         &mut effects,
         4,
         ManagementEffectEventV2::Prepared {
-            request: successor(2, 1).request,
+            request: Box::new(successor(2, 1).request),
         },
         &good,
     )
@@ -730,7 +747,9 @@ fn recovery_cannot_change_set_to_delete() {
         apply(
             &mut effects,
             4,
-            ManagementEffectEventV2::Prepared { request: next },
+            ManagementEffectEventV2::Prepared {
+                request: Box::new(next)
+            },
             &Proofs::default()
         )
         .is_err()

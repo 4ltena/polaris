@@ -51,13 +51,13 @@ enum Contents {
     },
     Families(FamilyTransportInspectionV2),
     Desktop(DesktopRootTransportInspectionV2),
-    Management(management::ManagementProjectObservationV2),
+    Management(Box<management::ManagementProjectObservationV2>),
 }
 enum ManagementUpdateV2 {
     Renamed(crate::management_effect::ManagementEffectHashV1),
     Tombstone,
     Stage(File),
-    Finished(crate::management_effect::ManagementMigrationTreeV2),
+    Finished(Box<crate::management_effect::ManagementMigrationTreeV2>),
 }
 impl Contents {
     fn verify_current(&self) -> StoreResult<()> {
@@ -77,10 +77,10 @@ impl TransportRootsObservationV2 {
         self.verify_current()?;
         let mut paths = Vec::new();
         for root in &self.roots {
-            if let Some(Contents::Management(owner)) = &root.contents {
-                if owner.needs_staging()? {
-                    paths.push(root.path.path.clone());
-                }
+            if let Some(Contents::Management(owner)) = &root.contents
+                && owner.needs_staging()?
+            {
+                paths.push(root.path.path.clone());
             }
         }
         self.verify_current()?;
@@ -121,16 +121,16 @@ impl TransportRootsObservationV2 {
         path: &Path,
         tree: crate::management_effect::ManagementMigrationTreeV2,
     ) -> StoreResult<Self> {
-        self.rebind_management(path, ManagementUpdateV2::Finished(tree))
+        self.rebind_management(path, ManagementUpdateV2::Finished(Box::new(tree)))
     }
     pub(crate) fn management_paths(&self) -> StoreResult<Vec<PathBuf>> {
         self.verify_current()?;
         let mut paths = Vec::new();
         for root in &self.roots {
-            if let Some(Contents::Management(owner)) = &root.contents {
-                if owner.source_target()?.is_some() {
-                    paths.push(root.path.path.clone());
-                }
+            if let Some(Contents::Management(owner)) = &root.contents
+                && owner.source_target()?.is_some()
+            {
+                paths.push(root.path.path.clone());
             }
         }
         self.verify_current()?;
@@ -143,13 +143,13 @@ impl TransportRootsObservationV2 {
         self.verify_current()?;
         let mut bindings = Vec::new();
         for root in &self.roots {
-            if let Some(Contents::Management(owner)) = &root.contents {
-                if let Some(binding) = owner.migration_binding()? {
-                    if binding.migration_id != migration_id {
-                        return Err(StoreError::RecoveryRequired);
-                    }
-                    bindings.push(binding);
+            if let Some(Contents::Management(owner)) = &root.contents
+                && let Some(binding) = owner.migration_binding()?
+            {
+                if binding.migration_id != migration_id {
+                    return Err(StoreError::RecoveryRequired);
                 }
+                bindings.push(binding);
             }
         }
         bindings.sort_by(|a, b| a.state_path.cmp(&b.state_path));
@@ -183,10 +183,10 @@ impl TransportRootsObservationV2 {
     fn rebind_management(mut self, path: &Path, update: ManagementUpdateV2) -> StoreResult<Self> {
         for root in &self.roots {
             root.path.verify_current()?;
-            if root.path.path != path {
-                if let Some(contents) = &root.contents {
-                    contents.verify_current()?;
-                }
+            if root.path.path != path
+                && let Some(contents) = &root.contents
+            {
+                contents.verify_current()?;
             }
         }
         let root = self
@@ -197,12 +197,12 @@ impl TransportRootsObservationV2 {
         let Some(Contents::Management(owner)) = root.contents.take() else {
             return Err(StoreError::RecoveryRequired);
         };
-        root.contents = Some(Contents::Management(match update {
+        root.contents = Some(Contents::Management(Box::new(match update {
             ManagementUpdateV2::Renamed(id) => owner.rebind_renamed(id)?,
             ManagementUpdateV2::Tombstone => owner.bind_tombstone()?,
             ManagementUpdateV2::Stage(file) => owner.bind_stage(file)?,
-            ManagementUpdateV2::Finished(tree) => owner.finish_stage(tree)?,
-        }));
+            ManagementUpdateV2::Finished(tree) => owner.finish_stage(*tree)?,
+        })));
         self.verify_current()?;
         Ok(self)
     }
@@ -251,9 +251,9 @@ impl TransportRootsObservationV2 {
                     TransportRootV2::ManagerFamilies(p) => Contents::Families(
                         FamilyTransportInspectionV2::inspect(&disk::Directory::open_owned(p)?)?,
                     ),
-                    TransportRootV2::ManagementProject(p) => Contents::Management(
+                    TransportRootV2::ManagementProject(p) => Contents::Management(Box::new(
                         management::ManagementProjectObservationV2::inspect(p)?,
-                    ),
+                    )),
                     TransportRootV2::Desktop(p) => {
                         Contents::Desktop(DesktopRootTransportInspectionV2::inspect(
                             &disk::Directory::open_owned(p)?,
@@ -415,7 +415,9 @@ thread_local! {
     static AFTER_ROOTS_VERIFIED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
-fn run_hook(slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>) {
+type HookSlot = std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>;
+#[cfg(test)]
+fn run_hook(slot: &'static HookSlot) {
     if let Some(hook) = slot.with(|s| s.borrow_mut().take()) {
         hook();
     }

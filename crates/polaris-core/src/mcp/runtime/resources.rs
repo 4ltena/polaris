@@ -169,7 +169,7 @@ impl RuntimeConfig {
     /// as save-time validation does, and retain every stdio witness until all
     /// servers have been admitted and revalidated. The caller keeps the returned
     /// witnesses and revalidates them immediately before using those paths.
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(crate) fn validate_servers_no_exec<'a>(
         servers: impl IntoIterator<Item = &'a Server>,
         project: &str,

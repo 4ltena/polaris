@@ -1351,7 +1351,7 @@ mod tests {
             )
             .unwrap();
             port.configure_execution_capability(Some(ConfirmedExecutionCapability::ConfinedCode {
-                scope: scope.clone(),
+                scope: Box::new(scope.clone()),
             }))
             .unwrap();
             owner.port = port.clone();
@@ -1505,7 +1505,7 @@ mod tests {
             )
             .unwrap();
             port.configure_execution_capability(Some(ConfirmedExecutionCapability::ConfinedCode {
-                scope: scope.clone(),
+                scope: Box::new(scope.clone()),
             }))
             .unwrap();
             owner.port = port;

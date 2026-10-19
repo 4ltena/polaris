@@ -1,3 +1,4 @@
+//! Windows session persistence, lifecycle and unsupported storage refusal tests.
 use super::*;
 use std::fs;
 

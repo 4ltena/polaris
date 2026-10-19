@@ -21,7 +21,7 @@ cargo build --release
 
 `--web-search`は`disabled`、`cached`、`live`を受け付けるが、現在のChatGPT認証先はResponses形式の上限契約を確認していない。既定の`disabled`だけが利用でき、`cached`と`live`は明示しても開始前に拒否される。`cached`もローカルのオフライン検索を意味しない。動作するlive用コマンドはまだ案内しない。
 
-推論強度の既定は`xhigh`。APIにはモデル名を`gpt-6-astra`、推論強度を`xhigh`として別々に渡す。`--effort`で明示した値が優先され、アカウントのプランによって既定値は変わらない。受け付ける値は`low`・`medium`・`high`・`xhigh`・`max`の5つである。`max`はResponses API限定だが、主経路が`/responses`なので使える。この既定はroot実行自身の強度であり、委譲先の強度は`[tier.*]`が決める。
+one-shot実行の推論強度は、省略時に`xhigh`を使う。対話TUIでは省略時に自動判定し、`--effort`で明示した値が優先される。APIにはモデル名と推論強度を別々に渡す。CLIが受け付ける値は`low`・`medium`・`high`・`xhigh`・`max`の5つである。`max`はResponses API限定だが、主経路が`/responses`なので使える。この設定はroot実行自身の強度であり、委譲先の強度は`[tier.*]`が決める。
 
 現行の`openai`プロバイダは`/chat/completions`を使う。公式仕様ではAstraのtool callingにResponses APIが必要なため、この経路でのAstraのツール実行は非対応である。`codex`プロバイダは別のResponses形式の実装であり、APIキー用のResponses対応とは区別する。[Astra移行ガイド](https://developers.openai.com/api/docs/guides/latest-model)
 
@@ -89,7 +89,7 @@ SwiftUIの作業画面は、選択したプロジェクトと会話を専用の�
 
 失敗ターンの使用量は累計表示へ反映されない。プロバイダがusageを返さないときは`0`と表示する。履歴ペインはスクロールバックを持たず、最新メッセージだけを表示する。
 
-`/model`はモデル、続けてreasoning effortを選ぶ2段階のピッカーを表示する。並ぶのは`low`・`medium`・`high`・`extra high`・`max`の5行で、APIが受け付ける値と1対1である。表示上の`extra high`だけは送るとき`xhigh`へ変換し、`max`はそのまま送る。明示した選択は既定の`gpt-6-astra`・`extra high`を上書きし、次のターンから反映する。`/permissions`と`/skills`も同じ形式のピッカーを使う。`/permissions`では起動時の承認境界を超える選択を拒否し、固定のsandboxと再起動用の引数を表示する。`/skills`は閲覧専用である。
+`/model`はホスト型モデルと`Local model`を選ぶピッカーを表示する。`Local model`を選ぶと、接続済みのOllamaとLM Studioからモデルを取得し、次の一覧で選択できる。ツール対応を確認できたモデルだけを採用し、次のターンから反映する。推論強度はこのピッカーでは選ばない。`/permissions`では起動時の承認境界を超える選択を拒否し、固定のsandboxと再起動用の引数を表示する。`/skills`は閲覧専用である。
 
 `/resume`の一覧は、現在の作業ディレクトリを最初に置き、ほかのディレクトリは最後の会話日時の新しい順に並べる。各行には相対時刻、メッセージ数、最初のユーザーメッセージの60文字プレビューを表示する。30日を超えた会話は絶対日時で表示する。legacyでは壊れた行より前までを読むが、v2の破損・世代不一致は原文を切り捨てず拒否する。
 
@@ -106,11 +106,18 @@ SwiftUIの作業画面は、選択したプロジェクトと会話を専用の�
 | `/new`、`/resume`、`/fork`、`/clear` | 会話を新規作成、再開、複製、消去する。`/clear`は元に戻せない。 |
 | `/init` | カレントディレクトリに`AGENTS.md`の雛形を作成する。既存時は何もしない。 |
 | `/model`、`/permissions` | モデル・推論強度、起動時の境界内で承認ポリシーを選び直す。 |
+| `/mcp` | 登録・外部接続上限と認証情報の参照名を表示する。`setup`で検出・登録、`check <server>`でカタログ取得、`enable <server>`・`disable <server>`でプロジェクトの有効化を変更する。 |
+| `/mcp materialize <名前>` | 検出したパッケージを確認後に取得・固定する。登録は別途確認する。取得処理の終了までは待つ必要がある。 |
+| `/mcp secret set`、`/mcp secret delete <参照名>` | 専用画面で秘密値を入力し、または保存済みの認証情報を確認後に削除する。`set`の引数へ値を書かない。値も文字数も表示せず、Esc・Ctrl-Cで入力を取り消せる。 |
+| `/subagents list`、`/subagents wait <child-id> <attempt-id>`、`/subagents cancel <child-id> <attempt-id>` | 実行中の子を一覧からIDで選び、状態を取得するか、確認後に停止を要求する。停止要求の受付は終了証明ではなく、`outcome_unknown`は結果未確定を示す。 |
+| `/memory import <JSONL>`、`/memory search <query>`、`/memory get <session> <id>`、`/memory source <session> <id>`、`/memory forget <session>` | 記録の取り込み、検索・参照、確認後の記憶削除を行う。取り込みと削除は巻き戻しでは取り消せない。 |
 | `/diff`、`/review` | 変更点を表示し、またはレビュー指示を通常のモデルターンとして送る。 |
 | `/export` | 会話をMarkdownへ書き出す。ファイル名省略時はタイムスタンプ付きの名前を使う。 |
 | `/logout`、`/quit`、`/exit` | 保存済み認証を削除し、または終了する。 |
 
-`/resume`は作業ディレクトリ別に会話をグループ化し、現在のディレクトリを先頭に表示する。選んだ会話への送信は既存ファイルへ追記する。MCP、IDE連携、複数セッションのライフサイクル管理など、対応する基盤を持たないCodex由来のコマンドは実装していない。
+`/resume`は作業ディレクトリ別に会話をグループ化し、現在のディレクトリを先頭に表示する。選んだ会話への送信は既存ファイルへ追記する。
+
+MCPの外部接続は起動時の`--mcp-external`が上限となる。カタログ取得・登録・パッケージ取得は、上限や承認設定が拒否した場合には実行しない。秘密値は通常入力・履歴・モデルへ送らず、専用入力画面でのみ扱う。
 
 ### AGENTS.mdの変更反映
 
@@ -131,7 +138,7 @@ auto_regenerate = true
 
 この設定はroot起点の自動更新だけを止める。`spawn`による明示的なsubagent実行は維持される。
 
-具体的には、`/mcp`、`/apps`、`/plugins`、`/vim`、`/keymap`、`/hooks`、`/import`、`/memories`、`/theme`、`/pets`、`/ide`、`/plan`、`/goal`、`/agents`、`/subagents`、`/side`、`/btw`、`/ps`、`/stop`、`/title`、`/statusline`、`/feedback`、`/personality`、`/experimental`、`/approve`、`/mention`、`/copy`、`/rename`、`/archive`、`/delete`、`/cd`は利用できない。`/usage`は`/status`のトークン表示と重なるため設けない。
+コマンドの一覧は`/help`で確認できる。未対応の操作は明示的に拒否する。`/usage`は`/status`のトークン表示と重なるため設けない。
 
 ## subagent
 

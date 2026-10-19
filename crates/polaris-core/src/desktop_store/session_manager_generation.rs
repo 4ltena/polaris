@@ -596,7 +596,7 @@ impl SessionManagerStore {
 
 /// Exact referenced object set for a read-only migration inspection. Unlike
 /// ordinary recovery, no torn suffix or unreferenced generation is accepted.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 impl SessionManagerStore {
     pub(super) fn migration_layout(&self) -> StoreResult<BTreeMap<String, u64>> {
         let mut files = BTreeMap::from([(OWNER_LOCK.into(), 0)]);
@@ -669,7 +669,7 @@ impl SessionManagerStore {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn migration_journal(
     directory: &Directory,
     name: &str,

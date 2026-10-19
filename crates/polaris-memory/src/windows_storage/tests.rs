@@ -1,3 +1,4 @@
+//! Windows protected SQLite storage, journal, locking and publication regression tests.
 use super::*;
 use crate::{
     MemoryStore, Record,

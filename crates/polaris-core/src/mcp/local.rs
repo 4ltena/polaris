@@ -136,6 +136,12 @@ impl LocalHost {
         &self.project
     }
 
+    /// The canonical account home already bound during host admission.
+    /// Explicit management commands use it instead of reading HOME again.
+    pub fn account_home(&self) -> &Path {
+        &self.home
+    }
+
     /// A root at or above home contains every server directory, so no stdio
     /// server can run there.
     pub fn root_contains_home(&self) -> bool {

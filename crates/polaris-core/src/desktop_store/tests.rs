@@ -134,7 +134,7 @@ fn m2a_source_apply_sidecar_record_versions_require_exact_nullable_and_reserved_
     );
     let (state, version) = super::model::decode_sidecar_wire(raw.as_bytes()).unwrap();
     assert_eq!(version, 2);
-    assert_eq!(state.source_applies, [record.clone()]);
+    assert_eq!(state.source_applies, std::slice::from_ref(&record));
     let parsed: serde_json::Value = serde_json::from_str(&record_bytes).unwrap();
     for field in parsed.as_object().unwrap().keys() {
         let mut missing = parsed.clone();
@@ -947,7 +947,8 @@ fn s07_child_lock_worker() {
         return;
     }
     file.try_lock().unwrap();
-    println!("DESKTOP_LOCK_HELD");
+    // The serial test harness may leave its test-name prefix on this line.
+    println!("\nDESKTOP_LOCK_HELD");
     std::io::stdout().flush().unwrap();
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line).unwrap();
@@ -990,18 +991,23 @@ fn s07_child_process_contention_and_exit_release_real_writer_lock() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    loop {
-        line.clear();
-        assert!(
-            reader.read_line(&mut line).unwrap() > 0,
-            "子がlock取得前に終了"
-        );
-        if line.trim() == "DESKTOP_LOCK_HELD" {
-            break;
-        }
+    let stdout = child.stdout.take().unwrap();
+    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+    let readiness = std::thread::spawn(move || {
+        let ready = BufReader::new(stdout)
+            .lines()
+            .any(|line| line.is_ok_and(|line| line.trim() == "DESKTOP_LOCK_HELD"));
+        let _ = ready_sender.send(ready);
+    });
+    let ready = ready_receiver.recv_timeout(std::time::Duration::from_secs(30));
+    if ready != Ok(true) {
+        // EOF releases the fixture's stdin wait even when its marker is missing.
+        drop(child.stdin.take());
+        let _ = child.wait();
+        readiness.join().unwrap();
+        panic!("子のlock取得を確認できませんでした: {ready:?}");
     }
+    readiness.join().unwrap();
     let blocked = matches!(root.open(&project(), &session()), Err(StoreError::Busy));
     child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
     assert!(child.wait().unwrap().success());
@@ -3665,8 +3671,7 @@ fn m2a_source_apply_joined_marker_recovery_uses_exact_precommit_and_report_at_pu
                     &pre,
                     &descriptor,
                     &binding,
-                    &request,
-                    &before,
+                    (&request, &before),
                     &generic,
                     report,
                 )
@@ -3742,8 +3747,7 @@ fn m2a_source_apply_joined_marker_token_rejects_changed_inode_mode_link_length_a
                 &pre,
                 &descriptor,
                 &binding,
-                &request,
-                &before,
+                (&request, &before),
                 &generic,
                 None,
             )
@@ -4030,8 +4034,7 @@ fn d27_marker_restart_worker() {
             &pre,
             &descriptor,
             &binding,
-            &request,
-            &before,
+            (&request, &before),
             &generic,
             report,
         )
@@ -4139,8 +4142,7 @@ fn m2a_source_apply_marker_recovery_stops_resume_without_new_names_or_unjoined_c
                 &pre,
                 &descriptor,
                 &binding,
-                &request,
-                &before,
+                (&request, &before),
                 &generic,
                 None,
             )
@@ -4157,8 +4159,7 @@ fn m2a_source_apply_marker_recovery_stops_resume_without_new_names_or_unjoined_c
                 &pre,
                 &descriptor,
                 &binding,
-                &request,
-                &before,
+                (&request, &before),
                 &generic,
                 None,
             )
@@ -4308,16 +4309,15 @@ fn source_report() -> SourceApplyResult {
 const M2A_PRECOMMIT: &str = r#"{"schema_version":1,"project_binding":"1111111111111111111111111111111111111111111111111111111111111111","run_id":"run","attempt_id":"attempt","approval_id":"approval","source_operation_digest":"2222222222222222222222222222222222222222222222222222222222222222","payload_hash":"3333333333333333333333333333333333333333333333333333333333333333","policy_revision":7,"base_session_revision":8,"consume_target_revision":9,"reserved_result_id":"result-原文","reserved_result_id_digest":"1fec8a4ec4b8065d13d67b4258adfc8ecf8d6059d319211e609e51b3a45ce8db","base_marker_evidence_hash":"4444444444444444444444444444444444444444444444444444444444444444","consume_marker_evidence_hash":"5555555555555555555555555555555555555555555555555555555555555555","consume_sidecar_offset":100,"consume_sidecar_hash":"6666666666666666666666666666666666666666666666666666666666666666","consume_record_hash":"7777777777777777777777777777777777777777777777777777777777777777","result_capacity_bytes":1048576}"#;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn m2a_session_files(
-    writer: &Writer,
-) -> std::collections::BTreeMap<String, (u64, u64, u32, u32, u64, Vec<u8>)> {
+type M2aFileSnapshot = std::collections::BTreeMap<String, (u64, u64, u32, u32, u64, Vec<u8>)>;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn m2a_session_files(writer: &Writer) -> M2aFileSnapshot {
     m2a_directory_files(&dir(writer))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn m2a_directory_files(
-    path: &std::path::Path,
-) -> std::collections::BTreeMap<String, (u64, u64, u32, u32, u64, Vec<u8>)> {
+fn m2a_directory_files(path: &std::path::Path) -> M2aFileSnapshot {
     use std::os::unix::fs::MetadataExt;
     fs::read_dir(path)
         .unwrap()
@@ -4466,11 +4466,9 @@ fn m2a_precommit(
         &target(),
         &candidate.approval_id,
         &candidate.payload_hash,
-        source_guard(writer),
-        proof,
+        (source_guard(writer), proof),
         crate::management_effect::ManagementEffectHashV1::digest(b"verified-project-binding"),
-        reserved,
-        MAX_SOURCE_APPLY_BYTES as u64,
+        (reserved, MAX_SOURCE_APPLY_BYTES as u64),
     )
 }
 
@@ -4701,11 +4699,9 @@ fn m2a_consumed(
             &target(),
             &candidate.approval_id,
             &candidate.payload_hash,
-            source_guard(&writer),
-            proof,
+            (source_guard(&writer), proof),
             crate::management_effect::ManagementEffectHashV1::digest(b"verified-project-binding"),
-            ResultId::new("trusted-result").unwrap(),
-            capacity,
+            (ResultId::new("trusted-result").unwrap(), capacity),
         )
         .unwrap();
     let guard = source_guard(&writer);
@@ -4992,9 +4988,15 @@ fn m2a_source_apply_capacity_full_record_table_and_ledger_plus_minus_one() {
         consumed_rows[0].reserved_result_id = Some(reserved.clone());
         let desired = (MAX_SOURCE_APPLY_LEDGER_BYTES - MAX_SOURCE_APPLY_BYTES) as i64 + delta;
         let mut gap = desired as usize - serde_json::to_vec(&consumed_rows).unwrap().len();
-        for index in 1..MAX_SOURCE_APPLY_RECORDS {
+        for (record, consumed_row) in next
+            .state
+            .source_applies
+            .iter_mut()
+            .zip(&mut consumed_rows)
+            .skip(1)
+        {
             for recovery in [false, true] {
-                let payload = &mut next.state.source_applies[index].candidate.payload;
+                let payload = &mut record.candidate.payload;
                 let text = if recovery {
                     &mut payload.recovery_parent_path
                 } else {
@@ -5004,9 +5006,8 @@ fn m2a_source_apply_capacity_full_record_table_and_ledger_plus_minus_one() {
                 text.push_str(&"x".repeat(count));
                 gap -= count;
             }
-            let record = &mut next.state.source_applies[index];
             record.candidate.payload_hash = record.candidate.payload.payload_hash().unwrap();
-            consumed_rows[index] = record.clone();
+            *consumed_row = record.clone();
         }
         assert_eq!(gap, 0);
         assert_eq!(

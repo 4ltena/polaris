@@ -102,13 +102,13 @@ pub fn append(project_root: &std::path::Path, rules: &[&str]) -> std::io::Result
     #[cfg(unix)]
     {
         let existing = read(project_root)?;
-        return append_checked(
+        append_checked(
             project_root,
             rules,
             &crate::conversation_state::content_hash(existing.as_bytes()),
             None,
         )
-        .map(|_| ());
+        .map(|_| ())
     }
     #[cfg(not(unix))]
     {

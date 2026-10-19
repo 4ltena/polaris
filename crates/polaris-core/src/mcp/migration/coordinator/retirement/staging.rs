@@ -245,8 +245,8 @@ impl StagedPayloadV2 {
                     .map(|m| m.projection.clone()),
                 unregistered_pins: source.unregistered_pins.clone(),
                 package_directories: directories,
-                package_files: package_files,
-                runtime_rechecks: runtime_rechecks,
+                package_files,
+                runtime_rechecks,
             },
             registry,
             &source.documents.credential,
@@ -874,8 +874,11 @@ fn staging_fault(point: &'static str) -> Result<(), Error> {
     Ok(())
 }
 #[cfg(test)]
+type StagingFaultHook = Box<dyn Fn(&'static str) -> Result<(), Error>>;
+
+#[cfg(test)]
 thread_local! {
-    static STAGING_FAULT: std::cell::RefCell<Option<Box<dyn Fn(&'static str) -> Result<(), Error>>>> = const { std::cell::RefCell::new(None) };
+    static STAGING_FAULT: std::cell::RefCell<Option<StagingFaultHook>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 mod tests;

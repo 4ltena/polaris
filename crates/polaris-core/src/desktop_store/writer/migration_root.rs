@@ -275,7 +275,10 @@ thread_local! {
     pub(in crate::desktop_store) static AFTER_ROOT_FINAL_NAMES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
-fn run_hook(slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>) {
+type HookSlot = &'static std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>;
+
+#[cfg(test)]
+fn run_hook(slot: HookSlot) {
     if let Some(hook) = slot.with(|slot| slot.borrow_mut().take()) {
         hook();
     }

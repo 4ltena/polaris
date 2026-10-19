@@ -11,6 +11,8 @@ use std::{
     path::PathBuf,
 };
 
+type SnapshotEntry = (PathBuf, u64, u32, u64, i64, i64, i64, i64, Option<Vec<u8>>);
+
 struct Fixture {
     _root: tempfile::TempDir,
     _retained: Vec<tempfile::TempDir>,
@@ -127,7 +129,7 @@ impl Fixture {
             .unwrap(),
         );
     }
-    fn snapshot(&self) -> Vec<(PathBuf, u64, u32, u64, i64, i64, i64, i64, Option<Vec<u8>>)> {
+    fn snapshot(&self) -> Vec<SnapshotEntry> {
         let mut pending = vec![self.store.clone()];
         let mut result = vec![];
         while let Some(path) = pending.pop() {

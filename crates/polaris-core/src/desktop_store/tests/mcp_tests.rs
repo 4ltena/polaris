@@ -1261,9 +1261,10 @@ fn migration_desktop_rejects_persisted_unknown_and_unfinished_mcp_without_recove
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn migration_session_files(
-    path: &std::path::Path,
-) -> Vec<(String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64))> {
+type MigrationSessionSnapshot = Vec<(String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64))>;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn migration_session_files(path: &std::path::Path) -> MigrationSessionSnapshot {
     use std::os::unix::fs::MetadataExt;
     let mut result = Vec::new();
     for entry in std::fs::read_dir(path).unwrap() {
@@ -1738,6 +1739,7 @@ mod desktop_root_migration_tests {
         let path = root.path().join("session-manager-v1").join("commits.jsonl");
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(&path)
             .unwrap();

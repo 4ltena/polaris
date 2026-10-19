@@ -246,7 +246,7 @@ impl WorkflowChangeOwner<'_> {
                 &prepared,
                 ManagementDenialReasonV1::ResourceUnavailable,
             );
-            return Err(error.into());
+            return Err(error);
         }
         let read_back = match read_descriptor(
             self.state_dir,

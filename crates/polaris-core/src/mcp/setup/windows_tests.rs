@@ -1,3 +1,4 @@
+//! Windows MCP setup refusal tests that preserve storage and avoid approval requests.
 use super::*;
 use crate::approval::{ApprovalPolicy, Approver, Decision, Gate};
 use crate::isolated_workspace::Limits;

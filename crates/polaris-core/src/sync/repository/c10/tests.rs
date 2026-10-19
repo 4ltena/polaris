@@ -156,7 +156,7 @@ impl Fixture {
                     &self.payload(),
                 )
                 .unwrap(),
-            C10RepositoryInspectionV1::Existing(repository) => repository,
+            C10RepositoryInspectionV1::Existing(repository) => *repository,
         }
     }
     fn first_commit(&self) -> (C10LocalRepositoryV1, C10CommitReadbackV1, Transaction) {

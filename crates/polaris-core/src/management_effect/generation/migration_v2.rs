@@ -13,7 +13,9 @@ const V2_ARCHIVE: &str = "archive.v2.json";
 const V2_CHECKPOINT: &str = "checkpoint.v2.json";
 const V2_JOURNAL: &str = "journal.v2.jsonl";
 const MIGRATION: &str = "migration.v2.json";
+#[cfg(test)]
 const MIGRATION_TEMP: &str = ".migration.v2.tmp";
+#[cfg(test)]
 const CURRENT_TEMP: &str = ".CURRENT.v2.tmp";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -175,6 +177,7 @@ impl ManagementMigrationTreeV2 {
     pub fn manifest(&self) -> &MigrationManifestV2 {
         &self.manifest
     }
+    #[cfg(test)]
     pub(crate) fn manifest_file_hash(
         &self,
     ) -> Result<ManagementEffectHashV1, ManagementEffectStoreError> {
@@ -183,6 +186,7 @@ impl ManagementMigrationTreeV2 {
             .map(|bytes| ManagementEffectHashV1::digest(bytes))
             .ok_or(ManagementEffectStoreError::InvalidStore)
     }
+    #[cfg(test)]
     pub(crate) fn verify_staging(&self, root: &File) -> Result<(), ManagementEffectStoreError> {
         let mount = MigrationMountV2::inspect(root, true)?;
         let read = Self::read_staging_inner(root, ManagementEffectLimitsV1::default(), &mount)?;
@@ -877,6 +881,7 @@ thread_local! {
 fn fail_staging_once_at(point: u64) {
     STAGING_FAILURE.with(|slot| slot.set(Some(point)));
 }
+#[cfg(test)]
 fn staging_fault(counter: &mut u64) -> Result<(), ManagementEffectStoreError> {
     *counter += 1;
     #[cfg(test)]
@@ -887,6 +892,7 @@ fn staging_fault(counter: &mut u64) -> Result<(), ManagementEffectStoreError> {
     Ok(())
 }
 
+#[cfg(test)]
 impl ManagementMigrationTreeV2 {
     /// The caller pins the final directory layout before preparation. The
     /// final anchor is read after all payload names exist, including hidden
@@ -1053,6 +1059,7 @@ fn migration_anchor(meta: &fs::Metadata) -> ManagementMigrationAnchorV2 {
         links: meta.nlink(),
     }
 }
+#[cfg(test)]
 fn staging_directories(
     root: &File,
     generations: u64,
@@ -1124,6 +1131,7 @@ fn staging_directories(
     }
     Ok(directories)
 }
+#[cfg(test)]
 fn staging_parent<'a>(
     directories: &'a BTreeMap<String, File>,
     relative: &'a str,
@@ -1136,6 +1144,7 @@ fn staging_parent<'a>(
         name,
     ))
 }
+#[cfg(test)]
 fn create_staging_file(
     parent: &File,
     name: &str,
@@ -1169,6 +1178,7 @@ fn create_staging_file(
     mount.verify(&file)?;
     Ok(file)
 }
+#[cfg(test)]
 fn finish_staging_file(
     file: &mut File,
     parent: &File,
@@ -1191,6 +1201,7 @@ fn finish_staging_file(
     }
     Ok(())
 }
+#[cfg(test)]
 fn write_staging_file(
     parent: &File,
     name: &str,
@@ -1201,6 +1212,7 @@ fn write_staging_file(
     let mut file = create_staging_file(parent, name, mount)?;
     finish_staging_file(&mut file, parent, name, relative, bytes, mount)
 }
+#[cfg(test)]
 fn read_staging_files(
     root: &File,
     generations: u64,

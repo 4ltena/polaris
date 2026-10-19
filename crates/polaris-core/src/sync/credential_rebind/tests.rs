@@ -10,12 +10,8 @@ use std::{
     collections::BTreeMap,
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    str::FromStr,
 };
 
-fn operation(number: u64) -> Operation {
-    Operation::from_str(&format!("{number:032x}")).unwrap()
-}
 fn binding(generation: u64) -> GitCredentialBindingV1 {
     let remote =
         CanonicalHttpsRemoteV1::parse("https://example.invalid:443/team/project.git").unwrap();
@@ -145,7 +141,9 @@ pub(super) fn no_intent_record(id: Operation) -> C08StoredRecordV1 {
         evidence_hash: zero_hash().unwrap(),
     };
     evidence.evidence_hash = evidence.computed_hash().unwrap();
-    let stored = C08StoredRecordV1::NoIntentAbandon { evidence };
+    let stored = C08StoredRecordV1::NoIntentAbandon {
+        evidence: Box::new(evidence),
+    };
     stored.canonical_bytes().unwrap();
     stored
 }
@@ -258,14 +256,11 @@ impl Fixture {
         )
         .unwrap();
         match inspected {
-            ManagementEffectInspectOpenV1::Present(value) => {
-                let effect = value
-                    .effects()
-                    .find(|e| e.request.operation_id == id)
-                    .unwrap()
-                    .clone();
-                effect
-            }
+            ManagementEffectInspectOpenV1::Present(value) => value
+                .effects()
+                .find(|e| e.request.operation_id == id)
+                .unwrap()
+                .clone(),
             _ => panic!("expected durable effect"),
         }
     }

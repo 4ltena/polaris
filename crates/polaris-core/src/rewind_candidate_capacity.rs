@@ -325,9 +325,15 @@ fn filesystem_available_bytes(path: &Path) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     let stat = unsafe { stat.assume_init() };
-    u64::try_from(stat.f_bavail)
-        .ok()
-        .and_then(|blocks| blocks.checked_mul(u64::try_from(stat.f_frsize).ok()?))
+    #[cfg(any(target_os = "macos", target_pointer_width = "32"))]
+    let blocks = u64::from(stat.f_bavail);
+    #[cfg(all(not(target_os = "macos"), target_pointer_width = "64"))]
+    let blocks = stat.f_bavail;
+    let unit = stat.f_frsize;
+    #[cfg(target_pointer_width = "32")]
+    let unit = u64::from(unit);
+    blocks
+        .checked_mul(unit)
         .ok_or_else(|| invalid("sessions-v2空き容量が上限です"))
 }
 
@@ -355,7 +361,7 @@ fn invalid(message: &str) -> io::Error {
 }
 
 fn workspace_error(error: crate::rewind_workspace::WorkspaceError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error.to_string())
+    io::Error::other(error.to_string())
 }
 
 #[cfg(test)]

@@ -217,8 +217,7 @@ fn execute(command: Command) -> Result<String, String> {
             recover,
             abandon,
             yes,
-            account,
-            credential_choice,
+            (account, credential_choice),
             join,
         );
     }
@@ -261,8 +260,7 @@ fn execute(command: Command) -> Result<String, String> {
                     recover,
                     abandon,
                     yes,
-                    account,
-                    credential_choice,
+                    (account, credential_choice),
                     None,
                 );
             }
@@ -279,16 +277,15 @@ fn execute(command: Command) -> Result<String, String> {
             };
             #[cfg(not(test))]
             {
-                return c08_command(
+                c08_command(
                     &project,
                     false,
                     None,
                     None,
                     yes,
-                    account,
-                    credential_choice,
+                    (account, credential_choice),
                     Some((share, manifest, now())),
-                );
+                )
             }
             #[cfg(test)]
             {
@@ -877,7 +874,7 @@ fn c10_summary(summary: &polaris_core::sync::push::SyncPushConfirmationSummaryV1
 #[cfg(any(target_os = "macos", all(unix, test)))]
 fn c10_confirm(yes: bool, summary: &str) -> Result<C08Confirmation, String> {
     use std::io::{IsTerminal, Read, Write};
-    if !yes && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+    if !(yes || std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
         return Err("c10_permission_unavailable".into());
     }
     let mut output = std::io::stderr().lock();
@@ -923,8 +920,7 @@ fn c08_command(
     recover: Option<String>,
     abandon: Option<String>,
     yes: bool,
-    account: Option<String>,
-    choice: Option<String>,
+    (account, choice): (Option<String>, Option<String>),
     join: Option<(ShareLink, ShareManifest, u64)>,
 ) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]

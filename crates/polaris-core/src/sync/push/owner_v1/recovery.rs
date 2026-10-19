@@ -152,8 +152,7 @@ impl SyncPushOwnerV1 {
                 &mut reservation,
                 &history,
                 &management,
-                None,
-                unknown.as_ref(),
+                (None, unknown.as_ref()),
                 &part,
             ) {
                 Ok(result) => Ok(result),
@@ -170,7 +169,7 @@ impl SyncPushOwnerV1 {
             .ok_or(SyncPushErrorV1::Protection)?;
         let repository =
             C10LocalRepositoryV1::inspect(&self.state, self.credentials.git_identity())?;
-        let C10RepositoryInspectionV1::Existing(mut repository) = repository else {
+        let C10RepositoryInspectionV1::Existing(repository) = repository else {
             // No repair/init is inferred from LocalPrepared.
             if matches!(
                 history.current().state(),
@@ -188,6 +187,7 @@ impl SyncPushOwnerV1 {
                 operation_id: operation,
             });
         };
+        let mut repository = *repository;
         let mut readback = None;
         match history.current().state() {
             SyncRemoteIntentStateV2::LocalPrepared { .. } => {
@@ -196,7 +196,7 @@ impl SyncPushOwnerV1 {
                 let inspection =
                     C10LocalRepositoryV1::inspect(&self.state, self.credentials.git_identity())?;
                 if let C10RepositoryInspectionV1::Existing(candidate) = inspection {
-                    if let Ok((reopened, proof)) = candidate.durable_current_after_unknown(
+                    if let Ok((reopened, proof)) = (*candidate).durable_current_after_unknown(
                         &self.project,
                         &management,
                         &unknown,
@@ -241,10 +241,10 @@ impl SyncPushOwnerV1 {
                         .map(|p| p.commit().clone())
                 })
                 .or_else(|| {
-                    if prepared.payload == prepared.head_tree {
-                        if let SyncPriorHeadV2::Present { commit } = &prepared.prior_head {
-                            return Some(commit.clone());
-                        }
+                    if prepared.payload == prepared.head_tree
+                        && let SyncPriorHeadV2::Present { commit } = &prepared.prior_head
+                    {
+                        return Some(commit.clone());
                     }
                     None
                 }),
@@ -330,8 +330,7 @@ impl SyncPushOwnerV1 {
             &mut reservation,
             &history,
             &management,
-            None,
-            Some(&unknown),
+            (None, Some(&unknown)),
             &part,
         ) {
             Ok(result) => Ok(result),
@@ -456,14 +455,14 @@ impl SyncPushOwnerV1 {
                 let candidate =
                     C10LocalRepositoryV1::inspect(&self.state, self.credentials.git_identity())?;
                 if let C10RepositoryInspectionV1::Existing(candidate) = candidate {
-                    match candidate.durable_current_after_unknown(
+                    match (*candidate).durable_current_after_unknown(
                         &self.project,
                         &management,
                         &unknown,
                         &lease,
                     ) {
                         Ok((reopened, proof)) => {
-                            repository = C10RepositoryInspectionV1::Existing(reopened);
+                            repository = C10RepositoryInspectionV1::Existing(Box::new(reopened));
                             created = Some(proof);
                         }
                         Err(_) => {
@@ -512,7 +511,7 @@ impl SyncPushOwnerV1 {
                 value.restore_absent_after_unknown(&self.project, &management, &unknown, &lease)?
             }
             C10RepositoryInspectionV1::Existing(value) => {
-                value
+                (*value)
                     .restore_after_unknown(
                         &self.project,
                         &management,

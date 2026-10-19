@@ -84,6 +84,7 @@ pub(super) fn management_fixture_history(
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn management_physical_retirement_holds_all_owners_and_two_phase_native_closure() {
     let (_fixture, admission, states) = management_fixture();
     let retired = admission
@@ -132,6 +133,7 @@ fn management_physical_retirement_holds_all_owners_and_two_phase_native_closure(
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn management_retirement_connects_to_global_staging_without_activating_project_stores() {
     let (_fixture, admission, states) = management_fixture_history(true);
     let staged = admission.retire_source().unwrap().stage_source().unwrap();
@@ -161,6 +163,7 @@ fn management_retirement_connects_to_global_staging_without_activating_project_s
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn management_staging_faults_preserve_partial_tree_and_reject_changed_payload() {
     for point in [
         "before-management-staging-payload",
@@ -213,6 +216,7 @@ fn management_staging_faults_preserve_partial_tree_and_reject_changed_payload() 
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn management_physical_retirement_faults_preserve_partial_evidence_without_activation() {
     for point in [
         "before-management-rename",
@@ -255,6 +259,7 @@ fn management_physical_retirement_faults_preserve_partial_evidence_without_activ
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn management_physical_retirement_rejects_external_old_path_without_overwrite() {
     let (_fixture, admission, mut states) = management_fixture();
     states.sort();
@@ -281,6 +286,7 @@ fn management_physical_retirement_rejects_external_old_path_without_overwrite() 
     }
 }
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn retained_physical_retirement_prepares_source_without_advancing_phase_or_releasing_locks() {
     let (_root, admission, session, parent) = fixture(true);
     let retired = admission.retire_source().unwrap();
@@ -335,11 +341,12 @@ pub(super) fn fixture(
         ConversationStateV2::new("project".into(), ID.into()).unwrap(),
     )
     .unwrap();
-    let discovery = TransportRootDiscoveryV2::inspect(&[parent.clone()], &[]).unwrap();
+    let discovery = TransportRootDiscoveryV2::inspect(std::slice::from_ref(&parent), &[]).unwrap();
     let admission = MigrationAdmissionV2::assemble(source, fixture.guard, discovery).unwrap();
     (fixture._root, admission, session, parent)
 }
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn physical_retirement_persists_actual_anchor_chain_and_retains_all_locks() {
     for has_lock in [false, true] {
         let (_root, admission, session, parent) = fixture(has_lock);
@@ -364,7 +371,7 @@ fn physical_retirement_persists_actual_anchor_chain_and_retains_all_locks() {
         );
         assert_eq!(
             parent
-                .join(&record.binding.layout.retired.component())
+                .join(record.binding.layout.retired.component())
                 .metadata()
                 .unwrap()
                 .ino(),
@@ -398,6 +405,7 @@ fn physical_retirement_persists_actual_anchor_chain_and_retains_all_locks() {
     }
 }
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn physical_retirement_busy_source_lock_writes_no_intent_or_retired_root() {
     let (_root, admission, _session, parent) = fixture(true);
     let lock = File::open(parent.join("mcp/owner.lock")).unwrap();
@@ -416,6 +424,7 @@ fn physical_retirement_busy_source_lock_writes_no_intent_or_retired_root() {
     );
 }
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn physical_retirement_faults_preserve_migrating_source_and_durable_evidence() {
     for point in [
         "after-intent",
@@ -466,6 +475,7 @@ fn physical_retirement_faults_preserve_migrating_source_and_durable_evidence() {
     }
 }
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn physical_retirement_competing_old_path_is_preserved_without_tombstone_overwrite() {
     let (_root, admission, _session, parent) = fixture(true);
     let target = parent.join("mcp");
@@ -488,6 +498,7 @@ fn physical_retirement_competing_old_path_is_preserved_without_tombstone_overwri
     assert!(!parent.join("mcp-v2").exists());
 }
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn physical_retirement_closes_tombstone_intent_and_retired_owner_drift() {
     for mutation in 0..3 {
         let (_root, admission, _session, parent) = fixture(true);

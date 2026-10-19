@@ -325,6 +325,122 @@ pub(crate) fn handle_with_selection<B: Backend, R: KeyReader>(
     ))])
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compact<B: Backend, R: KeyReader>(
+    terminal: &RefCell<Terminal<B>>,
+    reader: &mut R,
+    provider: &dyn polaris_provider::Provider,
+    session: &mut Session,
+    session_path: &Path,
+    workspace: &WorkspaceOwner,
+    effects: &ManagementEffectStoreV1,
+    status: &mut crate::Status,
+    usage: &mut polaris_provider::Usage,
+    has_pending: bool,
+) -> Result<bool, String> {
+    if has_pending {
+        return Err("送信待ちの入力があるためcompactできません".into());
+    }
+    session.check_persistence().map_err(|e| e.to_string())?;
+    let saved = session.persistence.clone().ok_or("v2保存会話が必要です")?;
+    let before = saved.snapshot().map_err(|e| e.to_string())?;
+    if ManagementEffectHashV1::digest(before.state.project_id.as_bytes())
+        != effects.project_scope_hash()
+    {
+        return Err("compactのprojectが一致しません".into());
+    }
+    let model = provider.model().ok_or("現在のmodelを確認できません")?;
+    let lease = workspace.try_mutation().map_err(|e| e.to_string())?;
+    workspace
+        .require_quiescent_with_lease(&lease)
+        .map_err(|e| e.to_string())?;
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        effects.state_dir(),
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
+    let payload = serde_json::to_vec(&(
+        &before.state.session_id,
+        before.state.generation,
+        &model,
+        before.raw_hash.clone(),
+    ))
+    .map_err(|e| e.to_string())?;
+    let prepared = effects
+        .prepare(
+            &lease,
+            effects.cursor().map_err(|e| e.to_string())?,
+            PrepareManagementEffectV1 {
+                operation_id: ManagementOperationIdV1::random().map_err(|e| e.to_string())?,
+                inventory: ManagementInventoryIdV1::parse("T09").map_err(|e| e.to_string())?,
+                scope: ManagementEffectScopeV1 {
+                    project: effects.project_scope_hash(),
+                    session: Some(ManagementEffectHashV1::digest(
+                        before.state.session_id.as_bytes(),
+                    )),
+                    generation: before.state.generation,
+                    revision: before.state.generation,
+                    permission: ManagementPermissionScopeV1::LocalSession,
+                    account_binding: None,
+                },
+                request_hash: ManagementEffectHashV1::digest(&payload),
+                rewind: ManagementRewindDispositionV1::IrreversibleLocal,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let PrepareManagementEffectOutcomeV1::Prepared(prepared) = prepared else {
+        return Err("既存のcompactを再送しません".into());
+    };
+    if !account::confirm(
+        terminal,
+        reader,
+        "会話をcompact",
+        &before.state.session_id,
+        &format!(
+            "model: {model}\n現在の会話を既存providerへ送信して要約します。原文を保持し、送信は巻き戻せません。"
+        ),
+    ) {
+        effects
+            .deny(&lease, &prepared, ManagementDenialReasonV1::UserDeclined)
+            .map_err(|e| e.to_string())?;
+        *status = crate::Status::Notice("compactを取り消しました".into());
+        return Ok(false);
+    }
+    let current = saved.snapshot().map_err(|e| e.to_string())?;
+    if current.state != before.state || current.raw_hash != before.raw_hash {
+        effects
+            .deny(&lease, &prepared, ManagementDenialReasonV1::StaleRequest)
+            .map_err(|e| e.to_string())?;
+        return Err("確認後に会話が変更されました".into());
+    }
+    let started = effects
+        .start(&lease, &prepared)
+        .map_err(|e| e.to_string())?;
+    let failed = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        crate::handle_compact(provider, session, session_path, status, usage),
+    )
+    .await
+    .unwrap_or(true);
+    let failed = failed
+        || matches!(status,crate::Status::Notice(text) if text.starts_with("compaction failed"));
+    if failed {
+        effects
+            .mark_outcome_unknown(
+                &lease,
+                &started,
+                ManagementUnknownReasonV1::InterruptedAfterStart,
+            )
+            .map_err(|e| e.to_string())?;
+        return Err("compact結果を確認できません。原文を保ち、再送せず復旧してください".into());
+    }
+    effects
+        .complete_started(&lease, &started, ManagementEffectHashV1::digest(&payload))
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,123 +568,4 @@ mod tests {
             4
         );
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn compact<B: Backend, R: KeyReader>(
-    terminal: &RefCell<Terminal<B>>,
-    reader: &mut R,
-    provider: &dyn polaris_provider::Provider,
-    session: &mut Session,
-    session_path: &Path,
-    workspace: &WorkspaceOwner,
-    effects: &ManagementEffectStoreV1,
-    status: &mut crate::Status,
-    usage: &mut polaris_provider::Usage,
-    has_pending: bool,
-) -> Result<bool, String> {
-    if has_pending {
-        return Err("送信待ちの入力があるためcompactできません".into());
-    }
-    session.check_persistence().map_err(|e| e.to_string())?;
-    let saved = session.persistence.clone().ok_or("v2保存会話が必要です")?;
-    let before = saved.snapshot().map_err(|e| e.to_string())?;
-    if ManagementEffectHashV1::digest(before.state.project_id.as_bytes())
-        != effects.project_scope_hash()
-    {
-        return Err("compactのprojectが一致しません".into());
-    }
-    let model = provider.model().ok_or("現在のmodelを確認できません")?;
-    let lease = workspace.try_mutation().map_err(|e| e.to_string())?;
-    workspace
-        .require_quiescent_with_lease(&lease)
-        .map_err(|e| e.to_string())?;
-    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
-        workspace.project_root(),
-        effects.state_dir(),
-        &lease,
-    )
-    .map_err(|error| error.to_string())?;
-    let payload = serde_json::to_vec(&(
-        &before.state.session_id,
-        before.state.generation,
-        &model,
-        before.raw_hash.clone(),
-    ))
-    .map_err(|e| e.to_string())?;
-    let prepared = effects
-        .prepare(
-            &lease,
-            effects.cursor().map_err(|e| e.to_string())?,
-            PrepareManagementEffectV1 {
-                operation_id: ManagementOperationIdV1::random().map_err(|e| e.to_string())?,
-                inventory: ManagementInventoryIdV1::parse("T09").map_err(|e| e.to_string())?,
-                scope: ManagementEffectScopeV1 {
-                    project: effects.project_scope_hash(),
-                    session: Some(ManagementEffectHashV1::digest(
-                        before.state.session_id.as_bytes(),
-                    )),
-                    generation: before.state.generation,
-                    revision: before.state.generation,
-                    permission: ManagementPermissionScopeV1::LocalSession,
-                    account_binding: None,
-                },
-                request_hash: ManagementEffectHashV1::digest(&payload),
-                rewind: ManagementRewindDispositionV1::IrreversibleLocal,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-    let PrepareManagementEffectOutcomeV1::Prepared(prepared) = prepared else {
-        return Err("既存のcompactを再送しません".into());
-    };
-    if !account::confirm(
-        terminal,
-        reader,
-        "会話をcompact",
-        &before.state.session_id,
-        &format!(
-            "model: {model}\n現在の会話を既存providerへ送信して要約します。原文を保持し、送信は巻き戻せません。"
-        ),
-    ) {
-        effects
-            .deny(&lease, &prepared, ManagementDenialReasonV1::UserDeclined)
-            .map_err(|e| e.to_string())?;
-        *status = crate::Status::Notice("compactを取り消しました".into());
-        return Ok(false);
-    }
-    let current = saved.snapshot().map_err(|e| e.to_string())?;
-    if current.state != before.state || current.raw_hash != before.raw_hash {
-        effects
-            .deny(&lease, &prepared, ManagementDenialReasonV1::StaleRequest)
-            .map_err(|e| e.to_string())?;
-        return Err("確認後に会話が変更されました".into());
-    }
-    let started = effects
-        .start(&lease, &prepared)
-        .map_err(|e| e.to_string())?;
-    let failed = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        crate::handle_compact(provider, session, session_path, status, usage),
-    )
-    .await
-    {
-        Ok(failed) => failed,
-        Err(_) => true,
-    };
-    let failed = failed
-        || matches!(status,crate::Status::Notice(text) if text.starts_with("compaction failed"));
-    if failed {
-        effects
-            .mark_outcome_unknown(
-                &lease,
-                &started,
-                ManagementUnknownReasonV1::InterruptedAfterStart,
-            )
-            .map_err(|e| e.to_string())?;
-        return Err("compact結果を確認できません。原文を保ち、再送せず復旧してください".into());
-    }
-    effects
-        .complete_started(&lease, &started, ManagementEffectHashV1::digest(&payload))
-        .map_err(|e| e.to_string())?;
-    Ok(true)
 }

@@ -246,7 +246,7 @@ struct AuthorizedMutation {
 #[derive(Clone)]
 pub enum ConfirmedExecutionCapability {
     FixedHelpersOnly,
-    ConfinedCode { scope: SandboxPolicy },
+    ConfinedCode { scope: Box<SandboxPolicy> },
 }
 struct AuthorizedExecution {
     run_id: RunId,
@@ -804,7 +804,7 @@ mod tests {
             let (_dir, helper, scope, run, mut port, mut receiver) = mutation_fixture();
             port.configure_execution_capability(Some(if build {
                 ConfirmedExecutionCapability::ConfinedCode {
-                    scope: scope.clone(),
+                    scope: Box::new(scope.clone()),
                 }
             } else {
                 ConfirmedExecutionCapability::FixedHelpersOnly
@@ -839,7 +839,7 @@ mod tests {
             .restrict(SandboxMode::WorkspaceWrite, &[selected])
             .unwrap();
         port.configure_execution_capability(Some(ConfirmedExecutionCapability::ConfinedCode {
-            scope: scope.clone(),
+            scope: Box::new(scope.clone()),
         }))
         .unwrap();
         for change in 0..6 {
@@ -895,7 +895,7 @@ mod tests {
         .with_isolated_environment(&env.home, &env.tmpdir)
         .unwrap();
         port.configure_execution_capability(Some(ConfirmedExecutionCapability::ConfinedCode {
-            scope: full.clone(),
+            scope: Box::new(full.clone()),
         }))
         .unwrap();
         let _wait = port

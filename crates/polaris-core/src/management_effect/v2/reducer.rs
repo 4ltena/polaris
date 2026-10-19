@@ -6,7 +6,7 @@ use super::*;
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagementEffectEventV2 {
     Prepared {
-        request: PrepareManagementEffectV2,
+        request: Box<PrepareManagementEffectV2>,
     },
     EffectStarted {
         operation_id: ManagementOperationIdV1,
@@ -57,6 +57,7 @@ impl ManagementEffectEventV2 {
 /// Implemented by the store-scoped coordinator after durable read-back.
 /// There is deliberately no permissive/default implementation. A failed
 /// proof must leave the project snapshot and journal unchanged.
+#[cfg(test)]
 pub(crate) trait CredentialEvidenceVerifierV1 {
     fn reserved(
         &self,
@@ -88,11 +89,13 @@ pub(crate) trait CredentialEvidenceVerifierV1 {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct ManagementEffectReplayV2 {
     pub(super) effects: BTreeMap<ManagementOperationIdV1, ManagementEffectSnapshotV2>,
     sequence: u64,
 }
 
+#[cfg(test)]
 impl ManagementEffectReplayV2 {
     pub(super) fn from_checkpoint(
         effects: BTreeMap<ManagementOperationIdV1, ManagementEffectSnapshotV2>,
@@ -115,6 +118,7 @@ impl ManagementEffectReplayV2 {
 
 /// V2 sequence numbers remain monotonic across generation boundaries.
 /// The generation reader supplies the previous verified journal cursor.
+#[cfg(test)]
 pub(crate) fn apply_event(
     replay: &mut ManagementEffectReplayV2,
     sequence: u64,
@@ -129,6 +133,7 @@ pub(crate) fn apply_event(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_transition(
     effects: &mut BTreeMap<ManagementOperationIdV1, ManagementEffectSnapshotV2>,
     sequence: u64,
@@ -148,7 +153,7 @@ fn apply_transition(
         effects.insert(
             id,
             ManagementEffectSnapshotV2 {
-                request: request.clone(),
+                request: (**request).clone(),
                 state: ManagementEffectStateV2::Prepared,
                 last_sequence: sequence,
                 credential_authorization: authorization,

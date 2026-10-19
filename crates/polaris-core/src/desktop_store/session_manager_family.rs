@@ -3,7 +3,7 @@
 use super::*;
 use crate::session_manager::SessionId;
 use std::collections::BTreeMap;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "session_manager_family_migration.rs"]
 pub(in crate::desktop_store) mod migration;
 

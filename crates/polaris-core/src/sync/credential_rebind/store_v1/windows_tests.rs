@@ -1,3 +1,4 @@
+//! Windows credential rebind intent inspection refusal and storage preservation tests.
 use super::*;
 
 fn assert_unavailable(path: &Path) {

@@ -399,7 +399,7 @@ mod generations_v1 {
         },
         Committed {
             marker: ParticipationGenerationV1,
-            pending: Option<(C12PendingV1, C12PendingPositionV1)>,
+            pending: Option<(Box<C12PendingV1>, C12PendingPositionV1)>,
         },
         /// Only an empty pending directory remains after committed cleanup.
         CleanupCommitted {
@@ -714,6 +714,9 @@ mod generations_v1 {
                 return Err(io::Error::last_os_error().into());
             }
             let raw = unsafe { raw.assume_init() };
+            #[cfg(target_pointer_width = "64")]
+            let unit = raw.f_frsize;
+            #[cfg(not(target_pointer_width = "64"))]
             let unit = raw.f_frsize as u64;
             if unit == 0 {
                 return Err(C12MutationErrorV1::CorruptEvidence("allocation unit"));
@@ -1835,18 +1838,17 @@ mod generations_v1 {
                         "pending rollback/conflict",
                     ));
                 };
-            if let Some(source) = pending.cas_source {
-                if source.exact_digest().is_some() != base.participation_hash.is_some()
+            if let Some(source) = pending.cas_source
+                && (source.exact_digest().is_some() != base.participation_hash.is_some()
                     || (position == C12PendingPositionV1::Base
                         && current_body.as_deref().map(SyncDigestV1::digest)
-                            != source.exact_digest())
-                {
-                    return Err(C12MutationErrorV1::CorruptEvidence(
-                        "pending CAS source mismatch",
-                    ));
-                }
+                            != source.exact_digest()))
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "pending CAS source mismatch",
+                ));
             }
-            Some((pending, position))
+            Some((Box::new(pending), position))
         } else {
             if body_hash != marker.participation_hash {
                 return Err(C12MutationErrorV1::CorruptEvidence(
@@ -1953,6 +1955,7 @@ pub struct Participation {
     pub unresolved: Vec<String>,
 }
 
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
 fn path(state_dir: &Path) -> PathBuf {
     state_dir.join("sync").join(FILE)
 }

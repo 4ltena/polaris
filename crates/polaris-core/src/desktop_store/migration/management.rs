@@ -168,7 +168,7 @@ impl ManagementProjectObservationV2 {
             {
                 ManagementEffectInspectOpenV1::Present(history) => {
                     history.verify_read_snapshot().map_err(management_error)?;
-                    Some(history)
+                    Some(*history)
                 }
                 ManagementEffectInspectOpenV1::Absent => return Err(StoreError::RecoveryRequired),
             }
@@ -515,22 +515,19 @@ impl ManagementProjectObservationV2 {
         }
         let binding = ManagementMigrationBindingV2 {
             state_path: self.state.path.as_os_str().as_encoded_bytes().to_vec(),
-            migration_id: manifest.migration_id.as_hex().into(),
-            project_scope: manifest.project_scope.as_hex().into(),
+            migration_id: manifest.migration_id.as_hex(),
+            project_scope: manifest.project_scope.as_hex(),
             canonical_parent_anchor: EntryAnchorV2::of(&self.state.ancestor.metadata()?),
             retired_source_anchor: EntryAnchorV2::of(&self.source.ancestor.metadata()?),
             tombstone: TombstoneLedgerAnchorV1 {
                 anchor: EntryAnchorV2::of(&tombstone.file.metadata()?),
-                file_hash: ManagementEffectHashV1::digest(&tombstone.bytes)
-                    .as_hex()
-                    .into(),
+                file_hash: ManagementEffectHashV1::digest(&tombstone.bytes).as_hex(),
             },
             planned_active_v2_root_anchor: EntryAnchorV2::of(&stage.file.metadata()?),
             migration_manifest_hash: tree
                 .manifest_file_hash()
                 .map_err(management_error)?
-                .as_hex()
-                .into(),
+                .as_hex(),
         };
         self.verify_current()?;
         Ok(Some(binding))
@@ -625,10 +622,10 @@ impl ManagementProjectObservationV2 {
     }
     fn verify_workspace(&self) -> StoreResult<()> {
         self.workspace.verify_current()?;
-        if let Some(metadata) = &self.workspace_metadata {
-            if file_stamp(&self.workspace.ancestor.metadata()?) != file_stamp(metadata) {
-                return Err(StoreError::RecoveryRequired);
-            }
+        if let Some(metadata) = &self.workspace_metadata
+            && file_stamp(&self.workspace.ancestor.metadata()?) != file_stamp(metadata)
+        {
+            return Err(StoreError::RecoveryRequired);
         }
         if let (Some(owner), Some(lease)) = (&self.owner, &self.lease) {
             owner

@@ -1,15 +1,17 @@
 //! Read-only classification of decoded history before MCP store migration.
 //! These private checks prove neither root inventory completeness nor stopping.
 use super::*;
+#[cfg(test)]
 use polaris_provider::Role;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "migration_local.rs"]
 pub(in crate::desktop_store) mod local;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "migration_root.rs"]
 pub(in crate::desktop_store) mod root;
 
+#[cfg(test)]
 pub(in crate::desktop_store) fn validate_desktop(published: &Published) -> StoreResult<()> {
     validate_ledger(published)?;
     if published
@@ -26,6 +28,7 @@ pub(in crate::desktop_store) fn validate_desktop(published: &Published) -> Store
 
 /// The caller must supply one verified snapshot turn, including expired epochs.
 /// A decoded slice is not a filesystem capability or a global zero proof.
+#[cfg(test)]
 pub(in crate::desktop_store) fn validate_local_turn(
     events: &[RawEventV2],
     project: &str,
@@ -59,6 +62,7 @@ pub(in crate::desktop_store) fn validate_local_turn(
 }
 
 /// Shared typed tool evidence validation, without inferring prompt provenance.
+#[cfg(test)]
 pub(in crate::desktop_store) fn validate_local_tool_history(
     messages: &[Message],
 ) -> StoreResult<()> {
@@ -71,7 +75,7 @@ pub(in crate::desktop_store) fn validate_local_tool_history(
         });
         // Search/list/select return metadata, not an operation binding. Their
         // unfinished calls were already rejected by the complete-turn check.
-        if !alias && !(call.name == "mcp_catalog" && call.arguments["op"] == "read") {
+        if !(alias || call.name == "mcp_catalog" && call.arguments["op"] == "read") {
             continue;
         }
         let result = messages
@@ -87,7 +91,7 @@ pub(in crate::desktop_store) fn validate_local_tool_history(
 
 // Actual read-only session observations; the containing DesktopRoot inventory
 // and all other canonical/custom/local roots remain the outer owner's gate.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(in crate::desktop_store) struct DesktopSessionTransportInspectionV2 {
     parent: disk::Directory,
     parent_metadata: std::fs::Metadata,
@@ -98,16 +102,16 @@ pub(in crate::desktop_store) struct DesktopSessionTransportInspectionV2 {
     files: Vec<SessionFilePin>,
     published: Published,
 }
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 struct SessionFilePin {
     name: &'static str,
     file: File,
     metadata: std::fs::Metadata,
 }
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 const SESSION_FILES: [&str; 4] = ["desktop.jsonl", "raw.jsonl", "state.json", "writer.lock"];
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 impl DesktopSessionTransportInspectionV2 {
     pub(in crate::desktop_store) fn inspect(
         parent: &disk::Directory,
@@ -247,7 +251,7 @@ impl DesktopSessionTransportInspectionV2 {
         Ok(())
     }
 }
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(in crate::desktop_store) fn read_held_bytes(
     file: &File,
     metadata: &std::fs::Metadata,
@@ -290,7 +294,7 @@ pub(in crate::desktop_store) fn native_mount(
     }
     polaris_mcp::NativeMountIdentityV2::inspect(file).map_err(|_| StoreError::RecoveryRequired)
 }
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(in crate::desktop_store) fn file_stamp(
     metadata: &std::fs::Metadata,
 ) -> (u64, u64, u32, u32, u64, u64, i64, i64, i64, i64) {

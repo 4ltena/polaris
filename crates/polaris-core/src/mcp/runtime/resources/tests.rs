@@ -922,7 +922,11 @@ fn no_exec_http_has_no_resource_witnesses_or_filesystem_effects() {
     };
     let before = inventory(&base);
     let scratch_before = scratch_preparations();
-    assert!(no_exec(&registry, &[base.clone()]).unwrap().is_empty());
+    assert!(
+        no_exec(&registry, std::slice::from_ref(&base))
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(inventory(&base), before);
     assert_eq!(scratch_preparations(), scratch_before);
 }

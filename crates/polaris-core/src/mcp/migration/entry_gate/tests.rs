@@ -207,6 +207,7 @@ fn live_entry_candidate_is_never_counted_as_stopped() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn native_inventory_refuses_owned_live_entry_then_requires_complete_stop_proof() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

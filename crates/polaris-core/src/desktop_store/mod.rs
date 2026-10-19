@@ -11,7 +11,7 @@ mod disk;
 mod goal;
 pub mod hub;
 mod memory;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) mod migration;
 mod model;
 mod roles;

@@ -2842,11 +2842,13 @@ fn real_execution_capability_is_forwarded_and_invalid_scope_prevents_provider() 
                 // A legacy policy lacks the prepared isolated boundary. If the
                 // engine discards this field, the provider would wrongly run.
                 ConfirmedExecutionCapability::ConfinedCode {
-                    scope: SandboxPolicy::new(
-                        SandboxMode::WorkspaceWrite,
-                        &[inputs.prepared.snapshot().path().to_owned()],
-                    )
-                    .unwrap(),
+                    scope: Box::new(
+                        SandboxPolicy::new(
+                            SandboxMode::WorkspaceWrite,
+                            &[inputs.prepared.snapshot().path().to_owned()],
+                        )
+                        .unwrap(),
+                    ),
                 }
             } else {
                 ConfirmedExecutionCapability::FixedHelpersOnly

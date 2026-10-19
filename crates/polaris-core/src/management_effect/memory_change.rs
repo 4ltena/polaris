@@ -400,19 +400,19 @@ impl MemoryChangeOwnerV1<'_> {
                 return Err(error.to_string());
             }
         };
-        if let Some(plan) = removal {
-            if let Err(error) = plan.remove() {
-                self.effects
-                    .mark_outcome_unknown(
-                        self.lease,
-                        &started,
-                        ManagementUnknownReasonV1::InterruptedAfterStart,
-                    )
-                    .map_err(|e| e.to_string())?;
-                return Err(format!(
-                    "索引削除は保存済みです。保管原文の削除結果は不明です: {error}"
-                ));
-            }
+        if let Some(plan) = removal
+            && let Err(error) = plan.remove()
+        {
+            self.effects
+                .mark_outcome_unknown(
+                    self.lease,
+                    &started,
+                    ManagementUnknownReasonV1::InterruptedAfterStart,
+                )
+                .map_err(|e| e.to_string())?;
+            return Err(format!(
+                "索引削除は保存済みです。保管原文の削除結果は不明です: {error}"
+            ));
         }
         let evidence = receipt_hash(&receipt)?;
         if self
@@ -664,7 +664,7 @@ fn named_identity(parent: &File, name: &[u8], metadata: &fs::Metadata) -> io::Re
     }
     let entry = unsafe { entry.assume_init() };
     if entry.st_dev as u64 != metadata.dev()
-        || entry.st_ino as u64 != metadata.ino()
+        || entry.st_ino != metadata.ino()
         || entry.st_mode & libc::S_IFMT == libc::S_IFLNK
     {
         return Err(io::Error::from_raw_os_error(libc::ESTALE));

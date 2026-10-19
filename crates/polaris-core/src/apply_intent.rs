@@ -164,7 +164,7 @@ pub fn d27_management_operation_id(binding: Hash) -> Result<ManagementOperationI
         .map_err(|_| ApplyIntentError::Invalid("operation id"))
 }
 fn raw_hex(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(ApplyIntentError::Invalid("hex length"));
     }
     value
@@ -472,7 +472,7 @@ pub fn allocated_bytes(bytes: u64, unit: u64) -> Result<u64> {
         return Err(ApplyIntentError::Invalid("zero allocation unit"));
     }
     let units = (bytes / unit)
-        .checked_add(u64::from(bytes % unit != 0))
+        .checked_add(u64::from(!bytes.is_multiple_of(unit)))
         .ok_or(ApplyIntentError::Overflow)?;
     units.checked_mul(unit).ok_or(ApplyIntentError::Overflow)
 }
@@ -641,7 +641,9 @@ fn sample_statvfs(file: &File) -> Result<(u64, u64)> {
         return Err(std::io::Error::last_os_error().into());
     }
     let value = unsafe { value.assume_init() };
-    let unit = value.f_frsize as u64;
+    let unit = value.f_frsize;
+    #[cfg(target_pointer_width = "32")]
+    let unit = u64::from(unit);
     Ok((unit, available_from_statvfs(unit, value.f_bavail as u64)?))
 }
 
@@ -901,13 +903,12 @@ impl CapacityPlanV1 {
                 "capacity inventory or binding presence",
             ));
         }
-        if let Some(binding) = input.d27_source_binding {
-            if binding.manifest.project_request()? != *input.request
+        if let Some(binding) = input.d27_source_binding
+            && (binding.manifest.project_request()? != *input.request
                 || binding.source_before_hash != input.source_before.observation_hash()?
-                || binding.source_before_bytes != source_before_bytes
-            {
-                return Err(ApplyIntentError::Invalid("capacity binding artifacts"));
-            }
+                || binding.source_before_bytes != source_before_bytes)
+        {
+            return Err(ApplyIntentError::Invalid("capacity binding artifacts"));
         }
         let records = management_append_lengths(input.prepare)?;
         let append = sum(records.iter().copied())?;
@@ -1217,13 +1218,12 @@ impl CapacityPlanV1 {
         if let (Some(result), Some(remaining)) = (
             self.desktop_result_required_bytes,
             self.desktop_bytes_remaining_at_admission,
-        ) {
-            if result > 1024 * 1024 || remaining < 1024 * 1024 {
-                return Err(ApplyIntentError::Capacity("desktop result"));
-            }
-            // Updating an existing candidate consumes no new record slot. The
-            // full pending-result reserve is checked by the Desktop validator.
+        ) && (result > 1024 * 1024 || remaining < 1024 * 1024)
+        {
+            return Err(ApplyIntentError::Capacity("desktop result"));
         }
+        // Updating an existing candidate consumes no new record slot. The
+        // full pending-result reserve is checked by the Desktop validator.
         Ok(())
     }
     fn check_physical_admission(&self) -> Result<()> {
@@ -2434,7 +2434,7 @@ impl IntentDirectory {
         let metadata = unsafe { metadata.assume_init() };
         Ok(IdentityV1 {
             device: metadata.st_dev as u64,
-            inode: metadata.st_ino as u64,
+            inode: metadata.st_ino,
         })
     }
     fn open_file(&self, name: &str, write: bool, create: bool) -> Result<File> {
@@ -2876,10 +2876,10 @@ impl<'lease> ApplyIntentStoreV1<'lease> {
     /// A staging or active intent is retained evidence even without management.
     pub(crate) fn require_idle(&self) -> Result<()> {
         self.verify()?;
-        if let Some(root) = &self.root {
-            if !root.child("staging", false)?.names(Some(1))?.is_empty() {
-                return Err(ApplyIntentError::Invalid("staging apply intent"));
-            }
+        if let Some(root) = &self.root
+            && !root.child("staging", false)?.names(Some(1))?.is_empty()
+        {
+            return Err(ApplyIntentError::Invalid("staging apply intent"));
         }
         if self.active()?.is_some() {
             return Err(ApplyIntentError::Invalid("active apply intent"));
@@ -2983,15 +2983,14 @@ impl<'lease> ApplyIntentStoreV1<'lease> {
         }
         self.verify()?;
         let key = descriptor.operation_key.as_hex();
-        if let Some(root) = &self.root {
-            if !root.child("staging", false)?.names(Some(1))?.is_empty()
+        if let Some(root) = &self.root
+            && (!root.child("staging", false)?.names(Some(1))?.is_empty()
                 || self.active()?.is_some()
-                || self.archived(descriptor.operation_key)?.is_some()
-            {
-                return Err(ApplyIntentError::Invalid(
-                    "occupied intent slot or archive collision",
-                ));
-            }
+                || self.archived(descriptor.operation_key)?.is_some())
+        {
+            return Err(ApplyIntentError::Invalid(
+                "occupied intent slot or archive collision",
+            ));
         }
         let mut nonce = [0_u8; 12];
         getrandom::fill(&mut nonce)

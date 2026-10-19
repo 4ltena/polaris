@@ -8,6 +8,7 @@ use std::{
 };
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn management_payload_binds_every_completed_project_and_rejects_structural_omission() {
     let (_fixture, admission, states) = super::super::tests::management_fixture_history(true);
     assert!(
@@ -171,6 +172,7 @@ fn populated(admission: &mut MigrationAdmissionV2, parent: &Path) {
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn physical_staging_copies_transforms_fsyncs_and_validates_without_epoch_or_activation() {
     let (_root, mut admission, session, parent) = super::super::tests::fixture(true);
     populated(&mut admission, &parent);
@@ -253,6 +255,7 @@ fn physical_staging_copies_transforms_fsyncs_and_validates_without_epoch_or_acti
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn physical_staging_faults_preserve_source_partial_stage_and_migrating_gate() {
     for point in [
         "after-staging-root",
@@ -455,6 +458,7 @@ fn staging_builder_copies_large_package_under_process_fd_limit() {
 }
 
 #[test]
+#[ignore = "requires a quiescent disposable OS account; v1.x MCP M1 acceptance"]
 fn physical_staging_streams_unregistered_pins_with_optional_serial_fd_limit() {
     // Ordinary parallel runs never change a process-global limit. Only an
     // explicitly opted-in disposable Cargo child with one test thread may do so.

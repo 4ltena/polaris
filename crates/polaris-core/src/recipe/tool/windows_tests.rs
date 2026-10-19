@@ -1,3 +1,4 @@
+//! Windows recipe setting refusal tests that preserve project state and avoid approval requests.
 use super::*;
 use crate::approval::{ApprovalPolicy, Decision};
 use polaris_sandbox::SandboxMode;

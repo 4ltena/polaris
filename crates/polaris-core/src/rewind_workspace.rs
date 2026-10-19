@@ -823,7 +823,7 @@ impl WorkspaceOwner {
         let state_dir = self.management_state_dir()?;
         ManagementEffectStoreV1::verify_rewind_crossing_for_project_at_state_dir(
             &self.project_root,
-            &state_dir,
+            state_dir,
             lease,
             from,
             through,
@@ -1507,10 +1507,10 @@ impl WorkspaceOwner {
                 .ok_or_else(|| WorkspaceError::at(ErrorKind::InvalidTransaction, &path))?
                 .parse()
                 .map_err(|_| WorkspaceError::at(ErrorKind::InvalidTransaction, &path))?;
-            if let Some(candidate) = self.load_marker(&id)?.candidate_session_id {
-                if !candidates.insert(candidate) {
-                    return Err(WorkspaceError::new(ErrorKind::InvalidTransaction));
-                }
+            if let Some(candidate) = self.load_marker(&id)?.candidate_session_id
+                && !candidates.insert(candidate)
+            {
+                return Err(WorkspaceError::new(ErrorKind::InvalidTransaction));
             }
         }
         Ok(candidates.into_iter().collect())
@@ -1868,7 +1868,7 @@ impl WorkspaceOwner {
         let state_dir = self.management_state_dir()?;
         ManagementEffectStoreV1::rewind_checkpoint_for_project_at_state_dir(
             &self.project_root,
-            &state_dir,
+            state_dir,
             lease,
         )
         .map_err(|_| WorkspaceError::new(ErrorKind::IneligiblePolicy))

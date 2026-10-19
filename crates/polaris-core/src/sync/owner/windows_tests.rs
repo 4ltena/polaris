@@ -1,3 +1,4 @@
+//! Windows sync remote intent owner refusal and storage preservation tests.
 use super::*;
 
 fn assert_unavailable(path: &Path) {

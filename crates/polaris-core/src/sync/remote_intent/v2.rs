@@ -112,6 +112,7 @@ impl SyncPayloadDescriptorV1 {
     pub fn digest(&self) -> SyncDigestV1 {
         self.digest
     }
+    #[cfg(test)]
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
@@ -1042,5 +1043,5 @@ mod tests;
 #[cfg(test)]
 pub(crate) use tests::{
     c10_test_history, c10_test_identity, c10_test_no_intent, c10_test_oid, c10_test_prepared,
-    c10_test_receipt, c10_test_unknown,
+    c10_test_receipt,
 };

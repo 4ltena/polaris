@@ -128,14 +128,14 @@ mod registered_layout_tests {
             layout.readable_roots(),
             &[workspace.clone(), runtime.clone()]
         );
-        assert_eq!(layout.writable_roots(), &[workspace.clone()]);
+        assert_eq!(layout.writable_roots(), std::slice::from_ref(&workspace));
         assert!(layout.contains_readable(&workspace.join("index.js")));
         assert!(!layout.contains_readable(&root.join("foreign/index.js")));
         assert!(
             SandboxPolicy::isolated_registered(
                 SandboxMode::WorkspaceWrite,
                 &workspace,
-                &[runtime.clone()],
+                std::slice::from_ref(&runtime),
             )
             .is_err()
         );
@@ -158,9 +158,14 @@ mod registered_layout_tests {
             SandboxMode::FullAccess,
         ] {
             let layout =
-                RegisteredBoundaryLayout::new(mode, &workspace, &[runtime.clone()]).unwrap();
-            let live =
-                SandboxPolicy::isolated_registered(mode, &workspace, &[runtime.clone()]).unwrap();
+                RegisteredBoundaryLayout::new(mode, &workspace, std::slice::from_ref(&runtime))
+                    .unwrap();
+            let live = SandboxPolicy::isolated_registered(
+                mode,
+                &workspace,
+                std::slice::from_ref(&runtime),
+            )
+            .unwrap();
             let boundary = live.isolated_boundary().unwrap();
             assert_eq!(layout.workspace(), boundary.workspace);
             assert_eq!(layout.readable_roots(), boundary.readable_roots);

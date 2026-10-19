@@ -4,13 +4,15 @@
 //! existing files only; a legacy installation with no gate stays explicit.
 //! A migration holds the exclusive lock through stop-proof and publication.
 
+#[cfg(test)]
+pub(crate) use polaris_tools::entry_kernel::physical_directory;
 pub use polaris_tools::entry_kernel::{
     ENTRY_MANIFEST, EntryAnchorV2, EntryGateErrorV2, GATE_FILE, GATE_LOCK,
     ProductionBinaryIdentityV2, ProductionEntryGateV2, ProductionEntryIdentityV2,
     ProductionEntryKindV2, ProductionEntryManifestV2,
 };
 pub(crate) use polaris_tools::entry_kernel::{
-    child, child_bytes, owned_directory, physical_directory, private_file, valid_digest,
+    child, child_bytes, owned_directory, private_file, valid_digest,
 };
 use polaris_tools::entry_kernel::{
     decode, lock_shared, physical_search_directory, read_optional, runtime_copy_anchors,

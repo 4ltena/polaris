@@ -209,10 +209,10 @@ impl SessionManagerTransportInspectionV2 {
             {
                 return Err(StoreError::RecoveryRequired);
             }
-            if let Some(names) = &pin.names {
-                if pin.directory.names_bounded_migration(names.len())? != *names {
-                    return Err(StoreError::RecoveryRequired);
-                }
+            if let Some(names) = &pin.names
+                && pin.directory.names_bounded_migration(names.len())? != *names
+            {
+                return Err(StoreError::RecoveryRequired);
             }
             if file_stamp(&file.metadata()?) != file_stamp(&pin.metadata) {
                 return Err(StoreError::RecoveryRequired);
@@ -285,12 +285,10 @@ mod tests {
         drop(store);
         (root, directory)
     }
-    fn snapshot(path: &Path) -> Vec<(String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64))> {
-        fn visit(
-            base: &Path,
-            path: &Path,
-            entries: &mut Vec<(String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64))>,
-        ) {
+    type SnapshotEntry = (String, Vec<u8>, (u64, u64, u32, u64, i64, i64, i64, i64));
+
+    fn snapshot(path: &Path) -> Vec<SnapshotEntry> {
+        fn visit(base: &Path, path: &Path, entries: &mut Vec<SnapshotEntry>) {
             for entry in std::fs::read_dir(path).unwrap() {
                 let path = entry.unwrap().path();
                 let m = path.symlink_metadata().unwrap();

@@ -1,3 +1,4 @@
+//! Windows read-only TUI interaction, secret scrubbing and terminal restoration tests.
 use super::*;
 use ratatui::backend::TestBackend;
 use std::cell::Cell;

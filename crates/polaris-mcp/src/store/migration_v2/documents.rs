@@ -297,9 +297,12 @@ fn stable(a: &Metadata, b: &Metadata) -> bool {
             == (b.mtime(), b.mtime_nsec(), b.ctime(), b.ctime_nsec())
 }
 #[cfg(test)]
+type AbsentDocumentHook = Box<dyn FnOnce(&str)>;
+
+#[cfg(test)]
 std::thread_local! {
     // One-shot thread-owned injection only after the exact absence read.
-    static AFTER_ABSENT_DOCUMENT: std::cell::RefCell<Option<Box<dyn FnOnce(&str)>>> =
+    static AFTER_ABSENT_DOCUMENT: std::cell::RefCell<Option<AbsentDocumentHook>> =
         const { std::cell::RefCell::new(None) };
 }
 fn storage(_: io::Error) -> Error {

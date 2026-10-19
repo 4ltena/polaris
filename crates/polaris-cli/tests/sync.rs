@@ -158,12 +158,11 @@ fn remote(directory: &Path) -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn tree_snapshot(root: &Path) -> Vec<(PathBuf, bool, u64, u64, u32, u64, i64, i64, Vec<u8>)> {
-    fn visit(
-        root: &Path,
-        path: &Path,
-        entries: &mut Vec<(PathBuf, bool, u64, u64, u32, u64, i64, i64, Vec<u8>)>,
-    ) {
+type TreeSnapshotEntry = (PathBuf, bool, u64, u64, u32, u64, i64, i64, Vec<u8>);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_snapshot(root: &Path) -> Vec<TreeSnapshotEntry> {
+    fn visit(root: &Path, path: &Path, entries: &mut Vec<TreeSnapshotEntry>) {
         use std::os::unix::fs::MetadataExt;
         let metadata = fs::symlink_metadata(path).unwrap();
         let is_dir = metadata.is_dir();

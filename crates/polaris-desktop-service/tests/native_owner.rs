@@ -51,6 +51,7 @@ async fn frame(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC frame deadline"))?
 }
 #[tokio::test]
+#[ignore = "requires a disposable macOS OS account; v1.x native desktop owner acceptance"]
 async fn native_owner_main_and_recovery_hello_then_eof_release_store() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/", listener.local_addr().unwrap());

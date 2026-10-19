@@ -467,7 +467,7 @@ fn mapped_registry_closes_schema_reference_every_server_and_project_exclusions()
     let cwd = view.logical_root().join("servers/example");
     // Disabled servers are still admitted, but selected-project exclusions only
     // apply when that project is enabled, matching ordinary no-exec admission.
-    validate(&registry, &[cwd.clone()], admission_limits()).unwrap();
+    validate(&registry, std::slice::from_ref(&cwd), admission_limits()).unwrap();
     registry.servers[0]
         .enabled_projects
         .insert("selected".into());
@@ -537,7 +537,7 @@ fn mapped_registry_uses_explicit_live_external_resources_and_same_fd_script_hash
         &credential,
         crate::admission::ProjectAdmissionScope::new("project", &[]),
         home,
-        &[install.clone()],
+        std::slice::from_ref(&install),
         admission_limits(),
     )
     .unwrap();
@@ -611,7 +611,7 @@ fn mapped_registry_admits_inventoried_install_root_with_live_cwd() {
             &view,
             &registry,
             &credential,
-            crate::admission::ProjectAdmissionScope::new("selected", &[root.clone()]),
+            crate::admission::ProjectAdmissionScope::new("selected", std::slice::from_ref(&root)),
             home,
             &[],
             admission_limits(),
@@ -674,7 +674,7 @@ fn mapped_registry_final_close_rejects_first_pin_changed_after_later_admission()
             &credential,
             crate::admission::ProjectAdmissionScope::new("project", &[]),
             home,
-            &[install.clone()],
+            std::slice::from_ref(&install),
             admission_limits(),
         )
         .unwrap();

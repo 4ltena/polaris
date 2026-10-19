@@ -277,6 +277,7 @@ fn local_prompt_intent(
     Ok(value)
 }
 
+#[cfg(test)]
 pub(in crate::desktop_store) fn inspect_local_terminal(
     message: &Message,
     project: &str,

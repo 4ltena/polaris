@@ -36,7 +36,12 @@ fn m2a_d27_fixture() -> (
     use polaris_desktop_protocol::{ids::*, snapshot::ApprovalDecision};
     let (source_owner, source) = fixture();
     fs::write(source.join("changed"), b"before").unwrap();
-    fs::set_permissions(source.join("changed"), Permissions::from_mode(0o6755)).unwrap();
+    // macOS sandbox may strip setid bits; retain a sticky bit as observed evidence.
+    fs::set_permissions(source.join("changed"), Permissions::from_mode(0o1755)).unwrap();
+    assert_eq!(
+        fs::metadata(source.join("changed")).unwrap().mode() & 0o7777,
+        0o1755
+    );
     fs::write(source.join("deleted"), b"delete").unwrap();
     fs::write(source.join("unchanged"), b"retain").unwrap();
     let snapshot = snapshot(&source, &empty(), limits()).unwrap();
@@ -200,7 +205,7 @@ fn m2a_d27_projection_reads_changed_subset_and_keeps_observed_and_normal_modes()
     let old = changed.before.as_ref().unwrap();
     let new = changed.after.as_ref().unwrap();
     assert_eq!(old.normal_mode, 0o755);
-    assert_eq!(old.observed_mode, 0o6755);
+    assert_eq!(old.observed_mode, 0o1755);
     assert_eq!(new.normal_mode, 0o640);
     assert_eq!(new.observed_mode, 0o640);
     assert_eq!(old.bytes, 6);
@@ -228,7 +233,7 @@ fn m2a_d27_projection_reads_changed_subset_and_keeps_observed_and_normal_modes()
             .as_ref()
             .unwrap()
             .observed_mode,
-        0o6755
+        0o1755
     );
     assert!(artifacts.request.entries[1].before.is_none());
     assert!(artifacts.request.entries[2].after.is_none());
@@ -314,7 +319,11 @@ fn m2a_d27_projection_refuses_each_payload_field_and_changed_manifest_field_with
             8 => payload.entries.push(payload.entries[0].clone()),
             9 => payload.entries[0].relative_path = "missing".into(),
             10 => payload.entries[0].before.as_mut().unwrap().hash = "1".repeat(64),
-            11 => payload.entries[0].before.as_mut().unwrap().mode = 0o755,
+            11 => {
+                let before = payload.entries[0].before.as_mut().unwrap();
+                assert_ne!(before.mode, 0o755);
+                before.mode = 0o755;
+            }
             12 => payload.entries[0].after.as_mut().unwrap().hash = "2".repeat(64),
             13 => payload.entries[0].after.as_mut().unwrap().mode = 0o600,
             14 => payload.entries[0].before = None,
@@ -455,9 +464,16 @@ fn m2a_d27_projection_retains_copy_observed_bits_without_installing_them() {
     let (_source, snapshot, _changes, _recovery, recovery, mut record) = m2a_d27_fixture();
     fs::set_permissions(
         snapshot.path().join("changed"),
-        Permissions::from_mode(0o4640),
+        Permissions::from_mode(0o1640),
     )
     .unwrap();
+    assert_eq!(
+        fs::metadata(snapshot.path().join("changed"))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o1640
+    );
     let changes = collect_changes(&snapshot, &empty(), limits()).unwrap();
     // The approved payload's after mode remains ordinary 0640.
     record.candidate.payload_hash = record.candidate.payload.payload_hash().unwrap();
@@ -469,7 +485,7 @@ fn m2a_d27_projection_retains_copy_observed_bits_without_installing_them() {
         .as_ref()
         .unwrap();
     assert_eq!(version.normal_mode, 0o640);
-    assert_eq!(version.observed_mode, 0o4640);
+    assert_eq!(version.observed_mode, 0o1640);
     assert_eq!(
         artifacts.request.entries[0].after.as_ref().unwrap().mode,
         0o640
@@ -479,7 +495,7 @@ fn m2a_d27_projection_retains_copy_observed_bits_without_installing_them() {
             .unwrap()
             .mode()
             & 0o7777,
-        0o4640
+        0o1640
     );
 }
 

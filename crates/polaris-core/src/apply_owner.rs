@@ -605,13 +605,12 @@ impl ApplyOwnerV1 {
             initializing,
         )?;
         let inspected = self.inspect_management()?;
-        if let ManagementEffectInspectOpenV1::Present(value) = &inspected {
-            if value
+        if let ManagementEffectInspectOpenV1::Present(value) = &inspected
+            && value
                 .effects()
                 .any(|effect| effect.request.operation_id == admission.management_operation_id)
-            {
-                return Err(ApplyOwnerError::EvidenceMismatch);
-            }
+        {
+            return Err(ApplyOwnerError::EvidenceMismatch);
         }
         require_absent_child(&recovery_directory, &recovery_child(operation_key)?)?;
         let (record_limit, records_remaining, bytes_remaining) = match &inspected {
@@ -986,7 +985,12 @@ impl ApplyOwnerV1 {
                 crate::isolated_workspace::RegisteredSecrets::from_auth_registry(registered)
                     .map_err(|_| ApplyOwnerError::EvidenceMismatch)?;
             self.begin_d27_protected(
-                writer, admission, snapshot, changes, limits, parent, &secrets,
+                writer,
+                admission,
+                (snapshot, changes),
+                limits,
+                parent,
+                &secrets,
             )
         })
         .map_err(|_| ApplyOwnerError::EvidenceMismatch)?
@@ -997,8 +1001,10 @@ impl ApplyOwnerV1 {
         self,
         writer: &mut crate::desktop_store::Writer,
         admission: D27ApplyAdmissionV1,
-        snapshot: &crate::isolated_workspace::Snapshot,
-        changes: &crate::isolated_workspace::ChangeSet,
+        (snapshot, changes): (
+            &crate::isolated_workspace::Snapshot,
+            &crate::isolated_workspace::ChangeSet,
+        ),
         limits: crate::isolated_workspace::Limits,
         parent: &crate::workspace_apply::RecoveryParent,
         secrets: &crate::isolated_workspace::RegisteredSecrets,
@@ -1060,11 +1066,9 @@ impl ApplyOwnerV1 {
             &admission.target,
             &admission.approval_id,
             &admission.payload_hash,
-            admission.guard,
-            admission.proof,
+            (admission.guard, admission.proof),
             project_binding,
-            admission.result_id,
-            result_capacity,
+            (admission.result_id, result_capacity),
         )?;
         let precommit = token.precommit().clone();
         let state_file = open_directory_nofollow(&self.state_dir)?;
@@ -1076,13 +1080,12 @@ impl ApplyOwnerV1 {
         let roots =
             CapacityRootsV1::from_pinned_files(&state_file, &recovery_file, Some(&desktop_file))?;
         let inspected = self.inspect_management()?;
-        if let ManagementEffectInspectOpenV1::Present(value) = &inspected {
-            if value
+        if let ManagementEffectInspectOpenV1::Present(value) = &inspected
+            && value
                 .effects()
                 .any(|effect| effect.request.operation_id == management_id)
-            {
-                return Err(ApplyOwnerError::EvidenceMismatch);
-            }
+        {
+            return Err(ApplyOwnerError::EvidenceMismatch);
         }
         require_absent_child(&recovery_file, &recovery_child(operation_key)?)?;
         let (record_limit, records_remaining, bytes_remaining) = match &inspected {
@@ -1496,13 +1499,13 @@ impl ApplyOwnerV1 {
         }
         let key = intent.descriptor().operation_key;
         let inspected = self.inspect_management()?;
-        if let ManagementEffectInspectOpenV1::Present(value) = &inspected {
-            if value.effects().any(|e| {
+        if let ManagementEffectInspectOpenV1::Present(value) = &inspected
+            && value.effects().any(|e| {
                 e.request.operation_id != intent.descriptor().management_operation_id
                     && e.state.blocks_new_work()
-            }) {
-                return Err(ApplyOwnerError::EvidenceMismatch);
-            }
+            })
+        {
+            return Err(ApplyOwnerError::EvidenceMismatch);
         }
         if intent.latest().phase.is_terminal() {
             if let ApplyEvidenceV1::Completed { readback_hash, .. } = intent.latest().evidence {
@@ -1599,7 +1602,7 @@ impl ApplyOwnerV1 {
             self.archive_terminal_joined(Some(&store))?;
             return Ok(ApplyOwnerRecoveryV1::Archived(key));
         }
-        let token = self.join_management_recovery(inspected)?;
+        let token = self.join_management_recovery(*inspected)?;
         let (store, event) = self.recover_joined_store(token, parent)?;
         if self
             .active()?
@@ -1687,8 +1690,7 @@ impl ApplyOwnerV1 {
             &precommit,
             descriptor,
             binding,
-            &intent.request,
-            &intent.source_before,
+            (&intent.request, &intent.source_before),
             &Self::management_request(descriptor)?,
             None,
         )?;
@@ -1707,7 +1709,7 @@ impl ApplyOwnerV1 {
                     let seal = if state.is_terminal() {
                         false
                     } else {
-                        self.join_management_recovery(inspected)?
+                        self.join_management_recovery(*inspected)?
                             .requires_generation_seal()?
                     };
                     (state, seal)
@@ -1837,8 +1839,7 @@ impl ApplyOwnerV1 {
             &precommit,
             descriptor,
             binding,
-            &intent.request,
-            &intent.source_before,
+            (&intent.request, &intent.source_before),
             &generic.request,
             Some((&bytes, hash)),
         )?;
@@ -1924,7 +1925,7 @@ impl ApplyOwnerV1 {
             return Err(ApplyOwnerError::EvidenceMismatch);
         }
         // All read-only joins precede generic or desktop publication repair.
-        let token = self.join_management_recovery(inspected)?;
+        let token = self.join_management_recovery(*inspected)?;
         self.require_live_capacity(
             &descriptor.capacity_plan,
             &recovery_directory,
@@ -2549,10 +2550,10 @@ impl ApplyOwnerV1 {
         {
             return Err(ApplyOwnerError::EvidenceMismatch);
         }
-        if let Some(binding) = &intent.d27_source_binding {
-            if parent.provenance() != Path::new(&binding.manifest.recovery_parent_path) {
-                return Err(ApplyOwnerError::EvidenceMismatch);
-            }
+        if let Some(binding) = &intent.d27_source_binding
+            && parent.provenance() != Path::new(&binding.manifest.recovery_parent_path)
+        {
+            return Err(ApplyOwnerError::EvidenceMismatch);
         }
         let child = crate::workspace_apply::inspect_reserved_recovery_v2(
             parent,
@@ -3326,8 +3327,7 @@ impl D27ApplyOperationV1 {
             &self.precommit,
             intent.descriptor(),
             binding,
-            &intent.request,
-            &intent.source_before,
+            (&intent.request, &intent.source_before),
             &snapshot.request,
             Some((&report_bytes, hash)),
         )?;
@@ -3636,7 +3636,9 @@ fn request_from_changes(
     Ok(request)
 }
 
-fn directory_chain(path: &Path) -> Result<Vec<(PathBuf, (u64, u64))>, ApplyOwnerError> {
+type DirectoryChain = Vec<(PathBuf, (u64, u64))>;
+
+fn directory_chain(path: &Path) -> Result<DirectoryChain, ApplyOwnerError> {
     use std::os::unix::fs::MetadataExt;
     let mut prefix = PathBuf::from("/");
     let mut result = Vec::new();
@@ -3731,7 +3733,7 @@ fn read_report_bytes(directory: &std::fs::File, maximum: u64) -> Result<Vec<u8>,
         return Err(std::io::Error::last_os_error().into());
     }
     let attached = unsafe { attached.assume_init() };
-    if (attached.st_dev as u64, attached.st_ino as u64) != (metadata.dev(), metadata.ino())
+    if (attached.st_dev as u64, attached.st_ino) != (metadata.dev(), metadata.ino())
         || bytes.len() as u64 != metadata.len()
         || (
             now.len(),
@@ -3919,6 +3921,9 @@ mod tests {
                 std::fs::create_dir(path).unwrap();
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
+            // The fixture is its own project even beneath the repository's target.
+            std::fs::create_dir(project.join(".git")).unwrap();
+            assert_eq!(crate::project::resolve_root(&project), project);
             std::fs::write(project.join("main.rs"), b"before\n").unwrap();
             let revision = RevisionV1 {
                 kind: RevisionKindV1::GitSha1,
@@ -4089,6 +4094,9 @@ mod tests {
             std::fs::create_dir(path).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+        // The fixture is its own project even beneath the repository's target.
+        std::fs::create_dir(project.join(".git")).unwrap();
+        assert_eq!(crate::project::resolve_root(&project), project);
         std::fs::write(project.join("main.rs"), b"before\n").unwrap();
         let revision = RevisionV1 {
             kind: RevisionKindV1::GitSha1,

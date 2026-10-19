@@ -116,6 +116,9 @@ impl Anchor {
     fn stat(m: &libc::stat) -> Self {
         Self {
             dev: m.st_dev as u64,
+            #[cfg(target_pointer_width = "64")]
+            ino: m.st_ino,
+            #[cfg(not(target_pointer_width = "64"))]
             ino: m.st_ino as u64,
             uid: m.st_uid,
             mode: m.st_mode as u32,
@@ -681,7 +684,7 @@ impl C10RepositorySnapshotV1 {
 }
 pub(crate) enum C10RepositoryInspectionV1 {
     Absent(C10AbsentRepositoryV1),
-    Existing(C10LocalRepositoryV1),
+    Existing(Box<C10LocalRepositoryV1>),
 }
 pub(crate) struct C10AbsentRepositoryV1 {
     state: DirectoryPath,
@@ -1066,7 +1069,7 @@ fn validate_full_index(bytes: &[u8]) -> Result<usize> {
             .try_into()
             .map_err(|_| C10RepositoryErrorV1::Protection)?,
     ) as usize;
-    if !matches!(version, 2 | 3 | 4) || count > MAX_FILES {
+    if !matches!(version, 2..=4) || count > MAX_FILES {
         return Err(C10RepositoryErrorV1::Protection);
     }
     let trailer = bytes.len() - 20;
@@ -1400,7 +1403,7 @@ impl C10LocalRepositoryV1 {
             config,
         };
         result.verify()?;
-        Ok(C10RepositoryInspectionV1::Existing(result))
+        Ok(C10RepositoryInspectionV1::Existing(Box::new(result)))
     }
     fn verify(&self) -> Result<()> {
         self.state.verify()?;
@@ -1775,7 +1778,7 @@ impl C10LocalRepositoryV1 {
         drop(self);
         fault(FaultPoint::Reopen)?;
         match Self::inspect(&state, &git)? {
-            C10RepositoryInspectionV1::Existing(repository) => Ok(repository),
+            C10RepositoryInspectionV1::Existing(repository) => Ok(*repository),
             C10RepositoryInspectionV1::Absent(_) => Err(C10RepositoryErrorV1::Corrupt),
         }
     }
@@ -2567,7 +2570,7 @@ impl C10AbsentRepositoryV1 {
         drop(sync);
         drop(self);
         match C10LocalRepositoryV1::inspect(&state, &git)? {
-            C10RepositoryInspectionV1::Existing(repository) => Ok(repository),
+            C10RepositoryInspectionV1::Existing(repository) => Ok(*repository),
             _ => Err(C10RepositoryErrorV1::Corrupt),
         }
     }
@@ -3262,9 +3265,11 @@ enum FaultPoint {
     Readback,
 }
 #[cfg(all(test, unix))]
+type AfterEofHook = ((u64, u64), Box<dyn FnOnce()>);
+#[cfg(all(test, unix))]
 thread_local! {
     static FAILURE:std::cell::Cell<Option<FaultPoint>>=const {std::cell::Cell::new(None)};
-    static AFTER_EOF:std::cell::RefCell<Option<((u64,u64),Box<dyn FnOnce()>)>>=const {std::cell::RefCell::new(None)};
+    static AFTER_EOF:std::cell::RefCell<Option<AfterEofHook>>=const {std::cell::RefCell::new(None)};
 }
 #[cfg(unix)]
 fn fault(point: FaultPoint) -> Result<()> {

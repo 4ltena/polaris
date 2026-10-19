@@ -148,10 +148,10 @@ impl CommandScratch {
 impl Drop for CommandScratch {
     fn drop(&mut self) {
         // Never remove a changed namespace or scratch still used by an unconfirmed child.
-        if self.preserve.get() || self.revalidate().is_err() {
-            if let Some(directory) = self.directory.take() {
-                let _ = directory.keep();
-            }
+        if (self.preserve.get() || self.revalidate().is_err())
+            && let Some(directory) = self.directory.take()
+        {
+            let _ = directory.keep();
         }
     }
 }

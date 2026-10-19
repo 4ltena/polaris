@@ -564,10 +564,10 @@ fn mount_identity(file: &File) -> Result<MountIdentityV2, Error> {
     let identity = platform_mount_identity(file)?;
     #[cfg(test)]
     {
-        return MOUNT_IDENTITY_OVERRIDE.with(|slot| match slot.borrow_mut().as_mut() {
+        MOUNT_IDENTITY_OVERRIDE.with(|slot| match slot.borrow_mut().as_mut() {
             Some(hook) => hook(file, identity),
             None => Ok(identity),
-        });
+        })
     }
     #[cfg(not(test))]
     Ok(identity)
@@ -672,10 +672,10 @@ fn enumerate(
     #[cfg(test)]
     AFTER_ENUMERATION_EOF.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if let Some(hook) = slot.as_mut() {
-            if hook(relative_path) {
-                *slot = None;
-            }
+        if let Some(hook) = slot.as_mut()
+            && hook(relative_path)
+        {
+            *slot = None;
         }
     });
     #[cfg(not(test))]
@@ -731,19 +731,29 @@ fn projection_read_point(point: ProjectionReadPointV2, file: &File) {
 }
 
 #[cfg(test)]
+type EnumerationEofHook = Box<dyn FnMut(&[u8]) -> bool>;
+#[cfg(test)]
+type MountIdentityOverride =
+    Box<dyn FnMut(&File, MountIdentityV2) -> Result<MountIdentityV2, Error>>;
+#[cfg(test)]
+type DirectoryIdentityOverride = Box<dyn FnMut((u64, u64)) -> (u64, u64)>;
+#[cfg(test)]
+type ProjectionReadHook = Box<dyn FnMut(ProjectionReadPointV2, &File)>;
+
+#[cfg(test)]
 thread_local! {
     // true consumes the hook. Tests can target a particular directory's final
     // enumeration rather than accidentally injecting into an earlier pass.
     static AFTER_ENUMERATION_EOF:
-        std::cell::RefCell<Option<Box<dyn FnMut(&[u8]) -> bool>>> =
+        std::cell::RefCell<Option<EnumerationEofHook>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_PROJECTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
-    static MOUNT_IDENTITY_OVERRIDE: std::cell::RefCell<Option<Box<dyn FnMut(&File, MountIdentityV2) -> Result<MountIdentityV2, Error>>>> =
+    static MOUNT_IDENTITY_OVERRIDE: std::cell::RefCell<Option<MountIdentityOverride>> =
         const { std::cell::RefCell::new(None) };
-    static DIRECTORY_IDENTITY_OVERRIDE: std::cell::RefCell<Option<Box<dyn FnMut((u64, u64)) -> (u64, u64)>>> =
+    static DIRECTORY_IDENTITY_OVERRIDE: std::cell::RefCell<Option<DirectoryIdentityOverride>> =
         const { std::cell::RefCell::new(None) };
-    static PROJECTION_READ_POINT: std::cell::RefCell<Option<Box<dyn FnMut(ProjectionReadPointV2, &File)>>> =
+    static PROJECTION_READ_POINT: std::cell::RefCell<Option<ProjectionReadHook>> =
         const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]

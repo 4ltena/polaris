@@ -74,7 +74,7 @@ impl std::fmt::Debug for Directory {
     }
 }
 impl Directory {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(super) fn with_migration_mount(
         mut self,
         mount: std::sync::Arc<polaris_mcp::NativeMountIdentityV2>,
@@ -85,10 +85,10 @@ impl Directory {
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn verify_migration_mount(&self, file: &File) -> StoreResult<()> {
-        if let Some(expected) = &self.migration_mount {
-            if super::writer::migration::native_mount(file)? != **expected {
-                return Err(StoreError::RecoveryRequired);
-            }
+        if let Some(expected) = &self.migration_mount
+            && super::writer::migration::native_mount(file)? != **expected
+        {
+            return Err(StoreError::RecoveryRequired);
         }
         Ok(())
     }
@@ -107,7 +107,9 @@ impl Directory {
             return Err(std::io::Error::last_os_error().into());
         }
         let value = unsafe { value.assume_init() };
-        let unit = value.f_frsize as u64;
+        let unit = value.f_frsize;
+        #[cfg(target_pointer_width = "32")]
+        let unit = u64::from(unit);
         if unit == 0 {
             return Err(StoreError::Corrupt("desktop allocation unit"));
         }
@@ -678,7 +680,7 @@ pub(super) fn load(
 }
 
 /// Decode held bytes only; no filesystem or execution authority.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(super) fn decode_migration_published(
     marker_bytes: &[u8],
     raw: &[u8],
@@ -1129,7 +1131,7 @@ impl Directory {
         };
         observation.identity = Some(crate::apply_intent::IdentityV1 {
             device: before.st_dev as u64,
-            inode: before.st_ino as u64,
+            inode: before.st_ino,
         });
         let uid = before.st_uid;
         #[cfg(test)]
@@ -1161,7 +1163,7 @@ impl Directory {
         };
         let meta = file.metadata()?;
         if meta.dev() != before.st_dev as u64
-            || meta.ino() != before.st_ino as u64
+            || meta.ino() != before.st_ino
             || meta.uid() != before.st_uid
             || meta.mode() & 0o777 != 0o600
             || meta.nlink() != 1
@@ -1208,7 +1210,7 @@ impl Directory {
             || after.ctime_nsec() != meta.ctime_nsec()
             || named.is_none_or(|s| {
                 s.st_dev as u64 != after.dev()
-                    || s.st_ino as u64 != after.ino()
+                    || s.st_ino != after.ino()
                     || s.st_uid != after.uid()
                     || s.st_mode as u32 != after.mode()
                     || s.st_nlink as u64 != after.nlink()
@@ -1415,10 +1417,13 @@ pub(super) fn inspect_published_m2a(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+type HistoricalPublishedM2a = (Published, Vec<u8>, Vec<u8>, Vec<u8>);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn historical_published_m2a(
     observed: &PublishedInspectionM2a,
     revision: u64,
-) -> StoreResult<(Published, Vec<u8>, Vec<u8>, Vec<u8>)> {
+) -> StoreResult<HistoricalPublishedM2a> {
     let row_count = usize::try_from(revision.checked_add(1).ok_or(StoreError::Overflow)?)
         .map_err(|_| StoreError::Overflow)?;
     let mut side = Vec::new();
@@ -1692,13 +1697,13 @@ fn open_error() -> StoreError {
 }
 
 /// No-create local container observation; never an execution or activation grant.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(super) struct OwnerControlledContainer {
     path: std::path::PathBuf,
     file: File,
     mount: std::sync::Arc<polaris_mcp::NativeMountIdentityV2>,
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 impl OwnerControlledContainer {
     pub(super) fn open_migration(path: &Path) -> StoreResult<Self> {
         let file = canonical_directory_file(path)?;
@@ -1802,7 +1807,7 @@ impl OwnerControlledContainer {
         Ok((container, directory))
     }
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn owner_controlled_container(metadata: &fs::Metadata) -> StoreResult<()> {
     use std::os::unix::fs::MetadataExt;
     if !metadata.is_dir()

@@ -1,3 +1,4 @@
+//! Sync push request, history, identity binding and spawn error data tests.
 use super::*;
 use crate::sync::share::CanonicalHttpsRemoteV1;
 use polaris_auth::git_credentials::{

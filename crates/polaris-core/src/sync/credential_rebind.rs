@@ -263,7 +263,7 @@ enum C08StoredRecordV1 {
         records: Vec<C08RebindIntentV1>,
     },
     NoIntentAbandon {
-        evidence: C08NoIntentAbandonEvidenceV1,
+        evidence: Box<C08NoIntentAbandonEvidenceV1>,
     },
 }
 impl C08StoredRecordV1 {
@@ -1018,7 +1018,9 @@ impl CredentialRebindOwnerV1 {
                 return Err(CredentialRebindErrorV1::Corrupt);
             }
             evidence.evidence_hash = evidence.computed_hash()?;
-            let stored = C08StoredRecordV1::NoIntentAbandon { evidence };
+            let stored = C08StoredRecordV1::NoIntentAbandon {
+                evidence: Box::new(evidence),
+            };
             self.intents.publish(&stored)?;
             self.checkpoint("no-intent-evidence")?;
             effects.reconcile_abandon(&self.lease, &unknown, stored.evidence_hash()?)?;

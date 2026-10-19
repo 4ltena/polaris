@@ -1,3 +1,4 @@
+//! Windows scratch registry refusal tests that preserve installed records and copies.
 use super::*;
 use std::cell::Cell;
 

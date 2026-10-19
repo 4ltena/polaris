@@ -1,3 +1,4 @@
+//! Windows sync push factory refusal tests that preserve state and avoid host callbacks.
 use super::*;
 
 struct UnvisitedHost;

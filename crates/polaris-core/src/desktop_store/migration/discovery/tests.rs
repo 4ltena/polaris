@@ -144,7 +144,7 @@ fn discovery_closes_state_project_and_family_namespace_drift() {
         let root = temp.path().join("data");
         data(&root);
         let current = project(&root, A);
-        let view = TransportRootDiscoveryV2::inspect(&[root.clone()], &[]).unwrap();
+        let view = TransportRootDiscoveryV2::inspect(std::slice::from_ref(&root), &[]).unwrap();
         match kind {
             0 => {
                 project(&root, B);
@@ -172,7 +172,8 @@ fn discovery_absent_data_state_and_desktop_are_read_only_and_rechecked() {
         }
         let settings = temp.path().join("settings.json");
         let before = file_stamp(&temp.path().metadata().unwrap());
-        let view = TransportRootDiscoveryV2::inspect(&[root.clone()], &[settings]).unwrap();
+        let view =
+            TransportRootDiscoveryV2::inspect(std::slice::from_ref(&root), &[settings]).unwrap();
         assert_eq!(file_stamp(&temp.path().metadata().unwrap()), before);
         match kind {
             0 => directory(&root),
@@ -252,7 +253,9 @@ fn discovery_rejects_invalid_or_alias_settings_locations_without_reading_setting
         alias.join("settings.json"),
         PathBuf::from(format!("{}/settings.json/", temp.path().display())),
     ] {
-        assert!(TransportRootDiscoveryV2::inspect(&[root.clone()], &[settings]).is_err());
+        assert!(
+            TransportRootDiscoveryV2::inspect(std::slice::from_ref(&root), &[settings]).is_err()
+        );
     }
     assert!(TransportRootDiscoveryV2::inspect(&[], &[]).is_err());
 }

@@ -296,8 +296,10 @@ impl D27RecoveryOpenOutcomeV1 {
         precommit: &SourceApplyPrecommitV1,
         descriptor: &crate::apply_intent::ApplyIntentDescriptorV1,
         binding: &crate::apply_intent::D27SourceBindingV1,
-        request: &crate::apply_intent::RequestV1,
-        before: &crate::apply_intent::ObservedSourceV1,
+        (request, before): (
+            &crate::apply_intent::RequestV1,
+            &crate::apply_intent::ObservedSourceV1,
+        ),
         generic: &crate::management_effect::PrepareManagementEffectV1,
         report: Option<(&[u8], crate::management_effect::ManagementEffectHashV1)>,
     ) -> StoreResult<JoinedD27MarkerRecoveryV1> {
@@ -3573,11 +3575,9 @@ impl Writer {
         target: &RunTarget,
         approval: &ApprovalId,
         payload_hash: &str,
-        guard: SourceApplyGuard,
-        proof: SourceApplyIdentityProof,
+        (guard, proof): (SourceApplyGuard, SourceApplyIdentityProof),
         project_binding: crate::management_effect::ManagementEffectHashV1,
-        reserved_result_id: ResultId,
-        result_capacity_bytes: u64,
+        (reserved_result_id, result_capacity_bytes): (ResultId, u64),
     ) -> StoreResult<SourceApplyPrecommitTokenV1> {
         use crate::{
             apply_intent::{d27_operation_binding, d27_result_id_digest},
@@ -3684,11 +3684,12 @@ impl Writer {
             &target,
             &token.precommit.approval_id,
             &token.precommit.payload_hash.as_hex(),
-            guard,
-            proof,
+            (guard, proof),
             token.precommit.project_binding,
-            token.precommit.reserved_result_id.clone(),
-            token.precommit.result_capacity_bytes,
+            (
+                token.precommit.reserved_result_id.clone(),
+                token.precommit.result_capacity_bytes,
+            ),
         )?;
         if rebuilt.precommit != token.precommit
             || rebuilt.prediction != token.prediction
@@ -3788,7 +3789,7 @@ impl Writer {
             || *consume_target_revision != precommit.consume_target_revision
             || *policy_revision != precommit.policy_revision
             || *source_operation_digest != precommit.source_operation_digest
-            || reserved_result_id != &precommit.reserved_result_id.as_str()
+            || reserved_result_id != precommit.reserved_result_id.as_str()
             || *reserved_result_id_digest != precommit.reserved_result_id_digest
             || *base_marker_evidence_hash != precommit.base_marker_evidence_hash
             || *consume_marker_evidence_hash != precommit.consume_marker_evidence_hash

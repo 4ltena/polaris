@@ -25,6 +25,9 @@ fn m2a_agreed_tree_adapter_joins_the_owner_and_refuses_deferred_files_before_int
             fs::create_dir(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
+        // The fixture is its own project even beneath the repository's target.
+        fs::create_dir(project.join(".git")).unwrap();
+        assert_eq!(crate::project::resolve_root(&project), project);
         fs::write(project.join("main.rs"), b"before\n").unwrap();
         fs::write(agreed.join("main.rs"), b"after\n").unwrap();
         let revision = RevisionV1 {

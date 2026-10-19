@@ -5,7 +5,7 @@ pub mod apps;
 pub mod credentials;
 pub mod lease;
 pub mod local;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod migration;
 pub mod operation;
 pub mod preselection;

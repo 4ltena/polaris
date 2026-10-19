@@ -644,7 +644,9 @@ mod tests {
             RewindLimits::default(),
         )
         .unwrap();
-        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[project.clone()]).unwrap();
+        let policy =
+            SandboxPolicy::new(SandboxMode::WorkspaceWrite, std::slice::from_ref(&project))
+                .unwrap();
         let pre = owner.capture(&policy).unwrap();
         let source_id = "00000000-0000-4000-8000-000000000010";
         let source = ConversationStore::create(
@@ -716,12 +718,16 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(bounded.origin_session_id, source_id);
-        let mut file_limit = PublicationReadBudgetV1::default();
-        file_limit.max_file_bytes = 1;
+        let mut file_limit = PublicationReadBudgetV1 {
+            max_file_bytes: 1,
+            ..PublicationReadBudgetV1::default()
+        };
         assert!(published_branch_bounded(&owner, &accepted, &mut file_limit).is_err());
         assert!(file_limit.evidence_read_failed());
-        let mut entry_limit = PublicationReadBudgetV1::default();
-        entry_limit.max_entries = 0;
+        let mut entry_limit = PublicationReadBudgetV1 {
+            max_entries: 0,
+            ..PublicationReadBudgetV1::default()
+        };
         assert!(published_branch_bounded(&owner, &accepted, &mut entry_limit).is_err());
         assert!(entry_limit.evidence_read_failed());
         let diagnostics = candidate_diagnostics(&owner, &data_root, "project");

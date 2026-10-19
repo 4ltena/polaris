@@ -1,3 +1,4 @@
+//! Windows verification store refusal tests that preserve roots and existing records.
 use super::*;
 
 #[test]

@@ -1,3 +1,4 @@
+//! MCP setup proposal hashing, authentication and credential data validation tests.
 use super::*;
 use polaris_mcp::registration::Capabilities;
 use std::collections::BTreeSet;

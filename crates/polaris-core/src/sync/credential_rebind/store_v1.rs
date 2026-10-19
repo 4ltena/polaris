@@ -68,6 +68,9 @@ impl Anchor {
     fn stat(value: &libc::stat) -> Self {
         Self {
             device: value.st_dev as u64,
+            #[cfg(target_pointer_width = "64")]
+            inode: value.st_ino,
+            #[cfg(not(target_pointer_width = "64"))]
             inode: value.st_ino as u64,
             mode: value.st_mode as u32,
             uid: value.st_uid,
@@ -349,10 +352,10 @@ impl C08IntentStoreV1 {
             if bytes == prior.bytes {
                 return Ok(());
             }
-        } else if let C08StoredRecordV1::IntentHistory { records } = record {
-            if records.len() != 1 || records[0].state != super::C08IntentStateV1::BeforeWrite {
-                return Err(CredentialRebindErrorV1::Corrupt);
-            }
+        } else if let C08StoredRecordV1::IntentHistory { records } = record
+            && (records.len() != 1 || records[0].state != super::C08IntentStateV1::BeforeWrite)
+        {
+            return Err(CredentialRebindErrorV1::Corrupt);
         }
         // Initialization is the first filesystem mutation, and is called only
         // after the parent owner has written EffectStarted.
@@ -364,10 +367,10 @@ impl C08IntentStoreV1 {
             .ok_or(CredentialRebindErrorV1::Corrupt)?
             .file;
         let target = record_name(record);
-        if let Some(prior) = self.inventory.records.get(&id) {
-            if prior.name != target {
-                return Err(CredentialRebindErrorV1::Corrupt);
-            }
+        if let Some(prior) = self.inventory.records.get(&id)
+            && prior.name != target
+        {
+            return Err(CredentialRebindErrorV1::Corrupt);
         }
         let temporary_name = format!("{}.tmp", id.as_hex());
         let temporary_component = component(&temporary_name)?;

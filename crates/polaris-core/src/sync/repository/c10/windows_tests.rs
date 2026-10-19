@@ -1,3 +1,4 @@
+//! Windows C10 repository refusal tests that preserve project and state contents.
 use super::*;
 
 const GIT_FIXTURE: &[u8] = b"retained\0\xffgit-fixture";

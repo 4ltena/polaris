@@ -378,13 +378,13 @@ impl ManagementEffectStoreV1 {
                             self.m_rename_directory(&directory, &orphan)?;
                             break;
                         }
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(error),
                     }
                 }
                 self.m_sync(&generations)?;
             }
             Ok(false) => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
         self.m_ensure_directory(&directory)?;
         let archive_bytes = serde_json::to_vec(&archive)?;
@@ -499,10 +499,10 @@ impl ManagementEffectStoreV1 {
         if !already_published && self.load()?.cursor() != state.cursor() {
             return Err(ManagementEffectStoreError::StaleCursor);
         }
-        if let Some(bytes) = optional_management_bytes(root, &pointer_name, MAX_POINTER_BYTES)? {
-            if already_published || !pointer_bytes.starts_with(&bytes) {
-                return Err(ManagementEffectStoreError::ForeignPrefix);
-            }
+        if let Some(bytes) = optional_management_bytes(root, &pointer_name, MAX_POINTER_BYTES)?
+            && (already_published || !pointer_bytes.starts_with(&bytes))
+        {
+            return Err(ManagementEffectStoreError::ForeignPrefix);
         }
         let generations = optional_management_directory(root, GENERATIONS)?;
         let mut stage = None;
@@ -550,10 +550,16 @@ impl ManagementEffectStoreV1 {
             };
             #[cfg(test)]
             seal_fault(1)?;
-            for (_index, (name, bytes, max)) in payloads.into_iter().enumerate() {
+            for (name, bytes, max) in payloads {
                 resume_joined_exact_prefix(&stage, name, bytes, max)?;
                 #[cfg(test)]
-                seal_fault(_index as u8 + 2)?;
+                seal_fault(match name {
+                    ARCHIVE => 2,
+                    CHECKPOINT => 3,
+                    MANIFEST => 4,
+                    JOURNAL_NAME => 5,
+                    _ => unreachable!("fixed seal payload"),
+                })?;
             }
             stage.sync_all()?;
             verify_management_entry(
@@ -572,7 +578,7 @@ impl ManagementEffectStoreV1 {
             root,
             &pointer_name,
             CURRENT,
-            &pointer_bytes,
+            pointer_bytes,
             MAX_POINTER_BYTES,
         )?;
         root.sync_all()?;
@@ -677,10 +683,10 @@ impl ManagementEffectStoreV1 {
                 }
             }
         }
-        if let Some(file) = inspected.files.get(&temporary) {
-            if !target_exists || !artifacts.pointer_bytes.starts_with(&file.bytes) {
-                return Err(ManagementEffectStoreError::ForeignPrefix);
-            }
+        if let Some(file) = inspected.files.get(&temporary)
+            && (!target_exists || !artifacts.pointer_bytes.starts_with(&file.bytes))
+        {
+            return Err(ManagementEffectStoreError::ForeignPrefix);
         }
         Ok(())
     }
@@ -1011,14 +1017,6 @@ pub(super) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), ManagementEffec
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, ManagementEffectStoreError> {
-    read_bounded(path, maximum).map_err(|error| match error {
-        ManagementEffectStoreError::StoreFull => ManagementEffectStoreError::CorruptJournal,
-        other => other,
-    })
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ManagementEffectStoreError> {

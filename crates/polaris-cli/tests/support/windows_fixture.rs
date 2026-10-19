@@ -1,3 +1,4 @@
+//! Capture recursive fixture contents for Windows CLI preservation assertions.
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -118,15 +118,16 @@ fn account_home() -> Result<PathBuf, TrustedHomeError> {
     trusted_user_home()
 }
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+type ParentHookSlot = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 thread_local! {
     static TEST_ACCOUNT_HOME: std::cell::RefCell<Option<PathBuf>> = const {std::cell::RefCell::new(None)};
-    static AFTER_PARENT_HOME_FD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {std::cell::RefCell::new(None)};
-    static AFTER_PARENT_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {std::cell::RefCell::new(None)};
+    static AFTER_PARENT_HOME_FD: ParentHookSlot = const {std::cell::RefCell::new(None)};
+    static AFTER_PARENT_OPEN: ParentHookSlot = const {std::cell::RefCell::new(None)};
 }
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-fn run_parent_hook(
-    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>,
-) {
+fn run_parent_hook(slot: &'static std::thread::LocalKey<ParentHookSlot>) {
     if let Some(hook) = slot.with(|slot| slot.borrow_mut().take()) {
         hook();
     }

@@ -61,6 +61,7 @@ pub(crate) enum C10IntentStoreErrorV2 {
     Corrupt,
     #[error("c10_intent_blocked: {0}")]
     Blocked(&'static str),
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[error("c10_intent_unavailable: {0}")]
     Unavailable(&'static str),
     #[error("c10_intent_storage")]
@@ -90,6 +91,9 @@ impl Anchor {
     fn stat(meta: &libc::stat) -> Self {
         Self {
             device: meta.st_dev as u64,
+            #[cfg(target_pointer_width = "64")]
+            inode: meta.st_ino,
+            #[cfg(not(target_pointer_width = "64"))]
             inode: meta.st_ino as u64,
             mode: meta.st_mode as u32,
             uid: meta.st_uid,
@@ -270,6 +274,7 @@ impl<'a> C10IntentStoreV2<'a> {
     }
 
     #[cfg(unix)]
+    #[cfg(test)]
     pub(crate) fn archive_page_at_state_dir(
         state: &Path,
         lease: &'a ProjectMutationLeaseV1,
@@ -394,6 +399,7 @@ impl<'a> C10IntentStoreV2<'a> {
 
     /// P3 explicitly completes a verified empty initial layout under its EX lease.
     #[cfg(unix)]
+    #[cfg(test)]
     pub(crate) fn complete_initial_layout(
         &mut self,
         reservation: &mut C10IntentReservationV2,
@@ -1099,7 +1105,7 @@ impl<'a> C10IntentStoreV2<'a> {
         if let Some(store) = &self.store {
             verify_optional_directory(&store.file, "archive", self.archive.as_ref())?;
             if let Some((lock, anchor)) = &self.owner_lock {
-                if bounded_bytes(lock, 0)?.len() != 0
+                if !bounded_bytes(lock, 0)?.is_empty()
                     || Anchor::metadata(&lock.metadata()?) != *anchor
                 {
                     return Err(C10IntentStoreErrorV2::Corrupt);
@@ -2086,6 +2092,7 @@ impl<'a> C10IntentStoreV2<'a> {
         Err(unavailable())
     }
 
+    #[cfg(test)]
     pub(crate) fn archive_page_at_state_dir(
         _state: &Path,
         _lease: &'a ProjectMutationLeaseV1,
@@ -2141,6 +2148,7 @@ impl<'a> C10IntentStoreV2<'a> {
         Err(unavailable())
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_initial_layout(
         &mut self,
         _reservation: &mut C10IntentReservationV2,

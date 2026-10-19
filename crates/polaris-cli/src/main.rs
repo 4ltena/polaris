@@ -2638,10 +2638,7 @@ async fn main_with_args(mut args: Args) -> ExitCode {
 }
 
 #[cfg(not(windows))]
-async fn run_native_turn(
-    mut args: Args,
-    tool_memory_embedding: Option<(String, String)>,
-) -> ExitCode {
+async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, String)>) -> ExitCode {
     if args.confined_read {
         return run_confined_read();
     }
@@ -4934,7 +4931,9 @@ mod tests {
             RewindLimits::default(),
         )
         .unwrap();
-        let policy = SandboxPolicy::new(SandboxMode::WorkspaceWrite, &[project.clone()]).unwrap();
+        let policy =
+            SandboxPolicy::new(SandboxMode::WorkspaceWrite, std::slice::from_ref(&project))
+                .unwrap();
         std::fs::write(project.join("file.txt"), b"before").unwrap();
         let pre = owner.capture(&policy).unwrap();
         std::fs::write(project.join("file.txt"), b"after").unwrap();

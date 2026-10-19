@@ -169,13 +169,11 @@ pub(crate) async fn handle<B: Backend, R: KeyReader>(
             cwd, state_dir, &lease,
         )
         .map_err(|error| error.to_string())?
-    {
-        if !matches!(command, Command::Reconcile(operation)
+        && !matches!(command, Command::Reconcile(operation)
             if effect.request.inventory.encoded() != "C10"
                 && effect.request.operation_id == operation)
-        {
-            return Err("未解決の管理操作があります。先に照合してください".into());
-        }
+    {
+        return Err("未解決の管理操作があります。先に照合してください".into());
     }
     let owner = MemoryChangeOwnerV1 {
         effects,
@@ -377,7 +375,7 @@ fn read_import(path: &Path, project: &str) -> Result<Vec<Record>, String> {
     }
     let named = unsafe { named.assume_init() };
     if named.st_dev as u64 != meta.dev()
-        || named.st_ino as u64 != meta.ino()
+        || named.st_ino != meta.ino()
         || named.st_mode & libc::S_IFMT != libc::S_IFREG
     {
         return Err("取り込み元が変更されました".into());

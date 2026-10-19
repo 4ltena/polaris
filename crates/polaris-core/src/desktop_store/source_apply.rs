@@ -369,8 +369,8 @@ pub(super) fn validate(state: &Sidecar) -> StoreResult<()> {
         {
             return Err(StoreError::Corrupt("source apply ledger binding"));
         }
-        if let Some(reserved) = &record.reserved_result_id {
-            if !reservations.insert(reserved)
+        if let Some(reserved) = &record.reserved_result_id
+            && (!reservations.insert(reserved)
                 || record
                     .result
                     .as_ref()
@@ -388,12 +388,11 @@ pub(super) fn validate(state: &Sidecar) -> StoreResult<()> {
                             .result
                             .as_ref()
                             .is_some_and(|result| &result.result_id == reserved)
-                })
-            {
-                return Err(StoreError::Corrupt(
-                    "source apply result reservation collision",
-                ));
-            }
+                }))
+        {
+            return Err(StoreError::Corrupt(
+                "source apply result reservation collision",
+            ));
         }
         if let Some(result) = &record.result {
             result.validate()?;

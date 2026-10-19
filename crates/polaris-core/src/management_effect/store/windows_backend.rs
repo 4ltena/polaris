@@ -475,10 +475,7 @@ impl ManagementEffectStoreV1 {
             root,
             owner,
             observed,
-            false,
-            MigrationMountV2::default(),
-            None,
-            None,
+            MigrationInspectionV2::default(),
         )
     }
     pub(super) fn check_runtime_request(

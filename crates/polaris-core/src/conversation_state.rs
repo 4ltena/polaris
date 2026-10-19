@@ -1868,6 +1868,7 @@ pub(crate) fn decode_raw_snapshot(
     Ok(snapshot)
 }
 /// Migration also checks receipts and the committed prefix of historical snapshots.
+#[cfg(test)]
 pub(crate) fn validate_migration_snapshot(snapshot: &ConversationSnapshot) -> io::Result<()> {
     snapshot.validate_admission_receipts()?;
     let mut raw = Vec::new();

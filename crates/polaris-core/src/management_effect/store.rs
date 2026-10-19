@@ -143,7 +143,7 @@ pub struct ManagementEffectStoreV1 {
 #[derive(Debug)]
 pub enum ManagementEffectInspectOpenV1 {
     Absent,
-    Present(ManagementEffectInspectV1),
+    Present(Box<ManagementEffectInspectV1>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +175,15 @@ struct PinnedManagementFileV1 {
     bytes: Vec<u8>,
     metadata: fs::Metadata,
     migration_mount: MigrationMountV2,
+}
+
+#[cfg(any(unix, all(test, windows)))]
+#[derive(Default)]
+struct MigrationInspectionV2 {
+    enabled: bool,
+    mount: MigrationMountV2,
+    state_directory: Option<(File, fs::Metadata)>,
+    root_metadata: Option<fs::Metadata>,
 }
 
 #[derive(Debug)]
@@ -732,7 +741,7 @@ impl ManagementEffectInspectV1 {
 
     /// Read-only continuation after the coordinator's physical rename. Keep
     /// the original root, child pins and owner lock; never reacquire a reader.
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(crate) fn rebind_retired_for_migration(
         mut self,
         state_directory: &File,
@@ -824,12 +833,11 @@ impl ManagementEffectInspectV1 {
         self.migration_mount.verify(&self.root_directory)?;
         let root = named_root.metadata()?;
         let pinned = self.root_directory.metadata()?;
-        if let Some(expected) = &self.migration_root_metadata {
-            if management_stamp(&root) != management_stamp(expected)
-                || management_stamp(&pinned) != management_stamp(expected)
-            {
-                return Err(ManagementEffectStoreError::InvalidStore);
-            }
+        if let Some(expected) = &self.migration_root_metadata
+            && (management_stamp(&root) != management_stamp(expected)
+                || management_stamp(&pinned) != management_stamp(expected))
+        {
+            return Err(ManagementEffectStoreError::InvalidStore);
         }
         for (file, expected) in self.migration_directories.values() {
             self.migration_mount.verify(file)?;
@@ -1098,7 +1106,7 @@ impl ManagementEffectStoreV1 {
     }
     /// Existing-only historical reader; its optional input is not an authority.
     /// An empty source without a namespace-derived scope fails closed.
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(crate) fn inspect_migration_history(
         state_dir: &Path,
         lease: &ProjectMutationLeaseV1,
@@ -1154,12 +1162,12 @@ impl ManagementEffectStoreV1 {
         let migration_root_metadata = migration_inspection
             .then(|| root_directory.metadata())
             .transpose()?;
-        let mut store = Self {
+        let store = Self {
             state_dir: state_dir.to_owned(),
             root: state_dir.join(root_name),
             journal_path: state_dir.join(root_name).join(JOURNAL_NAME),
             expected_lease_root,
-            project_scope: project_scope.unwrap_or(ManagementEffectHashV1::zero()),
+            project_scope: project_scope.unwrap_or_default(),
             limits,
         };
         // The existing lock is opened without O_CREAT and remains held until
@@ -1188,10 +1196,12 @@ impl ManagementEffectStoreV1 {
             root_directory,
             owner,
             inventory,
-            migration_inspection,
-            migration_mount,
-            migration_inspection.then_some((state_directory, state_meta)),
-            migration_root_metadata,
+            MigrationInspectionV2 {
+                enabled: migration_inspection,
+                mount: migration_mount,
+                state_directory: migration_inspection.then_some((state_directory, state_meta)),
+                root_metadata: migration_root_metadata,
+            },
         )
     }
     #[cfg(any(unix, all(test, windows)))]
@@ -1201,11 +1211,14 @@ impl ManagementEffectStoreV1 {
         root_directory: ManagementDirectoryV1,
         owner: PinnedManagementFileV1,
         inventory: ManagementInventoryV1,
-        migration_inspection: bool,
-        migration_mount: MigrationMountV2,
-        migration_state_directory: Option<(File, fs::Metadata)>,
-        migration_root_metadata: Option<fs::Metadata>,
+        migration: MigrationInspectionV2,
     ) -> Result<ManagementEffectInspectOpenV1, ManagementEffectStoreError> {
+        let MigrationInspectionV2 {
+            enabled: migration_inspection,
+            mount: migration_mount,
+            state_directory: migration_state_directory,
+            root_metadata: migration_root_metadata,
+        } = migration;
         let files = inventory.files;
         let read =
             |relative: &str, max: u64| -> Result<Option<Vec<u8>>, ManagementEffectStoreError> {
@@ -1248,10 +1261,10 @@ impl ManagementEffectStoreV1 {
             for verified in state.events.values() {
                 // Check new preparations, not carried pending snapshots: a
                 // checkpoint legitimately repeats its original operation.
-                if let ManagementEffectEventV1::Prepared { request } = &verified.event {
-                    if !prepared_operations.insert(request.operation_id) {
-                        return Err(ManagementEffectStoreError::CorruptJournal);
-                    }
+                if let ManagementEffectEventV1::Prepared { request } = &verified.event
+                    && !prepared_operations.insert(request.operation_id)
+                {
+                    return Err(ManagementEffectStoreError::CorruptJournal);
                 }
                 if events
                     .insert(
@@ -1327,7 +1340,7 @@ impl ManagementEffectStoreV1 {
                 .latest_event_evidence(snapshot.request.operation_id, snapshot)?
                 .ok_or(ManagementEffectStoreError::CorruptJournal)?;
         }
-        Ok(ManagementEffectInspectOpenV1::Present(inspected))
+        Ok(ManagementEffectInspectOpenV1::Present(Box::new(inspected)))
     }
 
     /// Opens the project store while holding the one shared mutation lease.
@@ -1652,8 +1665,9 @@ impl ManagementEffectStoreV1 {
         Ok(
             matches!(effect.state, ManagementEffectStateV1::Prepared).then_some(
                 PreparedManagementEffectV1 {
-                    verified_event: self
-                        .latest_event_for_operation_unlocked(effect.request.operation_id)?,
+                    verified_event: Box::new(
+                        self.latest_event_for_operation_unlocked(effect.request.operation_id)?,
+                    ),
                     request: effect.request,
                     generation: state.generation,
                     chain_hash: state.chain_hash,
@@ -1730,8 +1744,9 @@ impl ManagementEffectStoreV1 {
             return Ok(match existing.state {
                 ManagementEffectStateV1::Prepared => {
                     PrepareManagementEffectOutcomeV1::Prepared(PreparedManagementEffectV1 {
-                        verified_event: self
-                            .latest_event_for_operation_unlocked(request.operation_id)?,
+                        verified_event: Box::new(
+                            self.latest_event_for_operation_unlocked(request.operation_id)?,
+                        ),
                         request,
                         generation: state.generation,
                         chain_hash: state.chain_hash,
@@ -1781,7 +1796,9 @@ impl ManagementEffectStoreV1 {
         )?;
         Ok(PrepareManagementEffectOutcomeV1::Prepared(
             PreparedManagementEffectV1 {
-                verified_event: self.latest_event_for_operation_unlocked(request.operation_id)?,
+                verified_event: Box::new(
+                    self.latest_event_for_operation_unlocked(request.operation_id)?,
+                ),
                 request,
                 generation: state.generation,
                 chain_hash: state.chain_hash,
@@ -2949,7 +2966,7 @@ fn verify_management_entry(
     }
     let entry = unsafe { entry.assume_init() };
     let meta = file.metadata()?;
-    if meta.dev() != entry.st_dev as u64 || meta.ino() != entry.st_ino as u64 {
+    if meta.dev() != entry.st_dev as u64 || meta.ino() != entry.st_ino {
         return Err(ManagementEffectStoreError::InvalidStore);
     }
     Ok(())
@@ -2985,10 +3002,10 @@ impl MigrationMountV2 {
     }
     fn verify(&self, file: &File) -> Result<(), ManagementEffectStoreError> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(expected) = &self.native {
-            if management_native_mount(file)? != **expected {
-                return Err(ManagementEffectStoreError::InvalidStore);
-            }
+        if let Some(expected) = &self.native
+            && management_native_mount(file)? != **expected
+        {
+            return Err(ManagementEffectStoreError::InvalidStore);
         }
         let _ = file;
         Ok(())
@@ -3024,16 +3041,17 @@ fn management_stamp(meta: &fs::Metadata) -> (u64, u64, u32, u32, u64, u64, i64, 
     )
 }
 #[cfg(all(test, unix))]
+type ManagementMigrationHookV1 = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(all(test, unix))]
 thread_local! {
     static REJECT_MIGRATION_MOUNT: std::cell::Cell<Option<(u64,u64)>> = const { std::cell::Cell::new(None) };
-    static BEFORE_MIGRATION_REFRESH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
-    static AFTER_MIGRATION_CENSUS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_MIGRATION_REFRESH: ManagementMigrationHookV1 = const { std::cell::RefCell::new(None) };
+    static AFTER_MIGRATION_CENSUS: ManagementMigrationHookV1 = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 #[cfg(unix)]
-fn management_migration_hook(
-    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>,
-) {
+fn management_migration_hook(slot: &'static std::thread::LocalKey<ManagementMigrationHookV1>) {
     if let Some(hook) = slot.with(|slot| slot.borrow_mut().take()) {
         hook();
     }
@@ -3185,14 +3203,13 @@ fn management_inventory_mode(
                     } else {
                         None
                     };
-                    if let Some((_, suffix)) = orphan {
-                        if suffix
+                    if let Some((_, suffix)) = orphan
+                        && suffix
                             .parse::<u64>()
                             .ok()
                             .is_none_or(|n| n.to_string() != suffix)
-                        {
-                            return Err(ManagementEffectStoreError::CorruptJournal);
-                        }
+                    {
+                        return Err(ManagementEffectStoreError::CorruptJournal);
                     }
                     let decimal = orphan.map(|(number, _)| number).unwrap_or_else(|| {
                         number
@@ -3815,7 +3832,7 @@ impl ManagementEffectInspectV1 {
             if effect.request.rewind != ManagementRewindDispositionV1::CapturedRestorable {
                 return Ok(ManagementRewindCrossingV1::Blocked {
                     operation_id: id,
-                    inventory: effect.request.inventory.clone(),
+                    inventory: effect.request.inventory,
                     rewind: effect.request.rewind,
                     state: effect.state.clone(),
                 });
@@ -3863,6 +3880,7 @@ impl ManagementEffectStoreV1 {
         Err(unsupported())
     }
 
+    #[cfg(test)]
     pub(crate) fn inspect_migration_history(
         _state_dir: &Path,
         _lease: &ProjectMutationLeaseV1,
@@ -4144,6 +4162,7 @@ impl ManagementEffectInspectV1 {
         Err(unsupported())
     }
 
+    #[cfg(test)]
     pub(crate) fn rebind_retired_for_migration(
         self,
         _state_directory: &File,

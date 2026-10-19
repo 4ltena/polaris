@@ -30,132 +30,6 @@ pub enum AccountChangeV1 {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn m3a_account_local_confirmation_and_stale_target() {
-        // Auth protection pins one HOME per process, including its test child.
-        if std::env::var_os("POLARIS_M3A_ACCOUNT_CHILD").is_none() {
-            let root = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["management_effect::account_change::tests::m3a_account_local_confirmation_and_stale_target", "--exact", "--nocapture"])
-                .env("POLARIS_M3A_ACCOUNT_CHILD", "1").env("HOME", root.path())
-                .output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
-        polaris_auth::protection::use_trusted_home(&home).unwrap();
-        let project = home.join("project");
-        std::fs::create_dir(&project).unwrap();
-        let state = crate::project::state_dir(&project).unwrap();
-        let workspace = crate::rewind_workspace::WorkspaceOwner::open(
-            &project,
-            &state.join("rewind-workspace"),
-            Default::default(),
-        )
-        .unwrap();
-        let lease = workspace.try_mutation().unwrap();
-        let effects = ManagementEffectStoreV1::open_at_state_dir(&project, &state, &lease).unwrap();
-        let store = polaris_auth::accounts::store::AccountStore::open().unwrap();
-        let reservation = store.begin_registration(None).unwrap();
-        store.mark_exchange_pending(&reservation).unwrap();
-        let (generation, _) = store
-            .complete_registration(
-                &reservation,
-                polaris_auth::Credentials {
-                    access_token: "synthetic-access-not-for-network".into(),
-                    refresh_token: "synthetic-refresh-not-for-network".into(),
-                    account_id: "fixture-account".into(),
-                    expires_at: Some(u64::MAX),
-                },
-            )
-            .unwrap();
-        let auth = AccountOwner::open(polaris_auth::ISSUER).unwrap();
-        let owner = AccountChangeOwnerV1 {
-            auth,
-            effects: &effects,
-            lease: &lease,
-        };
-        let id = reservation.registration_id;
-        let prepared = owner
-            .prepare(AccountChangeV1::Label {
-                registration: id.clone(),
-                generation,
-                label: "kept label".into(),
-            })
-            .unwrap();
-        assert_eq!(
-            owner.apply_local(&prepared, true).unwrap(),
-            Some(id.clone())
-        );
-        assert_eq!(
-            owner.target(&id).unwrap().label.as_deref(),
-            Some("kept label")
-        );
-        let prepared = owner
-            .prepare(AccountChangeV1::Unlink {
-                registration: id.clone(),
-                generation,
-            })
-            .unwrap();
-        assert!(owner.apply_local(&prepared, false).unwrap().is_none());
-        assert_eq!(
-            owner.target(&id).unwrap().state,
-            polaris_auth::accounts::store::AccountState::Ready
-        );
-        let stale = owner
-            .prepare(AccountChangeV1::Label {
-                registration: id.clone(),
-                generation,
-                label: "stale".into(),
-            })
-            .unwrap();
-        store
-            .set_label(&id, generation, Some("concurrent label".into()))
-            .unwrap();
-        assert!(owner.apply_local(&stale, true).is_err());
-        assert_eq!(
-            owner.target(&id).unwrap().label.as_deref(),
-            Some("concurrent label")
-        );
-        let prepared = owner
-            .prepare(AccountChangeV1::Unlink {
-                registration: id.clone(),
-                generation,
-            })
-            .unwrap();
-        owner.apply_local(&prepared, true).unwrap();
-        assert_eq!(
-            owner.target(&id).unwrap().state,
-            polaris_auth::accounts::store::AccountState::Disconnected
-        );
-        assert!(
-            owner
-                .prepare(AccountChangeV1::Label {
-                    registration: id,
-                    generation,
-                    label: "must refuse".into()
-                })
-                .is_err()
-        );
-        assert!(effects.blocker().unwrap().is_none());
-        assert!(
-            effects
-                .effects()
-                .unwrap()
-                .iter()
-                .any(|effect| matches!(effect.state, ManagementEffectStateV1::Completed { .. }))
-        );
-    }
-}
-
 impl AccountChangeV1 {
     pub fn target(&self) -> &str {
         match self {
@@ -246,15 +120,15 @@ impl AccountChangeOwnerV1<'_> {
                 return Err("Legacy credential store changed".into());
             }
         }
-        if let AccountChangeV1::Label { label, .. } = &change {
-            if label.len() > 256 || label.chars().any(char::is_control) {
-                return Err("Invalid account label".into());
-            }
+        if let AccountChangeV1::Label { label, .. } = &change
+            && (label.len() > 256 || label.chars().any(char::is_control))
+        {
+            return Err("Invalid account label".into());
         }
-        if let AccountChangeV1::Login { label: Some(label) } = &change {
-            if label.len() > 256 || label.chars().any(char::is_control) {
-                return Err("Invalid account label".into());
-            }
+        if let AccountChangeV1::Login { label: Some(label) } = &change
+            && (label.len() > 256 || label.chars().any(char::is_control))
+        {
+            return Err("Invalid account label".into());
         }
         let request_hash = ManagementEffectHashV1::digest(
             &serde_json::to_vec(&change).map_err(|_| "Invalid account request")?,
@@ -446,5 +320,131 @@ impl AccountChangeOwnerV1<'_> {
         };
         self.finish(&started, result.map(|token| token.registration_id))
             .map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m3a_account_local_confirmation_and_stale_target() {
+        // Auth protection pins one HOME per process, including its test child.
+        if std::env::var_os("POLARIS_M3A_ACCOUNT_CHILD").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["management_effect::account_change::tests::m3a_account_local_confirmation_and_stale_target", "--exact", "--nocapture"])
+                .env("POLARIS_M3A_ACCOUNT_CHILD", "1").env("HOME", root.path())
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        polaris_auth::protection::use_trusted_home(&home).unwrap();
+        let project = home.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let state = crate::project::state_dir(&project).unwrap();
+        let workspace = crate::rewind_workspace::WorkspaceOwner::open(
+            &project,
+            &state.join("rewind-workspace"),
+            Default::default(),
+        )
+        .unwrap();
+        let lease = workspace.try_mutation().unwrap();
+        let effects = ManagementEffectStoreV1::open_at_state_dir(&project, &state, &lease).unwrap();
+        let store = polaris_auth::accounts::store::AccountStore::open().unwrap();
+        let reservation = store.begin_registration(None).unwrap();
+        store.mark_exchange_pending(&reservation).unwrap();
+        let (generation, _) = store
+            .complete_registration(
+                &reservation,
+                polaris_auth::Credentials {
+                    access_token: "synthetic-access-not-for-network".into(),
+                    refresh_token: "synthetic-refresh-not-for-network".into(),
+                    account_id: "fixture-account".into(),
+                    expires_at: Some(u64::MAX),
+                },
+            )
+            .unwrap();
+        let auth = AccountOwner::open(polaris_auth::ISSUER).unwrap();
+        let owner = AccountChangeOwnerV1 {
+            auth,
+            effects: &effects,
+            lease: &lease,
+        };
+        let id = reservation.registration_id;
+        let prepared = owner
+            .prepare(AccountChangeV1::Label {
+                registration: id.clone(),
+                generation,
+                label: "kept label".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            owner.apply_local(&prepared, true).unwrap(),
+            Some(id.clone())
+        );
+        assert_eq!(
+            owner.target(&id).unwrap().label.as_deref(),
+            Some("kept label")
+        );
+        let prepared = owner
+            .prepare(AccountChangeV1::Unlink {
+                registration: id.clone(),
+                generation,
+            })
+            .unwrap();
+        assert!(owner.apply_local(&prepared, false).unwrap().is_none());
+        assert_eq!(
+            owner.target(&id).unwrap().state,
+            polaris_auth::accounts::store::AccountState::Ready
+        );
+        let stale = owner
+            .prepare(AccountChangeV1::Label {
+                registration: id.clone(),
+                generation,
+                label: "stale".into(),
+            })
+            .unwrap();
+        store
+            .set_label(&id, generation, Some("concurrent label".into()))
+            .unwrap();
+        assert!(owner.apply_local(&stale, true).is_err());
+        assert_eq!(
+            owner.target(&id).unwrap().label.as_deref(),
+            Some("concurrent label")
+        );
+        let prepared = owner
+            .prepare(AccountChangeV1::Unlink {
+                registration: id.clone(),
+                generation,
+            })
+            .unwrap();
+        owner.apply_local(&prepared, true).unwrap();
+        assert_eq!(
+            owner.target(&id).unwrap().state,
+            polaris_auth::accounts::store::AccountState::Disconnected
+        );
+        assert!(
+            owner
+                .prepare(AccountChangeV1::Label {
+                    registration: id,
+                    generation,
+                    label: "must refuse".into()
+                })
+                .is_err()
+        );
+        assert!(effects.blocker().unwrap().is_none());
+        assert!(
+            effects
+                .effects()
+                .unwrap()
+                .iter()
+                .any(|effect| matches!(effect.state, ManagementEffectStateV1::Completed { .. }))
+        );
     }
 }

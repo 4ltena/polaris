@@ -161,6 +161,35 @@ pub struct Detector {
     key: [u8; 32],
 }
 
+/// An account-bound fetch snapshot. Only the detector can construct it; it
+/// carries neither a serialized command request nor permission to execute.
+#[cfg(unix)]
+pub struct MaterialisePlan {
+    home: PathBuf,
+    source_hash: [u8; 32],
+    command: String,
+    arguments: Vec<String>,
+    directory: PathBuf,
+    runtime: PathBuf,
+    package: String,
+    version: Option<String>,
+}
+
+#[cfg(unix)]
+impl MaterialisePlan {
+    /// The exact download request, interpreter and managed destination shown
+    /// before execution. Secret-bearing arguments are refused during prepare.
+    pub fn description(&self) -> String {
+        format!(
+            "package: {}\nversion: {}\ninterpreter: {}\n保存先: {}\nネットワークから1度だけ取得します。導入時のスクリプトは実行しません。\n登録はこの取得とは別に確認します。取得は巻き戻しでは取り消せません。",
+            self.package,
+            self.version.as_deref().unwrap_or("取得時に解決して固定"),
+            self.runtime.display(),
+            self.directory.display(),
+        )
+    }
+}
+
 /// Detection target and the registry revision that names new secret references.
 #[cfg(unix)]
 struct Scope<'a> {
@@ -373,6 +402,118 @@ impl Detector {
         name: &str,
         runtime: Option<&Path>,
     ) -> Result<launcher::Pinned, launcher::Refused> {
+        self.materialise_with_output(name, runtime, false)
+    }
+
+    /// TUI hosts keep package-manager output out of their terminal renderer.
+    /// Fetching, pin validation and the separate registration boundary are shared.
+    pub fn materialise_quiet(
+        &self,
+        name: &str,
+        runtime: Option<&Path>,
+    ) -> Result<launcher::Pinned, launcher::Refused> {
+        self.materialise_with_output(name, runtime, true)
+    }
+
+    /// Binds the existing launcher parser to the source and runtime before a
+    /// TUI asks for approval. No package is downloaded by this preparation.
+    pub fn prepare_materialise(
+        &self,
+        name: &str,
+        runtime: Option<&Path>,
+    ) -> Result<MaterialisePlan, launcher::Refused> {
+        let [source, _] = self.sources();
+        let body = Self::read(&source).ok_or(launcher::Refused::NotALauncher)?;
+        let document =
+            toml::from_str::<toml::Value>(&body).map_err(|_| launcher::Refused::NotALauncher)?;
+        let entry = document
+            .get("mcp_servers")
+            .and_then(|servers| servers.get(name))
+            .ok_or(launcher::Refused::NotALauncher)?;
+        let command = entry
+            .get("command")
+            .and_then(toml::Value::as_str)
+            .ok_or(launcher::Refused::NotALauncher)?
+            .to_owned();
+        let arguments: Vec<String> = entry
+            .get("args")
+            .and_then(toml::Value::as_array)
+            .ok_or(launcher::Refused::NotALauncher)?
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect::<Option<_>>()
+            .ok_or(launcher::Refused::NotALauncher)?;
+        if credential_like(&arguments) || command.chars().any(char::is_control) {
+            return Err(launcher::Refused::NotALauncher);
+        }
+        let request =
+            launcher::request(&command, &arguments).ok_or(launcher::Refused::NotALauncher)?;
+        let runtime = match runtime {
+            Some(runtime) => runtime.to_owned(),
+            None => launcher::default_runtime(request.manager)
+                .ok_or(launcher::Refused::RuntimeNotPinned)?,
+        };
+        if !runtime.is_absolute() || !runtime.is_file() {
+            return Err(launcher::Refused::RuntimeNotPinned);
+        }
+        let server_id = sanitized_id(
+            name,
+            &format!("{}\n{}", source.display(), ["mcp_servers", name].join("\n")),
+        );
+        Ok(MaterialisePlan {
+            home: self.home.clone(),
+            source_hash: Sha256::digest(body.as_bytes()).into(),
+            command,
+            arguments,
+            directory: self.home.join(".polaris/mcp/servers").join(server_id),
+            runtime,
+            package: request.package,
+            version: request.version,
+        })
+    }
+
+    /// Rechecks the source, then executes only the approved snapshot. A source
+    /// change cannot substitute another package after the approval card.
+    pub fn materialise_prepared_quiet(
+        &self,
+        plan: MaterialisePlan,
+    ) -> Result<launcher::Pinned, launcher::Refused> {
+        let [source, _] = self.sources();
+        let body = Self::read(&source).ok_or(launcher::Refused::NotALauncher)?;
+        let source_hash: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+        if plan.home != self.home || source_hash != plan.source_hash {
+            return Err(launcher::Refused::NotALauncher);
+        }
+        // Reuse the store's descriptor-relative directory owner before the
+        // downloader receives a path. It rejects symlinked managed roots.
+        let store =
+            polaris_mcp::store::Store::open(&self.home).map_err(|_| launcher::Refused::NotSaved)?;
+        let server_id = plan
+            .directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(launcher::Refused::NotSaved)?;
+        if store
+            .server_directory(server_id)
+            .map_err(|_| launcher::Refused::NotSaved)?
+            != plan.directory
+        {
+            return Err(launcher::Refused::NotSaved);
+        }
+        launcher::materialise_quiet(
+            &plan.directory,
+            &plan.command,
+            &plan.arguments,
+            Some(&plan.runtime),
+        )
+    }
+
+    fn materialise_with_output(
+        &self,
+        name: &str,
+        runtime: Option<&Path>,
+        quiet: bool,
+    ) -> Result<launcher::Pinned, launcher::Refused> {
         let [codex, _] = self.sources();
         let body = Self::read(&codex).ok_or(launcher::Refused::NotALauncher)?;
         let document =
@@ -399,7 +540,11 @@ impl Detector {
             &format!("{}\n{}", codex.display(), ["mcp_servers", name].join("\n")),
         );
         let directory = self.home.join(".polaris/mcp/servers").join(&server_id);
-        launcher::materialise(&directory, command, &args, runtime)
+        if quiet {
+            launcher::materialise_quiet(&directory, command, &args, runtime)
+        } else {
+            launcher::materialise(&directory, command, &args, runtime)
+        }
     }
 
     /// `current` is the saved state proposals are bound to.
@@ -991,6 +1136,8 @@ pub use tool::{Authorization, HOST_PATH, SetupTool};
 
 #[cfg(test)]
 mod data_tests;
+#[cfg(all(test, unix))]
+mod materialise_tests;
 #[cfg(all(test, unix))]
 mod tests;
 #[cfg(all(test, windows))]

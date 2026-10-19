@@ -460,6 +460,29 @@ pub fn materialise(
     args: &[String],
     runtime: Option<&std::path::Path>,
 ) -> Result<Pinned, Refused> {
+    materialise_with_output(directory, command, args, runtime, false)
+}
+
+/// Uses the same fetch and pin checks without writing untrusted package output
+/// into an interactive renderer. Registration still requires separate approval.
+#[cfg(unix)]
+pub fn materialise_quiet(
+    directory: &std::path::Path,
+    command: &str,
+    args: &[String],
+    runtime: Option<&std::path::Path>,
+) -> Result<Pinned, Refused> {
+    materialise_with_output(directory, command, args, runtime, true)
+}
+
+#[cfg(unix)]
+fn materialise_with_output(
+    directory: &std::path::Path,
+    command: &str,
+    args: &[String],
+    runtime: Option<&std::path::Path>,
+    quiet: bool,
+) -> Result<Pinned, Refused> {
     let request = request(command, args).ok_or(Refused::NotALauncher)?;
     let chosen;
     let runtime = match runtime {
@@ -488,13 +511,18 @@ pub fn materialise(
             .create(directory)
             .map_err(|_| Refused::NotSaved)?;
     }
-    let status = std::process::Command::new(&program)
+    let mut fetch = std::process::Command::new(&program);
+    fetch
         .args(&argv)
         // A fetch writes into the directory and nowhere else. It is given no
         // inherited stdin so a package cannot prompt its way into running.
-        .stdin(std::process::Stdio::null())
-        .status()
-        .map_err(|_| Refused::FetchFailed)?;
+        .stdin(std::process::Stdio::null());
+    if quiet {
+        fetch
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
+    let status = fetch.status().map_err(|_| Refused::FetchFailed)?;
     if !status.success() {
         return Err(Refused::FetchFailed);
     }

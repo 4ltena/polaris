@@ -1,12 +1,19 @@
 //! MCP controls change next-run admission; they never replace a running runtime.
 use crate::{account::confirm, approver::KeyReader, render};
 use polaris_core::{
+    approval::ApprovalPolicy,
     management_effect::{ManagementEffectStoreV1, mcp_change::McpRegistryChangeOwnerV1},
     mcp::{local::LocalHost, operation::ExternalCeiling},
     rewind_workspace::WorkspaceOwner,
 };
 use ratatui::{Terminal, backend::Backend, text::Line};
-use std::{cell::RefCell, path::Path};
+use std::{cell::RefCell, path::Path, sync::Arc};
+
+mod journal;
+#[cfg(test)]
+mod management_tests;
+mod operations;
+mod secret;
 
 pub(crate) fn state_lines(
     host: &LocalHost,
@@ -23,6 +30,9 @@ pub(crate) fn state_lines(
             "外部MCPを許可するには --mcp-external を指定して再起動してください。"
         }),
         Line::from("以下は登録・入場状態です。接続成功や実行中runtimeの変更を意味しません。"),
+        Line::from("/mcp setup: 検出して登録内容を確認 / /mcp check <server>: カタログを確認"),
+        Line::from("/mcp materialize <名前>: パッケージを取得して固定（登録は別途確認）"),
+        Line::from("/mcp secret set: 専用の秘密入力 / /mcp secret delete <参照名>: 認証情報を削除"),
     ];
     let states = host
         .state_report(ExternalCeiling::host_external(external_enabled))
@@ -46,6 +56,18 @@ pub(crate) fn state_lines(
     }
     if let Some(registry) = &registry {
         lines.push(Line::from(format!("登録revision {}", registry.revision)));
+    }
+    if let Some(store) = host.store()
+        && let Some(secrets) = store
+            .load_secrets()
+            .map_err(|_| "MCP認証情報の参照名を読めません")?
+    {
+        for reference in secrets.references() {
+            lines.push(Line::from(format!(
+                "認証情報の参照名: {}",
+                render::sanitize(reference)
+            )));
+        }
     }
     if states.is_empty() {
         lines.push(Line::from("登録されたMCPサーバーはありません。"));
@@ -82,6 +104,140 @@ pub(crate) fn state_lines(
     Ok(lines)
 }
 
+pub(crate) async fn handle<B: Backend, R: KeyReader>(
+    request: &str,
+    terminal: &RefCell<Terminal<B>>,
+    reader: &mut R,
+    management: (&WorkspaceOwner, &ManagementEffectStoreV1),
+    cwd: &Path,
+    (external_enabled, approval_policy): (bool, ApprovalPolicy),
+    has_pending: bool,
+) -> Result<Vec<Line<'static>>, String> {
+    let host = LocalHost::open(cwd, false).map_err(|_| "MCP保存領域を開けません")?;
+    handle_host(
+        request,
+        terminal,
+        reader,
+        management,
+        &host,
+        (external_enabled, approval_policy),
+        has_pending,
+    )
+    .await
+}
+
+pub(crate) async fn handle_host<B: Backend, R: KeyReader>(
+    request: &str,
+    terminal: &RefCell<Terminal<B>>,
+    reader: &mut R,
+    (workspace, effects): (&WorkspaceOwner, &ManagementEffectStoreV1),
+    host: &LocalHost,
+    (external_enabled, approval_policy): (bool, ApprovalPolicy),
+    has_pending: bool,
+) -> Result<Vec<Line<'static>>, String> {
+    let request = request.trim();
+    if request.is_empty() || request == "list" || request == "status" {
+        return state_lines(host, external_enabled);
+    }
+    if request.len() > 2048 || request.chars().any(char::is_control) {
+        return Err("MCP操作は2048バイト以内の1行で指定してください".into());
+    }
+    let parts: Vec<_> = request.split_whitespace().collect();
+    let command = parts[0];
+    match command {
+        "configure" | "delete" => {
+            return Err(
+                "このMCP操作は提供していません。/mcp setup で検出した登録を管理してください。"
+                    .into(),
+            );
+        }
+        "prompt" => {
+            return Err(
+                "/mcp prompt <server>/<prompt> [key=value ...] は次の入力の選択欄で扱います。"
+                    .into(),
+            );
+        }
+        "enable" | "disable" | "secret" | "check" | "setup" | "register" | "materialize" => {}
+        _ => {
+            return Err(
+                "/mcp list|enable|disable|check <server>、setup、register [名前]、materialize <名前>、secret set|delete、prompt <server>/<prompt>".into(),
+            );
+        }
+    }
+    if has_pending {
+        return Err("送信待ちの入力があるためMCP登録を変更できません".into());
+    }
+    let lease = Arc::new(
+        workspace
+            .try_mutation()
+            .map_err(|_| "実行中の操作があるためMCP登録を変更できません")?,
+    );
+    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
+        workspace.project_root(),
+        effects.state_dir(),
+        &lease,
+    )
+    .map_err(|error| error.to_string())?;
+    if effects.project_scope_hash()
+        != polaris_core::management_effect::ManagementEffectHashV1::digest(
+            workspace.project_root().as_os_str().as_encoded_bytes(),
+        )
+        || host.project() != polaris_core::project::project_id(workspace.project_root())
+        || lease.store_root() != effects.state_dir().join("rewind-workspace")
+    {
+        return Err("MCP管理ownerのprojectが一致しません".into());
+    }
+    let journal = journal::Journal {
+        effects,
+        lease: &lease,
+    };
+    match parts.as_slice() {
+        ["secret", rest @ ..] => return secret::handle(rest, terminal, reader, host, &journal, approval_policy),
+        ["check", server] => {
+            return operations::check(server, terminal, reader, host, (ExternalCeiling::host_external(external_enabled), approval_policy), &journal).await;
+        }
+        ["setup"] | ["register"] => {
+            return operations::setup(None, terminal, reader, host, (ExternalCeiling::host_external(external_enabled), approval_policy), &journal).await;
+        }
+        ["register", name] => {
+            return operations::setup(Some(name), terminal, reader, host, (ExternalCeiling::host_external(external_enabled), approval_policy), &journal).await;
+        }
+        ["materialize", rest @ ..] => return operations::materialize(rest, terminal, reader, host, (external_enabled, approval_policy), (&journal, &lease)).await,
+        ["enable" | "disable", _] => {}
+        _ => return Err("MCP操作の引数が不正です。/mcp setup、check <server>、enable|disable <server>、secret set|delete を指定してください".into()),
+    }
+    let server_id = parts[1];
+    let owner = McpRegistryChangeOwnerV1::new(host, effects, &lease, workspace.project_root())?;
+    let prepared = owner.prepare(server_id, command == "enable")?;
+    let accepted = confirm(
+        terminal,
+        reader,
+        if prepared.enabled() {
+            "MCPをこのプロジェクトで有効化"
+        } else {
+            "MCPをこのプロジェクトで無効化"
+        },
+        prepared.server_id(),
+        &format!(
+            "registry revision {}。次の実行から反映します。実行中runtime・起動時の外部MCP上限は変更しません。巻き戻しでは取り消せません。",
+            prepared.before_revision()
+        ),
+    );
+    match owner.apply(&prepared, accepted)? {
+        Some(revision) => Ok(vec![Line::from(format!(
+            "{} をこのプロジェクトで{}にしました（revision {revision}）。次の実行から反映します。外部MCP上限: {}。",
+            render::sanitize(prepared.server_id()),
+            if prepared.enabled() {
+                "有効"
+            } else {
+                "無効"
+            },
+            if external_enabled { "許可" } else { "拒否" },
+        ))]),
+        None => Ok(vec![Line::from("MCP登録の変更を取り消しました。")]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,8 +256,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn m3d_mcp_tui_registry_confirmation_ceiling_and_denial() {
+    #[tokio::test]
+    async fn m3d_mcp_tui_registry_confirmation_ceiling_and_denial() {
         if std::env::var_os("POLARIS_M3D_TUI_CHILD").is_none() {
             let home = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -164,12 +320,12 @@ mod tests {
             "enable fixture",
             &terminal,
             &mut yes,
-            &workspace,
-            &effects,
+            (&workspace, &effects),
             &host,
-            false,
+            (false, ApprovalPolicy::Always),
             false,
         )
+        .await
         .unwrap();
         assert!(output[0].to_string().contains("次の実行"));
         assert!(
@@ -187,12 +343,12 @@ mod tests {
             "disable fixture",
             &terminal,
             &mut no,
-            &workspace,
-            &effects,
+            (&workspace, &effects),
             &host,
-            false,
+            (false, ApprovalPolicy::Always),
             false,
         )
+        .await
         .unwrap();
         assert!(
             host.store()
@@ -209,12 +365,12 @@ mod tests {
             "disable fixture",
             &terminal,
             &mut yes,
-            &workspace,
-            &effects,
+            (&workspace, &effects),
             &host,
-            false,
+            (false, ApprovalPolicy::Always),
             false,
         )
+        .await
         .unwrap();
         assert!(
             !host
@@ -233,12 +389,12 @@ mod tests {
                 "enable missing",
                 &terminal,
                 &mut keys,
-                &workspace,
-                &effects,
+                (&workspace, &effects),
                 &host,
-                false,
+                (false, ApprovalPolicy::Always),
                 false
             )
+            .await
             .is_err()
         );
         assert!(
@@ -246,12 +402,12 @@ mod tests {
                 "enable fixture",
                 &terminal,
                 &mut keys,
-                &workspace,
-                &effects,
+                (&workspace, &effects),
                 &host,
-                false,
+                (false, ApprovalPolicy::Always),
                 true
             )
+            .await
             .is_err()
         );
         assert!(
@@ -259,12 +415,12 @@ mod tests {
                 "secret delete fixture",
                 &terminal,
                 &mut keys,
-                &workspace,
-                &effects,
+                (&workspace, &effects),
                 &host,
-                false,
+                (false, ApprovalPolicy::Always),
                 false
             )
+            .await
             .is_err()
         );
         assert!(
@@ -272,12 +428,12 @@ mod tests {
                 "check fixture",
                 &terminal,
                 &mut keys,
-                &workspace,
-                &effects,
+                (&workspace, &effects),
                 &host,
-                false,
+                (false, ApprovalPolicy::Always),
                 false
             )
+            .await
             .is_err()
         );
         let text = state_lines(&host, false)
@@ -299,119 +455,5 @@ mod tests {
         assert!(effects.blocker().unwrap().is_none());
         std::fs::write(home.join(".polaris/mcp/servers.json"), b"not-json").unwrap();
         assert!(state_lines(&host, false).is_err());
-    }
-}
-
-pub(crate) fn handle<B: Backend, R: KeyReader>(
-    request: &str,
-    terminal: &RefCell<Terminal<B>>,
-    reader: &mut R,
-    workspace: &WorkspaceOwner,
-    effects: &ManagementEffectStoreV1,
-    cwd: &Path,
-    external_enabled: bool,
-    has_pending: bool,
-) -> Result<Vec<Line<'static>>, String> {
-    let host = LocalHost::open(cwd, false).map_err(|_| "MCP保存領域を開けません")?;
-    handle_host(
-        request,
-        terminal,
-        reader,
-        workspace,
-        effects,
-        &host,
-        external_enabled,
-        has_pending,
-    )
-}
-
-pub(crate) fn handle_host<B: Backend, R: KeyReader>(
-    request: &str,
-    terminal: &RefCell<Terminal<B>>,
-    reader: &mut R,
-    workspace: &WorkspaceOwner,
-    effects: &ManagementEffectStoreV1,
-    host: &LocalHost,
-    external_enabled: bool,
-    has_pending: bool,
-) -> Result<Vec<Line<'static>>, String> {
-    let request = request.trim();
-    if request.is_empty() || request == "list" || request == "status" {
-        return state_lines(host, external_enabled);
-    }
-    if request.len() > 2048 || request.chars().any(char::is_control) {
-        return Err("MCP操作は2048バイト以内の1行で指定してください".into());
-    }
-    let mut parts = request.split_whitespace();
-    let command = parts.next().unwrap_or("");
-    match command {
-        "secret" => {
-            return Err(
-                "MCP credential ownerの安全な保存・復旧経路は未実装です。値を保存・削除できません。".into(),
-            );
-        }
-        "check" | "setup" | "materialize" | "register" | "configure" | "delete" => {
-            return Err(
-                "このMCP操作の管理ownerは未実装です。登録・catalog・install領域を変更できません。"
-                    .into(),
-            );
-        }
-        "prompt" => {
-            return Err(
-                "/mcp prompt <server>/<prompt> [key=value ...] は次の入力の選択欄で扱います。"
-                    .into(),
-            );
-        }
-        "enable" | "disable" => {}
-        _ => {
-            return Err(
-                "/mcp list|enable <server>|disable <server>|prompt <server>/<prompt>".into(),
-            );
-        }
-    }
-    let server_id = parts.next().ok_or("/mcp enable|disable <server>")?;
-    if parts.next().is_some() {
-        return Err("/mcp enable|disable <server> はserverを1件だけ指定してください".into());
-    }
-    if has_pending {
-        return Err("送信待ちの入力があるためMCP登録を変更できません".into());
-    }
-    let lease = workspace
-        .try_mutation()
-        .map_err(|_| "実行中の操作があるためMCP登録を変更できません")?;
-    polaris_core::sync::composite::C10CompositeBlockerV1::require_clear_with_mutation(
-        workspace.project_root(),
-        effects.state_dir(),
-        &lease,
-    )
-    .map_err(|error| error.to_string())?;
-    let owner = McpRegistryChangeOwnerV1::new(host, effects, &lease, workspace.project_root())?;
-    let prepared = owner.prepare(server_id, command == "enable")?;
-    let accepted = confirm(
-        terminal,
-        reader,
-        if prepared.enabled() {
-            "MCPをこのプロジェクトで有効化"
-        } else {
-            "MCPをこのプロジェクトで無効化"
-        },
-        prepared.server_id(),
-        &format!(
-            "registry revision {}。次の実行から反映します。実行中runtime・起動時の外部MCP上限は変更しません。巻き戻しでは取り消せません。",
-            prepared.before_revision()
-        ),
-    );
-    match owner.apply(&prepared, accepted)? {
-        Some(revision) => Ok(vec![Line::from(format!(
-            "{} をこのプロジェクトで{}にしました（revision {revision}）。次の実行から反映します。外部MCP上限: {}。",
-            render::sanitize(prepared.server_id()),
-            if prepared.enabled() {
-                "有効"
-            } else {
-                "無効"
-            },
-            if external_enabled { "許可" } else { "拒否" },
-        ))]),
-        None => Ok(vec![Line::from("MCP登録の変更を取り消しました。")]),
     }
 }

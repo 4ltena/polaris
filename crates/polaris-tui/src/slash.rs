@@ -178,7 +178,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "mcp",
-        description: "show registered MCP servers and why any are unavailable",
+        description: "manage MCP servers, catalogs, and credentials",
     },
     SlashCommand {
         name: "model",

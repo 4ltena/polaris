@@ -261,10 +261,7 @@ impl C10CompletedParticipationRecoveryV1<'_, '_> {
             match effect.state {
                 State::EffectStarted | State::OutcomeUnknown { .. } => (),
                 State::Completed { evidence_hash }
-                    if evidence_hash == management_hash(actual.terminal_evidence_hash()?)? =>
-                {
-                    ()
-                }
+                    if evidence_hash == management_hash(actual.terminal_evidence_hash()?)? => {}
                 _ => return Err(SyncPushErrorV1::Protection),
             }
             let SyncRemoteIntentStateV2::Completed { receipt } = actual.current().state() else {
@@ -774,7 +771,7 @@ impl SyncPushOwnerV1 {
                     &token.lease,
                     &token.preview.payload,
                 )?,
-                C10RepositoryInspectionV1::Existing(value) => value,
+                C10RepositoryInspectionV1::Existing(value) => *value,
             };
             let (repository, readback) = repository.commit_after_local_prepared(
                 &management,
@@ -842,8 +839,7 @@ impl SyncPushOwnerV1 {
                 &mut token.reservation,
                 &history,
                 &management,
-                Some(&started),
-                None,
+                (Some(&started), None),
                 &token.preview.participation,
             )
         })();
@@ -901,8 +897,10 @@ impl SyncPushOwnerV1 {
         reservation: &mut C10IntentReservationV2,
         history: &SyncRemoteIntentHistoryV2,
         management: &ManagementEffectStoreV1,
-        started: Option<&StartedManagementEffectV1>,
-        unknown: Option<&UnknownManagementEffectV1>,
+        (started, unknown): (
+            Option<&StartedManagementEffectV1>,
+            Option<&UnknownManagementEffectV1>,
+        ),
         prior: &ParticipationV2,
     ) -> Result<SyncPushOutcomeV1> {
         let SyncRemoteIntentStateV2::Completed { receipt } = history.current().state() else {
@@ -1134,8 +1132,7 @@ impl SyncPushOwnerV1 {
             if effect.request.inventory.encoded() == "C10" {
                 if !paired.contains(&effect.request.operation_id)
                     && !matches!(effect.state, State::Denied { .. })
-                {
-                    if own != Some(effect.request.operation_id)
+                    && (own != Some(effect.request.operation_id)
                         || !(matches!(effect.state, State::Prepared)
                             || recovering
                                 && matches!(
@@ -1147,10 +1144,9 @@ impl SyncPushOwnerV1 {
                         || effect.request.scope.permission != ManagementPermissionScopeV1::Remote
                         || effect.request.scope.account_binding.is_none()
                         || effect.request.rewind
-                            != ManagementRewindDispositionV1::IrreversibleRemote
-                    {
-                        return Err(SyncPushErrorV1::Blocked);
-                    }
+                            != ManagementRewindDispositionV1::IrreversibleRemote)
+                {
+                    return Err(SyncPushErrorV1::Blocked);
                 }
             } else if !effect.state.is_terminal() {
                 return Err(SyncPushErrorV1::Blocked);
@@ -1297,7 +1293,7 @@ impl NetworkChildV1 for OwnerNetwork<'_> {
         &mut self,
         args: &[OsString],
     ) -> std::result::Result<GitChildOutputV1, NetworkFailureV1> {
-        let checked = (|| -> Result<_> {
+        (|| -> Result<()> {
             self.owner.verify_state()?;
             self.owner
                 .require_invocation(self.invocation, self.subject)?;
@@ -1314,7 +1310,6 @@ impl NetworkChildV1 for OwnerNetwork<'_> {
             Ok(())
         })()
         .map_err(|_| NetworkFailureV1::BeforeSpawn)?;
-        let _ = checked;
         self.owner
             .existing_network(self.repository, self.binding, args)
     }

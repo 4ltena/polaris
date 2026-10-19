@@ -245,7 +245,9 @@ impl Engine {
                     intent_committed: r.intent_revision.is_some(),
                     result_saved: r.result.is_some(),
                     result: {
-                        let mut result = projected_result(r.result.as_ref(), &c.payload.entries);
+                        let result = projected_result(r.result.as_ref(), &c.payload.entries);
+                        #[cfg(target_os = "linux")]
+                        let mut result = result;
                         #[cfg(target_os = "linux")]
                         if r.reserved_result_id.is_some()
                             && !self.saved_source_completed.contains(r)

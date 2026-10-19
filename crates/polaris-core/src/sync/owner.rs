@@ -4,24 +4,39 @@
 //! calls the transport. Once dispatch can have happened, every failure is an
 //! unresolved outcome. The owner never retries a send automatically.
 
+mod store_v2;
+pub(crate) use store_v2::{
+    C10IntentReadV2, C10IntentReservationV2, C10IntentStoreErrorV2, C10IntentStoreV2,
+    C10PendingIntentV2,
+};
+
+#[cfg(any(unix, test))]
+use super::remote_intent::SyncRemoteIntentStateV1;
 use super::remote_intent::{
     CurrentSyncRemoteStateV1, SyncRemoteIntentRecordV1, SyncRemoteIntentRequestV1,
-    SyncRemoteIntentStateV1, SyncRemoteOperationIdV1, SyncRemoteReceiptV1,
-    SyncRemoteUnknownReasonV1,
+    SyncRemoteOperationIdV1, SyncRemoteReceiptV1, SyncRemoteUnknownReasonV1,
 };
+#[cfg(any(unix, test))]
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use std::{
     ffi::CString,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    fs::{self, OpenOptions},
+    io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
+};
+use std::{
+    fs::File,
+    io,
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
 const STORE_DIRECTORY: &str = "remote-intents-v1";
+#[cfg(unix)]
 const MAX_RECORD_BYTES: u64 = 128 * 1024;
 
 pub trait SyncRemoteTransportV1 {
@@ -60,6 +75,8 @@ pub enum SyncRemoteRecoveryV1 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncRemoteOwnerErrorV1 {
+    #[error("legacy sync intent is read-only; manual recovery is required")]
+    LegacyUnavailable,
     #[error("sync remote intent store is invalid: {0}")]
     InvalidStore(PathBuf),
     #[error("sync remote intent record is invalid")]
@@ -97,7 +114,11 @@ pub struct SyncRemoteIntentOwnerV1 {
 impl SyncRemoteIntentOwnerV1 {
     /// Opens the remote intent store below this project's already-resolved
     /// Polaris state directory. No credential is read or inferred here.
+    #[cfg(unix)]
     pub fn open(state_dir: &Path) -> Result<Self, SyncRemoteOwnerErrorV1> {
+        if !cfg!(test) {
+            return Err(SyncRemoteOwnerErrorV1::LegacyUnavailable);
+        }
         Ok(Self {
             store: FsRemoteIntentStoreV1::open(&state_dir.join("sync").join(STORE_DIRECTORY))?,
         })
@@ -105,12 +126,16 @@ impl SyncRemoteIntentOwnerV1 {
 
     /// Sends at most once. Any existing record, including an unresolved one,
     /// refuses dispatch and must be inspected or reconciled instead.
+    #[cfg(unix)]
     pub fn send_once<T: SyncRemoteTransportV1>(
         &mut self,
         request: SyncRemoteIntentRequestV1,
         current: &CurrentSyncRemoteStateV1,
         transport: &mut T,
     ) -> Result<SyncRemotePushOutcomeV1, SyncRemoteOwnerErrorV1> {
+        if !cfg!(test) {
+            return Err(SyncRemoteOwnerErrorV1::LegacyUnavailable);
+        }
         validate_current(&request, current)?;
         let _lease = self.store.try_lock()?;
         match self.store.read(&request.operation_id)? {
@@ -159,11 +184,15 @@ impl SyncRemoteIntentOwnerV1 {
     /// Loads an operation after restart. A durable BeforeSend record means
     /// dispatch may have happened, so it is converted to OutcomeUnknown and
     /// is never offered as an automatic retry.
+    #[cfg(unix)]
     pub fn recover(
         &mut self,
         operation_id: &SyncRemoteOperationIdV1,
         current: &CurrentSyncRemoteStateV1,
     ) -> Result<Option<SyncRemoteRecoveryV1>, SyncRemoteOwnerErrorV1> {
+        if !cfg!(test) {
+            return Err(SyncRemoteOwnerErrorV1::LegacyUnavailable);
+        }
         let _lease = self.store.try_lock()?;
         let Some(mut record) = self.store.read(operation_id)? else {
             return Ok(None);
@@ -184,12 +213,16 @@ impl SyncRemoteIntentOwnerV1 {
     /// Reconciles only from proof that the exact requested ref currently
     /// equals the exact local commit. Missing, different or unreadable refs
     /// remain unresolved and never trigger another send.
+    #[cfg(unix)]
     pub fn reconcile<T: SyncRemoteTransportV1>(
         &mut self,
         operation_id: &SyncRemoteOperationIdV1,
         current: &CurrentSyncRemoteStateV1,
         transport: &mut T,
     ) -> Result<Option<SyncRemoteRecoveryV1>, SyncRemoteOwnerErrorV1> {
+        if !cfg!(test) {
+            return Err(SyncRemoteOwnerErrorV1::LegacyUnavailable);
+        }
         let _lease = self.store.try_lock()?;
         let Some(mut record) = self.store.read(operation_id)? else {
             return Ok(None);
@@ -231,6 +264,7 @@ impl SyncRemoteIntentOwnerV1 {
         }
     }
 
+    #[cfg(unix)]
     fn persist_unknown(
         &mut self,
         mut record: SyncRemoteIntentRecordV1,
@@ -244,17 +278,18 @@ impl SyncRemoteIntentOwnerV1 {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn fail_next_completed_write(&mut self) {
         self.store.fail_next_completed_write = true;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn fail_write_after(&mut self, successful_writes: usize) {
         self.store.fail_on_write_call = Some(self.store.write_calls + successful_writes + 1);
     }
 }
 
+#[cfg(any(unix, test))]
 fn validate_current(
     request: &SyncRemoteIntentRequestV1,
     current: &CurrentSyncRemoteStateV1,
@@ -297,6 +332,7 @@ struct FsRemoteIntentStoreV1 {
     write_calls: usize,
 }
 
+#[cfg(unix)]
 impl FsRemoteIntentStoreV1 {
     fn open(root: &Path) -> Result<Self, SyncRemoteOwnerErrorV1> {
         let parent = root
@@ -460,6 +496,7 @@ impl FsRemoteIntentStoreV1 {
     }
 }
 
+#[cfg(any(unix, test))]
 fn validate_record_invariants(
     record: &SyncRemoteIntentRecordV1,
 ) -> Result<(), SyncRemoteOwnerErrorV1> {
@@ -474,6 +511,7 @@ fn validate_record_invariants(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn record_name(operation_id: &SyncRemoteOperationIdV1) -> String {
     let digest: [u8; 32] = Sha256::digest(operation_id.as_str().as_bytes()).into();
     let mut name = String::with_capacity(64 + ".json".len());
@@ -485,6 +523,7 @@ fn record_name(operation_id: &SyncRemoteOperationIdV1) -> String {
     name
 }
 
+#[cfg(unix)]
 fn temporary_name(target: &str) -> Result<String, SyncRemoteOwnerErrorV1> {
     let mut random = [0_u8; 12];
     getrandom::fill(&mut random)
@@ -498,10 +537,12 @@ fn temporary_name(target: &str) -> Result<String, SyncRemoteOwnerErrorV1> {
     Ok(name)
 }
 
+#[cfg(unix)]
 fn c_name(name: &str) -> Result<CString, SyncRemoteOwnerErrorV1> {
     CString::new(name).map_err(|_| SyncRemoteOwnerErrorV1::InvalidRecord)
 }
 
+#[cfg(unix)]
 fn rename_at(directory: &File, from: &str, to: &str) -> io::Result<()> {
     let from = CString::new(from).expect("generated file name has no NUL");
     let to = CString::new(to).expect("generated file name has no NUL");
@@ -519,6 +560,7 @@ fn rename_at(directory: &File, from: &str, to: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn unlink_at(directory: &File, name: &str) -> io::Result<()> {
     let name = CString::new(name).expect("generated file name has no NUL");
     if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
@@ -527,6 +569,7 @@ fn unlink_at(directory: &File, name: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn map_store_open_error(root: &Path, error: io::Error) -> SyncRemoteOwnerErrorV1 {
     if matches!(error.raw_os_error(), Some(code) if code == libc::ELOOP || code == libc::ENOTDIR) {
         SyncRemoteOwnerErrorV1::InvalidStore(root.to_path_buf())
@@ -535,6 +578,7 @@ fn map_store_open_error(root: &Path, error: io::Error) -> SyncRemoteOwnerErrorV1
     }
 }
 
+#[cfg(unix)]
 fn validate_directory(file: &File, path: &Path) -> Result<(), SyncRemoteOwnerErrorV1> {
     let metadata = file.metadata()?;
     if !metadata.is_dir()
@@ -547,6 +591,7 @@ fn validate_directory(file: &File, path: &Path) -> Result<(), SyncRemoteOwnerErr
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_record_file(file: &File, path: &Path) -> Result<(), SyncRemoteOwnerErrorV1> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
@@ -559,8 +604,10 @@ fn validate_record_file(file: &File, path: &Path) -> Result<(), SyncRemoteOwnerE
     Ok(())
 }
 
+#[cfg(unix)]
 struct RemoteIntentLeaseV1(File);
 
+#[cfg(unix)]
 impl Drop for RemoteIntentLeaseV1 {
     fn drop(&mut self) {
         unsafe {
@@ -569,7 +616,7 @@ impl Drop for RemoteIntentLeaseV1 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::sync::remote_intent::{
@@ -957,3 +1004,39 @@ mod tests {
         assert_eq!(transport.sends, 1);
     }
 }
+
+#[cfg(not(unix))]
+impl SyncRemoteIntentOwnerV1 {
+    pub fn open(_state_dir: &Path) -> Result<Self, SyncRemoteOwnerErrorV1> {
+        Err(SyncRemoteOwnerErrorV1::LegacyUnavailable)
+    }
+
+    pub fn send_once<T: SyncRemoteTransportV1>(
+        &mut self,
+        _request: SyncRemoteIntentRequestV1,
+        _current: &CurrentSyncRemoteStateV1,
+        _transport: &mut T,
+    ) -> Result<SyncRemotePushOutcomeV1, SyncRemoteOwnerErrorV1> {
+        Err(SyncRemoteOwnerErrorV1::LegacyUnavailable)
+    }
+
+    pub fn recover(
+        &mut self,
+        _operation_id: &SyncRemoteOperationIdV1,
+        _current: &CurrentSyncRemoteStateV1,
+    ) -> Result<Option<SyncRemoteRecoveryV1>, SyncRemoteOwnerErrorV1> {
+        Err(SyncRemoteOwnerErrorV1::LegacyUnavailable)
+    }
+
+    pub fn reconcile<T: SyncRemoteTransportV1>(
+        &mut self,
+        _operation_id: &SyncRemoteOperationIdV1,
+        _current: &CurrentSyncRemoteStateV1,
+        _transport: &mut T,
+    ) -> Result<Option<SyncRemoteRecoveryV1>, SyncRemoteOwnerErrorV1> {
+        Err(SyncRemoteOwnerErrorV1::LegacyUnavailable)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests;

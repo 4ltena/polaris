@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Temporary projects only; the synchronization repository is local.
 use super::*;
 use std::os::unix::fs::symlink;

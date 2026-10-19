@@ -56,6 +56,12 @@ fn m2a_agreed_tree_adapter_joins_the_owner_and_refuses_deferred_files_before_int
         )
         .unwrap();
         participation.applied_commit = participation.agreed_commit.clone();
+        crate::rewind_workspace::WorkspaceOwner::open(
+            &project,
+            &state.join("rewind-workspace"),
+            Default::default(),
+        )
+        .unwrap();
         let lease_owner =
             ProjectMutationOwnerV1::at_store_root(&state.join("rewind-workspace")).unwrap();
         let owner = ApplyOwnerV1::with_lease(&project, &state, lease_owner.try_mutation().unwrap())

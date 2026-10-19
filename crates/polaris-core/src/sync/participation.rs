@@ -1,12 +1,15 @@
 //! M7b-5: what this device remembers about a shared project. One small file
-//! per project, next to the rest of its state. It holds no credential: the
-//! remote it names is reached with the credentials Git already has.
-use super::share::{ShareLink, ShareManifest};
+//! per project, next to the rest of its state. V2 binds an explicitly selected
+//! credential identity; neither format contains a credential secret.
+use super::remote_intent::{SyncDigestV1, SyncGitObjectIdV1};
+use super::share::{CanonicalHttpsRemoteV1, ShareLink, ShareManifest};
+use polaris_auth::git_credentials::{GitCredentialBindingV1, GitCredentialOwnerV1};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 pub const FILE: &str = "participation.json";
+pub const MAX_PARTICIPATION_BYTES_V2: usize = 128 * 1024;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod generations_v1 {
@@ -65,6 +68,32 @@ mod generations_v1 {
         pub target_body_hash: Option<Hash>,
         pub target_body_bytes: u64,
         pub publication: ParticipationPublicationV1,
+        /// Only V2 CAS publications carry this exact source association. The
+        /// absent field preserves the canonical bytes of historical records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cas_source: Option<ParticipationCasSourceV2>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum ParticipationCasSourceV2 {
+        Missing,
+        Present { exact_digest: SyncDigestV1 },
+    }
+
+    impl ParticipationCasSourceV2 {
+        fn from_expected(expected: Option<SyncDigestV1>) -> Self {
+            match expected {
+                None => Self::Missing,
+                Some(exact_digest) => Self::Present { exact_digest },
+            }
+        }
+        fn exact_digest(self) -> Option<SyncDigestV1> {
+            match self {
+                Self::Missing => None,
+                Self::Present { exact_digest } => Some(exact_digest),
+            }
+        }
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -159,6 +188,8 @@ mod generations_v1 {
                 .checked_add(1)
                 .ok_or(C12MutationErrorV1::Overflow)?;
             if self.schema_version != 1
+                || (self.cas_source.is_some()
+                    && self.publication != ParticipationPublicationV1::Write)
                 || [
                     Some(self.base_marker_hash),
                     Some(self.target_marker_hash),
@@ -261,6 +292,7 @@ mod generations_v1 {
             target_body_hash: target_body.map(participation_bytes_hash),
             target_body_bytes: target_body.map_or(0, |b| b.len() as u64),
             publication,
+            cas_source: None,
         };
         let alloc =
             |n| allocated_bytes(n, allocation_unit).map_err(|_| C12MutationErrorV1::Overflow);
@@ -269,8 +301,20 @@ mod generations_v1 {
                 n.checked_add(*v).ok_or(C12MutationErrorV1::Overflow)
             })
         };
+        // Reserve the largest optional CAS association even for an older
+        // caller, so the shared pre-publication bound remains sufficient.
+        let cas_source_bytes = serde_json::to_vec(&ParticipationCasSourceV2::Present {
+            exact_digest: SyncDigestV1::digest(b"capacity placeholder"),
+        })
+        .map_err(|_| C12MutationErrorV1::CorruptEvidence("CAS capacity encode"))?
+        .len() as u64
+            + b",\"cas_source\":".len() as u64;
         let pending_final_bytes = sum(&[
-            alloc(pending.canonical_bytes()?.len() as u64)?,
+            alloc(
+                (pending.canonical_bytes()?.len() as u64)
+                    .checked_add(cas_source_bytes)
+                    .ok_or(C12MutationErrorV1::Overflow)?,
+            )?,
             alloc(pending.target_body_bytes)?,
             DIRECTORY_OVERHEAD_BYTES,
         ])?;
@@ -506,6 +550,15 @@ mod generations_v1 {
         }
 
         fn read(&self, name: &str, maximum: Option<u64>, private: bool) -> Result<Option<Vec<u8>>> {
+            let maximum = if matches!(name, FILE | "target-body.v1.json") {
+                Some(
+                    maximum
+                        .unwrap_or(MAX_PARTICIPATION_BYTES_V2 as u64)
+                        .min(MAX_PARTICIPATION_BYTES_V2 as u64),
+                )
+            } else {
+                maximum
+            };
             self.verify()?;
             let name = component(name)?;
             let mut file = match descriptor(unsafe {
@@ -594,7 +647,7 @@ mod generations_v1 {
             })?;
             let initial = file.metadata()?;
             file.write_all(bytes)?;
-            file.sync_data()?;
+            file.sync_all()?;
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::Start(0))?;
             let mut actual = Vec::new();
@@ -684,6 +737,10 @@ mod generations_v1 {
     }
 
     impl<'a> C12GenerationOwnerV1<'a> {
+        pub(super) fn state_path(&self) -> &Path {
+            &self.state.path
+        }
+
         pub(crate) fn open(state: &Path, lease: &'a ProjectMutationLeaseV1) -> Result<Self> {
             let state = Directory::open(state, false)?;
             let lock = state.child("rewind-workspace", true)?.ok_or(
@@ -740,194 +797,7 @@ mod generations_v1 {
         }
 
         pub(crate) fn inspect(&self) -> Result<C12InspectionV1> {
-            let Some(sync) = self.sync()? else {
-                return Ok(C12InspectionV1::Legacy {
-                    participation_hash: None,
-                });
-            };
-            let current_body = sync.read(FILE, None, false)?;
-            let body_hash = current_body.as_deref().map(participation_bytes_hash);
-            let Some(root) = sync.child(GENERATION_ROOT, true)? else {
-                return Ok(C12InspectionV1::Legacy {
-                    participation_hash: body_hash,
-                });
-            };
-            for name in root.names()? {
-                if !matches!(name.as_str(), BASELINE_FILE | GENERATIONS_DIR | PENDING_DIR) {
-                    return Err(C12MutationErrorV1::CorruptEvidence(
-                        "foreign generation root entry",
-                    ));
-                }
-            }
-            let baseline: BaselineV1 = decode_exact(
-                &root
-                    .read(BASELINE_FILE, Some(65536), true)?
-                    .ok_or(C12MutationErrorV1::CorruptEvidence("missing baseline"))?,
-            )?;
-            if baseline.schema_version != 1 {
-                return Err(C12MutationErrorV1::CorruptEvidence("baseline version"));
-            }
-            let generations = root
-                .child(GENERATIONS_DIR, true)?
-                .ok_or(C12MutationErrorV1::CorruptEvidence("missing generations"))?;
-            // Decode each immutable record separately; retain no artifact bodies.
-            let mut records = BTreeMap::new();
-            let mut mutation_ids = BTreeSet::new();
-            let mut generation_temporary = None;
-            generations.verify()?;
-            for entry in fs::read_dir(&generations.path)? {
-                let name = entry?
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| C12MutationErrorV1::CorruptEvidence("generation filename"))?;
-                if name.starts_with('.') && name.ends_with(".tmp") {
-                    if generation_temporary.is_some() {
-                        return Err(C12MutationErrorV1::CorruptEvidence(
-                            "multiple generation temporaries",
-                        ));
-                    }
-                    let bytes = generations.read(&name, Some(65536), true)?.ok_or(
-                        C12MutationErrorV1::CorruptEvidence("missing generation temporary"),
-                    )?;
-                    generation_temporary = Some((name, bytes));
-                    continue;
-                }
-                let marker = ParticipationGenerationV1::from_canonical_bytes(
-                    &generations
-                        .read(&name, Some(65536), true)?
-                        .ok_or(C12MutationErrorV1::CorruptEvidence("missing generation"))?,
-                )?;
-                if marker
-                    .mutation_id
-                    .is_some_and(|id| !mutation_ids.insert(id))
-                {
-                    return Err(C12MutationErrorV1::CorruptEvidence("reused mutation ID"));
-                }
-                if marker.filename()? != name || records.insert(marker.generation, marker).is_some()
-                {
-                    return Err(C12MutationErrorV1::CorruptEvidence(
-                        "generation filename/duplicate",
-                    ));
-                }
-            }
-            generations.verify()?;
-            let first = records.get(&0).ok_or(C12MutationErrorV1::CorruptEvidence(
-                "missing generation zero",
-            ))?;
-            if first.marker_hash()? != baseline.baseline_marker_hash {
-                return Err(C12MutationErrorV1::CorruptEvidence("baseline hash"));
-            }
-            let mut previous = None;
-            let mut expected = 0u64;
-            for (number, marker) in &records {
-                if *number != expected || marker.previous_marker_hash != previous {
-                    return Err(C12MutationErrorV1::CorruptEvidence("generation gap/fork"));
-                }
-                previous = Some(marker.marker_hash()?);
-                expected = number.checked_add(1).unwrap_or(*number);
-            }
-            let marker = records
-                .last_key_value()
-                .expect("generation zero exists")
-                .1
-                .clone();
-            let pending = if let Some(directory) = root.child(PENDING_DIR, true)? {
-                let names = directory.names()?;
-                if names.is_empty()
-                    && marker.generation > 0
-                    && body_hash == marker.participation_hash
-                    && generation_temporary.is_none()
-                {
-                    root.verify()?;
-                    sync.verify()?;
-                    if sync.read(FILE, None, false)? != current_body {
-                        return Err(C12MutationErrorV1::CorruptEvidence(
-                            "body raced during inspection",
-                        ));
-                    }
-                    return Ok(C12InspectionV1::CleanupCommitted { marker });
-                }
-                let pending = C12PendingV1::from_canonical_bytes(
-                    &directory
-                        .read("operation.v1.json", Some(65536), true)?
-                        .ok_or(C12MutationErrorV1::CorruptEvidence(
-                            "missing pending operation",
-                        ))?,
-                )?;
-                if names
-                    .iter()
-                    .any(|n| n != "operation.v1.json" && n != "target-body.v1.json")
-                {
-                    return Err(C12MutationErrorV1::CorruptEvidence("foreign pending entry"));
-                }
-                let target = directory.read("target-body.v1.json", None, true)?;
-                if target.is_none()
-                    && marker == pending.target_marker
-                    && body_hash == pending.target_body_hash
-                {
-                    // Cleanup may already have removed the retained copy;
-                    // the authoritative generation and current exact body
-                    // still prove that only cleanup remains.
-                    pending.verify_target_body(current_body.as_deref())?;
-                } else {
-                    pending.verify_target_body(target.as_deref())?;
-                }
-                let base = records
-                    .get(&pending.base_generation)
-                    .ok_or(C12MutationErrorV1::CorruptEvidence("pending base missing"))?;
-                if base.marker_hash()? != pending.base_marker_hash {
-                    return Err(C12MutationErrorV1::CorruptEvidence("pending base mismatch"));
-                }
-                if marker != pending.target_marker
-                    && mutation_ids.contains(&pending.target_marker.mutation_id.expect("validated"))
-                {
-                    return Err(C12MutationErrorV1::CorruptEvidence(
-                        "pending mutation ID reused",
-                    ));
-                }
-                let position =
-                    if marker == pending.target_marker && body_hash == pending.target_body_hash {
-                        C12PendingPositionV1::Committed
-                    } else if marker == *base && body_hash == base.participation_hash {
-                        C12PendingPositionV1::Base
-                    } else if marker == *base && body_hash == pending.target_body_hash {
-                        C12PendingPositionV1::Target
-                    } else {
-                        return Err(C12MutationErrorV1::CorruptEvidence(
-                            "pending rollback/conflict",
-                        ));
-                    };
-                Some((pending, position))
-            } else {
-                if body_hash != marker.participation_hash {
-                    return Err(C12MutationErrorV1::CorruptEvidence(
-                        "participation rollback",
-                    ));
-                }
-                None
-            };
-            if let Some((name, bytes)) = generation_temporary {
-                let Some((pending, _)) = pending.as_ref() else {
-                    return Err(C12MutationErrorV1::CorruptEvidence(
-                        "unowned generation temporary",
-                    ));
-                };
-                if name != format!(".{}.tmp", pending.target_marker.filename()?)
-                    || !pending.target_marker.canonical_bytes()?.starts_with(&bytes)
-                {
-                    return Err(C12MutationErrorV1::CorruptEvidence(
-                        "foreign generation temporary",
-                    ));
-                }
-            }
-            root.verify()?;
-            sync.verify()?;
-            if sync.read(FILE, None, false)? != current_body {
-                return Err(C12MutationErrorV1::CorruptEvidence(
-                    "body raced during inspection",
-                ));
-            }
-            Ok(C12InspectionV1::Committed { marker, pending })
+            inspect_generation_state(&self.state, None, false)
         }
 
         pub(crate) fn initialize_for_mutation(
@@ -1127,6 +997,7 @@ mod generations_v1 {
         publication: ParticipationPublicationV1,
         body: Option<&[u8]>,
         mutation_id: Hash,
+        cas_source: Option<ParticipationCasSourceV2>,
     ) -> Result<C12PendingV1> {
         if publication == ParticipationPublicationV1::Baseline
             || (publication == ParticipationPublicationV1::Leave) != body.is_none()
@@ -1153,6 +1024,7 @@ mod generations_v1 {
             target_body_hash: body.map(participation_bytes_hash),
             target_body_bytes: body.map_or(0, |b| b.len() as u64),
             publication,
+            cas_source,
         };
         pending.verify_target_body(body)?;
         Ok(pending)
@@ -1199,6 +1071,7 @@ mod generations_v1 {
             publication: ParticipationPublicationV1,
             body: Option<&[u8]>,
             mutation_id: Hash,
+            cas_source: Option<ParticipationCasSourceV2>,
         ) -> Result<C12PendingV1> {
             if self.inspect()?
                 != (C12InspectionV1::Committed {
@@ -1208,7 +1081,7 @@ mod generations_v1 {
             {
                 return Err(C12MutationErrorV1::CorruptEvidence("pending base raced"));
             }
-            let pending = pending_from(base, publication, body, mutation_id)?;
+            let pending = pending_from(base, publication, body, mutation_id, cas_source)?;
             let sync = self
                 .sync()?
                 .ok_or(C12MutationErrorV1::CorruptEvidence("missing sync"))?;
@@ -1256,6 +1129,17 @@ mod generations_v1 {
                 {
                     return Err(C12MutationErrorV1::CorruptEvidence("pending source raced"));
                 }
+                if let Some(source) = cas_source
+                    && sync
+                        .read(FILE, None, false)?
+                        .as_deref()
+                        .map(SyncDigestV1::digest)
+                        != source.exact_digest()
+                {
+                    return Err(C12MutationErrorV1::CorruptEvidence(
+                        "pending exact CAS source raced",
+                    ));
+                }
                 self.checkpoint("pending-publish")?;
                 root.publish_directory(&staging, PENDING_DIR)?;
                 sync.file.sync_all()?;
@@ -1290,11 +1174,250 @@ mod generations_v1 {
             Ok(pending)
         }
 
+        /// Retry only the original V2 CAS whose durable pending control still
+        /// proves its source and complete target. A legacy pending record is
+        /// never promoted into this authority, even for a missing source.
+        pub(super) fn inspect_exact_v2_cas(
+            &self,
+            expected_digest: Option<SyncDigestV1>,
+            bytes: &[u8],
+        ) -> Result<Option<Option<Vec<u8>>>> {
+            let inspected = inspect_generation_state(
+                &self.state,
+                Some(MAX_PARTICIPATION_BYTES_V2 as u64),
+                true,
+            )?;
+            let (pending, position) = match inspected {
+                C12InspectionV1::Legacy { .. }
+                | C12InspectionV1::Committed { pending: None, .. } => return Ok(None),
+                C12InspectionV1::CleanupCommitted { .. } => {
+                    return Err(C12MutationErrorV1::CorruptEvidence(
+                        "CAS source proof retired",
+                    ));
+                }
+                C12InspectionV1::Committed {
+                    pending: Some(pair),
+                    ..
+                } => pair,
+            };
+            if pending.publication != ParticipationPublicationV1::Write
+                || pending.cas_source
+                    != Some(ParticipationCasSourceV2::from_expected(expected_digest))
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence("different pending CAS"));
+            }
+            pending.verify_target_body(Some(bytes))?;
+            let sync = self
+                .sync()?
+                .ok_or(C12MutationErrorV1::CorruptEvidence("missing sync"))?;
+            let current = sync.read(FILE, Some(MAX_PARTICIPATION_BYTES_V2 as u64), true)?;
+            match position {
+                C12PendingPositionV1::Base => {
+                    if current.as_deref().map(SyncDigestV1::digest) != expected_digest {
+                        return Err(C12MutationErrorV1::CorruptEvidence(
+                            "pending CAS base changed",
+                        ));
+                    }
+                    if let Some(current) = current.as_deref() {
+                        let old = decode_participation_v2(current).map_err(|_| {
+                            C12MutationErrorV1::CorruptEvidence("pending CAS source schema")
+                        })?;
+                        let next = decode_participation_v2(bytes).map_err(|_| {
+                            C12MutationErrorV1::CorruptEvidence("pending CAS target schema")
+                        })?;
+                        if old.participation().map(|p| &p.share.share_id)
+                            != next.participation().map(|p| &p.share.share_id)
+                        {
+                            return Err(C12MutationErrorV1::CorruptEvidence(
+                                "pending CAS share mismatch",
+                            ));
+                        }
+                    }
+                }
+                C12PendingPositionV1::Target | C12PendingPositionV1::Committed => {
+                    if current.as_deref() != Some(bytes) {
+                        return Err(C12MutationErrorV1::CorruptEvidence(
+                            "pending CAS target changed",
+                        ));
+                    }
+                }
+            }
+            let root =
+                sync.child(GENERATION_ROOT, true)?
+                    .ok_or(C12MutationErrorV1::CorruptEvidence(
+                        "missing generation root",
+                    ))?;
+            let directory = root
+                .child(PENDING_DIR, true)?
+                .ok_or(C12MutationErrorV1::CorruptEvidence("missing pending"))?;
+            let retained = directory.read(
+                "target-body.v1.json",
+                Some(MAX_PARTICIPATION_BYTES_V2 as u64),
+                true,
+            )?;
+            if retained.as_deref() != Some(bytes)
+                && !(retained.is_none()
+                    && position == C12PendingPositionV1::Committed
+                    && current.as_deref() == Some(bytes))
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "pending CAS exact target mismatch",
+                ));
+            }
+            Ok(Some(current))
+        }
+
+        // Only the C10 sealed receipt entry points below may use this seam.
+        // Retired CAS control never grants a new publication: the whole target
+        // and committed Write marker must already exist, with empty cleanup.
+        pub(super) fn inspect_c10_completed_cleanup(
+            &self,
+            target: &ParticipationV2,
+            target_digest: SyncDigestV1,
+        ) -> Result<(ParticipationGenerationV1, Vec<u8>)> {
+            let bytes = target
+                .canonical_bytes()
+                .map_err(|_| C12MutationErrorV1::CorruptEvidence("C10 completed target schema"))?;
+            if SyncDigestV1::digest(&bytes) != target_digest {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "C10 completed target digest",
+                ));
+            }
+            let inspected = inspect_generation_state(
+                &self.state,
+                Some(MAX_PARTICIPATION_BYTES_V2 as u64),
+                true,
+            )?;
+            let C12InspectionV1::CleanupCommitted { marker } = inspected else {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "C10 completed cleanup state",
+                ));
+            };
+            if marker.generation == 0
+                || marker.publication != ParticipationPublicationV1::Write
+                || marker.participation_hash != Some(participation_bytes_hash(&bytes))
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "C10 completed cleanup marker",
+                ));
+            }
+            let sync = self
+                .sync()?
+                .ok_or(C12MutationErrorV1::CorruptEvidence("missing sync"))?;
+            if sync
+                .read(FILE, Some(MAX_PARTICIPATION_BYTES_V2 as u64), true)?
+                .as_deref()
+                != Some(bytes.as_slice())
+                || inspect_generation_state(
+                    &self.state,
+                    Some(MAX_PARTICIPATION_BYTES_V2 as u64),
+                    true,
+                )? != (C12InspectionV1::CleanupCommitted {
+                    marker: marker.clone(),
+                })
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "C10 completed cleanup changed",
+                ));
+            }
+            Ok((marker, bytes))
+        }
+
+        pub(super) fn cleanup_c10_completed_target(
+            &self,
+            target: &ParticipationV2,
+            target_digest: SyncDigestV1,
+        ) -> Result<()> {
+            let (marker, bytes) = self.inspect_c10_completed_cleanup(target, target_digest)?;
+            let sync = self
+                .sync()?
+                .ok_or(C12MutationErrorV1::CorruptEvidence("missing sync"))?;
+            let root =
+                sync.child(GENERATION_ROOT, true)?
+                    .ok_or(C12MutationErrorV1::CorruptEvidence(
+                        "missing generation root",
+                    ))?;
+            let directory =
+                root.child(PENDING_DIR, true)?
+                    .ok_or(C12MutationErrorV1::CorruptEvidence(
+                        "missing cleanup directory",
+                    ))?;
+            if self.inspect_c10_completed_cleanup(target, target_digest)?
+                != (marker.clone(), bytes.clone())
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "C10 completed cleanup changed",
+                ));
+            }
+            // Keep this action fixed to empty-directory cleanup, even if an
+            // outside writer introduces a pending control after inspection.
+            self.checkpoint("cleanup-directory")?;
+            root.remove_empty_child(&directory)?;
+            sync.file.sync_all()?;
+            if inspect_generation_state(&self.state, Some(MAX_PARTICIPATION_BYTES_V2 as u64), true)?
+                != (C12InspectionV1::Committed {
+                    marker,
+                    pending: None,
+                })
+                || sync
+                    .read(FILE, Some(MAX_PARTICIPATION_BYTES_V2 as u64), true)?
+                    .as_deref()
+                    != Some(bytes.as_slice())
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "C10 completed cleanup readback",
+                ));
+            }
+            Ok(())
+        }
+
+        pub(super) fn resume_exact_v2_cas(
+            &self,
+            expected_digest: Option<SyncDigestV1>,
+            bytes: &[u8],
+        ) -> Result<bool> {
+            if self.inspect_exact_v2_cas(expected_digest, bytes)?.is_none() {
+                return Ok(false);
+            }
+            self.resume_pending()?;
+            Ok(true)
+        }
+
         pub(crate) fn publish_normal(
             &self,
             publication: ParticipationPublicationV1,
             body: Option<&[u8]>,
         ) -> Result<ParticipationGenerationV1> {
+            self.publish_normal_checked(publication, body, None)
+        }
+
+        pub(super) fn publish_normal_cas(
+            &self,
+            publication: ParticipationPublicationV1,
+            body: Option<&[u8]>,
+            expected_digest: Option<SyncDigestV1>,
+        ) -> Result<ParticipationGenerationV1> {
+            self.publish_normal_checked(publication, body, Some(expected_digest))
+        }
+
+        fn publish_normal_checked(
+            &self,
+            publication: ParticipationPublicationV1,
+            body: Option<&[u8]>,
+            expected_digest: Option<Option<SyncDigestV1>>,
+        ) -> Result<ParticipationGenerationV1> {
+            let cas_source = expected_digest.map(ParticipationCasSourceV2::from_expected);
+            let check_expected = || -> Result<()> {
+                if let Some(expected) = expected_digest
+                    && self.current_body()?.as_deref().map(SyncDigestV1::digest) != expected
+                {
+                    return Err(C12MutationErrorV1::CorruptEvidence(
+                        "participation CAS raced",
+                    ));
+                }
+                Ok(())
+            };
+            check_expected()?;
             if !matches!(
                 publication,
                 ParticipationPublicationV1::Join
@@ -1304,6 +1427,7 @@ mod generations_v1 {
                 return Err(C12MutationErrorV1::CorruptEvidence("normal publication"));
             }
             if matches!(self.inspect()?, C12InspectionV1::CleanupCommitted { .. }) {
+                check_expected()?;
                 self.resume_pending()?;
             }
             if let C12InspectionV1::Committed {
@@ -1312,6 +1436,7 @@ mod generations_v1 {
             } = self.inspect()?
             {
                 if pending.publication != publication
+                    || pending.cas_source != cas_source
                     || pending.target_body_hash != body.map(participation_bytes_hash)
                     || pending.target_body_bytes != body.map_or(0, |b| b.len() as u64)
                 {
@@ -1319,9 +1444,11 @@ mod generations_v1 {
                         "different pending mutation",
                     ));
                 }
+                check_expected()?;
                 return self.resume_pending();
             }
             if matches!(self.inspect()?, C12InspectionV1::Legacy { .. }) {
+                check_expected()?;
                 self.initialize_for_mutation(publication, body)?;
             }
             let C12InspectionV1::Committed {
@@ -1338,7 +1465,8 @@ mod generations_v1 {
             c12_mutation_capacity_upper_bound(&base, publication, body, unit, false)?
                 .check_available(available)?;
             let mutation_id = normal_mutation_id(base.marker_hash()?, publication)?;
-            self.publish_pending(&base, publication, body, mutation_id)?;
+            check_expected()?;
+            self.publish_pending(&base, publication, body, mutation_id, cas_source)?;
             self.resume_pending()
         }
 
@@ -1355,6 +1483,7 @@ mod generations_v1 {
                 ParticipationPublicationV1::Apply,
                 Some(body),
                 operation_key,
+                None,
             )
         }
 
@@ -1542,12 +1671,264 @@ mod generations_v1 {
             sync.verify()
         }
     }
+
+    // Inspection is shared by mutation owners and bounded, read-only diagnostics.
+    // The latter must not acquire/create a lease or repair a pending publication.
+    fn inspect_generation_state(
+        state: &Directory,
+        maximum: Option<u64>,
+        private: bool,
+    ) -> Result<C12InspectionV1> {
+        let Some(sync) = state.child("sync", false)? else {
+            return Ok(C12InspectionV1::Legacy {
+                participation_hash: None,
+            });
+        };
+        let current_body = sync.read(FILE, maximum, private)?;
+        let body_hash = current_body.as_deref().map(participation_bytes_hash);
+        let Some(root) = sync.child(GENERATION_ROOT, true)? else {
+            return Ok(C12InspectionV1::Legacy {
+                participation_hash: body_hash,
+            });
+        };
+        for name in root.names()? {
+            if !matches!(name.as_str(), BASELINE_FILE | GENERATIONS_DIR | PENDING_DIR) {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "foreign generation root entry",
+                ));
+            }
+        }
+        let baseline: BaselineV1 = decode_exact(
+            &root
+                .read(BASELINE_FILE, Some(65536), true)?
+                .ok_or(C12MutationErrorV1::CorruptEvidence("missing baseline"))?,
+        )?;
+        if baseline.schema_version != 1 {
+            return Err(C12MutationErrorV1::CorruptEvidence("baseline version"));
+        }
+        let generations = root
+            .child(GENERATIONS_DIR, true)?
+            .ok_or(C12MutationErrorV1::CorruptEvidence("missing generations"))?;
+        // Decode each immutable record separately; retain no artifact bodies.
+        let mut records = BTreeMap::new();
+        let mut mutation_ids = BTreeSet::new();
+        let mut generation_temporary = None;
+        generations.verify()?;
+        for entry in fs::read_dir(&generations.path)? {
+            let name = entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| C12MutationErrorV1::CorruptEvidence("generation filename"))?;
+            if name.starts_with('.') && name.ends_with(".tmp") {
+                if generation_temporary.is_some() {
+                    return Err(C12MutationErrorV1::CorruptEvidence(
+                        "multiple generation temporaries",
+                    ));
+                }
+                let bytes = generations.read(&name, Some(65536), true)?.ok_or(
+                    C12MutationErrorV1::CorruptEvidence("missing generation temporary"),
+                )?;
+                generation_temporary = Some((name, bytes));
+                continue;
+            }
+            let marker = ParticipationGenerationV1::from_canonical_bytes(
+                &generations
+                    .read(&name, Some(65536), true)?
+                    .ok_or(C12MutationErrorV1::CorruptEvidence("missing generation"))?,
+            )?;
+            if marker
+                .mutation_id
+                .is_some_and(|id| !mutation_ids.insert(id))
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence("reused mutation ID"));
+            }
+            if marker.filename()? != name || records.insert(marker.generation, marker).is_some() {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "generation filename/duplicate",
+                ));
+            }
+        }
+        generations.verify()?;
+        let first = records.get(&0).ok_or(C12MutationErrorV1::CorruptEvidence(
+            "missing generation zero",
+        ))?;
+        if first.marker_hash()? != baseline.baseline_marker_hash {
+            return Err(C12MutationErrorV1::CorruptEvidence("baseline hash"));
+        }
+        let mut previous = None;
+        let mut expected = 0u64;
+        for (number, marker) in &records {
+            if *number != expected || marker.previous_marker_hash != previous {
+                return Err(C12MutationErrorV1::CorruptEvidence("generation gap/fork"));
+            }
+            previous = Some(marker.marker_hash()?);
+            expected = number.checked_add(1).unwrap_or(*number);
+        }
+        let marker = records
+            .last_key_value()
+            .expect("generation zero exists")
+            .1
+            .clone();
+        let pending = if let Some(directory) = root.child(PENDING_DIR, true)? {
+            let names = directory.names()?;
+            if names.is_empty()
+                && marker.generation > 0
+                && body_hash == marker.participation_hash
+                && generation_temporary.is_none()
+            {
+                root.verify()?;
+                sync.verify()?;
+                if sync.read(FILE, maximum, private)? != current_body {
+                    return Err(C12MutationErrorV1::CorruptEvidence(
+                        "body raced during inspection",
+                    ));
+                }
+                return Ok(C12InspectionV1::CleanupCommitted { marker });
+            }
+            let pending = C12PendingV1::from_canonical_bytes(
+                &directory
+                    .read("operation.v1.json", Some(65536), true)?
+                    .ok_or(C12MutationErrorV1::CorruptEvidence(
+                        "missing pending operation",
+                    ))?,
+            )?;
+            if names
+                .iter()
+                .any(|n| n != "operation.v1.json" && n != "target-body.v1.json")
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence("foreign pending entry"));
+            }
+            let target = directory.read("target-body.v1.json", maximum, true)?;
+            if target.is_none()
+                && marker == pending.target_marker
+                && body_hash == pending.target_body_hash
+            {
+                // Cleanup may already have removed the retained copy;
+                // the authoritative generation and current exact body
+                // still prove that only cleanup remains.
+                pending.verify_target_body(current_body.as_deref())?;
+            } else {
+                pending.verify_target_body(target.as_deref())?;
+            }
+            let base = records
+                .get(&pending.base_generation)
+                .ok_or(C12MutationErrorV1::CorruptEvidence("pending base missing"))?;
+            if base.marker_hash()? != pending.base_marker_hash {
+                return Err(C12MutationErrorV1::CorruptEvidence("pending base mismatch"));
+            }
+            if marker != pending.target_marker
+                && mutation_ids.contains(&pending.target_marker.mutation_id.expect("validated"))
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "pending mutation ID reused",
+                ));
+            }
+            let position =
+                if marker == pending.target_marker && body_hash == pending.target_body_hash {
+                    C12PendingPositionV1::Committed
+                } else if marker == *base && body_hash == base.participation_hash {
+                    C12PendingPositionV1::Base
+                } else if marker == *base && body_hash == pending.target_body_hash {
+                    C12PendingPositionV1::Target
+                } else {
+                    return Err(C12MutationErrorV1::CorruptEvidence(
+                        "pending rollback/conflict",
+                    ));
+                };
+            if let Some(source) = pending.cas_source {
+                if source.exact_digest().is_some() != base.participation_hash.is_some()
+                    || (position == C12PendingPositionV1::Base
+                        && current_body.as_deref().map(SyncDigestV1::digest)
+                            != source.exact_digest())
+                {
+                    return Err(C12MutationErrorV1::CorruptEvidence(
+                        "pending CAS source mismatch",
+                    ));
+                }
+            }
+            Some((pending, position))
+        } else {
+            if body_hash != marker.participation_hash {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "participation rollback",
+                ));
+            }
+            None
+        };
+        if let Some((name, bytes)) = generation_temporary {
+            let Some((pending, _)) = pending.as_ref() else {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "unowned generation temporary",
+                ));
+            };
+            if name != format!(".{}.tmp", pending.target_marker.filename()?)
+                || !pending.target_marker.canonical_bytes()?.starts_with(&bytes)
+            {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "foreign generation temporary",
+                ));
+            }
+        }
+        root.verify()?;
+        sync.verify()?;
+        if sync.read(FILE, maximum, private)? != current_body {
+            return Err(C12MutationErrorV1::CorruptEvidence(
+                "body raced during inspection",
+            ));
+        }
+        Ok(C12InspectionV1::Committed { marker, pending })
+    }
+
+    pub(super) fn read_strict_participation(state: &Path) -> Result<Option<Vec<u8>>> {
+        let state = match Directory::open(state, false) {
+            Ok(state) => state,
+            Err(C12MutationErrorV1::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(sync) = state.child("sync", false)? else {
+            return Ok(None);
+        };
+        let maximum = Some(MAX_PARTICIPATION_BYTES_V2 as u64);
+        let body = sync.read(FILE, maximum, true)?;
+        let body_hash = body.as_deref().map(participation_bytes_hash);
+        match inspect_generation_state(&state, maximum, true)? {
+            C12InspectionV1::Legacy { participation_hash } if participation_hash == body_hash => (),
+            C12InspectionV1::Committed {
+                marker,
+                pending: None,
+            } if marker.participation_hash == body_hash => (),
+            C12InspectionV1::Committed {
+                pending: Some(_), ..
+            }
+            | C12InspectionV1::CleanupCommitted { .. } => {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "pending participation publication",
+                ));
+            }
+            _ => {
+                return Err(C12MutationErrorV1::CorruptEvidence(
+                    "participation generation mismatch",
+                ));
+            }
+        }
+        if sync.read(FILE, maximum, true)? != body {
+            return Err(C12MutationErrorV1::CorruptEvidence(
+                "participation snapshot raced",
+            ));
+        }
+        sync.verify()?;
+        state.verify()?;
+        Ok(body)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use generations_v1::{
-    C12MutationCapacityV1, C12MutationErrorV1, C12PendingV1, ParticipationGenerationV1,
-    ParticipationPublicationV1, c12_mutation_capacity_upper_bound, participation_bytes_hash,
+    C12MutationCapacityV1, C12MutationErrorV1, C12PendingV1, ParticipationCasSourceV2,
+    ParticipationGenerationV1, ParticipationPublicationV1, c12_mutation_capacity_upper_bound,
+    participation_bytes_hash,
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1576,10 +1957,500 @@ fn path(state_dir: &Path) -> PathBuf {
     state_dir.join("sync").join(FILE)
 }
 
-/// What this device joined, if anything.
-pub fn read(state_dir: &Path) -> Option<Participation> {
-    let body = fs::read(path(state_dir)).ok()?;
-    serde_json::from_slice(&body).ok()
+/// V1 is retained only as the complete, validated historical field set. A V2
+/// update preserves these fields and never makes a legacy locator production
+/// eligible by rewriting it in place.
+impl Participation {
+    pub fn validate(&self) -> Result<(), ParticipationErrorV2> {
+        self.share
+            .validate_legacy()
+            .map_err(|_| ParticipationErrorV2::Corrupt("share identity or remote"))?;
+        if self.manifest.version != 1
+            || self.joined_unix_seconds >= self.share.expires_unix_seconds
+            || self.manifest.excluded.iter().any(|name| {
+                name.is_empty()
+                    || name == "."
+                    || name == ".."
+                    || name.len() > 255
+                    || name.contains(['/', '\\'])
+                    || name.bytes().any(|byte| byte.is_ascii_control())
+            })
+            || [&self.agreed_commit, &self.applied_commit]
+                .into_iter()
+                .flatten()
+                .any(|oid| SyncGitObjectIdV1::parse(oid.as_str()).is_err())
+            || self.unresolved.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > 4096
+                    || name.bytes().any(|byte| byte.is_ascii_control())
+                    || Path::new(name)
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            })
+        {
+            return Err(ParticipationErrorV2::Corrupt("participation fields"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipationV2 {
+    pub schema_version: u8,
+    pub participation: Participation,
+    pub credential_binding: GitCredentialBindingV1,
+}
+
+// The wire identity is a validated endpoint object, never a raw URL string.
+// The common V1 field view remains available privately for historical callers.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShareLinkWireV2 {
+    remote: CanonicalHttpsRemoteV1,
+    share_id: String,
+    invitation_id: String,
+    expires_unix_seconds: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParticipationFieldsWireV2 {
+    share: ShareLinkWireV2,
+    manifest: ShareManifest,
+    joined_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agreed_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unresolved: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParticipationWireV2 {
+    schema_version: u8,
+    participation: ParticipationFieldsWireV2,
+    credential_binding: GitCredentialBindingV1,
+}
+
+impl Serialize for ParticipationV2 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let value = &self.participation;
+        ParticipationWireV2 {
+            schema_version: self.schema_version,
+            participation: ParticipationFieldsWireV2 {
+                share: ShareLinkWireV2 {
+                    remote: value.share.production_remote().map_err(|_| {
+                        <S::Error as serde::ser::Error>::custom("production remote policy")
+                    })?,
+                    share_id: value.share.share_id.clone(),
+                    invitation_id: value.share.invitation_id.clone(),
+                    expires_unix_seconds: value.share.expires_unix_seconds,
+                },
+                manifest: value.manifest.clone(),
+                joined_unix_seconds: value.joined_unix_seconds,
+                agreed_commit: value.agreed_commit.clone(),
+                applied_commit: value.applied_commit.clone(),
+                unresolved: value.unresolved.clone(),
+            },
+            credential_binding: self.credential_binding.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ParticipationV2 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ParticipationWireV2::deserialize(deserializer)?;
+        let value = wire.participation;
+        let result = Self {
+            schema_version: wire.schema_version,
+            participation: Participation {
+                share: ShareLink {
+                    remote: value.share.remote.transport_url(),
+                    share_id: value.share.share_id,
+                    invitation_id: value.share.invitation_id,
+                    expires_unix_seconds: value.share.expires_unix_seconds,
+                },
+                manifest: value.manifest,
+                joined_unix_seconds: value.joined_unix_seconds,
+                agreed_commit: value.agreed_commit,
+                applied_commit: value.applied_commit,
+                unresolved: value.unresolved,
+            },
+            credential_binding: wire.credential_binding,
+        };
+        result.validate().map_err(serde::de::Error::custom)?;
+        Ok(result)
+    }
+}
+
+impl ParticipationV2 {
+    pub fn validate(&self) -> Result<(), ParticipationErrorV2> {
+        if self.schema_version != 2 {
+            return Err(ParticipationErrorV2::Corrupt("participation schema"));
+        }
+        self.participation.validate()?;
+        let remote = self
+            .participation
+            .share
+            .production_remote()
+            .map_err(|_| ParticipationErrorV2::Corrupt("production remote policy"))?;
+        self.credential_binding
+            .validate()
+            .map_err(|_| ParticipationErrorV2::Corrupt("stored credential binding"))?;
+        if !self.credential_binding.matches_remote(&remote) {
+            return Err(ParticipationErrorV2::Corrupt("credential remote mismatch"));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ParticipationErrorV2> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|_| ParticipationErrorV2::Corrupt("participation encoding"))?;
+        if bytes.len() > MAX_PARTICIPATION_BYTES_V2 {
+            return Err(ParticipationErrorV2::Corrupt("participation size"));
+        }
+        Ok(bytes)
+    }
+
+    pub fn inner(&self) -> &Participation {
+        &self.participation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParticipationReadV2 {
+    Missing,
+    Current(ParticipationV2),
+    LegacyParticipationOnly(Participation),
+    StaleCredentialBindingOnly(ParticipationV2),
+}
+
+impl ParticipationReadV2 {
+    /// Historical callers may inspect the common fields only after explicit
+    /// classification. This does not grant credential or mutation authority.
+    pub fn participation(&self) -> Option<&Participation> {
+        match self {
+            Self::Missing => None,
+            Self::LegacyParticipationOnly(value) => Some(value),
+            Self::Current(value) | Self::StaleCredentialBindingOnly(value) => Some(value.inner()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipationSnapshotV2 {
+    pub classification: ParticipationReadV2,
+    /// SHA-256 of the exact bytes read, including historical whitespace.
+    pub exact_digest: Option<SyncDigestV1>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParticipationErrorV2 {
+    #[error("invalid participation: {0}")]
+    Corrupt(&'static str),
+    #[error("participation changed before publication")]
+    StaleExpectedDigest,
+    #[error("strict participation is unavailable on this platform")]
+    Unavailable,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[error(transparent)]
+    Publication(#[from] C12MutationErrorV1),
+}
+
+pub(crate) fn decode_participation_v2(
+    bytes: &[u8],
+) -> Result<ParticipationReadV2, ParticipationErrorV2> {
+    if bytes.len() > MAX_PARTICIPATION_BYTES_V2 {
+        return Err(ParticipationErrorV2::Corrupt("participation size"));
+    }
+    let object: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| ParticipationErrorV2::Corrupt("participation JSON"))?;
+    let object = object
+        .as_object()
+        .ok_or(ParticipationErrorV2::Corrupt("participation object"))?;
+    if object.contains_key("schema_version") {
+        let value: ParticipationV2 = serde_json::from_slice(bytes)
+            .map_err(|_| ParticipationErrorV2::Corrupt("participation schema"))?;
+        value.validate()?;
+        // No Keychain or executable lookup is inferred from a stored snapshot.
+        Ok(ParticipationReadV2::StaleCredentialBindingOnly(value))
+    } else {
+        let value: Participation = serde_json::from_slice(bytes)
+            .map_err(|_| ParticipationErrorV2::Corrupt("legacy participation schema"))?;
+        value.validate()?;
+        Ok(ParticipationReadV2::LegacyParticipationOnly(value))
+    }
+}
+
+/// Builds a canonical C12 target while retaining the validated source schema
+/// and its exact credential binding. It is not a join/rebind primitive: share
+/// identity and the private transport locator must remain exactly unchanged.
+pub(crate) fn updated_participation_bytes_v2(
+    current_bytes: &[u8],
+    next: &Participation,
+) -> Result<Vec<u8>, ParticipationErrorV2> {
+    next.validate()?;
+    let held = decode_participation_v2(current_bytes)?;
+    let previous = held
+        .participation()
+        .ok_or(ParticipationErrorV2::Corrupt("missing update source"))?;
+    if previous.share.share_id != next.share.share_id || previous.share.remote != next.share.remote
+    {
+        return Err(ParticipationErrorV2::Corrupt(
+            "participation update identity",
+        ));
+    }
+    let bytes = match held {
+        ParticipationReadV2::Current(mut value)
+        | ParticipationReadV2::StaleCredentialBindingOnly(mut value) => {
+            value.participation = next.clone();
+            value.canonical_bytes()?
+        }
+        ParticipationReadV2::LegacyParticipationOnly(_) => serde_json::to_vec(next)
+            .map_err(|_| ParticipationErrorV2::Corrupt("participation encoding"))?,
+        ParticipationReadV2::Missing => {
+            return Err(ParticipationErrorV2::Corrupt("missing update source"));
+        }
+    };
+    if bytes.len() > MAX_PARTICIPATION_BYTES_V2 {
+        return Err(ParticipationErrorV2::Corrupt("participation size"));
+    }
+    Ok(bytes)
+}
+
+pub fn read_snapshot(state_dir: &Path) -> Result<ParticipationSnapshotV2, ParticipationErrorV2> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let body = generations_v1::read_strict_participation(state_dir)?;
+        Ok(ParticipationSnapshotV2 {
+            classification: match body.as_deref() {
+                None => ParticipationReadV2::Missing,
+                Some(bytes) => decode_participation_v2(bytes)?,
+            },
+            exact_digest: body.as_deref().map(SyncDigestV1::digest),
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = state_dir;
+        Err(ParticipationErrorV2::Unavailable)
+    }
+}
+
+/// Structural inspection alone is fail closed for production credentials.
+pub fn read(state_dir: &Path) -> Result<ParticipationReadV2, ParticipationErrorV2> {
+    Ok(read_snapshot(state_dir)?.classification)
+}
+
+/// The public promotion path invokes the credential owner's live recheck of
+/// the stored Keychain binding and both executable identities. API failure,
+/// missing items, ambiguity, and identity changes remain stale.
+pub fn read_with_credential_owner(
+    state_dir: &Path,
+    owner: &GitCredentialOwnerV1,
+) -> Result<ParticipationSnapshotV2, ParticipationErrorV2> {
+    read_with_binding_verifier(state_dir, |binding| {
+        owner.revalidate_binding(binding).is_ok()
+    })
+}
+
+// This injection seam is private to this module and its focused tests. A
+// caller outside it cannot promote a snapshot with an arbitrary boolean.
+fn read_with_binding_verifier(
+    state_dir: &Path,
+    verify: impl FnOnce(&GitCredentialBindingV1) -> bool,
+) -> Result<ParticipationSnapshotV2, ParticipationErrorV2> {
+    let mut snapshot = read_snapshot(state_dir)?;
+    snapshot.classification = match snapshot.classification {
+        ParticipationReadV2::StaleCredentialBindingOnly(value) => {
+            if verify(&value.credential_binding) {
+                ParticipationReadV2::Current(value)
+            } else {
+                ParticipationReadV2::StaleCredentialBindingOnly(value)
+            }
+        }
+        other => other,
+    };
+    Ok(snapshot)
+}
+
+/// C08 may inspect only its exact pending CAS without repairing or publishing.
+/// Ordinary reads retain their pending blocker; arbitrary pending records are
+/// never accepted by this owner-specific recovery path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn inspect_rebind_publication(
+    state_dir: &Path,
+    lease: &crate::project_mutation::ProjectMutationLeaseV1,
+    expected_digest: Option<SyncDigestV1>,
+    next: &ParticipationV2,
+) -> Result<ParticipationSnapshotV2, ParticipationErrorV2> {
+    let owner = C12GenerationOwnerV1::open(state_dir, lease)?;
+    match owner.inspect_exact_v2_cas(expected_digest, &next.canonical_bytes()?)? {
+        None => read_snapshot(state_dir),
+        Some(body) => Ok(ParticipationSnapshotV2 {
+            exact_digest: body.as_deref().map(SyncDigestV1::digest),
+            classification: match body.as_deref() {
+                None => ParticipationReadV2::Missing,
+                Some(bytes) => decode_participation_v2(bytes)?,
+            },
+        }),
+    }
+}
+
+/// The sealed C10 receipt permits inspection of its exact published target
+/// after CAS source control has retired. It does not relax C08's CAS evidence.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn inspect_c10_completed_publication(
+    proof: &super::push::C10CompletedParticipationRecoveryV1<'_, '_>,
+) -> Result<ParticipationSnapshotV2, ParticipationErrorV2> {
+    proof.verify()?;
+    let owner = C12GenerationOwnerV1::open(proof.state_path(), proof.lease())?;
+    let bytes = proof.target().canonical_bytes()?;
+    if SyncDigestV1::digest(&bytes) != proof.target_digest() {
+        return Err(ParticipationErrorV2::Corrupt("C10 completed target digest"));
+    }
+    let body = if matches!(owner.inspect()?, C12InspectionV1::CleanupCommitted { .. }) {
+        Some(Some(
+            owner
+                .inspect_c10_completed_cleanup(proof.target(), proof.target_digest())?
+                .1,
+        ))
+    } else {
+        owner.inspect_exact_v2_cas(Some(proof.expected_prior()), &bytes)?
+    };
+    let snapshot = match body {
+        None => read_snapshot(proof.state_path())?,
+        Some(body) => ParticipationSnapshotV2 {
+            exact_digest: body.as_deref().map(SyncDigestV1::digest),
+            classification: match body.as_deref() {
+                None => ParticipationReadV2::Missing,
+                Some(bytes) => decode_participation_v2(bytes)?,
+            },
+        },
+    };
+    proof.verify()?;
+    Ok(snapshot)
+}
+
+/// Finish only the durable C10 receipt's exact target. An already committed
+/// target is idempotent; retired control permits empty cleanup alone.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn publish_c10_completed_publication(
+    proof: &super::push::C10CompletedParticipationRecoveryV1<'_, '_>,
+) -> Result<SyncDigestV1, ParticipationErrorV2> {
+    proof.verify()?;
+    let owner = C12GenerationOwnerV1::open(proof.state_path(), proof.lease())?;
+    #[cfg(test)]
+    if let Some(stage) = proof.test_fault() {
+        owner.inject_failure(stage, libc::EIO);
+    }
+    let bytes = proof.target().canonical_bytes()?;
+    let digest = SyncDigestV1::digest(&bytes);
+    if digest != proof.target_digest() {
+        return Err(ParticipationErrorV2::Corrupt("C10 completed target digest"));
+    }
+    match owner.inspect()? {
+        C12InspectionV1::CleanupCommitted { .. } => {
+            owner.inspect_c10_completed_cleanup(proof.target(), digest)?;
+            proof.verify()?;
+            let result = owner.cleanup_c10_completed_target(proof.target(), digest);
+            proof.verify()?;
+            result?;
+        }
+        inspected => {
+            let already_published = if matches!(
+                inspected,
+                C12InspectionV1::Legacy { .. } | C12InspectionV1::Committed { pending: None, .. }
+            ) {
+                let snapshot = read_snapshot(proof.state_path())?;
+                snapshot.exact_digest == Some(digest)
+                    && matches!(
+                        snapshot.classification,
+                        ParticipationReadV2::Current(ref value)
+                            | ParticipationReadV2::StaleCredentialBindingOnly(ref value)
+                            if value == proof.target()
+                    )
+            } else {
+                false
+            };
+            if !already_published {
+                proof.verify()?;
+                let result =
+                    publish_v2_under_owner(&owner, Some(proof.expected_prior()), proof.target());
+                proof.verify()?;
+                result?;
+            }
+        }
+    }
+    let snapshot = read_snapshot(proof.state_path())?;
+    if snapshot.exact_digest != Some(digest)
+        || !matches!(
+            snapshot.classification,
+            ParticipationReadV2::Current(ref value)
+                | ParticipationReadV2::StaleCredentialBindingOnly(ref value)
+                if value == proof.target()
+        )
+    {
+        return Err(ParticipationErrorV2::Corrupt(
+            "C10 completed publication readback",
+        ));
+    }
+    proof.verify()?;
+    Ok(digest)
+}
+
+/// Publication is lease-bound and uses the existing C12 receipt chain. C08
+/// and C10 owners must establish their own durable EffectStarted/BeforeWrite
+/// before calling this shared primitive.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn publish_v2(
+    state_dir: &Path,
+    lease: &crate::project_mutation::ProjectMutationLeaseV1,
+    expected_digest: Option<SyncDigestV1>,
+    next: &ParticipationV2,
+) -> Result<SyncDigestV1, ParticipationErrorV2> {
+    let owner = C12GenerationOwnerV1::open(state_dir, lease)?;
+    publish_v2_under_owner(&owner, expected_digest, next)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_v2_under_owner(
+    owner: &C12GenerationOwnerV1<'_>,
+    expected_digest: Option<SyncDigestV1>,
+    next: &ParticipationV2,
+) -> Result<SyncDigestV1, ParticipationErrorV2> {
+    let bytes = next.canonical_bytes()?;
+    if !owner.resume_exact_v2_cas(expected_digest, &bytes)? {
+        let snapshot = read_snapshot(owner.state_path())?;
+        if snapshot.exact_digest != expected_digest {
+            return Err(ParticipationErrorV2::StaleExpectedDigest);
+        }
+        if let Some(old) = snapshot.classification.participation()
+            && old.share.share_id != next.participation.share.share_id
+        {
+            return Err(ParticipationErrorV2::Corrupt("different share identity"));
+        }
+        owner.publish_normal_cas(
+            ParticipationPublicationV1::Write,
+            Some(&bytes),
+            expected_digest,
+        )?;
+    }
+    let actual = read_snapshot(owner.state_path())?;
+    let digest = SyncDigestV1::digest(&bytes);
+    if actual.exact_digest != Some(digest)
+        || actual.classification.participation() != Some(next.inner())
+    {
+        return Err(ParticipationErrorV2::Corrupt(
+            "participation publication readback",
+        ));
+    }
+    Ok(digest)
 }
 
 /// Records the join. An invitation that has run out is refused here, so an
@@ -1594,7 +2465,7 @@ pub fn join(
     share
         .accept(now_unix_seconds)
         .map_err(|_| io::Error::other("この共有リンクは使えません"))?;
-    if let Some(held) = read(state_dir)
+    if let Some(held) = read(state_dir).map_err(io::Error::other)?.participation()
         && held.share.share_id != share.share_id
     {
         // One project belongs to one share; joining a second would mix two
@@ -1644,16 +2515,9 @@ fn with_normal_owner<T>(
     )
     .map_err(io::Error::other)?;
     let lease = lock.try_mutation().map_err(io::Error::other)?;
-    if crate::apply_intent::ApplyIntentStoreV1::inspect(state_dir, &lease)
-        .map_err(io::Error::other)?
-        .active()
-        .map_err(io::Error::other)?
-        .is_some()
-    {
-        return Err(io::Error::other(
-            "未完了の適用処理があるため参加状態を変更できません",
-        ));
-    }
+    crate::apply_intent::ApplyIntentStoreV1::inspect(state_dir, &lease)
+        .and_then(|store| store.require_idle())
+        .map_err(io::Error::other)?;
     let owner = C12GenerationOwnerV1::open(state_dir, &lease).map_err(io::Error::other)?;
     operation(&owner).map_err(io::Error::other)
 }
@@ -1694,10 +2558,21 @@ pub(crate) fn join_under_owner(
     owner: &C12GenerationOwnerV1<'_>,
     participation: Participation,
 ) -> std::result::Result<Participation, C12MutationErrorV1> {
+    participation
+        .validate()
+        .map_err(|_| C12MutationErrorV1::CorruptEvidence("participation fields"))?;
     let body = serde_json::to_vec_pretty(&participation).map_err(io::Error::other)?;
+    if body.len() > MAX_PARTICIPATION_BYTES_V2 {
+        return Err(C12MutationErrorV1::CorruptEvidence("participation size"));
+    }
     if let Some(current) = owner.current_body()? {
-        let held: Participation = serde_json::from_slice(&current)
+        let classification = decode_participation_v2(&current)
             .map_err(|_| C12MutationErrorV1::CorruptEvidence("participation schema"))?;
+        let ParticipationReadV2::LegacyParticipationOnly(held) = classification else {
+            return Err(C12MutationErrorV1::CorruptEvidence(
+                "V2 requires bound join",
+            ));
+        };
         if held.share.share_id != participation.share.share_id {
             return Err(io::Error::other("このprojectは別の共有に参加しています").into());
         }
@@ -1716,7 +2591,17 @@ pub(crate) fn write_under_owner(
     owner: &C12GenerationOwnerV1<'_>,
     participation: &Participation,
 ) -> std::result::Result<(), C12MutationErrorV1> {
-    let body = serde_json::to_vec_pretty(participation).map_err(io::Error::other)?;
+    participation
+        .validate()
+        .map_err(|_| C12MutationErrorV1::CorruptEvidence("participation fields"))?;
+    let body = match owner.current_body()? {
+        Some(current) => updated_participation_bytes_v2(&current, participation)
+            .map_err(|_| C12MutationErrorV1::CorruptEvidence("participation update"))?,
+        None => serde_json::to_vec_pretty(participation).map_err(io::Error::other)?,
+    };
+    if body.len() > MAX_PARTICIPATION_BYTES_V2 {
+        return Err(C12MutationErrorV1::CorruptEvidence("participation size"));
+    }
     owner.publish_normal(ParticipationPublicationV1::Write, Some(&body))?;
     Ok(())
 }
@@ -1731,6 +2616,10 @@ pub(crate) fn leave_under_owner(
     owner: &C12GenerationOwnerV1<'_>,
 ) -> std::result::Result<bool, C12MutationErrorV1> {
     let current = owner.current_body()?;
+    if let Some(bytes) = current.as_deref() {
+        decode_participation_v2(bytes)
+            .map_err(|_| C12MutationErrorV1::CorruptEvidence("participation schema"))?;
+    }
     if current.is_none()
         && matches!(
             owner.inspect()?,

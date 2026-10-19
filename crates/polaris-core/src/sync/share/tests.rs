@@ -106,3 +106,87 @@ fn both_sides_compare_one_digest_of_the_rules() {
         .digest()
     );
 }
+
+#[test]
+fn p2a_production_remote_rejects_legacy_and_noncanonical_locators() {
+    let valid = ShareLink {
+        remote: "https://example.invalid:443/team/project.git".into(),
+        ..link()
+    };
+    assert!(valid.accept_production(1_000).is_ok());
+    for remote in [
+        "https://example.invalid/team/project.git",
+        "https://EXAMPLE.invalid:443/team/project.git",
+        "https://example.invalid:443/team/../project.git",
+        "https://example.invalid:443/team//project.git",
+        "https://example.invalid:443/team/%70roject.git",
+        "https://user@example.invalid:443/project.git",
+        "https://user:secret@example.invalid:443/project.git",
+        "https://example.invalid:443/project.git?token=secret",
+        "https://example.invalid:443/project.git#secret",
+        "https://example.invalid:443/project.git\n",
+        "file:///tmp/project.git",
+        "ssh://git@example.invalid/project.git",
+        "git@example.invalid:project.git",
+    ] {
+        assert_eq!(
+            ShareLink {
+                remote: remote.into(),
+                ..link()
+            }
+            .accept_production(1_000),
+            Err(LinkRefusal::Remote)
+        );
+    }
+}
+
+#[test]
+fn p2a_legacy_inspection_does_not_renew_or_rewrite_a_locator() {
+    let legacy = link();
+    assert!(legacy.validate_legacy().is_ok());
+    assert_eq!(legacy.accept(2_000), Err(LinkRefusal::Expired));
+    assert_eq!(
+        legacy.remote,
+        "ssh://git@example.invalid/polaris-projects.git"
+    );
+    for remote in [
+        "https://user@example.invalid/project.git",
+        "https://example.invalid/project.git?token=secret",
+        "ssh://git:secret@example.invalid/project.git",
+        "file:///tmp/project.git#secret",
+        "ssh:///project.git",
+        "git@example.invalid",
+    ] {
+        assert_eq!(
+            ShareLink {
+                remote: remote.into(),
+                ..link()
+            }
+            .validate_legacy(),
+            Err(LinkRefusal::Remote)
+        );
+    }
+}
+
+#[test]
+fn p2a_debug_and_serialized_display_never_retain_unsafe_locator() {
+    let unsafe_link = ShareLink {
+        remote: "https://user:SECRET@example.invalid/private.git?token=TOKEN".into(),
+        ..link()
+    };
+    let debug = format!("{unsafe_link:?}");
+    let display = unsafe_link.remote_display();
+    let encoded = serde_json::to_string(&display).unwrap();
+    for text in [debug, display.to_string(), encoded] {
+        for omitted in [
+            "SECRET",
+            "TOKEN",
+            "user",
+            "example.invalid",
+            "private.git",
+            &unsafe_link.remote,
+        ] {
+            assert!(!text.contains(omitted));
+        }
+    }
+}

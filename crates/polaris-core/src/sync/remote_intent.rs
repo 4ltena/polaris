@@ -10,6 +10,9 @@ use std::{fmt, str::FromStr};
 
 const DIGEST_BYTES: usize = 32;
 
+mod v2;
+pub(crate) use v2::*;
+
 macro_rules! opaque_id {
     ($name:ident, $invalid:ident, $max:expr) => {
         #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

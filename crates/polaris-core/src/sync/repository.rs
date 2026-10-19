@@ -247,5 +247,7 @@ impl SyncRepository {
     }
 }
 
+pub(crate) mod c10;
+
 #[cfg(test)]
 mod tests;

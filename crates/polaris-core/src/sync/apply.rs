@@ -3,9 +3,13 @@
 //! the agreed tree, and hands the difference to the existing apply owner,
 //! which keeps the recovery copy, the journal and the protected-path rules.
 use super::share::ShareManifest;
-use crate::isolated_workspace::{ChangeSet, Limits, RegisteredSecrets, Snapshot, snapshot};
+#[cfg(unix)]
+use crate::isolated_workspace::snapshot;
+use crate::isolated_workspace::{ChangeSet, Limits, RegisteredSecrets, Snapshot};
+#[cfg(unix)]
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Shaped {
@@ -31,6 +35,7 @@ pub struct Changed {
 /// Builds the copy the apply owner will compare against the project. Only the
 /// changed shared paths are shaped; everything else in the copy is left
 /// exactly as the project has it.
+#[cfg(unix)]
 pub fn shape_copy(
     project_root: &Path,
     agreed_tree: &Path,
@@ -82,6 +87,7 @@ pub fn shape_copy(
 
 /// The difference the apply owner would carry out. Kept separate from the
 /// application itself so a caller can show it first.
+#[cfg(unix)]
 pub fn planned_changes(
     snapshot: &Snapshot,
     secrets: &RegisteredSecrets,
@@ -95,6 +101,7 @@ pub fn planned_changes(
 /// which keeps a recovery copy and refuses anything protected. The caller
 /// must have resolved every kept-from-both-sides path first: this applies
 /// what the shared history holds, nothing else.
+#[cfg(unix)]
 pub fn apply_agreed(
     project_root: &Path,
     agreed_tree: &Path,
@@ -169,5 +176,101 @@ pub fn apply_agreed_m2a(
     Ok((report, shaped))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(not(unix))]
+fn unavailable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "shared apply is unavailable on this platform",
+    )
+}
+
+#[cfg(not(unix))]
+pub fn shape_copy(
+    _project_root: &Path,
+    _agreed_tree: &Path,
+    _manifest: &ShareManifest,
+    _changed: &Changed,
+    _secrets: &RegisteredSecrets,
+    _limits: Limits,
+) -> io::Result<(Snapshot, Shaped)> {
+    Err(unavailable())
+}
+
+#[cfg(not(unix))]
+pub fn planned_changes(
+    _snapshot: &Snapshot,
+    _secrets: &RegisteredSecrets,
+    _limits: Limits,
+) -> io::Result<ChangeSet> {
+    Err(unavailable())
+}
+
+#[cfg(not(unix))]
+pub fn apply_agreed(
+    _project_root: &Path,
+    _agreed_tree: &Path,
+    _manifest: &ShareManifest,
+    _changed: &Changed,
+    _limits: Limits,
+    _recovery_parent: &Path,
+) -> io::Result<(crate::workspace_apply::ApplyReport, Shaped)> {
+    Err(unavailable())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_sync_apply_refuses_existing_and_missing_trees_without_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let agreed = root.path().join("agreed");
+        let recovery = root.path().join("recovery");
+        for path in [&project, &agreed, &recovery] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(project.join("file.rs"), b"before").unwrap();
+        std::fs::write(agreed.join("file.rs"), b"after").unwrap();
+        let missing = root.path().join("missing");
+        let changed = Changed {
+            written: vec!["file.rs".into()],
+            removed: vec!["local.txt".into()],
+        };
+        let limits = Limits {
+            max_entries: 8,
+            max_files: 4,
+            max_file_bytes: 128,
+            max_total_bytes: 256,
+            max_depth: 2,
+        };
+        for (project, agreed, recovery) in [
+            (&project, &agreed, &recovery),
+            (&missing, &missing, &missing),
+        ] {
+            assert_eq!(
+                apply_agreed(
+                    project,
+                    agreed,
+                    &ShareManifest::default(),
+                    &changed,
+                    limits,
+                    recovery,
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        assert_eq!(std::fs::read(project.join("file.rs")).unwrap(), b"before");
+        assert_eq!(std::fs::read(agreed.join("file.rs")).unwrap(), b"after");
+        assert_eq!(std::fs::read_dir(project).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(agreed).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(recovery).unwrap().count(), 0);
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
+    }
+}

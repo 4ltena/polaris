@@ -38,10 +38,12 @@ graph TD
   desktop-service --> core
   desktop-service --> provider
   desktop-service --> desktop-protocol
+  mcp --> tools
   mcp --> auth
   mcp --> sandbox
   provider --> tools
   provider --> http
+  tools --> auth
   tools --> sandbox
   tools --> skills
   tui --> memory
@@ -52,7 +54,7 @@ graph TD
   tui --> skills
 ```
 
-crate 13件、依存 38件。名前の`polaris-`は省いた。開発用の依存は、製品の組み立てを表さないため含めない。
+crate 13件、依存 40件。名前の`polaris-`は省いた。開発用の依存は、製品の組み立てを表さないため含めない。
 
 ## 外部との接続点
 
@@ -73,8 +75,8 @@ crate 13件、依存 38件。名前の`polaris-`は省いた。開発用の依�
 - `crates/polaris-core/src/compaction.rs:241`
 - `crates/polaris-core/src/local_execution.rs:153`
 - `crates/polaris-core/src/mcp/preselection.rs:346`
-- `crates/polaris-core/src/session_switch.rs:251`
-- `crates/polaris-core/src/session_switch.rs:349`
+- `crates/polaris-core/src/session_switch.rs:274`
+- `crates/polaris-core/src/session_switch.rs:378`
 - `crates/polaris-core/src/strict_provider.rs:76`
 - `crates/polaris-core/src/tier.rs:118`
 - `crates/polaris-core/src/tier.rs:121`
@@ -121,14 +123,14 @@ processが動く。
 
 呼び出し側 21件。
 
-- `crates/polaris-cli/src/main.rs:2531`
-- `crates/polaris-cli/src/main.rs:2568`
-- `crates/polaris-cli/src/main.rs:2571`
-- `crates/polaris-cli/src/main.rs:4140`
-- `crates/polaris-cli/src/main.rs:4150`
+- `crates/polaris-cli/src/main.rs:2560`
+- `crates/polaris-cli/src/main.rs:2597`
+- `crates/polaris-cli/src/main.rs:2600`
+- `crates/polaris-cli/src/main.rs:4197`
+- `crates/polaris-cli/src/main.rs:4207`
 - `crates/polaris-core/src/desktop_execution.rs:5`
 - `crates/polaris-core/src/execution_owner.rs:674`
-- `crates/polaris-core/src/sandbox_command.rs:193`
+- `crates/polaris-core/src/sandbox_command.rs:319`
 - `crates/polaris-core/src/verification/checkpoint.rs:786`
 - `crates/polaris-sandbox/src/broker.rs:480`
 - `crates/polaris-sandbox/src/child_fds.rs:241`
@@ -147,13 +149,14 @@ processが動く。
 
 残留・port占有・回収漏れ。
 
-呼び出し側 27件。
+呼び出し側 28件。
 
+- `crates/polaris-auth/src/git_credentials.rs:832`
 - `crates/polaris-auth/src/login.rs:205`
 - `crates/polaris-cli/src/account.rs:209`
 - `crates/polaris-cli/src/account.rs:400`
 - `crates/polaris-cli/src/decided.rs:103`
-- `crates/polaris-cli/src/main.rs:903`
+- `crates/polaris-cli/src/main.rs:911`
 - `crates/polaris-core/src/computer/macos.rs:45`
 - `crates/polaris-core/src/conversation_memory/strict_history.rs:1116`
 - `crates/polaris-core/src/llama_server.rs:112`
@@ -174,15 +177,16 @@ processが動く。
 - `crates/polaris-sandbox/src/child_fds.rs:496`
 - `crates/polaris-sandbox/src/confine.rs:197`
 - `crates/polaris-sandbox/src/confine.rs:248`
-- `crates/polaris-tui/src/account.rs:233`
+- `crates/polaris-tui/src/account.rs:239`
 - `crates/polaris-tui/src/clipboard.rs:67`
 
 ### gitの呼出し
 
 利用者のrepositoryが変わる。
 
-呼び出し側 12件。
+呼び出し側 13件。
 
+- `crates/polaris-core/src/sync/repository/c10.rs:1484`
 - `crates/polaris-cli/src/handoff.rs:8`
 - `crates/polaris-cli/src/handoff.rs:46`
 - `crates/polaris-cli/src/handoff.rs:72`
@@ -194,4 +198,4 @@ processが動く。
 - `crates/polaris-core/src/sync/repository.rs:49`
 - `crates/polaris-core/src/sync/repository.rs:50`
 - `crates/polaris-desktop-service/src/workspace_view.rs:467`
-- `crates/polaris-tui/src/lib.rs:11293`
+- `crates/polaris-tui/src/lib.rs:12340`

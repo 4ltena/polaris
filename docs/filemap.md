@@ -49,9 +49,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `Cargo.toml` — manifest for the polaris-auth crate
 
+## `crates/polaris-auth/examples`
+
+- `git-credential-owned-dp-probe.rs` — Owned macOS DP Keychain validation. Never queries existing user items.
+
 ## `crates/polaris-auth/src`
 
 - `api_key.rs` — Storage for a plain OpenAI API key at `~/.polaris/api_key.json`.
+- `git_credentials.rs` — C08/C10 shared, local Keychain credential binding.
 - `lib.rs` — Lifecycle of ChatGPT subscription auth (OAuth) and storage of credentials.
 - `login.rs` — Building the authorization URL, and receiving the callback exactly once.
 - `pkce.rs` — PKCE (RFC 7636) verifier and challenge.
@@ -79,6 +84,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-auth/src/accounts/store`
 
 - `tests.rs` — Synthetic credentials and temporary homes only.
+
+## `crates/polaris-auth/src/git_credentials`
+
+- `runner_tests.rs` — Git credential runner authorization, execution and replay regression tests.
 
 ## `crates/polaris-auth/src/quota`
 
@@ -143,8 +152,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `strict_history_tests.rs` — Exercises the CLI history constructor through persisted retrieval and a counting judge.
 - `sync.rs` — M7b-5: the `polaris sync` entry points. Every command works on this
 
+## `crates/polaris-cli/src/bin`
+
+- `polaris-git-askpass.rs` — The only credential handoff executable used by C08/C10 Git children.
+
 ## `crates/polaris-cli/tests`
 
+- `c08.rs` — Actual CLI rejection boundaries with disposable HOME, data and project roots.
 - `cli.rs` — Integration tests for the CLI binary. Launches the real process to verify behavior.
 - `confined_helper.rs` — Integration test that launches the real `polaris` binary as a helper
 - `entry_points.rs` — The three commands that had no caller until now: comparing folders,
@@ -209,7 +223,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `management_effect.rs` — Durable, typed lifecycle records for management side effects.
 - `mcp.rs` — Run-owned MCP connections, request context and local result retention.
 - `measurement.rs` — M8: what one comparison measurement leaves behind. Nothing here sends
-- `os_home.rs` — Trusted OS account home lookup. Never consults or changes the environment.
+- `os_home.rs` — Trusted OS account lookup shared with the MCP migration owner.
 - `preselect.rs` — Ranking candidates by embedding similarity — M10's second route.
 - `preselection_corpus.rs` — The fixed corpus every preselection comparison is measured against, and
 - `project.rs` — Resolves the project root.
@@ -356,12 +370,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `goal.rs` — M6-3a: the goal a session is working toward, and the instructions that
 - `hub.rs` — M6-1: the one state window an agent reads, and the difference since what
 - `memory.rs` — strict10のv3公開境界。モデルを呼ばず、v2 writerを開かない。
+- `migration.rs` — Simultaneously retained observations of the supplied transport roots.
 - `mod.rs` — v3保存。単一writer、世代公開、要求台帳と復旧を提供する。
 - `model.rs` — P1値を共用する保存marker、付随状態、要求結果と明示的な保存エラー。
 - `roles.rs` — Durable role choices and past metadata observations, never runtime authorization.
 - `session_manager.rs` — Root-owned durable state for the two-session admission manager.
 - `session_manager_family.rs` — Bounded family index reads and durable session-family membership.
+- `session_manager_family_migration.rs` — Read-only whole-family inventory; no index repair or manager recovery.
 - `session_manager_generation.rs` — Session-manager generation publication, sealing and archive recovery.
+- `session_manager_migration.rs` — Private no-create/no-repair observations for the MCP migration owner.
 - `source_apply.rs` — Controller-only evidence ledger. No filesystem authorization or dispatch.
 - `star_names.rs` — Stable display names for child runs.
 - `subagent_control.rs` — Durable, private owner storage for the typed subagent control plane.
@@ -424,6 +441,25 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `budget_tests.rs` — An authored long-plan variant tests the real preparation budget boundary.
 - `failure_tests.rs` — Fixed-oracle absence, source integrity, and interrupted withdrawal publication.
 
+## `crates/polaris-core/src/desktop_store/migration`
+
+- `discovery.rs` — Existing-only transport topology in every supplied data/settings location.
+- `legacy.rs` — Existing-only legacy JSONL and pre-compaction archive observation.
+- `management.rs` — Retained project mutation exclusion and historical management observation.
+- `tests.rs` — Simultaneous storage-root ownership and migration closure regression tests.
+
+## `crates/polaris-core/src/desktop_store/migration/discovery`
+
+- `tests.rs` — Transport storage-root discovery and retained-inventory regression tests.
+
+## `crates/polaris-core/src/desktop_store/migration/legacy`
+
+- `tests.rs` — Read-only legacy transcript and archive migration inspection tests.
+
+## `crates/polaris-core/src/desktop_store/migration/management`
+
+- `tests.rs` — Management-store migration ownership and terminal-state inspection tests.
+
 ## `crates/polaris-core/src/desktop_store/roles`
 
 - `tests.rs` — Durable role metadata validation without provider resolution.
@@ -444,6 +480,9 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `details.rs` — Display projection of one saved run: its accepted input and raw turn. The
 - `history.rs` — Owner-proven request projection; durable raw and actual user query stay separate.
 - `mcp.rs` — Atomic MCP intent/raw publication using the existing desktop writer.
+- `migration.rs` — Read-only classification of decoded history before MCP store migration.
+- `migration_local.rs` — Read-only local conversation migration inspection through pinned directories.
+- `migration_root.rs` — Complete existing desktop-root observation; no create, repair, or activation.
 - `prompt.rs` — One host-selected prompt per accepted input; saved proof never grants a retry.
 - `recipe.rs` — M7c-3a: what a bundled setting command has already done. One saved step
 
@@ -489,6 +528,8 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/isolated_run`
 
+- `helper_staging.rs` — FD-fixed copy kernel with separate ephemeral and persistent lifetimes.
+- `helper_staging_tests.rs` — Persistent helper staging, publication faults and retained-runtime regression tests.
 - `tests.rs` — Prepared workspace, staged helper identity, and runtime allowlist tests.
 - `toolchains.rs` — Explicit, bounded copies of already relocatable packages. No discovery,
 
@@ -498,7 +539,6 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/isolated_workspace`
 
-- `registered.rs` — Admission of a host-registered directory without copying or modifying it.
 - `tests.rs` — Sanitized snapshots, excluded secrets, source conflicts, and copy limits.
 
 ## `crates/polaris-core/src/llama_server`
@@ -517,12 +557,26 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `memory_change.rs` — One project owner for explicit import, embedding, indexing and session forgetting.
 - `store.rs` — Lease-bound management-effect journal storage and validation.
 - `tests.rs` — Management-effect ownership, journal and recovery regression tests.
+- `v2.rs` — Version-two management contracts. Durable publication is owned by the
 - `workflow_change.rs` — Durable local-session workflow changes.  A started change is reconciled
 - `workspace_change.rs` — Confirmed Git recipe changes share the existing recipe ledger and effect journal.
+
+## `crates/polaris-core/src/management_effect/generation`
+
+- `migration_v2.rs` — Immutable, whole-generation v1 -> v2 transformation.
+
+## `crates/polaris-core/src/management_effect/generation/migration_v2`
+
+- `tests.rs` — Management generation staging, payload validation and migration fault tests.
 
 ## `crates/polaris-core/src/management_effect/memory_change`
 
 - `tests.rs` — Memory-change effect tests for durable mutation and recovery.
+
+## `crates/polaris-core/src/management_effect/v2`
+
+- `reducer.rs` — V2 lifecycle replay. The store supplies durable ledger proofs; this module
+- `tests.rs` — Management effect v2 request, snapshot and successor validation tests.
 
 ## `crates/polaris-core/src/mcp`
 
@@ -530,6 +584,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `credentials.rs` — Typed ownership of MCP credential mutations.
 - `lease.rs` — Fail-closed leases for parent-captured MCP read evidence.
 - `local.rs` — CLI and TUI hosts: the same store, startup admission and setup tool as the
+- `migration.rs` — Core-private MCP migration authority. Read-only MCP observations never grant
 - `operation.rs` — Host-bound MCP operation evidence.
 - `preselection.rs` — Host-owned tool preselection for one root run. BM25 narrows indexed
 - `results.rs` — Bounded, nonpersistent result bytes. Handles are host-generated and usable
@@ -540,6 +595,56 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/mcp/local`
 
 - `tests.rs` — Shared CLI/TUI preparation with synthetic stores and providers, no network.
+
+## `crates/polaris-core/src/mcp/migration`
+
+- `account_home.rs` — Retained OS account-home identity and descriptor binding for migration.
+- `coordinator.rs` — Private retained admission for physical MCP migration.
+- `entry_gate.rs` — Exclusive migration entry-gate ownership and retained home binding.
+- `intent_file.rs` — Descriptor-owned external migration intent, outside the activation payload.
+- `preflight.rs` — Side-effect-free source inspection before acquiring the migrating entry gate.
+- `read_admission.rs` — Live private guard binding around MCP's non-authoritative read observations.
+- `test_fixture.rs` — Shared private migration guard fixtures and canonical intent records.
+
+## `crates/polaris-core/src/mcp/migration/account_home`
+
+- `tests.rs` — Account-home identity, alias and namespace-drift migration tests.
+
+## `crates/polaris-core/src/mcp/migration/coordinator`
+
+- `retirement.rs` — Physical source retirement. Failure preserves all on-disk evidence and the
+- `tests.rs` — Migration coordinator storage ownership and fresh-boundary regression tests.
+
+## `crates/polaris-core/src/mcp/migration/coordinator/retirement`
+
+- `source_payload.rs` — Read-only source preparation borrowed from the retained retirement owner.
+- `staging.rs` — Global pre-epoch staging under the retained retirement owner. Failed writes
+- `tests.rs` — Management retirement, global staging and partial-evidence recovery tests.
+
+## `crates/polaris-core/src/mcp/migration/coordinator/retirement/source_payload`
+
+- `tests.rs` — Retired source payload, registry and package-pin inspection tests.
+
+## `crates/polaris-core/src/mcp/migration/coordinator/retirement/staging`
+
+- `tests.rs` — Physical global staging and completed-project payload binding tests.
+
+## `crates/polaris-core/src/mcp/migration/entry_gate`
+
+- `process_inventory.rs` — Native inventory only. Unknown live identities are blockers, never zero.
+- `tests.rs` — Migration entry-gate identity, binding and fail-closed regression tests.
+
+## `crates/polaris-core/src/mcp/migration/intent_file`
+
+- `tests.rs` — Durable external migration intent history, binding and replacement tests.
+
+## `crates/polaris-core/src/mcp/migration/preflight`
+
+- `tests.rs` — Migration source preflight inventory and production manifest validation tests.
+
+## `crates/polaris-core/src/mcp/migration/read_admission`
+
+- `tests.rs` — Historical migration read admission and live entry-authority closure tests.
 
 ## `crates/polaris-core/src/mcp/operation`
 
@@ -689,9 +794,12 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/sync`
 
 - `apply.rs` — M7b-4: putting an agreed shared tree into the project. Nothing here writes
+- `composite.rs` — Read-only project admission across retained C08/C10 and management evidence.
+- `credential_rebind.rs` — C08 owns credential-binding replacement under one project EX lease.
 - `exchange.rs` — M7b-3: exchanging with the other devices and deciding what each change
 - `owner.rs` — Durable owner for sync operations that may mutate a remote ref.
 - `participation.rs` — M7b-5: what this device remembers about a shared project. One small file
+- `push.rs` — C10's shared push owner. Frontends consume its prepared token, never Git.
 - `remote_intent.rs` — Durable request and receipt types for one state-changing sync remote call.
 - `repository.rs` — M7b-2: the synchronization repository. Git only ever sees the staging
 - `share.rs` — M7b-1: who takes part in a shared project, what is shared, and where the
@@ -700,17 +808,66 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `tests.rs` — Temporary projects only; the apply owner is exercised through the copy.
 
+## `crates/polaris-core/src/sync/composite`
+
+- `tests.rs` — Composite sync read ownership, intent history and recovery regression tests.
+
+## `crates/polaris-core/src/sync/credential_rebind`
+
+- `store_v1.rs` — Strict descriptor-relative storage for C08 history and no-intent evidence.
+- `tests.rs` — Disposable C08 owner tests. No HOME override, Keychain query or Git process.
+
+## `crates/polaris-core/src/sync/credential_rebind/store_v1`
+
+- `tests.rs` — Credential rebind store ownership, archive and persistence regression tests.
+
 ## `crates/polaris-core/src/sync/exchange`
 
 - `tests.rs` — Two local devices and a bare repository standing in for the remote.
+
+## `crates/polaris-core/src/sync/owner`
+
+- `store_v2.rs` — C10 bounded descriptor-relative store. Inspection and reservation write nothing.
+
+## `crates/polaris-core/src/sync/owner/store_v2`
+
+- `tests.rs` — C10 owner store v2 identity, persistence and recovery regression tests.
 
 ## `crates/polaris-core/src/sync/participation`
 
 - `tests.rs` — Temporary state directories only.
 
+## `crates/polaris-core/src/sync/push`
+
+- `owner_v1.rs` — Production C10 orchestration. Persisted DTOs never grant execution.
+- `tests.rs` — Push payload decisions, exact confirmation and permission regression tests.
+- `transport.rs` — One explicitly bound C10 network attempt. The owner supplies admission,
+
+## `crates/polaris-core/src/sync/push/owner_v1`
+
+- `recovery.rs` — Explicit recovery never resumes a send or reconstructs a confirm token.
+- `tests.rs` — Owner-only regression fixtures.  Every subprocess is an owned wrapper or
+
+## `crates/polaris-core/src/sync/push/transport`
+
+- `tests.rs` — Controlled Git transport, ancestry and remote-change regression tests.
+
+## `crates/polaris-core/src/sync/remote_intent`
+
+- `v2.rs` — C10's closed, immutable identity and complete durable history. No transport.
+
+## `crates/polaris-core/src/sync/remote_intent/v2`
+
+- `tests.rs` — Remote intent v2 records, completed receipts and history validation tests.
+
 ## `crates/polaris-core/src/sync/repository`
 
+- `c10.rs` — C10's private, descriptor-relative local Git repository owner.
 - `tests.rs` — Temporary projects only; the synchronization repository is local.
+
+## `crates/polaris-core/src/sync/repository/c10`
+
+- `tests.rs` — Owned filesystem/Git fixtures only. Never contact Keychain or a remote.
 
 ## `crates/polaris-core/src/sync/share`
 
@@ -928,11 +1085,20 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `Cargo.toml` — manifest for the polaris-mcp crate
 
+## `crates/polaris-mcp/examples`
+
+- `entry-manifest-owned-probe.rs` — Read-only inspection of a disposable, unpublished macOS package.
+
 ## `crates/polaris-mcp/src`
 
+- `account_home.rs` — Compatibility name for OS account-home lookup.
+- `admission.rs` — Shared read-only stdio resource admission for startup and store migration.
 - `catalog.rs` — Bounded, SDK-independent catalog data. Descriptions and annotations are
 - `content.rs` — SDK-independent result variants. Binary content is never serialized into a
+- `entry_gate.rs` — Per-user production entry admission for the MCP protocol cutover.
 - `lib.rs` — Host-owned MCP registration and bounded client data.
+- `migration_observation.rs` — Read-only migration observations and strict, non-authoritative wire codecs.
+- `native_mount.rs` — Compatibility adapter for the shared native descriptor mount identity.
 - `registration.rs` — Validated host registrations, without SDK types or secret values.
 - `secret_input.rs` — Masked, short-lived credential input for trusted interactive hosts.
 - `store.rs` — Descriptor-relative private storage shared by trusted host surfaces.
@@ -944,6 +1110,59 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `budget.rs` — Run-owned catalog accounting, independent of connection and future lifetimes.
 - `index.rs` — Host-owned tool summaries saved by a dedicated catalog check. Text is
+
+## `crates/polaris-mcp/src/store`
+
+- `documents_v2.rs` — Closed v2 document envelopes for the store migration coordinator.
+- `ledger_v1.rs` — Non-secret, whole-chain evidence for the per-user MCP credential ledger.
+- `migration_v2.rs` — Private preparation for the approved MCP protocol migration.
+
+## `crates/polaris-mcp/src/store/documents_v2`
+
+- `tests.rs` — V2 credential and registry baseline envelope validation tests.
+
+## `crates/polaris-mcp/src/store/ledger_v1`
+
+- `file_store.rs` — Descriptor-bound durable ledger payload. This layer checks a caller-supplied
+- `tests.rs` — Ledger epoch, baseline and operation-record validation tests.
+
+## `crates/polaris-mcp/src/store/ledger_v1/file_store`
+
+- `tests.rs` — Ledger file-store identity, persistence and namespace regression tests.
+
+## `crates/polaris-mcp/src/store/migration_v2`
+
+- `documents.rs` — Read-only v1 document pins and directly compared v2 baseline preparation.
+- `inventory.rs` — Complete descriptor-pinned inventory for the migration's non-secret projection.
+- `mapped.rs` — Fixed logical-final to inventoried-staging descriptor mapping. This is a
+- `namespace.rs` — Retained descriptor and namespace observations, never an entry/stop grant.
+- `paths.rs` — Pure typed-path migration for registered and materialized servers.
+- `projection.rs` — Streaming non-secret migration projection from already enumerated children.
+- `records.rs` — Closed, non-secret records for the approved store migration.
+
+## `crates/polaris-mcp/src/store/migration_v2/documents`
+
+- `tests.rs` — Migration document reads, staged payloads and source-content preservation tests.
+
+## `crates/polaris-mcp/src/store/migration_v2/inventory`
+
+- `tests.rs` — Migration tree inventory, inode replacement and directory-boundary tests.
+
+## `crates/polaris-mcp/src/store/migration_v2/mapped`
+
+- `tests.rs` — Mapped staging views and inventoried payload identity regression tests.
+
+## `crates/polaris-mcp/src/store/migration_v2/paths`
+
+- `tests.rs` — Deterministic registry destination and pinned-path migration mapping tests.
+
+## `crates/polaris-mcp/src/store/migration_v2/projection`
+
+- `tests.rs` — Canonical migration tree projection and namespace-change regression tests.
+
+## `crates/polaris-mcp/src/store/migration_v2/records`
+
+- `tests.rs` — External migration intent phases, anchors and canonical record validation tests.
 
 ## `crates/polaris-mcp/src/transport`
 
@@ -967,6 +1186,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-mcp/tests`
 
 - `dependency_boundary.rs` — A01: the SDK stays a pinned client with no server, child-process or macro
+- `migration_observation.rs` — Public migration observation identity and named-home replacement tests.
 
 ## `crates/polaris-memory`
 
@@ -1145,16 +1365,31 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-tools/src`
 
+- `account_home.rs` — Trusted OS account home lookup. Never consults or changes the environment.
 - `bash.rs` — `bash` tool. Runs a command inside a confined `/bin/sh`.
 - `edit.rs` — `edit` tool. Goes through the same confined path as `write`.
+- `entry_kernel.rs` — Shared entry wire and descriptor primitives for trusted host owners.
 - `isolated_read.rs` — OS隔離されたhelper内でのみ本文を読む。親側の直読fallbackは用意しない。
 - `lib.rs` — polaris's built-in tools. The always-on tool set never exceeds 6 tools.
+- `native_mount.rs` — Native mount identity of an actual open descriptor, never an authorization.
 - `path_policy.rs` — Decides which paths reading is denied on. Leans toward avoiding missed
 - `predicate.rs` — Predicts ahead of time whether a write will be denied.
 - `read.rs` — read tool. Line numbers are attached to the output so the model can
 - `schema_validate.rs` — subagent の結果を、型が宣言した JSON Schema に照合するだけの薄い
 - `skill.rs` — skill tool. Returns the body on an exact name match, otherwise returns a
 - `write.rs` — `write` tool. The actual write happens inside a confined child process.
+
+## `crates/polaris-tools/src/entry_kernel`
+
+- `package.rs` — Closed inventory of the actual macOS package used for migration admission.
+
+## `crates/polaris-tools/src/path_policy`
+
+- `tree_admission.rs` — Shared descriptor-based tree inspection for sanitized copies and strict
+
+## `crates/polaris-tools/src/path_policy/tree_admission`
+
+- `registered.rs` — Admission of a host-registered directory without copying or modifying it.
 
 ## `crates/polaris-tools/src/skill`
 

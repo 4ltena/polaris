@@ -1,4 +1,6 @@
 //! `polaris mcp` against a synthetic home; no server or model is contacted.
+#![cfg(unix)]
+
 #[path = "support/product_binary.rs"]
 mod product_binary;
 

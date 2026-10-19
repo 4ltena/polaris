@@ -1,15 +1,20 @@
 //! Local project memory commands; embedding requests require explicit configuration.
 
+#[cfg(unix)]
 use polaris_core::{
     management_effect::{
         ManagementEffectStoreV1, ManagementOperationIdV1, memory_change::MemoryChangeOwnerV1,
     },
     project_mutation::ProjectMutationOwnerV1,
 };
+#[cfg(unix)]
+use polaris_memory::Record;
+#[cfg(unix)]
 use polaris_memory::management::{
     MAX_CHANGE_BYTES, MemoryChangeRequestV1, MemoryChangeV1, MemoryEmbeddingUpdateV1,
 };
-use polaris_memory::{Embedding, MemoryStore, Record, SearchMode, SearchRequest};
+use polaris_memory::{Embedding, MemoryStore, SearchMode, SearchRequest};
+#[cfg(unix)]
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -123,6 +128,19 @@ pub async fn run(args: Args) -> ExitCode {
 }
 
 async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(unix))]
+    if !match &args.command {
+        Command::Get { .. } => true,
+        Command::Search { embedding, .. } => {
+            embedding.embedding_url.is_none() && embedding.embedding_model.is_none()
+        }
+        _ => false,
+    } {
+        return Err(
+            "このプラットフォームでは記憶の変更・出典取得・埋め込み送信に必要な保護機構が未対応です"
+                .into(),
+        );
+    }
     let cwd = args.project.unwrap_or(std::env::current_dir()?);
     let project = polaris_core::project::resolve_root(&cwd).canonicalize()?;
     let project_id = polaris_tui::persist::project_identity(&project)?;
@@ -148,23 +166,28 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .join(polaris_core::project::project_id(&project))
     };
     let database = state.join("memory.sqlite3");
+    #[cfg(unix)]
     let data_root = state
         .parent()
         .and_then(std::path::Path::parent)
         .ok_or("メモリ保存先が不正です")?;
+    #[cfg(unix)]
     let mutation = if writes {
         Some(ProjectMutationOwnerV1::for_project(&project)?)
     } else {
         None
     };
+    #[cfg(unix)]
     let lease = mutation
         .as_ref()
         .map(ProjectMutationOwnerV1::try_mutation)
         .transpose()?;
+    #[cfg(unix)]
     let effects = lease
         .as_ref()
         .map(|lease| ManagementEffectStoreV1::open_at_state_dir(&project, &state, lease))
         .transpose()?;
+    #[cfg(unix)]
     let owner = effects
         .as_ref()
         .zip(lease.as_ref())
@@ -175,11 +198,15 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             data_root,
             active_session: None,
         });
+    #[cfg(unix)]
     let mut store = match &owner {
         Some(owner) => owner.open_store()?,
         None => MemoryStore::open_read_only(&database)?,
     };
+    #[cfg(not(unix))]
+    let store = MemoryStore::open_read_only(&database)?;
     match args.command {
+        #[cfg(unix)]
         Command::Import { file } => {
             use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
             let file = file.canonicalize()?;
@@ -296,6 +323,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 )?
             );
         }
+        #[cfg(unix)]
         Command::Source {
             session,
             id,
@@ -323,6 +351,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             println!("{source}");
         }
+        #[cfg(unix)]
         Command::Embed {
             session,
             id,
@@ -354,6 +383,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             println!("埋め込みを保存しました");
         }
+        #[cfg(unix)]
         Command::Index {
             session,
             batch,
@@ -403,6 +433,7 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 next.unwrap_or_default()
             );
         }
+        #[cfg(unix)]
         Command::Forget { session } => {
             let receipt = apply_change(
                 owner.as_ref().ok_or("メモリownerがありません")?,
@@ -418,14 +449,27 @@ async fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 receipt.records_changed, receipt.conversation_rows_deleted
             );
         }
+        #[cfg(not(unix))]
+        Command::Import { .. }
+        | Command::Source { .. }
+        | Command::Embed { .. }
+        | Command::Index { .. }
+        | Command::Forget { .. } => {
+            return Err(
+                "このプラットフォームでは記憶の変更・出典取得・埋め込み送信に必要な保護機構が未対応です"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_session(session: &str) -> Result<(), Box<dyn std::error::Error>> {
     polaris_memory::management::validate_session_id(session).map_err(Into::into)
 }
 
+#[cfg(unix)]
 fn apply_change(
     owner: &MemoryChangeOwnerV1<'_>,
     store: &mut MemoryStore,

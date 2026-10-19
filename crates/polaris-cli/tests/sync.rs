@@ -1,16 +1,12 @@
 //! Two local devices exchanging through a bare repository; no network.
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn bin() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("polaris")
-}
+#[path = "support/product_binary.rs"]
+mod product_binary;
 
 struct Device {
     _data: tempfile::TempDir,
@@ -35,7 +31,7 @@ impl Device {
     }
 
     fn run(&self, arguments: &[&str]) -> (bool, String) {
-        let output = Command::new(bin())
+        let output = product_binary::command()
             .args(["sync"])
             .args(arguments)
             .current_dir(&self.root)
@@ -53,6 +49,45 @@ impl Device {
         )
     }
 
+    /// Synthetic legacy participation for local pull/apply/leave fixtures.
+    /// This does not exercise or prove the production C08 join contract.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn join(&self, remote: &str) -> (bool, String) {
+        use polaris_core::sync::{
+            participation,
+            share::{ShareLink, ShareManifest},
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(remote.starts_with("file://"), "fixture must stay local");
+        let state = self
+            .data
+            .join("state")
+            .join(polaris_core::project::project_id(&self.root));
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        // participation::join acquires the shared project lease under this
+        // dedicated state root; no process-wide HOME/data override is needed.
+        match participation::join(
+            &state,
+            ShareLink {
+                remote: remote.into(),
+                share_id: "share-0001".into(),
+                invitation_id: "invite-0001".into(),
+                expires_unix_seconds: 4102444800,
+            },
+            ShareManifest {
+                version: 1,
+                excluded: Vec::new(),
+            },
+            1,
+        ) {
+            Ok(_) => (true, "synthetic legacy participation fixture".into()),
+            Err(error) => (false, error.to_string()),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn join(&self, remote: &str) -> (bool, String) {
         self.run(&[
             "join",
@@ -67,24 +102,37 @@ impl Device {
         ])
     }
 
-    /// Seed the local test remote so receive/apply does not depend on C10.
-    /// Production Linux push stays disabled; no participation is published here.
-    #[cfg(target_os = "linux")]
+    /// Seed only a disposable file:// remote for receive/apply fixtures.
+    /// This neither calls nor proves the production C10 sender.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn seed_received_fixture(&self) -> polaris_core::sync::repository::Staged {
         use polaris_core::sync::{participation, repository::SyncRepository, share::SyncPaths};
         let state = self
             .data
             .join("state")
             .join(polaris_core::project::project_id(&self.root));
-        let held = participation::read(&state).expect("synthetic joined sender");
+        let held = participation::read(&state)
+            .expect("synthetic joined sender")
+            .participation()
+            .unwrap()
+            .clone();
         assert!(
             held.share.remote.starts_with("file://"),
             "fixture must stay local"
         );
         let repository = SyncRepository::open(SyncPaths::under(&state)).unwrap();
         let staged = repository.stage_from(&self.root, &held.manifest).unwrap();
-        repository.commit("Linux receive fixture").unwrap();
+        repository.commit("local receive fixture").unwrap();
         repository.send(&held.share.remote).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            // Preserve the legacy sender's baseline for subsequent conflict
+            // fixtures, without inventing C10 authority or a send receipt.
+            let mut held = held;
+            held.agreed_commit = repository.head();
+            held.applied_commit = held.agreed_commit.clone();
+            participation::write(&state, &held).unwrap();
+        }
         staged
     }
 
@@ -109,7 +157,7 @@ fn remote(directory: &Path) -> String {
     format!("file://{}", path.to_string_lossy())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tree_snapshot(root: &Path) -> Vec<(PathBuf, bool, u64, u64, u32, u64, i64, i64, Vec<u8>)> {
     fn visit(
         root: &Path,
@@ -194,7 +242,11 @@ fn linux_sync_apply_uses_shared_owner_and_preserves_local_files() {
         .data
         .join("state")
         .join(polaris_core::project::project_id(&receiver.root));
-    let held = polaris_core::sync::participation::read(&state).unwrap();
+    let held = polaris_core::sync::participation::read(&state)
+        .unwrap()
+        .participation()
+        .unwrap()
+        .clone();
     assert_eq!(held.agreed_commit, held.applied_commit);
     assert!(held.agreed_commit.is_some());
     assert_eq!(
@@ -327,9 +379,14 @@ fn sync_owner_fixture_child() {
             let before = tree_snapshot(&project);
             let participation = fs::read(state.join("sync/participation.json")).unwrap();
             for command in ["push", "pull", "apply", "leave"] {
-                let output = Command::new(bin())
+                let output = product_binary::command()
                     .args(["sync", command])
                     .current_dir(&project)
+                    .env(
+                        "POLARIS_DATA_DIR",
+                        std::env::var_os("POLARIS_DATA_DIR").unwrap(),
+                    )
+                    .env("HOME", std::env::var_os("HOME").unwrap())
                     .output()
                     .unwrap();
                 let message = format!(
@@ -337,10 +394,14 @@ fn sync_owner_fixture_child() {
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
-                assert!(
-                    !output.status.success() && message.contains("共有操作を開始できません"),
-                    "{command}: {message}"
-                );
+                let refused = if command == "push" {
+                    // C10 checks platform support before acquiring the send
+                    // owner. Receive/apply/leave still exercise the held lease.
+                    message.starts_with("c10_unavailable_platform:")
+                } else {
+                    message.contains("共有操作を開始できません")
+                };
+                assert!(!output.status.success() && refused, "{command}: {message}");
                 assert_eq!(before, tree_snapshot(&project));
                 assert_eq!(
                     participation,
@@ -380,7 +441,11 @@ fn linux_sync_apply_refuses_deferred_directories_without_intent_or_source_effect
         management.exists().then(|| tree_snapshot(&management)),
         "refused apply must preserve the effects already published by join"
     );
-    let held = polaris_core::sync::participation::read(&state).unwrap();
+    let held = polaris_core::sync::participation::read(&state)
+        .unwrap()
+        .participation()
+        .unwrap()
+        .clone();
     assert_ne!(held.agreed_commit, held.applied_commit);
 }
 
@@ -406,7 +471,8 @@ fn linux_sync_apply_refuses_cross_device_recovery_before_creation() {
         fs::metadata(&receiver.data).unwrap().dev(),
         "the Linux tmpfs recovery fixture needs distinct devices"
     );
-    assert!(receiver.join(&remote).0);
+    let (joined, message) = receiver.join(&remote);
+    assert!(joined, "cross-device legacy fixture setup: {message}");
     let (ok, message) = receiver.run(&["pull"]);
     assert!(ok, "{message}");
     let state = receiver
@@ -489,9 +555,14 @@ fn two_devices_share_a_project_and_keep_both_versions_of_a_clash() {
 
     first.write("src/main.rs", "fn main() {}\n");
     first.write(".env", "SECRET=1\n");
-    let (ok, message) = first.run(&["push"]);
-    assert!(ok, "{message}");
-    assert!(message.contains("送信しました: 1件"), "{message}");
+    #[cfg(target_os = "macos")]
+    assert_eq!(first.seed_received_fixture().files, 1);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (ok, message) = first.run(&["push"]);
+        assert!(ok, "{message}");
+        assert!(message.contains("送信しました: 1件"), "{message}");
+    }
 
     let second = Device::new();
     second.join(&remote);
@@ -506,6 +577,9 @@ fn two_devices_share_a_project_and_keep_both_versions_of_a_clash() {
     fs::create_dir_all(second.root.join("src")).unwrap();
     assert!(second.run(&["apply"]).0);
     second.write("src/main.rs", "fn main() { second() }\n");
+    #[cfg(target_os = "macos")]
+    second.seed_received_fixture();
+    #[cfg(not(target_os = "macos"))]
     assert!(second.run(&["push"]).0);
     first.write("src/main.rs", "fn main() { first() }\n");
     let (ok, message) = first.run(&["pull"]);
@@ -559,6 +633,9 @@ fn applying_needs_an_agreed_state_and_never_removes_what_was_never_shared() {
     let first = Device::new();
     assert!(first.join(&remote).0);
     first.write("src/main.rs", "fn main() {}\n");
+    #[cfg(target_os = "macos")]
+    first.seed_received_fixture();
+    #[cfg(not(target_os = "macos"))]
     assert!(first.run(&["push"]).0);
 
     // Joining alone agrees to nothing, so applying must not empty the project.
@@ -606,6 +683,9 @@ fn sending_is_refused_while_received_work_has_not_reached_the_project() {
     let first = Device::new();
     assert!(first.join(&remote).0);
     first.write("README.md", "最初の版\n");
+    #[cfg(target_os = "macos")]
+    first.seed_received_fixture();
+    #[cfg(not(target_os = "macos"))]
     assert!(first.run(&["push"]).0);
 
     let second = Device::new();
@@ -615,11 +695,35 @@ fn sending_is_refused_while_received_work_has_not_reached_the_project() {
 
     // Sending now would record the received file as a removal.
     let (ok, message) = second.run(&["push"]);
+    #[cfg(target_os = "macos")]
+    assert!(
+        !ok && message.trim() == "c10_permission_unavailable",
+        "{message}"
+    );
+    #[cfg(not(target_os = "macos"))]
     assert!(!ok && message.contains("`polaris sync apply`"), "{message}");
 
     assert!(second.run(&["apply"]).0);
-    let (ok, message) = second.run(&["push"]);
-    assert!(ok, "{message}");
+    #[cfg(target_os = "macos")]
+    {
+        let source = tree_snapshot(&second.root);
+        let state = tree_snapshot(&second.data);
+        let remote_before = tree_snapshot(bare.path());
+        let (ok, message) = second.run(&["push"]);
+        assert!(
+            !ok && message.trim() == "c10_permission_unavailable",
+            "{message}"
+        );
+        assert_eq!(source, tree_snapshot(&second.root));
+        assert_eq!(state, tree_snapshot(&second.data));
+        assert_eq!(remote_before, tree_snapshot(bare.path()));
+        second.seed_received_fixture();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (ok, message) = second.run(&["push"]);
+        assert!(ok, "{message}");
+    }
 
     // The other device still has what it sent.
     assert!(first.run(&["pull"]).0);
@@ -649,13 +753,28 @@ fn every_env_variant_and_generated_output_stays_on_this_device() {
         let before = tree_snapshot(&device.root);
         let (ok, message) = device.run(&["push"]);
         assert!(
-            !ok && message.contains("共有送信ownerは未実装"),
+            !ok && message.starts_with("c10_unavailable_platform:"),
             "{message}"
         );
         assert_eq!(before, tree_snapshot(&device.root));
         assert_eq!(device.seed_received_fixture().files, 1);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let before = tree_snapshot(&device.root);
+        let state = tree_snapshot(&device.data);
+        let remote_before = tree_snapshot(bare.path());
+        let (ok, message) = device.run(&["push"]);
+        assert!(
+            !ok && message.trim() == "c10_permission_unavailable",
+            "{message}"
+        );
+        assert_eq!(before, tree_snapshot(&device.root));
+        assert_eq!(state, tree_snapshot(&device.data));
+        assert_eq!(remote_before, tree_snapshot(bare.path()));
+        assert_eq!(device.seed_received_fixture().files, 1);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let (ok, message) = device.run(&["push"]);
         assert!(ok, "{message}");

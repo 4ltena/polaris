@@ -107,46 +107,50 @@ async fn actual_agent_sends_off_and_projected_input_once_and_reopens_original() 
         let case = Case::load(&args).unwrap();
         let (expected, _) = projection(&case, mode).unwrap();
         assert_eq!(expected == case.input, mode == InputPreparationMode::Off);
-        let answer = input::tests::correct_reply(&case).to_string();
-        let (inner, guard) = rig(
-            dir.path(),
-            &expected,
-            &case.instructions(),
-            Ok(response(answer)),
-            5_000_000,
-        );
-        let trial = run_agent(&case, mode, guard.clone(), &dir.path().join("trial"))
-            .await
-            .unwrap();
-        assert!(trial.raw_verified);
-        let outcome = trial.outcome.unwrap();
-        assert_eq!(case.score(&outcome.text)["quality_complete"], true);
-        assert_eq!(trial.usage.reported_responses, 1);
-        assert_eq!(trial.usage.usage, usage());
-        assert_eq!(outcome.usage_report, trial.usage);
-        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
-        let sent = inner.requests.lock().unwrap();
-        assert!(sent[0].tools.is_empty());
-        assert_eq!(sent[0].messages[0].content, expected);
-        assert!(
-            sent[0].system.contains(&case.instructions()),
-            "format must survive normal prompt caps"
-        );
-        assert!(!sent[0].system.contains("GOLDEN_"));
-        let evidence = guard.evidence.lock().unwrap();
-        assert!(evidence.error.is_none());
-        assert_eq!(
-            evidence.request.as_ref().unwrap()["user_sha256"],
-            content_hash(expected.as_bytes())
-        );
-        assert_eq!(
-            evidence.diagnostics.as_ref().unwrap()["parts"]["tool_calls"],
-            0
-        );
+        #[cfg(unix)]
+        {
+            let answer = input::tests::correct_reply(&case).to_string();
+            let (inner, guard) = rig(
+                dir.path(),
+                &expected,
+                &case.instructions(),
+                Ok(response(answer)),
+                5_000_000,
+            );
+            let trial = run_agent(&case, mode, guard.clone(), &dir.path().join("trial"))
+                .await
+                .unwrap();
+            assert!(trial.raw_verified);
+            let outcome = trial.outcome.unwrap();
+            assert_eq!(case.score(&outcome.text)["quality_complete"], true);
+            assert_eq!(trial.usage.reported_responses, 1);
+            assert_eq!(trial.usage.usage, usage());
+            assert_eq!(outcome.usage_report, trial.usage);
+            assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+            let sent = inner.requests.lock().unwrap();
+            assert!(sent[0].tools.is_empty());
+            assert_eq!(sent[0].messages[0].content, expected);
+            assert!(
+                sent[0].system.contains(&case.instructions()),
+                "format must survive normal prompt caps"
+            );
+            assert!(!sent[0].system.contains("GOLDEN_"));
+            let evidence = guard.evidence.lock().unwrap();
+            assert!(evidence.error.is_none());
+            assert_eq!(
+                evidence.request.as_ref().unwrap()["user_sha256"],
+                content_hash(expected.as_bytes())
+            );
+            assert_eq!(
+                evidence.diagnostics.as_ref().unwrap()["parts"]["tool_calls"],
+                0
+            );
+        }
     }
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn tools_are_rejected_before_agent_can_execute_or_spawn() {
     let dir = tempfile::tempdir().unwrap();
     let case = Case::load(&input::tests::args(dir.path())).unwrap();

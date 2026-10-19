@@ -45,6 +45,7 @@ const ROOT_MODEL: &str = "gpt-6-astra";
 const EFFORT: &str = "xhigh";
 const REQUEST_BYTES: usize = 131_072;
 
+#[cfg(unix)]
 fn save_new(path: &Path, value: &Value) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = OpenOptions::new()
@@ -215,6 +216,7 @@ async fn run_agent(
     })
 }
 
+#[cfg(unix)]
 fn live_environment(args: &Args) -> Result<(), String> {
     if std::env::var("POLARIS_AUTH_READ_ONLY").as_deref() != Ok("1")
         || std::env::var("POLARIS_WS").as_deref() != Ok("off")
@@ -243,6 +245,7 @@ fn live_environment(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn live(args: &Args, case: &Case) -> Result<(), String> {
     live_environment(args)?;
     let plan = plan(args, case)?;
@@ -371,6 +374,7 @@ async fn live(args: &Args, case: &Case) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn main() {
     let args = Args::parse();
     let result = (|| {
@@ -390,4 +394,12 @@ fn main() {
         eprintln!("M12比較を停止: {reason}");
         std::process::exit(1);
     }
+}
+
+#[cfg(not(unix))]
+fn main() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native evaluation is unavailable on this platform",
+    ))
 }

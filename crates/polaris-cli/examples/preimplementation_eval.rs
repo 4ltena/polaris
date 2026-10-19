@@ -232,6 +232,12 @@ impl Approver for Deny {
     }
 }
 
+#[cfg(not(unix))]
+fn new_file(_path: &Path) -> Result<File, String> {
+    Err("native evaluation is unavailable on this platform".into())
+}
+
+#[cfg(unix)]
 fn new_file(path: &Path) -> Result<File, String> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
@@ -528,6 +534,7 @@ async fn run(args: Args) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     let values: Vec<String> = std::env::args().skip(1).collect();
@@ -556,12 +563,17 @@ mod tests {
     use std::sync::Mutex;
     #[test]
     fn arguments_reject_unsafe_trial_and_unknown_arm() {
+        let case_path = if cfg!(windows) {
+            "C:/case.json"
+        } else {
+            "/tmp/case.json"
+        };
         assert!(
             parse_args(&[
                 "--trial-id".into(),
                 "PRE01-baseline-r1".into(),
                 "--case-path".into(),
-                "/tmp/case.json".into(),
+                case_path.into(),
                 "--arm".into(),
                 "baseline".into()
             ])
@@ -572,7 +584,7 @@ mod tests {
                 "--trial-id".into(),
                 "../bad".into(),
                 "--case-path".into(),
-                "/tmp/case.json".into(),
+                case_path.into(),
                 "--arm".into(),
                 "baseline".into()
             ])
@@ -583,7 +595,7 @@ mod tests {
                 "--trial-id".into(),
                 "ok".into(),
                 "--case-path".into(),
-                "/tmp/case.json".into(),
+                case_path.into(),
                 "--arm".into(),
                 "other".into()
             ])
@@ -752,4 +764,12 @@ mod tests {
             assert_eq!(requests[1].system.contains("### builtin:implement"), false);
         }
     }
+}
+
+#[cfg(not(unix))]
+fn main() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native evaluation is unavailable on this platform",
+    ))
 }

@@ -147,6 +147,12 @@ fn canonical_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub(super) fn claim_output(_path: &Path) -> Result<(), String> {
+    Err("native evaluation is unavailable on this platform".into())
+}
+
+#[cfg(unix)]
 pub(super) fn claim_output(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
     if path.exists() {

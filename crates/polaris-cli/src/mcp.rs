@@ -101,6 +101,10 @@ fn message(error: Error) -> &'static str {
 }
 
 pub async fn run(args: Args) -> ExitCode {
+    if cfg!(windows) {
+        eprintln!("WindowsではMCPの保護された保存先を利用できません。変更していません。");
+        return ExitCode::FAILURE;
+    }
     let cwd = args
         .project
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -218,6 +222,16 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
 /// separate act**: this only turns a command that fetches at every launch
 /// into a file that does not, so the approval that follows has a digest and a
 /// version to show.
+#[cfg(not(unix))]
+fn materialize(
+    _server: &str,
+    _runtime: Option<&std::path::Path>,
+    _confirmed: bool,
+) -> Result<(), String> {
+    Err("このプラットフォームではMCPの取得に必要な保護を確認できません。".into())
+}
+
+#[cfg(unix)]
 fn materialize(
     server: &str,
     runtime: Option<&std::path::Path>,
@@ -269,6 +283,7 @@ fn materialize(
 /// `PATH` is deliberately not used: a version manager rewrites it, and the
 /// interpreter that resolves through one is not the interpreter that will be
 /// there next time.
+#[cfg(unix)]
 fn search_path() -> Vec<PathBuf> {
     ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"]
         .into_iter()

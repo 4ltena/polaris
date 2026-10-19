@@ -1,7 +1,9 @@
 //! Entry point for the `polaris` binary. Decides the endpoint from environment
 //! variables, assembles the always-on context, and runs the agent loop once.
 
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -623,6 +625,11 @@ fn build_component_manifest_static_adapters(
     if criteria.is_empty() {
         return Ok(Vec::new());
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let entry_lease = production_entry_lease()
+        .map_err(|()| "static analyzer entry admissionを確認できません".to_owned())?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let entry_files = entry_lease.isolated_read_files();
     let program = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(|error| format!("static analyzer実体を確認できません: {error}"))?;
@@ -655,7 +662,10 @@ fn build_component_manifest_static_adapters(
     prepare_static_private_directory(&container)?;
     prepare_static_private_directory(&home)?;
     prepare_static_private_directory(&tmpdir)?;
-    let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, component_root, &runtime_roots)
+    let policy = SandboxPolicy::isolated(SandboxMode::ReadOnly, component_root, &runtime_roots);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let policy = policy.and_then(|policy| policy.with_isolated_readable_files(&entry_files));
+    let policy = policy
         .and_then(|policy| policy.with_isolated_private_environment(&container, &home, &tmpdir))
         .and_then(SandboxPolicy::require_process_containment)
         .map_err(|error| format!("static analyzer sandboxを準備できません: {error}"))?;
@@ -1744,8 +1754,12 @@ fn with_cli_management_lease<T>(
     }
     .recover(data_root, &state_dir.join("memory.sqlite3"), project_id)
     .map_err(|error| std::io::Error::other(error.to_string()))?;
-    if let Some(effect) = effects
-        .blocker()
+    if let Some(effect) =
+        polaris_core::sync::composite::C10CompositeBlockerV1::inspect_with_mutation(
+            &project_root,
+            state_dir,
+            &lease,
+        )
         .map_err(|error| std::io::Error::other(error.to_string()))?
     {
         return Err(std::io::Error::other(format!(
@@ -1901,7 +1915,7 @@ fn cli_workflow_mode_name(config: &polaris_core::workflow::WorkflowConfig) -> &'
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn strict_history(
     config: &polaris_core::config::EmbeddingConfig,
     runtime_home: &Path,
@@ -1988,7 +2002,7 @@ fn strict_history(
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 fn strict_history(
     _config: &polaris_core::config::EmbeddingConfig,
     _runtime_home: &Path,
@@ -2230,6 +2244,7 @@ fn build_finalizer_decider(
         })
 }
 
+#[cfg(unix)]
 async fn build_tui_answer_finalizer(
     config: &polaris_core::config::Config,
     state_dir: &Path,
@@ -2308,6 +2323,18 @@ async fn build_tui_answer_finalizer(
     Ok(owner)
 }
 
+#[cfg(not(unix))]
+async fn build_tui_answer_finalizer(
+    _config: &polaris_core::config::Config,
+    _state_dir: &Path,
+    _managed_home: Option<&Path>,
+) -> Result<
+    Option<std::sync::Arc<polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner>>,
+    String,
+> {
+    Err("Windowsでは回答の後処理はまだ利用できません".into())
+}
+
 /// The provider handle everything downstream holds. Named so the three
 /// that come out of the construction below read as what they are.
 type Shared = std::sync::Arc<dyn polaris_provider::Provider>;
@@ -2353,7 +2380,23 @@ fn tier_providers(
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Retain admission through every command, TUI run and confined helper.
+    // The OS home and actual executable are never derived from argv or HOME.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let _entry_lease = match production_entry_lease() {
+        Ok(lease) => lease,
+        Err(()) => {
+            eprintln!("MCPの移行状態または実行物を確認できません。開始していません。");
+            return ExitCode::FAILURE;
+        }
+    };
     let args = Args::parse();
+    // Only an argument-free Windows launch enters browsing. Explicit options,
+    // even when equal to their defaults, retain the normal refusal path.
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).is_none() {
+        return polaris_tui::run_windows_read_only();
+    }
     #[cfg(target_os = "linux")]
     if linux_interactive_requested(&args) {
         return run_with_linux_signal_owner(
@@ -2364,6 +2407,13 @@ async fn main() -> ExitCode {
         .await;
     }
     main_with_args(args).await
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn production_entry_lease() -> Result<polaris_mcp::entry_gate::ProductionEntryLeaseV2, ()> {
+    let home = polaris_core::os_home::trusted_user_home().map_err(|_| ())?;
+    let executable = std::env::current_exe().map_err(|_| ())?;
+    polaris_mcp::entry_gate::ProductionEntryLeaseV2::enter(&home, &executable).map_err(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -2426,6 +2476,17 @@ where
 }
 
 async fn main_with_args(mut args: Args) -> ExitCode {
+    if cfg!(windows)
+        && matches!(
+            args.command.as_ref(),
+            None | Some(
+                Command::Exec { .. } | Command::Sandbox { .. } | Command::CommonTests { .. }
+            )
+        )
+    {
+        eprintln!("Windowsでは実行・変更に必要な保護機構が未対応です。変更していません。");
+        return ExitCode::FAILURE;
+    }
     if args.web_search != WebSearchArg::Disabled {
         eprintln!(
             "Web検索は接続先の上限契約が未確認のため利用できません。disabledを使用してください。"
@@ -2436,6 +2497,7 @@ async fn main_with_args(mut args: Args) -> ExitCode {
         eprintln!("{error}");
         return ExitCode::FAILURE;
     }
+    #[cfg(not(windows))]
     let tool_memory_embedding = args
         .tool_memory_embedding_url
         .clone()
@@ -2564,6 +2626,22 @@ async fn main_with_args(mut args: Args) -> ExitCode {
         None => {}
     }
 
+    #[cfg(windows)]
+    {
+        eprintln!("Windowsでは実行・変更に必要な保護機構が未対応です。変更していません。");
+        ExitCode::FAILURE
+    }
+    #[cfg(not(windows))]
+    {
+        run_native_turn(args, tool_memory_embedding).await
+    }
+}
+
+#[cfg(not(windows))]
+async fn run_native_turn(
+    mut args: Args,
+    tool_memory_embedding: Option<(String, String)>,
+) -> ExitCode {
     if args.confined_read {
         return run_confined_read();
     }
@@ -3108,6 +3186,26 @@ async fn main_with_args(mut args: Args) -> ExitCode {
     // The binary that gets re-executed is staged outside the writable root.
     // Skipping this would let anyone who can write to the workspace replace
     // the helper (see the docs on `polaris_sandbox::stage`).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let prepared_helper = match std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| polaris_core::isolated_run::PrepareError::InvalidPath)
+        .and_then(|executable| {
+            polaris_core::isolated_run::PreparedConfinedHelper::prepare(
+                &sandbox,
+                &state_dir,
+                &executable,
+            )
+        }) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("Can't prepare the confined helper: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let helper = prepared_helper.helper_path().to_owned();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let helper = match polaris_sandbox::stage::staged_helper(&sandbox, &state_dir) {
         Ok(p) => p,
         Err(e) => {
@@ -3658,7 +3756,11 @@ async fn main_with_args(mut args: Args) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                match store.blocker() {
+                match polaris_core::sync::composite::C10CompositeBlockerV1::inspect_with_mutation(
+                    &project_root,
+                    &state_dir,
+                    &lease,
+                ) {
                     Ok(None) => {}
                     Ok(Some(effect)) => {
                         eprintln!(
@@ -3693,13 +3795,17 @@ async fn main_with_args(mut args: Args) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                if let Err(error) = store.blocker().and_then(|blocker| {
-                    if blocker.is_some() {
-                        Err(polaris_core::management_effect::ManagementEffectStoreError::UnresolvedEffect)
-                    } else {
-                        Ok(())
-                    }
-                }) {
+                if let Err(error) =
+                    polaris_core::sync::composite::C10CompositeBlockerV1::inspect_with_activity(
+                        &project_root,
+                        &state_dir,
+                        &activity,
+                    )
+                    .and_then(|blocker| match blocker {
+                        None => Ok(()),
+                        Some(_) => Err(polaris_core::sync::composite::C10CompositeErrorV1::Blocked),
+                    })
+                {
                     eprintln!("管理操作の状態を確認できません: {error}");
                     return ExitCode::FAILURE;
                 }
@@ -4816,6 +4922,12 @@ mod tests {
         let state_dir = temp.path().join("state");
         std::fs::create_dir(&project).unwrap();
         assert!(resolve_pending_workspace_before_execution(&project, &state_dir).is_ok());
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(
+            &state_dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let owner = WorkspaceOwner::open(
             &project,
             &state_dir.join("rewind-workspace"),
@@ -5078,6 +5190,7 @@ mod tests {
         std::fs::create_dir(&project).expect("project");
         std::fs::create_dir(project.join(".polaris")).expect("project marker");
         std::fs::create_dir(&data).expect("data");
+        let saved_project = project.canonicalize().unwrap().to_str().unwrap().to_owned();
         with_home(&home, || {
             let state_dir = polaris_core::project::state_dir(&project).expect("state dir");
             let workflow = SessionWorkflow::new(WorkflowConfig {
@@ -5088,7 +5201,7 @@ mod tests {
             let saved = PersistedSession::create(
                 &data,
                 &data.join("memory.sqlite3"),
-                "test-project",
+                &saved_project,
                 HistoryMode::Legacy,
                 Some(&workflow),
             )
@@ -5108,7 +5221,7 @@ mod tests {
                 &project,
                 &state_dir,
                 &data,
-                "test-project",
+                &saved_project,
                 true,
                 true,
                 &mut input,
@@ -5661,6 +5774,7 @@ mod tests {
         directory
     }
 
+    #[cfg(unix)]
     fn routine_path_dependency_project() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join("crate-a/src")).unwrap();
@@ -5699,6 +5813,7 @@ mod tests {
         directory
     }
 
+    #[cfg(unix)]
     fn static_owner_for_path_dependency_project(
         project: &Path,
         session_id: &str,
@@ -5712,11 +5827,27 @@ mod tests {
             workflow::{ChangeContractV1, Phase, SessionWorkflow, WorkflowConfig},
         };
 
+        // This helper tests graph binding, not the production analyzer. The unit
+        // test executable runs the test harness rather than the CLI subcommand.
+        let analyzer = project.join("crate-a/static-analyzer-fixture");
+        let analyzer_bytes = b"#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":1,\"state\":\"satisfied\",\"findings\":[],\"error_kind\":null}'\n";
+        std::fs::write(&analyzer, analyzer_bytes).unwrap();
+        std::fs::set_permissions(
+            &analyzer,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o500),
+        )
+        .unwrap();
+
         let sandbox = build_sandbox_policy(project, SandboxMode::WorkspaceWrite).unwrap();
         let prompt = "Validate the component manifest.";
-        let prepared =
+        let mut prepared =
             prepare_routine_authority(&static_authority_json(), prompt, project, &sandbox, project)
                 .unwrap();
+        for adapter in &mut prepared.static_adapters {
+            adapter.program = analyzer.canonicalize().unwrap();
+            adapter.capability.executable_hash =
+                polaris_core::conversation_state::content_hash(analyzer_bytes);
+        }
         let workflow = SessionWorkflow::new(WorkflowConfig {
             enabled: true,
             initial_phase: Phase::Specify,
@@ -6122,6 +6253,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn cargo_lock_change_after_prepare_rejects_the_static_run() {
         use polaris_core::verification::VerificationToolOwnerV1;
 
@@ -6141,6 +6273,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn sibling_path_dependency_change_after_run_is_unknown_and_cannot_publish() {
         use polaris_core::verification::{VerificationCheckpointStageV1, VerificationToolOwnerV1};
 
@@ -6481,22 +6614,28 @@ mod tests {
     /// they step on each other's HOME. Serialize the swap here.
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Swaps HOME, runs `f`, and always restores it afterward.
+    /// Swaps HOME without a custom data directory, runs `f`, and restores both.
     ///
-    /// SAFETY: This only swaps HOME temporarily within this process; it
+    /// SAFETY: This only swaps environment variables within this process; it
     /// doesn't affect other processes. `std::env::set_var`'s safety
     /// condition is concurrent reads/writes from multiple threads, and
     /// that's serialized by `HOME_LOCK` above.
     fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("HOME");
+        let previous_data_dir = std::env::var_os("POLARIS_DATA_DIR");
         unsafe {
             std::env::set_var("HOME", home);
+            std::env::remove_var("POLARIS_DATA_DIR");
         }
         let out = f();
         match prev {
             Some(p) => unsafe { std::env::set_var("HOME", p) },
             None => unsafe { std::env::remove_var("HOME") },
+        }
+        match previous_data_dir {
+            Some(p) => unsafe { std::env::set_var("POLARIS_DATA_DIR", p) },
+            None => unsafe { std::env::remove_var("POLARIS_DATA_DIR") },
         }
         out
     }

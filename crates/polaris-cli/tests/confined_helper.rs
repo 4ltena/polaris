@@ -29,6 +29,7 @@
 //! (`polaris-cli`). From `polaris-tools`'s unit tests there's no way to
 //! reach it other than guessing the build artifact's path, and that guess
 //! silently breaks with profile or `--target` choices.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 
@@ -52,9 +53,8 @@ const OS_REFUSAL: &[&str] = &[
 const STARTUP_FAILURE: &[&str] = &["panicked", "fatal runtime error", "guard page"];
 
 /// Obtains the helper's path through the same path production uses.
-/// `main.rs` goes through `staged_helper`, so the test calls its
-/// underlying version (the one whose executable can be swapped) against
-/// the real binary.
+/// `main.rs` retains a prepared helper owner across child execution. The test
+/// uses that same preparation against the real binary.
 ///
 /// Passes the real binary in only *after placing it inside the writable
 /// root*. This is exactly production's layout (launching
@@ -66,13 +66,30 @@ const STARTUP_FAILURE: &[&str] = &["panicked", "fatal runtime error", "guard pag
 /// staging location even once. That would make the claim "the staging
 /// location is outside the root" structurally always true, verifying
 /// nothing.
-fn staged_real_binary(policy: &SandboxPolicy, state_dir: &Path) -> PathBuf {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+type HelperOwner = polaris_core::isolated_run::PreparedConfinedHelper;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+type HelperOwner = ();
+
+fn staged_real_binary(policy: &SandboxPolicy, state_dir: &Path) -> (PathBuf, HelperOwner) {
     let inside_the_root = policy.writable_roots()[0].join("polaris");
     std::fs::copy(env!("CARGO_BIN_EXE_polaris"), &inside_the_root)
         .expect("could not place the real binary inside the writable root");
 
-    polaris_sandbox::stage::staged_helper_from(policy, state_dir, &inside_the_root)
-        .expect("could not prepare the helper")
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let owner = HelperOwner::prepare(policy, state_dir, &inside_the_root)
+            .expect("could not prepare the helper");
+        (owner.helper_path().to_owned(), owner)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (
+            polaris_sandbox::stage::staged_helper_from(policy, state_dir, &inside_the_root)
+                .expect("could not prepare the helper"),
+            (),
+        )
+    }
 }
 
 fn workspace_write(root: &Path) -> SandboxPolicy {
@@ -84,9 +101,9 @@ fn a_write_inside_the_root_lands_through_the_real_binary_under_a_real_profile() 
     let root = tempfile::tempdir().expect("temp directory");
     let state = tempfile::tempdir().expect("temp directory");
     let policy = workspace_write(root.path());
-    let helper = staged_real_binary(&policy, state.path());
+    let (helper, _owner) = staged_real_binary(&policy, state.path());
 
-    // This checks that `staged_helper_from` actually made a copy. Since
+    // This checks that preparation actually made a copy. Since
     // the binary we passed in is inside the writable root, this claim
     // would be false if staging didn't work (leaving anyone who can write
     // to the workspace able to replace the helper used for the next
@@ -125,7 +142,7 @@ fn a_write_outside_the_root_is_refused_by_the_policy_not_by_a_helper_that_could_
     let outside = tempfile::tempdir().expect("temp directory");
     let state = tempfile::tempdir().expect("temp directory");
     let policy = workspace_write(root.path());
-    let helper = staged_real_binary(&policy, state.path());
+    let (helper, _owner) = staged_real_binary(&policy, state.path());
 
     // Put a control run inside this test. A test that only looks at
     // failure outside the root can't distinguish "denied by policy" from
@@ -190,7 +207,7 @@ fn an_edit_whose_marker_is_absent_is_a_request_problem_not_a_policy_denial() {
     let root = tempfile::tempdir().expect("temp directory");
     let state = tempfile::tempdir().expect("temp directory");
     let policy = workspace_write(root.path());
-    let helper = staged_real_binary(&policy, state.path());
+    let (helper, _owner) = staged_real_binary(&policy, state.path());
 
     let target = policy.writable_roots()[0].join("f.txt");
     std::fs::write(&target, "original body text").expect("cannot write");
@@ -237,11 +254,16 @@ fn isolated_read_real_helper_returns_only_allowed_dummy_text() {
     let helper = Path::new(env!("CARGO_BIN_EXE_polaris"))
         .canonicalize()
         .unwrap();
+    let os_home = polaris_tools::account_home::trusted_user_home().unwrap();
+    let entry_lease =
+        polaris_mcp::entry_gate::ProductionEntryLeaseV2::enter(&os_home, &helper).unwrap();
     let policy = SandboxPolicy::isolated(
         SandboxMode::ReadOnly,
         root.path(),
         std::slice::from_ref(&helper),
     )
+    .unwrap()
+    .with_isolated_readable_files(&entry_lease.isolated_read_files())
     .unwrap()
     .with_isolated_environment(&home, &tmp)
     .unwrap();

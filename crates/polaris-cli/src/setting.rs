@@ -1,6 +1,7 @@
 //! 同梱の定型コマンド。引数の受け取りと表示だけを行い、検出・計画・記録は
 //! coreの`recipe`が持つ。実際のパッケージ導入は利用者の確認を経る。
 
+#[cfg(unix)]
 use polaris_core::recipe::{
     self, Manager, Plan, Refusal,
     confirm::{Postcondition, Verdict, confirm, postcondition},
@@ -31,6 +32,7 @@ enum Command {
     Git,
 }
 
+#[cfg(unix)]
 pub fn run(args: Args) -> ExitCode {
     let cwd = args
         .project
@@ -48,6 +50,7 @@ pub fn run(args: Args) -> ExitCode {
     }
 }
 
+#[cfg(unix)]
 fn refusal(reason: Refusal) -> &'static str {
     match reason {
         Refusal::NoManifest => "package.json がないため、この手順は当てはまりません。",
@@ -61,12 +64,14 @@ fn refusal(reason: Refusal) -> &'static str {
     }
 }
 
+#[cfg(unix)]
 fn manager_name(manager: Manager) -> &'static str {
     manager.program()
 }
 
 /// 台帳を読み、残りの工程と、各工程の事後条件を表示する。実行そのものは
 /// M7c-3d（起動確認のprocess所有）まで未実装なので、確認待ちとして示す。
+#[cfg(unix)]
 fn nextjs(cwd: &std::path::Path, install: bool) -> Result<(), String> {
     let (writer, ..) =
         recipe::session::open(cwd).map_err(|e| recipe::session::refusal(&e).to_owned())?;
@@ -128,6 +133,7 @@ fn nextjs(cwd: &std::path::Path, install: bool) -> Result<(), String> {
 }
 
 /// 事後条件が今の時点で満たされているかを、実行前の状態として示す。
+#[cfg(unix)]
 fn state_of(root: &std::path::Path, condition: &Postcondition) -> String {
     // 検出工程は管理ツールの応答が答えなので、実行前には判定できない。
     if matches!(condition, Postcondition::ManagerAnswered) {
@@ -140,6 +146,7 @@ fn state_of(root: &std::path::Path, condition: &Postcondition) -> String {
     }
 }
 
+#[cfg(unix)]
 fn skipped_reason(why: &recipe::template::Skipped) -> &'static str {
     match why {
         recipe::template::Skipped::AlreadyPresent => "既にあるので触りません",
@@ -147,6 +154,7 @@ fn skipped_reason(why: &recipe::template::Skipped) -> &'static str {
     }
 }
 
+#[cfg(unix)]
 fn git_refusal(reason: &GitRefusal) -> String {
     match reason {
         GitRefusal::NoRepository => {
@@ -162,6 +170,7 @@ fn git_refusal(reason: &GitRefusal) -> String {
     }
 }
 
+#[cfg(unix)]
 fn withheld_reason(held: &Withheld) -> String {
     match &held.reason {
         WithheldReason::AlreadyPresent => format!("  {}\t既にあります", held.rule),
@@ -172,8 +181,10 @@ fn withheld_reason(held: &Withheld) -> String {
 }
 
 /// M7c-3c の規則。既存の行・順序・否定規則を保ったまま、不足分だけを足す。
+#[cfg(unix)]
 const NEXT_JS_IGNORES: &[&str] = &[".next/", "node_modules/", "coverage/"];
 
+#[cfg(unix)]
 fn placement_text(found: &Placement) -> String {
     let committed = |head: &Head| match head {
         Head::Committed => "コミットあり",
@@ -190,6 +201,7 @@ fn placement_text(found: &Placement) -> String {
     }
 }
 
+#[cfg(unix)]
 fn git(cwd: &std::path::Path) -> Result<(), String> {
     let root = polaris_core::project::resolve_root(cwd);
     let opened = std::fs::File::open(&root).map_err(|_| "対象を開けません。".to_owned())?;
@@ -208,6 +220,7 @@ fn git(cwd: &std::path::Path) -> Result<(), String> {
 
 /// 不足規則の追加を、台帳へ記録しながら行う。実行の前にintentを、実行の後に
 /// 終端を保存する。終端は事後条件を読み直してから決める。
+#[cfg(unix)]
 fn tidy(cwd: &std::path::Path, root: &std::path::Path) -> Result<(), String> {
     let existing = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
     let (add, withheld) = recipe::ignore_rules::plan_additions(&existing, NEXT_JS_IGNORES);
@@ -294,9 +307,16 @@ fn tidy(cwd: &std::path::Path, root: &std::path::Path) -> Result<(), String> {
 }
 
 /// 呼出しごとの識別子。同じ呼出しの再送は同じrunになる。
+#[cfg(unix)]
 fn now_id() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|held| held.as_nanos())
         .unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+pub fn run(_args: Args) -> ExitCode {
+    eprintln!("このプラットフォームでは設定の変更に必要な保護機構が未対応です。変更していません。");
+    ExitCode::FAILURE
 }

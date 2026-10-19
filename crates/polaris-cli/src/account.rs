@@ -79,6 +79,10 @@ enum Command {
 }
 
 pub async fn run(args: Args) -> ExitCode {
+    if cfg!(windows) {
+        eprintln!("Windowsではアカウントの保護された保存先を利用できません。変更していません。");
+        return ExitCode::FAILURE;
+    }
     let result = match args.command {
         Command::List => list(),
         Command::Login { label } => login(label).await,

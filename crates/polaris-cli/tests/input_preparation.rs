@@ -1,4 +1,5 @@
 //! Real CLI input preparation with an isolated home and a synthetic loopback model.
+#![cfg(unix)]
 
 use std::{
     io::{self, Read, Write},

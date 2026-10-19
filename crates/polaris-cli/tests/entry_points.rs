@@ -2,20 +2,15 @@
 //! handing an implementation to a person, and judging spare quota. Real
 //! directories; nothing is sent and no account is contacted.
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 
-fn bin() -> PathBuf {
-    let mut path = std::env::current_exe().expect("this test binary");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("polaris")
-}
+#[path = "support/product_binary.rs"]
+mod product_binary;
 
 fn run(args: &[&str], cwd: &Path) -> (bool, String) {
-    let output = Command::new(bin())
+    let output = product_binary::command()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -38,6 +33,7 @@ fn write(root: &Path, relative: &str, body: &str) {
     fs::write(path, body).expect("the file");
 }
 
+#[cfg(unix)]
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -86,6 +82,7 @@ fn folders_with_nothing_in_common_come_back_as_nothing_to_look_at() {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_handoff_names_the_generation_and_the_files_git_says_changed() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let root = dir.path().canonicalize().expect("canonical");
@@ -121,6 +118,7 @@ fn the_handoff_names_the_generation_and_the_files_git_says_changed() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_run_that_changed_nothing_produces_no_handoff() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let root = dir.path().canonicalize().expect("canonical");

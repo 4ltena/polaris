@@ -30,6 +30,14 @@ enum Command {
 }
 
 pub fn run(args: Args) -> Result<(), String> {
+    if cfg!(windows)
+        && matches!(
+            (&args.command, &args.what),
+            (Some(Command::Add { .. }), _) | (None, Some(_))
+        )
+    {
+        return Err("Windowsでは決定事項の追記は未対応です。変更していません。".into());
+    }
     let cwd = std::env::current_dir().map_err(|e| format!("作業ディレクトリを読めません: {e}"))?;
     let root = project::resolve_root(&cwd);
 

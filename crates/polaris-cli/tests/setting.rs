@@ -1,5 +1,7 @@
 //! The bundled setting commands from the terminal. Real directories and a
 //! real ledger; no package is installed and nothing is sent.
+#![cfg(unix)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;

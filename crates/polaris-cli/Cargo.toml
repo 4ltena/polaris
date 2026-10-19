@@ -9,6 +9,10 @@ license.workspace = true
 name = "polaris"
 path = "src/main.rs"
 
+[[bin]]
+name = "polaris-git-askpass"
+path = "src/bin/polaris-git-askpass.rs"
+
 [dependencies]
 polaris-memory = { path = "../polaris-memory" }
 polaris-auth = { path = "../polaris-auth" }
@@ -24,6 +28,7 @@ clap = { workspace = true }
 clap_complete = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+zeroize = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }

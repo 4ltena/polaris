@@ -8,6 +8,7 @@ fn run(home: &std::path::Path, project: &std::path::Path, args: &[&str]) -> std:
     std::fs::create_dir_all(project.join(".git")).unwrap();
     product_binary::command()
         .env("HOME", home)
+        .env_remove("POLARIS_DATA_DIR")
         .current_dir(project)
         .args(args)
         .output()
@@ -15,6 +16,7 @@ fn run(home: &std::path::Path, project: &std::path::Path, args: &[&str]) -> std:
 }
 
 #[test]
+#[cfg(unix)]
 fn import_search_get_and_forget_preserve_project_boundary() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -101,18 +103,10 @@ fn search_does_not_create_memory_and_invalid_threshold_is_rejected() {
         .status
         .success()
     );
-    assert!(
-        !run(
-            home.path(),
-            project.path(),
-            &["memory", "forget", "../escape"]
-        )
-        .status
-        .success()
-    );
 }
 
 #[test]
+#[cfg(unix)]
 fn get_range_is_opt_in_byte_bounded_and_preserves_full_get() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -185,6 +179,27 @@ fn get_range_is_opt_in_byte_bounded_and_preserves_full_get() {
             .success()
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn forget_rejects_an_invalid_session() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    assert!(
+        !run(
+            home.path(),
+            project.path(),
+            &["memory", "forget", "../escape"]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn get_does_not_create_missing_memory() {
+    let project = tempfile::tempdir().unwrap();
     let absent_home = tempfile::tempdir().unwrap();
     assert!(
         !run(

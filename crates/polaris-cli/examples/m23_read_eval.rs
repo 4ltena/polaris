@@ -45,6 +45,12 @@ const ROOT_MODEL: &str = "gpt-6-astra";
 const CHILD_MODEL: &str = "gpt-5.6-luna";
 const EFFORT: &str = "xhigh";
 
+#[cfg(not(unix))]
+fn save_new(_path: &Path, _value: &Value) -> Result<(), String> {
+    Err("native evaluation is unavailable on this platform".into())
+}
+
+#[cfg(unix)]
 fn save_new(path: &Path, value: &Value) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = OpenOptions::new()
@@ -342,6 +348,7 @@ async fn live(args: &Args, plan: Plan) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn main() {
     let args = Args::parse();
     let result = (|| {
@@ -365,4 +372,12 @@ fn main() {
         eprintln!("M23比較を停止: {reason}");
         std::process::exit(1);
     }
+}
+
+#[cfg(not(unix))]
+fn main() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native evaluation is unavailable on this platform",
+    ))
 }

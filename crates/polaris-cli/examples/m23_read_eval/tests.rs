@@ -101,6 +101,7 @@ fn row(model: &str, id: &str, usage: Usage) -> Value {
     json!({"schema_version":1,"provider":"synthetic_no_network","attempt_id":id,"model":model,"effort":EFFORT,"outcome":"completed",
         "usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"cache_read_tokens":usage.cached_tokens,"cache_write_tokens":null,"reasoning_tokens":3}})
 }
+#[cfg(unix)]
 struct Scripted {
     model: &'static str,
     steps: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
@@ -108,6 +109,7 @@ struct Scripted {
     calls: AtomicUsize,
     metrics: PathBuf,
 }
+#[cfg(unix)]
 impl Scripted {
     fn new(
         model: &'static str,
@@ -123,6 +125,7 @@ impl Scripted {
         })
     }
 }
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl Provider for Scripted {
     async fn complete(&self, _: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
@@ -172,6 +175,7 @@ impl Provider for Scripted {
     }
 }
 
+#[cfg(unix)]
 struct Rig {
     shared: Arc<guard::Shared>,
     trial: Arc<Mutex<guard::Trial>>,
@@ -180,6 +184,7 @@ struct Rig {
     root_guard: Arc<dyn Provider>,
     child_guard: Arc<dyn Provider>,
 }
+#[cfg(unix)]
 fn rig(
     case: &Case,
     arm: Arm,
@@ -219,6 +224,7 @@ fn rig(
         child_guard,
     }
 }
+#[cfg(unix)]
 async fn execute(case: &Case, arm: Arm, limits: &Bounds, rig: &Rig) -> TrialRun {
     run_agent(
         case,
@@ -240,6 +246,7 @@ async fn execute(case: &Case, arm: Arm, limits: &Bounds, rig: &Rig) -> TrialRun 
 /// accepts and left the arm unmeasurable for a reason that is not the question
 /// being measured, so the field is recorded rather than rejected.
 #[tokio::test]
+#[cfg(unix)]
 async fn a_read_only_child_task_may_declare_write_root_because_production_ignores_it() {
     let (_temp, case) = fixture();
     let limits = bounds();
@@ -264,6 +271,7 @@ async fn a_read_only_child_task_may_declare_write_root_because_production_ignore
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn real_agent_read_and_spawn_keep_source_out_of_parent_and_account_once() {
     for arm in [Arm::Direct, Arm::Reader] {
         let (_temp, case) = fixture();
@@ -336,6 +344,7 @@ async fn real_agent_read_and_spawn_keep_source_out_of_parent_and_account_once() 
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn child_schema_retry_shares_budget_and_never_reloads_parent_history() {
     let (_temp, case) = fixture();
     let limits = bounds();
@@ -364,6 +373,7 @@ async fn child_schema_retry_shares_budget_and_never_reloads_parent_history() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn child_limit_missing_usage_error_and_output_stop_block_next_parent_send() {
     for fault in ["cap", "missing", "error", "output"] {
         let (_temp, case) = fixture();
@@ -439,6 +449,7 @@ async fn child_limit_missing_usage_error_and_output_stop_block_next_parent_send(
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn invalid_child_schema_twice_blocks_parent_even_without_provider_error() {
     let (_temp, case) = fixture();
     let limits = bounds();
@@ -460,6 +471,7 @@ async fn invalid_child_schema_twice_blocks_parent_even_without_provider_error() 
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn invalid_tool_paths_and_spawns_are_rejected_before_execution_with_usage() {
     for fault in [
         "answer-file",
@@ -704,25 +716,28 @@ fn websocket_refresh_environment_and_started_restart_are_refused() {
     let mut changed = env;
     changed.insert("POLARIS_AUTH_READ_ONLY", "0");
     assert!(check(&changed).is_err());
-    let temp = tempfile::tempdir().unwrap();
-    let out = temp.path().canonicalize().unwrap().join("output");
-    input::claim_output(&out).unwrap();
-    save_new(&out.join("started.json"), &json!({"state":"started"})).unwrap();
-    assert!(input::claim_output(&out).is_err());
-    let budget = AttemptBudget::new(15).unwrap();
-    let ledger_path = out.join("attempts.json");
-    let ledger =
-        AttemptLedger::open_observed(&ledger_path, AttemptContext::default(), budget).unwrap();
-    let mut saved = ledger.persisted();
-    drop(ledger);
-    let mut running = attempt(ROOT_MODEL, "interrupted");
-    running.status = AttemptStatus::Running;
-    running.finished_at_ms = None;
-    saved.records.push(running);
-    fs::write(&ledger_path, serde_json::to_vec(&saved).unwrap()).unwrap();
-    let restored =
-        AttemptLedger::open_observed(&ledger_path, AttemptContext::default(), budget).unwrap();
-    assert!(restored.persisted().halted);
+    #[cfg(unix)]
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().canonicalize().unwrap().join("output");
+        input::claim_output(&out).unwrap();
+        save_new(&out.join("started.json"), &json!({"state":"started"})).unwrap();
+        assert!(input::claim_output(&out).is_err());
+        let budget = AttemptBudget::new(15).unwrap();
+        let ledger_path = out.join("attempts.json");
+        let ledger =
+            AttemptLedger::open_observed(&ledger_path, AttemptContext::default(), budget).unwrap();
+        let mut saved = ledger.persisted();
+        drop(ledger);
+        let mut running = attempt(ROOT_MODEL, "interrupted");
+        running.status = AttemptStatus::Running;
+        running.finished_at_ms = None;
+        saved.records.push(running);
+        fs::write(&ledger_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let restored =
+            AttemptLedger::open_observed(&ledger_path, AttemptContext::default(), budget).unwrap();
+        assert!(restored.persisted().halted);
+    }
 }
 
 #[tokio::test]
@@ -736,19 +751,22 @@ async fn refresh_and_unscoped_completion_never_reach_a_model() {
         expires_at: u64::MAX,
     };
     assert!(tokens.refreshed().await.is_err());
-    let (_temp, case) = fixture();
-    let limits = bounds();
-    let rig = rig(&case, Arm::Direct, &limits, vec![], vec![]);
-    assert!(
-        rig.root_guard
-            .complete(CompletionRequest {
-                system: String::new(),
-                messages: vec![],
-                tools: vec![]
-            })
-            .await
-            .is_err()
-    );
-    assert_eq!(rig.root.calls.load(Ordering::SeqCst), 0);
-    assert!(rig.shared.ensure_running().is_err());
+    #[cfg(unix)]
+    {
+        let (_temp, case) = fixture();
+        let limits = bounds();
+        let rig = rig(&case, Arm::Direct, &limits, vec![], vec![]);
+        assert!(
+            rig.root_guard
+                .complete(CompletionRequest {
+                    system: String::new(),
+                    messages: vec![],
+                    tools: vec![]
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(rig.root.calls.load(Ordering::SeqCst), 0);
+        assert!(rig.shared.ensure_running().is_err());
+    }
 }

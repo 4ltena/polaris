@@ -11,6 +11,7 @@ mod product_binary;
 /// under `~/.polaris/api_key.json` (from `polaris login` or onboarding)
 /// can never make this test resolve a real key and send a real, billed
 /// request to `https://api.openai.com/v1`.
+#[cfg(unix)]
 #[test]
 fn reports_missing_api_key() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -38,6 +39,7 @@ fn reports_missing_api_key() {
 /// whole process. Discovery runs before the missing-API-key check fails the
 /// run, so a dummy key and an unreachable base URL let the process reach
 /// discovery and then fail later, on its own terms, at the network call.
+#[cfg(unix)]
 #[test]
 fn reports_a_broken_agent_type_without_crashing() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -89,6 +91,7 @@ fn help_mentions_the_three_environment_variables() {
 }
 
 /// A project config alone cannot start the experimental structured10 mode.
+#[cfg(unix)]
 #[test]
 fn project_config_cannot_start_structured10_without_the_explicit_flag() {
     let home = tempfile::tempdir().expect("temp directory");

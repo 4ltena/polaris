@@ -4,10 +4,13 @@
 //! 「変えていない」と言ってしまう。文面は実装が終わったことだけを示し、
 //! 実機での合格は含まない。
 
+#[cfg(unix)]
 use polaris_core::handoff::{Implementation, Refusal, prompt};
+#[cfg(unix)]
 use polaris_core::project_git::read_only_git;
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[derive(clap::Args)]
@@ -28,6 +31,7 @@ pub struct Args {
     attempt: String,
 }
 
+#[cfg(unix)]
 fn refusal_text(refusal: Refusal) -> &'static str {
     match refusal {
         Refusal::NoChanges => {
@@ -40,6 +44,7 @@ fn refusal_text(refusal: Refusal) -> &'static str {
 
 /// 追跡済みの変更と、追跡されていないファイルの両方。どちらも「試す対象」
 /// であり、新規ファイルを落とすと実機で足りないものが出る。
+#[cfg(unix)]
 fn changed(root: &std::path::Path) -> Result<Vec<String>, String> {
     let opened = std::fs::File::open(root).map_err(|_| "対象を開けません。".to_owned())?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -66,6 +71,7 @@ fn changed(root: &std::path::Path) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
+#[cfg(unix)]
 fn head(root: &std::path::Path) -> Option<String> {
     let opened = std::fs::File::open(root).ok()?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -80,6 +86,7 @@ fn head(root: &std::path::Path) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+#[cfg(unix)]
 pub fn run(args: Args) -> ExitCode {
     let cwd = args
         .project
@@ -116,4 +123,12 @@ pub fn run(args: Args) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(not(unix))]
+pub fn run(_args: Args) -> ExitCode {
+    eprintln!(
+        "このプラットフォームではGitからの引き継ぎ情報取得に必要な保護機構が未対応です。変更していません。"
+    );
+    ExitCode::FAILURE
 }

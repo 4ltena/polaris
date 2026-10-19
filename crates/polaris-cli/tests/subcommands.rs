@@ -11,6 +11,7 @@
 #[path = "support/product_binary.rs"]
 mod product_binary;
 
+#[cfg(unix)]
 #[test]
 fn common_tests_runs_a_valid_bounded_plan_or_reports_unavailable() {
     let workspace = tempfile::tempdir().expect("temp directory");
@@ -44,6 +45,7 @@ fn common_tests_runs_a_valid_bounded_plan_or_reports_unavailable() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn common_tests_rejects_a_plan_larger_than_the_decode_limit() {
     let workspace = tempfile::tempdir().expect("temp directory");
@@ -62,6 +64,7 @@ fn common_tests_rejects_a_plan_larger_than_the_decode_limit() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("計画を読めません"));
 }
 
+#[cfg(unix)]
 #[test]
 fn common_tests_never_returns_a_host_home_sentinel() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -95,6 +98,7 @@ fn common_tests_never_returns_a_host_home_sentinel() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn common_tests_never_exposes_workspace_secrets_to_a_case_program() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -130,6 +134,7 @@ fn common_tests_never_exposes_workspace_secrets_to_a_case_program() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn common_tests_rejects_an_invalid_plan_before_execution() {
     let workspace = tempfile::tempdir().expect("temp directory");
@@ -215,6 +220,7 @@ fn the_login_subcommand_is_reachable_without_a_prompt() {
 
 /// `logout` runs to completion without `--prompt`. It doesn't fail even
 /// when not logged in.
+#[cfg(unix)]
 #[test]
 fn the_logout_subcommand_runs_without_a_prompt() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -235,6 +241,7 @@ fn the_logout_subcommand_runs_without_a_prompt() {
 
 /// `logout` deletes only its own store. It doesn't touch
 /// `~/.codex/auth.json`.
+#[cfg(unix)]
 #[test]
 fn logout_never_touches_the_codex_store() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -276,6 +283,7 @@ fn logout_never_touches_the_codex_store() {
 /// non-interactive guard refuses to start instead of hanging — this must
 /// not silently succeed, and it must not be confused with the old
 /// "--prompt is required" error (which no longer exists).
+#[cfg(unix)]
 #[test]
 fn the_normal_path_without_a_prompt_refuses_the_tui_on_a_non_interactive_terminal() {
     // Provider construction now runs unconditionally, even without a
@@ -303,6 +311,7 @@ fn the_normal_path_without_a_prompt_refuses_the_tui_on_a_non_interactive_termina
 /// unreachable address so that a developer machine with a real saved key
 /// under `~/.polaris/api_key.json` can never make this test resolve a
 /// real key and send a real, billed request to the OpenAI API.
+#[cfg(unix)]
 #[test]
 fn the_default_provider_is_still_openai() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -328,6 +337,7 @@ fn the_default_provider_is_still_openai() {
 /// Acceptance criterion 4. Pointing at codex while logged out produces an
 /// error naming `polaris login`. It's not an HTTP error — this stops
 /// before reaching the network, so no real API call is made.
+#[cfg(unix)]
 #[test]
 fn a_logged_out_codex_run_names_the_login_command() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -358,6 +368,7 @@ fn a_logged_out_codex_run_names_the_login_command() {
 
 /// An unknown provider name fails at startup. Noticing only after
 /// running, via "the model isn't responding", is too late.
+#[cfg(unix)]
 #[test]
 fn an_unknown_provider_name_fails_fast() {
     let out = product_binary::command()
@@ -380,6 +391,7 @@ fn an_unknown_provider_name_fails_fast() {
 /// by a real network call, but that's not what this test checks — it
 /// only checks that key *resolution* used the file instead of failing at
 /// "POLARIS_API_KEY is not set").
+#[cfg(unix)]
 #[test]
 fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -417,6 +429,7 @@ fn a_saved_api_key_file_is_used_when_the_env_var_is_absent() {
 /// message from the chat loop's own guard, so seeing THAT specific
 /// message (not the chat loop's "refusing to start the TUI...") proves
 /// main.rs's onboarding wiring was actually exercised, not skipped.
+#[cfg(unix)]
 #[test]
 fn tui_mode_with_no_key_anywhere_reaches_onboarding() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -447,6 +460,7 @@ fn tui_mode_with_no_key_anywhere_reaches_onboarding() {
 /// with saved codex credentials, no openai key anywhere, and no explicit
 /// `POLARIS_PROVIDER` must reach the *chat loop's* own non-interactive
 /// guard (proving it picked the codex provider), not onboarding's guard.
+#[cfg(unix)]
 #[test]
 fn saved_codex_credentials_are_used_without_an_explicit_provider() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -484,6 +498,7 @@ fn saved_codex_credentials_are_used_without_an_explicit_provider() {
 /// path as `--prompt` — proven the same way `the_default_provider_is_still_openai`
 /// proves it: no key anywhere, and the failure is the openai arm's own
 /// "not set" message, not a `clap` parse error or the TUI path.
+#[cfg(unix)]
 #[test]
 fn exec_with_an_argument_reaches_the_one_shot_path() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -511,6 +526,7 @@ fn exec_with_an_argument_reaches_the_one_shot_path() {
 /// ran (an empty pipe would otherwise block forever waiting on the real
 /// terminal, so a successful non-hanging exit here is itself part of what
 /// this proves).
+#[cfg(unix)]
 #[test]
 fn exec_with_no_argument_reads_the_prompt_from_stdin() {
     use std::io::Write as _;
@@ -550,6 +566,7 @@ fn exec_with_no_argument_reads_the_prompt_from_stdin() {
 /// `sandbox` runs the given command under confinement and reports its
 /// output and exit code, without going through the agent loop at all (no
 /// credentials needed).
+#[cfg(unix)]
 #[test]
 fn sandbox_runs_a_command_under_confinement_and_reports_its_output() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -574,6 +591,7 @@ fn sandbox_runs_a_command_under_confinement_and_reports_its_output() {
 
 /// `sandbox` propagates the child's real exit code (not a flat 0/1), so a
 /// caller scripting around it can tell success from a specific failure.
+#[cfg(unix)]
 #[test]
 fn sandbox_propagates_the_childs_exit_code() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -610,10 +628,20 @@ fn doctor_runs_successfully_with_no_credentials() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    #[cfg(not(windows))]
     assert!(
         stdout.contains("not found"),
         "missing credentials: {stdout}"
     );
+    #[cfg(windows)]
+    {
+        assert!(stdout.contains(
+            "Can't determine the credentials path: authentication path protection is unavailable"
+        ));
+        assert!(stdout.contains(
+            "Can't determine the API key path: authentication path protection is unavailable"
+        ));
+    }
     assert!(
         stdout.contains("would default to: openai"),
         "missing provider resolution: {stdout}"
@@ -625,6 +653,7 @@ fn doctor_runs_successfully_with_no_credentials() {
 /// scenario `saved_codex_credentials_are_used_without_an_explicit_provider`
 /// pins down at the process level; here `doctor` must describe the same
 /// decision it's about to make.
+#[cfg(unix)]
 #[test]
 fn doctor_reports_codex_as_default_when_only_codex_credentials_are_saved() {
     let home = tempfile::tempdir().expect("temp directory");
@@ -676,6 +705,7 @@ fn completion_generates_a_script_for_every_supported_shell() {
 }
 
 /// 明示指定は登録がある場合だけ意味を持ち、別providerとは併用できない。
+#[cfg(unix)]
 #[test]
 fn an_explicit_account_is_refused_without_a_registration_or_outside_codex() {
     let home = tempfile::tempdir().expect("temp directory");

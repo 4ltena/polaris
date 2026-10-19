@@ -111,6 +111,7 @@ impl Approver for Deny {
     }
 }
 
+#[cfg(unix)]
 fn private_new(path: &Path) -> Result<File, String> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
@@ -120,6 +121,7 @@ fn private_new(path: &Path) -> Result<File, String> {
         .open(path)
         .map_err(|_| "new output unavailable".into())
 }
+#[cfg(unix)]
 fn save(path: &Path, data: &Value) -> Result<(), String> {
     let mut file = private_new(path)?;
     serde_json::to_writer(&mut file, data).map_err(|_| "output encoding failed")?;
@@ -127,6 +129,7 @@ fn save(path: &Path, data: &Value) -> Result<(), String> {
         .and_then(|()| file.sync_all())
         .map_err(|_| "output persistence failed".into())
 }
+#[cfg(unix)]
 fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&fs::read(path).map_err(|_| "input unavailable")?)
         .map_err(|_| "invalid JSON".into())
@@ -239,6 +242,7 @@ fn assess(metric: &Value, outcome: &agent::AgentOutcome, expected: &Value) -> Va
         "answer":outcome.text})
 }
 
+#[cfg(unix)]
 async fn run(work: PathBuf, arm: String) -> Result<(), String> {
     if !matches!(
         arm.as_str(),
@@ -335,6 +339,7 @@ async fn run(work: PathBuf, arm: String) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -434,6 +439,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn arm_claim_cannot_be_overwritten() {
         let temp = tempfile::tempdir().unwrap();
         let p = temp.path().join("started.json");
@@ -477,4 +483,12 @@ mod tests {
             assert_eq!(requests[0].contains(implement.body.trim()), expected);
         }
     }
+}
+
+#[cfg(not(unix))]
+fn main() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native evaluation is unavailable on this platform",
+    ))
 }

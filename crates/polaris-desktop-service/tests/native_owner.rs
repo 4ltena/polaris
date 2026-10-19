@@ -39,16 +39,16 @@ fn put(path: &Path, bytes: &[u8], mode: u32) {
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
-async fn frame(reader: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+async fn frame(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
     timeout(Duration::from_secs(30), async {
-        let length = reader.read_u32().await.unwrap() as usize;
+        let length = reader.read_u32().await? as usize;
         assert!(length <= codec::MAX_FRAME_BYTES);
         let mut bytes = vec![0; length];
-        reader.read_exact(&mut bytes).await.unwrap();
-        bytes
+        reader.read_exact(&mut bytes).await?;
+        Ok(bytes)
     })
     .await
-    .unwrap()
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC frame deadline"))?
 }
 #[tokio::test]
 async fn native_owner_main_and_recovery_hello_then_eof_release_store() {
@@ -89,7 +89,9 @@ async fn native_owner_main_and_recovery_hello_then_eof_release_store() {
     let base = temporary.path();
     let store = base.join("store");
     let source = base.join("source");
-    for p in [&store, &source] {
+    let data = base.join("data");
+    let temporary_files = base.join("tmp");
+    for p in [&store, &source, &data, &temporary_files] {
         fs::create_dir(p).unwrap();
         fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -202,6 +204,8 @@ async fn native_owner_main_and_recovery_hello_then_eof_release_store() {
     let alias = Path::new("/tmp").join(executable.strip_prefix("/private/tmp").unwrap());
     let mut child = Command::new(alias)
         .env_clear()
+        .env("POLARIS_DATA_DIR", &data)
+        .env("TMPDIR", &temporary_files)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -223,7 +227,25 @@ async fn native_owner_main_and_recovery_hello_then_eof_release_store() {
         )
         .await
         .unwrap();
-    let response: Response = codec::from_json(&frame(&mut output).await).unwrap();
+    let response_bytes = match frame(&mut output).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let status = timeout(Duration::from_secs(5), child.wait()).await;
+            let mut recovery_bytes = Vec::new();
+            let recovery_closed = timeout(
+                Duration::from_secs(5),
+                control
+                    .take(codec::MAX_FRAME_BYTES as u64)
+                    .read_to_end(&mut recovery_bytes),
+            )
+            .await;
+            panic!(
+                "main Hello failed: {error}; child={status:?}; recovery={recovery_closed:?}; recovery_bytes={}",
+                recovery_bytes.len()
+            );
+        }
+    };
+    let response: Response = codec::from_json(&response_bytes).unwrap();
     let SuccessResult::Hello(hello) = response.outcome.unwrap() else {
         panic!("expected hello")
     };
@@ -245,7 +267,7 @@ async fn native_owner_main_and_recovery_hello_then_eof_release_store() {
         .await
         .unwrap();
     let recovery: source_recovery::Response =
-        serde_json::from_slice(&frame(&mut control).await).unwrap();
+        serde_json::from_slice(&frame(&mut control).await.unwrap()).unwrap();
     assert_eq!(recovery.engine_epoch, hello.engine_epoch);
     assert_eq!(recovery.project_id, project);
     assert_eq!(recovery.session_id, session);

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 import PolarisSettings
 
@@ -7,8 +8,14 @@ struct PolarisDesktopApp: App {
     @NSApplicationDelegateAdaptor(DesktopDelegate.self) private var delegate
     @StateObject private var model: DesktopModel
     private let installerMode: Bool
+    private let entryLease: MCPProductionEntryLease
 
     init() {
+        do { entryLease = try MCPProductionEntryLease.enter() }
+        catch {
+            NSLog("MCPの移行状態または実行物を確認できません。開始していません。")
+            Darwin.exit(78)
+        }
         let mode = Bundle.main.bundleIdentifier?.hasPrefix("com.polaris.installer.") == true
             || CommandLine.arguments.contains("--installer-mode")
         installerMode = mode

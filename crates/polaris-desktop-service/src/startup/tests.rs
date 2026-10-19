@@ -596,50 +596,73 @@ async fn legacy_new_owner_rejects_malformed_workflow_source_before_recovery() {
 }
 
 #[tokio::test]
-async fn owner_reconnect_uses_saved_workflow_even_when_global_config_becomes_invalid() {
-    let temp = tempfile::tempdir().unwrap();
-    let base = temp.path().canonicalize().unwrap();
-    let (args, home, exe) = fixture(&base);
-    let store = args.store.store_root.clone();
-    let root = DesktopRoot::open_owned(&store).unwrap();
-    let mut writer = root
-        .open(&args.store.project_id, &args.store.session_id)
-        .unwrap();
-    let mut config = polaris_core::config::Config::default().workflow;
-    config.initial_phase = polaris_core::workflow::Phase::Implement;
-    config.phase_skills.insert(
-        polaris_core::workflow::Phase::Implement,
-        vec!["builtin:missing-old-phase".into()],
-    );
-    let mut workflow = polaris_core::workflow::SessionWorkflow::new(config);
-    // This fixture represents a pre-M27 saved session whose phase behavior is
-    // retained until an explicit durable-contract migration.
-    workflow.gates.phase_gate_schema_version = None;
-    workflow
-        .request_phase(polaris_core::workflow::Phase::Verify)
-        .unwrap();
-    // Manual mode needs the saved current phase, not an unused initial phase.
-    drop(workflow.begin_turn(&[]).unwrap());
-    let saved_workflow = polaris_core::desktop_store::SavedWorkflow::capture(&workflow);
-    writer
-        .configure_workflow(
-            writer.snapshot().unwrap().marker.session_revision,
-            Some(saved_workflow.clone()),
-        )
-        .unwrap();
-    drop(writer);
-    drop(root);
-    put(&home.join(".polaris/config.toml"), b"invalid TOML [", 0o600);
-    let project = args.store.project_id.clone();
-    let session = args.store.session_id.clone();
-    let owner = tokio::task::spawn_blocking(move || start_at(args, &home, &exe))
-        .await
-        .unwrap()
-        .unwrap();
-    drop(owner);
-    let root = DesktopRoot::open_owned(&store).unwrap();
-    let saved = root.open(&project, &session).unwrap().snapshot().unwrap();
-    assert_eq!(saved.state.workflow, Some(saved_workflow));
+async fn owner_reconnect_preserves_saved_workflow_and_rejects_malformed_finalizer_config() {
+    for malformed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (args, home, exe) = fixture(&base);
+        let store = args.store.store_root.clone();
+        let root = DesktopRoot::open_owned(&store).unwrap();
+        let mut writer = root
+            .open(&args.store.project_id, &args.store.session_id)
+            .unwrap();
+        let mut config = polaris_core::config::Config::default().workflow;
+        config.initial_phase = polaris_core::workflow::Phase::Implement;
+        config.phase_skills.insert(
+            polaris_core::workflow::Phase::Implement,
+            vec!["builtin:missing-old-phase".into()],
+        );
+        let mut workflow = polaris_core::workflow::SessionWorkflow::new(config);
+        // This fixture represents a pre-M27 saved session whose phase behavior is
+        // retained until an explicit durable-contract migration.
+        workflow.gates.phase_gate_schema_version = None;
+        workflow
+            .request_phase(polaris_core::workflow::Phase::Verify)
+            .unwrap();
+        // Manual mode needs the saved current phase, not an unused initial phase.
+        drop(workflow.begin_turn(&[]).unwrap());
+        let saved_workflow = polaris_core::desktop_store::SavedWorkflow::capture(&workflow);
+        writer
+            .configure_workflow(
+                writer.snapshot().unwrap().marker.session_revision,
+                Some(saved_workflow.clone()),
+            )
+            .unwrap();
+        drop(writer);
+        drop(root);
+        let config: &[u8] = if malformed {
+            b"invalid TOML ["
+        } else {
+            b"[workflow]\nmode = 'invalid-workflow-mode'\n"
+        };
+        put(&home.join(".polaris/config.toml"), config, 0o600);
+        assert!(
+            polaris_core::config::try_load_workflow_from(
+                Some(&home.join(".polaris/config.toml")),
+                None,
+            )
+            .is_err()
+        );
+        if malformed {
+            assert!(
+                answer_finalizer_resource(&home, &store, &args.confirmed_source_path, &exe, None)
+                    .is_err()
+            );
+        }
+        let project = args.store.project_id.clone();
+        let session = args.store.session_id.clone();
+        let result = tokio::task::spawn_blocking(move || start_at(args, &home, &exe))
+            .await
+            .unwrap();
+        if malformed {
+            assert!(matches!(result, Err(StartupError::Generic)));
+        } else {
+            drop(result.unwrap());
+        }
+        let root = DesktopRoot::open_owned(&store).unwrap();
+        let saved = root.open(&project, &session).unwrap().snapshot().unwrap();
+        assert_eq!(saved.state.workflow, Some(saved_workflow));
+    }
 }
 
 #[tokio::test]

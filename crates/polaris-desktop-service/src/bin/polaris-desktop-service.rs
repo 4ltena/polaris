@@ -13,6 +13,13 @@ fn main() {
         None
     };
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        // Keep the shared entry lock across all service modes and accepted children.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let _entry_lease = {
+            let home = polaris_desktop_service::trusted_user_home()?;
+            let executable = std::env::current_exe()?;
+            polaris_mcp::entry_gate::ProductionEntryLeaseV2::enter(&home, &executable)?
+        };
         let args = polaris_desktop_service::parse_launch_args(&args)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

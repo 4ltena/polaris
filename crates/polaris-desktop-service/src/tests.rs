@@ -2443,6 +2443,7 @@ fn production_engine() -> (tempfile::TempDir, ServiceConfig, Engine) {
     std::fs::set_permissions(&store_root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let project = store_root.join("source");
     std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(project.join(".polaris")).unwrap();
     let config = ServiceConfig {
         store_root,
         project_id: project_id(),
@@ -2587,6 +2588,81 @@ fn production_input_refuses_project_management_blocker_before_admission() {
         .persisted_state()
         .unwrap();
     assert_eq!(manager_after, manager_before);
+}
+
+#[test]
+fn production_input_refuses_torn_c10_before_admission_without_writes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, _config, mut engine) = production_engine();
+    hello(&mut engine);
+    assert!(engine.input_management_guard().unwrap().is_some());
+    let state = polaris_core::project::state_dir(&root.path().join("source")).unwrap();
+    let sync = state.join("sync");
+    let intents = sync.join("remote-intents-v2");
+    for directory in [&sync, &intents, &intents.join("archive")] {
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let torn = intents.join(format!("{}.json", "a".repeat(64)));
+    for (path, bytes) in [
+        (intents.join("owner.lock"), b"".as_slice()),
+        (torn.clone(), b"{torn".as_slice()),
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let before = engine.store.snapshot().unwrap();
+    let manager_before = engine
+        .admission
+        .as_ref()
+        .unwrap()
+        .persisted_state()
+        .unwrap();
+    let cursor = engine
+        .management_effects
+        .as_ref()
+        .unwrap()
+        .cursor()
+        .unwrap();
+    let result = direct(
+        &mut engine,
+        &submit_input(
+            "torn-c10-input",
+            session_id(),
+            0,
+            0,
+            InputRoute::Current,
+            "torn-c10-admission",
+            "must remain unsaved",
+        ),
+    );
+    assert_eq!(result.unwrap_err().code, ErrorCode::RecoveryRequired);
+    let after = engine.store.snapshot().unwrap();
+    assert_eq!(after.marker, before.marker);
+    assert_eq!(
+        serde_json::to_vec(&after.raw).unwrap(),
+        serde_json::to_vec(&before.raw).unwrap()
+    );
+    assert_eq!(
+        engine
+            .admission
+            .as_ref()
+            .unwrap()
+            .persisted_state()
+            .unwrap(),
+        manager_before
+    );
+    assert_eq!(
+        engine
+            .management_effects
+            .as_ref()
+            .unwrap()
+            .cursor()
+            .unwrap(),
+        cursor
+    );
+    assert_eq!(std::fs::read(torn).unwrap(), b"{torn");
 }
 
 #[test]

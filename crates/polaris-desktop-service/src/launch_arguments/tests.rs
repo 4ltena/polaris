@@ -139,10 +139,22 @@ fn owner_accepts_all_tiers_max_decimal_and_unicode_without_coercion() {
         a[5] = "界".repeat(42).into();
         assert!(parse_launch_args(&a).is_ok());
     }
-    use std::os::unix::ffi::OsStringExt;
-    let mut a = args();
-    a[13] = OsString::from_vec(vec![255]);
-    assert!(parse_launch_args(&a).is_err());
+    #[cfg(any(unix, windows))]
+    {
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStringExt;
+        let mut a = args();
+        #[cfg(unix)]
+        {
+            a[13] = OsString::from_vec(vec![255]);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            a[13] = OsString::from_wide(&[0xd800]);
+        }
+        assert!(parse_launch_args(&a).is_err());
+    }
 }
 
 #[test]

@@ -15,6 +15,7 @@ import tempfile
 
 
 CLI_MANIFEST_NAME = "polaris-cli.json"
+ENTRY_MANIFEST_NAME = "mcp-entry-binaries-v2.json"
 SUPPORTED_MACOS_ARCHITECTURES = frozenset({"arm64", "arm64e", "x86_64"})
 
 
@@ -89,6 +90,39 @@ def package_polaris_cli(source, contents):
         stream.write("\n")
 
 
+
+def package_entry_manifest(contents, with_execution_helper):
+    """Bind every packaged production entry without temporary build anchors."""
+    entries = [
+        ("cli", "Contents/Helpers/polaris"),
+        ("desktop_app", "Contents/MacOS/PolarisDesktop"),
+        ("desktop_service", "Contents/Helpers/polaris-desktop-service"),
+    ]
+    if with_execution_helper:
+        entries.append(("execution_helper", "Contents/Helpers/polaris-execution-helper"))
+    expected = {relative for _, relative in entries}
+    actual = {
+        str(path.relative_to(contents.parent))
+        for directory in [contents / "MacOS", contents / "Helpers"]
+        for path in directory.iterdir()
+    }
+    if actual != expected:
+        raise RuntimeError("同梱production entryの集合が一致しません。")
+    identities = []
+    for kind, relative in entries:
+        path = contents.parent / relative
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or info.st_mode & 0o7022
+                or not info.st_mode & 0o111 or not 0 < info.st_size <= 256 * 1024 * 1024):
+            raise RuntimeError("同梱production entryのidentityを検証できません。")
+        identities.append({"kind": kind, "relative_path": relative, "sha256": sha256_file(path)})
+    manifest = {"protocol_version": 2, "entries": identities}
+    with (contents / "Resources" / ENTRY_MANIFEST_NAME).open("x", encoding="utf-8") as stream:
+        json.dump(manifest, stream, separators=(",", ":"))
+        stream.write("\n")
+
+
 def validate_helper_argument(source):
     if not source.is_absolute() or source.is_symlink() or not source.is_file() or not os.access(source, os.X_OK):
         raise RuntimeError("既存のhelper実行物を絶対パスで明示的に指定してください。")
@@ -120,6 +154,7 @@ def main():
     parser.add_argument("--execution-helper", type=Path)
     parser.add_argument("--polaris-executable", type=Path, required=True)
     parser.add_argument("--destination", type=Path)
+    parser.add_argument("--scratch-path", type=Path)
     parser.add_argument("--disable-swiftpm-sandbox", action="store_true")
     arguments = parser.parse_args()
     # Validate before spending the Swift build slot. No Cargo build or discovery.
@@ -128,7 +163,10 @@ def main():
     if arguments.execution_helper is not None:
         validate_helper_argument(arguments.execution_helper)
     package = Path(__file__).resolve().parent.parent
-    scratch = package / ".build"
+    scratch = arguments.scratch_path or package / ".build"
+    if not scratch.is_absolute() or scratch.is_symlink():
+        raise RuntimeError("scratch出力はsymlinkでない絶対パスを指定してください。")
+    scratch.mkdir(parents=True, exist_ok=True)
     destination = arguments.destination or scratch / "PolarisDesktop.app"
     if not destination.is_absolute():
         raise RuntimeError("出力先は絶対パスで指定してください。")
@@ -136,7 +174,7 @@ def main():
         raise RuntimeError("既存の .build/PolarisDesktop.app を別の場所へ移してから再実行してください。")
 
     command = ["swift", "build", "--package-path", str(package),
-               "--scratch-path", str(scratch), "--configuration", "debug"]
+               "--scratch-path", str(scratch), "--configuration", "debug", "--jobs", "1"]
     if arguments.disable_swiftpm_sandbox:
         command.append("--disable-sandbox")
     subprocess.run(command + ["--product", "PolarisDesktop"], check=True)
@@ -185,6 +223,7 @@ def main():
             copy_runtime_tree(repository / "skills", contents / "Resources" / "skills")
             copy_runtime_tree(repository / "agents", contents / "Resources" / "agents")
         shutil.copy2(executable, contents / "MacOS" / "PolarisDesktop")
+        package_entry_manifest(contents, arguments.execution_helper is not None)
         # SwiftPM生成accessorの優先探索先はBundle.main.bundleURL直下。
         # ビルドディレクトリへのフォールバックに依存しない配置を保持する。
         shutil.copytree(resources, app / resource_name)

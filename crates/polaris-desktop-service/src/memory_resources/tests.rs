@@ -121,11 +121,36 @@ fn product_strict10_refuses_legacy_runtime_without_v2_lease() {
             &fixture.home,
             &fixture.store,
             &fixture.source,
-            None,
         ),
         Err(ResourceError::Runtime)
     ));
     assert!(!fixture.store.join("embedding-helper").exists());
+}
+
+#[test]
+fn product_strict10_requires_managed_runtime_after_valid_model_configuration() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.home.join(".polaris/config.toml"),
+        format!(
+            "[embedding]\nmodel_path = {}\nrevision = \"fixed\"\n",
+            serde_json::to_string(&fixture.model).unwrap(),
+        ),
+    )
+    .unwrap();
+    assert!(load_config(&fixture.home).unwrap().runtime.is_none());
+    assert!(matches!(
+        prepare(
+            HistoryMode::Strict10,
+            BootstrapProvider::Codex,
+            &fixture.home,
+            &fixture.store,
+            &fixture.source,
+        ),
+        Err(ResourceError::Runtime)
+    ));
+    assert!(!fixture.store.join("embedding-helper").exists());
+    assert!(!fixture.store.join("conversation-memory.sqlite3").exists());
 }
 
 #[test]

@@ -451,23 +451,12 @@ fn start_at(
         mcp_snapshot.registry.as_ref().map_or(0, |r| r.revision),
         mcp_snapshot.secrets.as_ref().map_or(0, |s| s.revision()),
     );
-    let managed_runtime = if saved.state.configuration.history_mode
-        == polaris_desktop_protocol::snapshot::HistoryMode::Legacy
-    {
-        None
-    } else {
-        Some(Arc::new(
-            polaris_core::managed_runtime::ManagedRuntimeLease::acquire(home)
-                .map_err(|_| StartupError::Generic)?,
-        ))
-    };
     let history = crate::memory_resources::prepare(
         saved.state.configuration.history_mode,
         doc.provider,
         home,
         &args.store.store_root,
         &args.confirmed_source_path,
-        managed_runtime,
     )
     .map_err(StartupError::Memory)?;
     // These existing loaders register the actual credential inode before any
@@ -617,11 +606,9 @@ fn start_at(
     // The same `[decision]` table the terminal reads, from the same two
     // pinned paths. The key stays in the environment: a configuration file
     // is shared, a credential is not.
-    // A configuration this owner cannot read leaves it without a judge,
-    // not without a session. Every path that would ask the judge something
-    // works without an answer, so refusing to start over an optional
-    // optimization would cost more than it protects — and the owner
-    // already starts on a saved workflow when this same file is malformed.
+    // An invalid optional decision configuration leaves this path without a
+    // judge. Saved workflow restoration and mandatory finalizer configuration
+    // validation remain separate; malformed TOML can still stop startup there.
     let mut decision = polaris_core::config::try_load_decision_from(
         Some(&home.join(".polaris/config.toml")),
         Some(&args.confirmed_source_path.join(".polaris/config.toml")),

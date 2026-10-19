@@ -16,7 +16,7 @@ REPOSITORY = Path(__file__).resolve().parents[3]
 
 
 class HelperAssemblyTests(unittest.TestCase):
-    def assemble_checkout(self, root, with_local_skills=False):
+    def assemble_checkout(self, root, with_local_skills=False, with_execution_helper=True, scratch=None):
         repository = root / "source"
         package = repository / "apps/macos"
         binary_directory = package / ".build/bin"
@@ -28,6 +28,7 @@ class HelperAssemblyTests(unittest.TestCase):
             resources / "runtime-dependencies.json",
         )
         (binary_directory / "PolarisDesktop").write_bytes(b"compiled native executable")
+        (binary_directory / "PolarisDesktop").chmod(0o755)
         shutil.copytree(REPOSITORY / "skills", repository / "skills")
         shutil.copytree(REPOSITORY / "agents", repository / "agents")
         if with_local_skills:
@@ -47,17 +48,26 @@ class HelperAssemblyTests(unittest.TestCase):
         destination = root / "PolarisDesktop.app"
         arguments = [
             "assemble-app.py", "--service-helper", str(service),
-            "--execution-helper", str(execution), "--polaris-executable", str(cli),
+            "--polaris-executable", str(cli),
             "--destination", str(destination),
         ]
+        if with_execution_helper:
+            arguments.extend(["--execution-helper", str(execution)])
+        if scratch is not None:
+            arguments.extend(["--scratch-path", str(scratch)])
         # Stub compilation only. Exercise the real resource copy, manifest,
         # metadata and final publication paths against a clean source fixture.
         with patch.object(assembly, "__file__", str(package / "scripts/assemble-app.py")), \
                 patch.object(assembly.sys, "argv", arguments), \
-                patch.object(assembly.subprocess, "run"), \
+                patch.object(assembly.subprocess, "run") as run, \
                 patch.object(assembly, "macho_architectures", return_value=("arm64",)), \
                 patch.object(assembly.subprocess, "check_output", return_value=str(binary_directory)):
             assembly.main()
+            if scratch is not None:
+                build = run.call_args_list[0].args[0]
+                self.assertEqual(build[build.index("--scratch-path") + 1], str(scratch))
+                self.assertTrue(scratch.is_dir())
+                self.assertFalse(list(scratch.glob("native-app-*")))
         return destination
 
     def assert_bundled_catalogs(self, app):
@@ -95,6 +105,45 @@ class HelperAssemblyTests(unittest.TestCase):
             })
             self.assertFalse((app / "Contents/Resources/toolchains").exists())
             self.assertTrue((app / "PolarisDesktop_PolarisDesktop.bundle/runtime-dependencies.json").is_file())
+
+    def test_entry_manifest_describes_all_packaged_entries_without_build_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = self.assemble_checkout(root)
+            manifest = json.loads((app / "Contents/Resources" / assembly.ENTRY_MANIFEST_NAME).read_text())
+            expected = [
+                ("cli", "Contents/Helpers/polaris"),
+                ("desktop_app", "Contents/MacOS/PolarisDesktop"),
+                ("desktop_service", "Contents/Helpers/polaris-desktop-service"),
+                ("execution_helper", "Contents/Helpers/polaris-execution-helper"),
+            ]
+            self.assertEqual(manifest, {"protocol_version": 2, "entries": [
+                {"kind": kind, "relative_path": relative,
+                 "sha256": hashlib.sha256((app / relative).read_bytes()).hexdigest()}
+                for kind, relative in expected
+            ]})
+            self.assertNotIn(str(root), json.dumps(manifest))
+            with self.assertRaises(FileExistsError):
+                assembly.package_entry_manifest(app / "Contents", True)
+
+    def test_entry_manifest_without_optional_helper_has_exact_required_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.assemble_checkout(Path(directory), with_execution_helper=False)
+            manifest = json.loads((app / "Contents/Resources" / assembly.ENTRY_MANIFEST_NAME).read_text())
+            self.assertEqual([entry["kind"] for entry in manifest["entries"]],
+                             ["cli", "desktop_app", "desktop_service"])
+            unknown = app / "Contents/Helpers/unknown"
+            unknown.write_bytes(b"unexpected entry")
+            unknown.chmod(0o755)
+            with self.assertRaises(RuntimeError):
+                assembly.package_entry_manifest(app / "Contents", False)
+
+    def test_dedicated_scratch_is_used_for_local_assembly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scratch = root / "mcp-m1-build"
+            app = self.assemble_checkout(root, scratch=scratch)
+            self.assertTrue((app / "Contents/Resources" / assembly.ENTRY_MANIFEST_NAME).is_file())
 
     def test_local_overrides_do_not_change_the_packaged_catalogs(self):
         with tempfile.TemporaryDirectory() as directory:

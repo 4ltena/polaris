@@ -115,18 +115,29 @@ pub(crate) fn prepare(
     home: &Path,
     store: &Path,
     source: &Path,
-    runtime: Option<std::sync::Arc<polaris_core::managed_runtime::ManagedRuntimeLease>>,
 ) -> Result<Option<TrustedMemoryIndex>, ResourceError> {
+    if mode.is_structured() {
+        return Err(ResourceError::StructuredUnavailable);
+    }
     if mode == HistoryMode::Legacy {
         return Ok(None);
     }
-    let runtime = runtime.ok_or(ResourceError::Runtime)?;
+    if !matches!(
+        provider,
+        BootstrapProvider::Codex | BootstrapProvider::Openai
+    ) {
+        return Err(ResourceError::Provider);
+    }
     let mut config = load_config(home)?;
     // A writable Python path from either legacy managed-resources.toml or the
     // user's config is never a fallback for the package-trusted runtime image.
     if config.runtime.is_some() {
         return Err(ResourceError::Runtime);
     }
+    let runtime = std::sync::Arc::new(
+        polaris_core::managed_runtime::ManagedRuntimeLease::acquire(home)
+            .map_err(|_| ResourceError::Runtime)?,
+    );
     config.runtime = Some(runtime.python_path());
     prepare_with_config(
         mode,

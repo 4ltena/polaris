@@ -2671,10 +2671,13 @@ impl Engine {
         {
             return Err(error(ErrorCode::RecoveryRequired));
         }
-        if effects
-            .blocker()
-            .map_err(|_| error(ErrorCode::RecoveryRequired))?
-            .is_some()
+        if polaris_core::sync::composite::C10CompositeBlockerV1::inspect_with_activity(
+            project,
+            effects.state_dir(),
+            &activity,
+        )
+        .map_err(|_| error(ErrorCode::RecoveryRequired))?
+        .is_some()
         {
             return Err(error(ErrorCode::RecoveryRequired));
         }

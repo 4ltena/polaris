@@ -84,6 +84,8 @@ enum LocalOperation {
         q: String,
         server: Option<String>,
         kind: Option<Kind>,
+        #[serde(default, deserialize_with = "search_limit")]
+        limit: Option<usize>,
     },
     Select {
         server: String,
@@ -96,6 +98,16 @@ enum LocalOperation {
         offset: usize,
         limit: usize,
     },
+}
+
+fn search_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    let limit = Option::<usize>::deserialize(deserializer)?;
+    match limit {
+        None | Some(1..=32768) => Ok(limit),
+        _ => Err(serde::de::Error::custom("search limit must be 1..=32768")),
+    }
 }
 
 pub(super) struct Reply {
@@ -133,7 +145,12 @@ async fn execute(
         let operation: LocalOperation = serde_json::from_value(call.arguments.clone())
             .map_err(|_| mcp::Error::InvalidArguments)?;
         let content = match operation {
-            LocalOperation::Search { q, server, kind } => {
+            LocalOperation::Search {
+                q,
+                server,
+                kind,
+                limit,
+            } => {
                 if q.len() > 4096 || server.as_ref().is_some_and(|s| s.len() > 128) {
                     return Err(mcp::Error::InvalidArguments.into());
                 }
@@ -147,7 +164,11 @@ async fn execute(
                     .as_ref()
                     .map(|w| w.state().phase.as_str())
                     .unwrap_or("");
-                let found = runtime.candidates_matching(&q, server.as_deref(), phase, kind)?;
+                let mut found = runtime.candidates_matching(&q, server.as_deref(), phase, kind)?;
+                if let Some(limit) = limit {
+                    found.truncated |= found.candidates.len() > limit;
+                    found.candidates.truncate(limit);
+                }
                 let unloaded = runtime.unloaded_server_ids();
                 json(&serde_json::json!({
                     "servers": runtime.server_ids(), "unloaded_servers": unloaded,
@@ -284,6 +305,41 @@ pub(super) fn event(events: Option<&EventSink>, call: &ToolCall, outcome: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_search_accepts_the_advertised_limit() {
+        for (q, limit) in [
+            ("bash file-reader reviewer subagent", 8),
+            ("shell", 5),
+            ("subagent", 5),
+            ("file", 5),
+            ("fixture", 1),
+            ("fixture", 32768),
+        ] {
+            assert!(matches!(
+                serde_json::from_value::<LocalOperation>(
+                    serde_json::json!({"op":"search","q":q,"limit":limit})
+                )
+                .expect("a schema-valid search limit must be accepted"),
+                LocalOperation::Search { .. }
+            ));
+        }
+        for limit in [
+            serde_json::json!(0),
+            serde_json::json!(32769),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("5"),
+        ] {
+            assert!(
+                serde_json::from_value::<LocalOperation>(
+                    serde_json::json!({"op":"search","q":"fixture","limit":limit})
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn local_meta_operations_reject_prompt_grants_unknown_fields_and_invalid_chunks() {
         for value in [

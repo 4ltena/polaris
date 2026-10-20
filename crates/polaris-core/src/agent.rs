@@ -5760,15 +5760,34 @@ mod tests {
             .unwrap();
         runtime.select(&item, &found[0].generation).unwrap();
         let alias = polaris_mcp::catalog::tool_alias(&item).unwrap();
+        let mut tool_calls: Vec<_> = [
+            ("search-8", "bash file-reader reviewer subagent", 8),
+            ("search-shell", "shell", 5),
+            ("search-subagent", "subagent", 5),
+            ("search-file", "file", 5),
+        ]
+        .into_iter()
+        .map(|(id, q, limit)| ToolCall {
+            id: id.into(),
+            name: "mcp_catalog".into(),
+            arguments: serde_json::json!({"op":"search","q":q,"limit":limit}),
+        })
+        .collect();
+        tool_calls.push(ToolCall {
+            id: "search-limited".into(),
+            name: "mcp_catalog".into(),
+            arguments: serde_json::json!({"op":"search","server":"fixture","limit":1}),
+        });
+        tool_calls.push(ToolCall {
+            id: "mcp-call".into(),
+            name: alias.clone(),
+            arguments: serde_json::json!({}),
+        });
         let provider = Capture {
             requests: Mutex::new(Vec::new()),
             replies: Mutex::new(vec![
                 CompletionResponse {
-                    tool_calls: vec![ToolCall {
-                        id: "mcp-call".into(),
-                        name: alias.clone(),
-                        arguments: serde_json::json!({}),
-                    }],
+                    tool_calls,
                     ..Default::default()
                 },
                 CompletionResponse {
@@ -5809,6 +5828,25 @@ mod tests {
         {
             let requests = provider.requests.lock().unwrap();
             assert!(requests[0].tools.iter().any(|tool| tool.name == alias));
+            for id in ["search-8", "search-shell", "search-subagent", "search-file"] {
+                let content = requests[1]
+                    .messages
+                    .iter()
+                    .find(|message| message.tool_call_id.as_deref() == Some(id))
+                    .expect("each search must have a result");
+                let result: serde_json::Value = serde_json::from_str(&content.content)
+                    .expect("search must return catalog JSON, not an argument error");
+                assert!(result["candidates"].as_array().unwrap().len() <= 5);
+            }
+            let limited = requests[1]
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("search-limited"))
+                .unwrap();
+            let limited: serde_json::Value = serde_json::from_str(&limited.content).unwrap();
+            assert_eq!(limited["candidates"].as_array().unwrap().len(), 1);
+            assert_eq!(limited["candidates_truncated"], true);
+            assert_eq!(limited["partial"], true);
             let result = requests[1]
                 .messages
                 .iter()

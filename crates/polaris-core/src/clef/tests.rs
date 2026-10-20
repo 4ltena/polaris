@@ -23,7 +23,7 @@ while IFS= read -r request; do
     *'"op":"shutdown"'*)
       printf '{"protocol":1,"owner":"%s","generation":"%s","request_id":%s,"status":"closed"}\n' "$owner" "$generation" "$id"
       exit 0;;
-    *'hang'*|*'timeout'*) while :; do :; done;;
+    *'hang'*|*'timeout'*) printf started >"$TMPDIR/inflight"; while :; do :; done;;
     *'crash'*) exit 23;;
     *'bad-generation'*) generation=wrong;;
   esac
@@ -167,6 +167,80 @@ fn native_reply_binds_identity_shape_and_usage() {
     );
 }
 
+#[test]
+fn native_choice_and_score_preserve_options_distribution_and_scale() {
+    let asked = BTreeMap::from([
+        (
+            "route/担当".into(),
+            Question::Choice {
+                instructions: "team?".into(),
+                criteria: BTreeMap::from([
+                    ("billing/請求".into(), "payments".into()),
+                    ("shipping/配送".into(), "delivery".into()),
+                ]),
+            },
+        ),
+        (
+            "urgency".into(),
+            Question::Score {
+                instructions: "urgency?".into(),
+                criteria: vec!["later".into(), "today".into()],
+            },
+        ),
+    ]);
+    let good = serde_json::json!({"protocol":1,"owner":"owner","generation":"gen","request_id":1,"status":"ok",
+        "decision":{"model":"/dev/fd/3","answers":{
+            "route/担当":{"type":"choice","choice":"billing/請求","probabilities":{"billing/請求":0.75,"shipping/配送":0.25},"confidence":0.5},
+            "urgency":{"type":"score","score":0.75,"probabilities":{"0":0.25,"1":0.75},"legend":{"0":"later","1":"today"},"confidence":0.5}
+        },"usage":{"input_tokens":42,"output_tokens":0}}});
+    let parse = |value: &serde_json::Value| {
+        wire::decision(value.to_string().as_bytes(), "owner", "gen", 1, &asked)
+    };
+    let result = parse(&good).unwrap();
+    assert_eq!(
+        result.answers["route/担当"].choice.as_deref(),
+        Some("billing/請求")
+    );
+    assert_eq!(result.answers["urgency"].score, Some(0.75));
+    assert_eq!(result.answers["urgency"].legend["1"], "today");
+    assert_eq!(result.input_tokens, Some(42));
+    for (pointer, value) in [
+        ("/decision/answers/urgency/score", serde_json::json!(0.25)),
+        (
+            "/decision/answers/urgency/legend/1",
+            serde_json::json!("different scale"),
+        ),
+        (
+            "/decision/answers/urgency/probabilities/1",
+            serde_json::json!(0.25),
+        ),
+        (
+            "/decision/answers/route~1担当/choice",
+            serde_json::json!("unknown"),
+        ),
+        (
+            "/decision/answers/route~1担当/probabilities/billing~1請求",
+            serde_json::json!(-0.25),
+        ),
+    ] {
+        let mut bad = good.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        assert_eq!(
+            parse(&bad),
+            Err(DecisionError::InvalidAnswer),
+            "accepted {pointer}"
+        );
+    }
+    let duplicate = good.to_string().replace(
+        "\"billing/請求\":0.75",
+        "\"billing/請求\":0.75,\"billing/請求\":0.5",
+    );
+    assert_eq!(
+        wire::decision(duplicate.as_bytes(), "owner", "gen", 1, &asked),
+        Err(DecisionError::InvalidAnswer)
+    );
+}
+
 #[tokio::test]
 async fn framing_bounds_the_whole_message_and_refuses_partial_eof() {
     let mut input = BufReader::new(&b"{a}\n{b}\n"[..]);
@@ -241,20 +315,28 @@ async fn cancelled_or_invalid_work_is_terminal_without_restart() {
             .decide(&serde_json::Value::Null, &questions())
             .await
             .unwrap();
+        let inflight = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .unwrap()
+            .path()
+            .join("tmp/inflight");
         let held = decider.clone();
         let mode = mode.to_owned();
         let hang = mode == "hang";
         let job =
             tokio::spawn(async move { held.decide(&serde_json::json!(mode), &questions()).await });
         if hang {
-            // The previous request proved readiness. Yield until the next
-            // request actually owns admission before cancelling its future.
+            // The fixture acknowledges that it started work before we abort
+            // the caller. Admission alone would allow a pre-dispatch cancel.
             for _ in 0..100 {
-                if decider.capacity.available_permits() == 0 {
+                if inflight.is_file() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            assert!(inflight.is_file());
             assert_eq!(decider.capacity.available_permits(), 0);
             assert_eq!(
                 decider.decide(&serde_json::Value::Null, &questions()).await,

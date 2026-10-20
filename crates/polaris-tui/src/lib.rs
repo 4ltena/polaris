@@ -5,6 +5,8 @@
 pub mod account;
 pub mod approver;
 mod clipboard;
+#[cfg(unix)]
+mod command_dispatch;
 #[cfg(test)]
 mod continuation_tests;
 #[cfg(unix)]
@@ -4426,105 +4428,38 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     let pending_cursor = input_cursor;
                     input_cursor = 0;
                     selected_suggestion = 0;
+                    #[cfg(unix)]
+                    if let Some(result) = command_dispatch::dispatch(
+                        &action,
+                        &terminal,
+                        &mut key_reader,
+                        &mut session,
+                        (
+                            &initial_saved_settings,
+                            args.provider.as_ref(),
+                            args.history_backend_factory.as_ref(),
+                        ),
+                        (
+                            rewind_workspace.as_ref().expect("startup owner"),
+                            &management_effects,
+                        ),
+                        (&args.cwd, &args.state_dir),
+                        saved_embedding.as_ref(),
+                        (args.mcp_external, approval_policy),
+                        has_pending_inputs,
+                    )
+                    .await
+                    {
+                        local_lines.extend(result.lines);
+                        refresh_saved_settings |= result.settings_changed;
+                        if result.invalidate_mcp_prompt {
+                            pending_mcp_prompt = None;
+                            mcp_prompt_requires_reselect = false;
+                        }
+                        status = result.status;
+                        continue;
+                    }
                     match action {
-                        #[cfg(unix)]
-                        slash::Action::SessionControl(request) => {
-                            let result = session_commands::handle(
-                                &request,
-                                &terminal,
-                                &mut key_reader,
-                                &mut session,
-                                &initial_saved_settings,
-                                rewind_workspace.as_ref().expect("startup owner"),
-                                &management_effects,
-                                args.provider.as_ref(),
-                                args.history_backend_factory.as_ref(),
-                                has_pending_inputs,
-                            );
-                            match result {
-                                Ok(result) => {
-                                    local_lines.extend(result.lines);
-                                    refresh_saved_settings |= result.settings_changed;
-                                    status =
-                                        Status::Notice("セッション操作の結果を表示しました".into());
-                                }
-                                Err(error) => status = Status::Error(error),
-                            }
-                            continue;
-                        }
-                        #[cfg(unix)]
-                        slash::Action::Memory(request) => {
-                            let id = match active_saved_session_id(&session) {
-                                Ok(id) => id,
-                                Err(error) => {
-                                    status = Status::Error(error);
-                                    continue;
-                                }
-                            };
-                            let result = memory_commands::handle(
-                                &request,
-                                &terminal,
-                                &mut key_reader,
-                                rewind_workspace.as_ref().expect("startup owner"),
-                                &management_effects,
-                                &args.cwd,
-                                &args.state_dir,
-                                id.as_deref(),
-                                saved_embedding.clone(),
-                                has_pending_inputs,
-                            )
-                            .await;
-                            match result {
-                                Ok(lines) => {
-                                    local_lines.extend(lines);
-                                    status =
-                                        Status::Notice("メモリ操作の結果を表示しました".into());
-                                }
-                                Err(error) => status = Status::Error(error),
-                            }
-                            continue;
-                        }
-                        #[cfg(unix)]
-                        slash::Action::Mcp(request)
-                            if request.split_whitespace().next() != Some("prompt") =>
-                        {
-                            let result = mcp_commands::handle(
-                                &request,
-                                &terminal,
-                                &mut key_reader,
-                                (
-                                    rewind_workspace.as_ref().expect("startup owner"),
-                                    &management_effects,
-                                ),
-                                &args.cwd,
-                                (args.mcp_external, approval_policy),
-                                has_pending_inputs,
-                            )
-                            .await;
-                            match result {
-                                Ok(lines) => {
-                                    local_lines.extend(lines);
-                                    if matches!(
-                                        request.split_whitespace().next(),
-                                        Some(
-                                            "enable"
-                                                | "disable"
-                                                | "check"
-                                                | "setup"
-                                                | "register"
-                                                | "materialize"
-                                                | "secret"
-                                        )
-                                    ) {
-                                        pending_mcp_prompt = None;
-                                        mcp_prompt_requires_reselect = false;
-                                    }
-                                    status = Status::Notice("MCP操作の結果を表示しました".into());
-                                }
-                                Err(error) => status = Status::Error(error),
-                            }
-                            continue;
-                        }
                         #[cfg(target_os = "linux")]
                         slash::Action::WorkspaceControl(request) => {
                             let (verb, extra) = request.split_once(' ').unwrap_or((&request, ""));
@@ -5504,103 +5439,39 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                 status = Status::Error(error);
                 continue;
             }
-            match parsed_action {
-                #[cfg(unix)]
-                Some(slash::Action::SessionControl(request)) => {
-                    let result = session_commands::handle(
-                        &request,
-                        &terminal,
-                        &mut key_reader,
-                        &mut session,
+            #[cfg(unix)]
+            if let Some(action) = parsed_action.as_ref()
+                && let Some(result) = command_dispatch::dispatch(
+                    action,
+                    &terminal,
+                    &mut key_reader,
+                    &mut session,
+                    (
                         &initial_saved_settings,
-                        rewind_workspace.as_ref().expect("startup owner"),
-                        &management_effects,
                         args.provider.as_ref(),
                         args.history_backend_factory.as_ref(),
-                        has_pending_inputs,
-                    );
-                    match result {
-                        Ok(result) => {
-                            local_lines.extend(result.lines);
-                            refresh_saved_settings |= result.settings_changed;
-                            status = Status::Notice("セッション操作の結果を表示しました".into());
-                        }
-                        Err(error) => status = Status::Error(error),
-                    }
-                    continue;
-                }
-                #[cfg(unix)]
-                Some(slash::Action::Memory(request)) => {
-                    let id = match active_saved_session_id(&session) {
-                        Ok(id) => id,
-                        Err(error) => {
-                            status = Status::Error(error);
-                            continue;
-                        }
-                    };
-                    let result = memory_commands::handle(
-                        &request,
-                        &terminal,
-                        &mut key_reader,
+                    ),
+                    (
                         rewind_workspace.as_ref().expect("startup owner"),
                         &management_effects,
-                        &args.cwd,
-                        &args.state_dir,
-                        id.as_deref(),
-                        saved_embedding.clone(),
-                        has_pending_inputs,
-                    )
-                    .await;
-                    match result {
-                        Ok(lines) => {
-                            local_lines.extend(lines);
-                            status = Status::Notice("メモリ操作の結果を表示しました".into());
-                        }
-                        Err(error) => status = Status::Error(error),
-                    }
-                    continue;
+                    ),
+                    (&args.cwd, &args.state_dir),
+                    saved_embedding.as_ref(),
+                    (args.mcp_external, approval_policy),
+                    has_pending_inputs,
+                )
+                .await
+            {
+                local_lines.extend(result.lines);
+                refresh_saved_settings |= result.settings_changed;
+                if result.invalidate_mcp_prompt {
+                    pending_mcp_prompt = None;
+                    mcp_prompt_requires_reselect = false;
                 }
-                #[cfg(unix)]
-                Some(slash::Action::Mcp(request))
-                    if request.split_whitespace().next() != Some("prompt") =>
-                {
-                    let result = mcp_commands::handle(
-                        &request,
-                        &terminal,
-                        &mut key_reader,
-                        (
-                            rewind_workspace.as_ref().expect("startup owner"),
-                            &management_effects,
-                        ),
-                        &args.cwd,
-                        (args.mcp_external, approval_policy),
-                        has_pending_inputs,
-                    )
-                    .await;
-                    match result {
-                        Ok(lines) => {
-                            local_lines.extend(lines);
-                            if matches!(
-                                request.split_whitespace().next(),
-                                Some(
-                                    "enable"
-                                        | "disable"
-                                        | "check"
-                                        | "setup"
-                                        | "register"
-                                        | "materialize"
-                                        | "secret"
-                                )
-                            ) {
-                                pending_mcp_prompt = None;
-                                mcp_prompt_requires_reselect = false;
-                            }
-                            status = Status::Notice("MCP操作の結果を表示しました".into());
-                        }
-                        Err(error) => status = Status::Error(error),
-                    }
-                    continue;
-                }
+                status = result.status;
+                continue;
+            }
+            match parsed_action {
                 #[cfg(target_os = "linux")]
                 Some(slash::Action::WorkspaceControl(request)) => {
                     let (verb, extra) = request.split_once(' ').unwrap_or((&request, ""));

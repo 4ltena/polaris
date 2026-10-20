@@ -1464,6 +1464,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `account.rs` — Account commands never put OAuth codes or token values into TUI history.
 - `approver.rs` — The `Approver` that runs inside the TUI: draws a modal over the current
 - `clipboard.rs` — Copies text to the system clipboard. macOS uses `/usr/bin/pbcopy`, whose
+- `command_dispatch.rs` — 保存済みsession、memory、MCPのlocal command実行をまとめる。
 - `continuation_tests.rs` — Shared continuation recovery through real raw/receipt owners and fake backends.
 - `draft.rs` — An unsent draft belongs to its conversation and never enters raw history.
 - `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from

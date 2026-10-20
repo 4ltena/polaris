@@ -199,7 +199,7 @@ processが動く。
 - `crates/polaris-core/src/project_git.rs:52`
 - `crates/polaris-core/src/sync/repository.rs:50`
 - `crates/polaris-core/src/translation.rs:772`
-- `crates/polaris-provider/src/decision/semif.rs:126`
+- `crates/polaris-provider/src/decision/semif.rs:110`
 - `crates/polaris-sandbox/src/child_fds.rs:217`
 - `crates/polaris-sandbox/src/child_fds.rs:316`
 - `crates/polaris-sandbox/src/child_fds.rs:383`

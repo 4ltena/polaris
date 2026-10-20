@@ -116,7 +116,7 @@ try:
              'device': 'cpu', 'request_timeout_ms': 120000})
     ready = receive(p, 120)
     assert ready['status'] == 'ready' and ready['model_sha256'] == DIGEST
-    assert ready['runtime_revision'] == '620d2225cc436ab0b001e3200e590e3b286ef9ab'
+    assert ready['runtime_revision'] == '620d2225cc436ab0b001e3200e590e3b286ef9ab+polaris-fileptr-v1'
     assert ready['owner'] == OWNER and ready['generation'] == GENERATION and ready['device'] == 'cpu'
     load_seconds = time.monotonic() - started
     observations = []

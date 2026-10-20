@@ -11,6 +11,8 @@ pub mod approval;
 pub mod audit;
 pub mod budget;
 pub mod build_cache;
+#[cfg(target_os = "macos")]
+pub mod clef;
 pub mod common_tests;
 pub mod compaction;
 pub mod computer;

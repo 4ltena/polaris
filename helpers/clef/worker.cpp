@@ -89,6 +89,7 @@ void emit(const wire_json & value) {
 
 struct model_file {
     int fd = -1;
+    FILE * stream = nullptr;
     struct stat original {};
     model_file(const std::string & path, uint64_t size, const std::string & expected) {
         require(path.size() <= 4096 && path.find('\0') == std::string::npos);
@@ -116,15 +117,18 @@ struct model_file {
                 actual.push_back(hex[byte & 15]);
             }
             require(actual == expected);
+            stream = fdopen(fd, "rb");
+            require(stream != nullptr);
         } catch (...) {
-            if (fd >= 0) close(fd);
+            if (stream) fclose(stream);
+            else if (fd >= 0) close(fd);
             fd = -1;
             throw;
         }
     }
     model_file(const model_file &) = delete;
     model_file & operator=(const model_file &) = delete;
-    ~model_file() { if (fd >= 0) close(fd); }
+    ~model_file() { if (stream) fclose(stream); else if (fd >= 0) close(fd); }
     std::string path() const { return "/dev/fd/" + std::to_string(fd); }
     void unchanged() const {
         struct stat current {};
@@ -236,7 +240,8 @@ int run() {
         params.devices = {nullptr};
     }
     model_file model(init["model"].get<std::string>(), init["model_bytes"].get<uint64_t>(), digest);
-    params.model.path = model.path(); // The descriptor, not a replaceable pathname, is loaded.
+    params.model.path = model.path(); // Metadata only: never reopen a /dev/fd alias.
+    params.model.file = model.stream; // Borrowed until context destruction; no pathname race.
     server_context context;
     server_routes routes(params, context);
     require(context.load_model(params));
@@ -246,7 +251,7 @@ int run() {
     loop_guard running(context);
     const auto base = wire_json{{"protocol", 1}, {"owner", init["owner"]}, {"generation", init["generation"]}};
     auto ready = base;
-    ready.update({{"status", "ready"}, {"runtime_revision", "620d2225cc436ab0b001e3200e590e3b286ef9ab"},
+    ready.update({{"status", "ready"}, {"runtime_revision", "620d2225cc436ab0b001e3200e590e3b286ef9ab+polaris-fileptr-v1"},
                   {"model_sha256", digest}, {"device", init["device"]}, {"context_tokens", tokens}});
     emit(ready);
     uint64_t last_id = 0;

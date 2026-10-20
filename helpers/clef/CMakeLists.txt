@@ -23,6 +23,25 @@ endif()
 file(CHMOD "${snapshot}" PERMISSIONS OWNER_READ)
 file(ARCHIVE_EXTRACT INPUT "${snapshot}" DESTINATION "${extraction}")
 set(POLARIS_LLAMA_SOURCE "${extraction}/llama.cpp-620d2225cc436ab0b001e3200e590e3b286ef9ab")
+# Seatbelt denies reopening /dev/fd aliases. Feed the verified open stream to
+# llama.cpp's public FILE API instead; no new filesystem grant is required.
+# Apply only these exact deltas to the hash-pinned, fresh source snapshot.
+function(replace_once path before after)
+  file(READ "${path}" original)
+  string(FIND "${original}" "${before}" first)
+  string(FIND "${original}" "${before}" last REVERSE)
+  if(first LESS 0 OR NOT first EQUAL last)
+    message(FATAL_ERROR "Pinned FILE loader patch does not match exactly once")
+  endif()
+  string(REPLACE "${before}" "${after}" patched "${original}")
+  file(WRITE "${path}" "${patched}")
+endfunction()
+replace_once("${POLARIS_LLAMA_SOURCE}/common/common.h"
+  "    std::string docker_repo = \"\"; // Docker repo\n"
+  "    std::string docker_repo = \"\"; // Docker repo\n    FILE * file = nullptr; // Borrowed verified model stream.\n")
+replace_once("${POLARIS_LLAMA_SOURCE}/common/common.cpp"
+  "    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
+  "    llama_model * model = params.model.file\n        ? llama_model_load_from_file_ptr(params.model.file, mparams)\n        : llama_model_load_from_file(params.model.path.c_str(), mparams);")
 # Source archives have no VCS metadata. Do not probe the parent repository.
 set(CMAKE_DISABLE_FIND_PACKAGE_Git TRUE)
 set(GIT_EXECUTABLE "" CACHE FILEPATH "VCS probes disabled for source archive" FORCE)

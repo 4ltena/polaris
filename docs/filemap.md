@@ -182,6 +182,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `Cargo.toml` — manifest for the polaris-core crate
 
+## `crates/polaris-core/examples`
+
+- `clef_probe.rs` — Offline integration smoke for an explicitly pinned Clef installation.
+
 ## `crates/polaris-core/src`
 
 - `activity.rs` — M6-2: what the host knows about a run's liveness, decided from events and
@@ -192,6 +196,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `audit.rs` — Append-only audit log. Not signed: in-process, the entity signing and the
 - `budget.rs` — Measurement of the always-on context. Numbers are backed by measurement,
 - `build_cache.rs` — What a project's build output may grow to, and what goes when it does.
+- `clef.rs` — A lazy, offline Clef process owner. Package activation supplies the pinned
 - `common_tests.rs` — A small, bounded black-box test schema and its confined runner.
 - `compaction.rs` — Automatic history summarization. Fires when the conversation's measured
 - `computer.rs` — Driving an application by naming the goal, not the pixels.
@@ -290,6 +295,11 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/build_cache`
 
 - `tests.rs` — Each test names one thing that must hold before this is allowed to delete
+
+## `crates/polaris-core/src/clef`
+
+- `tests.rs` — Protocol and lifecycle fixtures, with no real weights or remote calls.
+- `wire.rs` — Strict, bounded native worker protocol. No upstream diagnostics escape it.
 
 ## `crates/polaris-core/src/computer`
 

@@ -1246,6 +1246,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `conversation.rs` — Pending, scope-bound summaries for strict conversation history.
 - `lib.rs` — Local, explicitly populated memory. Retrieved text is quoted historical evidence,
 - `management.rs` — Bounded atomic management batches, durable project revisions and receipts.
+- `search.rs` — Ranks legacy memory records into bounded, provenance-preserving excerpts.
 - `structured.rs` — Version 3 structured-memory schema and host-owned domain values.
 - `windows_storage.rs` — Dedicated SQLite VFS. Filesystem callbacks never forward to a pathname VFS.
 

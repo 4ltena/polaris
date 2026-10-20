@@ -1102,6 +1102,60 @@ pub fn footer_height(suggestion_count: usize) -> u16 {
     5 + suggestions_popup_height(suggestion_count)
 }
 
+fn footer_areas(
+    area: ratatui::layout::Rect,
+    suggestion_count: usize,
+) -> [ratatui::layout::Rect; 6] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(suggestions_popup_height(suggestion_count)),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .flex(Flex::End)
+    .areas(area)
+}
+
+fn composer_cursor_position(
+    input_area: ratatui::layout::Rect,
+    input: &str,
+    cursor: usize,
+) -> Position {
+    let prefix_width: u16 = 2;
+    let typed_width = sanitize(&input[..cursor]).width() as u16;
+    let cursor_x = input_area
+        .x
+        .saturating_add(prefix_width)
+        .saturating_add(typed_width)
+        .min(input_area.right().saturating_sub(1));
+    Position::new(cursor_x, input_area.y)
+}
+
+/// The composer row and caret position for a completed chat frame.
+///
+/// `Terminal::draw` may skip this row when its buffer has not changed.  A
+/// terminal or IME can still have cleared its unused suffix, so callers use
+/// this geometry to resend exactly this row after the normal frame draw.
+pub(crate) fn composer_geometry(
+    frame_area: ratatui::layout::Rect,
+    suggestion_count: usize,
+    input: &str,
+    cursor: usize,
+) -> Option<(ratatui::layout::Rect, Position)> {
+    let footer_height = footer_height(suggestion_count);
+    let [_, footer_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).areas(frame_area);
+    let [_, _, _, input_area, _, _] = footer_areas(footer_area, suggestion_count);
+    (input_area.width > 0 && input_area.height > 0).then(|| {
+        (
+            input_area,
+            composer_cursor_position(input_area, input, cursor),
+        )
+    })
+}
+
 /// Everything redrawn every frame: the suggestions popup (while typing a
 /// `/command`), the status row (idle / thinking-with-shimmer / error /
 /// notice), the input line, and the footer (`model effort · cwd`). This is
@@ -1155,7 +1209,6 @@ pub(crate) fn render_footer_with_mode(
     // `footer_height` (see its doc) so the two can never disagree about
     // how tall the popup is this frame.
     let shown = suggestions.len().min(MAX_DISPLAYED_SUGGESTIONS);
-    let suggestions_height = suggestions_popup_height(suggestions.len());
     // `area` is `draw_frame`'s `footer_height(suggestions.len())`
     // reservation — normally an exact fit for what this frame actually
     // needs, but `Flex::End` is kept regardless: it costs nothing when
@@ -1174,16 +1227,7 @@ pub(crate) fn render_footer_with_mode(
         input_area,
         input_pad_bottom_area,
         footer_area,
-    ] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(suggestions_height),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .flex(Flex::End)
-    .areas(area);
+    ] = footer_areas(area, suggestions.len());
 
     let status_line = match status {
         Status::Idle => Line::from(""),
@@ -1320,14 +1364,7 @@ pub(crate) fn render_footer_with_mode(
     // (CJK) characters already typed before `cursor` so the reported
     // column lines up with what's actually drawn; the `.min(...)` clamp
     // keeps it from running past the row's right edge.
-    let prefix_width: u16 = 2;
-    let typed_width = sanitize(&input[..cursor]).width() as u16;
-    let cursor_x = input_area
-        .x
-        .saturating_add(prefix_width)
-        .saturating_add(typed_width)
-        .min(input_area.right().saturating_sub(1));
-    frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+    frame.set_cursor_position(composer_cursor_position(input_area, input, cursor));
 
     // Two-tone footer matching codex's own status line: the model name in
     // a warm tan, the working directory in a soft green, separated by a

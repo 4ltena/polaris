@@ -65,7 +65,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -86,6 +86,7 @@ use polaris_provider::Provider;
 use polaris_provider::local::{Capability, Endpoint, LocalAdapter, ModelMetadata, Runtime};
 use polaris_sandbox::SandboxPolicy;
 use polaris_skills::Skill;
+use ratatui::backend::Backend;
 use zeroize::Zeroize;
 
 #[cfg(not(target_os = "linux"))]
@@ -2838,6 +2839,38 @@ fn draw_frame_with_mode(
     );
 }
 
+/// Draws a normal chat frame, then replays the input row in full.
+///
+/// IME composition can clear the terminal's unused cells after ratatui has
+/// already recorded the row as unchanged. Replaying the completed row from an
+/// empty buffer repairs that external damage without clearing history or
+/// synthesizing cells for wide characters.
+fn draw_chat_frame<B: Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    input: &str,
+    cursor: usize,
+    suggestion_count: usize,
+    draw: impl FnOnce(&mut ratatui::Frame),
+) -> io::Result<()> {
+    let completed = terminal.draw(draw)?;
+    let Some((input_area, cursor_position)) =
+        render::composer_geometry(completed.area, suggestion_count, input, cursor)
+    else {
+        return Ok(());
+    };
+
+    let mut row = ratatui::buffer::Buffer::empty(input_area);
+    for y in input_area.top()..input_area.bottom() {
+        for x in input_area.left()..input_area.right() {
+            row[(x, y)] = completed.buffer[(x, y)].clone();
+        }
+    }
+    let empty = ratatui::buffer::Buffer::empty(input_area);
+    terminal.backend_mut().draw(empty.diff(&row).into_iter())?;
+    terminal.set_cursor_position(cursor_position)?;
+    terminal.backend_mut().flush()
+}
+
 /// The terminal's current (width, height), or a fallback if the size
 /// can't be read (matches the fallback other `run()` call sites already
 /// use — see e.g. `abbreviate_home`'s caller).
@@ -3697,9 +3730,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // one-shot and must happen before the footer draw so the newly
         // printed lines appear above it, not interleaved mid-frame.
         conversation_view.append_new_history(&session, &local_lines);
-        if terminal
-            .borrow_mut()
-            .draw(|f| {
+        if draw_chat_frame(
+            &mut terminal.borrow_mut(),
+            &input_buffer,
+            input_cursor,
+            suggestions.len(),
+            |f| {
                 draw_frame(
                     f,
                     &conversation_view.history,
@@ -3720,8 +3756,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     selected_suggestion,
                     &conversation_view.selection,
                 )
-            })
-            .is_err()
+            },
+        )
+        .is_err()
         {
             break ExitCode::FAILURE;
         }
@@ -4709,9 +4746,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             // do the slow thing" shape as the Ctrl+O
                             // mid-turn confirmation above).
                             status = Status::Notice("compacting...".to_string());
-                            if terminal
-                                .borrow_mut()
-                                .draw(|f| {
+                            if draw_chat_frame(
+                                &mut terminal.borrow_mut(),
+                                &input_buffer,
+                                input_cursor,
+                                0,
+                                |f| {
                                     draw_frame(
                                         f,
                                         &conversation_view.history,
@@ -4732,8 +4772,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         0,
                                         &conversation_view.selection,
                                     )
-                                })
-                                .is_err()
+                                },
+                            )
+                            .is_err()
                             {
                                 break ExitCode::FAILURE;
                             }
@@ -5698,9 +5739,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     // seconds-long) summarization call rather than
                     // leaving the last drawn frame on screen.
                     status = Status::Notice("compacting...".to_string());
-                    if terminal
-                        .borrow_mut()
-                        .draw(|f| {
+                    if draw_chat_frame(
+                        &mut terminal.borrow_mut(),
+                        &input_buffer,
+                        input_cursor,
+                        0,
+                        |f| {
                             draw_frame(
                                 f,
                                 &conversation_view.history,
@@ -5721,8 +5765,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 0,
                                 &conversation_view.selection,
                             )
-                        })
-                        .is_err()
+                        },
+                    )
+                    .is_err()
                     {
                         break ExitCode::FAILURE;
                     }
@@ -5870,9 +5915,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             &mut status,
             &text,
             |preview_history, preview_wrap_cache, preview_status| {
-                terminal
-                    .borrow_mut()
-                    .draw(|f| {
+                draw_chat_frame(
+                    &mut terminal.borrow_mut(),
+                    &input_buffer,
+                    input_cursor,
+                    preview_suggestions.len(),
+                    |f| {
                         draw_frame(
                             f,
                             preview_history,
@@ -5893,8 +5941,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             selected_suggestion,
                             &preview_selection,
                         )
-                    })
-                    .map(|_| ())
+                    },
+                )
+                .map(|_| ())
             },
         )
         .is_err()
@@ -6458,9 +6507,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             selected_suggestion = 0;
         }
         let mut rendered_suggestion_count = suggestions.len();
-        if terminal
-            .borrow_mut()
-            .draw(|f| {
+        if draw_chat_frame(
+            &mut terminal.borrow_mut(),
+            &input_buffer,
+            input_cursor,
+            suggestions.len(),
+            |f| {
                 draw_frame(
                     f,
                     &conversation_view.history,
@@ -6481,8 +6533,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     selected_suggestion,
                     &conversation_view.selection,
                 )
-            })
-            .is_err()
+            },
+        )
+        .is_err()
         {
             #[cfg(target_os = "linux")]
             if let Err(cleanup) = linux_finish_pre_turn_shutdown(
@@ -6803,9 +6856,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         // row's shimmer/elapsed time animates, so this
                         // only needs the footer redrawn, never a new
                         // `append_new_history` call.
-                        if terminal
-                            .borrow_mut()
-                            .draw(|f| {
+                        if draw_chat_frame(
+                            &mut terminal.borrow_mut(),
+                            &input_buffer,
+                            input_cursor,
+                            suggestions.len(),
+                            |f| {
                                 draw_frame(
                                     f,
                                     &conversation_view.history,
@@ -6826,7 +6882,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     selected_suggestion,
                                     &conversation_view.selection,
                                 )
-                            })
+                            },
+                        )
                             .is_err()
                         {
                             break TurnOutcome::Fatal;
@@ -6897,9 +6954,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         // its very next tick.
                                         mid_turn_notice_until =
                                             Some(Instant::now() + MID_TURN_NOTICE_DURATION);
-                                        if terminal
-                                            .borrow_mut()
-                                            .draw(|f| {
+                                        if draw_chat_frame(
+                                            &mut terminal.borrow_mut(),
+                                            &input_buffer,
+                                            input_cursor,
+                                            suggestions.len(),
+                                            |f| {
                                                 draw_frame(
                                                     f,
                                                     &conversation_view.history,
@@ -6920,7 +6980,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                     selected_suggestion,
                                                     &conversation_view.selection,
                                                 )
-                                            })
+                                            },
+                                        )
                                             .is_err()
                                         {
                                             break TurnOutcome::Fatal;
@@ -7155,9 +7216,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             mid_turn_notice_until = Some(
                                                 Instant::now() + MID_TURN_NOTICE_DURATION,
                                             );
-                                            if terminal
-                                                .borrow_mut()
-                                                .draw(|f| {
+                                            if draw_chat_frame(
+                                                &mut terminal.borrow_mut(),
+                                                &input_buffer,
+                                                input_cursor,
+                                                suggestions.len(),
+                                                |f| {
                                                     draw_frame(
                                                         f,
                                                         &conversation_view.history,
@@ -7178,7 +7242,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                         selected_suggestion,
                                                         &conversation_view.selection,
                                                     )
-                                                })
+                                                },
+                                            )
                                                 .is_err()
                                             {
                                                 break TurnOutcome::Fatal;
@@ -16015,6 +16080,125 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("Ask polaris to do anything"))
         );
+    }
+
+    #[test]
+    fn chat_draw_repairs_an_ime_cleared_cjk_composer_suffix() {
+        use ratatui::{
+            buffer::{Buffer, Cell},
+            layout::Rect,
+            style::Color,
+        };
+        use unicode_width::UnicodeWidthStr;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 14)).unwrap();
+        let header = render::HeaderInfo {
+            provider_name: "openai",
+            model_name: "test",
+            usage: polaris_provider::Usage::default(),
+            cwd: "/tmp",
+            cwd_short: "~",
+            effort_name: "low",
+        };
+        let history = vec![render::HistoryLine {
+            line: ratatui::text::Line::from("history must remain visible"),
+            shaded: false,
+        }];
+        let mut cache = render::HistoryWrapCache::default();
+
+        for input in [
+            "日本語",
+            "日本語を追記",
+            "日本語",
+            "",
+            "日本語を繰り返して入力する長い文です。日本語を繰り返して入力する長い文です。",
+        ] {
+            let cursor = input.len();
+            draw_chat_frame(&mut terminal, input, cursor, 0, |frame| {
+                draw_frame(
+                    frame,
+                    &history,
+                    &mut cache,
+                    0,
+                    input,
+                    cursor,
+                    &Status::Idle,
+                    &header,
+                    &[],
+                    0,
+                    &None,
+                );
+            })
+            .expect("initial chat draw");
+
+            let (input_area, cursor_position) =
+                render::composer_geometry(terminal.backend().buffer().area, 0, input, cursor)
+                    .expect("input row");
+            let before_damage = terminal.backend().buffer().clone();
+            let suffix_width = input_area.width.min(21);
+            let damaged_area = Rect::new(
+                input_area.right().saturating_sub(suffix_width),
+                input_area.y,
+                suffix_width,
+                input_area.height,
+            );
+            let before = Buffer::filled(damaged_area, Cell::new("x"));
+            let cleared = Buffer::empty(damaged_area);
+            terminal
+                .backend_mut()
+                .draw(before.diff(&cleared).into_iter())
+                .expect("simulate IME clearing the real terminal suffix");
+            assert_ne!(
+                terminal.backend().buffer()[(damaged_area.x, damaged_area.y)].bg,
+                Color::DarkGray,
+                "the simulated IME damage must reach the real terminal"
+            );
+
+            draw_chat_frame(&mut terminal, input, cursor, 0, |frame| {
+                draw_frame(
+                    frame,
+                    &history,
+                    &mut cache,
+                    0,
+                    input,
+                    cursor,
+                    &Status::Idle,
+                    &header,
+                    &[],
+                    0,
+                    &None,
+                );
+            })
+            .expect("unchanged chat draw repairs the IME damage");
+
+            assert_eq!(
+                terminal.backend_mut().get_cursor_position().unwrap(),
+                cursor_position,
+                "replaying the input row must restore the caret"
+            );
+            let buffer = terminal.backend().buffer();
+            let mut x = input_area.left();
+            while x < input_area.right() {
+                assert_eq!(
+                    buffer[(x, input_area.y)],
+                    before_damage[(x, input_area.y)],
+                    "composer cell was not restored at {x} for {input:?}"
+                );
+                assert_eq!(buffer[(x, input_area.y)].bg, Color::DarkGray);
+                // TestBackend stores each draw command independently. A real
+                // terminal also paints a wide glyph's continuation column,
+                // while Buffer::diff correctly omits that separate command.
+                x += buffer[(x, input_area.y)].symbol().width().max(1) as u16;
+            }
+            assert!(
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, 0)].symbol())
+                    .collect::<String>()
+                    .contains("history must remain visible"),
+                "replaying the composer row must not clear adjacent history"
+            );
+        }
     }
 
     #[test]

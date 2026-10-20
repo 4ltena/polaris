@@ -2634,19 +2634,15 @@ fn append_new_history(
 /// removed after the one draw: persistence and `printed_messages` remain the
 /// sole record of an accepted turn.
 fn draw_submission_preview<E>(
-    history: &mut Vec<render::HistoryLine>,
-    history_wrap_cache: &mut render::HistoryWrapCache,
+    conversation_view: &mut conversation_view::ConversationViewState,
     status: &mut Status,
     text: &str,
     draw: impl FnOnce(&[render::HistoryLine], &mut render::HistoryWrapCache, &Status) -> Result<(), E>,
 ) -> Result<(), E> {
     let previous_status =
         std::mem::replace(status, Status::Notice("送信準備中（未受理）".to_owned()));
-    let result = history_wrap_cache.with_appended(
-        history,
-        render::history_lines_for(&[polaris_provider::Message::user(text)]),
-        |preview, cache| draw(preview, cache, status),
-    );
+    let result = conversation_view
+        .with_temporary_user_input(text, |preview, cache| draw(preview, cache, status));
     *status = previous_status;
     result
 }
@@ -6007,9 +6003,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // while keeping the preview out of the durable session until admission
         // succeeds.
         let preview_suggestions = slash_suggestions(&input_buffer, &input_history, false);
+        let preview_selection = conversation_view.selection.clone();
         if draw_submission_preview(
-            &mut conversation_view.history,
-            &mut conversation_view.history_wrap_cache,
+            &mut conversation_view,
             &mut status,
             &text,
             |preview_history, preview_wrap_cache, preview_status| {
@@ -6034,7 +6030,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             },
                             &preview_suggestions,
                             selected_suggestion,
-                            &conversation_view.selection,
+                            &preview_selection,
                         )
                     })
                     .map(|_| ())
@@ -16051,19 +16047,25 @@ mod tests {
     fn submission_preview_is_drawn_without_committing_and_is_removed_afterward() {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 20)).expect("terminal");
-        let mut wrap_cache = render::HistoryWrapCache::default();
-        let mut history = vec![render::HistoryLine {
+        let header = render::HeaderInfo {
+            provider_name: "openai",
+            model_name: "test",
+            usage: polaris_provider::Usage::default(),
+            cwd: "/tmp",
+            cwd_short: "~",
+            effort_name: "low",
+        };
+        let mut conversation_view = conversation_view::ConversationViewState::new(&header, 90);
+        conversation_view.push_history_line(render::HistoryLine {
             line: ratatui::text::Line::from("earlier turn"),
             shaded: false,
-        }];
+        });
+        let original_history_len = conversation_view.history.len();
         let mut status = Status::Idle;
         let session = polaris_core::session::Session::new();
-        let printed_messages = 0usize;
-        let printed_local_lines = 0usize;
 
         draw_submission_preview(
-            &mut history,
-            &mut wrap_cache,
+            &mut conversation_view,
             &mut status,
             "first line\nsecond\u{1b}[31m line",
             |preview, cache, preview_status| {
@@ -16103,20 +16105,25 @@ mod tests {
         assert!(preview_screen.contains("first line"));
         assert!(preview_screen.contains("second"));
         assert!(!preview_screen.contains("\u{1b}[31m"));
-        assert_eq!(history.len(), 1, "the preview must not enter history");
-        assert_eq!(history[0].line.to_string(), "earlier turn");
+        assert_eq!(
+            conversation_view.history.len(),
+            original_history_len,
+            "the preview must not enter history"
+        );
+        assert_eq!(
+            conversation_view.history.last().unwrap().line.to_string(),
+            "earlier turn"
+        );
         assert!(matches!(status, Status::Idle));
         assert!(session.messages.is_empty());
-        assert_eq!(printed_messages, 0);
-        assert_eq!(printed_local_lines, 0);
 
         status = Status::Error("preflight failed".into());
         terminal
             .draw(|f| {
                 draw_frame(
                     f,
-                    &history,
-                    &mut wrap_cache,
+                    &conversation_view.history,
+                    &mut conversation_view.history_wrap_cache,
                     0,
                     "",
                     0,
@@ -16149,64 +16156,80 @@ mod tests {
 
     #[test]
     fn submission_preview_draw_error_removes_the_temporary_history() {
-        let mut history = vec![render::HistoryLine {
+        let header = render::HeaderInfo {
+            provider_name: "test",
+            model_name: "test",
+            usage: Default::default(),
+            cwd: "/tmp",
+            cwd_short: "~",
+            effort_name: "auto",
+        };
+        let mut conversation_view = conversation_view::ConversationViewState::new(&header, 80);
+        conversation_view.push_history_line(render::HistoryLine {
             line: ratatui::text::Line::from("earlier turn"),
             shaded: false,
-        }];
-        let mut wrap_cache = render::HistoryWrapCache::default();
+        });
+        let original_history_len = conversation_view.history.len();
         let mut status = Status::Idle;
 
         let result = draw_submission_preview(
-            &mut history,
-            &mut wrap_cache,
+            &mut conversation_view,
             &mut status,
             "not accepted",
             |_preview, _cache, _status| Err::<(), _>("draw failed"),
         );
 
         assert_eq!(result, Err("draw failed"));
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].line.to_string(), "earlier turn");
+        assert_eq!(conversation_view.history.len(), original_history_len);
+        assert_eq!(
+            conversation_view.history.last().unwrap().line.to_string(),
+            "earlier turn"
+        );
         assert!(matches!(status, Status::Idle));
     }
 
     #[test]
     fn accepted_submission_appends_one_user_line_after_preview() {
         let mut session = polaris_core::session::Session::new();
-        let mut history = Vec::new();
-        let mut printed_messages = 0;
-        let mut printed_local_lines = 0;
-        let mut wrap_cache = render::HistoryWrapCache::default();
+        let header = render::HeaderInfo {
+            provider_name: "test",
+            model_name: "test",
+            usage: Default::default(),
+            cwd: "/tmp",
+            cwd_short: "~",
+            effort_name: "auto",
+        };
+        let mut conversation_view = conversation_view::ConversationViewState::new(&header, 80);
+        let original_history_len = conversation_view.history.len();
         let mut status = Status::Idle;
 
         draw_submission_preview(
-            &mut history,
-            &mut wrap_cache,
+            &mut conversation_view,
             &mut status,
             "accepted request",
             |preview, _, _| {
-                assert_eq!(preview.len(), 1);
-                assert_eq!(preview[0].line.to_string(), "accepted request");
+                assert_eq!(preview.len(), original_history_len + 1);
+                assert_eq!(preview.last().unwrap().line.to_string(), "accepted request");
                 Ok::<(), ()>(())
             },
         )
         .unwrap();
-        assert!(history.is_empty());
+        assert_eq!(conversation_view.history.len(), original_history_len);
         assert!(session.messages.is_empty());
 
         session.push_user("accepted request");
-        assert!(append_new_history(
-            &session,
-            &[],
-            &mut printed_messages,
-            &mut printed_local_lines,
-            &mut history,
-        ));
+        conversation_view.append_new_history(&session, &[]);
 
         assert_eq!(session.messages.len(), 1);
-        assert_eq!(printed_messages, 1);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].line.to_string(), "accepted request");
+        assert_eq!(conversation_view.history.len(), original_history_len + 1);
+        assert_eq!(
+            conversation_view
+                .history
+                .iter()
+                .filter(|line| line.line.to_string() == "accepted request")
+                .count(),
+            1
+        );
     }
 
     #[test]

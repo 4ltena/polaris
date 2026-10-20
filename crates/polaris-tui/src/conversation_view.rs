@@ -44,6 +44,16 @@ impl ConversationViewState {
         }
     }
 
+    pub(super) fn with_temporary_user_input<R>(
+        &mut self,
+        text: &str,
+        draw: impl FnOnce(&[render::HistoryLine], &mut render::HistoryWrapCache) -> R,
+    ) -> R {
+        let appended = render::history_lines_for(&[polaris_provider::Message::user(text)]);
+        self.history_wrap_cache
+            .with_appended(&mut self.history, appended, draw)
+    }
+
     pub(super) fn reset(&mut self, header: &render::HeaderInfo<'_>, width: u16) {
         self.history.clear();
         self.history
@@ -298,6 +308,23 @@ mod tests {
                 .first()
                 .map(|line| line.line.to_string())
         );
+    }
+
+    #[test]
+    fn temporary_user_input_does_not_advance_projection_counters() {
+        let mut view = ConversationViewState::new(&header(), 80);
+        let history_len = view.history.len();
+
+        let result = view.with_temporary_user_input("not accepted", |preview, _| {
+            assert_eq!(preview.len(), history_len + 1);
+            assert_eq!(preview.last().unwrap().line.to_string(), "not accepted");
+            Err::<(), _>("draw failed")
+        });
+
+        assert_eq!(result, Err("draw failed"));
+        assert_eq!(view.history.len(), history_len);
+        assert_eq!(view.printed_messages, 0);
+        assert_eq!(view.printed_local_lines, 0);
     }
 
     #[test]

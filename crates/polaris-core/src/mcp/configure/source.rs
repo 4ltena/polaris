@@ -27,7 +27,15 @@ const LOCKS: &[&str] = &[
     "pnpm-lock.yaml",
     "yarn.lock",
 ];
-const FIXED_BIN: &str = "node_modules/.bin";
+const FIXED_BINS: &[&str] = &[
+    "node_modules/.bin",
+    "node_modules/eslint-plugin-import/node_modules/.bin",
+    "node_modules/babel-plugin-istanbul/node_modules/.bin",
+    "node_modules/ts-jest/node_modules/.bin",
+    "node_modules/@babel/core/node_modules/.bin",
+    "node_modules/@babel/helper-compilation-targets/node_modules/.bin",
+    "node_modules/@istanbuljs/load-nyc-config/node_modules/.bin",
+];
 const ESBUILD_BYTES: u64 = 9_817_266;
 const PAIR: [&str; 2] = [
     "node_modules/esbuild/bin/esbuild",
@@ -425,6 +433,7 @@ pub(super) fn scan(root_path: &Path, root: &File, protection: &Protection) -> Re
         files: 0,
         bytes: 0,
         identities: BTreeMap::new(),
+        fixed_exclusions: BTreeSet::new(),
     };
     for name in names {
         let selected = name == OsStr::new(PACKAGE)
@@ -474,7 +483,7 @@ pub(super) fn scan(root_path: &Path, root: &File, protection: &Protection) -> Re
             .into_iter()
             .map(|name| name.as_bytes().to_vec())
             .collect(),
-        fixed_exclusions: vec![FIXED_BIN.as_bytes().to_vec()],
+        fixed_exclusions: state.fixed_exclusions.into_iter().collect(),
     };
     if entry_digest(&manifest).is_err() {
         return Err("Unity sourceにbuild/index.jsがありません".into());
@@ -494,6 +503,7 @@ struct WalkState<'a> {
     files: usize,
     bytes: u64,
     identities: BTreeMap<(u64, u64), Vec<u8>>,
+    fixed_exclusions: BTreeSet<Vec<u8>>,
 }
 
 impl WalkState<'_> {
@@ -510,11 +520,15 @@ impl WalkState<'_> {
         self.count += 1;
         let relative = relative_parent.join(name);
         let relative_bytes = relative.as_os_str().as_bytes().to_vec();
-        if relative == Path::new(FIXED_BIN) {
+        if FIXED_BINS
+            .iter()
+            .any(|excluded| relative == Path::new(excluded))
+        {
             let metadata = lstat_at(parent, name)?;
             if metadata.mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
                 return Err("node_modules/.binがdirectoryではありません".into());
             }
+            self.fixed_exclusions.insert(relative_bytes);
             return Ok(());
         }
         let path = self.root_path.join(&relative);

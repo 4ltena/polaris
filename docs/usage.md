@@ -129,7 +129,7 @@ polaris mcp configure <server-id> --preset unity-local-v2 --source /absolute/pat
 
 表示されたコピー元・配置先・ハッシュ・登録差分を確認して承認する。非対話実行では`--yes`で同じ内容を承認する。承認前に配置先や管理操作の記録は作らない。
 
-コピー対象は`build/`、`node_modules/`、`package.json`と存在するlockfileで、`node_modules/.bin`は除外する。検証済みの特定のesbuild hardlink pairだけを独立した通常fileへ展開する。別の構成や検証できないfileは拒否するため、その場合は元の登録を確認する。
+コピー対象は`build/`、`node_modules/`、`package.json`と存在するlockfileである。`node_modules/.bin`と、依存package配下の固定リストにある同名directoryを除外し、実在する除外先を確認画面とmanifestへ列挙する。検証済みの特定のesbuild hardlink pairだけを独立した通常fileへ展開する。別の構成や検証できないfileは拒否するため、その場合は元の登録を確認する。
 
 配置の完了後に登録を更新し、次の実行から新しいcwd・entry、`auto_2024_compat`、loopback限定の通信設定を使う。構成中にdownload、プログラムの起動、接続確認は行わない。旧runtimeと未参照のコピーは保持する。途中で結果不明となった操作は繰り返さず、管理操作の記録と保存済み状態を確認する。
 

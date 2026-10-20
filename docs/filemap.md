@@ -1486,6 +1486,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `runtime_effects.rs` — Runtime management requests use the bound activity lease, never source mutation.
 - `sandbox_commands.rs` — Explicit argv execution under the startup ceiling and durable C38 receipt.
 - `selection.rs` — Mouse drag-to-select over the conversation history. Operates entirely
+- `session_activation.rs` — 保存会話の設定とプロセス所有サービスを実行中のセッションへ適用する。
 - `session_commands.rs` — Saved session controls use the conversation owner and shared project lease.
 - `sessions.rs` — Enumerates saved conversations under `~/.polaris/sessions/` for the
 - `signal.rs` — Linux process-signal capture for the interactive terminal lifetime.

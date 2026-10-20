@@ -42,6 +42,7 @@ mod runtime_commands;
 mod runtime_effects;
 #[cfg(unix)]
 mod sandbox_commands;
+mod session_activation;
 #[cfg(unix)]
 mod session_commands;
 #[cfg(target_os = "linux")]
@@ -92,6 +93,14 @@ use approver::CrosstermKeyReader;
 use approver::TuiApprover;
 use input::{InputAction, apply_key};
 use render::Status;
+use session_activation::{
+    MAX_TOOL_MEMORY_ORIGINS, ProcessServices, apply_compaction_and_memory, apply_tool_memory,
+    attach_process_services, configure_saved_tool_memory, saved_tool_memory_namespace,
+};
+#[cfg(unix)]
+use session_activation::{
+    SavedDraftTarget, apply_saved_binding, apply_saved_draft, read_saved_activation,
+};
 
 const UNDECIDED_EFFORT: &str = "undecided";
 
@@ -1931,114 +1940,6 @@ fn schedule_tui_shadow(
     Ok(true)
 }
 
-// Ancestors are read-only and must form an explicit, bounded same-project chain.
-const MAX_TOOL_MEMORY_ORIGINS: usize = 64;
-
-fn saved_tool_memory_namespace(
-    project: &std::path::Path,
-    path: &std::path::Path,
-) -> std::io::Result<(String, Vec<String>)> {
-    let id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| {
-            !s.is_empty()
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        })
-        .ok_or_else(|| std::io::Error::other("invalid session id"))?
-        .to_owned();
-    let project = polaris_core::project::resolve_root(project);
-    let mut seen = std::collections::HashSet::from([id.clone()]);
-    let mut origins = Vec::new();
-    let mut cursor = path.to_path_buf();
-    while let Some(origin) = persist::read_tool_memory_origin(&cursor.with_extension("meta.json"))?
-    {
-        if origins.len() >= MAX_TOOL_MEMORY_ORIGINS || !seen.insert(origin.clone()) {
-            return Err(std::io::Error::other(
-                "記憶の系譜が循環しているか上限を超えています",
-            ));
-        }
-        let source = path.with_file_name(format!("{origin}.jsonl"));
-        let source_meta = persist::read_meta(&source.with_extension("meta.json"))
-            .ok_or_else(|| std::io::Error::other("記憶の元セッションの出自を確認できません"))?;
-        if !source.is_file()
-            || !std::path::Path::new(&source_meta.cwd).is_absolute()
-            || polaris_core::project::resolve_root(std::path::Path::new(&source_meta.cwd))
-                != project
-        {
-            return Err(std::io::Error::other(
-                "記憶の元セッションが存在しないか同一プロジェクトではありません",
-            ));
-        }
-        origins.push(origin);
-        cursor = source;
-    }
-    Ok((id, origins))
-}
-
-fn configure_saved_tool_memory(
-    session: &mut polaris_core::session::Session,
-    project: &std::path::Path,
-    state_dir: &std::path::Path,
-    session_path: &std::path::Path,
-    mode: Option<polaris_core::tool_memory::RetentionMode>,
-    embedding: Option<(String, String)>,
-) -> std::io::Result<()> {
-    session.tool_memory = None;
-    if let Some(mode) = mode
-        && memory::saved_project_matches(session, project, session_path)
-    {
-        if let Some(persistence) = session.persistence.as_ref() {
-            let snapshot = persistence.snapshot()?;
-            let mut origins = snapshot
-                .state
-                .ancestors
-                .iter()
-                .map(|ancestor| ancestor.session_id.clone())
-                .collect::<Vec<_>>();
-            origins.sort();
-            origins.dedup();
-            if origins.len() > MAX_TOOL_MEMORY_ORIGINS {
-                return Err(std::io::Error::other("記憶の系譜が上限を超えています"));
-            }
-            if let Some(branch) = persistence.store.rewind_branch_metadata()? {
-                if !origins.contains(&branch.origin_session_id) {
-                    return Err(std::io::Error::other(
-                        "rewind分岐の記憶出自が保存された系譜と一致しません",
-                    ));
-                }
-                tool_memory::configure_tool_memory_with_origin_allowlist(
-                    session,
-                    project,
-                    state_dir,
-                    &snapshot.state.session_id,
-                    &origins,
-                    &branch.visible_memory_raw_object_ids,
-                    mode,
-                    embedding,
-                )?;
-            } else {
-                tool_memory::configure_tool_memory_with_origins(
-                    session,
-                    project,
-                    state_dir,
-                    &snapshot.state.session_id,
-                    &origins,
-                    mode,
-                    embedding,
-                )?;
-            }
-            return Ok(());
-        }
-        let (id, origins) = saved_tool_memory_namespace(project, session_path)?;
-        tool_memory::configure_tool_memory_with_origins(
-            session, project, state_dir, &id, &origins, mode, embedding,
-        )?;
-    }
-    Ok(())
-}
-
 fn visible_rewind_memory_ids(
     session: &polaris_core::session::Session,
     project: &Path,
@@ -3647,62 +3548,57 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         #[cfg(unix)]
         if refresh_saved_settings || saved_settings_path.as_ref() != Some(&session_path) {
             let switched = saved_settings_path.as_ref() != Some(&session_path);
-            if let Some(saved) = &session.persistence {
-                match saved.snapshot() {
-                    Ok(snapshot) => {
-                        effective_saved_settings =
-                            snapshot.state.session_settings.unwrap_or_else(|| {
-                                let mut initial = initial_saved_settings.clone();
-                                initial.model = model_name.clone();
-                                initial
-                            });
-                        if effective_saved_settings.provider != provider_name {
-                            fatal_message = Some("保存providerが起動時providerと異なります。指定して再起動してください".into());
-                            break 'outer ExitCode::FAILURE;
-                        }
-                        if model_name != effective_saved_settings.model {
-                            if args.provider.model().is_none() {
-                                fatal_message =
-                                    Some("保存modelをこのproviderへ適用できません".into());
-                                break 'outer ExitCode::FAILURE;
-                            }
-                            args.provider.set_model(&effective_saved_settings.model);
-                            if args.provider.model().as_deref()
-                                != Some(effective_saved_settings.model.as_str())
-                            {
-                                fatal_message = Some("保存modelの適用を確認できません".into());
-                                break 'outer ExitCode::FAILURE;
-                            }
-                            model_name = effective_saved_settings.model.clone();
-                        }
-                        if switched {
-                            input_buffer = snapshot.state.draft.text;
-                            input_cursor = input_buffer.len();
-                            input_history = input::History::new();
-                            draft_saved_text = input_buffer.clone();
-                            draft_candidate = input_buffer.clone();
-                            #[cfg(target_os = "linux")]
-                            {
-                                draft_changed_at = Instant::now();
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        fatal_message = Some(format!("会話設定を復元できません: {error}"));
-                        break 'outer ExitCode::FAILURE;
-                    }
+            let activation = match read_saved_activation(
+                &session,
+                &initial_saved_settings,
+                &model_name,
+                switched,
+            ) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    fatal_message = Some(error);
+                    break 'outer ExitCode::FAILURE;
                 }
+            };
+            if let Some(activation) = activation {
+                if let Err(error) = apply_saved_binding(
+                    &activation,
+                    &mut effective_saved_settings,
+                    &provider_name,
+                    args.provider.as_ref(),
+                    &mut model_name,
+                ) {
+                    fatal_message = Some(error);
+                    break 'outer ExitCode::FAILURE;
+                }
+                apply_saved_draft(
+                    activation,
+                    SavedDraftTarget {
+                        input_buffer: &mut input_buffer,
+                        input_cursor: &mut input_cursor,
+                        input_history: &mut input_history,
+                        saved_text: &mut draft_saved_text,
+                        candidate: &mut draft_candidate,
+                        #[cfg(target_os = "linux")]
+                        changed_at: &mut draft_changed_at,
+                    },
+                );
             }
             saved_settings_path = Some(session_path.clone());
             refresh_saved_settings = false;
             tool_memory_path = None;
         }
-        session.decider = args.decider.clone();
-        session.tier_decider = args.tier_decider.clone();
-        session.light_model = args.mcp_selection_provider.clone();
-        session.approval_auto = args.approval_auto;
-        session.setting = Some(setting.clone());
-        session.computer = computer.clone();
+        attach_process_services(
+            &mut session,
+            ProcessServices {
+                decider: &args.decider,
+                tier_decider: &args.tier_decider,
+                light_model: &args.mcp_selection_provider,
+                approval_auto: args.approval_auto,
+                setting: &setting,
+                computer: &computer,
+            },
+        );
         // A queued submission uses the same slash-command/prompt path as an
         // idle Enter press. Preserve anything the user has started typing
         // since queueing it, then restore that draft before the queued item
@@ -3745,76 +3641,41 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             status = Status::Error("秘密情報を通常の入力欄へ入力できません".into());
         }
         #[cfg(unix)]
-        let saved_tool_mode = match effective_saved_settings.tool_memory {
-            polaris_core::session_settings::ToolMemoryModeV1::Off => None,
-            polaris_core::session_settings::ToolMemoryModeV1::History => {
-                Some(polaris_core::tool_memory::RetentionMode::History)
-            }
-            polaris_core::session_settings::ToolMemoryModeV1::Retrieval => {
-                Some(polaris_core::tool_memory::RetentionMode::Retrieval)
-            }
-        };
+        let memory_activation =
+            session_activation::MemoryActivation::from_saved(&effective_saved_settings);
         #[cfg(not(unix))]
-        let saved_tool_mode = args.tool_memory;
-        #[cfg(unix)]
-        let saved_embedding = effective_saved_settings
-            .tool_memory_embedding
-            .as_ref()
-            .map(|p| (p.url.clone(), p.model.clone()));
-        #[cfg(not(unix))]
-        let saved_embedding = args.tool_memory_embedding.clone();
-        if tool_memory_path.as_ref() != Some(&session_path)
-            || (saved_tool_mode.is_some()
-                && session.tool_memory.is_none()
-                && memory::saved_project_matches(&session, &args.cwd, &session_path))
-        {
-            if let Err(error) = configure_saved_tool_memory(
-                &mut session,
-                &args.cwd,
-                &args.state_dir,
-                &session_path,
-                saved_tool_mode,
-                saved_embedding.clone(),
-            ) {
-                fatal_message = Some(format!("ツール記憶を準備できません: {error}"));
+        let memory_activation = session_activation::MemoryActivation::from_runtime(
+            args.tool_memory,
+            args.tool_memory_embedding.clone(),
+            args.compact_at,
+            args.remember,
+        );
+        match apply_tool_memory(
+            &mut session,
+            &args.cwd,
+            &args.state_dir,
+            &session_path,
+            tool_memory_path.as_deref(),
+            &memory_activation,
+        ) {
+            Ok(true) => {
+                tool_memory_path = Some(session_path.clone());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                fatal_message = Some(error);
                 break 'outer ExitCode::FAILURE;
             }
-            tool_memory_path = Some(session_path.clone());
         }
         let mut cumulative_usage = usage_meter.snapshot().usage;
-        #[cfg(unix)]
-        {
-            session.compaction_threshold = effective_saved_settings.compact_threshold;
-        }
-        #[cfg(not(unix))]
-        {
-            session.compaction_threshold = args.compact_at;
-        }
-        #[cfg(unix)]
-        let saved_remember = effective_saved_settings.remember;
-        #[cfg(not(unix))]
-        let saved_remember = args.remember;
-        if saved_remember {
-            if let Err(error) = memory::configure_saved_memory(
-                &mut session,
-                &args.cwd,
-                &args.state_dir,
-                &session_path,
-            ) {
-                fatal_message = Some(format!("履歴保存を準備できません: {error}"));
-                break 'outer ExitCode::FAILURE;
-            }
-        } else if session.persistence.is_some() {
-            session.before_compact = None;
-        } else if session.persistence.is_none()
-            && session.before_compact.is_none()
-            && let Some(id) = session_path.file_stem().and_then(|s| s.to_str())
-            && let Err(error) =
-                memory::configure_archive(&mut session, &args.cwd, &args.state_dir, id)
-        {
-            // Without this the legacy log is rewritten over the summary and
-            // the compacted prefix is gone from memory and disk at once.
-            fatal_message = Some(format!("圧縮前の履歴を退避できません: {error}"));
+        if let Err(error) = apply_compaction_and_memory(
+            &mut session,
+            &args.cwd,
+            &args.state_dir,
+            &session_path,
+            &memory_activation,
+        ) {
+            fatal_message = Some(error);
             break 'outer ExitCode::FAILURE;
         }
         // Recomputed every draw from the live buffer, so the popup tracks
@@ -4248,7 +4109,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             &management_effects,
                         ),
                         (&args.cwd, &args.state_dir),
-                        saved_embedding.as_ref(),
+                        memory_activation.embedding(),
                         (args.mcp_external, approval_policy),
                         has_pending_inputs,
                     )
@@ -5228,7 +5089,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &management_effects,
                     ),
                     (&args.cwd, &args.state_dir),
-                    saved_embedding.as_ref(),
+                    memory_activation.embedding(),
                     (args.mcp_external, approval_policy),
                     has_pending_inputs,
                 )
@@ -6262,7 +6123,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     rewind_pre_manifest_id.as_deref(),
                     &args.cwd,
                     &args.state_dir,
-                    saved_tool_mode.is_some(),
+                    memory_activation.tool_memory_enabled(),
                 )
                 .map_err(|error| error.to_string())?;
                 let applied =
@@ -6411,12 +6272,17 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // after the loop-top attachment. Reinstall only process-owned
         // capabilities; conversation history, approval replies, tool state,
         // and memory are deliberately not copied from the parent.
-        session.decider = args.decider.clone();
-        session.tier_decider = args.tier_decider.clone();
-        session.light_model = args.mcp_selection_provider.clone();
-        session.approval_auto = args.approval_auto;
-        session.setting = Some(setting.clone());
-        session.computer = computer.clone();
+        attach_process_services(
+            &mut session,
+            ProcessServices {
+                decider: &args.decider,
+                tier_decider: &args.tier_decider,
+                light_model: &args.mcp_selection_provider,
+                approval_auto: args.approval_auto,
+                setting: &setting,
+                computer: &computer,
+            },
+        );
         // `mut`: mid-turn compaction (see `history_compacted_this_turn`
         // below) can shrink `session.messages` after this point but within
         // the same turn, which would otherwise leave `checkpoint` pointing

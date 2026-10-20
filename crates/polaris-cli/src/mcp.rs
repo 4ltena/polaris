@@ -58,16 +58,27 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// 登録済みUnity MCPのruntimeを固定配置し、次回起動用の設定を更新する。
+    Configure {
+        server: String,
+        #[arg(long, value_parser = ["unity-local-v2"])]
+        preset: String,
+        #[arg(long)]
+        source: PathBuf,
+        /// 表示する構成内容を承認する。接続確認やtool実行は行わない。
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Answers every registration card with yes, after printing it. Used only
-/// when the person wrote `-y`, which is where the answer came from.
+/// when the person supplied `--yes` (or setup's `-y` alias).
 struct BulkApprover;
 
 impl Approver for BulkApprover {
     fn ask(&mut self, reason: &str) -> Decision {
         eprintln!("Approval required: {reason}");
-        eprintln!("Allow this? [y/N] y  (-y により承認)");
+        eprintln!("Allow this? [y/N] y  (--yes により承認)");
         Decision::Allow
     }
 }
@@ -108,9 +119,17 @@ pub async fn run(args: Args) -> ExitCode {
     let cwd = args
         .project
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let result = match LocalHost::open(&cwd, true) {
-        Ok(host) => command(&host, &cwd, args.command).await,
-        Err(error) => Err(message(error).to_owned()),
+    let result = match args.command {
+        Command::Configure {
+            server,
+            preset,
+            source,
+            yes,
+        } => configure(&cwd, &server, &preset, &source, yes),
+        command_args => match LocalHost::open(&cwd, true) {
+            Ok(host) => command(&host, &cwd, command_args).await,
+            Err(error) => Err(message(error).to_owned()),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -215,6 +234,199 @@ async fn command(host: &LocalHost, cwd: &std::path::Path, command: Command) -> R
             runtime,
             yes,
         } => materialize(&server, runtime.as_deref(), yes),
+        // Configuration must enter through the noncreating preflight above.
+        Command::Configure { .. } => Err("構成には専用の読み取り準備経路が必要です。".into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn configure(
+    _cwd: &std::path::Path,
+    _server: &str,
+    _preset: &str,
+    _source: &std::path::Path,
+    _confirmed: bool,
+) -> Result<(), String> {
+    Err("このプラットフォームではMCP構成に必要な保護を確認できません。".into())
+}
+
+#[cfg(unix)]
+fn configure(
+    cwd: &std::path::Path,
+    server: &str,
+    preset: &str,
+    source: &std::path::Path,
+    confirmed: bool,
+) -> Result<(), String> {
+    use polaris_core::{
+        management_effect::ManagementEffectStoreV1, mcp::configure::UnityLocalV2Preparation,
+        project_mutation::ProjectMutationOwnerV1,
+    };
+
+    // Refuse before opening even a noncreating store when no answer is possible.
+    if !confirmed && !io::stdin().is_terminal() {
+        return Err("構成の確認には対話端末が必要です。--yes でも承認できます。".into());
+    }
+    if preset != "unity-local-v2" {
+        return Err("対応する構成presetではありません。".into());
+    }
+    let safe = |text: String| text.escape_debug().to_string();
+    let host = LocalHost::open_existing(cwd).map_err(|error| message(error).to_owned())?;
+    let prepared = UnityLocalV2Preparation::prepare(&host, server, source).map_err(safe)?;
+    let card = configure_card(prepared.preview());
+    let decision = if confirmed {
+        BulkApprover.ask(&card)
+    } else {
+        crate::TerminalApprover.ask(&card)
+    };
+    if !matches!(decision, Decision::Allow) {
+        return Err("構成を取り消しました。".into());
+    }
+
+    // The preparation holds no registry lock across the approval question.
+    // Destination/effect creation begins only after the answer above.
+    let project = polaris_core::project::resolve_root(cwd)
+        .canonicalize()
+        .map_err(|error| safe(error.to_string()))?;
+    let mutation =
+        ProjectMutationOwnerV1::for_project(&project).map_err(|error| safe(error.to_string()))?;
+    let lease = mutation
+        .try_mutation()
+        .map_err(|error| safe(error.to_string()))?;
+    let state =
+        polaris_core::project::state_dir(&project).map_err(|error| safe(error.to_string()))?;
+    let effects = ManagementEffectStoreV1::open_at_state_dir(&project, &state, &lease)
+        .map_err(|error| safe(error.to_string()))?;
+    let receipt = prepared
+        .apply(&host, &effects, &lease, &project)
+        .map_err(safe)?;
+    println!(
+        "{} を構成しました（登録の版 {}）。次の実行から反映します。\n配置先: {}\n接続確認は `polaris mcp check {}` で行います。",
+        receipt.server_id.escape_debug(),
+        receipt.registry_revision,
+        receipt.cwd.display().to_string().escape_debug(),
+        receipt.server_id.escape_debug(),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_card(preview: &polaris_core::mcp::configure::UnityLocalV2Preview) -> String {
+    let text = |value: &str| value.escape_debug().to_string();
+    let path = |value: &std::path::Path| text(&value.display().to_string());
+    let mut lines = vec![
+        "Unity MCPの固定配置と登録更新".into(),
+        format!(
+            "preset: unity-local-v2 / server: {}",
+            text(&preview.server_id)
+        ),
+        format!("project: {}", text(&preview.project_id)),
+        format!("source: {}", path(&preview.source)),
+        format!("node: {}", path(&preview.node)),
+        format!("node SHA256: {}", text(&preview.node_sha256)),
+        format!("entry: {}", path(&preview.entry)),
+        format!("新entry: {}", path(&preview.new_cwd.join("build/index.js"))),
+        format!("entry SHA256: {}", text(&preview.entry_sha256)),
+        format!("manifest SHA256: {}", text(&preview.manifest_sha256)),
+        format!(
+            "選択: {} files / {} bytes",
+            preview.selected_files, preview.selected_bytes
+        ),
+        "対象: build/、node_modules/、package.json、存在するlockfile".into(),
+        format!("現在cwd: {}", path(&preview.old_cwd)),
+        format!("配置先・新cwd: {}", path(&preview.new_cwd)),
+        format!(
+            "protocol: {:?} / sandbox: {}",
+            preview.protocol_profile,
+            text(&preview.sandbox_profile)
+        ),
+        format!(
+            "登録の版: {} → {}",
+            preview.registry_before_revision, preview.registry_after_revision
+        ),
+        "登録差分: cwd・entry引数・script pin・protocol・sandbox".into(),
+        "server ID・project集合・capabilities・timeouts・秘密参照は保持します。".into(),
+        "限定hardlink pair（9,817,266 bytes・同一inode/nlink=2を別々のnlink=1へコピー）:".into(),
+        format!("pair SHA256: {}", text(&preview.hardlink_pair_sha256)),
+    ];
+    for entry in &preview.hardlink_pair {
+        lines.push(format!("  {}", path(entry)));
+    }
+    lines.push("固定除外:".into());
+    for entry in &preview.fixed_exclusions {
+        lines.push(format!("  {}", path(entry)));
+    }
+    lines.push("保持する秘密参照名（値は表示しません）:".into());
+    if preview.secret_references.is_empty() {
+        lines.push("  なし".into());
+    } else {
+        for reference in &preview.secret_references {
+            lines.push(format!("  {}", text(reference)));
+        }
+    }
+    lines.push("通信範囲: このMac内のloopbackのみ。".into());
+    lines.push(
+        "C28の配置完了後にC27の登録を更新します。旧runtimeと未参照のコピーは保持します。".into(),
+    );
+    lines.push("準備・配置ではプログラムの起動、download、接続確認は行いません。".into());
+    lines.join("\n")
+}
+
+#[cfg(all(test, unix))]
+mod configure_tests {
+    use super::configure_card;
+    use polaris_core::mcp::configure::UnityLocalV2Preview;
+    use polaris_mcp::registration::ProtocolProfile;
+    use std::path::PathBuf;
+
+    #[test]
+    fn configuration_card_binds_digests_and_escapes_untrusted_fields() {
+        let preview = UnityLocalV2Preview {
+            server_id: "unity\nforged approval".into(),
+            project_id: "project-test".into(),
+            source: PathBuf::from("/source\u{1b}[2J"),
+            old_cwd: PathBuf::from("/store/servers/unity"),
+            new_cwd: PathBuf::from("/store/servers/unity/runtime-1234"),
+            node: PathBuf::from("/runtime/node"),
+            entry: PathBuf::from("/source/build/index.js"),
+            node_sha256: "a".repeat(64),
+            entry_sha256: "b".repeat(64),
+            manifest_sha256: "c".repeat(64),
+            selected_files: 42,
+            selected_bytes: 12345,
+            fixed_exclusions: vec![PathBuf::from("node_modules/.bin")],
+            hardlink_pair: [
+                PathBuf::from("node_modules/esbuild/bin/esbuild"),
+                PathBuf::from("node_modules/@esbuild/darwin-arm64/bin/esbuild"),
+            ],
+            hardlink_pair_sha256: "d".repeat(64),
+            secret_references: vec!["reference\nforged-value".into()],
+            registry_before_revision: 7,
+            registry_after_revision: 8,
+            protocol_profile: ProtocolProfile::Auto2024Compat,
+            sandbox_profile: "loopback".into(),
+        };
+        let card = configure_card(&preview);
+        for digest in [
+            &preview.node_sha256,
+            &preview.entry_sha256,
+            &preview.manifest_sha256,
+            &preview.hardlink_pair_sha256,
+        ] {
+            assert!(card.contains(digest));
+        }
+        assert!(card.contains("/store/servers/unity/runtime-1234/build/index.js"));
+        assert!(card.contains("42 files / 12345 bytes"));
+        assert!(card.contains("7 → 8"));
+        assert!(card.contains("node_modules/.bin"));
+        assert!(card.contains("unity\\nforged approval"));
+        assert!(!card.contains("\nforged approval"));
+        assert!(!card.contains('\u{1b}'));
+        assert!(card.contains("reference\\nforged-value"));
+        assert!(!card.contains("\nforged-value"));
+        for path in &preview.hardlink_pair {
+            assert!(card.contains(path.to_str().unwrap()));
+        }
     }
 }
 

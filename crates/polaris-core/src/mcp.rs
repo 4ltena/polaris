@@ -2,6 +2,8 @@
 //! Registration and durable operation authority remain with the trusted host.
 
 pub mod apps;
+#[cfg(unix)]
+pub mod configure;
 pub mod credentials;
 pub mod lease;
 pub mod local;

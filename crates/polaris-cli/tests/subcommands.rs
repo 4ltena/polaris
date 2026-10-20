@@ -13,6 +13,97 @@ mod product_binary;
 
 #[cfg(unix)]
 #[test]
+fn mcp_configure_exposes_the_fixed_preset_and_rejects_unconfirmed_non_tty_without_state() {
+    use std::process::Stdio;
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let help = product_binary::command()
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .args(["mcp", "configure", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    for field in ["unity-local-v2", "--preset", "--source", "--yes"] {
+        assert!(help_text.contains(field), "{help_text}");
+    }
+    let output = product_binary::command()
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .args([
+            "mcp",
+            "configure",
+            "unity-fixture",
+            "--preset",
+            "unity-local-v2",
+            "--source",
+        ])
+        .arg(project.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("構成の確認には対話端末が必要"));
+    assert!(!home.path().join(".polaris").exists());
+    assert!(!project.path().join(".polaris").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_configure_never_creates_an_absent_store_even_with_explicit_yes() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let output = product_binary::command()
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .args([
+            "mcp",
+            "configure",
+            "unity-fixture",
+            "--preset",
+            "unity-local-v2",
+            "--yes",
+            "--source",
+        ])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!output.stderr.is_empty());
+    assert!(!home.path().join(".polaris").exists());
+    assert!(!project.path().join(".polaris").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_configure_rejects_an_unknown_preset_before_store_access() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let output = product_binary::command()
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .args([
+            "mcp",
+            "configure",
+            "unity-fixture",
+            "--preset",
+            "arbitrary-command",
+            "--yes",
+            "--source",
+        ])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unity-local-v2"));
+    assert!(!home.path().join(".polaris").exists());
+    assert!(!project.path().join(".polaris").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn common_tests_runs_a_valid_bounded_plan_or_reports_unavailable() {
     let workspace = tempfile::tempdir().expect("temp directory");
     let plan = workspace.path().join("common-tests.json");

@@ -154,6 +154,73 @@ fn managed_cwd_requires_exact_own_server_directory() {
 }
 
 #[test]
+fn managed_cwd_accepts_only_exact_own_runtime_version_child() {
+    let operation = "0123456789abcdef0123456789abcdef";
+    let old_version = format!("{OLD}/runtime-{operation}");
+    let new_version = format!("{NEW}/runtime-{operation}");
+    let mut original = server();
+    let Destination::Stdio {
+        cwd,
+        command,
+        script,
+        args,
+        readable_roots,
+        ..
+    } = &mut original.transport
+    else {
+        unreachable!()
+    };
+    *cwd = PathBuf::from(&old_version);
+    *script = Some(PathBuf::from(format!("{old_version}/build/index.js")));
+    args[0] = format!("{old_version}/build/index.js");
+    *readable_roots = vec![PathBuf::from(&old_version)];
+    *command = PathBuf::from("/usr/local/bin/node");
+    let held_pins = pins(&original);
+    let transformed = map(&registry(original), &held_pins).unwrap();
+    let Destination::Stdio {
+        cwd,
+        script,
+        args,
+        readable_roots,
+        ..
+    } = &transformed.registry.servers[0].transport
+    else {
+        unreachable!()
+    };
+    assert_eq!(cwd, Path::new(&new_version));
+    assert_eq!(
+        script.as_deref(),
+        Some(Path::new(&format!("{new_version}/build/index.js")))
+    );
+    assert_eq!(args[0], format!("{new_version}/build/index.js"));
+    assert_eq!(readable_roots, &[PathBuf::from(new_version)]);
+    assert_eq!(
+        transformed.pins["alpha"].runtime,
+        PathBuf::from("/usr/local/bin/node")
+    );
+    assert_eq!(
+        transformed.pins["alpha"].entry,
+        PathBuf::from(format!("{NEW}/runtime-{operation}/build/index.js"))
+    );
+
+    for cwd in [
+        format!("{OLD}/runtime-0123456789ABCDEF0123456789ABCDEF"),
+        format!("{OLD}/runtime-0123456789abcdef0123456789abcdeg"),
+        format!("{OLD}/runtime-0123456789abcdef0123456789abcde"),
+        format!("{OLD}/runtime-{operation}/build"),
+        format!("/logical-home/.polaris/mcp/servers/beta/runtime-{operation}"),
+    ] {
+        let mut source = registry(server());
+        let Destination::Stdio { cwd: field, .. } = &mut source.servers[0].transport else {
+            unreachable!()
+        };
+        *field = PathBuf::from(&cwd);
+        source.validate().unwrap();
+        assert!(map(&source, &BTreeMap::new()).is_err(), "{cwd}");
+    }
+}
+
+#[test]
 fn command_script_and_readable_roots_cannot_cross_server_tree() {
     let mut command = registry(server());
     let Destination::Stdio {

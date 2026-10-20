@@ -528,6 +528,49 @@ pub(super) fn python_stdio(fixture: &str, extra: &[&str], profile: ProtocolProfi
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn loopback_stdio_requires_a_matching_policy_and_completes_legacy_catalog() {
+    let mut fixture = python_stdio(
+        "tests/fixtures/stdio_2024_server.py",
+        &[],
+        ProtocolProfile::Auto2024Compat,
+    );
+    let read_only = fixture.policy.clone();
+    let loopback = read_only.clone().with_loopback_network().unwrap();
+    for (profile, policy) in [("loopback", &read_only), ("read-only", &loopback)] {
+        let Destination::Stdio {
+            sandbox_profile, ..
+        } = &mut fixture.server.transport
+        else {
+            panic!("fixture is not stdio");
+        };
+        *sandbox_profile = profile.into();
+        assert!(matches!(
+            Connection::prepare(&fixture.server, "project", &secrets(), Some(policy), || {
+                panic!("mismatched loopback launch reached authorization")
+            }),
+            Err(Error::Protection)
+        ));
+    }
+    let Destination::Stdio {
+        sandbox_profile, ..
+    } = &mut fixture.server.transport
+    else {
+        panic!("fixture is not stdio");
+    };
+    *sandbox_profile = "loopback".into();
+    fixture.policy = loopback;
+    let mut connection = fixture.connect();
+    connection
+        .initialize(std::future::pending(), || true)
+        .await
+        .unwrap();
+    assert_catalog(&mut connection).await;
+    connection.shutdown().await.unwrap();
+    assert!(connection.take_pending_cleanup().is_none());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn native_stdio_discovers_the_same_catalog_and_confirms_shutdown() {
     // Only the explicit stdio profile accepts a server that speaks 2024-11-05.
     for (fixture, profile, success) in [

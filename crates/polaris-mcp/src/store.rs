@@ -11,8 +11,9 @@ pub mod ledger_v1;
 pub(crate) mod migration_v2;
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 #[cfg(unix)]
-use std::ffi::CString;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 #[cfg(unix)]
 use std::fs::OpenOptions;
@@ -23,8 +24,12 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use polaris_auth::protection::protect_store;
@@ -41,6 +46,18 @@ use crate::registration::{MAX_STORE_BYTES, bounded_json};
 
 #[cfg(unix)]
 const CATALOG: &str = "catalog.json";
+#[cfg(unix)]
+static RUNTIME_PARTIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(unix)]
+const RUNTIME_MAX_ENTRIES: usize = 100_000;
+#[cfg(unix)]
+const RUNTIME_MAX_FILES: usize = 50_000;
+#[cfg(unix)]
+const RUNTIME_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+#[cfg(unix)]
+const RUNTIME_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(unix)]
+const RUNTIME_MAX_DEPTH: usize = 64;
 
 /// Secret values deliberately have no Debug implementation or public serializer.
 pub struct Secrets(SecretDocument);
@@ -254,6 +271,66 @@ pub struct Store {
     path: PathBuf,
 }
 
+/// A host-derived destination for one immutable server runtime version.
+///
+/// Fields stay private so callers cannot substitute another store, server, or
+/// version path between approval and creation.
+#[derive(Clone)]
+pub struct RuntimeVersionPlan {
+    server_id: String,
+    operation_id: String,
+    destination: PathBuf,
+    store_dev: u64,
+    store_ino: u64,
+}
+
+impl RuntimeVersionPlan {
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+}
+
+/// A newly created private directory below the plan's exact server parent.
+/// Dropping it intentionally leaves recovery evidence in place.
+pub struct RuntimeVersionStaging {
+    store_home: File,
+    store_directory: File,
+    directory: File,
+    parent: File,
+    partial_name: OsString,
+    plan: RuntimeVersionPlan,
+}
+
+impl RuntimeVersionStaging {
+    pub fn try_clone_directory(&self) -> Result<File, Error> {
+        self.directory.try_clone().map_err(|_| Error::Storage)
+    }
+}
+
+/// A published runtime pinned by an open descriptor.
+pub struct PublishedRuntime {
+    directory: File,
+    path: PathBuf,
+}
+
+impl PublishedRuntime {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn try_clone_directory(&self) -> Result<File, Error> {
+        self.directory.try_clone().map_err(|_| Error::Storage)
+    }
+}
+
 #[cfg(unix)]
 struct WriterLock(File);
 #[cfg(unix)]
@@ -290,7 +367,12 @@ fn metadata(file: &File, directory: bool) -> Result<(), Error> {
 
 #[cfg(unix)]
 fn open_at(parent: &File, name: &str, flags: i32) -> Result<File, std::io::Error> {
-    let name = CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    open_at_os(parent, OsStr::new(name), flags)
+}
+
+#[cfg(unix)]
+fn open_at_os(parent: &File, name: &OsStr, flags: i32) -> Result<File, std::io::Error> {
+    let name = CString::new(name.as_bytes()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
     // SAFETY: parent owns a live descriptor and name is terminated. A successful
     // openat returns a new descriptor, immediately transferred to File.
     let fd = unsafe {
@@ -335,6 +417,327 @@ fn parent_metadata(file: &File) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn check_store_directory(home: &File, directory: &File) -> Result<(), Error> {
+    let parent = open_at(home, ".polaris", libc::O_RDONLY | libc::O_DIRECTORY)
+        .map_err(|_| Error::Protection)?;
+    parent_metadata(&parent)?;
+    let current = open_at(&parent, "mcp", libc::O_RDONLY | libc::O_DIRECTORY)
+        .map_err(|_| Error::Protection)?;
+    metadata(&current, true)?;
+    let a = current.metadata().map_err(|_| Error::Storage)?;
+    let b = directory.metadata().map_err(|_| Error::Storage)?;
+    if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+        return Err(Error::Protection);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_home(home: &Path) -> Result<(File, PathBuf), Error> {
+    if !home.is_absolute() || home.canonicalize().map_err(|_| Error::Protection)? != home {
+        return Err(Error::Protection);
+    }
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(home)
+        .map_err(|_| Error::Protection)?;
+    let m = root.metadata().map_err(|_| Error::Storage)?;
+    if m.uid() != unsafe { libc::geteuid() } || !m.is_dir() {
+        return Err(Error::Protection);
+    }
+    Ok((root, home.join(".polaris/mcp")))
+}
+
+#[cfg(unix)]
+fn reserve_store_paths(path: &Path) -> Result<(), Error> {
+    // Reserve every protected path before opening a document or lock inode.
+    drop(protect_store(&path.join("servers.json")).map_err(|_| Error::Protection)?);
+    drop(protect_store(&path.join("secrets.json")).map_err(|_| Error::Protection)?);
+    drop(protect_store(&path.join("owner.lock")).map_err(|_| Error::Protection)?);
+    drop(protect_store(&path.join(CATALOG)).map_err(|_| Error::Protection)?);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn valid_runtime_operation_id(operation_id: &str) -> bool {
+    operation_id.len() == 32
+        && operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(unix)]
+fn runtime_version_name(operation_id: &str) -> String {
+    format!("runtime-{operation_id}")
+}
+
+#[cfg(unix)]
+fn runtime_entry_names(directory: &File) -> Result<Vec<OsString>, Error> {
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(Error::Storage);
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(Error::Storage);
+    }
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            let close = unsafe { libc::closedir(stream) };
+            if close != 0 || error.raw_os_error().unwrap_or(0) != 0 {
+                return Err(Error::Storage);
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsString::from_vec(name.to_vec()));
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn sync_runtime_tree(directory: &File) -> Result<(), Error> {
+    let mut budget = RuntimeSyncBudget::default();
+    sync_runtime_tree_inner(directory, 0, &mut budget)
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct RuntimeSyncBudget {
+    entries: usize,
+    files: usize,
+    bytes: u64,
+}
+
+#[cfg(unix)]
+fn sync_runtime_tree_inner(
+    directory: &File,
+    depth: usize,
+    budget: &mut RuntimeSyncBudget,
+) -> Result<(), Error> {
+    if depth > RUNTIME_MAX_DEPTH {
+        return Err(Error::Limit);
+    }
+    let metadata = directory.metadata().map_err(|_| Error::Storage)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(Error::Protection);
+    }
+    for name in runtime_entry_names(directory)? {
+        budget.entries = budget.entries.checked_add(1).ok_or(Error::Limit)?;
+        if budget.entries > RUNTIME_MAX_ENTRIES {
+            return Err(Error::Limit);
+        }
+        let bytes = name.as_os_str().as_bytes();
+        let c_name = CString::new(bytes).map_err(|_| Error::Protection)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                c_name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(Error::Protection);
+        }
+        let stat = unsafe { stat.assume_init() };
+        let kind = stat.st_mode & libc::S_IFMT;
+        if stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & 0o022 != 0 {
+            return Err(Error::Protection);
+        }
+        if kind == libc::S_IFDIR {
+            let child = open_at_os(directory, &name, libc::O_RDONLY | libc::O_DIRECTORY)
+                .map_err(|_| Error::Protection)?;
+            if !same_runtime_identity(&child.metadata().map_err(|_| Error::Storage)?, &stat) {
+                return Err(Error::Protection);
+            }
+            sync_runtime_tree_inner(&child, depth + 1, budget)?;
+        } else if kind == libc::S_IFREG && stat.st_nlink == 1 {
+            let file =
+                open_at_os(directory, &name, libc::O_RDONLY).map_err(|_| Error::Protection)?;
+            let reopened = file.metadata().map_err(|_| Error::Storage)?;
+            if !same_runtime_identity(&reopened, &stat)
+                || !reopened.is_file()
+                || reopened.uid() != unsafe { libc::geteuid() }
+                || reopened.mode() & 0o022 != 0
+                || reopened.nlink() != 1
+            {
+                return Err(Error::Protection);
+            }
+            budget.files = budget.files.checked_add(1).ok_or(Error::Limit)?;
+            budget.bytes = budget
+                .bytes
+                .checked_add(reopened.len())
+                .ok_or(Error::Limit)?;
+            if budget.files > RUNTIME_MAX_FILES
+                || reopened.len() > RUNTIME_MAX_FILE_BYTES
+                || budget.bytes > RUNTIME_MAX_TOTAL_BYTES
+            {
+                return Err(Error::Limit);
+            }
+            file.sync_all().map_err(|_| Error::Storage)?;
+        } else {
+            return Err(Error::Protection);
+        }
+    }
+    directory.sync_all().map_err(|_| Error::Storage)
+}
+
+#[cfg(target_os = "macos")]
+fn same_runtime_identity(metadata: &std::fs::Metadata, stat: &libc::stat) -> bool {
+    metadata.dev() == stat.st_dev as u64 && metadata.ino() == stat.st_ino
+}
+
+#[cfg(target_os = "linux")]
+fn same_runtime_identity(metadata: &std::fs::Metadata, stat: &libc::stat) -> bool {
+    metadata.dev() == stat.st_dev && metadata.ino() == stat.st_ino
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn same_runtime_identity(metadata: &std::fs::Metadata, stat: &libc::stat) -> bool {
+    metadata.dev() == stat.st_dev as u64 && metadata.ino() == stat.st_ino as u64
+}
+
+#[cfg(unix)]
+fn rename_no_replace(
+    from: &File,
+    source: &OsStr,
+    to: &File,
+    destination: &OsStr,
+) -> Result<(), Error> {
+    let source = CString::new(source.as_bytes()).map_err(|_| Error::Protection)?;
+    let destination = CString::new(destination.as_bytes()).map_err(|_| Error::Protection)?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                from.as_raw_fd(),
+                source.as_ptr(),
+                to.as_raw_fd(),
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                from.as_raw_fd(),
+                source.as_ptr(),
+                to.as_raw_fd(),
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::RevisionConflict
+            } else {
+                Error::Storage
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (from, source, to, destination);
+        Err(Error::Protection)
+    }
+}
+
+#[cfg(unix)]
+impl RuntimeVersionStaging {
+    /// Verify, durably publish with no replacement, then verify the exact
+    /// published descriptor again. The callback is the caller's manifest and
+    /// admission boundary and receives only the bound directory.
+    pub fn publish(
+        self,
+        verify: impl Fn(&File) -> Result<(), Error>,
+    ) -> Result<PublishedRuntime, Error> {
+        verify(&self.directory)?;
+        sync_runtime_tree(&self.directory)?;
+        let destination_name = runtime_version_name(&self.plan.operation_id);
+        rename_no_replace(
+            &self.parent,
+            &self.partial_name,
+            &self.parent,
+            OsStr::new(&destination_name),
+        )?;
+        self.parent.sync_all().map_err(|_| Error::Storage)?;
+        let directory = open_at(
+            &self.parent,
+            &destination_name,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )
+        .map_err(|_| Error::Protection)?;
+        metadata(&directory, true)?;
+        let before = self.directory.metadata().map_err(|_| Error::Storage)?;
+        let after = directory.metadata().map_err(|_| Error::Storage)?;
+        if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+            return Err(Error::Protection);
+        }
+        check_store_directory(&self.store_home, &self.store_directory)?;
+        let servers = open_at(
+            &self.store_directory,
+            "servers",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )
+        .map_err(|_| Error::Protection)?;
+        let namespace_parent = open_at(
+            &servers,
+            &self.plan.server_id,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )
+        .map_err(|_| Error::Protection)?;
+        metadata(&namespace_parent, true)?;
+        let held_parent = self.parent.metadata().map_err(|_| Error::Storage)?;
+        let current_parent = namespace_parent.metadata().map_err(|_| Error::Storage)?;
+        if (held_parent.dev(), held_parent.ino()) != (current_parent.dev(), current_parent.ino()) {
+            return Err(Error::Protection);
+        }
+        let namespace_directory = open_at(
+            &namespace_parent,
+            &destination_name,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )
+        .map_err(|_| Error::Protection)?;
+        metadata(&namespace_directory, true)?;
+        let current = namespace_directory.metadata().map_err(|_| Error::Storage)?;
+        if (after.dev(), after.ino()) != (current.dev(), current.ino()) {
+            return Err(Error::Protection);
+        }
+        sync_runtime_tree(&directory)?;
+        verify(&directory)?;
+        self.parent.sync_all().map_err(|_| Error::Storage)?;
+        Ok(PublishedRuntime {
+            directory,
+            path: self.plan.destination,
+        })
+    }
+}
+
 impl Store {
     /// Whether a store directory was ever created, without creating it.
     pub fn exists(home: &Path) -> bool {
@@ -349,24 +752,8 @@ impl Store {
     /// `home` must be the trusted OS-resolved canonical home, never project input.
     /// Reserve store paths before calling any model-visible reader.
     pub fn open(home: &Path) -> Result<Self, Error> {
-        if !home.is_absolute() || home.canonicalize().map_err(|_| Error::Protection)? != home {
-            return Err(Error::Protection);
-        }
-        let path = home.join(".polaris/mcp");
-        // Reserve both stores before creating any file that can contain secrets.
-        drop(protect_store(&path.join("servers.json")).map_err(|_| Error::Protection)?);
-        drop(protect_store(&path.join("secrets.json")).map_err(|_| Error::Protection)?);
-        drop(protect_store(&path.join("owner.lock")).map_err(|_| Error::Protection)?);
-        drop(protect_store(&path.join(CATALOG)).map_err(|_| Error::Protection)?);
-        let root = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(home)
-            .map_err(|_| Error::Protection)?;
-        let m = root.metadata().map_err(|_| Error::Storage)?;
-        if m.uid() != unsafe { libc::geteuid() } || !m.is_dir() {
-            return Err(Error::Protection);
-        }
+        let (root, path) = open_home(home)?;
+        reserve_store_paths(&path)?;
         let polaris = private_directory(&root, ".polaris", false)?;
         let directory = private_directory(&polaris, "mcp", true)?;
         Ok(Self {
@@ -376,10 +763,28 @@ impl Store {
         })
     }
 
-    fn writer_lock(&self) -> Result<WriterLock, Error> {
-        // Do not keep the in-process protection lock while awaiting a file lock.
-        let file = open_at(&self.directory, "owner.lock", libc::O_RDWR | libc::O_CREAT)
+    /// Open a previously initialized store without creating any directory,
+    /// destination, or lock file. Used by approval preflight only.
+    pub fn open_existing(home: &Path) -> Result<Self, Error> {
+        let (root, path) = open_home(home)?;
+        reserve_store_paths(&path)?;
+        let polaris = open_at(&root, ".polaris", libc::O_RDONLY | libc::O_DIRECTORY)
             .map_err(|_| Error::Protection)?;
+        parent_metadata(&polaris)?;
+        let directory = open_at(&polaris, "mcp", libc::O_RDONLY | libc::O_DIRECTORY)
+            .map_err(|_| Error::Protection)?;
+        metadata(&directory, true)?;
+        Ok(Self {
+            home: root,
+            directory,
+            path,
+        })
+    }
+
+    fn writer_lock_with_creation(&self, create: bool) -> Result<WriterLock, Error> {
+        // Do not keep the in-process protection lock while awaiting a file lock.
+        let flags = libc::O_RDWR | if create { libc::O_CREAT } else { 0 };
+        let file = open_at(&self.directory, "owner.lock", flags).map_err(|_| Error::Protection)?;
         metadata(&file, false)?;
         // Short reads hold the lock for milliseconds; a busy lock past this
         // bound is reported as a conflict rather than awaited.
@@ -396,19 +801,12 @@ impl Store {
         Ok(guard)
     }
 
+    fn writer_lock(&self) -> Result<WriterLock, Error> {
+        self.writer_lock_with_creation(true)
+    }
+
     fn check_directory(&self) -> Result<(), Error> {
-        let parent = open_at(&self.home, ".polaris", libc::O_RDONLY | libc::O_DIRECTORY)
-            .map_err(|_| Error::Protection)?;
-        parent_metadata(&parent)?;
-        let current = open_at(&parent, "mcp", libc::O_RDONLY | libc::O_DIRECTORY)
-            .map_err(|_| Error::Protection)?;
-        metadata(&current, true)?;
-        let a = current.metadata().map_err(|_| Error::Storage)?;
-        let b = self.directory.metadata().map_err(|_| Error::Storage)?;
-        if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
-            return Err(Error::Protection);
-        }
-        Ok(())
+        check_store_directory(&self.home, &self.directory)
     }
 
     pub fn load_registry(&self) -> Result<Option<Registry>, Error> {
@@ -421,7 +819,17 @@ impl Store {
     /// Trusted startup read, before any model-visible preparation. Retains the
     /// same store lock and protection guard through both reads and validation.
     pub fn load_snapshot(&self) -> Result<Snapshot, Error> {
-        let _writer = self.writer_lock()?;
+        self.load_snapshot_with_creation(true)
+    }
+
+    /// Read and validate one snapshot while opening the existing owner lock
+    /// without O_CREAT. The lock is released before this method returns.
+    pub fn load_snapshot_noncreating(&self) -> Result<Snapshot, Error> {
+        self.load_snapshot_with_creation(false)
+    }
+
+    fn load_snapshot_with_creation(&self, create_lock: bool) -> Result<Snapshot, Error> {
+        let _writer = self.writer_lock_with_creation(create_lock)?;
         let mut protection =
             protect_store(&self.path.join("servers.json")).map_err(|_| Error::Protection)?;
         self.require_no_temp("servers.json")?;
@@ -496,6 +904,91 @@ impl Store {
         drop(private_directory(&servers, server_id, true)?);
         self.check_directory()?;
         Ok(self.path.join("servers").join(server_id))
+    }
+
+    /// Derive one immutable runtime destination from the held store and exact
+    /// server/operation identities without creating it.
+    pub fn plan_runtime_version(
+        &self,
+        server_id: &str,
+        operation_id: &str,
+    ) -> Result<RuntimeVersionPlan, Error> {
+        if !valid_id(server_id) || !valid_runtime_operation_id(operation_id) {
+            return Err(Error::InvalidRegistration);
+        }
+        self.check_directory()?;
+        let store = self.directory.metadata().map_err(|_| Error::Storage)?;
+        Ok(RuntimeVersionPlan {
+            server_id: server_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            destination: self
+                .path
+                .join("servers")
+                .join(server_id)
+                .join(runtime_version_name(operation_id)),
+            store_dev: store.dev(),
+            store_ino: store.ino(),
+        })
+    }
+
+    /// Create a unique private partial below the plan's exact server parent.
+    /// This is intentionally a post-approval operation.
+    pub fn create_runtime_version_staging(
+        &self,
+        plan: &RuntimeVersionPlan,
+    ) -> Result<RuntimeVersionStaging, Error> {
+        self.validate_runtime_plan(plan)?;
+        let servers = private_directory(&self.directory, "servers", true)?;
+        let parent = private_directory(&servers, &plan.server_id, true)?;
+        let mut created = None;
+        for _ in 0..64 {
+            let sequence = RUNTIME_PARTIAL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                ".partial-{}-{:x}-{sequence:016x}",
+                plan.operation_id,
+                std::process::id()
+            );
+            let c_name = CString::new(name.as_str()).map_err(|_| Error::Storage)?;
+            let result = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) };
+            if result == 0 {
+                let directory = open_at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY)
+                    .map_err(|_| Error::Protection)?;
+                metadata(&directory, true)?;
+                parent.sync_all().map_err(|_| Error::Storage)?;
+                created = Some((OsString::from(name), directory));
+                break;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(Error::Storage);
+            }
+        }
+        let (partial_name, directory) = created.ok_or(Error::RevisionConflict)?;
+        Ok(RuntimeVersionStaging {
+            store_home: self.home.try_clone().map_err(|_| Error::Storage)?,
+            store_directory: self.directory.try_clone().map_err(|_| Error::Storage)?,
+            directory,
+            parent,
+            partial_name,
+            plan: plan.clone(),
+        })
+    }
+
+    fn validate_runtime_plan(&self, plan: &RuntimeVersionPlan) -> Result<(), Error> {
+        self.check_directory()?;
+        let store = self.directory.metadata().map_err(|_| Error::Storage)?;
+        let exact = self
+            .path
+            .join("servers")
+            .join(&plan.server_id)
+            .join(runtime_version_name(&plan.operation_id));
+        if !valid_id(&plan.server_id)
+            || !valid_runtime_operation_id(&plan.operation_id)
+            || (store.dev(), store.ino()) != (plan.store_dev, plan.store_ino)
+            || plan.destination != exact
+        {
+            return Err(Error::Protection);
+        }
+        Ok(())
     }
 
     /// Derived cache: callers treat any error as an unavailable index.
@@ -716,6 +1209,10 @@ impl Store {
         Err(Error::Protection)
     }
 
+    pub fn open_existing(_home: &Path) -> Result<Self, Error> {
+        Err(Error::Protection)
+    }
+
     pub fn load_registry(&self) -> Result<Option<Registry>, Error> {
         Err(Error::Protection)
     }
@@ -725,6 +1222,10 @@ impl Store {
     }
 
     pub fn load_snapshot(&self) -> Result<Snapshot, Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn load_snapshot_noncreating(&self) -> Result<Snapshot, Error> {
         Err(Error::Protection)
     }
 
@@ -757,6 +1258,21 @@ impl Store {
         Err(Error::Protection)
     }
 
+    pub fn plan_runtime_version(
+        &self,
+        _server_id: &str,
+        _operation_id: &str,
+    ) -> Result<RuntimeVersionPlan, Error> {
+        Err(Error::Protection)
+    }
+
+    pub fn create_runtime_version_staging(
+        &self,
+        _plan: &RuntimeVersionPlan,
+    ) -> Result<RuntimeVersionStaging, Error> {
+        Err(Error::Protection)
+    }
+
     pub fn load_catalog_index(&self) -> Result<Option<CatalogIndex>, Error> {
         Err(Error::Protection)
     }
@@ -766,6 +1282,16 @@ impl Store {
         _server_id: &str,
         _entry: ServerIndex,
     ) -> Result<(usize, bool), Error> {
+        Err(Error::Protection)
+    }
+}
+
+#[cfg(not(unix))]
+impl RuntimeVersionStaging {
+    pub fn publish(
+        self,
+        _verify: impl Fn(&File) -> Result<(), Error>,
+    ) -> Result<PublishedRuntime, Error> {
         Err(Error::Protection)
     }
 }
@@ -788,6 +1314,231 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().canonicalize().unwrap()).unwrap();
         (dir, store)
+    }
+
+    fn staging_path(staging: &RuntimeVersionStaging) -> PathBuf {
+        staging
+            .plan
+            .destination
+            .parent()
+            .unwrap()
+            .join(&staging.partial_name)
+    }
+
+    #[test]
+    fn existing_store_snapshot_never_creates_store_or_lock() {
+        let absent = tempfile::tempdir().unwrap();
+        let home = absent.path().canonicalize().unwrap();
+        assert_eq!(Store::open_existing(&home).err(), Some(Error::Protection));
+        assert!(!home.join(".polaris").exists());
+
+        let (dir, store) = fixture();
+        let home = dir.path().canonicalize().unwrap();
+        assert!(!store.path.join("owner.lock").exists());
+        let existing = Store::open_existing(&home).unwrap();
+        assert_eq!(
+            existing.load_snapshot_noncreating().err(),
+            Some(Error::Protection)
+        );
+        assert!(!store.path.join("owner.lock").exists());
+
+        store.save_registry(0, &empty(1)).unwrap();
+        let existing = Store::open_existing(&home).unwrap();
+        assert_eq!(
+            existing.load_snapshot_noncreating().unwrap().registry,
+            Some(empty(1))
+        );
+        assert_eq!(
+            std::fs::metadata(store.path.join("owner.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn runtime_version_is_bound_to_store_server_and_lower_hex_operation() {
+        let (dir, store) = fixture();
+        let operation = "0123456789abcdef0123456789abcdef";
+        let plan = store.plan_runtime_version("unity", operation).unwrap();
+        assert_eq!(plan.server_id(), "unity");
+        assert_eq!(plan.operation_id(), operation);
+        assert_eq!(
+            plan.destination(),
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .join(".polaris/mcp/servers/unity")
+                .join(format!("runtime-{operation}"))
+        );
+        for invalid in [
+            "0123456789abcdef0123456789abcde",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            assert_eq!(
+                store.plan_runtime_version("unity", invalid).err(),
+                Some(Error::InvalidRegistration),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            store.plan_runtime_version("../other", operation).err(),
+            Some(Error::InvalidRegistration)
+        );
+
+        let (other_home, other) = fixture();
+        assert_eq!(
+            other.create_runtime_version_staging(&plan).err(),
+            Some(Error::Protection)
+        );
+        assert!(!other_home.path().join(".polaris/mcp/servers").exists());
+    }
+
+    #[test]
+    fn runtime_version_publishes_without_replacement_and_revalidates() {
+        let (_dir, store) = fixture();
+        let operation = "0123456789abcdef0123456789abcdef";
+        let plan = store.plan_runtime_version("unity", operation).unwrap();
+        let staging = store.create_runtime_version_staging(&plan).unwrap();
+        let staging_dir = staging_path(&staging);
+        assert!(
+            staging_dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".partial-")
+        );
+        std::fs::create_dir(staging_dir.join("build")).unwrap();
+        std::fs::write(staging_dir.join("build/index.js"), b"fixture entry").unwrap();
+        std::fs::set_permissions(
+            staging_dir.join("build/index.js"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let published = staging
+            .publish(|directory| {
+                calls.set(calls.get() + 1);
+                assert!(directory.metadata().unwrap().is_dir());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(published.path().join("build/index.js").is_file());
+        assert_eq!(
+            std::fs::metadata(published.path().join("build/index.js"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+        published.try_clone_directory().unwrap();
+        let repeated_plan = store.plan_runtime_version("unity", operation).unwrap();
+        let repeated = store
+            .create_runtime_version_staging(&repeated_plan)
+            .unwrap();
+        std::fs::write(staging_path(&repeated).join("different"), b"not published").unwrap();
+        assert_eq!(
+            repeated.publish(|_| Ok(())).err(),
+            Some(Error::RevisionConflict)
+        );
+        assert!(!published.path().join("different").exists());
+    }
+
+    #[test]
+    fn runtime_version_rejects_hardlinks_and_special_entries_before_publish() {
+        let (_dir, store) = fixture();
+        for (index, special) in [false, true].into_iter().enumerate() {
+            let operation = format!("{index:032x}");
+            let plan = store.plan_runtime_version("unity", &operation).unwrap();
+            let staging = store.create_runtime_version_staging(&plan).unwrap();
+            let staging_path = staging_path(&staging);
+            let target = staging_path.join("file");
+            std::fs::write(&target, b"fixture").unwrap();
+            if special {
+                symlink("file", staging_path.join("alias")).unwrap();
+            } else {
+                std::fs::hard_link(&target, staging_path.join("alias")).unwrap();
+            }
+            let destination = store
+                .plan_runtime_version("unity", &operation)
+                .unwrap()
+                .destination()
+                .to_path_buf();
+            assert_eq!(staging.publish(|_| Ok(())).err(), Some(Error::Protection));
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn runtime_version_requires_manifest_admission_before_and_after_publish() {
+        let (_dir, store) = fixture();
+        let pre_operation = "00000000000000000000000000000001";
+        let pre_plan = store.plan_runtime_version("unity", pre_operation).unwrap();
+        let pre_destination = pre_plan.destination().to_path_buf();
+        let pre_staging = store.create_runtime_version_staging(&pre_plan).unwrap();
+        let pre_partial = staging_path(&pre_staging);
+        std::fs::write(pre_partial.join("entry"), b"fixture").unwrap();
+        assert_eq!(
+            pre_staging.publish(|_| Err(Error::Protocol)).err(),
+            Some(Error::Protocol)
+        );
+        assert!(!pre_destination.exists());
+        assert!(pre_partial.join("entry").is_file());
+
+        let post_operation = "00000000000000000000000000000002";
+        let post_plan = store.plan_runtime_version("unity", post_operation).unwrap();
+        let post_destination = post_plan.destination().to_path_buf();
+        let post_staging = store.create_runtime_version_staging(&post_plan).unwrap();
+        std::fs::write(staging_path(&post_staging).join("entry"), b"fixture").unwrap();
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            post_staging
+                .publish(|_| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 {
+                        Ok(())
+                    } else {
+                        Err(Error::Protocol)
+                    }
+                })
+                .err(),
+            Some(Error::Protocol)
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(post_destination.join("entry").is_file());
+    }
+
+    #[test]
+    fn runtime_version_rejects_detached_server_namespace_after_publish() {
+        let (_dir, store) = fixture();
+        let operation = "0123456789abcdef0123456789abcdef";
+        let plan = store.plan_runtime_version("unity", operation).unwrap();
+        let destination = plan.destination().to_path_buf();
+        let staging = store.create_runtime_version_staging(&plan).unwrap();
+        std::fs::write(staging_path(&staging).join("entry"), b"fixture").unwrap();
+
+        let servers = store.path.join("servers");
+        let retired = servers.join("retired-unity");
+        std::fs::rename(servers.join("unity"), &retired).unwrap();
+        std::fs::create_dir(servers.join("unity")).unwrap();
+        std::fs::set_permissions(
+            servers.join("unity"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        assert_eq!(staging.publish(|_| Ok(())).err(), Some(Error::Protection));
+        assert!(!destination.exists());
+        assert!(
+            retired
+                .join(runtime_version_name(operation))
+                .join("entry")
+                .is_file()
+        );
     }
 
     #[test]

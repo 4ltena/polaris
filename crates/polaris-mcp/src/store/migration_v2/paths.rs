@@ -324,9 +324,16 @@ fn map_path(
         return Ok(path.to_owned());
     }
     if exact_cwd {
-        return (path == old_server)
-            .then(|| new_server.to_owned())
-            .ok_or(Error::InvalidRegistration);
+        if path == old_server {
+            return Ok(new_server.to_owned());
+        }
+        let relative = path
+            .strip_prefix(old_server)
+            .map_err(|_| Error::InvalidRegistration)?;
+        if is_runtime_version_child(relative) {
+            return Ok(new_server.join(relative));
+        }
+        return Err(Error::InvalidRegistration);
     }
     let relative = path
         .strip_prefix(old_server)
@@ -336,6 +343,26 @@ fn map_path(
     } else {
         Ok(new_server.join(relative))
     }
+}
+
+fn is_runtime_version_child(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return false;
+    };
+    if components.next().is_some() {
+        return false;
+    }
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(operation_id) = name.strip_prefix("runtime-") else {
+        return false;
+    };
+    operation_id.len() == 32
+        && operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn field_hash<T: Serialize>(

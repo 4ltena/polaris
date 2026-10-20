@@ -1300,6 +1300,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `turn_affinity.rs` — Opaque transport continuity scoped to one logical user turn.
 - `web_search.rs` — Hosted web-search request policy and Responses-style output parsing.
 
+## `crates/polaris-provider/src/codex`
+
+- `fold.rs` — Incrementally folds Codex Responses API SSE events into one completion.
+
 ## `crates/polaris-provider/src/codex_ws`
 
 - `tests.rs` — The two decisions that decide whether a continuation is safe to use.

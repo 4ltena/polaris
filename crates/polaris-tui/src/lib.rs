@@ -2257,6 +2257,48 @@ enum InflightInputAction {
     Interrupt,
 }
 
+fn slash_suggestions(
+    buffer: &str,
+    history: &input::History,
+    dispatching_queued_input: bool,
+) -> Vec<&'static slash::SlashCommand> {
+    // Queued and unchanged recalled commands must reach the parser intact.
+    if dispatching_queued_input || history.is_recalled(buffer) {
+        return Vec::new();
+    }
+    buffer
+        .strip_prefix('/')
+        .map(slash::matching)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SlashCompletionAction {
+    PassThrough,
+    Navigate,
+    Submit(&'static str),
+}
+
+fn slash_completion_action(
+    suggestions: &[&slash::SlashCommand],
+    selected: &mut usize,
+    key: ratatui::crossterm::event::KeyEvent,
+) -> SlashCompletionAction {
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind};
+
+    if key.kind != KeyEventKind::Press || suggestions.is_empty() {
+        return SlashCompletionAction::PassThrough;
+    }
+    *selected %= suggestions.len();
+    match key.code {
+        KeyCode::Down => *selected = (*selected + 1) % suggestions.len(),
+        KeyCode::Up => *selected = (*selected + suggestions.len() - 1) % suggestions.len(),
+        KeyCode::Enter => return SlashCompletionAction::Submit(suggestions[*selected].name),
+        _ => return SlashCompletionAction::PassThrough,
+    }
+    SlashCompletionAction::Navigate
+}
+
 const WINDOWS_OWNER_UNAVAILABLE: &str =
     "Windowsでは実行・変更に必要な保護機構が未対応です。変更していません。";
 
@@ -3934,18 +3976,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             || active_instruction.is_some();
         #[cfg(not(unix))]
         let has_pending_inputs = !queued_inputs.is_empty();
-        let suggestions = if dispatching_queued_input || input_history.is_recalled(&input_buffer) {
-            // Let the full command reach `slash::parse` below. The picker is
-            // for interactive completion and would otherwise reinterpret a
-            // queued or recalled command as its first highlighted prefix
-            // match, and consume keys meant for history navigation.
-            Vec::new()
-        } else {
-            match input_buffer.strip_prefix('/') {
-                Some(prefix) => slash::matching(prefix),
-                None => Vec::new(),
-            }
-        };
+        let suggestions =
+            slash_suggestions(&input_buffer, &input_history, dispatching_queued_input);
         if selected_suggestion >= suggestions.len() {
             selected_suggestion = 0;
         }
@@ -4324,19 +4356,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // picker. Typing the full command name and pressing Enter still
         // works too, since at that point it's the (only) highlighted row.
         if key.kind == ratatui::crossterm::event::KeyEventKind::Press && !suggestions.is_empty() {
-            use ratatui::crossterm::event::KeyCode;
-            match key.code {
-                KeyCode::Down => {
-                    selected_suggestion = (selected_suggestion + 1) % suggestions.len();
-                    continue;
-                }
-                KeyCode::Up => {
-                    selected_suggestion =
-                        (selected_suggestion + suggestions.len() - 1) % suggestions.len();
-                    continue;
-                }
-                KeyCode::Enter => {
-                    let action = slash::action_for(suggestions[selected_suggestion].name);
+            match slash_completion_action(&suggestions, &mut selected_suggestion, key) {
+                SlashCompletionAction::Navigate => continue,
+                SlashCompletionAction::Submit(command) => {
+                    let action = slash::action_for(command);
                     if let Err(error) = require_action_owner(&action) {
                         status = Status::Error(error.into());
                         continue;
@@ -4359,7 +4382,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     // normal Enter, preserving hidden drafts for new/quit.
                     record_submission_before_dispatch(
                         &mut input_history,
-                        &format!("/{}", suggestions[selected_suggestion].name),
+                        &format!("/{command}"),
                         dispatching_queued_input,
                     );
                     let pending_input = std::mem::take(&mut input_buffer);
@@ -5237,7 +5260,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         }
                     }
                 }
-                _ => {}
+                SlashCompletionAction::PassThrough => {}
             }
         }
 
@@ -6883,6 +6906,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         ) {
             history_wrap_cache.invalidate();
         }
+        let suggestions = slash_suggestions(&input_buffer, &input_history, false);
+        if selected_suggestion >= suggestions.len() {
+            selected_suggestion = 0;
+        }
+        let mut rendered_suggestion_count = suggestions.len();
         if terminal
             .borrow_mut()
             .draw(|f| {
@@ -6902,10 +6930,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         cwd_short: &cwd_footer_display,
                         effort_name: &effort_name,
                     },
-                    // `input_buffer` was just cleared by `apply_key`'s
-                    // Submit branch, so there's nothing to suggest against.
-                    &[],
-                    0,
+                    &suggestions,
+                    selected_suggestion,
                     &selection,
                 )
             })
@@ -7140,6 +7166,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             let mut mid_turn_notice_until: Option<Instant> = None;
 
             let turn_outcome = loop {
+                // A queued run may have restored a draft. These keys are
+                // interactive even when that run began from queued input.
+                let suggestions = slash_suggestions(&input_buffer, &input_history, false);
+                if selected_suggestion >= suggestions.len() {
+                    selected_suggestion = 0;
+                }
                 #[cfg(target_os = "linux")]
                 if let Some(reason) = signal::pending_linux_process_shutdown() {
                     break TurnOutcome::Shutdown(reason);
@@ -7259,8 +7291,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         cwd_short: &cwd_footer_display,
                                         effort_name: &effort_name,
                                     },
-                                    &[],
-                                    0,
+                                    &suggestions,
+                                    selected_suggestion,
                                     &selection,
                                 )
                             })
@@ -7268,6 +7300,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         {
                             break TurnOutcome::Fatal;
                         }
+                        rendered_suggestion_count = suggestions.len();
                     }
                     maybe_event = event_stream.next() => {
                         use ratatui::crossterm::event::{
@@ -7276,6 +7309,15 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         };
                         match maybe_event {
                             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                                match slash_completion_action(&suggestions, &mut selected_suggestion, key) {
+                                    SlashCompletionAction::Navigate => continue,
+                                    SlashCompletionAction::Submit(command) => {
+                                        input_buffer = format!("/{command}");
+                                        input_cursor = input_buffer.len();
+                                        selected_suggestion = 0;
+                                    }
+                                    SlashCompletionAction::PassThrough => {}
+                                }
                                 // Esc interrupts the in-flight turn;
                                 // PageUp/PageDown still scroll the
                                 // conversation history while a turn is
@@ -7341,8 +7383,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                         cwd_short: &cwd_footer_display,
                                                         effort_name: &effort_name,
                                                     },
-                                                    &[],
-                                                    0,
+                                                    &suggestions,
+                                                    selected_suggestion,
                                                     &selection,
                                                 )
                                             })
@@ -7350,6 +7392,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         {
                                             break TurnOutcome::Fatal;
                                         }
+                                        rendered_suggestion_count = suggestions.len();
                                     }
                                     #[cfg(unix)]
                                     KeyCode::Enter if input_buffer.starts_with("/instruction ") => {
@@ -7432,7 +7475,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         &mut queued_inputs,
                                         key,
                                     ) {
-                                        InflightInputAction::Continue => {}
+                                        InflightInputAction::Continue => { selected_suggestion = 0; }
                                         InflightInputAction::Queued => {
                                             #[cfg(unix)]
                                             if queued_inputs.back().is_some_and(|text|!text.starts_with('/')) && runtime_persistence.is_some() {
@@ -7482,16 +7525,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
                                 }
                                 MouseEventKind::Down(MouseButton::Left) => {
-                                    // Mid-turn `draw_frame` calls always pass
-                                    // a literal `&[]` for suggestions (the
-                                    // popup never shows once a turn is in
-                                    // flight — the input buffer that would
-                                    // drive it was already cleared on
-                                    // submit), so `footer_height(0)` always
-                                    // matches what this frame actually
-                                    // rendered.
+                                    // Input may change before the next ticker redraw.
+                                    // Hit-test the footer that is actually on screen.
                                     let history_area_height = area_height_for_history(
-                                        render::footer_height(0),
+                                        render::footer_height(rendered_suggestion_count),
                                         terminal_height(&terminal),
                                     );
                                     if mouse.row < history_area_height {
@@ -7525,11 +7562,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     if let Some(sel) = selection.as_mut()
                                         && sel.dragging
                                     {
-                                        // See the `Down` arm above: mid-turn
-                                        // `draw_frame` calls always pass `&[]`
-                                        // for suggestions.
                                         let history_area_height = area_height_for_history(
-                                            render::footer_height(0),
+                                            render::footer_height(rendered_suggestion_count),
                                             terminal_height(&terminal),
                                         );
                                         let width = terminal_width(&terminal);
@@ -7594,8 +7628,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                             cwd_short: &cwd_footer_display,
                                                             effort_name: &effort_name,
                                                         },
-                                                        &[],
-                                                        0,
+                                                        &suggestions,
+                                                        selected_suggestion,
                                                         &selection,
                                                     )
                                                 })
@@ -7603,6 +7637,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             {
                                                 break TurnOutcome::Fatal;
                                             }
+                                            rendered_suggestion_count = suggestions.len();
                                         }
                                     }
                                 }
@@ -15166,7 +15201,7 @@ mod tests {
             ),
             InflightInputAction::Queued
         );
-        for character in "/model".chars() {
+        for character in "/m".chars() {
             apply_inflight_key(
                 &mut buffer,
                 &mut cursor,
@@ -15175,6 +15210,21 @@ mod tests {
                 key(KeyCode::Char(character)),
             );
         }
+        let suggestions = slash_suggestions(&buffer, &history, false);
+        let mut selected = 0;
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Up] {
+            assert_eq!(
+                slash_completion_action(&suggestions, &mut selected, key(code)),
+                SlashCompletionAction::Navigate
+            );
+        }
+        let completed = slash_completion_action(&suggestions, &mut selected, key(KeyCode::Enter));
+        assert_eq!(completed, SlashCompletionAction::Submit("model"));
+        let SlashCompletionAction::Submit(command) = completed else {
+            unreachable!()
+        };
+        buffer = format!("/{command}");
+        cursor = buffer.len();
         assert_eq!(
             apply_inflight_key(
                 &mut buffer,
@@ -15200,6 +15250,31 @@ mod tests {
         assert_eq!(history.older(""), Some("/model"));
         assert_eq!(history.older(""), Some("next prompt"));
         assert_eq!(history.older(""), None);
+    }
+
+    #[test]
+    fn slash_completion_preserves_recalled_and_queued_commands() {
+        let mut history = input::History::new();
+        history.record("/subagents");
+        assert_eq!(history.older("independent draft"), Some("/subagents"));
+        assert!(slash_suggestions("/subagents", &history, false).is_empty());
+        assert!(slash_suggestions("/sub", &history, true).is_empty());
+
+        // Editing a recalled command, or typing during a queued run, uses
+        // interactive completion without consuming the saved history draft.
+        let suggestions = slash_suggestions("/sub", &history, false);
+        assert_eq!(suggestions.len(), 1);
+        let mut selected = 0;
+        assert_eq!(
+            slash_completion_action(
+                &suggestions,
+                &mut selected,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ),
+            SlashCompletionAction::Submit("subagents")
+        );
+        assert_eq!(history.newer(), Some("independent draft"));
+        assert!(slash_suggestions("/subagents list", &history, false).is_empty());
     }
 
     #[test]

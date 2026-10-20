@@ -231,9 +231,9 @@ struct WorkspaceComposerInput: View {
     private func modelDisplayName(_ option: WorkspaceModelConfiguration) -> String {
         let value = (option.id + " " + option.title).lowercased()
         if value.contains("gpt-6-astra") { return "Astra" }
-        if value.contains("gpt-5.6-sol") { return "Sol" }
+        if value.contains("gpt-6.1-sol") || value.contains("gpt-5.6-sol") { return "Sol" }
         if value.contains("gpt-5.6-terra") { return "Terra" }
-        if value.contains("gpt-5.6-luna") { return "Luna" }
+        if value.contains("gpt-6-luna") || value.contains("gpt-5.6-luna") { return "Luna" }
         if value.contains("ollama|") || value.contains("lmstudio|") || value.contains("llamacpp|") || value.contains("local") {
             return "ローカルモデル"
         }

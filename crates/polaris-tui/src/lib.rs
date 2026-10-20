@@ -11305,7 +11305,7 @@ async fn model_inventory_read_lines(
     Ok(lines)
 }
 
-/// Runs the `/model` picker — four hosted choices plus one local-runtime
+/// Runs the `/model` picker — three hosted choices plus one local-runtime
 /// entry. Reasoning effort is intentionally absent because routing owns it.
 fn run_model_picker<B: ratatui::backend::Backend, R: approver::KeyReader>(
     terminal: &RefCell<ratatui::Terminal<B>>,
@@ -18827,7 +18827,7 @@ mod tests {
         let usage_meter = polaris_provider::UsageMeter::default();
         let local_router = polaris_core::local_execution::LocalRouter::new(1);
         let mut provider_name = "codex".to_string();
-        let mut model_name = "gpt-5.6-sol".to_string();
+        let mut model_name = "gpt-6-astra".to_string();
         let mut effort_name = render::DEFAULT_EFFORT.to_string();
         let mut status = Status::Idle;
 
@@ -18847,19 +18847,19 @@ mod tests {
         )
         .await;
 
-        assert_eq!(model_name, "gpt-5.6-terra");
+        assert_eq!(model_name, "gpt-6.1-sol");
         assert_eq!(provider_name, "codex");
         assert_eq!(effort_name, render::DEFAULT_EFFORT);
         assert!(Arc::ptr_eq(&provider, &cloud_dyn));
         assert_eq!(
             *cloud.model.lock().expect("lock"),
-            Some("gpt-5.6-terra".to_string()),
+            Some("gpt-6.1-sol".to_string()),
             "the provider itself must be switched, not just the display copy"
         );
         assert_eq!(*cloud.effort.lock().expect("lock"), None);
         match status {
             Status::Notice(n) => {
-                assert!(n.contains("gpt-5.6-terra"));
+                assert!(n.contains("gpt-6.1-sol"));
             }
             _ => panic!("expected a Notice"),
         }
@@ -18876,7 +18876,7 @@ mod tests {
         let usage_meter = polaris_provider::UsageMeter::default();
         let local_router = polaris_core::local_execution::LocalRouter::new(1);
         let mut provider_name = "codex".to_string();
-        let mut model_name = "gpt-5.6-sol".to_string();
+        let mut model_name = "gpt-6-astra".to_string();
         let mut effort_name = render::DEFAULT_EFFORT.to_string();
         let mut status = Status::Idle;
 
@@ -18896,7 +18896,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(model_name, "gpt-5.6-sol");
+        assert_eq!(model_name, "gpt-6-astra");
         assert_eq!(effort_name, render::DEFAULT_EFFORT);
         assert_eq!(*cloud.model.lock().expect("lock"), None);
         assert_eq!(*cloud.effort.lock().expect("lock"), None);

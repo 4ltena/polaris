@@ -1851,12 +1851,7 @@ pub fn render_workflow_change_confirmation(
 
 /// Fixed hosted choices for `/model`. Local runtimes are discovered only
 /// after the separate local-model row is chosen.
-pub const MODEL_CATALOG: &[&str] = &[
-    "gpt-6-astra",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-];
+pub const MODEL_CATALOG: &[&str] = &["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"];
 pub const RECOMMENDED_MODEL: &str = "gpt-6-astra";
 pub const LOCAL_MODEL_LABEL: &str = "Local model";
 
@@ -3065,6 +3060,7 @@ mod tests {
 
     #[test]
     fn the_model_picker_marks_the_current_model_and_highlights_the_selection() {
+        assert_eq!(MODEL_CATALOG, &["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"]);
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -3083,8 +3079,10 @@ mod tests {
             rows.iter()
                 .any(|r| r.contains("gpt-6-astra (recommended, current)"))
         );
+        assert!(rows.iter().any(|r| r.contains("gpt-6.1-sol")));
+        assert!(rows.iter().any(|r| r.contains("gpt-6-luna")));
         assert!(rows.iter().any(|r| r.contains("Local model")));
-        assert!(!rows.iter().any(|r| r.contains("gpt-5.5")));
+        assert!(!rows.iter().any(|r| r.contains("terra")));
         assert!(rows.iter().any(|r| r.contains("enter to confirm")));
     }
 
@@ -3110,8 +3108,8 @@ mod tests {
     fn the_model_picker_keeps_the_selected_option_visible_on_a_short_terminal() {
         let mut terminal = Terminal::new(TestBackend::new(70, 8)).expect("terminal");
         for (selected, expected) in [
-            (MODEL_CATALOG.len(), "❯ 5. Local model"),
-            (MODEL_CATALOG.len() - 1, "❯ 4. gpt-5.6-luna"),
+            (MODEL_CATALOG.len(), "❯ 4. Local model"),
+            (MODEL_CATALOG.len() - 1, "❯ 3. gpt-6-luna"),
         ] {
             terminal
                 .draw(|f| render_model_picker(f, "gpt-6-astra", false, selected))

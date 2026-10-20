@@ -157,9 +157,8 @@ private struct NativeConversationView: View {
     private var modelOptions: [WorkspaceModelConfiguration] {
         let cloud = [
             WorkspaceModelConfiguration(id: "codex|gpt-6-astra", title: "gpt-6-astra", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true),
-            WorkspaceModelConfiguration(id: "codex|gpt-5.6-sol", title: "gpt-5.6-sol", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true),
-            WorkspaceModelConfiguration(id: "codex|gpt-5.6-terra", title: "gpt-5.6-terra", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true),
-            WorkspaceModelConfiguration(id: "codex|gpt-5.6-luna", title: "gpt-5.6-luna", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true)
+            WorkspaceModelConfiguration(id: "codex|gpt-6.1-sol", title: "gpt-6.1-sol", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true),
+            WorkspaceModelConfiguration(id: "codex|gpt-6-luna", title: "gpt-6-luna", destination: "codex", effort: "medium", unavailableReason: nil, supportsAttachments: true)
         ]
         let local = inventories.flatMap { inventory in
             inventory.models.map { observed in

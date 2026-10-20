@@ -16,6 +16,7 @@ use crate::audit::{AuditLog, Record};
 use crate::session::Session;
 use crate::stop::{StopReason, StopTracker};
 
+mod delegated_read;
 #[cfg(test)]
 mod input_preparation_tests;
 mod mcp_dispatch;
@@ -2646,73 +2647,24 @@ async fn prepare_project_analysis_context(
         }]
     })
     .to_string();
-    if let Some(sink) = &events {
-        let _ = sink.send(crate::events::AgentEvent::ToolStarted {
-            name: "spawn".into(),
-            detail: detail.clone(),
-        });
-    }
-    check_event_delivery(events.as_ref())?;
-
-    let control = session
-        .issue_spawn_control(1)
-        .map_err(std::io::Error::other)?;
-    let result = Box::pin(crate::spawn::run_wave_with_gate_controlled(
-        vec![task],
+    let entry = delegated_read::run(
+        session,
+        task,
+        detail,
+        &reader.path,
+        caller,
+        delegated_read::EventResult::Raw,
         agent_types,
         provider_pool,
-        audit.clone(),
-        ctx.sandbox,
-        ctx.helper,
+        audit,
+        events,
+        child_workflow,
         spawn_concurrency,
         spawn_write_concurrency,
-        events.clone(),
-        child_workflow,
-        ctx.gate,
-        session.tier_decider.as_deref(),
-        1,
-        session.child_memory.clone(),
-        control,
-    ))
-    .await;
-
-    if let Some(sink) = &events {
-        let ok = serde_json::from_str::<serde_json::Value>(&result)
-            .ok()
-            .and_then(|value| {
-                value
-                    .as_array()
-                    .and_then(|entries| entries.first())
-                    .cloned()
-            })
-            .and_then(|entry| entry.get("ok").and_then(serde_json::Value::as_bool))
-            .unwrap_or(false);
-        let _ = sink.send(crate::events::AgentEvent::ToolFinished {
-            name: "spawn".into(),
-            detail: detail.clone(),
-            ok,
-            result: result.clone(),
-            diff: None,
-        });
-    }
-    check_event_delivery(events.as_ref())?;
-    audit.lock().await.record(&Record {
-        tool: "spawn",
-        detail: &detail,
-        sandbox: None,
-        target: Some(&reader.path),
-        result: &result,
-        caller,
-    })?;
-
-    let entry = serde_json::from_str::<serde_json::Value>(&result)
-        .ok()
-        .and_then(|value| {
-            value
-                .as_array()
-                .and_then(|entries| entries.first())
-                .cloned()
-        });
+        ctx,
+    )
+    .await?
+    .entry;
     let answer_only = match entry {
         Some(entry) if entry.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
             let evidence = entry
@@ -2806,48 +2758,30 @@ async fn delegate_review_read(
         }]
     })
     .to_string();
-    if let Some(sink) = &events {
-        let _ = sink.send(crate::events::AgentEvent::ToolStarted {
-            name: "spawn".into(),
-            detail: detail.clone(),
-        });
-    }
-    check_event_delivery(events.as_ref())?;
-    let control = session
-        .issue_spawn_control(1)
-        .map_err(std::io::Error::other)?;
-    let result = Box::pin(crate::spawn::run_wave_with_gate_controlled(
-        vec![task],
+    let delegated = delegated_read::run(
+        session,
+        task,
+        detail,
+        path,
+        "root",
+        delegated_read::EventResult::Brief,
         agent_types,
         provider_pool,
-        audit.clone(),
-        ctx.sandbox,
-        ctx.helper,
+        audit,
+        events,
+        child_workflow,
         spawn_concurrency,
         spawn_write_concurrency,
-        events.clone(),
-        child_workflow,
-        ctx.gate,
-        session.tier_decider.as_deref(),
-        1,
-        session.child_memory.clone(),
-        control,
-    ))
-    .await;
-    let entry = serde_json::from_str::<serde_json::Value>(&result)
-        .ok()
-        .and_then(|value| {
-            value
-                .as_array()
-                .and_then(|entries| entries.first())
-                .cloned()
-        });
-    let ok = entry
+        ctx,
+    )
+    .await?;
+    let ok = delegated
+        .entry
         .as_ref()
         .and_then(|entry| entry.get("ok"))
         .and_then(serde_json::Value::as_bool)
         == Some(true);
-    let body = match entry {
+    let body = match delegated.entry {
         Some(entry) if ok => serde_json::json!({
             "source": "file-reader",
             "path": path,
@@ -2869,28 +2803,6 @@ async fn delegate_review_read(
         })
         .to_string(),
     };
-    if let Some(sink) = &events {
-        let _ = sink.send(crate::events::AgentEvent::ToolFinished {
-            name: "spawn".into(),
-            detail: detail.clone(),
-            ok,
-            result: if ok {
-                "file-reader evidence returned".into()
-            } else {
-                "file-reader returned a gap".into()
-            },
-            diff: None,
-        });
-    }
-    check_event_delivery(events.as_ref())?;
-    audit.lock().await.record(&Record {
-        tool: "spawn",
-        detail: &detail,
-        sandbox: None,
-        target: Some(path),
-        result: &result,
-        caller: "root",
-    })?;
     Ok(body)
 }
 

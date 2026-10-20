@@ -269,6 +269,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/agent`
 
+- `delegated_read.rs` — Shared execution boundary for one delegated file-reader task.
 - `input_preparation_tests.rs` — Request-boundary regressions for source-bound, host-only input preparation.
 - `mcp_dispatch.rs` — Borrow the run owner; model operations cannot construct settings or grants.
 - `request_context.rs` — Shared assembly for the sections appended to a request system prompt.

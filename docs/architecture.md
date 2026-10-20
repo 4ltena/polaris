@@ -131,11 +131,11 @@ processが動く。
 
 呼び出し側 42件。
 
-- `crates/polaris-cli/src/main.rs:2595`
-- `crates/polaris-cli/src/main.rs:2645`
-- `crates/polaris-cli/src/main.rs:2648`
-- `crates/polaris-cli/src/main.rs:3987`
-- `crates/polaris-cli/src/main.rs:3997`
+- `crates/polaris-cli/src/main.rs:2555`
+- `crates/polaris-cli/src/main.rs:2605`
+- `crates/polaris-cli/src/main.rs:2608`
+- `crates/polaris-cli/src/main.rs:3947`
+- `crates/polaris-cli/src/main.rs:3957`
 - `crates/polaris-core/src/desktop_execution.rs:5`
 - `crates/polaris-core/src/execution_owner.rs:442`
 - `crates/polaris-core/src/sandbox_command.rs:319`
@@ -236,4 +236,4 @@ processが動く。
 - `crates/polaris-core/src/sync/repository.rs:50`
 - `crates/polaris-core/src/sync/repository/c10.rs:1551`
 - `crates/polaris-desktop-service/src/workspace_view.rs:467`
-- `crates/polaris-tui/src/lib.rs:12258`
+- `crates/polaris-tui/src/lib.rs:12323`

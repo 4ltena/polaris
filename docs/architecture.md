@@ -137,7 +137,7 @@ processが動く。
 - `crates/polaris-cli/src/main.rs:3987`
 - `crates/polaris-cli/src/main.rs:3997`
 - `crates/polaris-core/src/desktop_execution.rs:5`
-- `crates/polaris-core/src/execution_owner.rs:674`
+- `crates/polaris-core/src/execution_owner.rs:442`
 - `crates/polaris-core/src/sandbox_command.rs:319`
 - `crates/polaris-core/src/verification/checkpoint.rs:786`
 - `crates/polaris-sandbox/src/broker.rs:480`

@@ -511,6 +511,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `mcp.rs` — The desktop execution owner's bounded MCP approval and publication relay.
 - `prepared_tests.rs` — Prepared workspace policy and lifetime checks through deferred process cleanup.
 - `registration.rs` — Host-local MCP registration: one durable approval and intent per proposal.
+- `step.rs` — Ordered polling phases for the single `RunExecution` owner.
 
 ## `crates/polaris-core/src/execution_owner/mcp`
 

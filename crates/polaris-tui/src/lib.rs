@@ -2639,6 +2639,28 @@ fn append_new_history(
     changed
 }
 
+/// Shows an input in the transcript while its admission checks run without
+/// making it part of the conversation yet.  The preview is intentionally
+/// removed after the one draw: persistence and `printed_messages` remain the
+/// sole record of an accepted turn.
+fn draw_submission_preview<E>(
+    history: &mut Vec<render::HistoryLine>,
+    history_wrap_cache: &mut render::HistoryWrapCache,
+    status: &mut Status,
+    text: &str,
+    draw: impl FnOnce(&[render::HistoryLine], &mut render::HistoryWrapCache, &Status) -> Result<(), E>,
+) -> Result<(), E> {
+    let previous_status =
+        std::mem::replace(status, Status::Notice("送信準備中（未受理）".to_owned()));
+    let result = history_wrap_cache.with_appended(
+        history,
+        render::history_lines_for(&[polaris_provider::Message::user(text)]),
+        |preview, cache| draw(preview, cache, status),
+    );
+    *status = previous_status;
+    result
+}
+
 /// Clears `history` and immediately re-seeds it with the header box,
 /// resets `scroll_offset` back to 0 (following the tail), and drops any
 /// in-progress or finalized text `selection` — the one place every
@@ -6365,6 +6387,49 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             );
             status = Status::Error(error.into());
             continue;
+        }
+
+        // Admission can save drafts, capture a rewind boundary, and await
+        // sidechat routing.  Echo the submitted text before that work starts
+        // while keeping the preview out of the durable session until admission
+        // succeeds.
+        let preview_suggestions = slash_suggestions(&input_buffer, &input_history, false);
+        if draw_submission_preview(
+            &mut history,
+            &mut history_wrap_cache,
+            &mut status,
+            &text,
+            |preview_history, preview_wrap_cache, preview_status| {
+                terminal
+                    .borrow_mut()
+                    .draw(|f| {
+                        draw_frame(
+                            f,
+                            preview_history,
+                            preview_wrap_cache,
+                            0,
+                            &input_buffer,
+                            input_cursor,
+                            preview_status,
+                            &render::HeaderInfo {
+                                provider_name: &provider_name,
+                                model_name: &model_name,
+                                usage: cumulative_usage,
+                                cwd: &cwd_display,
+                                cwd_short: &cwd_footer_display,
+                                effort_name: &effort_name,
+                            },
+                            &preview_suggestions,
+                            selected_suggestion,
+                            &selection,
+                        )
+                    })
+                    .map(|_| ())
+            },
+        )
+        .is_err()
+        {
+            break 'outer ExitCode::FAILURE;
         }
 
         #[cfg(unix)]
@@ -16426,6 +16491,168 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("Ask polaris to do anything"))
         );
+    }
+
+    #[test]
+    fn submission_preview_is_drawn_without_committing_and_is_removed_afterward() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 20)).expect("terminal");
+        let mut wrap_cache = render::HistoryWrapCache::default();
+        let mut history = vec![render::HistoryLine {
+            line: ratatui::text::Line::from("earlier turn"),
+            shaded: false,
+        }];
+        let mut status = Status::Idle;
+        let session = polaris_core::session::Session::new();
+        let printed_messages = 0usize;
+        let printed_local_lines = 0usize;
+
+        draw_submission_preview(
+            &mut history,
+            &mut wrap_cache,
+            &mut status,
+            "first line\nsecond\u{1b}[31m line",
+            |preview, cache, preview_status| {
+                assert!(matches!(preview_status, Status::Notice(message) if message == "送信準備中（未受理）"));
+                terminal.draw(|f| {
+                    draw_frame(
+                        f,
+                        preview,
+                        cache,
+                        0,
+                        "",
+                        0,
+                        preview_status,
+                        &render::HeaderInfo {
+                            provider_name: "openai",
+                            model_name: "test",
+                            usage: polaris_provider::Usage::default(),
+                            cwd: "/tmp",
+                            cwd_short: "~",
+                            effort_name: "low",
+                        },
+                        &[],
+                        0,
+                        &None,
+                    )
+                }).map(|_| ())
+            },
+        )
+        .expect("preview draw");
+
+        let preview_screen: String = {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+                .collect()
+        };
+        assert!(preview_screen.contains("first line"));
+        assert!(preview_screen.contains("second"));
+        assert!(!preview_screen.contains("\u{1b}[31m"));
+        assert_eq!(history.len(), 1, "the preview must not enter history");
+        assert_eq!(history[0].line.to_string(), "earlier turn");
+        assert!(matches!(status, Status::Idle));
+        assert!(session.messages.is_empty());
+        assert_eq!(printed_messages, 0);
+        assert_eq!(printed_local_lines, 0);
+
+        status = Status::Error("preflight failed".into());
+        terminal
+            .draw(|f| {
+                draw_frame(
+                    f,
+                    &history,
+                    &mut wrap_cache,
+                    0,
+                    "",
+                    0,
+                    &status,
+                    &render::HeaderInfo {
+                        provider_name: "openai",
+                        model_name: "test",
+                        usage: polaris_provider::Usage::default(),
+                        cwd: "/tmp",
+                        cwd_short: "~",
+                        effort_name: "low",
+                    },
+                    &[],
+                    0,
+                    &None,
+                )
+            })
+            .expect("redraw after preflight failure");
+        let redrawn: String = {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+                .collect()
+        };
+        assert!(
+            !redrawn.contains("first line"),
+            "failed preflight leaves no ghost"
+        );
+    }
+
+    #[test]
+    fn submission_preview_draw_error_removes_the_temporary_history() {
+        let mut history = vec![render::HistoryLine {
+            line: ratatui::text::Line::from("earlier turn"),
+            shaded: false,
+        }];
+        let mut wrap_cache = render::HistoryWrapCache::default();
+        let mut status = Status::Idle;
+
+        let result = draw_submission_preview(
+            &mut history,
+            &mut wrap_cache,
+            &mut status,
+            "not accepted",
+            |_preview, _cache, _status| Err::<(), _>("draw failed"),
+        );
+
+        assert_eq!(result, Err("draw failed"));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].line.to_string(), "earlier turn");
+        assert!(matches!(status, Status::Idle));
+    }
+
+    #[test]
+    fn accepted_submission_appends_one_user_line_after_preview() {
+        let mut session = polaris_core::session::Session::new();
+        let mut history = Vec::new();
+        let mut printed_messages = 0;
+        let mut printed_local_lines = 0;
+        let mut wrap_cache = render::HistoryWrapCache::default();
+        let mut status = Status::Idle;
+
+        draw_submission_preview(
+            &mut history,
+            &mut wrap_cache,
+            &mut status,
+            "accepted request",
+            |preview, _, _| {
+                assert_eq!(preview.len(), 1);
+                assert_eq!(preview[0].line.to_string(), "accepted request");
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        assert!(history.is_empty());
+        assert!(session.messages.is_empty());
+
+        session.push_user("accepted request");
+        assert!(append_new_history(
+            &session,
+            &[],
+            &mut printed_messages,
+            &mut printed_local_lines,
+            &mut history,
+        ));
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(printed_messages, 1);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].line.to_string(), "accepted request");
     }
 
     #[test]

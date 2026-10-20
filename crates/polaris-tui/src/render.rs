@@ -755,6 +755,34 @@ impl HistoryWrapCache {
         self.valid = false;
     }
 
+    /// Draw a temporary suffix without reflowing the unchanged conversation.
+    /// A resize may reflow once at the new width; afterward the cached prefix
+    /// remains usable even though the preview is removed from `history`.
+    pub(crate) fn with_appended<R>(
+        &mut self,
+        history: &mut Vec<HistoryLine>,
+        appended: Vec<HistoryLine>,
+        draw: impl FnOnce(&[HistoryLine], &mut Self) -> R,
+    ) -> R {
+        let original_len = history.len();
+        history.extend(appended);
+        if self.valid && self.source_len == original_len {
+            self.wrapped
+                .extend(wrap_history_lines(&history[original_len..], self.width));
+            self.source_len = history.len();
+        }
+        let result = draw(history, self);
+        if self.valid && self.source_len == history.len() {
+            let preview_rows = wrap_history_lines(&history[original_len..], self.width).len();
+            self.wrapped.truncate(self.wrapped.len() - preview_rows);
+            self.source_len = original_len;
+        } else {
+            self.invalidate();
+        }
+        history.truncate(original_len);
+        result
+    }
+
     pub fn lines<'a>(&'a mut self, history: &[HistoryLine], width: u16) -> &'a [HistoryLine] {
         if !self.valid || self.width != width || self.source_len != history.len() {
             self.wrapped = wrap_history_lines(history, width);
@@ -2751,6 +2779,57 @@ mod tests {
         cache.invalidate();
         assert_eq!(cache.lines(&history, 12)[0].line.to_string(), "changed");
         assert_eq!(cache.rebuilds(), 2);
+    }
+
+    #[test]
+    fn temporary_history_suffix_reuses_the_cached_prefix_even_after_draw_failure() {
+        let mut cache = HistoryWrapCache::default();
+        let mut history = vec![plain_history_line("earlier wrapped conversation"); 2_000];
+        let rows = cache.lines(&history, 12).len();
+        let extra = plain_history_line("new input with several wrapped rows");
+        let extra_rows = wrap_history_lines(std::slice::from_ref(&extra), 12).len();
+        let result = cache.with_appended(&mut history, vec![extra], |preview, cache| {
+            assert_eq!(cache.lines(preview, 12).len(), rows + extra_rows);
+            assert_eq!(cache.rebuilds(), 1, "preview must not reflow the prefix");
+            Err::<(), _>("draw failed")
+        });
+        assert_eq!(result, Err("draw failed"));
+        assert_eq!(history.len(), 2_000);
+        assert_eq!(cache.lines(&history, 12).len(), rows);
+        assert_eq!(cache.rebuilds(), 1, "cleanup must retain the cached prefix");
+    }
+
+    #[test]
+    fn temporary_history_suffix_keeps_the_resized_prefix_cache() {
+        let mut cache = HistoryWrapCache::default();
+        let mut history = vec![plain_history_line(
+            "earlier conversation with wide text 日本語",
+        )];
+        let _ = cache.lines(&history, 60);
+        cache.with_appended(
+            &mut history,
+            vec![plain_history_line("preview 日本語 with wrapping")],
+            |preview, cache| {
+                assert!(cache.lines(preview, 12).len() > 2);
+                assert_eq!(cache.rebuilds(), 2);
+            },
+        );
+        assert_eq!(history.len(), 1);
+        let actual = cache
+            .lines(&history, 12)
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>();
+        let expected = wrap_history_lines(&history, 12)
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            cache.rebuilds(),
+            2,
+            "removing preview must not reflow again"
+        );
     }
 
     #[test]

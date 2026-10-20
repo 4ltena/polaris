@@ -158,23 +158,12 @@ fn answer_finalizer_resource(
 fn finalizer_decider_from_configuration(
     config: &polaris_core::config::DecisionConfig,
 ) -> Option<Arc<dyn polaris_provider::decision::Decider>> {
-    use polaris_core::config::DecisionBackend;
-
-    if !config.enabled || config.backend != DecisionBackend::Jev {
-        return None;
-    }
-    let key = std::env::var("POLARIS_JEV_API_KEY").ok()?;
-    let base = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| "https://api.typesafe.ai/v1".to_owned());
-    let model = config
-        .model
-        .clone()
-        .unwrap_or_else(|| "jev-latest".to_owned());
-    polaris_provider::decision::jev::JevDecider::new_finalizer(&base, key, model)
-        .ok()
-        .map(|judge| Arc::new(judge) as Arc<dyn polaris_provider::decision::Decider>)
+    polaris_core::decision_bands::build_configured(
+        config,
+        polaris_core::decision_bands::DecisionUse::Finalization,
+    )
+    .ok()
+    .flatten()
 }
 
 fn catalog_copies(paths: &[PathBuf]) -> Result<Vec<Snapshot>, StartupError> {

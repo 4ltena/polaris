@@ -4,6 +4,133 @@ use polaris_provider::decision::{Answer, Decision};
 
 struct Stub(Vec<f64>);
 
+#[test]
+fn the_shared_factory_preserves_an_explicit_semif_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = dir.path().join("semif-helper");
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    let config = crate::config::DecisionConfig {
+        enabled: true,
+        backend: crate::config::DecisionBackend::SemIf,
+        helper: Some(helper),
+        ..Default::default()
+    };
+    assert_eq!(
+        from_configuration(&config).map(|decider| decider.name().to_owned()),
+        Some("semif".to_owned()),
+        "a configured local judge must not be replaced by Jev or silently disabled"
+    );
+}
+
+#[test]
+fn disabled_local_and_unsupported_finalizer_paths_do_not_read_a_remote_key() {
+    use crate::config::{DecisionBackend, DecisionConfig};
+    let unused = || panic!("a disabled or local judge looked up a remote credential");
+    assert!(
+        build_with_key(&DecisionConfig::default(), DecisionUse::Routing, unused)
+            .unwrap()
+            .is_none()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let helper = dir.path().join("helper");
+    std::fs::write(&helper, b"synthetic, never executed").unwrap();
+    let config = DecisionConfig {
+        enabled: true,
+        backend: DecisionBackend::SemIf,
+        helper: Some(helper),
+        ..Default::default()
+    };
+    assert_eq!(
+        build_with_key(&config, DecisionUse::Routing, unused)
+            .unwrap()
+            .unwrap()
+            .name(),
+        "semif"
+    );
+    assert!(
+        build_with_key(&config, DecisionUse::Finalization, unused)
+            .unwrap()
+            .is_none()
+    );
+    let missing = DecisionConfig {
+        helper: None,
+        ..config
+    };
+    assert!(matches!(
+        build_with_key(&missing, DecisionUse::Routing, unused),
+        Err(DecisionBuildError::MissingSemIfHelper)
+    ));
+}
+
+#[test]
+fn the_shared_factory_preserves_jev_and_reports_missing_or_empty_credentials() {
+    let config = crate::config::DecisionConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    for purpose in [DecisionUse::Routing, DecisionUse::Finalization] {
+        assert!(matches!(
+            build_with_key(&config, purpose, || None),
+            Err(DecisionBuildError::MissingJevKey)
+        ));
+        assert!(matches!(
+            build_with_key(&config, purpose, || Some(String::new())),
+            Err(DecisionBuildError::InvalidSettings(DecisionError::Auth))
+        ));
+        assert_eq!(
+            build_with_key(&config, purpose, || Some("synthetic-only".into()))
+                .unwrap()
+                .unwrap()
+                .name(),
+            "jev"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_shared_finalizer_factory_does_not_retry_a_failed_observation() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 8192];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            observed.fetch_add(1, Ordering::SeqCst);
+            stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ).await.unwrap();
+        }
+    });
+    let config = crate::config::DecisionConfig {
+        enabled: true,
+        base_url: Some(format!("http://{address}")),
+        ..Default::default()
+    };
+    let decider = build_with_key(&config, DecisionUse::Finalization, || {
+        Some("synthetic-only".into())
+    })
+    .unwrap()
+    .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        decider.decide(&serde_json::json!({}), &BTreeMap::new()),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert!(matches!(result, Ok(Err(DecisionError::Unavailable))));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
 #[async_trait::async_trait]
 impl Decider for Stub {
     async fn decide(

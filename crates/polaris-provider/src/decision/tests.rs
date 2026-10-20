@@ -219,6 +219,42 @@ fn a_request_too_large_to_send_is_refused_before_it_is_sent() {
     assert_eq!(within_limits(1, &questions(&[("q", noul())])), Ok(()));
 }
 
+#[tokio::test]
+async fn shared_and_metered_judges_retain_the_backend_identity() {
+    struct Named;
+    #[async_trait::async_trait]
+    impl Decider for Named {
+        fn name(&self) -> &str {
+            "synthetic-backend"
+        }
+
+        async fn decide(
+            &self,
+            _: &serde_json::Value,
+            _: &std::collections::BTreeMap<String, Question>,
+        ) -> Result<Decision, DecisionError> {
+            Ok(Decision {
+                answers: Default::default(),
+                input_tokens: Some(7),
+                output_tokens: Some(0),
+            })
+        }
+    }
+    let shared: std::sync::Arc<dyn Decider> = std::sync::Arc::new(Named);
+    assert_eq!(shared.name(), "synthetic-backend");
+    let meter = DecisionMeter::default();
+    let metered = meter.wrap(shared);
+    assert_eq!(metered.name(), "synthetic-backend");
+    let nested = std::sync::Arc::new(metered);
+    assert_eq!(nested.name(), "synthetic-backend");
+    nested
+        .decide(&serde_json::Value::Null, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(meter.snapshot().input_tokens, 7);
+    assert_eq!(meter.snapshot().reported, 1);
+}
+
 /// The judge bills separately from the models and at a different rate, and
 /// its consumption was counted nowhere: the reply carries a usage figure,
 /// `Decision` carries it forward, and no caller read it. A run with the judge

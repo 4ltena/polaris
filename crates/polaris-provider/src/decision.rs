@@ -162,6 +162,10 @@ struct MeteredDecider {
 
 #[async_trait::async_trait]
 impl Decider for MeteredDecider {
+    fn name(&self) -> &str {
+        self.decider.name()
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,
@@ -197,6 +201,10 @@ impl Decider for MeteredDecider {
 /// wherever the trait is expected, without each caller unwrapping it.
 #[async_trait::async_trait]
 impl<T: Decider + ?Sized> Decider for std::sync::Arc<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,

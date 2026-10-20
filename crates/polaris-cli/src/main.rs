@@ -2174,49 +2174,22 @@ fn sweep_build_cache(cwd: &std::path::Path, config: &polaris_core::config::Confi
 fn build_decider(
     config: &polaris_core::config::DecisionConfig,
 ) -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
-    use polaris_core::config::DecisionBackend;
+    use polaris_core::decision_bands::{DecisionUse, build_configured};
 
-    if !config.enabled {
-        return None;
+    match build_configured(config, DecisionUse::Routing) {
+        Ok(Some(decider)) => {
+            eprintln!("[decision] backend = \"{}\"", decider.name());
+            Some(decider)
+        }
+        Ok(None) => None,
+        Err(reason) => {
+            eprintln!(
+                "[decision] backend = \"{}\" を使えません（{reason}）。判定器なしで実行します",
+                config.backend.as_str()
+            );
+            None
+        }
     }
-    let refuse = |reason: &str| -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
-        eprintln!(
-            "[decision] backend = \"{}\" を使えません（{reason}）。判定器なしで実行します",
-            config.backend.as_str()
-        );
-        None
-    };
-    let decider: std::sync::Arc<dyn polaris_provider::decision::Decider> = match config.backend {
-        DecisionBackend::SemIf => {
-            // `available` re-checks the path here rather than trusting the
-            // load-time check: the helper can be removed between the two.
-            match polaris_provider::decision::semif::SemIfDecider::available(
-                config.helper.as_deref(),
-            ) {
-                Some(decider) => std::sync::Arc::new(decider),
-                None => return refuse("helperが実在する絶対pathではありません"),
-            }
-        }
-        DecisionBackend::Jev => {
-            let Ok(key) = std::env::var("POLARIS_JEV_API_KEY") else {
-                return refuse("POLARIS_JEV_API_KEY がありません");
-            };
-            let base = config
-                .base_url
-                .clone()
-                .unwrap_or_else(|| "https://api.typesafe.ai/v1".to_owned());
-            let model = config
-                .model
-                .clone()
-                .unwrap_or_else(|| "jev-latest".to_owned());
-            match polaris_provider::decision::jev::JevDecider::new(&base, key, model) {
-                Ok(decider) => std::sync::Arc::new(decider),
-                Err(error) => return refuse(&format!("{error:?}")),
-            }
-        }
-    };
-    eprintln!("[decision] backend = \"{}\"", decider.name());
-    Some(decider)
 }
 
 /// Final-answer observation has a separate one-shot disclosure boundary. The
@@ -2225,25 +2198,12 @@ fn build_decider(
 fn build_finalizer_decider(
     config: &polaris_core::config::DecisionConfig,
 ) -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
-    use polaris_core::config::DecisionBackend;
-
-    if !config.enabled || config.backend != DecisionBackend::Jev {
-        return None;
-    }
-    let key = std::env::var("POLARIS_JEV_API_KEY").ok()?;
-    let base = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| "https://api.typesafe.ai/v1".to_owned());
-    let model = config
-        .model
-        .clone()
-        .unwrap_or_else(|| "jev-latest".to_owned());
-    polaris_provider::decision::jev::JevDecider::new_finalizer(&base, key, model)
-        .ok()
-        .map(|judge| {
-            std::sync::Arc::new(judge) as std::sync::Arc<dyn polaris_provider::decision::Decider>
-        })
+    polaris_core::decision_bands::build_configured(
+        config,
+        polaris_core::decision_bands::DecisionUse::Finalization,
+    )
+    .ok()
+    .flatten()
 }
 
 #[cfg(unix)]

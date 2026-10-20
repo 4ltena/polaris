@@ -184,31 +184,84 @@ pub async fn judge_with(
     Ok(bands)
 }
 
-/// Builds the judge every surface shares, from the configuration every
-/// surface reads.
-///
-/// `None` both when it is switched off and when it is on but unusable:
-/// every path that asks it something works without an answer, so neither
-/// is a reason to refuse to start. The API key is read from the
-/// environment and never from the configuration file, which is shared.
+/// Normal routing can use the backend's bounded retry policy. A finalizer
+/// receipt covers one observation and must never become retry traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionUse {
+    Routing,
+    Finalization,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DecisionBuildError {
+    #[error("POLARIS_JEV_API_KEY がありません")]
+    MissingJevKey,
+    #[error("helperが実在する絶対pathではありません")]
+    MissingSemIfHelper,
+    #[error("判断器を構築できません ({0:?})")]
+    InvalidSettings(DecisionError),
+}
+
+/// One factory for CLI and desktop. Looking up a remote credential is lazy:
+/// disabled decisions and a selected local backend never read that key.
+pub fn build_configured(
+    config: &crate::config::DecisionConfig,
+    purpose: DecisionUse,
+) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
+    build_with_key(config, purpose, || {
+        std::env::var("POLARIS_JEV_API_KEY").ok()
+    })
+}
+
+fn build_with_key(
+    config: &crate::config::DecisionConfig,
+    purpose: DecisionUse,
+    key: impl FnOnce() -> Option<String>,
+) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
+    use crate::config::DecisionBackend;
+    use polaris_provider::decision::{jev::JevDecider, semif::SemIfDecider};
+
+    if !config.enabled {
+        return Ok(None);
+    }
+    let decider: std::sync::Arc<dyn Decider> = match config.backend {
+        DecisionBackend::SemIf => {
+            // SemIf has no finalizer activation contract yet. Preserve its
+            // routing support without silently substituting a remote judge.
+            if purpose == DecisionUse::Finalization {
+                return Ok(None);
+            }
+            std::sync::Arc::new(
+                SemIfDecider::available(config.helper.as_deref())
+                    .ok_or(DecisionBuildError::MissingSemIfHelper)?,
+            )
+        }
+        DecisionBackend::Jev => {
+            let key = key().ok_or(DecisionBuildError::MissingJevKey)?;
+            let base = config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.typesafe.ai/v1");
+            let model = config.model.clone().unwrap_or_else(|| "jev-latest".into());
+            let client = match purpose {
+                DecisionUse::Routing => JevDecider::new(base, key, model),
+                DecisionUse::Finalization => JevDecider::new_finalizer(base, key, model),
+            }
+            .map_err(DecisionBuildError::InvalidSettings)?;
+            std::sync::Arc::new(client)
+        }
+    };
+    Ok(Some(decider))
+}
+
+/// Optional routing for surfaces that already report unavailable capability
+/// separately. Call `build_configured` when a diagnostic reason is needed.
 pub fn from_configuration(
     config: &crate::config::DecisionConfig,
 ) -> Option<std::sync::Arc<dyn Decider>> {
-    if !config.enabled {
-        return None;
-    }
-    let key = std::env::var("POLARIS_JEV_API_KEY").ok()?;
-    let base = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| "https://api.typesafe.ai/v1".to_owned());
-    let model = config
-        .model
-        .clone()
-        .unwrap_or_else(|| "jev-latest".to_owned());
-    polaris_provider::decision::jev::JevDecider::new(&base, key, model)
+    build_configured(config, DecisionUse::Routing)
         .ok()
-        .map(|decider| std::sync::Arc::new(decider) as std::sync::Arc<dyn Decider>)
+        .flatten()
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@
 //! are compared against a gate, that gate is the caller's and belongs to
 //! whichever judge produced them.
 
-use super::{Answer, Decider, Decision, DecisionError, Question};
+use super::{Answer, Decider, Decision, DecisionError, Question, checked};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -82,25 +82,9 @@ impl SemIfDecider {
             input_tokens: wire.input_tokens,
             output_tokens: wire.output_tokens,
         };
-        if parsed.answers.len() != questions.len() {
-            return Err(DecisionError::Malformed);
-        }
-        for (name, answer) in &parsed.answers {
-            let Some(question) = questions.get(name) else {
-                return Err(DecisionError::Malformed);
-            };
-            let ok = match question {
-                Question::Noul { .. } => answer.noul.is_some(),
-                Question::Choice { criteria, .. } => answer
-                    .choice
-                    .as_deref()
-                    .is_some_and(|chosen| criteria.contains_key(chosen)),
-                Question::Score { .. } => answer.score.is_some(),
-            };
-            if !ok {
-                return Err(DecisionError::Malformed);
-            }
-        }
+        // Preserve this adapter's existing malformed-reply error while
+        // applying the same numerical and question checks as remote judges.
+        checked(&parsed, questions).map_err(|_| DecisionError::Malformed)?;
         Ok(parsed)
     }
 }
@@ -179,7 +163,8 @@ mod tests {
 
     fn reply(kind: &str) -> String {
         format!(
-            r#"{{"answers":{{"kind":{{"choice":"{kind}"}},"weight":{{"score":1.25}}}},
+            r#"{{"answers":{{"kind":{{"choice":"{kind}","probabilities":{{"brainstorm":0.25,"implement":0.75}}}},
+                "weight":{{"score":0.75,"probabilities":{{"0":0.25,"1":0.75}}}}}},
                 "input_tokens":10,"output_tokens":0}}"#
         )
     }
@@ -192,7 +177,7 @@ mod tests {
             decision.answers["kind"].choice.as_deref(),
             Some("implement")
         );
-        assert_eq!(decision.answers["weight"].score, Some(1.25));
+        assert_eq!(decision.answers["weight"].score, Some(0.75));
     }
 
     /// The three ways a local model drifts, each rejected rather than
@@ -214,6 +199,57 @@ mod tests {
                 "accepted a reply it should have refused: {line}"
             );
         }
+    }
+
+    #[test]
+    fn numerical_corruption_and_conflicting_types_use_common_validation() {
+        let asked = questions();
+        let valid: serde_json::Value = serde_json::from_str(&reply("implement")).unwrap();
+        for (pointer, replacement) in [
+            (
+                "/answers/kind/probabilities/brainstorm",
+                serde_json::json!(-0.25),
+            ),
+            (
+                "/answers/kind/probabilities/implement",
+                serde_json::json!(0.25),
+            ),
+            ("/answers/kind/noul", serde_json::json!(0.5)),
+            ("/answers/weight/score", serde_json::json!(1.25)),
+            ("/answers/weight/choice", serde_json::json!("0")),
+            (
+                "/answers/weight/probabilities",
+                serde_json::json!({"0": 1.0}),
+            ),
+        ] {
+            let mut corrupted = valid.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            corrupted
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), replacement);
+            assert_eq!(
+                SemIfDecider::parse_reply(&corrupted.to_string(), &asked),
+                Err(DecisionError::Malformed),
+                "accepted {pointer}"
+            );
+        }
+        let noul = BTreeMap::from([(
+            "yes".into(),
+            Question::Noul {
+                instructions: "fits?".into(),
+            },
+        )]);
+        for probability in [-0.1, 1.1] {
+            let line = serde_json::json!({"answers": {"yes": {"noul": probability}}});
+            assert_eq!(
+                SemIfDecider::parse_reply(&line.to_string(), &noul),
+                Err(DecisionError::Malformed)
+            );
+        }
+        assert!(SemIfDecider::parse_reply(r#"{"answers":{"yes":{"noul":0.4}}}"#, &noul).is_ok());
     }
 
     /// The helper is a file on disk, named absolutely. A relative path, a

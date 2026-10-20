@@ -84,6 +84,79 @@ fn an_answer_is_read_against_the_question_it_belongs_to() {
 }
 
 #[test]
+fn conflicting_answer_types_and_nonfinite_values_are_refused() {
+    let rated = Answer {
+        score: Some(0.74),
+        probabilities: weights(&[("0", 0.26), ("1", 0.74), ("2", 0.0)]),
+        ..Default::default()
+    };
+    assert!(rated.answers(&score()));
+    for (question, answer) in [
+        (
+            choice(),
+            Answer {
+                noul: Some(0.2),
+                ..picked("b")
+            },
+        ),
+        (
+            choice(),
+            Answer {
+                score: Some(0.2),
+                ..picked("b")
+            },
+        ),
+        (
+            score(),
+            Answer {
+                noul: Some(0.2),
+                ..rated.clone()
+            },
+        ),
+        (
+            score(),
+            Answer {
+                choice: Some("0".into()),
+                ..rated.clone()
+            },
+        ),
+        (
+            noul(),
+            Answer {
+                probabilities: weights(&[("yes", 1.0)]),
+                ..yes(0.2)
+            },
+        ),
+    ] {
+        assert!(!answer.answers(&question), "{answer:?}");
+    }
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(!yes(value).answers(&noul()));
+        assert!(
+            !Answer {
+                score: Some(value),
+                ..rated.clone()
+            }
+            .answers(&score())
+        );
+        assert!(
+            !Answer {
+                confidence: Some(value),
+                ..picked("b")
+            }
+            .answers(&choice())
+        );
+        assert!(
+            !Answer {
+                probabilities: weights(&[("a", value), ("b", 0.7), ("c", 0.3)]),
+                ..picked("b")
+            }
+            .answers(&choice())
+        );
+    }
+}
+
+#[test]
 fn a_choice_answers_only_with_an_option_that_was_offered() {
     // A name nobody offered. Position-free answers make this the shape the
     // check has to catch: there is no index to fall outside a range.

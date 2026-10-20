@@ -241,15 +241,21 @@ impl Answer {
         }
         match question {
             Question::Noul { .. } => {
-                self.noul.is_some_and(ranged) && self.choice.is_none() && self.score.is_none()
+                self.noul.is_some_and(ranged)
+                    && self.choice.is_none()
+                    && self.score.is_none()
+                    && self.probabilities.is_empty()
             }
             Question::Choice { criteria, .. } => {
                 // The chosen name has to be one that was offered, and every
                 // offered name has to carry a probability: a reply that
                 // answers about something else is not a narrower answer.
-                self.choice
-                    .as_ref()
-                    .is_some_and(|name| criteria.contains_key(name))
+                self.noul.is_none()
+                    && self.score.is_none()
+                    && self
+                        .choice
+                        .as_ref()
+                        .is_some_and(|name| criteria.contains_key(name))
                     && self.probabilities.len() == criteria.len()
                     && self
                         .probabilities
@@ -260,7 +266,9 @@ impl Answer {
             Question::Score { criteria, .. } => {
                 // Levels come back keyed by their index, and the weighted
                 // answer lies inside the scale it was asked on.
-                self.probabilities.len() == criteria.len()
+                self.noul.is_none()
+                    && self.choice.is_none()
+                    && self.probabilities.len() == criteria.len()
                     && (0..criteria.len())
                         .all(|index| self.probabilities.contains_key(&index.to_string()))
                     && self

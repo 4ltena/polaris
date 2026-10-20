@@ -1047,6 +1047,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `mcp_catalog.rs` — One-server catalog check with no model and no store run record. The job
 - `mcp_settings.rs` — Owner-served MCP registry and write-only secrets. Saved documents apply from
 - `mcp_setup.rs` — Settings-screen detection and registration. The user's action there is the
+- `projection.rs` — 子・workflow・確認状態を、上限付きの表示用summaryへ投影する。
 - `real.rs` — Explicit trusted production integration; no provider discovery or source apply.
 - `role_bindings.rs` — Trusted next-run role metadata configuration. Runtime binding happens only
 - `run_details.rs` — `run.details`: one immutable details snapshot, paged by UTF-8-safe fragments.

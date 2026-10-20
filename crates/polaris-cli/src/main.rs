@@ -6460,7 +6460,7 @@ mod tests {
         // Read out of the source rather than written here twice: a new
         // arm that the message does not mention is a provider nobody can
         // find, and that is exactly how `llamacpp` would have shipped.
-        let source = include_str!("main.rs");
+        let source = include_str!("provider_startup.rs");
         let arms: std::collections::BTreeSet<&str> = source
             .lines()
             .filter_map(|line| line.trim().strip_suffix(" => {"))

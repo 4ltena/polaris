@@ -788,6 +788,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `tests.rs` — Fixed observations only.
 
+## `crates/polaris-core/src/rewind_workspace`
+
+- `manifest_compare.rs` — Pure manifest value, observation and change comparisons.
+
 ## `crates/polaris-core/src/scratch_registry`
 
 - `tests.rs` — Temporary directories only; the registry path is process-wide, so these

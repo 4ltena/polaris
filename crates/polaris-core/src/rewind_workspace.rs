@@ -25,6 +25,9 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod manifest_compare;
+use manifest_compare::{important_exclusions, plan_changes, same_observation, same_value};
+
 const MANIFEST_VERSION: u32 = 2;
 const TRANSACTION_VERSION: u32 = 1;
 const NAMESPACE_VERSION: u32 = 1;
@@ -314,24 +317,6 @@ struct StoredEntry {
     inode: u64,
     mtime: (i64, i64),
     ctime: (i64, i64),
-}
-
-impl StoredEntry {
-    fn same_value(&self, other: &Self) -> bool {
-        self.path == other.path
-            && self.kind == other.kind
-            && self.mode == other.mode
-            && self.bytes == other.bytes
-            && self.hash == other.hash
-    }
-
-    fn same_observation(&self, other: &Self) -> bool {
-        self.same_value(other)
-            && self.device == other.device
-            && self.inode == other.inode
-            && self.mtime == other.mtime
-            && self.ctime == other.ctime
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2318,15 +2303,6 @@ impl WorkspaceOwner {
     }
 }
 
-impl StoredManifest {
-    fn entries_map(&self) -> BTreeMap<PathBuf, &StoredEntry> {
-        self.entries
-            .iter()
-            .map(|entry| (entry.path.clone(), entry))
-            .collect()
-    }
-}
-
 type ProjectLease = crate::project_mutation::ProjectMutationLeaseV1;
 
 fn project_mutation_error(error: crate::project_mutation::ProjectMutationError) -> WorkspaceError {
@@ -2406,58 +2382,6 @@ fn manifest_from_snapshot(
         entries,
         exclusions,
     })
-}
-
-fn plan_changes(before: &StoredManifest, after: &StoredManifest) -> Vec<PreviewChange> {
-    let before = before.entries_map();
-    let after = after.entries_map();
-    let paths: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let kind = match (before.get(&path), after.get(&path)) {
-                (None, Some(_)) => PreviewChangeKind::Created,
-                (Some(_), None) => PreviewChangeKind::Deleted,
-                (Some(left), Some(right)) if left.same_value(right) => return None,
-                (Some(left), Some(right)) if left.kind != right.kind => {
-                    PreviewChangeKind::TypeChanged
-                }
-                (Some(left), Some(right))
-                    if left.hash == right.hash && left.bytes == right.bytes =>
-                {
-                    PreviewChangeKind::ModeChanged
-                }
-                (Some(_), Some(_)) => PreviewChangeKind::Modified,
-                (None, None) => return None,
-            };
-            Some(PreviewChange {
-                relative_path: path,
-                kind,
-            })
-        })
-        .collect()
-}
-
-fn same_value(left: &StoredManifest, right: &StoredManifest) -> bool {
-    left.project_root == right.project_root
-        && left.root_device == right.root_device
-        && left.root_inode == right.root_inode
-        && left.entries.len() == right.entries.len()
-        && left
-            .entries
-            .iter()
-            .zip(&right.entries)
-            .all(|(left, right)| left.same_value(right))
-        && important_exclusions(left) == important_exclusions(right)
-}
-
-fn same_observation(left: &StoredManifest, right: &StoredManifest) -> bool {
-    same_value(left, right)
-        && left
-            .entries
-            .iter()
-            .zip(&right.entries)
-            .all(|(left, right)| left.same_observation(right))
 }
 
 fn known_partial_state(
@@ -2550,15 +2474,6 @@ fn known_partial_state(
             before.same_observation(now)
         }
     })
-}
-
-fn important_exclusions(manifest: &StoredManifest) -> Vec<&Path> {
-    manifest
-        .exclusions
-        .iter()
-        .filter(|entry| entry.reason == StoredExclusionReason::RepositoryMetadata)
-        .map(|entry| entry.path.as_path())
-        .collect()
 }
 
 fn temporary_paths_for(

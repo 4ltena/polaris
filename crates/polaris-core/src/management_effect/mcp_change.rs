@@ -4,6 +4,11 @@ use crate::{mcp::local::LocalHost, project_mutation::ProjectMutationLeaseV1};
 use polaris_mcp::registration::Registry;
 use std::path::Path;
 
+mod local_source;
+pub use local_source::McpLocalSourceChangeOwnerV1;
+#[cfg(test)]
+pub(crate) use local_source::{set_local_source_before_save_hook, set_local_source_fault};
+
 pub struct McpRegistryChangeOwnerV1<'a> {
     host: &'a LocalHost,
     effects: &'a ManagementEffectStoreV1,

@@ -97,8 +97,23 @@ impl LocalHost {
         Self::open_with_home(cwd, home, create_store)
     }
 
+    /// Explicit management preflight over an already initialized store.
+    /// Neither a missing store nor a concurrent removal may fall through to
+    /// the create-capable constructor, and the existing owner lock is required.
+    pub fn open_existing(cwd: &Path) -> Result<Self, Error> {
+        let home = &std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or(Error::Protection)?;
+        let host = Self::open_with_home(cwd, home, false)?;
+        host.store
+            .as_ref()
+            .ok_or(Error::Storage)?
+            .load_snapshot_noncreating()?;
+        Ok(host)
+    }
+
     /// Isolates cross-crate MCP tests from the process-wide HOME variable.
-    #[cfg(feature = "mcp-test-support")]
+    #[cfg(any(test, feature = "mcp-test-support"))]
     pub fn open_for_test(cwd: &Path, home: &Path, create_store: bool) -> Result<Self, Error> {
         Self::open_with_home(cwd, home, create_store)
     }
@@ -109,8 +124,11 @@ impl LocalHost {
         let root = canonical(&crate::project::resolve_root(cwd))?;
         let storage = crate::project::storage_root_from_env().map_err(|_| Error::Protection)?;
         let storage = storage.canonicalize().unwrap_or(storage);
-        let store = if create_store || Store::exists(&home) {
+        let store = if create_store {
             Some(Store::open(&home)?)
+        } else if Store::exists(&home) {
+            // Never let the exists/open race recreate a removed store.
+            Some(Store::open_existing(&home)?)
         } else {
             None
         };

@@ -19,6 +19,7 @@ use crate::stop::{StopReason, StopTracker};
 #[cfg(test)]
 mod input_preparation_tests;
 mod mcp_dispatch;
+mod request_context;
 mod skill_catalog;
 pub(crate) mod verification;
 pub(crate) mod workflow_artifact;
@@ -1407,11 +1408,6 @@ pub(crate) async fn run_loop(
         } else {
             None
         };
-        let request_system = if let Some(profile) = &current_profile {
-            format!("{base_system}\n{}", profile.body)
-        } else {
-            system.to_string()
-        };
         let empty_injected = Vec::new();
         let injected = current_profile
             .as_ref()
@@ -1421,33 +1417,23 @@ pub(crate) async fn run_loop(
         let catalog = optional_skills
             .as_mut()
             .map(|catalog| catalog.project(injected));
-        let request_system = if let Some(catalog) = &catalog {
-            if catalog.text.is_empty() {
-                request_system
+        let workflow_section = current_profile
+            .as_ref()
+            .map(|profile| profile.body.as_str());
+        let request_system = request_context::compose(
+            if current_profile.is_some() {
+                base_system
             } else {
-                format!("{request_system}\n{}", catalog.text)
-            }
-        } else {
-            request_system
-        };
-        // The routed files come last, so the sections that answer to their
-        // own ceilings keep the order they had before this existed.
-        let request_system = match &filemap_section {
-            Some(section) => {
-                format!("{request_system}\n{}\n{section}", crate::filemap::HEADING)
-            }
-            None => request_system,
-        };
-        let request_system = match &decided_section {
-            Some(section) => {
-                format!("{request_system}\n{}\n{section}", crate::decisions::HEADING)
-            }
-            None => request_system,
-        };
-        let request_system = match &analysis_context {
-            Some(prepared) => format!("{request_system}\n{}", prepared.context),
-            None => request_system,
-        };
+                system
+            },
+            workflow_section,
+            catalog.as_ref().map(|catalog| catalog.text.as_str()),
+            filemap_section.as_deref(),
+            decided_section.as_deref(),
+            analysis_context
+                .as_ref()
+                .map(|prepared| prepared.context.as_str()),
+        );
         // M6-3c: instructions that arrived during the run join the
         // conversation at this boundary, in arrival order, before the next
         // request is built. The owner marks them as taken in the same save.
@@ -1529,42 +1515,19 @@ pub(crate) async fn run_loop(
             .into());
         }
         let mut sending_system = match refreshed_base {
-            Some(mut refreshed) => {
-                if let Some(profile) = &current_profile {
-                    refreshed.push('\n');
-                    refreshed.push_str(&profile.body);
-                } else if let Some(turn) = &workflow_turn {
-                    refreshed.push('\n');
-                    refreshed.push_str(&turn.body);
-                }
-                if let Some(catalog) = &catalog
-                    && !catalog.text.is_empty()
-                {
-                    refreshed.push('\n');
-                    refreshed.push_str(&catalog.text);
-                }
-                // This branch rebuilds the prompt from scratch, so every
-                // section added above has to be added here too. Anything
-                // left out is silently dropped for root runs only — the
-                // one configuration where it was meant to apply.
-                if let Some(section) = &filemap_section {
-                    refreshed.push('\n');
-                    refreshed.push_str(crate::filemap::HEADING);
-                    refreshed.push('\n');
-                    refreshed.push_str(section);
-                }
-                if let Some(section) = &decided_section {
-                    refreshed.push('\n');
-                    refreshed.push_str(crate::decisions::HEADING);
-                    refreshed.push('\n');
-                    refreshed.push_str(section);
-                }
-                if let Some(prepared) = &analysis_context {
-                    refreshed.push('\n');
-                    refreshed.push_str(&prepared.context);
-                }
-                refreshed
-            }
+            Some(refreshed) => request_context::compose(
+                &refreshed,
+                current_profile
+                    .as_ref()
+                    .map(|profile| profile.body.as_str())
+                    .or_else(|| workflow_turn.as_ref().map(|turn| turn.body.as_str())),
+                catalog.as_ref().map(|catalog| catalog.text.as_str()),
+                filemap_section.as_deref(),
+                decided_section.as_deref(),
+                analysis_context
+                    .as_ref()
+                    .map(|prepared| prepared.context.as_str()),
+            ),
             None => request_system,
         };
         // Resolving the preselection is what turns picks into schemas, so

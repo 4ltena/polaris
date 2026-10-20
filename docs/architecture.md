@@ -69,9 +69,9 @@ crate 13件、依存 41件。名前の`polaris-`は省いた。開発用の依�
 
 呼び出し側 23件。
 
+- `crates/polaris-core/src/agent.rs:1704`
+- `crates/polaris-core/src/agent.rs:1738`
 - `crates/polaris-core/src/agent.rs:1741`
-- `crates/polaris-core/src/agent.rs:1775`
-- `crates/polaris-core/src/agent.rs:1778`
 - `crates/polaris-core/src/agent/skill_catalog.rs:45`
 - `crates/polaris-core/src/compaction.rs:241`
 - `crates/polaris-core/src/local_execution.rs:153`

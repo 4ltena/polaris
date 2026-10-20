@@ -271,6 +271,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `input_preparation_tests.rs` — Request-boundary regressions for source-bound, host-only input preparation.
 - `mcp_dispatch.rs` — Borrow the run owner; model operations cannot construct settings or grants.
+- `request_context.rs` — Shared assembly for the sections appended to a request system prompt.
 - `skill_catalog.rs` — Request-local metadata-only optional skill catalog.
 - `verification.rs` — Parser boundary for the root-only verification tool.
 - `workflow_artifact.rs` — Parsing boundary for root workflow-artifact calls.

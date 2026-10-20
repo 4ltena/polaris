@@ -11419,24 +11419,33 @@ fn doctor_lines(
 fn cat_diagnostic_lines(
     owner: Option<&polaris_core::answer_finalizer::shadow::ShadowFinalizerOwner>,
 ) -> Vec<ratatui::text::Line<'static>> {
-    let line = match owner {
-        None => {
-            "CAT: configured=shadow ownerなし; installed=未照合; verified=未確認; observed=未取得"
-                .into()
-        }
+    match owner {
+        None => vec![
+            status_row("CAT 構成", "shadow ownerなし"),
+            status_row("CAT 導入", "未照合"),
+            status_row("CAT 検証", "未確認"),
+            status_row("CAT 観測", "未取得"),
+        ],
         Some(owner) => match owner.translation_observation() {
-            Ok((requested, installed, verified, attempted)) => format!(
-                "CAT: configured={requested}; installed={}; verified={verified}; observed={attempted} attempts (保存済み観測)。実行の成功とは別です。",
-                match installed {
-                    Some(true) => "導入確認",
-                    Some(false) => "未導入",
-                    None => "未照合",
-                },
-            ),
-            Err(_) => "CAT: 状態を読めません。可用性は未確認です。".into(),
+            Ok((requested, installed, verified, attempted)) => vec![
+                status_row("CAT 構成", &requested.to_string()),
+                status_row(
+                    "CAT 導入",
+                    match installed {
+                        Some(true) => "導入確認",
+                        Some(false) => "未導入",
+                        None => "未照合",
+                    },
+                ),
+                status_row("CAT 検証", &verified.to_string()),
+                status_row(
+                    "CAT 観測",
+                    &format!("{attempted} attempts（保存済み観測。実行の成功とは別です）"),
+                ),
+            ],
+            Err(_) => vec![status_row("CAT", "状態を読めません。可用性は未確認です。")],
         },
-    };
-    vec![line.into()]
+    }
 }
 
 struct StatusSnapshot<'a> {
@@ -11458,6 +11467,39 @@ struct StatusSnapshot<'a> {
     management_effects: &'a polaris_core::management_effect::ManagementEffectStoreV1,
     #[cfg(unix)]
     recovery_issue: Option<&'a str>,
+}
+
+fn status_section(lines: &mut Vec<ratatui::text::Line<'static>>, title: &str) {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(Span::styled(
+        title.to_owned(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+}
+
+fn status_row(label: &str, value: &str) -> ratatui::text::Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use unicode_width::UnicodeWidthStr;
+
+    const LABEL_WIDTH: usize = 16;
+    let prefix = if label.is_empty() {
+        " ".repeat(LABEL_WIDTH + 4)
+    } else {
+        format!(
+            "  {label}:{} ",
+            " ".repeat(LABEL_WIDTH.saturating_sub(label.width()))
+        )
+    };
+    Line::from(vec![
+        Span::styled(prefix, Style::default().add_modifier(Modifier::DIM)),
+        Span::raw(render::sanitize(value).escape_debug().to_string()),
+    ])
 }
 
 fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static>> {
@@ -11482,67 +11524,104 @@ fn status_lines(snapshot: StatusSnapshot<'_>) -> Vec<ratatui::text::Line<'static
         recovery_issue,
     } = snapshot;
     let usage = usage_report.usage;
-    let mut lines = vec![
-        "状態 (read-only)".to_owned(),
-        format!("設定: provider={provider_name}, model={model_name}"),
-        format!(
-            "利用条件: approval 現在={approval:?}, 起動時={startup_approval:?}; sandbox={}",
-            sandbox.describe()
+    let mut lines = Vec::new();
+    status_section(&mut lines, "Polaris 状態 (read-only)");
+    lines.push(status_row("モデル", model_name));
+    lines.push(status_row("provider", provider_name));
+    lines.push(status_row(
+        "effort",
+        &format!(
+            "{}（固定overrideの変更はTUI非対応）",
+            fixed_effort.unwrap_or("automatic")
         ),
-        format!("利用条件: 外部MCP={mcp_external}; 個別サーバーは /mcp で確認"),
-        format!(
-            "観測: tokens in {} / out {} / cache {} / total {}; 欠測 {} / 失敗 {}",
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cached_tokens,
-            usage.total_tokens,
-            usage_report.missing_responses,
-            usage_report.failed_requests,
-        ),
-        format!("観測: 会話 {} messages", session.messages.len()),
-    ];
-    if let Some(workflow) = &session.workflow {
-        let state = workflow.state();
-        let ids = state
-            .skills
-            .iter()
-            .map(|skill| skill.id.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        lines.push(format!(
-            "観測: workflow phase={}; skills={}; manifest={}",
-            state.phase, ids, state.skill_manifest_hash
+    ));
+    lines.push(status_row(
+        "会話",
+        &format!("{} messages", session.messages.len()),
+    ));
+
+    status_section(&mut lines, "利用条件");
+    lines.push(status_row("承認（現在）", &format!("{approval:?}")));
+    lines.push(status_row(
+        "承認（起動時）",
+        &format!("{startup_approval:?}"),
+    ));
+    lines.push(status_row("sandbox", sandbox.mode().as_str()));
+    for (index, root) in sandbox.writable_roots().iter().enumerate() {
+        lines.push(status_row(
+            if index == 0 { "書き込み可能" } else { "" },
+            &root.display().to_string(),
         ));
     }
-    lines.push("可用性: 認証・モデル・MCPの実接続はこの表示では未検証です".to_owned());
-    lines.push(
-        "可用性: web-search=disabled。cached/liveは接続先の上限契約が未確認のため利用できません。"
-            .to_owned(),
-    );
-    lines.push("可用性: capacity観測は未接続です。資源の空きを確認したとは扱いません。".to_owned());
-    lines.push(format!(
-        "設定: audit={}; 保存先変更は --audit を指定して再起動",
-        audit_path
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "未指定".into())
+    lines.push(status_row(
+        "外部MCP",
+        &format!("{mcp_external}（個別サーバーは /mcp で確認）"),
     ));
-    lines.push(format!(
-        "設定: effort={}; TUIから固定overrideを変更できません",
-        fixed_effort.unwrap_or("automatic")
+
+    status_section(&mut lines, "観測・workflow");
+    lines.push(status_row(
+        "tokens",
+        &format!(
+            "in {} / out {} / cache {} / total {}",
+            usage.input_tokens, usage.output_tokens, usage.cached_tokens, usage.total_tokens,
+        ),
     ));
-    lines.push(format!("設定: host-issued routine/review authorityの構成={turn_authority_present}。内容・承認tokenは表示しません。"));
-    let mut rendered: Vec<_> = lines
-        .into_iter()
-        .map(|line| ratatui::text::Line::from(render::sanitize(&line).escape_debug().to_string()))
-        .collect();
-    rendered.extend(cat_diagnostic_lines(answer_finalizer));
+    lines.push(status_row(
+        "欠測 / 失敗",
+        &format!(
+            "{} / {}",
+            usage_report.missing_responses, usage_report.failed_requests,
+        ),
+    ));
+    if let Some(workflow) = &session.workflow {
+        let state = workflow.state();
+        lines.push(status_row("phase", &state.phase.to_string()));
+        if state.skills.is_empty() {
+            lines.push(status_row("skills", "なし"));
+        } else {
+            for (index, skill) in state.skills.iter().enumerate() {
+                lines.push(status_row(
+                    if index == 0 { "skills" } else { "" },
+                    &skill.id,
+                ));
+            }
+        }
+        lines.push(status_row("manifest", &state.skill_manifest_hash));
+    }
+
+    status_section(&mut lines, "可用性");
+    lines.push(status_row(
+        "実接続",
+        "未検証（認証・モデル・MCP。接続確認は行いません）",
+    ));
+    lines.push(status_row(
+        "web-search",
+        "disabled（cached/live: 接続先の上限契約未確認・利用不可）",
+    ));
+    lines.push(status_row("capacity", "観測は未接続（資源の空きは未確認）"));
+
+    status_section(&mut lines, "管理・診断");
+    lines.push(status_row(
+        "audit",
+        &format!(
+            "{}（変更は --audit を指定して再起動）",
+            audit_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "未指定".into())
+        ),
+    ));
+    lines.push(status_row(
+        "ホスト権限",
+        &format!("routine/review構成={turn_authority_present}（内容・承認tokenは非表示）"),
+    ));
+    lines.extend(cat_diagnostic_lines(answer_finalizer));
     #[cfg(unix)]
-    rendered.extend(management_effect_diagnostic(
+    lines.extend(management_effect_diagnostic(
         project_root,
         management_effects,
         recovery_issue,
     ));
-    rendered
+    lines
 }
 
 fn account_list_lines() -> Result<Vec<ratatui::text::Line<'static>>, String> {
@@ -11904,26 +11983,27 @@ fn management_effect_diagnostic(
     store: &polaris_core::management_effect::ManagementEffectStoreV1,
     recovery_issue: Option<&str>,
 ) -> Vec<ratatui::text::Line<'static>> {
-    let mut result = match polaris_core::sync::composite::C10CompositeBlockerV1::inspect_readonly(
+    let mut lines = match polaris_core::sync::composite::C10CompositeBlockerV1::inspect_readonly(
         project,
         store.state_dir(),
     ) {
-        Ok(Some(effect)) => format!(
-            "管理操作: 未解決 {} ({}) / 状態 {:?} / 記録番号 {}",
-            effect.request.operation_id,
-            effect.request.inventory,
-            effect.state,
-            effect.last_sequence
-        ),
-        Ok(None) => "管理操作: 未解決なし".to_owned(),
-        Err(error) => format!("管理操作: 状態を確認できません ({error})"),
+        Ok(Some(effect)) => vec![
+            status_row("管理操作", "未解決"),
+            status_row("操作ID", &effect.request.operation_id.to_string()),
+            status_row("対象", &effect.request.inventory.to_string()),
+            status_row("状態", &format!("{:?}", effect.state)),
+            status_row("記録番号", &effect.last_sequence.to_string()),
+        ],
+        Ok(None) => vec![status_row("管理操作", "未解決なし")],
+        Err(error) => vec![status_row(
+            "管理操作",
+            &format!("状態を確認できません ({error})"),
+        )],
     };
     if let Some(reason) = recovery_issue {
-        result.push_str(&format!(" / 復旧理由: {reason}"));
+        lines.push(status_row("復旧理由", reason));
     }
-    vec![ratatui::text::Line::from(
-        render::sanitize(&result).escape_debug().to_string(),
-    )]
+    lines
 }
 
 #[cfg(unix)]
@@ -12868,12 +12948,29 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("現在=Never, 起動時=OnRequest"), "{text}");
+        assert!(lines.iter().any(|line| {
+            let line = line.to_string();
+            line.contains("承認（現在）:") && line.ends_with("Never")
+        }));
+        assert!(lines.iter().any(|line| {
+            let line = line.to_string();
+            line.contains("承認（起動時）:") && line.ends_with("OnRequest")
+        }));
         let blocked = store.blocker().unwrap().unwrap();
         assert!(
             text.contains(&blocked.request.operation_id.to_string()),
             "{text}"
         );
+        for (label, value) in [
+            ("対象:", blocked.request.inventory.to_string()),
+            ("状態:", format!("{:?}", blocked.state)),
+            ("記録番号:", blocked.last_sequence.to_string()),
+        ] {
+            assert!(lines.iter().any(|line| {
+                let line = line.to_string();
+                line.contains(label) && line.ends_with(&value)
+            }));
+        }
         assert!(text.contains("復旧\\n確認待ち"), "{text}");
         assert!(text.contains("provider\\n管理操作: 未解決なし"), "{text}");
         assert!(text.contains("model\\tname"), "{text}");
@@ -14384,11 +14481,22 @@ mod tests {
             .unwrap()
             .record_translation_installation(Some(true));
         let diagnostic = cat_diagnostic_lines(Some(&owner));
-        assert!(
-            diagnostic[0]
-                .to_string()
-                .contains("installed=導入確認; verified=false; observed=0")
-        );
+        for (label, value) in [
+            ("CAT 構成:", "false"),
+            ("CAT 導入:", "導入確認"),
+            ("CAT 検証:", "false"),
+        ] {
+            assert!(diagnostic.iter().any(|line| {
+                let line = line.to_string();
+                line.contains(label) && line.ends_with(value)
+            }));
+        }
+        assert!(diagnostic.iter().any(|line| {
+            let line = line.to_string();
+            line.contains("CAT 観測:")
+                && line.contains("0 attempts")
+                && line.contains("保存済み観測。実行の成功とは別")
+        }));
         assert!(schedule_tui_shadow(&owner, &session, "answer this", &control).unwrap());
         assert_eq!(owner.records().unwrap().len(), 1);
     }
@@ -18595,7 +18703,33 @@ mod tests {
 
     #[test]
     fn m3_acceptance_status_includes_usage_and_fixed_capability_truth() {
-        let session = Session::default();
+        use polaris_core::workflow::{SessionWorkflow, WorkflowSkillV1, WorkflowStateV1};
+
+        let mut session = Session::default();
+        let workflow_state = WorkflowStateV1 {
+            skill_manifest_hash: "0123456789abcdef".repeat(4),
+            skills: vec![
+                WorkflowSkillV1 {
+                    id: "builtin:workflow-core".into(),
+                    source: "builtin".into(),
+                    body_hash: "core-hash".into(),
+                },
+                WorkflowSkillV1 {
+                    id: "user:example".into(),
+                    source: "user".into(),
+                    body_hash: "example-hash".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        session.workflow = Some(
+            SessionWorkflow::restore(
+                Default::default(),
+                Default::default(),
+                workflow_state.clone(),
+            )
+            .unwrap(),
+        );
         let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
         #[cfg(unix)]
         let root = tempfile::tempdir().unwrap();
@@ -18631,6 +18765,8 @@ mod tests {
             model_name: "gpt-5.4",
             usage_report: polaris_provider::UsageReport {
                 usage,
+                missing_responses: 3,
+                failed_requests: 2,
                 ..Default::default()
             },
             sandbox: &sandbox,
@@ -18654,7 +18790,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("cache 80"), "{text}");
-        assert!(text.contains("CAT: configured=shadow ownerなし; installed=未照合; verified=未確認; observed=未取得"), "{text}");
+        for (label, value) in [
+            ("CAT 構成:", "shadow ownerなし"),
+            ("CAT 導入:", "未照合"),
+            ("CAT 検証:", "未確認"),
+            ("CAT 観測:", "未取得"),
+        ] {
+            assert!(local_lines.iter().any(|line| {
+                let line = line.to_string();
+                line.contains(label) && line.ends_with(value)
+            }));
+        }
         let diagnostic = doctor_lines(
             "openai\nforged",
             "model\tforged",
@@ -18669,18 +18815,97 @@ mod tests {
                 .all(|line| !line.to_string().contains(['\n', '\t', '\x1b']))
         );
 
-        assert!(text.contains("audit=/tmp/audit\\nforged.jsonl"), "{text}");
-        assert!(text.contains("effort=automatic"));
-        assert!(text.contains("authorityの構成=false"));
-        assert!(text.contains("capacity観測は未接続"));
-        assert!(text.contains("web-search=disabled"));
+        for section in [
+            "Polaris 状態 (read-only)",
+            "利用条件",
+            "観測・workflow",
+            "可用性",
+            "管理・診断",
+        ] {
+            assert!(local_lines.iter().any(|line| line.to_string() == section));
+        }
+        assert!(text.contains("/tmp/audit\\nforged.jsonl"), "{text}");
+        assert!(local_lines.iter().any(|line| {
+            let line = line.to_string();
+            line.contains("effort:") && line.contains("automatic（固定overrideの変更はTUI非対応）")
+        }));
+        assert!(text.contains("routine/review構成=false"));
+        assert!(text.contains("観測は未接続"));
+        assert!(text.contains("資源の空きは未確認"));
+        assert!(local_lines.iter().any(|line| {
+            let line = line.to_string();
+            line.contains("web-search:")
+                && line.contains("disabled")
+                && line.contains("接続先の上限契約未確認・利用不可")
+        }));
         assert!(text.contains("in 100"));
         assert!(text.contains("out 20"));
         assert!(text.contains("total 120"));
-        assert!(text.contains("現在=Never, 起動時=OnRequest"));
-        assert!(text.contains("外部MCP=true"));
-        assert!(text.contains("実接続はこの表示では未検証"));
+        assert!(local_lines.iter().any(|line| {
+            let line = line.to_string();
+            line.contains("欠測 / 失敗:") && line.ends_with("3 / 2")
+        }));
+        assert!(local_lines.iter().any(|line| {
+            let line = line.to_string();
+            line.contains("外部MCP:") && line.contains("true") && line.contains("/mcp")
+        }));
+        assert!(text.contains("未検証（認証・モデル・MCP"));
+        assert!(text.contains("builtin:workflow-core"));
+        assert!(text.contains("user:example"));
+        assert!(text.contains(&workflow_state.skill_manifest_hash));
+        let history: Vec<_> = local_lines
+            .iter()
+            .cloned()
+            .map(|line| render::HistoryLine {
+                line,
+                shaded: false,
+            })
+            .collect();
+        for width in [80, 160] {
+            let wrapped = render::wrap_history_lines(&history, width);
+            assert!(
+                wrapped.len() <= 35,
+                "{width} columns: {} rows",
+                wrapped.len()
+            );
+        }
+        assert_eq!(session.workflow.as_ref().unwrap().state(), workflow_state);
         assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn status_rows_align_japanese_labels_and_keep_values_when_wrapped() {
+        use unicode_width::UnicodeWidthStr;
+
+        let value = "value";
+        for label in ["モデル", "provider", "承認（起動時）", ""] {
+            let line = status_row(label, value).to_string();
+            let start = line.find(value).unwrap();
+            assert_eq!(line[..start].width(), 20, "{line}");
+        }
+
+        let path = "/synthetic/project/with-a-long-directory-name/audit.jsonl";
+        let hash = "0123456789abcdef".repeat(4);
+        let history = vec![
+            render::HistoryLine {
+                line: status_row("audit", path),
+                shaded: false,
+            },
+            render::HistoryLine {
+                line: status_row("manifest", &hash),
+                shaded: false,
+            },
+        ];
+        for width in [24, 40, 80] {
+            let wrapped = render::wrap_history_lines(&history, width);
+            assert!(wrapped.iter().all(|row| row.line.width() <= width as usize));
+            let text: String = wrapped.iter().map(|row| row.line.to_string()).collect();
+            assert!(text.contains(path), "{text}");
+            assert!(text.contains(&hash), "{text}");
+        }
+        let escaped = status_row("audit", "/tmp/audit\nforged\t\x1b.jsonl").to_string();
+        assert!(!escaped.contains(['\n', '\t', '\x1b']));
+        assert!(escaped.contains("/tmp/audit\\nforged\\t"), "{escaped}");
     }
 
     #[test]

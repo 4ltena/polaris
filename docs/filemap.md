@@ -795,6 +795,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `mod.rs` — Remna's privacy filter. Pure logic that runs **before** a captured event
 
+## `crates/polaris-core/src/session`
+
+- `delegation.rs` — Root delegation control, durable publication, runtime aborts and safe projections.
+
 ## `crates/polaris-core/src/session_settings`
 
 - `owner.rs` — Preview and commit session settings through the management-effect owner.

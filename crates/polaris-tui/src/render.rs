@@ -1018,7 +1018,7 @@ fn header_lines_with_mode(header: &HeaderInfo, read_only: bool) -> Vec<Line<'sta
 /// `header_lines(header)`, framed with a hand-built box-drawing border, as
 /// plain `HistoryLine`s — the header's one-shot equivalent of
 /// `history_lines_for`. Used at startup and by every conversation-view
-/// reset (see `lib.rs`'s `run()` and `reset_conversation_view`) to (re-)seed
+/// reset (see `lib.rs`'s `run()` and `ConversationViewState::reset`) to re-seed
 /// `history`; there is no separate `render_header_into`/`insert_before`
 /// print anymore — the header lives in `history` like everything else.
 /// Always returns exactly `HEADER_HEIGHT` rows.

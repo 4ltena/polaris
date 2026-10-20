@@ -9,6 +9,7 @@ mod clipboard;
 mod command_dispatch;
 #[cfg(test)]
 mod continuation_tests;
+mod conversation_view;
 #[cfg(unix)]
 mod draft;
 pub mod input;
@@ -60,7 +61,7 @@ mod time;
 pub mod tool_memory;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 #[cfg(unix)]
 use std::fs;
 use std::io::IsTerminal;
@@ -467,7 +468,7 @@ async fn handle_runtime_command(
     approval: ApprovalPolicy,
     next_max_turns: &mut u32,
     startup_max_turns: u32,
-    activity: &AgentActivityRows,
+    activity: &conversation_view::ConversationViewState,
 ) -> Result<Vec<String>, String> {
     let (verb, extra) = request.split_once(' ').unwrap_or((request, ""));
     match verb {
@@ -2577,6 +2578,17 @@ fn restore_rejected_new_submission(
     }
 }
 
+/// Resume always rebuilds the projection after the picker returns. A successful
+/// resume can reactivate the same path after replacing the in-memory session and
+/// clearing local lines, so path equality is not a safe reset decision.
+fn reset_conversation_view_after_resume(
+    conversation_view: &mut conversation_view::ConversationViewState,
+    header: &render::HeaderInfo<'_>,
+    width: u16,
+) {
+    conversation_view.reset(header, width);
+}
+
 /// Appends every `session.messages` entry and every `local_lines` entry
 /// added since the last call to `history`, once each — the in-memory
 /// analogue of the old `insert_before`-based one-shot terminal print.
@@ -2592,7 +2604,7 @@ fn restore_rejected_new_submission(
 /// `HeaderInfo`/width threaded all the way into a function whose only
 /// other job is diffing two counters against two slices, for the sake of
 /// one caller. Instead every wholesale-reset path calls
-/// `reset_conversation_view` explicitly (see its own doc and every call
+/// `ConversationViewState::reset` explicitly (see every call
 /// site in `run()`, including the one right after `/clear`'s
 /// `apply_slash_action` call) *before* falling through to the next
 /// `append_new_history` call, so by the time this function's own
@@ -2600,6 +2612,7 @@ fn restore_rejected_new_submission(
 /// re-seeded and `printed_messages`/`printed_local_lines` already at 0 —
 /// meaning the guard is a no-op safety net on that path, not the
 /// mechanism actually doing the reset.
+#[cfg(test)]
 fn append_new_history(
     session: &polaris_core::session::Session,
     local_lines: &[ratatui::text::Line<'static>],
@@ -2607,38 +2620,13 @@ fn append_new_history(
     printed_local_lines: &mut usize,
     history: &mut Vec<render::HistoryLine>,
 ) -> bool {
-    let mut changed = false;
-    // A session that's now *shorter* than what's already been printed
-    // (`/clear`, `/new`) can only mean it was reset out from under us —
-    // reprint from scratch. This alone doesn't catch `/resume` loading a
-    // same-or-longer *different* session, which is why every `/resume`
-    // call site also resets both counters (and `history`) explicitly.
-    if *printed_messages > session.messages.len() {
-        *printed_messages = 0;
-        history.clear();
-        changed = true;
-    }
-    if *printed_local_lines > local_lines.len() {
-        *printed_local_lines = 0;
-        history.clear();
-        changed = true;
-    }
-    if session.messages.len() > *printed_messages {
-        let lines = render::history_lines_for(&session.messages[*printed_messages..]);
-        history.extend(lines);
-        *printed_messages = session.messages.len();
-        changed = true;
-    }
-    if local_lines.len() > *printed_local_lines {
-        let new_lines = &local_lines[*printed_local_lines..];
-        history.extend(new_lines.iter().map(|l| render::HistoryLine {
-            line: l.clone(),
-            shaded: false,
-        }));
-        *printed_local_lines = local_lines.len();
-        changed = true;
-    }
-    changed
+    conversation_view::append_new_history_parts(
+        session,
+        local_lines,
+        printed_messages,
+        printed_local_lines,
+        history,
+    )
 }
 
 /// Shows an input in the transcript while its admission checks run without
@@ -2663,44 +2651,6 @@ fn draw_submission_preview<E>(
     result
 }
 
-/// Clears `history` and immediately re-seeds it with the header box,
-/// resets `scroll_offset` back to 0 (following the tail), and drops any
-/// in-progress or finalized text `selection` — the one place every
-/// conversation-view reset (`/resume`, `/new`, `/fork`, `/clear`) goes
-/// through, so the header can't be dropped by a bare `history.clear()`, a
-/// stale scroll position can't survive into a different, possibly much
-/// shorter, conversation, and a selection can't keep pointing at
-/// `wrapped` coordinates from a history that no longer exists. Callers
-/// still separately reset `printed_messages`/`printed_local_lines` to 0 —
-/// this only owns `history`/`scroll_offset`/`selection`, not the counters
-/// `append_new_history` reads.
-fn reset_conversation_view(
-    history: &mut Vec<render::HistoryLine>,
-    history_wrap_cache: &mut render::HistoryWrapCache,
-    activity_rows: &mut AgentActivityRows,
-    scroll_offset: &mut usize,
-    selection: &mut Option<selection::Selection>,
-    header: &render::HeaderInfo,
-    width: u16,
-) {
-    history.clear();
-    history.extend(render::header_history_lines(header, width));
-    history_wrap_cache.invalidate();
-    activity_rows.rows.clear();
-    activity_rows.tools.clear();
-    *scroll_offset = 0;
-    *selection = None;
-}
-
-/// Appends one mid-turn `AgentEvent`'s formatted lines to `history` — the
-/// in-memory analogue of the old one-shot live print. `history_lines_for`
-/// deliberately leaves tool activity out of its own output (see its own
-/// doc comment) so appending this separately can't duplicate it. Returns
-/// how many lines were just appended, so a caller that's scrolled back
-/// (`scroll_offset > 0`) can advance `scroll_offset` by the same amount
-/// and keep the *viewed content* fixed instead of letting the window
-/// silently shift under the user by the number of newly appended lines
-/// (see the two call sites in `run()`).
 /// An MCP call in the failed turn may already have been sent. Keep it and
 /// close unanswered calls as unknown instead of dropping the evidence; other
 /// turns roll back to the user's message as before.
@@ -2717,121 +2667,6 @@ fn keep_or_roll_back(
     }
     session.messages.truncate(checkpoint);
     Ok(())
-}
-
-#[derive(Default)]
-struct AgentActivityRows {
-    rows: HashMap<(String, String), usize>,
-    tools: VecDeque<(String, String, &'static str)>,
-}
-
-impl AgentActivityRows {
-    fn tool_detail_lines(&self) -> Vec<String> {
-        if self.tools.is_empty() {
-            return vec!["この実行でtoolイベントは観測されていません".into()];
-        }
-        self.tools
-            .iter()
-            .map(|(name, _, state)| format!("tool {}: {}", render::sanitize(name), state))
-            .collect()
-    }
-    fn observe_tool(&mut self, event: &polaris_core::AgentEvent) {
-        let (name, detail, state) = match event {
-            polaris_core::AgentEvent::ToolStarted { name, detail } => {
-                (name, detail, "開始を観測・完了未確認")
-            }
-            polaris_core::AgentEvent::ToolFinished {
-                name, detail, ok, ..
-            } => (
-                name,
-                detail,
-                if *ok {
-                    "成功を観測"
-                } else {
-                    "失敗を観測"
-                },
-            ),
-            _ => return,
-        };
-        let name = name.chars().take(256).collect::<String>();
-        let detail = detail.chars().take(256).collect::<String>();
-        if matches!(event, polaris_core::AgentEvent::ToolFinished { .. })
-            && let Some(row) = self
-                .tools
-                .iter_mut()
-                .rev()
-                .find(|(n, d, s)| n == &name && d == &detail && *s == "開始を観測・完了未確認")
-        {
-            row.2 = state;
-            return;
-        }
-        if self.tools.len() == 128 {
-            self.tools.pop_front();
-        }
-        self.tools.push_back((name, detail, state));
-    }
-}
-
-fn append_live_event(
-    event: &polaris_core::AgentEvent,
-    history: &mut Vec<render::HistoryLine>,
-    activity_rows: &mut AgentActivityRows,
-) -> usize {
-    activity_rows.observe_tool(event);
-    let key = match event {
-        polaris_core::AgentEvent::SpawnStarted {
-            display_name,
-            agent_type,
-            ..
-        }
-        | polaris_core::AgentEvent::SpawnActivity {
-            display_name,
-            agent_type,
-            ..
-        }
-        | polaris_core::AgentEvent::SpawnFinished {
-            display_name,
-            agent_type,
-            ..
-        } => Some((display_name.clone(), agent_type.clone())),
-        _ => None,
-    };
-
-    if matches!(event, polaris_core::AgentEvent::SpawnActivity { .. }) {
-        if let Some(row) = key
-            .as_ref()
-            .and_then(|key| activity_rows.rows.get(key))
-            .copied()
-            && let Some(line) = render::format_event_for_live_print(event)
-                .into_iter()
-                .next()
-            && let Some(slot) = history.get_mut(row)
-        {
-            *slot = line;
-        }
-        // An activity without a preceding SpawnStarted is stale or malformed;
-        // never append it as a second unowned progress row.
-        return 0;
-    }
-
-    let before = history.len();
-    history.extend(render::format_event_for_live_print(event));
-    match event {
-        polaris_core::AgentEvent::SpawnStarted { .. } => {
-            if let Some(key) = key {
-                // SpawnStarted always renders the agent row followed by its
-                // one replaceable, dimmed activity row.
-                activity_rows.rows.insert(key, before + 1);
-            }
-        }
-        polaris_core::AgentEvent::SpawnFinished { .. } => {
-            if let Some(key) = key {
-                activity_rows.rows.remove(&key);
-            }
-        }
-        _ => {}
-    }
-    history.len() - before
 }
 
 fn now_millis() -> u128 {
@@ -3545,29 +3380,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         std::io::stdout(),
         ratatui::crossterm::cursor::SetCursorStyle::BlinkingBar
     );
-    // How many `session.messages` / `local_lines` entries have already
-    // been appended to `history`. Only the delta past this point gets
-    // appended on each call to `append_new_history` — appending is
-    // one-shot, never a redraw, so re-appending an already-appended line
-    // would duplicate it in `history` instead of updating anything in
-    // place.
-    let mut printed_messages = 0usize;
-    let mut printed_local_lines = 0usize;
-    // The in-memory scrollable history buffer — accumulates every line
-    // that used to be printed one-shot to the terminal's native scrollback
-    // via `insert_before`. Rendered every frame by `draw_frame`, which
-    // slices it down to `render::visible_history_window`'s current window.
-    let mut history: Vec<render::HistoryLine> = Vec::new();
-    let mut history_wrap_cache = render::HistoryWrapCache::default();
-    let mut agent_activity_rows = AgentActivityRows::default();
-    // How far back the user has scrolled the history region — 0 always
-    // means "following the tail" (see `render::visible_history_window`).
-    let mut scroll_offset: usize = 0;
-    // Mouse drag-to-select over the conversation history — see
-    // `selection.rs`. `None` means no active or finalized selection.
-    let mut selection: Option<selection::Selection> = None;
     let startup_width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-    history.extend(render::header_history_lines(
+    let mut conversation_view = conversation_view::ConversationViewState::new(
         &render::HeaderInfo {
             provider_name: &provider_name,
             model_name: &args.model_name,
@@ -3577,7 +3391,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             effort_name: "",
         },
         startup_width,
-    ));
+    );
 
     let cwd_display = args.cwd.display().to_string();
     // Shown only in the footer — verified against a real codex
@@ -4025,23 +3839,15 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // reset) before redrawing the small footer viewport — printing is
         // one-shot and must happen before the footer draw so the newly
         // printed lines appear above it, not interleaved mid-frame.
-        if append_new_history(
-            &session,
-            &local_lines,
-            &mut printed_messages,
-            &mut printed_local_lines,
-            &mut history,
-        ) {
-            history_wrap_cache.invalidate();
-        }
+        conversation_view.append_new_history(&session, &local_lines);
         if terminal
             .borrow_mut()
             .draw(|f| {
                 draw_frame(
                     f,
-                    &history,
-                    &mut history_wrap_cache,
-                    scroll_offset,
+                    &conversation_view.history,
+                    &mut conversation_view.history_wrap_cache,
+                    conversation_view.scroll_offset,
                     &input_buffer,
                     input_cursor,
                     &status,
@@ -4055,7 +3861,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     },
                     &suggestions,
                     selected_suggestion,
-                    &selection,
+                    &conversation_view.selection,
                 )
             })
             .is_err()
@@ -4128,10 +3934,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     match mouse.kind {
                         MouseEventKind::Moved => continue,
                         MouseEventKind::ScrollUp => {
-                            scroll_offset = scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
+                            conversation_view.scroll_offset = conversation_view
+                                .scroll_offset
+                                .saturating_add(MOUSE_SCROLL_LINES);
                         }
                         MouseEventKind::ScrollDown => {
-                            scroll_offset = scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                            conversation_view.scroll_offset = conversation_view
+                                .scroll_offset
+                                .saturating_sub(MOUSE_SCROLL_LINES);
                         }
                         MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
                             let history_area_height = area_height_for_history(
@@ -4140,10 +3950,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             );
                             if mouse.row < history_area_height {
                                 let width = terminal_width(&terminal);
-                                let wrapped = render::wrap_history_lines(&history, width);
+                                let wrapped =
+                                    render::wrap_history_lines(&conversation_view.history, width);
                                 let window = render::visible_history_window(
                                     wrapped.len(),
-                                    scroll_offset,
+                                    conversation_view.scroll_offset,
                                     history_area_height as usize,
                                 );
                                 let pos = selection::text_pos_from_screen(
@@ -4153,7 +3964,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     mouse.row,
                                     mouse.column,
                                 );
-                                selection = Some(selection::Selection {
+                                conversation_view.selection = Some(selection::Selection {
                                     anchor: pos,
                                     cursor: pos,
                                     dragging: true,
@@ -4161,7 +3972,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             }
                         }
                         MouseEventKind::Drag(ratatui::crossterm::event::MouseButton::Left) => {
-                            if let Some(sel) = selection.as_mut()
+                            if let Some(sel) = conversation_view.selection.as_mut()
                                 && sel.dragging
                             {
                                 let history_area_height = area_height_for_history(
@@ -4169,10 +3980,11 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     terminal_height(&terminal),
                                 );
                                 let width = terminal_width(&terminal);
-                                let wrapped = render::wrap_history_lines(&history, width);
+                                let wrapped =
+                                    render::wrap_history_lines(&conversation_view.history, width);
                                 let window = render::visible_history_window(
                                     wrapped.len(),
-                                    scroll_offset,
+                                    conversation_view.scroll_offset,
                                     history_area_height as usize,
                                 );
                                 sel.cursor = selection::text_pos_from_screen(
@@ -4183,19 +3995,22 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     mouse.column,
                                 );
                                 if mouse.row == 0 {
-                                    scroll_offset = scroll_offset.saturating_add(1);
+                                    conversation_view.scroll_offset =
+                                        conversation_view.scroll_offset.saturating_add(1);
                                 } else if mouse.row.saturating_add(1) >= history_area_height {
-                                    scroll_offset = scroll_offset.saturating_sub(1);
+                                    conversation_view.scroll_offset =
+                                        conversation_view.scroll_offset.saturating_sub(1);
                                 }
                             }
                         }
                         MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left) => {
-                            if let Some(sel) = selection.as_mut()
+                            if let Some(sel) = conversation_view.selection.as_mut()
                                 && sel.dragging
                             {
                                 sel.dragging = false;
                                 let width = terminal_width(&terminal);
-                                let wrapped = render::wrap_history_lines(&history, width);
+                                let wrapped =
+                                    render::wrap_history_lines(&conversation_view.history, width);
                                 let text = selection::extract_text(&wrapped, sel);
                                 if !text.is_empty() {
                                     #[cfg(unix)]
@@ -4244,7 +4059,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             break 'outer code;
         }
         if let ratatui::crossterm::event::Event::Resize(_, _) = &event {
-            selection = None;
+            conversation_view.selection = None;
         }
         let ratatui::crossterm::event::Event::Key(key) = event else {
             continue;
@@ -4339,12 +4154,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 .size()
                                 .map(|size| size.width)
                                 .unwrap_or(80);
-                            reset_conversation_view(
-                                &mut history,
-                                &mut history_wrap_cache,
-                                &mut agent_activity_rows,
-                                &mut scroll_offset,
-                                &mut selection,
+                            conversation_view.reset(
                                 &render::HeaderInfo {
                                     provider_name: &provider_name,
                                     model_name: &model_name,
@@ -4355,8 +4165,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 },
                                 width,
                             );
-                            printed_messages = 0;
-                            printed_local_lines = 0;
                             status = Status::Notice(format!(
                                 "入力「{}」の直前へ巻き戻しました。元の会話は保存されています。",
                                 boundary.user_message_preview.as_deref().unwrap_or("不明")
@@ -4546,12 +4354,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         local_lines.clear();
                                         let width =
                                             terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                                        reset_conversation_view(
-                                            &mut history,
-                                            &mut history_wrap_cache,
-                                            &mut agent_activity_rows,
-                                            &mut scroll_offset,
-                                            &mut selection,
+                                        conversation_view.reset(
                                             &render::HeaderInfo {
                                                 provider_name: &provider_name,
                                                 model_name: &model_name,
@@ -4562,8 +4365,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             },
                                             width,
                                         );
-                                        printed_messages = 0;
-                                        printed_local_lines = 0;
                                     }
                                     local_lines.extend(lines);
                                     status = Status::Notice("管理操作の結果を表示しました".into());
@@ -4656,7 +4457,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 approval_policy,
                                 &mut next_max_turns,
                                 args.max_turns,
-                                &agent_activity_rows,
+                                &conversation_view,
                             )
                             .await;
                             match result {
@@ -4802,12 +4603,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             // `append_new_history` can't detect that case,
                             // so reset explicitly here.
                             let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                            reset_conversation_view(
-                                &mut history,
-                                &mut history_wrap_cache,
-                                &mut agent_activity_rows,
-                                &mut scroll_offset,
-                                &mut selection,
+                            reset_conversation_view_after_resume(
+                                &mut conversation_view,
                                 &render::HeaderInfo {
                                     provider_name: &provider_name,
                                     model_name: &model_name,
@@ -4818,8 +4615,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 },
                                 width,
                             );
-                            printed_messages = 0;
-                            printed_local_lines = 0;
                             continue;
                         }
                         slash::Action::New => {
@@ -4868,12 +4663,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &mut mcp_prompt_requires_reselect,
                             );
                             let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                            reset_conversation_view(
-                                &mut history,
-                                &mut history_wrap_cache,
-                                &mut agent_activity_rows,
-                                &mut scroll_offset,
-                                &mut selection,
+                            conversation_view.reset(
                                 &render::HeaderInfo {
                                     provider_name: &provider_name,
                                     model_name: &model_name,
@@ -4884,8 +4674,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 },
                                 width,
                             );
-                            printed_messages = 0;
-                            printed_local_lines = 0;
                             continue;
                         }
                         slash::Action::Fork => {
@@ -4920,12 +4708,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 &mut mcp_prompt_requires_reselect,
                             );
                             let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                            reset_conversation_view(
-                                &mut history,
-                                &mut history_wrap_cache,
-                                &mut agent_activity_rows,
-                                &mut scroll_offset,
-                                &mut selection,
+                            conversation_view.reset(
                                 &render::HeaderInfo {
                                     provider_name: &provider_name,
                                     model_name: &model_name,
@@ -4936,8 +4719,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 },
                                 width,
                             );
-                            printed_messages = 0;
-                            printed_local_lines = 0;
                             continue;
                         }
                         slash::Action::Permissions => {
@@ -5076,9 +4857,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 .draw(|f| {
                                     draw_frame(
                                         f,
-                                        &history,
-                                        &mut history_wrap_cache,
-                                        scroll_offset,
+                                        &conversation_view.history,
+                                        &mut conversation_view.history_wrap_cache,
+                                        conversation_view.scroll_offset,
                                         &input_buffer,
                                         input_cursor,
                                         &status,
@@ -5092,7 +4873,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         },
                                         &[],
                                         0,
-                                        &selection,
+                                        &conversation_view.selection,
                                     )
                                 })
                                 .is_err()
@@ -5144,7 +4925,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 }
                                 break 'outer code;
                             }
-                            printed_messages = session.messages.len();
+                            conversation_view.mark_messages_printed(session.messages.len());
                             continue;
                         }
                         action => {
@@ -5175,12 +4956,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     if clear_view {
                                         let width =
                                             terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                                        reset_conversation_view(
-                                            &mut history,
-                                            &mut history_wrap_cache,
-                                            &mut agent_activity_rows,
-                                            &mut scroll_offset,
-                                            &mut selection,
+                                        conversation_view.reset(
                                             &render::HeaderInfo {
                                                 provider_name: &provider_name,
                                                 model_name: &model_name,
@@ -5191,8 +4967,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             },
                                             width,
                                         );
-                                        printed_messages = 0;
-                                        printed_local_lines = 0;
                                     }
                                     continue;
                                 }
@@ -5268,11 +5042,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             use ratatui::crossterm::event::KeyCode;
             match key.code {
                 KeyCode::PageUp => {
-                    scroll_offset = scroll_offset.saturating_add(1);
+                    conversation_view.scroll_offset =
+                        conversation_view.scroll_offset.saturating_add(1);
                     continue;
                 }
                 KeyCode::PageDown => {
-                    scroll_offset = scroll_offset.saturating_sub(1);
+                    conversation_view.scroll_offset =
+                        conversation_view.scroll_offset.saturating_sub(1);
                     continue;
                 }
                 _ => {}
@@ -5324,7 +5100,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             continue;
         }
 
-        selection = None;
+        conversation_view.selection = None;
 
         let cursor_before_submit = input_cursor;
         let text = if let Some(t) = review_text {
@@ -5396,7 +5172,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &text,
                         dispatching_queued_input,
                     );
-                    scroll_offset = 0;
+                    conversation_view.scroll_offset = 0;
                     text
                 }
             };
@@ -5560,12 +5336,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             {
                                 local_lines.clear();
                                 let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                                reset_conversation_view(
-                                    &mut history,
-                                    &mut history_wrap_cache,
-                                    &mut agent_activity_rows,
-                                    &mut scroll_offset,
-                                    &mut selection,
+                                conversation_view.reset(
                                     &render::HeaderInfo {
                                         provider_name: &provider_name,
                                         model_name: &model_name,
@@ -5576,8 +5347,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     },
                                     width,
                                 );
-                                printed_messages = 0;
-                                printed_local_lines = 0;
                             }
                             local_lines.extend(lines);
                             status = Status::Notice("管理操作の結果を表示しました".into());
@@ -5664,7 +5433,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         approval_policy,
                         &mut next_max_turns,
                         args.max_turns,
-                        &agent_activity_rows,
+                        &conversation_view,
                     )
                     .await;
                     match result {
@@ -5826,12 +5595,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     // resumed session's length alone can't be trusted to
                     // signal "this is a different conversation."
                     let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                    reset_conversation_view(
-                        &mut history,
-                        &mut history_wrap_cache,
-                        &mut agent_activity_rows,
-                        &mut scroll_offset,
-                        &mut selection,
+                    reset_conversation_view_after_resume(
+                        &mut conversation_view,
                         &render::HeaderInfo {
                             provider_name: &provider_name,
                             model_name: &model_name,
@@ -5842,8 +5607,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         },
                         width,
                     );
-                    printed_messages = 0;
-                    printed_local_lines = 0;
                     continue;
                 }
                 Some(slash::Action::New) => {
@@ -5892,12 +5655,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut mcp_prompt_requires_reselect,
                     );
                     let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                    reset_conversation_view(
-                        &mut history,
-                        &mut history_wrap_cache,
-                        &mut agent_activity_rows,
-                        &mut scroll_offset,
-                        &mut selection,
+                    conversation_view.reset(
                         &render::HeaderInfo {
                             provider_name: &provider_name,
                             model_name: &model_name,
@@ -5908,8 +5666,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         },
                         width,
                     );
-                    printed_messages = 0;
-                    printed_local_lines = 0;
                     continue;
                 }
                 Some(slash::Action::Fork) => {
@@ -5944,12 +5700,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         &mut mcp_prompt_requires_reselect,
                     );
                     let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                    reset_conversation_view(
-                        &mut history,
-                        &mut history_wrap_cache,
-                        &mut agent_activity_rows,
-                        &mut scroll_offset,
-                        &mut selection,
+                    conversation_view.reset(
                         &render::HeaderInfo {
                             provider_name: &provider_name,
                             model_name: &model_name,
@@ -5960,8 +5711,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         },
                         width,
                     );
-                    printed_messages = 0;
-                    printed_local_lines = 0;
                     continue;
                 }
                 Some(slash::Action::Permissions) => {
@@ -6097,9 +5846,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         .draw(|f| {
                             draw_frame(
                                 f,
-                                &history,
-                                &mut history_wrap_cache,
-                                scroll_offset,
+                                &conversation_view.history,
+                                &mut conversation_view.history_wrap_cache,
+                                conversation_view.scroll_offset,
                                 &input_buffer,
                                 input_cursor,
                                 &status,
@@ -6113,7 +5862,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 },
                                 &[],
                                 0,
-                                &selection,
+                                &conversation_view.selection,
                             )
                         })
                         .is_err()
@@ -6164,7 +5913,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         }
                         break 'outer code;
                     }
-                    printed_messages = session.messages.len();
+                    conversation_view.mark_messages_printed(session.messages.len());
                     continue;
                 }
                 Some(action) => {
@@ -6190,12 +5939,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         SlashOutcome::Continue => {
                             if clear_view {
                                 let width = terminal.borrow().size().map(|s| s.width).unwrap_or(80);
-                                reset_conversation_view(
-                                    &mut history,
-                                    &mut history_wrap_cache,
-                                    &mut agent_activity_rows,
-                                    &mut scroll_offset,
-                                    &mut selection,
+                                conversation_view.reset(
                                     &render::HeaderInfo {
                                         provider_name: &provider_name,
                                         model_name: &model_name,
@@ -6206,8 +5950,6 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     },
                                     width,
                                 );
-                                printed_messages = 0;
-                                printed_local_lines = 0;
                             }
                             continue;
                         }
@@ -6266,8 +6008,8 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // succeeds.
         let preview_suggestions = slash_suggestions(&input_buffer, &input_history, false);
         if draw_submission_preview(
-            &mut history,
-            &mut history_wrap_cache,
+            &mut conversation_view.history,
+            &mut conversation_view.history_wrap_cache,
             &mut status,
             &text,
             |preview_history, preview_wrap_cache, preview_status| {
@@ -6292,7 +6034,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             },
                             &preview_suggestions,
                             selected_suggestion,
-                            &selection,
+                            &conversation_view.selection,
                         )
                     })
                     .map(|_| ())
@@ -6848,15 +6590,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // appear until the *next* top-of-loop print, which only happens
         // after the assistant's reply finishes too, making the user's own
         // input look laggy instead of showing up the instant it's sent.
-        if append_new_history(
-            &session,
-            &local_lines,
-            &mut printed_messages,
-            &mut printed_local_lines,
-            &mut history,
-        ) {
-            history_wrap_cache.invalidate();
-        }
+        conversation_view.append_new_history(&session, &local_lines);
         let suggestions = slash_suggestions(&input_buffer, &input_history, false);
         if selected_suggestion >= suggestions.len() {
             selected_suggestion = 0;
@@ -6867,9 +6601,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             .draw(|f| {
                 draw_frame(
                     f,
-                    &history,
-                    &mut history_wrap_cache,
-                    scroll_offset,
+                    &conversation_view.history,
+                    &mut conversation_view.history_wrap_cache,
+                    conversation_view.scroll_offset,
                     &input_buffer,
                     input_cursor,
                     &status,
@@ -6883,7 +6617,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     },
                     &suggestions,
                     selected_suggestion,
-                    &selection,
+                    &conversation_view.selection,
                 )
             })
             .is_err()
@@ -6995,14 +6729,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         #[cfg(unix)]
         let mut interruption_effect = None;
         if let Some(active) = tui_admission.as_ref() {
-            history.push(render::HistoryLine {
+            conversation_view.push_history_line(render::HistoryLine {
                 line: ratatui::text::Line::from(format!(
                     "受理ID: {}（/input status|cancel）",
                     active.admission_id.as_str()
                 )),
                 shaded: true,
             });
-            history_wrap_cache.invalidate();
         }
         #[cfg(unix)]
         let runtime_persistence = session.persistence.clone();
@@ -7162,21 +6895,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             })
                         });
                         update_effort_from_event(&event, &mut effort_name);
-                        let appended = append_live_event(
-                            &event,
-                            &mut history,
-                            &mut agent_activity_rows,
-                        );
-                        history_wrap_cache.invalidate();
-                        // The user is scrolled back, not following the
-                        // tail — advance `scroll_offset` by however many
-                        // lines just landed so the *viewed content* stays
-                        // fixed under them instead of the window silently
-                        // sliding by `appended` lines (see
-                        // `append_live_event`'s doc).
-                        if scroll_offset > 0 {
-                            scroll_offset += appended;
-                        }
+                        conversation_view.append_live_event(&event);
                         if let polaris_core::AgentEvent::HistoryCompacted {
                             messages_before,
                             messages_after,
@@ -7202,8 +6921,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             // wiping the entire `history` buffer — header
                             // box included — instead of just rendering the
                             // turn's new messages.
-                            printed_messages = printed_messages
-                                .saturating_sub(messages_before.saturating_sub(messages_after));
+                            conversation_view.observe_compaction(messages_before, messages_after);
                         }
                     }
                     _ = ticker.tick() => {
@@ -7228,9 +6946,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             .draw(|f| {
                                 draw_frame(
                                     f,
-                                    &history,
-                                    &mut history_wrap_cache,
-                                    scroll_offset,
+                                    &conversation_view.history,
+                                    &mut conversation_view.history_wrap_cache,
+                                    conversation_view.scroll_offset,
                                     &input_buffer,
                                     input_cursor,
                                     &status,
@@ -7244,7 +6962,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     },
                                     &suggestions,
                                     selected_suggestion,
-                                    &selection,
+                                    &conversation_view.selection,
                                 )
                             })
                             .is_err()
@@ -7290,10 +7008,12 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         break TurnOutcome::Interrupted;
                                     },
                                     KeyCode::PageUp => {
-                                        scroll_offset = scroll_offset.saturating_add(1);
+                                        conversation_view.scroll_offset =
+                                            conversation_view.scroll_offset.saturating_add(1);
                                     }
                                     KeyCode::PageDown => {
-                                        scroll_offset = scroll_offset.saturating_sub(1);
+                                        conversation_view.scroll_offset =
+                                            conversation_view.scroll_offset.saturating_sub(1);
                                     }
                                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                         #[cfg(unix)]
@@ -7320,9 +7040,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             .draw(|f| {
                                                 draw_frame(
                                                     f,
-                                                    &history,
-                                                    &mut history_wrap_cache,
-                                                    scroll_offset,
+                                                    &conversation_view.history,
+                                                    &mut conversation_view.history_wrap_cache,
+                                                    conversation_view.scroll_offset,
                                                     &input_buffer,
                                                     input_cursor,
                                                     &status,
@@ -7336,7 +7056,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                     },
                                                     &suggestions,
                                                     selected_suggestion,
-                                                    &selection,
+                                                    &conversation_view.selection,
                                                 )
                                             })
                                             .is_err()
@@ -7355,7 +7075,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             let handle=instruction_commands::receive(&active.store,&mut active.manager,saved,&management_effects,&_project_activity,polaris_core::management_effect::ManagementOperationIdV1::random().map_err(|e|e.to_string())?,text)?;
                                             let id=handle.admission_id().as_str().to_owned();queued_instructions.push_back(handle);Ok(id)
                                         })();
-                                        match result {Ok(id)=>{history.push(render::HistoryLine{line:ratatui::text::Line::from(format!("指示受理ID: {id}。この会話の次のrun境界で適用します")),shaded:true});history_wrap_cache.invalidate();status=Status::Notice("次のrunへの指示を保存しました".into());},Err(error)=>status=Status::Error(error)}
+                                        match result {Ok(id)=>{conversation_view.push_history_line(render::HistoryLine{line:ratatui::text::Line::from(format!("指示受理ID: {id}。この会話の次のrun境界で適用します")),shaded:true});status=Status::Notice("次のrunへの指示を保存しました".into());},Err(error)=>status=Status::Error(error)}
                                         mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
                                     }
                                     #[cfg(unix)]
@@ -7394,7 +7114,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                         })();
                                         match result {
                                             Ok((true,_))=>break TurnOutcome::Interrupted,
-                                            Ok((false,line))=>{history.push(render::HistoryLine{line:ratatui::text::Line::from(line),shaded:false});history_wrap_cache.invalidate();status=Status::Notice("入力状態を表示しました".into());},
+                                            Ok((false,line))=>{conversation_view.push_history_line(render::HistoryLine{line:ratatui::text::Line::from(line),shaded:false});status=Status::Notice("入力状態を表示しました".into());},
                                             Err(error)=>status=Status::Error(error),
                                         }
                                         mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
@@ -7411,10 +7131,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             let accepted = !extra.trim().starts_with("cancel ") || account::confirm(&terminal,&mut cancellation_reader,"subagent停止要求",extra.trim(),"現在のchild/attemptだけへ停止要求を送ります。終了はwaitで確認してください。");
                                             runtime_commands::subagents(Some(&turn_control),extra.trim(),Some(runtime_commands::RuntimeMutationContext{effects:&management_effects,lease:&_project_activity,session_id:&durable_session_id,generation:runtime_generation,accepted})).await
                                         } else {
-                                            runtime_commands::run_details(Some(&turn_control)).await.map(|mut lines| { lines.extend(agent_activity_rows.tool_detail_lines()); lines })
+                                            runtime_commands::run_details(Some(&turn_control)).await.map(|mut lines| { lines.extend(conversation_view.tool_detail_lines()); lines })
                                         };
                                         match result {
-                                            Ok(lines)=>{history.extend(lines.into_iter().map(|line|render::HistoryLine{line:ratatui::text::Line::from(line),shaded:false}));history_wrap_cache.invalidate();status=Status::Notice("実行状態を表示しました".into());},
+                                            Ok(lines)=>{conversation_view.extend_text_lines(lines);status=Status::Notice("実行状態を表示しました".into());},
                                             Err(error)=>status=Status::Error(error),
                                         }
                                         mid_turn_notice_until=Some(Instant::now()+MID_TURN_NOTICE_DURATION);
@@ -7468,12 +7188,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                             }
                             Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
                                 MouseEventKind::ScrollUp => {
-                                    scroll_offset =
-                                        scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
+                                    conversation_view.scroll_offset = conversation_view
+                                        .scroll_offset
+                                        .saturating_add(MOUSE_SCROLL_LINES);
                                 }
                                 MouseEventKind::ScrollDown => {
-                                    scroll_offset =
-                                        scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                                    conversation_view.scroll_offset = conversation_view
+                                        .scroll_offset
+                                        .saturating_sub(MOUSE_SCROLL_LINES);
                                 }
                                 MouseEventKind::Down(MouseButton::Left) => {
                                     // Input may change before the next ticker redraw.
@@ -7484,10 +7206,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     );
                                     if mouse.row < history_area_height {
                                         let width = terminal_width(&terminal);
-                                        let wrapped = render::wrap_history_lines(&history, width);
+                                        let wrapped = render::wrap_history_lines(
+                                            &conversation_view.history,
+                                            width,
+                                        );
                                         let window = render::visible_history_window(
                                             wrapped.len(),
-                                            scroll_offset,
+                                            conversation_view.scroll_offset,
                                             history_area_height as usize,
                                         );
                                         let pos = selection::text_pos_from_screen(
@@ -7502,7 +7227,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             mouse.row,
                                             mouse.column,
                                         );
-                                        selection = Some(selection::Selection {
+                                        conversation_view.selection = Some(selection::Selection {
                                             anchor: pos,
                                             cursor: pos,
                                             dragging: true,
@@ -7510,7 +7235,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                     }
                                 }
                                 MouseEventKind::Drag(MouseButton::Left) => {
-                                    if let Some(sel) = selection.as_mut()
+                                    if let Some(sel) = conversation_view.selection.as_mut()
                                         && sel.dragging
                                     {
                                         let history_area_height = area_height_for_history(
@@ -7518,10 +7243,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             terminal_height(&terminal),
                                         );
                                         let width = terminal_width(&terminal);
-                                        let wrapped = render::wrap_history_lines(&history, width);
+                                        let wrapped = render::wrap_history_lines(
+                                            &conversation_view.history,
+                                            width,
+                                        );
                                         let window = render::visible_history_window(
                                             wrapped.len(),
-                                            scroll_offset,
+                                            conversation_view.scroll_offset,
                                             history_area_height as usize,
                                         );
                                         sel.cursor = selection::text_pos_from_screen(
@@ -7537,20 +7265,25 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                             mouse.column,
                                         );
                                         if mouse.row == 0 {
-                                            scroll_offset = scroll_offset.saturating_add(1);
+                                            conversation_view.scroll_offset =
+                                                conversation_view.scroll_offset.saturating_add(1);
                                         } else if mouse.row.saturating_add(1) >= history_area_height
                                         {
-                                            scroll_offset = scroll_offset.saturating_sub(1);
+                                            conversation_view.scroll_offset =
+                                                conversation_view.scroll_offset.saturating_sub(1);
                                         }
                                     }
                                 }
                                 MouseEventKind::Up(MouseButton::Left) => {
-                                    if let Some(sel) = selection.as_mut()
+                                    if let Some(sel) = conversation_view.selection.as_mut()
                                         && sel.dragging
                                     {
                                         sel.dragging = false;
                                         let width = terminal_width(&terminal);
-                                        let wrapped = render::wrap_history_lines(&history, width);
+                                        let wrapped = render::wrap_history_lines(
+                                            &conversation_view.history,
+                                            width,
+                                        );
                                         let text = selection::extract_text(&wrapped, sel);
                                         if !text.is_empty() {
                                             #[cfg(unix)]
@@ -7565,9 +7298,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                 .draw(|f| {
                                                     draw_frame(
                                                         f,
-                                                        &history,
-                                                        &mut history_wrap_cache,
-                                                        scroll_offset,
+                                                        &conversation_view.history,
+                                                        &mut conversation_view.history_wrap_cache,
+                                                        conversation_view.scroll_offset,
                                                         &input_buffer,
                                                         input_cursor,
                                                         &status,
@@ -7581,7 +7314,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                                         },
                                                         &suggestions,
                                                         selected_suggestion,
-                                                        &selection,
+                                                        &conversation_view.selection,
                                                     )
                                                 })
                                                 .is_err()
@@ -7595,7 +7328,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 _ => {}
                             },
                             Some(Ok(Event::Resize(_, _))) => {
-                                selection = None;
+                                conversation_view.selection = None;
                             }
                             Some(Ok(_)) => {}
                             Some(Err(_)) | None => break TurnOutcome::Fatal,
@@ -7617,11 +7350,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         .is_some_and(|owner| owner.is_restorable_path(path).unwrap_or(false))
                 });
                 update_effort_from_event(&event, &mut effort_name);
-                let appended = append_live_event(&event, &mut history, &mut agent_activity_rows);
-                history_wrap_cache.invalidate();
-                if scroll_offset > 0 {
-                    scroll_offset += appended;
-                }
+                conversation_view.append_live_event(&event);
                 if let polaris_core::AgentEvent::HistoryCompacted {
                     messages_before,
                     messages_after,
@@ -7631,8 +7360,7 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                     history_compacted_this_turn = true;
                     checkpoint =
                         checkpoint.saturating_sub(messages_before.saturating_sub(messages_after));
-                    printed_messages = printed_messages
-                        .saturating_sub(messages_before.saturating_sub(messages_after));
+                    conversation_view.observe_compaction(messages_before, messages_after);
                 }
             }
             turn_outcome
@@ -14401,7 +14129,17 @@ mod tests {
         let admissions_root = state_dir.join("tui-admissions-v1");
         let before_status = admission_files(&admissions_root);
         let sandbox = SandboxPolicy::new(polaris_sandbox::SandboxMode::ReadOnly, &[]).unwrap();
-        let activity = AgentActivityRows::default();
+        let activity = conversation_view::ConversationViewState::new(
+            &render::HeaderInfo {
+                provider_name: "test",
+                model_name: "test",
+                usage: Default::default(),
+                cwd: "test",
+                cwd_short: "test",
+                effort_name: "auto",
+            },
+            80,
+        );
         let mut max_turns = 1;
         let command = format!("input status {}", admission_id.as_str());
         let lines = handle_runtime_command(
@@ -15376,61 +15114,6 @@ mod tests {
                 ..Default::default()
             })
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn m3e_run_tool_details_use_observed_events_and_keep_unfinished_unknown() {
-        let mut activity = AgentActivityRows::default();
-        activity.observe_tool(&polaris_core::AgentEvent::ToolStarted {
-            name: "read".into(),
-            detail: "one".into(),
-        });
-        assert!(activity.tool_detail_lines()[0].contains("完了未確認"));
-        activity.observe_tool(&polaris_core::AgentEvent::ToolFinished {
-            name: "read".into(),
-            detail: "one".into(),
-            ok: false,
-            result: "private body".into(),
-            diff: None,
-        });
-        assert!(activity.tool_detail_lines()[0].contains("失敗を観測"));
-        assert!(!activity.tool_detail_lines()[0].contains("private body"));
-        for n in 0..130 {
-            activity.observe_tool(&polaris_core::AgentEvent::ToolStarted {
-                name: format!("tool-{n}"),
-                detail: "x".into(),
-            });
-        }
-        assert_eq!(activity.tools.len(), 128);
-        assert!(
-            activity
-                .tool_detail_lines()
-                .iter()
-                .all(|line| line.contains("完了未確認"))
-        );
-        let mut history = Vec::new();
-        let mut cache = render::HistoryWrapCache::default();
-        let mut scroll = 1;
-        let mut selection = None;
-        reset_conversation_view(
-            &mut history,
-            &mut cache,
-            &mut activity,
-            &mut scroll,
-            &mut selection,
-            &render::HeaderInfo {
-                provider_name: "test",
-                model_name: "test",
-                usage: Default::default(),
-                cwd: "test",
-                cwd_short: "test",
-                effort_name: "auto",
-            },
-            80,
-        );
-        assert!(activity.tools.is_empty());
-        assert!(activity.tool_detail_lines()[0].contains("観測されていません"));
     }
 
     #[tokio::test]
@@ -17084,64 +16767,6 @@ mod tests {
         assert_eq!(printed_messages, 8);
     }
 
-    #[test]
-    fn append_live_event_appends_formatted_lines() {
-        let mut history = Vec::new();
-        let mut activity_rows = AgentActivityRows::default();
-        let event = polaris_core::AgentEvent::ToolStarted {
-            name: "read".to_string(),
-            detail: "Cargo.toml".to_string(),
-        };
-        append_live_event(&event, &mut history, &mut activity_rows);
-        assert!(!history.is_empty());
-    }
-
-    #[test]
-    fn child_tool_activity_replaces_only_that_agents_single_progress_row() {
-        let mut history = Vec::new();
-        let mut activity_rows = AgentActivityRows::default();
-        for (display_name, agent_type) in [("Sirius", "file-reader"), ("Antares", "file-reader")] {
-            append_live_event(
-                &polaris_core::AgentEvent::SpawnStarted {
-                    display_name: display_name.to_string(),
-                    agent_type: agent_type.to_string(),
-                    task: "private".to_string(),
-                },
-                &mut history,
-                &mut activity_rows,
-            );
-        }
-
-        let activity =
-            |display_name: &str, name: &str, path: &str| polaris_core::AgentEvent::SpawnActivity {
-                display_name: display_name.to_string(),
-                agent_type: "file-reader".to_string(),
-                name: name.to_string(),
-                detail: serde_json::json!({"path": path}).to_string(),
-            };
-        append_live_event(
-            &activity("Sirius", "read", "first.md"),
-            &mut history,
-            &mut activity_rows,
-        );
-        append_live_event(
-            &activity("Antares", "write", "notes.md"),
-            &mut history,
-            &mut activity_rows,
-        );
-        append_live_event(
-            &activity("Sirius", "read", "second.md"),
-            &mut history,
-            &mut activity_rows,
-        );
-
-        assert_eq!(history.len(), 4, "activity must update instead of append");
-        assert_eq!(history[0].line.to_string(), "⏺ Sirius (file-reader)");
-        assert_eq!(history[1].line.to_string(), "  → read(second.md)");
-        assert_eq!(history[2].line.to_string(), "⏺ Antares (file-reader)");
-        assert_eq!(history[3].line.to_string(), "  → write(notes.md)");
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn call(
         action: slash::Action,
@@ -18596,6 +18221,84 @@ mod tests {
             "switching conversations clears local-only output"
         );
         assert!(matches!(status, Status::Idle));
+    }
+
+    #[test]
+    fn same_path_resume_rebuilds_the_projected_transcript_after_local_lines_are_cleared() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let saved_path = dir.path().join("saved.jsonl");
+        persist::write_meta_if_absent(
+            &dir.path().join("saved.meta.json"),
+            &persist::SessionMeta {
+                cwd: "/tmp/current".to_string(),
+                started_at_millis: 500,
+            },
+        )
+        .expect("write meta");
+        persist::append_message(&saved_path, &Message::user("resumed hi"))
+            .expect("seed saved session");
+
+        let mut session = Session::default();
+        session.push_user("old in-memory conversation");
+        let previous_session_path = saved_path.clone();
+        let mut session_path = previous_session_path.clone();
+        let mut meta_path = dir.path().join("saved.meta.json");
+        let mut session_started_at_millis = 111;
+        let mut status = Status::Idle;
+        let mut local_lines = vec![Line::from("leftover /diff output")];
+        let header = render::HeaderInfo {
+            provider_name: "test",
+            model_name: "test",
+            usage: Default::default(),
+            cwd: "/tmp/current",
+            cwd_short: "/tmp/current",
+            effort_name: "auto",
+        };
+        let mut conversation_view = conversation_view::ConversationViewState::new(&header, 60);
+        conversation_view.append_new_history(&session, &local_lines);
+        let terminal = RefCell::new(Terminal::new(TestBackend::new(60, 14)).expect("terminal"));
+        let mut reader = ScriptedReader(std::collections::VecDeque::from([KeyCode::Enter]));
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(handle_resume(
+                &terminal,
+                &mut reader,
+                dir.path(),
+                dir.path(),
+                "/tmp/current",
+                &polaris_core::workflow::WorkflowConfig::default(),
+                false,
+                &[],
+                None,
+                #[cfg(unix)]
+                None,
+                #[cfg(unix)]
+                None,
+                &mut session,
+                &mut session_path,
+                &mut meta_path,
+                &mut session_started_at_millis,
+                &mut status,
+                &mut local_lines,
+            ));
+
+        assert_eq!(session_path, previous_session_path);
+        assert_eq!(session.messages[0].content, "resumed hi");
+        assert!(local_lines.is_empty());
+        reset_conversation_view_after_resume(&mut conversation_view, &header, 60);
+        conversation_view.append_new_history(&session, &local_lines);
+
+        let projected = conversation_view
+            .history
+            .iter()
+            .map(|line| line.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(projected.contains("✦ polaris"));
+        assert!(projected.contains("resumed hi"));
+        assert!(!projected.contains("old in-memory conversation"));
+        assert!(!projected.contains("leftover /diff output"));
     }
 
     #[cfg(unix)]

@@ -1555,6 +1555,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `architecture.md` — アーキテクチャ
 - `codex-update-efficiency.md` — Codex更新と使用量削減策の適用
+- `command-reference.md` — コマンドの役割と出力
 - `context-efficiency.md` — コンテキストの効率化とローカル記憶
 - `filemap.md` — File map
 - `gpt6-cache-affinity-results.md` — 本文量を維持したキャッシュ再利用と品質検証

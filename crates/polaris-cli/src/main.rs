@@ -33,6 +33,8 @@ mod decided;
 mod handoff;
 mod mcp;
 mod memory;
+#[cfg(not(windows))]
+mod provider_startup;
 mod setting;
 mod spare;
 #[cfg(test)]
@@ -2746,20 +2748,6 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     }
 
     let model = selected_model(args.model.clone(), std::env::var("POLARIS_MODEL").ok());
-    let mut provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| {
-        let has_openai_key = std::env::var("POLARIS_API_KEY").is_ok()
-            || polaris_auth::api_key::default_path()
-                .ok()
-                .and_then(|p| polaris_auth::api_key::load_from(&p).ok().flatten())
-                .is_some();
-        let has_saved_codex_credentials = polaris_auth::store::default_path()
-            .ok()
-            .map(|p| p.exists())
-            .unwrap_or(false);
-        default_provider_name(has_openai_key, has_saved_codex_credentials).to_string()
-    });
-
-    let model_name: String;
     // A supplied `--effort` is fixed in both modes. One-shot runs retain the
     // historical xhigh default; an interactive TUI leaves this absent so Jev
     // can decide every turn and the footer can begin at `undecided`.
@@ -2778,283 +2766,39 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
             kind: polaris_provider::attempts::AttemptKind::Completion,
         },
     );
-
-    // Set by the `llamacpp` arm. Never read again on purpose: holding it
-    // is the whole job. `LlamaServer` kills the child when it drops, so
-    // the binding has to outlive every path that uses the provider — and
-    // it drops at the end of `main`, including on the early returns.
-    let mut _llama_server: Option<polaris_core::llama_server::LlamaServer> = None;
-    let (provider, mcp_selection_provider, tier_weights): (Shared, Option<Shared>, TierWeights) = loop {
-        match provider_name.as_str() {
-            "openai" => {
-                // Keep the existing setup as-is. Behavior does not change.
-                let base = std::env::var("POLARIS_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-                let key = std::env::var("POLARIS_API_KEY").ok().or_else(|| {
-                    polaris_auth::api_key::default_path().ok().and_then(|p| {
-                        match polaris_auth::api_key::load_from(&p) {
-                            Ok(k) => k,
-                            Err(e) => {
-                                eprintln!("Can't read the saved API key: {e}");
-                                None
-                            }
-                        }
-                    })
-                });
-                let key = match key {
-                    Some(k) => k,
-                    None if args.prompt.is_none() => {
-                        let auth_store_path = match polaris_auth::store::default_path() {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("Can't determine where to store credentials: {e}");
-                                return ExitCode::FAILURE;
-                            }
-                        };
-                        let api_key_path = match polaris_auth::api_key::default_path() {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("Can't determine where to store the API key: {e}");
-                                return ExitCode::FAILURE;
-                            }
-                        };
-                        match polaris_tui::onboarding::run(&auth_store_path, &api_key_path).await {
-                            Ok(polaris_tui::onboarding::Outcome::ApiKeySaved) => continue,
-                            Ok(polaris_tui::onboarding::Outcome::CodexLoggedIn) => {
-                                provider_name = "codex".to_string();
-                                continue;
-                            }
-                            Err(polaris_tui::onboarding::OnboardingError::Cancelled) => {
-                                return ExitCode::SUCCESS;
-                            }
-                            Err(e) => {
-                                eprintln!("{e}");
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                    }
-                    None => {
-                        eprintln!("POLARIS_API_KEY is not set");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                if args.account.is_some() {
-                    eprintln!(
-                        "--accountはcodexのみで使えます。POLARIS_PROVIDER=codexを指定してください。"
-                    );
-                    return ExitCode::FAILURE;
-                }
-                let model = model.clone();
-                model_name = model.clone();
-                let selector = OpenAiProvider::new(
-                    base.clone(),
-                    key.clone(),
-                    polaris_core::mcp::preselection::MODEL.into(),
-                )
+    let provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| {
+        let has_openai_key = std::env::var("POLARIS_API_KEY").is_ok()
+            || polaris_auth::api_key::default_path()
                 .ok()
-                .map(|provider| {
-                    std::sync::Arc::new(provider.with_attempt_ledger(attempt_ledger.clone()))
-                        as std::sync::Arc<dyn polaris_provider::Provider>
-                });
-                let weights = tier_providers(
-                    &config.tiers,
-                    &model,
-                    initial_effort_name.as_deref(),
-                    |named| {
-                        OpenAiProvider::new(base.clone(), key.clone(), named.to_owned())
-                            .map(|provider| {
-                                std::sync::Arc::new(
-                                    provider.with_attempt_ledger(attempt_ledger.clone()),
-                                )
-                                    as std::sync::Arc<dyn polaris_provider::Provider>
-                            })
-                            .map_err(|error| error.to_string())
-                    },
-                );
-                let weights = match weights {
-                    Ok(weights) => weights,
-                    Err(message) => {
-                        eprintln!("{message}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                match OpenAiProvider::new(base, key, model)
-                    .map(|provider| provider.with_attempt_ledger(attempt_ledger.clone()))
-                {
-                    Ok(p) => break (std::sync::Arc::new(p), selector, weights),
-                    Err(e) => {
-                        eprintln!("Can't build the client: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            "codex" => {
-                let store = match polaris_auth::store::default_path() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("Can't determine where to store credentials: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let model = model.clone();
-                model_name = model.clone();
-                // 登録が1件でもあれば、このrunは1つの登録へ固定される。
-                if let Err(message) = account::bind(&model, args.account.as_deref()) {
-                    eprintln!("{message}");
-                    return ExitCode::FAILURE;
-                }
-                let tokens = match account::require(store) {
-                    Ok(tokens) => tokens,
-                    Err(message) => {
-                        eprintln!("{message}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let selector = polaris_provider::codex::CodexProvider::new(
-                    polaris_provider::codex::ENDPOINT_BASE.to_string(),
-                    polaris_core::mcp::preselection::MODEL.into(),
-                    tokens.clone(),
-                )
-                .ok()
-                .map(|provider| {
-                    let provider = provider.with_attempt_ledger(attempt_ledger.clone());
-                    // This picks which of nine catalogue entries to offer
-                    // and nothing else, and it runs at whatever effort the
-                    // account's plan implies — `xhigh` on a pro plan, which
-                    // spent 605.7 of the 649.3 tokens it produced per run on
-                    // reasoning, most often to arrive at `{"skills":[]}`.
-                    //
-                    // Setting it to `low` does cut that: output fell 29%,
-                    // from 1,298 tokens a run to 926. It also cost more,
-                    // $0.1371 against $0.1322 over n=12 each, because the
-                    // run took 0.9 more astra requests and one of those is
-                    // worth $0.013. A cheaper selector that picks worse
-                    // skills is not cheaper. Measured 2026-09-21; not
-                    // repeated without separating it from the block change
-                    // it was measured beside.
-                    std::sync::Arc::new(provider) as std::sync::Arc<dyn polaris_provider::Provider>
-                });
-                let weights = tier_providers(
-                    &config.tiers,
-                    &model,
-                    initial_effort_name.as_deref(),
-                    |named| {
-                        polaris_provider::codex::CodexProvider::new(
-                            polaris_provider::codex::ENDPOINT_BASE.to_string(),
-                            named.to_owned(),
-                            tokens.clone(),
-                        )
-                        .map(|provider| {
-                            std::sync::Arc::new(
-                                provider.with_attempt_ledger(attempt_ledger.clone()),
-                            )
-                                as std::sync::Arc<dyn polaris_provider::Provider>
-                        })
-                        .map_err(|error| error.to_string())
-                    },
-                );
-                let weights = match weights {
-                    Ok(weights) => weights,
-                    Err(message) => {
-                        eprintln!("{message}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                match polaris_provider::codex::CodexProvider::new(
-                    polaris_provider::codex::ENDPOINT_BASE.to_string(),
-                    model,
-                    tokens,
-                )
-                .map(|provider| provider.with_attempt_ledger(attempt_ledger.clone()))
-                {
-                    Ok(provider) => break (std::sync::Arc::new(provider), selector, weights),
-                    Err(error) => {
-                        eprintln!("Can't build the client: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            // The bundled `llama-server`, started by this process. The
-            // other two local runtimes (Ollama, LM Studio) are reachable
-            // only from the desktop's role bindings; this arm exists so
-            // the CLI — which is what the measurement harnesses drive —
-            // can run a local model at all.
-            "llamacpp" => {
-                let Some(llama) = config.llama_cpp.clone() else {
-                    eprintln!(
-                        "POLARIS_PROVIDER=llamacpp には `[llama_cpp]` の server・models_dir・build が要ります。"
-                    );
-                    return ExitCode::FAILURE;
-                };
-                let state = match polaris_core::project::state_dir(&project_root) {
-                    Ok(directory) => directory,
-                    Err(error) => {
-                        eprintln!("状態ディレクトリを特定できません: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let started = async {
-                    let server =
-                        polaris_core::llama_server::LlamaServer::start(&llama, &state).await?;
-                    let adapter = polaris_core::llama_server::adapter(&server)
-                        .map_err(|_| std::io::Error::other("問い合わせ口を作成できません"))?;
-                    let inventory = adapter
-                        .inventory_with_load_state()
-                        .await
-                        .map_err(|error| std::io::Error::other(format!("{error}")))?;
-                    let observed = inventory
-                        .iter()
-                        .find(|held| held.id() == model)
-                        .ok_or_else(|| {
-                            let names: Vec<&str> = inventory.iter().map(|held| held.id()).collect();
-                            std::io::Error::other(format!(
-                                "{model} が {} にありません。あるのは {names:?}",
-                                llama.models_dir.display()
-                            ))
-                        })?;
-                    let selection = adapter
-                        .select(observed)
-                        .await
-                        .map_err(|error| std::io::Error::other(format!("{error}")))?;
-                    let provider =
-                        polaris_provider::local_inference::LocalInferenceProvider::with_token(
-                            selection,
-                            server.token(),
-                        )
-                        .map_err(|error| std::io::Error::other(format!("{error}")))?;
-                    Ok::<_, std::io::Error>((server, provider))
-                }
-                .await;
-                let (server, provider) = match started {
-                    Ok(started) => started,
-                    Err(error) => {
-                        eprintln!("llama-serverを起動できません: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                // Held for the life of the process: dropping it kills the
-                // child, and an orphan would hold the port and the model.
-                _llama_server = Some(server);
-                model_name = model.clone();
-                break (std::sync::Arc::new(provider), None, TierWeights::new());
-            }
-            other => {
-                eprintln!(
-                    "POLARIS_PROVIDER is an unknown value {other}. Specify openai, codex or llamacpp"
-                );
-                return ExitCode::FAILURE;
-            }
-        }
+                .and_then(|p| polaris_auth::api_key::load_from(&p).ok().flatten())
+                .is_some();
+        let has_saved_codex_credentials = polaris_auth::store::default_path()
+            .ok()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        default_provider_name(has_openai_key, has_saved_codex_credentials).to_string()
+    });
+    // Provider setup happens only after continuation preflight. The returned
+    // holder remains in scope for the whole turn so a local llama server stays alive.
+    let prepared_providers = match provider_startup::prepare(
+        &args,
+        &config,
+        &project_root,
+        model,
+        initial_effort_name.as_deref(),
+        attempt_ledger.clone(),
+        provider_name,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(status) => return status,
     };
-
-    if let Some(effort) = initial_effort_name.as_deref() {
-        provider.set_effort(Some(effort));
-    }
-
-    // Wrapped before anything takes a handle, so every consultation is
-    // counted whichever path reaches the judge. The judge bills separately
-    // from the models and at a different rate; leaving it out made a run
-    // with the judge on report its cost with the judge's part missing.
+    let provider_name = prepared_providers.provider_name.clone();
+    let model_name = prepared_providers.model_name.clone();
+    let mcp_selection_provider = prepared_providers.mcp_selection_provider.clone();
+    let tier_weights = prepared_providers.tier_weights.clone();
+    let provider = prepared_providers.provider.clone();
     let decision_meter = polaris_provider::decision::DecisionMeter::default();
     let decider = build_decider(&config.decision).map(|decider| decision_meter.wrap(decider));
     // The same judge weighs delegated tasks. One registration, because both

@@ -147,6 +147,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `main.rs` — Entry point for the `polaris` binary. Decides the endpoint from environment
 - `mcp.rs` — MCP registrations, secrets, catalog checks and setup from the terminal.
 - `memory.rs` — Local project memory commands; embedding requests require explicit configuration.
+- `provider_startup.rs` — Provider construction for the native CLI run after continuation preflight.
 - `setting.rs` — 同梱の定型コマンド。引数の受け取りと表示だけを行い、検出・計画・記録は
 - `spare.rs` — 頼まれていない整理へ余剰枠を使ってよいかを判定し、その理由を示す。
 - `strict_history_tests.rs` — Exercises the CLI history constructor through persisted retrieval and a counting judge.

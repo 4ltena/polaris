@@ -1,3 +1,5 @@
+//! Descriptor-relative independent Unity runtime copies and verified manifest publication.
+
 use super::source::{ManifestEntry, Stamp, UnitySourceBinding};
 use polaris_mcp::Error;
 use serde::Serialize;

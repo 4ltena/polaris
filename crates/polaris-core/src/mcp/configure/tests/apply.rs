@@ -66,7 +66,7 @@ fn approved_copy_completes_c28_before_c27_and_preserves_unrelated_registration()
         secret_env,
         &BTreeMap::from([("UNITY_DUMMY".into(), "unity-dummy".into())])
     );
-    assert_eq!(readable_roots, &[fixture.node.clone()]);
+    assert_eq!(readable_roots, std::slice::from_ref(&fixture.node));
     assert_eq!(
         executable_sha256.as_deref(),
         Some(preview.node_sha256.as_str())

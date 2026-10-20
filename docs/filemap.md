@@ -582,6 +582,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `tests.rs` — Management generation staging, payload validation and migration fault tests.
 
+## `crates/polaris-core/src/management_effect/mcp_change`
+
+- `local_source.rs` — C28 local-source publication followed by C27 registry replacement.
+
 ## `crates/polaris-core/src/management_effect/memory_change`
 
 - `tests.rs` — Memory-change effect tests for durable mutation and recovery.
@@ -600,6 +604,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/mcp`
 
 - `apps.rs` — Built-in creative-app definitions (M2b). Every entry is unverified until a
+- `configure.rs` — Host-owned preparation and application of the one supported local Unity MCP runtime.
 - `credentials.rs` — Typed ownership of MCP credential mutations.
 - `lease.rs` — Fail-closed leases for parent-captured MCP read evidence.
 - `local.rs` — CLI and TUI hosts: the same store, startup admission and setup tool as the
@@ -610,6 +615,18 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `runtime.rs` — Retained run ownership for lazy MCP connections, tools and resource reads.
 - `selection.rs` — Frozen MCP candidate ranking and bounded tool selection for one request.
 - `setup.rs` — Host-only detection of MCP servers already configured for Codex and Claude.
+
+## `crates/polaris-core/src/mcp/configure`
+
+- `install.rs` — Descriptor-relative independent Unity runtime copies and verified manifest publication.
+- `source.rs` — Descriptor-bound Unity source manifests, executable pins and the exact esbuild pair exception.
+- `tests.rs` — Isolated fixture owners and filesystem evidence for Unity configuration tests.
+
+## `crates/polaris-core/src/mcp/configure/tests`
+
+- `apply.rs` — Approved runtime publication, registry CAS, and management-effect fault checks.
+- `binding.rs` — Read-only preview and descriptor-bound source/registration consistency checks.
+- `scanner.rs` — Unity-only hardlink exception and ordinary tree-policy rejection controls.
 
 ## `crates/polaris-core/src/mcp/local`
 

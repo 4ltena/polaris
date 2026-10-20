@@ -119,6 +119,22 @@ SwiftUIの作業画面は、選択したプロジェクトと会話を専用の�
 
 MCPの外部接続は起動時の`--mcp-external`が上限となる。カタログ取得・登録・パッケージ取得は、上限や承認設定が拒否した場合には実行しない。秘密値は通常入力・履歴・モデルへ送らず、専用入力画面でのみ扱う。
 
+### 登録済みUnity MCPの固定配置
+
+CLIの`mcp configure`は、有効な既存stdio登録1件を対象に、ローカルのUnity MCPを専用のversion directoryへコピーする。対応するpresetは`unity-local-v2`だけで、登録の唯一のentry引数が指定元の`build/index.js`と一致する必要がある。
+
+```sh
+polaris mcp configure <server-id> --preset unity-local-v2 --source /absolute/path/to/unity-mcp-ts
+```
+
+表示されたコピー元・配置先・ハッシュ・登録差分を確認して承認する。非対話実行では`--yes`で同じ内容を承認する。承認前に配置先や管理操作の記録は作らない。
+
+コピー対象は`build/`、`node_modules/`、`package.json`と存在するlockfileで、`node_modules/.bin`は除外する。検証済みの特定のesbuild hardlink pairだけを独立した通常fileへ展開する。別の構成や検証できないfileは拒否するため、その場合は元の登録を確認する。
+
+配置の完了後に登録を更新し、次の実行から新しいcwd・entry、`auto_2024_compat`、loopback限定の通信設定を使う。構成中にdownload、プログラムの起動、接続確認は行わない。旧runtimeと未参照のコピーは保持する。途中で結果不明となった操作は繰り返さず、管理操作の記録と保存済み状態を確認する。
+
+構成後は`polaris mcp check <server-id>`でカタログを確認できる。カタログ取得の成功はUnity Editorへの実接続を示さない。`polaris mcp disable <server-id>`は現在のprojectでの利用を止める操作で、旧登録の復元ではない。
+
 ### AGENTS.mdの変更反映
 
 macOSのCLIとTUIでは、グローバルの`~/.polaris/AGENTS.md`と起動時のプロジェクト直下の`AGENTS.md`を、親エージェントの各モデル要求の直前に確認する。変更はその要求から反映する。同じターンのツール実行後も確認するため、再起動や次のユーザー入力を待つ必要はない。定期ポーリングは行わず、送信済みの要求は変更しない。

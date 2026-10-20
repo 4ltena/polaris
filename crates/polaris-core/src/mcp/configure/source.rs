@@ -1,3 +1,5 @@
+//! Descriptor-bound Unity source manifests, executable pins and the exact esbuild pair exception.
+
 use polaris_mcp::registration::{Destination, ProtocolProfile, Server};
 use polaris_tools::path_policy::{self, tree_admission};
 use serde::Serialize;
@@ -403,11 +405,8 @@ pub(super) fn scan(root_path: &Path, root: &File, protection: &Protection) -> Re
     let names = directory_names(root, MAX_ENTRIES)?;
     let lock_names: BTreeSet<_> = names
         .iter()
-        .filter_map(|name| {
-            LOCKS
-                .contains(&name.as_os_str().to_str().unwrap_or(""))
-                .then(|| name.clone())
-        })
+        .filter(|name| LOCKS.contains(&name.as_os_str().to_str().unwrap_or("")))
+        .cloned()
         .collect();
     for required in [
         OsStr::new(PACKAGE),

@@ -588,6 +588,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/management_effect/store`
 
+- `replay.rs` — Pure V1 journal envelopes and replay reducer.
 - `windows_backend.rs` — Qualified Windows I/O for the existing management journal algorithms.
 - `windows_tests.rs` — Windows management-effect journal lifecycle, replay and storage refusal tests.
 

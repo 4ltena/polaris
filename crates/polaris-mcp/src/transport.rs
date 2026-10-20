@@ -130,7 +130,14 @@ impl Connection {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {
                     let policy = policy.ok_or(Error::Protection)?;
-                    if policy.mode().as_str() != sandbox_profile
+                    let registered = policy.isolated_boundary().map(|boundary| {
+                        if boundary.loopback_network {
+                            "loopback"
+                        } else {
+                            policy.mode().as_str()
+                        }
+                    });
+                    if registered != Some(sandbox_profile.as_str())
                         || policy
                             .isolated_boundary()
                             .is_none_or(|boundary| boundary.environment.is_none())

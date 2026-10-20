@@ -373,7 +373,9 @@ mod tests {
         // `general` phase — an adaptive transition happens only when the
         // model calls `state` itself, and in 15 turns it never did, so
         // every phase-specific instruction was unreachable.
-        const PINNED: usize = 639;
+        // 655 since 2026-10-20: read supports directory discovery and the
+        // prompt tells the model to discover unknown paths before reading.
+        const PINNED: usize = 655;
         let n = crate::prompt::assemble_always_on("", "", &[]).tokens();
         assert_eq!(
             n, PINNED,
@@ -406,7 +408,7 @@ mod tests {
         // themselves rather than telling the caller what to pass. 45 tokens
         // of margin is deliberate — enough that a project's own rules do
         // not push the prefix back under the threshold.
-        const PINNED: usize = 1069;
+        const PINNED: usize = 1085;
         let mut tools = polaris_tools::all_specs();
         tools.push(polaris_tools::mcp_setup_spec());
         tools.push(polaris_tools::setting_spec());
@@ -789,9 +791,9 @@ mod phase_tools {
                 .collect();
             super::always_on_tokens(baseline.system(), &subset)
         };
-        assert_eq!(all, 639);
-        assert_eq!(kept(&["read", "bash", "skill"]), 366, "review");
-        assert_eq!(kept(&["read", "skill"]), 300, "brainstorm");
+        assert_eq!(all, 655);
+        assert_eq!(kept(&["read", "bash", "skill"]), 382, "review");
+        assert_eq!(kept(&["read", "skill"]), 316, "brainstorm");
 
         // Only an authorized Implement phase may expose mutation tools. The
         // runtime gate still checks the current contract at dispatch time.

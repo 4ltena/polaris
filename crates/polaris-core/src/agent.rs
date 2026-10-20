@@ -4987,6 +4987,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn general_summary_discovers_existing_files_from_a_parent_directory() {
+        struct Discover {
+            root: PathBuf,
+            step: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Discover {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, polaris_provider::ProviderError> {
+                assert!(request.tools.iter().any(|tool| tool.name == "read"));
+                assert!(!request.tools.iter().any(|tool| {
+                    matches!(tool.name.as_str(), "bash" | "write" | "edit" | "spawn")
+                }));
+                let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let expected = match step {
+                    0 => None,
+                    1 => Some("polaris"),
+                    2 => Some("README.md"),
+                    3 => Some("Polaris fixture: a Rust terminal coding agent."),
+                    _ => panic!("unexpected extra request"),
+                };
+                if let Some(expected) = expected {
+                    assert!(
+                        request.messages.iter().any(|message| {
+                            message.role == polaris_provider::Role::Tool
+                                && message.content.contains(expected)
+                        }),
+                        "the preceding read did not discover {expected}"
+                    );
+                }
+                if step == 3 {
+                    return Ok(CompletionResponse {
+                        text: "Polaris fixture is a Rust terminal coding agent.".into(),
+                        ..Default::default()
+                    });
+                }
+                let path = match step {
+                    0 => self.root.clone(),
+                    1 => self.root.join("polaris"),
+                    2 => self.root.join("polaris/README.md"),
+                    _ => unreachable!(),
+                };
+                Ok(CompletionResponse {
+                    tool_calls: vec![ToolCall {
+                        id: format!("discover-{step}"),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": path}),
+                    }],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("polaris")).unwrap();
+        std::fs::write(
+            project.path().join("polaris/README.md"),
+            "Polaris fixture: a Rust terminal coding agent.\n",
+        )
+        .unwrap();
+        let provider = Discover {
+            root: project.path().to_path_buf(),
+            step: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut session = Session::new();
+        session.push_user("このpolarisがどのようなプログラムかをまとめる");
+        session.workflow = Some(crate::workflow::SessionWorkflow::new(
+            crate::workflow::WorkflowConfig {
+                enabled: true,
+                initial_phase: crate::workflow::Phase::General,
+                ..Default::default()
+            },
+        ));
+        let always_on = crate::prompt::assemble_always_on("", "", &[])
+            .with_project_root(project.path())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (sandbox, helper, mut gate, mut approver) = dummy_tool_parts();
+        let mut ctx = ToolContext {
+            sandbox: &sandbox,
+            helper: &helper,
+            gate: &mut gate,
+            approver: &mut approver,
+        };
+        let outcome = run(
+            &provider,
+            &mut session,
+            dummy_audit(&dir),
+            &mut StopTracker::new(5),
+            &always_on,
+            &[],
+            &[],
+            unused_provider_pool(),
+            1,
+            1,
+            None,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.text,
+            "Polaris fixture is a Rust terminal coding agent."
+        );
+        assert_eq!(provider.step.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(approver.asked, 0);
+    }
+
+    #[tokio::test]
     async fn first_project_analysis_projects_only_the_current_state() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".polaris/notes")).unwrap();

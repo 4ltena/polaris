@@ -38,6 +38,12 @@ pub const DEFAULT_LIMIT: usize = 2000;
 /// ceiling) is actually bounded rather than merely less likely.
 pub const MAX_READ_OUTPUT_BYTES: usize = 1024 * 1024;
 
+/// A directory listing only inspects direct children.  This keeps discovery
+/// useful without turning `read` into an unbounded recursive traversal.
+pub const MAX_DIRECTORY_ENTRIES: usize = 10_000;
+
+const DIRECTORY_NOTICE_RESERVE: usize = 256;
+
 /// `offset` is a 0-based line number; `limit` is the number of lines to
 /// return. The line numbers in the output are 1-based.
 pub fn read(path: &Path, offset: usize, limit: usize) -> Result<String, ToolError> {
@@ -106,7 +112,10 @@ fn read_impl(
     // the read never finishes and resident memory grows without bound.
     // Check the type and size from the metadata first, and deny even a
     // regular file without reading any of its content if it's over the cap.
-    let meta = std::fs::metadata(path)?;
+    let meta = std::fs::metadata(path).map_err(missing_path_error)?;
+    if meta.is_dir() {
+        return read_directory(path, offset, limit, output_cap);
+    }
     if !meta.is_file() {
         return Err(ToolError::NotAFile(path.display().to_string()));
     }
@@ -193,6 +202,159 @@ fn read_impl(
         ));
     }
     Ok(out)
+}
+
+fn missing_path_error(error: std::io::Error) -> ToolError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{error}; read an existing parent directory to discover available files"),
+        ));
+    }
+    ToolError::Io(error)
+}
+
+struct DirectoryEntry {
+    name: std::ffi::OsString,
+    kind: &'static str,
+}
+
+/// List only immediate, policy-allowed children. `DirEntry::file_type`
+/// describes a link itself, so this does not reveal or follow a child
+/// symlink's target.
+fn read_directory(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    output_cap: usize,
+) -> Result<String, ToolError> {
+    let mut entries = Vec::new();
+    let mut scanned = 0usize;
+    // `read_impl` has already checked this canonical directory itself. Keep
+    // it so children reached through an allowed-looking directory symlink
+    // are judged against both spellings, without resolving any child.
+    let canonical_parent = std::fs::canonicalize(path)?;
+    for entry in std::fs::read_dir(path)? {
+        if scanned == MAX_DIRECTORY_ENTRIES {
+            break;
+        }
+        scanned += 1;
+        let entry = entry?;
+        let name = entry.file_name();
+        // The child path is used only for the existing lexical policy check;
+        // never canonicalize a child, which could follow a symlink target.
+        if path_policy::is_denied(&path.join(Path::new(&name)))
+            || path_policy::is_denied(&canonical_parent.join(Path::new(&name)))
+        {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let kind = if file_type.is_dir() {
+            "directory"
+        } else if file_type.is_file() {
+            "file"
+        } else if file_type.is_symlink() {
+            "symlink"
+        } else {
+            "other"
+        };
+        entries.push(DirectoryEntry { name, kind });
+    }
+    // Hitting the scan ceiling is intentionally treated as incomplete even
+    // when the directory happens to contain exactly that many entries: doing
+    // so avoids an extra probe and never claims a complete listing we cannot
+    // prove is complete.
+    let incomplete = scanned == MAX_DIRECTORY_ENTRIES;
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+    if entries.is_empty() {
+        return if incomplete {
+            Ok(directory_incomplete_notice())
+        } else {
+            Ok("(empty directory)".to_string())
+        };
+    }
+    if limit == 0 {
+        return Ok("(0 entries: limit is 0)".to_string());
+    }
+    if offset >= entries.len() {
+        let suffix = if incomplete {
+            "; listing is incomplete"
+        } else {
+            ""
+        };
+        return Ok(format!(
+            "(0 entries: offset {offset} is past the {} discovered entries{suffix})",
+            entries.len()
+        ));
+    }
+
+    let end = offset.saturating_add(limit).min(entries.len());
+    let mut out = String::new();
+    let mut last_included = offset;
+    for (index, entry) in entries.iter().enumerate().take(end).skip(offset) {
+        // JSON is an unambiguous, control-character-safe representation of a
+        // filename. It only exposes the child name, never its full path.
+        let name = serde_json::to_string(&entry.name.to_string_lossy())
+            .expect("string serialization cannot fail");
+        let rendered = format!("{}\t{}\t{name}\n", index + 1, entry.kind);
+        // Reserve notice room for every listing. A byte cap can interrupt
+        // even a range that otherwise ends at the last discovered entry.
+        if out.len() + rendered.len() + DIRECTORY_NOTICE_RESERVE > output_cap {
+            if out.is_empty() {
+                return Err(ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "directory entry name exceeds the output byte cap; increase POLARIS_READ_OUTPUT_BYTES or read a narrower directory",
+                )));
+            }
+            break;
+        }
+        out.push_str(&rendered);
+        last_included = index + 1;
+    }
+
+    if last_included < end {
+        append_directory_notice(
+            &mut out,
+            output_cap,
+            &format!(
+                "(directory output reached the byte cap; continue with offset={last_included}.)\n"
+            ),
+        );
+    } else if last_included < entries.len() {
+        append_directory_notice(
+            &mut out,
+            output_cap,
+            &format!(
+                "(showed entries {}-{last_included} of {} discovered. continue with offset={last_included}.)\n",
+                offset + 1,
+                entries.len()
+            ),
+        );
+    }
+    if incomplete {
+        append_directory_notice(&mut out, output_cap, &directory_incomplete_notice());
+    }
+    Ok(out)
+}
+
+fn directory_incomplete_notice() -> String {
+    format!(
+        "(directory listing incomplete after scanning {MAX_DIRECTORY_ENTRIES} entries; read a narrower directory.)\n"
+    )
+}
+
+fn append_directory_notice(out: &mut String, output_cap: usize, notice: &str) {
+    let available = output_cap.saturating_sub(out.len());
+    if notice.len() <= available {
+        out.push_str(notice);
+        return;
+    }
+    let mut end = available;
+    while end > 0 && !notice.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&notice[..end]);
 }
 
 #[cfg(test)]
@@ -348,16 +510,20 @@ mod tests {
 
         let err = read(&missing, 0, 100).expect_err("should be an error");
         assert!(matches!(err, ToolError::Io(_)));
+        assert!(
+            err.to_string()
+                .contains("read an existing parent directory to discover available files")
+        );
     }
 
     #[test]
-    fn refuses_non_regular_files_like_directories() {
-        // A directory has `is_file()` false, the same "not a regular file"
-        // path as a device file like `/dev/zero`. This reproduces
-        // regardless of OS, so make it the primary regression test.
+    fn directories_are_listed_instead_of_being_rejected() {
         let dir = tempfile::tempdir().expect("can't create temp dir");
-        let err = read(dir.path(), 0, 100).expect_err("should be denied");
-        assert!(matches!(err, ToolError::NotAFile(_)));
+        std::fs::write(dir.path().join("entry.txt"), "x").unwrap();
+        assert_eq!(
+            read(dir.path(), 0, 100).unwrap(),
+            "1\tfile\t\"entry.txt\"\n"
+        );
     }
 
     #[test]
@@ -369,6 +535,121 @@ mod tests {
         // all.
         let err = read(std::path::Path::new("/dev/zero"), 0, 100).expect_err("should be denied");
         assert!(matches!(err, ToolError::NotAFile(_)));
+    }
+
+    #[test]
+    fn directory_listing_is_sorted_kinded_and_escapes_names() {
+        let dir = tempfile::tempdir().expect("can't create temp directory");
+        std::fs::write(dir.path().join("zeta.txt"), "z").unwrap();
+        std::fs::create_dir(dir.path().join("alpha")).unwrap();
+        std::fs::write(dir.path().join("line\nbreak"), "control").unwrap();
+
+        let out = read(dir.path(), 0, 100).expect("can't list directory");
+        assert_eq!(
+            out,
+            "1\tdirectory\t\"alpha\"\n2\tfile\t\"line\\nbreak\"\n3\tfile\t\"zeta.txt\"\n"
+        );
+    }
+
+    #[test]
+    fn directory_listing_honors_pagination_and_empty_directory() {
+        let empty = tempfile::tempdir().expect("can't create temp directory");
+        assert_eq!(read(empty.path(), 0, 100).unwrap(), "(empty directory)");
+
+        let dir = tempfile::tempdir().expect("can't create temp directory");
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        assert_eq!(
+            read(dir.path(), 1, 1).unwrap(),
+            "2\tfile\t\"beta\"\n(showed entries 2-2 of 3 discovered. continue with offset=2.)\n"
+        );
+        assert_eq!(
+            read(dir.path(), 3, 1).unwrap(),
+            "(0 entries: offset 3 is past the 3 discovered entries)"
+        );
+        assert_eq!(read(dir.path(), 0, 0).unwrap(), "(0 entries: limit is 0)");
+    }
+
+    #[test]
+    fn directory_listing_omits_lexically_denied_children() {
+        let dir = tempfile::tempdir().expect("can't create temp directory");
+        std::fs::write(dir.path().join("visible.txt"), "ordinary").unwrap();
+        std::fs::write(dir.path().join(".env"), "DUMMY_SECRET_SENTINEL").unwrap();
+        std::fs::write(dir.path().join("id_rsa"), "DUMMY_SECRET_SENTINEL").unwrap();
+
+        assert_eq!(
+            read(dir.path(), 0, 100).unwrap(),
+            "1\tfile\t\"visible.txt\"\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_listing_checks_children_against_the_canonical_parent() {
+        let root = tempfile::tempdir().expect("can't create temp directory");
+        let protected = root.path().join(".polaris");
+        std::fs::create_dir(&protected).unwrap();
+        std::fs::write(protected.join("auth.json"), "DUMMY_SECRET_SENTINEL").unwrap();
+        std::fs::write(protected.join("config.toml"), "ordinary config").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&protected, &alias).unwrap();
+
+        assert_eq!(read(&alias, 0, 100).unwrap(), "1\tfile\t\"config.toml\"\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_listing_does_not_follow_child_symlinks() {
+        let dir = tempfile::tempdir().expect("can't create temp directory");
+        let target = tempfile::NamedTempFile::new().expect("can't create target");
+        std::os::unix::fs::symlink(target.path(), dir.path().join("alias")).unwrap();
+
+        assert_eq!(read(dir.path(), 0, 100).unwrap(), "1\tsymlink\t\"alias\"\n");
+    }
+
+    #[test]
+    fn directory_listing_respects_the_output_byte_cap() {
+        let dir = tempfile::tempdir().expect("can't create temp directory");
+        for index in 0..100 {
+            std::fs::write(dir.path().join(format!("entry-{index:03}-long-name")), "x").unwrap();
+        }
+
+        let out = read_with_budget(dir.path(), 0, usize::MAX, Some(1024)).unwrap();
+        assert!(
+            out.len() <= 1024,
+            "directory output exceeded cap: {}",
+            out.len()
+        );
+        assert!(
+            out.contains("byte cap"),
+            "missing byte cap continuation: {out}"
+        );
+    }
+
+    #[test]
+    fn directory_listing_reports_a_name_that_cannot_fit_the_byte_cap() {
+        let dir = tempfile::tempdir().expect("can't create temp directory");
+        let name = "\u{1}".repeat(255);
+        std::fs::write(dir.path().join(name), "x").unwrap();
+
+        let err = read_with_budget(dir.path(), 0, 100, Some(1024)).unwrap_err();
+        assert!(matches!(err, ToolError::Io(_)));
+        assert!(
+            err.to_string()
+                .contains("increase POLARIS_READ_OUTPUT_BYTES")
+        );
+    }
+
+    #[test]
+    fn directory_listing_marks_the_scan_limit_incomplete() {
+        let dir = tempfile::tempdir().expect("can't create temp directory");
+        for index in 0..MAX_DIRECTORY_ENTRIES {
+            std::fs::write(dir.path().join(format!("entry-{index:05}")), "x").unwrap();
+        }
+
+        let out = read(dir.path(), 0, usize::MAX).unwrap();
+        assert!(out.contains("listing incomplete after scanning 10000 entries"));
     }
 
     #[test]

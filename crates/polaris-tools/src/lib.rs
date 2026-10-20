@@ -272,7 +272,7 @@ and verification either way."
 fn read_spec() -> ToolSpec {
     ToolSpec {
         name: "read".into(),
-        description: "Read lines; offset 0-based, default limit 2000. Use relevant ranges; prefer file-reader for large files when available.".into(),
+        description: "Read file lines or list direct directory entries before choosing a file; offset 0-based, default limit 2000. Use relevant ranges; prefer file-reader for large files when available.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -411,6 +411,11 @@ mod tests {
         assert!(
             read.description.contains(&read::DEFAULT_LIMIT.to_string()),
             "description should name the actual default limit: {:?}",
+            read.description
+        );
+        assert!(
+            read.description.contains("directory entries"),
+            "description should explain directory discovery: {:?}",
             read.description
         );
     }

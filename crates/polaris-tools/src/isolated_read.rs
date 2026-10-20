@@ -182,6 +182,18 @@ mod tests {
         );
     }
     #[test]
+    fn isolated_lines_list_directories_without_exposing_denied_children() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("alpha")).unwrap();
+        std::fs::write(dir.path().join("zeta.txt"), "z").unwrap();
+        std::fs::write(dir.path().join(".env"), "DUMMY_SECRET_SENTINEL").unwrap();
+
+        assert_eq!(
+            roundtrip(&request(dir.path(), 0, 100, OUTPUT_BUDGET)),
+            Reply::Text("1\tdirectory\t\"alpha\"\n2\tfile\t\"zeta.txt\"\n".into())
+        );
+    }
+    #[test]
     fn isolated_long_line_and_json_escape_are_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("source.txt");

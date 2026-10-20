@@ -93,6 +93,16 @@ impl Fixture {
         pending: bool,
         factory: Option<&HistoryBackendFactory>,
     ) -> Result<Vec<Line<'static>>, String> {
+        self.call_result(request, key, pending, factory)
+            .map(|result| result.lines)
+    }
+    fn call_result(
+        &mut self,
+        request: &str,
+        key: KeyCode,
+        pending: bool,
+        factory: Option<&HistoryBackendFactory>,
+    ) -> Result<CommandResult, String> {
         handle(
             request,
             &self.terminal,
@@ -122,6 +132,40 @@ impl Fixture {
         );
         assert_eq!(self.snapshot().state, before, "{request}");
     }
+}
+
+#[test]
+fn only_committed_settings_changes_request_binding_refresh() {
+    let mut fixture = Fixture::new();
+    let before = fixture.snapshot().state;
+    for request in [
+        "session",
+        "session current",
+        "session history",
+        "goal",
+        "history",
+    ] {
+        let result = fixture
+            .call_result(request, KeyCode::Esc, true, None)
+            .unwrap();
+        assert!(!result.settings_changed, "{request}");
+        assert!(!result.lines.is_empty(), "{request}");
+    }
+    let cancelled = fixture
+        .call_result("remember on", KeyCode::Esc, false, None)
+        .unwrap();
+    assert!(!cancelled.settings_changed);
+    assert_eq!(fixture.snapshot().state, before);
+    let committed = fixture
+        .call_result("remember on", KeyCode::Char('y'), false, None)
+        .unwrap();
+    assert!(committed.settings_changed);
+    assert!(fixture.snapshot().state.session_settings.unwrap().remember);
+    let goal = fixture
+        .call_result("goal set finish", KeyCode::Char('y'), false, None)
+        .unwrap();
+    assert!(!goal.settings_changed);
+    assert!(fixture.snapshot().state.goal.unwrap().active);
 }
 
 #[test]

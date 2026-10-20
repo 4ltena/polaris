@@ -19,6 +19,20 @@ use std::cell::RefCell;
 const HISTORY_PAGE_MESSAGES: usize = 20;
 const MAX_VIEW_BYTES: usize = 64 * 1024;
 
+pub(crate) struct CommandResult {
+    pub lines: Vec<Line<'static>>,
+    pub settings_changed: bool,
+}
+
+impl CommandResult {
+    fn display(lines: Vec<Line<'static>>) -> Self {
+        Self {
+            lines,
+            settings_changed: false,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle<B: Backend, R: KeyReader>(
     request: &str,
@@ -31,7 +45,7 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
     provider: &dyn Provider,
     history_factory: Option<&HistoryBackendFactory>,
     has_pending: bool,
-) -> Result<Vec<Line<'static>>, String> {
+) -> Result<CommandResult, String> {
     let request = request.trim().trim_start_matches('/');
     let persistence = session
         .persistence
@@ -48,7 +62,7 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
     let snapshot = persistence.snapshot().map_err(|e| e.to_string())?;
     let saved = snapshot.state.session_settings.as_ref().unwrap_or(initial);
     if matches!(request, "session" | "session current") {
-        return Ok(vec![
+        return Ok(CommandResult::display(vec![
             line(format!(
                 "会話: {} / 世代 {}",
                 snapshot.state.session_id, snapshot.state.generation
@@ -82,19 +96,20 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
                 Some(pair) => format!("tool-memory endpoint: {} / model: {}", pair.url, pair.model),
                 None => "tool-memory endpoint: off".into(),
             }),
-        ]);
+        ]));
     }
     if matches!(request, "goal" | "goal current") {
-        return Ok(goal_lines(&snapshot));
+        return Ok(CommandResult::display(goal_lines(&snapshot)));
     }
     if request == "session history" {
-        return Ok(vec![line(format!(
+        return Ok(CommandResult::display(vec![line(format!(
             "履歴モード: {}。変更は新しい空の会話で行います。",
             history_name(snapshot.state.history_mode)
-        ))]);
+        ))]));
     }
     if request == "history" || request.starts_with("history ") {
-        return history_lines(&snapshot, request.strip_prefix("history").unwrap().trim());
+        return history_lines(&snapshot, request.strip_prefix("history").unwrap().trim())
+            .map(CommandResult::display);
     }
     if has_pending {
         return Err("送信待ちの入力があるためセッション設定を変更できません".into());
@@ -146,7 +161,9 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
         &format!("{request}\n{detail}"),
     ) {
         owner.deny(&prepared).map_err(|e| e.to_string())?;
-        return Ok(vec![line("セッション設定の変更を取り消しました")]);
+        return Ok(CommandResult::display(vec![line(
+            "セッション設定の変更を取り消しました",
+        )]));
     }
     let published = owner
         .execute(&persistence, &prepared)
@@ -168,7 +185,10 @@ pub(crate) fn handle<B: Backend, R: KeyReader>(
     if preview.inventory() == "D20" {
         lines.extend(goal_lines(&published));
     }
-    Ok(lines)
+    Ok(CommandResult {
+        lines,
+        settings_changed: published.state.session_settings != snapshot.state.session_settings,
+    })
 }
 
 fn parse(

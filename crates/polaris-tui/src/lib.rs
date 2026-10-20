@@ -3796,6 +3796,21 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         // Reattach process-owned services and selectors before accepting the
         // next input; none of these belong to durable conversation state.
         #[cfg(unix)]
+        {
+            // `/model` changes the process binding without saving preferences.
+            // Unconfigured conversations and first-time settings writes must
+            // use that current binding; durable settings still take precedence.
+            initial_saved_settings.provider.clone_from(&provider_name);
+            initial_saved_settings.model.clone_from(&model_name);
+            initial_saved_settings.effort = if is_local_provider(&provider_name) {
+                String::new()
+            } else {
+                args.initial_effort_name
+                    .clone()
+                    .unwrap_or_else(|| "auto".into())
+            };
+        }
+        #[cfg(unix)]
         if refresh_saved_settings || saved_settings_path.as_ref() != Some(&session_path) {
             let switched = saved_settings_path.as_ref() != Some(&session_path);
             if let Some(saved) = &session.persistence {
@@ -4405,9 +4420,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 has_pending_inputs,
                             );
                             match result {
-                                Ok(lines) => {
-                                    local_lines.extend(lines);
-                                    refresh_saved_settings = true;
+                                Ok(result) => {
+                                    local_lines.extend(result.lines);
+                                    refresh_saved_settings |= result.settings_changed;
                                     status =
                                         Status::Notice("セッション操作の結果を表示しました".into());
                                 }
@@ -5483,9 +5498,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         has_pending_inputs,
                     );
                     match result {
-                        Ok(lines) => {
-                            local_lines.extend(lines);
-                            refresh_saved_settings = true;
+                        Ok(result) => {
+                            local_lines.extend(result.lines);
+                            refresh_saved_settings |= result.settings_changed;
                             status = Status::Notice("セッション操作の結果を表示しました".into());
                         }
                         Err(error) => status = Status::Error(error),

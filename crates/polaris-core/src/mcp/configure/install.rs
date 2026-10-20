@@ -54,7 +54,7 @@ struct RuntimeManifest<'a> {
     entry_sha256: &'a str,
     selected_files: usize,
     selected_bytes: u64,
-    fixed_exclusion: &'static str,
+    fixed_exclusions: Vec<String>,
     hardlink_copy: &'static str,
 }
 
@@ -133,6 +133,15 @@ pub(super) fn populate(
         }
     }
     source.revalidate()?;
+    let fixed_exclusions = source
+        .fixed_exclusion_paths()
+        .into_iter()
+        .map(|path| {
+            path.to_str()
+                .map(ToOwned::to_owned)
+                .ok_or("Unity runtimeの固定除外pathを表現できません")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let manifest_bytes = serde_json::to_vec(&RuntimeManifest {
         schema_version: 1,
         preset: "unity-local-v2",
@@ -143,7 +152,7 @@ pub(super) fn populate(
         entry_sha256: source.entry_sha256(),
         selected_files: source.file_count(),
         selected_bytes: source.total_bytes(),
-        fixed_exclusion: "node_modules/.bin",
+        fixed_exclusions,
         hardlink_copy: "exact-esbuild-pair-to-two-independent-files",
     })
     .map_err(|_| "Unity runtime manifestを作成できません")?;

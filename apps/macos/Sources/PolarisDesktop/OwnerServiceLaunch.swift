@@ -13,7 +13,8 @@ struct OwnerServiceLaunch: Sendable {
     let storeDevice: String
     let storeInode: String
     init(store: ServiceClient.PersistentStore, binding: WorkspaceBinding, proof: PublicationProof,
-         permission: PermissionPreference, policyRevision: UInt64, decisionAPIKey: String? = nil) throws {
+         permission: PermissionPreference, policyRevision: UInt64, decisionAPIKey: String? = nil,
+         clefDecision: ClefDecisionSelection? = nil) throws {
         guard Data(store.projectID.utf8) == Data(binding.projectID.utf8),
               Data(store.sessionID.utf8) == Data(binding.sessionID.utf8) else { throw ServiceError.correlation }
         let root = try MetadataDirectory(url: store.root, create: false)
@@ -27,10 +28,18 @@ struct OwnerServiceLaunch: Sendable {
                   !decisionAPIKey.contains("\0") else { throw ServiceError.schema }
         }
         self.decisionAPIKey = decisionAPIKey
+        try clefDecision?.validate()
+        guard clefDecision == nil || decisionAPIKey == nil else { throw ServiceError.schema }
+        self.clefDecision = clefDecision
         storeDevice = String(UInt64(UInt32(bitPattern: info.st_dev))); storeInode = String(info.st_ino)
     }
     private let decisionAPIKey: String?
+    private let clefDecision: ClefDecisionSelection?
     var environment: [String: String] {
+        if let clefDecision {
+            return ["POLARIS_JEV_ENABLED": "0", "POLARIS_CLEF_PROFILE": clefDecision.profile,
+                    "POLARIS_CLEF_ENABLED": clefDecision.enabled ? "1" : "0"]
+        }
         guard let decisionAPIKey else { return ["POLARIS_JEV_ENABLED": "0"] }
         return ["POLARIS_JEV_ENABLED": "1", "POLARIS_JEV_API_KEY": decisionAPIKey]
     }

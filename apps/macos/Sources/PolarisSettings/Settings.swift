@@ -171,6 +171,30 @@ public enum PermissionPreference: String, Codable, CaseIterable, Sendable {
         }
     }
 }
+/// A native override selects an ID, never a path, runtime or acceptance grant.
+/// Removing it restores the existing TOML and Jev setup selection.
+public struct ClefDecisionSelection: Codable, Equatable, Sendable {
+    public let profile: String
+    public let enabled: Bool
+    public init(profile: String, enabled: Bool = false) throws {
+        self.profile = profile; self.enabled = enabled
+        try validate()
+    }
+    public func validate() throws {
+        guard !profile.isEmpty, profile.utf8.count <= 96,
+              profile.utf8.first.map({ (48...57).contains($0) || (97...122).contains($0) }) == true,
+              profile.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) || [45, 46, 95].contains($0) }) else {
+            throw SettingsError.invalidDocument
+        }
+    }
+    private enum CodingKeys: String, CodingKey { case profile, enabled }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(profile: c.decode(String.self, forKey: .profile),
+                      enabled: c.decode(Bool.self, forKey: .enabled))
+    }
+}
+
 public struct Preferences: Codable, Equatable, Sendable {
     public var gpt: GPTPreference = .later
     public var local: LocalPreference = .later
@@ -185,10 +209,12 @@ public struct Preferences: Codable, Equatable, Sendable {
     /// Uses the optional typed decision service. Its credential is kept in
     /// Keychain and is never encoded with these shareable settings.
     public var jevEnabled: Bool = false
+    public var clefDecision: ClefDecisionSelection? = nil
+    public var usesNativeJev: Bool { clefDecision == nil && jevEnabled }
     public init() {}
     private enum CodingKeys: String, CodingKey {
         case gpt, local, projectPath, permission, theme, executionBinding, historyMode, localConnection, jevEnabled
-        case presentationLanguage, answerFinalizer
+        case presentationLanguage, answerFinalizer, clefDecision
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -201,6 +227,7 @@ public struct Preferences: Codable, Equatable, Sendable {
         historyMode = try c.decodeIfPresent(HistoryMode.self, forKey: .historyMode) ?? .legacy
         localConnection = try c.decodeIfPresent(LocalConnectionPreference.self, forKey: .localConnection)
         jevEnabled = try c.decodeIfPresent(Bool.self, forKey: .jevEnabled) ?? false
+        clefDecision = try c.decodeIfPresent(ClefDecisionSelection.self, forKey: .clefDecision)
         presentationLanguage = try c.decodeIfPresent(PresentationLanguagePreference.self,
                                                      forKey: .presentationLanguage) ?? .unspecified
         answerFinalizer = try c.decodeIfPresent(AnswerFinalizerPreference.self,
@@ -216,6 +243,7 @@ public struct Preferences: Codable, Equatable, Sendable {
         try c.encodeIfPresent(localConnection, forKey: .localConnection)
         if historyMode != .legacy { try c.encode(historyMode, forKey: .historyMode) }
         if jevEnabled { try c.encode(jevEnabled, forKey: .jevEnabled) }
+        try c.encodeIfPresent(clefDecision, forKey: .clefDecision)
         if presentationLanguage != .unspecified {
             try c.encode(presentationLanguage, forKey: .presentationLanguage)
         }
@@ -298,6 +326,7 @@ public struct SettingsDocument: Codable, Equatable, Sendable {
         }
         guard workspace == nil || preferences?.projectPath != nil else { throw SettingsError.invalidDocument }
         for value in [draft.preferences, preferences].compactMap({ $0 }) {
+            try value.clefDecision?.validate()
             try value.executionBinding?.validate()
             try value.localConnection?.validate()
             try value.answerFinalizer.validate()

@@ -1,6 +1,7 @@
 import XCTest
 import CryptoKit
 import Foundation
+import PolarisSettings
 @testable import PolarisDesktop
 
 private func offerData() throws -> Data {
@@ -83,6 +84,48 @@ final class DecisionInstallTests: XCTestCase {
         let counts = await transport.counts()
         XCTAssertEqual(counts.0, 0); XCTAssertEqual(counts.1, [])
         XCTAssertNil(model.offer); XCTAssertTrue(model.message.contains("0件"))
+    }
+
+    @MainActor func testNativeSelectionIsDisabledUntilExplicitFreshVerification() async throws {
+        let transport = FixtureDecisionTransport()
+        let model = DecisionInstallModel(transport: transport)
+        var selection: ClefDecisionSelection?
+        model.refresh(); try await settle(model)
+        model.selectDisabled { selection = $0 }
+        XCTAssertEqual(selection, try ClefDecisionSelection(profile: "fixture-v1"))
+        var count = await transport.verificationCount(); XCTAssertEqual(count, 0)
+        model.verify(); try await settle(model)
+        XCTAssertFalse(selection!.enabled)
+        model.activate { selection = $0 }; try await settle(model)
+        XCTAssertEqual(selection, try ClefDecisionSelection(profile: "fixture-v1", enabled: true))
+        count = await transport.verificationCount(); XCTAssertEqual(count, 2)
+        XCTAssertTrue(model.message.contains("下書き"))
+        model.selectionEdited()
+        XCTAssertNil(model.verification)
+        XCTAssertFalse(model.message.contains("有効化"))
+    }
+
+    @MainActor func testFailedCancelledChangedOrStaleActivationNeverWritesSelection() async throws {
+        for mode in ["integrity", "cancelled", "changed", "stale"] {
+            let model = DecisionInstallModel(transport: FixtureDecisionTransport(profiles: ["fixture-v1", "other-v1"],
+                verificationStatus: mode == "integrity" ? "integrity" : "verified", verificationDelay: 20_000_000))
+            model.refresh(); try await settle(model)
+            var written = false
+            model.activate { _ in
+                if mode == "stale" { throw ServiceError.correlation }
+                written = true
+            }
+            if mode == "cancelled" { model.cancel() }
+            if mode == "changed" { model.profile = "other-v1" }
+            try await settle(model); try await Task.sleep(nanoseconds: 30_000_000)
+            XCTAssertFalse(written, mode)
+            XCTAssertNil(model.verification, mode)
+        }
+        let model = DecisionInstallModel(transport: FixtureDecisionTransport(profiles: []))
+        model.refresh(); try await settle(model)
+        var written = false
+        model.selectDisabled { _ in written = true }; model.activate { _ in written = true }
+        XCTAssertFalse(written)
     }
 
     @MainActor func testOneOfferIsConfirmedOnceWithoutEnablingTheBackend() async throws {

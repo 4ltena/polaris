@@ -234,6 +234,13 @@ pub struct DecisionConfig {
     pub helper: Option<PathBuf>,
 }
 
+impl DecisionConfig {
+    /// Validate an explicit owner selection with the same rules as TOML layers.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        RawDecision::settled(self)
+    }
+}
+
 /// Named judges. Unknown spellings are refused at load, so a typo stops
 /// the run instead of silently selecting the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

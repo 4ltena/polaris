@@ -788,3 +788,56 @@ fn native_jev_toggle_neither_disables_nor_activates_another_backend() {
         assert!(!decision.enabled);
     }
 }
+
+#[test]
+fn native_clef_selection_is_explicit_atomic_and_never_grants_fallback_or_paths() {
+    use polaris_core::config::{DecisionBackend, DecisionConfig, DecisionFallback};
+    let original = DecisionConfig {
+        enabled: true,
+        backend: DecisionBackend::SemIf,
+        helper: Some("/synthetic/helper".into()),
+        local_only: true,
+        fallback: Some(DecisionFallback {
+            targets: vec![DecisionConfig {
+                enabled: true,
+                ..Default::default()
+            }],
+            max_attempts: 2,
+            attempt_timeout_ms: 100,
+            total_timeout_ms: 200,
+        }),
+        ..Default::default()
+    };
+    for enabled in ["0", "1"] {
+        let mut selected = original.clone();
+        apply_native_clef_selection(&mut selected, Ok("fixture-v1".into()), Ok(enabled.into()))
+            .unwrap();
+        assert_eq!(selected.backend, DecisionBackend::Clef);
+        assert_eq!(selected.model.as_deref(), Some("fixture-v1"));
+        assert_eq!(selected.enabled, enabled == "1");
+        assert!(selected.local_only);
+        assert!(
+            selected.helper.is_none() && selected.base_url.is_none() && selected.fallback.is_none()
+        );
+        selected.validate().unwrap();
+    }
+    let absent = || Err(std::env::VarError::NotPresent);
+    let mut retained = original.clone();
+    apply_native_clef_selection(&mut retained, absent(), absent()).unwrap();
+    assert_eq!(retained, original);
+    for (profile, enabled) in [
+        (Ok("fixture-v1".into()), absent()),
+        (absent(), Ok("1".into())),
+        (Ok("fixture-v1".into()), Ok("true".into())),
+        (Ok("/arbitrary/worker".into()), Ok("1".into())),
+        (Ok("".into()), Ok("0".into())),
+        (Ok("a".repeat(97)), Ok("1".into())),
+    ] {
+        let mut retained = original.clone();
+        assert!(apply_native_clef_selection(&mut retained, profile, enabled).is_err());
+        assert_eq!(retained, original);
+    }
+    // No package authority is supplied by the selection. An unaccepted ID
+    // still cannot construct a managed runtime or grant a fallback.
+    assert!(polaris_core::managed_decision::build("synthetic-unaccepted-v1").is_err());
+}

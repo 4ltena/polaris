@@ -45,7 +45,9 @@ final class DesktopModelTests: XCTestCase {
     private final class StoredKey: @unchecked Sendable {
         private let lock = NSLock()
         private var value: String?
-        func load() -> String? { lock.lock(); defer { lock.unlock() }; return value }
+        private var reads = 0
+        func load() -> String? { lock.lock(); defer { lock.unlock() }; reads += 1; return value }
+        func readCount() -> Int { lock.lock(); defer { lock.unlock() }; return reads }
         func save(_ next: String) { lock.lock(); defer { lock.unlock() }; value = next }
     }
     @MainActor
@@ -167,6 +169,38 @@ final class DesktopModelTests: XCTestCase {
         XCTAssertTrue(model.jevAPIKey.isEmpty)
         let encoded = try JSONEncoder().encode(model.document)
         XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("synthetic-jev-key"))
+    }
+
+    @MainActor
+    func testClefChoiceSkipsKeyReadsAndRestoresTheExistingJevCredentialOnReturn() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("polaris-clef-setup-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("settings.json")
+        var document = SettingsDocument()
+        document.draft.preferences.jevEnabled = true
+        document.draft.preferences.clefDecision = try ClefDecisionSelection(profile: "fixture-v1", enabled: true)
+        do { let store = try SettingsStore(url: url); try store.save(document) }
+        let stored = StoredKey(); stored.save("synthetic-retained-key")
+        let model = DesktopModel(arguments: ["--installer-mode", "--settings-path", url.path],
+            jevCredentials: JevCredentialAccess(load: { stored.load() }, save: { stored.save($0) }),
+            dependencyInstaller: FakeDependencyInstaller())
+        await model.start()
+        model.setJevEnabled(true)
+        XCTAssertEqual(stored.readCount(), 0)
+        XCTAssertFalse(model.hasStoredJevAPIKey)
+        model.setClefDecision(nil)
+        XCTAssertEqual(stored.readCount(), 1)
+        XCTAssertTrue(model.hasStoredJevAPIKey)
+        XCTAssertNil(model.jevCredentialError)
+        model.setClefDecision(try ClefDecisionSelection(profile: "fixture-v1"))
+        XCTAssertFalse(model.hasStoredJevAPIKey)
+        model.setJevEnabled(false); model.setClefDecision(nil)
+        XCTAssertEqual(stored.readCount(), 1)
+        model.setJevEnabled(true)
+        XCTAssertEqual(stored.readCount(), 2)
+        XCTAssertTrue(model.hasStoredJevAPIKey)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(model.document), as: UTF8.self).contains("synthetic-retained-key"))
     }
 
     @MainActor

@@ -80,9 +80,9 @@ final class DesktopWorkspaceOwner: ObservableObject {
             }
             let historyMode = preferences.historyMode
             attemptedHistoryMode = historyMode
-            attemptedJev = preferences.jevEnabled
+            attemptedJev = preferences.usesNativeJev
             let decisionAPIKey: String?
-            if preferences.jevEnabled {
+            if preferences.usesNativeJev {
                 guard let stored = try decisionCredential(), !stored.isEmpty else { throw ServiceError.notReady }
                 decisionAPIKey = stored
             } else {
@@ -134,7 +134,7 @@ final class DesktopWorkspaceOwner: ObservableObject {
             try validatePublication(); try verifyAssembly()
             let launch = try OwnerServiceLaunch(store: service.store, binding: binding, proof: proof,
                                                permission: permission, policyRevision: policy,
-                                               decisionAPIKey: decisionAPIKey)
+                                               decisionAPIKey: decisionAPIKey, clefDecision: preferences.clefDecision)
             let executable = try helper(); let clientID = binding.clientID
             try await service.startConfigured(revalidate: validatePublication) {
                 if let makeConfiguredTransport { return try makeConfiguredTransport(launch) }

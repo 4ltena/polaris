@@ -53,6 +53,32 @@ final class SettingsTests: XCTestCase {
         XCTAssertNil(preferences.localConnection)
         XCTAssertEqual(preferences.presentationLanguage, .unspecified)
         XCTAssertEqual(preferences.answerFinalizer, AnswerFinalizerPreference())
+        XCTAssertNil(preferences.clefDecision)
+    }
+
+    func testClefOverrideRoundTripsWithoutDeletingJevAndCanRestoreItsSelection() throws {
+        try isolated { url in
+            let store = try SettingsStore(url: url)
+            var document = SettingsDocument()
+            document.draft.preferences.jevEnabled = true
+            document.draft.preferences.clefDecision = try ClefDecisionSelection(profile: "fixture-v1")
+            try store.save(document)
+            var restored = try store.load()
+            XCTAssertEqual(restored.draft.preferences.clefDecision?.enabled, false)
+            XCTAssertTrue(restored.draft.preferences.jevEnabled)
+            XCTAssertFalse(restored.draft.preferences.usesNativeJev)
+            restored.draft.preferences.clefDecision = try ClefDecisionSelection(profile: "fixture-v1", enabled: true)
+            restored.finish(); try store.save(restored)
+            XCTAssertEqual(try store.load().preferences?.clefDecision?.enabled, true)
+            restored.reopen(); restored.draft.preferences.clefDecision = nil
+            restored.finish(); try store.save(restored)
+            XCTAssertTrue(try store.load().preferences!.usesNativeJev)
+        }
+        for profile in ["", "/arbitrary/worker", "../worker", "UPPER", "a\n", String(repeating: "a", count: 97)] {
+            XCTAssertThrowsError(try ClefDecisionSelection(profile: profile))
+        }
+        XCTAssertThrowsError(try JSONDecoder().decode(ClefDecisionSelection.self, from: Data(#"{"profile":"fixture-v1"}"#.utf8)))
+        XCTAssertThrowsError(try JSONDecoder().decode(ClefDecisionSelection.self, from: Data(#"{"profile":"/worker","enabled":true}"#.utf8)))
     }
 
     func testTypedAnswerFinalizerPreferencesRoundTripWithoutGrantingBenchmarkLock() throws {

@@ -265,6 +265,32 @@ fn apply_native_decision_selection(
     Ok(())
 }
 
+fn apply_native_clef_selection(
+    decision: &mut polaris_core::config::DecisionConfig,
+    profile: Result<String, std::env::VarError>,
+    enabled: Result<String, std::env::VarError>,
+) -> Result<(), StartupError> {
+    use polaris_core::config::DecisionBackend;
+    let (profile, enabled) = match (profile, enabled.as_deref()) {
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => return Ok(()),
+        (Ok(profile), Ok("0")) => (profile, false),
+        (Ok(profile), Ok("1")) => (profile, true),
+        _ => return Err(StartupError::Generic),
+    };
+    let mut selected = decision.clone();
+    selected.backend = DecisionBackend::Clef;
+    selected.model = Some(profile);
+    selected.enabled = enabled;
+    selected.helper = None;
+    selected.base_url = None;
+    // This explicit native choice has no fallback. Clearing the override on
+    // the next launch restores TOML unchanged; local-only always survives.
+    selected.fallback = None;
+    selected.validate().map_err(|_| StartupError::Generic)?;
+    *decision = selected;
+    Ok(())
+}
+
 const MANAGED_RUST_VERSION: &str = "1.96.0";
 
 #[derive(Deserialize)]
@@ -614,6 +640,11 @@ fn start_at(
     // backends retain their explicit configuration, including enabled=false.
     // The key itself remains outside every config and argv.
     apply_native_decision_selection(&mut decision, std::env::var("POLARIS_JEV_ENABLED"))?;
+    apply_native_clef_selection(
+        &mut decision,
+        std::env::var("POLARIS_CLEF_PROFILE"),
+        std::env::var("POLARIS_CLEF_ENABLED"),
+    )?;
     if decision.enabled
         && let Some(fallback) = &decision.fallback
     {

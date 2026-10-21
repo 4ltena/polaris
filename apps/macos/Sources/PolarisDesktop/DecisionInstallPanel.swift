@@ -1,17 +1,37 @@
 import AppKit
 import SwiftUI
+import PolarisSettings
 
 struct DecisionInstallPanel: View {
+    @Binding var selection: ClefDecisionSelection?
     @StateObject private var model = DecisionInstallModel()
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Clef / Clef-flashの固定artifact導入。Jev・SemIfは維持し、この操作では判断器を有効にしません。")
+            Text("Clef / Clef-flashの導入と次回用の選択。導入・検証だけでは有効になりません。Jev・SemIfの既存設定は保持します。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button("登録profileを確認") { model.refresh() }.disabled(model.busy || model.offer != nil)
                 if model.busy { ProgressView().controlSize(.small) }
             }
             Text(model.message).font(.caption).textSelection(.enabled)
+            GroupBox("次回owner起動用の選択") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(selection.map { "\($0.profile) / \($0.enabled ? "有効化を選択" : "無効")" } ?? "設定ファイルとJevスイッチの選択を使用")
+                    Text("変更は下書きです。設定を確定し、ownerを終了して起動し直すと反映します。Clef選択中はfallbackを使用しません。受入・整合性・容量は実行時にも確認します。")
+                    if let current = selection {
+                        Button("このprofileを無効にする") {
+                            selection = try? ClefDecisionSelection(profile: current.profile)
+                            model.selectionEdited()
+                        }
+                            .disabled(model.busy || model.offer != nil || !current.enabled)
+                        Button("設定ファイルとJevスイッチの選択へ戻す") {
+                            selection = nil
+                            model.selectionEdited()
+                        }
+                            .disabled(model.busy || model.offer != nil)
+                    }
+                }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+            }
             if let catalog = model.catalog {
                 DisclosureGroup("容量の推薦（実行可否は未確認）") {
                     ForEach(Array(catalog.capacity.enumerated()), id: \.offset) { _, line in Text(line).font(.caption) }
@@ -21,6 +41,16 @@ struct DecisionInstallPanel: View {
                         ForEach(catalog.registeredProfiles, id: \.self) { Text($0).tag($0) }
                     }.disabled(model.busy || model.offer != nil)
                     Button("導入済みgenerationを検証") { model.verify() }.disabled(!model.canVerify)
+                    HStack {
+                        Button("無効のまま選択") { model.selectDisabled { selection = $0 } }
+                        Button("再検証して有効化を選択") {
+                            let before = selection
+                            model.activate {
+                                guard selection == before else { throw ServiceError.correlation }
+                                selection = $0
+                            }
+                        }
+                    }.disabled(!model.canVerify)
                     if let generation = model.verification?.generation {
                         DisclosureGroup("照合した固定内容（有効化・容量判定なし）") {
                             Text("\(generation.profile) / \(generation.generation)\n\(generation.modelRepository) @ \(generation.modelRevision)\n\(generation.quantization) / \(generation.runtimeRevision)")

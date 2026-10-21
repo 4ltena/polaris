@@ -62,6 +62,10 @@ review = ["user:review-rules"]
 
 macOS desktopのJevスイッチは、選択中のbackendが`jev`の場合だけ有効・無効を上書きする。`clef`・`semif`・`system-one`を選んでいる場合は、`[decision]`の`enabled`を維持する。Jevスイッチで他backendを有効にすることも、無効にすることもない。
 
+インストーラのClef欄では、登録profileを「無効のまま選択」できる。「再検証して有効化を選択」は、同梱CLIで導入済みgenerationの全SHAをその都度照合してから、選択を設定の下書きへ反映する。導入や検証だけでは有効にならない。設定を確定し、ownerを終了して起動し直すと反映され、実行中のownerは切り替わらない。このGUI選択はdesktopだけに適用され、CLI/TUIの設定は変更しない。
+
+GUIでClefを選んでいる間はfallbackとJevキーを使用せず、`local_only`などの制限と実行時の受入・整合性・容量検査を維持する。元の設定ファイル・Jevの選択・導入資源は変更しない。「このprofileを無効にする」で型付き判断器を無効にでき、「設定ファイルとJevスイッチの選択へ戻す」で元の設定を再適用できる。どちらも設定確定後の次回owner起動から反映する。登録profileがなくなった場合も、この無効化と復帰操作は使える。
+
 | `backend` | 指定する資源 | 現在の扱い |
 | --- | --- | --- |
 | `jev` | 任意の`model`・`base_url`と、環境変数`POLARIS_JEV_API_KEY` | 既存のHTTP経路。明示的に有効にした場合だけ使用する。 |

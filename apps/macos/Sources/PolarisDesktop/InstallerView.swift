@@ -371,19 +371,23 @@ struct InstallerRootView: View {
                     Toggle("Jevを内部判定に使う", isOn: Binding(
                         get: { model.document.draft.preferences.jevEnabled },
                         set: { model.setJevEnabled($0) }))
-                    Text(model.document.draft.preferences.jevEnabled
+                    Text(model.document.draft.preferences.clefDecision != nil
+                         ? "ClefのGUI選択中はJev設定を保持し、使用しません。設定ファイルの選択へ戻すと再適用します。"
+                         : model.document.draft.preferences.jevEnabled
                          ? "型付き判定をAPIへ委任し、判定精度を高めます。API利用量が発生します。"
                          : "端末内のe5を使います。Jevと比べて判定精度が少し下がります。")
                         .font(.caption).foregroundStyle(.secondary)
-                    if model.document.draft.preferences.jevEnabled {
+                    if model.document.draft.preferences.usesNativeJev {
                         SecureField("Jev APIキー", text: $model.jevAPIKey)
                             .textFieldStyle(.roundedBorder)
                         if let error = model.jevCredentialError { Text(error).font(.caption).foregroundStyle(.red) }
                     }
                 }
             }
-            installerSection("Clef判断器の導入（任意）") {
-                DecisionInstallPanel()
+            installerSection("Clef判断器の導入と選択（任意）") {
+                DecisionInstallPanel(selection: Binding(
+                    get: { model.document.draft.preferences.clefDecision },
+                    set: { model.setClefDecision($0) }))
             }
             installerSection("端末内モデル") {
                 VStack(alignment: .leading, spacing: 10) {
@@ -480,7 +484,9 @@ struct InstallerRootView: View {
             Grid(alignment: .leading, horizontalSpacing: 34, verticalSpacing: 15) {
                 summary("インストール先", installer.destination.path)
                 summary("GPT接続", model.document.draft.preferences.gpt.title)
-                summary("内部判定", model.document.draft.preferences.jevEnabled ? "Jev API" : "端末内のe5")
+                summary("内部判定", model.document.draft.preferences.clefDecision.map {
+                    "Clef: \($0.profile) / \($0.enabled ? "有効化を選択" : "無効")"
+                } ?? (model.document.draft.preferences.jevEnabled ? "Jev API" : "設定ファイルの選択（Jev off）"))
                 summary("端末内モデル", localSummary)
                 summary("翻訳モデル", installer.installCATTranslate
                         ? "CAT-Translate 3.3Bを導入（必要空き：\(capacity(ManagedDependencyInstaller.catTranslateRequiredSpaceBytes))以上）"
@@ -548,7 +554,7 @@ struct InstallerRootView: View {
     }
 
     private var missingJevKey: Bool {
-        model.document.draft.preferences.jevEnabled
+        model.document.draft.preferences.usesNativeJev
             && model.jevAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !model.hasStoredJevAPIKey
     }

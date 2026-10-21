@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import PolarisSettings
 
 struct DecisionInstallCatalog: Decodable, Sendable {
     let schemaVersion: Int
@@ -80,6 +81,34 @@ final class DecisionInstallModel: ObservableObject {
     }
 
     var canVerify: Bool { !busy && offer == nil && catalog?.registeredProfiles.contains(profile) == true }
+
+    func selectionEdited() {
+        verification = nil
+        message = "次回用の選択を変更しました。設定確定後のowner起動で反映します。"
+    }
+
+    func selectDisabled(_ apply: @MainActor (ClefDecisionSelection) throws -> Void) {
+        guard canVerify else { return }
+        do {
+            try apply(ClefDecisionSelection(profile: profile))
+            message = "無効のまま次回起動用の下書きに選択しました。設定の確定後に反映します。"
+        } catch { message = "選択を反映できませんでした。現在の設定を確認してください。" }
+    }
+
+    func activate(_ apply: @escaping @MainActor (ClefDecisionSelection) throws -> Void) {
+        guard canVerify else { return }
+        let selected = profile
+        verification = nil
+        start(failureMessage: "有効化を反映できませんでした。受入・導入・設定を確認してください。") {
+            let value = try await self.transport.verify(profile: selected)
+            guard !Task.isCancelled else { return }
+            guard self.profile == selected, value.profile == selected,
+                  value.status == "verified", value.generation?.profile == selected else { throw ServiceError.correlation }
+            try apply(ClefDecisionSelection(profile: selected, enabled: true))
+            self.verification = value
+            self.message = "再検証し、有効化を次回起動用の下書きに反映しました。設定確定後のowner起動で使用します。容量・応答品質は未確認です。"
+        }
+    }
 
     func verify() {
         guard canVerify else { return }

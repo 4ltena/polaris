@@ -150,7 +150,7 @@ final class DesktopModel: ObservableObject {
                 ?? prepared.draft.preferences.localConnection?.runtime.defaultEndpoint
                 ?? LocalRuntimePreference.ollama.defaultEndpoint!
             Task { await refreshDependencyStatuses() }
-            if prepared.draft.preferences.jevEnabled || prepared.preferences?.jevEnabled == true {
+            if prepared.draft.preferences.usesNativeJev || prepared.preferences?.usesNativeJev == true {
                 refreshJevCredentialState()
             } else {
                 hasStoredJevAPIKey = false
@@ -286,9 +286,20 @@ final class DesktopModel: ObservableObject {
     }
     func setJevEnabled(_ enabled: Bool) {
         change { $0.preferences.jevEnabled = enabled }
-        if enabled { refreshJevCredentialState() }
+        if document.draft.preferences.usesNativeJev { refreshJevCredentialState() }
         else {
             jevAPIKey = ""
+            jevCredentialError = nil
+        }
+    }
+    func setClefDecision(_ selection: ClefDecisionSelection?) {
+        let usedJev = document.draft.preferences.usesNativeJev
+        change { $0.preferences.clefDecision = selection }
+        if document.draft.preferences.usesNativeJev {
+            if !usedJev { refreshJevCredentialState() }
+        } else {
+            jevAPIKey = ""
+            hasStoredJevAPIKey = false
             jevCredentialError = nil
         }
     }
@@ -605,7 +616,7 @@ final class DesktopModel: ObservableObject {
         }
     }
     private func saveJevCredentialIfNeeded() -> Bool {
-        guard document.draft.preferences.jevEnabled else { return true }
+        guard document.draft.preferences.usesNativeJev else { return true }
         let key = jevAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty || hasStoredJevAPIKey else {
             jevCredentialError = JevCredentialError.invalidKey.errorDescription

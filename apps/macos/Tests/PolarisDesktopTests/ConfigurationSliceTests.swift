@@ -321,6 +321,32 @@ final class ConfigurationSliceTests: XCTestCase {
     _ = await model.saveAndClose()
   }
 
+  func testClefSelectionReachesOwnerWithoutReadingOrSendingTheRetainedJevCredential() async throws {
+    for enabled in [false, true] {
+      let (model, transport, settings, root) = try fixture()
+      defer { try? FileManager.default.removeItem(at: root) }
+      var document = try settings.load()
+      document.preferences?.permission = .readOnly
+      document.preferences?.jevEnabled = true
+      document.preferences?.clefDecision = try ClefDecisionSelection(profile: "fixture-v1", enabled: enabled)
+      try settings.save(document)
+      let owner = DesktopWorkspaceOwner(helper: { root.appendingPathComponent("not-launched") },
+                                        factory: { _,_,_ in model },
+                                        decisionCredential: { throw ServiceError.notReady })
+      _ = try await owner.prepare(document: settings.load(), store: settings)
+      await owner.configureAndStart(store: settings, makeConfiguredTransport: { launch in
+        XCTAssertEqual(launch.environment, ["POLARIS_JEV_ENABLED": "0", "POLARIS_CLEF_PROFILE": "fixture-v1",
+                                            "POLARIS_CLEF_ENABLED": enabled ? "1" : "0"])
+        XCTAssertFalse(launch.arguments.contains("fixture-v1"))
+        return transport
+      }, verifyAssembly: {})
+      XCTAssertEqual(model.phase, .ready)
+      XCTAssertNil(owner.error)
+      XCTAssertTrue(try settings.load().preferences!.jevEnabled)
+      _ = await model.saveAndClose()
+    }
+  }
+
   func testStrict10OwnerStartupFailureRestoresStorageThenAllowsLegacy() async throws {
     let (service, transport, settings, root) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
     var document = try settings.load()

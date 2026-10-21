@@ -242,6 +242,11 @@ fn prepare(
         MemoryKind::SystemRam
     };
     Ok(ClefConfig {
+        model_identity: Some(crate::clef::ClefModelIdentity {
+            repository: s.model_repository.clone(),
+            revision: s.model_revision.clone(),
+            quantization: s.quantization.clone(),
+        }),
         worker,
         worker_sha256: s.worker.sha256,
         model,

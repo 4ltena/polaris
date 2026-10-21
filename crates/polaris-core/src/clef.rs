@@ -26,11 +26,21 @@ pub struct CapacityAdmission {
     pub policy: crate::decision_capacity::CapacityPolicy,
 }
 
+/// Labels associated with the pinned model digest by a trusted acceptance subject.
+/// These labels alone never establish that a worker loaded the model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClefModelIdentity {
+    pub repository: String,
+    pub revision: String,
+    pub quantization: String,
+}
+
 /// Supplied by the trusted installation owner, not inferred from a project or
 /// whichever executable happens to be on PATH. Acceptance of a model/profile
 /// and its capacity budget remains the activation owner's responsibility.
 #[derive(Clone)]
 pub struct ClefConfig {
+    pub model_identity: Option<ClefModelIdentity>,
     pub worker: PathBuf,
     pub worker_sha256: String,
     pub model: PathBuf,
@@ -135,6 +145,10 @@ impl Decider for ClefDecider {
         "clef"
     }
 
+    fn identity(&self) -> polaris_provider::decision::DecisionIdentity {
+        self.config.identity(true)
+    }
+
     fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
         use polaris_provider::decision::{
             DecisionCancellation, DecisionCapabilities, DecisionLocation, DecisionShapes,
@@ -202,7 +216,7 @@ impl Decider for ClefDecider {
         .await;
         result.unwrap_or_else(|error| {
             polaris_provider::decision::DecisionObservation::single(
-                self.identity(),
+                self.config.identity(false),
                 self.capabilities(),
                 Err(error),
                 started.elapsed(),
@@ -212,7 +226,30 @@ impl Decider for ClefDecider {
 }
 
 impl ClefConfig {
+    fn identity(&self, model_confirmed: bool) -> polaris_provider::decision::DecisionIdentity {
+        let labels = self.model_identity.as_ref().filter(|_| model_confirmed);
+        polaris_provider::decision::DecisionIdentity {
+            backend: "clef".into(),
+            model: labels.map(|labels| labels.repository.clone()),
+            revision: labels.map(|labels| labels.revision.clone()),
+            quantization: labels.map(|labels| labels.quantization.clone()),
+        }
+    }
     fn validate(&self) -> Result<(), DecisionError> {
+        if self.model_identity.as_ref().is_some_and(|labels| {
+            let text = |value: &str| {
+                !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+            };
+            !text(&labels.repository)
+                || !text(&labels.quantization)
+                || labels.revision.len() != 40
+                || !labels
+                    .revision
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(DecisionError::Malformed);
+        }
         if !wire::identifier(&self.generation)
             || !wire::digest(&self.worker_sha256)
             || !wire::digest(&self.model_sha256)
@@ -608,12 +645,7 @@ async fn run(config: ClefConfig, mut jobs: mpsc::Receiver<Job>) {
                     continue;
                 }
                 let started_at = std::time::Instant::now();
-                let identity = polaris_provider::decision::DecisionIdentity {
-                    backend: "clef".into(),
-                    model: None,
-                    revision: None,
-                    quantization: None,
-                };
+                let identity = config.identity(false);
                 let capacity = capacity_report(
                     &config,
                     context,
@@ -653,10 +685,12 @@ async fn run(config: ClefConfig, mut jobs: mpsc::Receiver<Job>) {
                         }
                     }
                 }
+                let mut model_confirmed = !starting;
                 let result = async {
                     // Retain the process in the actor before the first await.
                     if starting {
                         session.as_mut().expect("started session").ready().await?;
+                        model_confirmed = true;
                     }
                     session
                         .as_mut()
@@ -670,7 +704,7 @@ async fn run(config: ClefConfig, mut jobs: mpsc::Receiver<Job>) {
                     let _ = held.close(false).await;
                 }
                 let mut observation = polaris_provider::decision::DecisionObservation::single(
-                    identity,
+                    config.identity(model_confirmed),
                     capabilities,
                     result,
                     started_at.elapsed(),

@@ -157,8 +157,11 @@ impl Decider for Unavailable {
 
 pub(super) fn identify(config: &DecisionConfig, inner: Arc<dyn Decider>) -> Arc<dyn Decider> {
     let mut identity = inner.identity();
-    // Clef's model selector is the package profile ID, never an inferred repository revision.
-    identity.model = config.model.clone();
+    // Preserve the managed owner's accepted labels. A profile ID is only a
+    // configured selector when that owner has no model metadata.
+    if identity.model.is_none() {
+        identity.model = config.model.clone();
+    }
     Arc::new(Identified { inner, identity })
 }
 struct Identified {
@@ -181,15 +184,9 @@ impl Decider for Identified {
         questions: &BTreeMap<String, Question>,
         context: polaris_provider::decision::DecisionContext,
     ) -> polaris_provider::decision::DecisionObservation {
-        let mut observation = self
-            .inner
+        self.inner
             .observe_with_context(state, questions, context)
-            .await;
-        observation.identity = self.identity();
-        for attempt in &mut observation.attempts {
-            attempt.identity = self.identity();
-        }
-        observation
+            .await
     }
 
     fn may_return_calibrated_bands(&self) -> bool {

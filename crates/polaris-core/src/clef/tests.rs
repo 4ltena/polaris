@@ -41,6 +41,7 @@ fn config() -> (tempfile::TempDir, ClefConfig) {
     fs::write(&model, b"dummy").unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
     let config = ClefConfig {
+        model_identity: None,
         worker,
         worker_sha256: format!("{:x}", Sha256::digest(FIXTURE)),
         model,
@@ -55,6 +56,90 @@ fn config() -> (tempfile::TempDir, ClefConfig) {
         admission: None,
     };
     (dir, config)
+}
+
+fn model_labels() -> ClefModelIdentity {
+    ClefModelIdentity {
+        repository: "synthetic/accepted-model".into(),
+        revision: "a".repeat(40),
+        quantization: "synthetic-q4".into(),
+    }
+}
+#[tokio::test]
+async fn model_identity_is_configured_but_not_observed_before_ready() {
+    let (_dir, mut config) = config();
+    config.model_identity = Some(model_labels());
+    let decider = ClefDecider::new(config.clone()).unwrap();
+    assert_eq!(
+        decider.identity().model.as_deref(),
+        Some("synthetic/accepted-model")
+    );
+    let observed = decider
+        .observe(
+            &serde_json::json!("x".repeat(wire::MAX_FRAME)),
+            &questions(),
+        )
+        .await;
+    assert_eq!(observed.result, Err(DecisionError::TooLarge));
+    assert_eq!(observed.identity.model, None);
+    assert_eq!(observed.identity.revision, None);
+    assert_eq!(observed.attempts[0].identity.quantization, None);
+    config.worker_sha256 = "0".repeat(64);
+    let decider = ClefDecider::new(config).unwrap();
+    let observed = decider
+        .observe(&serde_json::Value::Null, &questions())
+        .await;
+    assert!(observed.result.is_err());
+    assert_eq!(observed.identity.model, None);
+    assert_eq!(decider.shutdown().await, Err(DecisionError::Unavailable));
+}
+#[tokio::test]
+async fn model_identity_requires_ready_but_survives_a_later_invalid_answer() {
+    for bad_ready in [true, false] {
+        let (_dir, mut config) = config();
+        config.model_identity = Some(model_labels());
+        if bad_ready {
+            let fixture = FIXTURE.replace(RUNTIME_REVISION, "wrong-runtime");
+            fs::write(&config.worker, &fixture).unwrap();
+            config.worker_sha256 = format!("{:x}", Sha256::digest(fixture));
+        }
+        let decider = ClefDecider::new(config).unwrap();
+        let observed = decider
+            .observe(&serde_json::json!("bad-generation"), &questions())
+            .await;
+        assert_eq!(observed.result, Err(DecisionError::InvalidAnswer));
+        assert_eq!(
+            observed.identity.model.as_deref(),
+            if bad_ready {
+                None
+            } else {
+                Some("synthetic/accepted-model")
+            }
+        );
+        assert_eq!(observed.attempts[0].identity, observed.identity);
+    }
+}
+
+#[test]
+fn model_identity_refuses_unbounded_or_malformed_acceptance_labels() {
+    let (_dir, mut config) = config();
+    for labels in [
+        ClefModelIdentity {
+            revision: "not-a-revision".into(),
+            ..model_labels()
+        },
+        ClefModelIdentity {
+            repository: "x".repeat(257),
+            ..model_labels()
+        },
+        ClefModelIdentity {
+            quantization: "bad\nlabel".into(),
+            ..model_labels()
+        },
+    ] {
+        config.model_identity = Some(labels);
+        assert!(ClefDecider::new(config.clone()).is_err());
+    }
 }
 
 fn questions() -> BTreeMap<String, Question> {
@@ -299,19 +384,24 @@ fn oversized_or_media_requests_do_not_enter_the_actor() {
 
 #[tokio::test]
 async fn owner_reuses_one_process_then_reaps_on_graceful_shutdown() {
-    let (_dir, c) = config();
+    let (_dir, mut c) = config();
+    c.model_identity = Some(model_labels());
     let root = c.private_root.clone();
     let decider = ClefDecider::new(c).unwrap();
     for _ in 0..3 {
+        let observed = decider
+            .observe(&serde_json::Value::Null, &questions())
+            .await;
+        assert_eq!(observed.identity, decider.identity());
         assert_eq!(
-            decider
-                .decide(&serde_json::Value::Null, &questions())
-                .await
-                .unwrap()
-                .answers["yes"]
-                .noul,
-            Some(0.9)
+            observed.attempts[0].identity.revision.as_deref(),
+            Some("a".repeat(40).as_str())
         );
+        assert_eq!(
+            observed.attempts[0].identity.quantization.as_deref(),
+            Some("synthetic-q4")
+        );
+        assert_eq!(observed.result.unwrap().answers["yes"].noul, Some(0.9));
     }
     assert_eq!(
         fs::read_dir(&root).unwrap().count(),
@@ -395,6 +485,7 @@ async fn a_refused_managed_capacity_profile_never_starts_the_worker() {
     use crate::decision_capacity::{CapacityPolicy, ProfileMemory};
     let (_root, mut c) = config();
     let directory = c.private_root.clone();
+    c.model_identity = Some(model_labels());
     c.admission = Some(CapacityAdmission {
         profile: ProfileMemory {
             accepted: false,
@@ -411,10 +502,11 @@ async fn a_refused_managed_capacity_profile_never_starts_the_worker() {
         },
     });
     let decider = ClefDecider::new(c).unwrap();
-    assert_eq!(
-        decider.decide(&serde_json::json!({}), &questions()).await,
-        Err(DecisionError::Unavailable)
-    );
+    let observed = decider.observe(&serde_json::json!({}), &questions()).await;
+    assert_eq!(observed.result, Err(DecisionError::Unavailable));
+    assert_eq!(observed.identity.model, None);
+    assert_eq!(observed.identity.revision, None);
+    assert_eq!(observed.attempts[0].identity.quantization, None);
     assert_eq!(
         fs::read_dir(&directory).unwrap().count(),
         2,

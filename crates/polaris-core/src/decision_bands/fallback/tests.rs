@@ -8,11 +8,20 @@ struct Local {
     fail: bool,
     calibrated: bool,
     calls: AtomicUsize,
+    identity: Option<DecisionIdentity>,
 }
 #[async_trait::async_trait]
 impl Decider for Local {
     fn name(&self) -> &str {
         "clef"
+    }
+    fn identity(&self) -> DecisionIdentity {
+        self.identity.clone().unwrap_or(DecisionIdentity {
+            backend: "clef".into(),
+            model: None,
+            revision: None,
+            quantization: None,
+        })
     }
     fn capabilities(&self) -> DecisionCapabilities {
         // Synthetic primary enables the historical policy only to test that
@@ -79,6 +88,7 @@ fn local(fail: bool, calibrated: bool) -> Arc<Local> {
         fail,
         calibrated,
         calls: AtomicUsize::new(0),
+        identity: None,
     })
 }
 fn build(config: &DecisionConfig, first: Arc<Local>, second: Arc<Local>) -> Arc<dyn Decider> {
@@ -108,13 +118,26 @@ fn questions() -> BTreeMap<String, Question> {
 
 #[tokio::test]
 async fn fallback_factory_and_meter_preserve_actual_profile_and_each_attempt() {
-    let first = local(true, true);
-    let second = local(false, false);
+    let identified = |fail, calibrated, model: &str| {
+        Arc::new(Local {
+            fail,
+            calibrated,
+            calls: AtomicUsize::new(0),
+            identity: Some(DecisionIdentity {
+                backend: "clef".into(),
+                model: Some(model.into()),
+                revision: Some("a".repeat(40)),
+                quantization: Some("synthetic-q4".into()),
+            }),
+        })
+    };
+    let first = identified(true, true, "first-weights");
+    let second = identified(false, false, "second-weights");
     let meter = DecisionMeter::default();
     let chain = meter.wrap(build(&config(), first.clone(), second.clone()));
     let result = chain.observe(&serde_json::Value::Null, &questions()).await;
     assert!(result.result.is_ok());
-    assert_eq!(result.identity.model.as_deref(), Some("second"));
+    assert_eq!(result.identity.model.as_deref(), Some("second-weights"));
     assert_eq!(result.attempts.len(), 2);
     let usage = meter.snapshot();
     assert_eq!(
@@ -122,13 +145,28 @@ async fn fallback_factory_and_meter_preserve_actual_profile_and_each_attempt() {
         (1, 1, 3)
     );
     let traces = meter.recent();
-    assert_eq!(traces[0].configured.model.as_deref(), Some("first"));
+    assert_eq!(traces[0].configured.model.as_deref(), Some("first-weights"));
     assert_eq!(
         traces[0].effective.as_ref().unwrap().model.as_deref(),
-        Some("second")
+        Some("second-weights")
     );
     assert_eq!(first.calls.load(Ordering::SeqCst), 1);
     assert_eq!(second.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn configured_profile_does_not_replace_unknown_observed_model() {
+    let chain = build(&config(), local(true, true), local(false, false));
+    assert_eq!(chain.identity().model.as_deref(), Some("first"));
+    let observed = chain.observe(&serde_json::Value::Null, &questions()).await;
+    assert!(observed.result.is_ok());
+    assert_eq!(observed.identity.model, None);
+    assert!(
+        observed
+            .attempts
+            .iter()
+            .all(|attempt| attempt.identity.model.is_none())
+    );
 }
 
 #[tokio::test]

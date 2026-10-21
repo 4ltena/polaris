@@ -126,7 +126,7 @@ base_url = "https://api.typesafe.ai/v1"
 
 切替先へ主backendの校正を流用しない。未校正モデルによる候補絞込みは候補を維持し、判断の呼出自体を省く場合がある。既存の生成モデルによる候補選択は、型付きbackend間の切替とは別の段階である。
 
-CLIの終了時とTUIの`/status`には、型付き判断器の設定値と直近stageの観測値を分けて表示する。model・revision・quantizationが得られない場合は「未確認」とする。使用量の件数は、結果が返ったadapter呼出の観測数であり、内部のHTTP再試行数や実推論回数ではない。途中でfutureが破棄されたstageは別に数え、実行先・消費・実計算の停止を確認済みとして扱わない。
+CLIの終了時とTUIの`/status`には、型付き判断器の設定値と直近stageの観測値を分けて表示する。model・revision・quantizationが得られない場合は「未確認」とする。管理対象Clefの設定値は受入profileのモデル・revision・量子化に結び付ける。実行時はworkerのready応答で固定hash・runtime・device・contextを確認できた後だけ、そのモデル情報を観測値として記録する。容量拒否・起動失敗・ready不一致では未確認のままとし、設定profile IDで補わない。使用量の件数は、結果が返ったadapter呼出の観測数であり、内部のHTTP再試行数や実推論回数ではない。途中でfutureが破棄されたstageは別に数え、実行先・消費・実計算の停止を確認済みとして扱わない。
 
 監査の`typed_decision`には、要求IDを共通にした`start`・`attempt`・`settled`を保存する。入力本文や回答本文は含めない。adapterを呼ぶ前に開始記録を書き、書けなければ呼び出さない。開始だけが残った場合、完了と消費は不明である。回答後の監査書込に失敗した場合は失敗件数を表示し、判断を再実行しない。
 

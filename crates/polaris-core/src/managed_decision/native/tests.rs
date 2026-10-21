@@ -86,6 +86,16 @@ fn a_valid_package_subject_builds_a_lazy_owner_from_fixed_paths() {
     );
     let decider = ClefDecider::new(config).unwrap();
     assert_eq!(decider.name(), "clef");
+    let identity = decider.identity();
+    assert_eq!(identity.model.as_deref(), Some(s.model_repository.as_str()));
+    assert_eq!(
+        identity.revision.as_deref(),
+        Some(s.model_revision.as_str())
+    );
+    assert_eq!(
+        identity.quantization.as_deref(),
+        Some(s.quantization.as_str())
+    );
     assert_eq!(
         fs::read_dir(home.join(".polaris/decision-runtime/runs"))
             .unwrap()

@@ -14,6 +14,7 @@ async fn main() {
         "worker worker_sha256 model model_bytes model_sha256 generation private_root"
     );
     let config = ClefConfig {
+        model_identity: None,
         admission: None,
         worker: PathBuf::from(&args[0]),
         worker_sha256: args[1].clone(),

@@ -19,6 +19,9 @@ struct DecisionInstallOffer: Decodable, Sendable {
             struct Component: Decodable, Sendable { let name: String; let version: String; let license: String; let source: String }
             let purpose: String; let workerSource: String; let modelSource: String
             let license: String; let licenseSource: String; let noticeSource: String
+            struct Source: Decodable, Sendable { let url: String; let redirectOrigins: [String] }
+            struct Downloads: Decodable, Sendable { let worker: Source; let model: Source }
+            let downloads: Downloads?
             let components: [Component]
         }
         let transactionId: String; let profile: String; let generation: String
@@ -27,6 +30,8 @@ struct DecisionInstallOffer: Decodable, Sendable {
         let contextTokens: UInt32; let peakBytes: UInt64; let reserveBytes: UInt64
         let destination: String; let installedBytes: UInt64; let copyReserveBytes: UInt64
         let worker: Artifact; let model: Artifact; let delivery: Delivery
+        let transferBytes: UInt64?; let diskRequiredBytes: UInt64?; let transactionTimeoutSeconds: UInt64?
+        var isDownload: Bool { transferBytes != nil || diskRequiredBytes != nil || transactionTimeoutSeconds != nil }
     }
     let schemaVersion: Int
     let type: String
@@ -51,6 +56,7 @@ protocol DecisionInstallTransport: Sendable {
     func verify(profile: String) async throws -> DecisionGenerationVerification
     func catalog() async throws -> DecisionInstallCatalog
     func prepare(profile: String, worker: URL, model: URL, repair: Bool) async throws -> DecisionInstallOffer
+    func prepareDownload(profile: String, repair: Bool) async throws -> DecisionInstallOffer
     func confirm(consent: String, approved: Bool) async throws -> DecisionInstallOutcome
     func cancel() async
 }
@@ -73,6 +79,7 @@ final class DecisionInstallModel: ObservableObject {
     @Published var worker: URL?
     @Published var model: URL?
     @Published var repair = false
+    @Published var download = false
     @Published private(set) var recoveryBackup: String?
     private let transport: any DecisionInstallTransport
     private var task: Task<Void, Never>?
@@ -81,7 +88,7 @@ final class DecisionInstallModel: ObservableObject {
     init(transport: any DecisionInstallTransport = PackagedDecisionInstallClient()) { self.transport = transport }
     deinit { task?.cancel() }
     var canPrepare: Bool {
-        !busy && offer == nil && worker != nil && model != nil
+        !busy && offer == nil && (download || (worker != nil && model != nil))
             && catalog?.registeredProfiles.contains(profile) == true
     }
 
@@ -152,15 +159,24 @@ final class DecisionInstallModel: ObservableObject {
     }
 
     func prepare() {
-        guard canPrepare, let worker, let model else { return }
+        guard canPrepare else { return }
         let selected = profile
         let repairing = repair
+        let downloading = download
+        let worker = worker, model = model
         verification = nil
         start {
-            let offer = try await self.transport.prepare(profile: selected, worker: worker, model: model, repair: repairing)
+            let offer: DecisionInstallOffer
+            if downloading {
+                offer = try await self.transport.prepareDownload(profile: selected, repair: repairing)
+            } else {
+                guard let worker, let model else { throw ServiceError.notReady }
+                offer = try await self.transport.prepare(profile: selected, worker: worker, model: model, repair: repairing)
+            }
             guard !Task.isCancelled else { return }
-            guard offer.plan.profile == selected, offer.plan.worker.source == worker.path,
-                  offer.plan.model.source == model.path, self.repair == repairing,
+            guard self.profile == selected, self.download == downloading, offer.plan.isDownload == downloading,
+                  offer.plan.profile == selected, self.repair == repairing,
+                  downloading || (offer.plan.worker.source == worker?.path && offer.plan.model.source == model?.path),
                   offer.plan.operation == (repairing ? "repair" : "import") else { throw ServiceError.correlation }
             self.recoveryBackup = offer.plan.replacement?.backupDestination
             self.offer = offer
@@ -170,13 +186,14 @@ final class DecisionInstallModel: ObservableObject {
 
     func confirm(_ approved: Bool) {
         guard !busy, let offer else { return }
-        if approved && (profile != offer.plan.profile || worker?.path != offer.plan.worker.source || model?.path != offer.plan.model.source || (repair ? "repair" : "import") != offer.plan.operation) {
+        if approved && (profile != offer.plan.profile || download != offer.plan.isDownload || (!download && (worker?.path != offer.plan.worker.source || model?.path != offer.plan.model.source)) || (repair ? "repair" : "import") != offer.plan.operation) {
             cancel()
             message = "対象が変わりました。新しい計画を確認してください。"
             return
         }
         self.offer = nil
         verification = nil
+        if approved && offer.plan.isDownload { message = "固定artifactを取得・検証し、導入しています。停止を要求できます。" }
         start {
             let result = try await self.transport.confirm(consent: offer.consentSha256, approved: approved)
             guard !Task.isCancelled else { return }

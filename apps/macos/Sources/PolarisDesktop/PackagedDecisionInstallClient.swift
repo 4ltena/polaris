@@ -7,6 +7,7 @@ actor PackagedDecisionInstallClient: DecisionInstallTransport {
     private let helper: @Sendable () throws -> URL
     private var child: DecisionInstallChild?
     private var consent: String?
+    private var completionTimeout: UInt64 = 300
     init(helper: @escaping @Sendable () throws -> URL = { try PackagedDecisionInstallClient.packagedCLI() }) { self.helper = helper }
 
     func catalog() async throws -> DecisionInstallCatalog {
@@ -59,18 +60,36 @@ actor PackagedDecisionInstallClient: DecisionInstallTransport {
     }
 
     func prepare(profile: String, worker: URL, model: URL, repair: Bool = false) async throws -> DecisionInstallOffer {
-        guard child == nil, Self.profileID(profile), worker.isFileURL, model.isFileURL else { throw ServiceError.notReady }
-        let process = try DecisionInstallChild(helper: helper(), arguments: ["decision", repair ? "repair" : "import", profile,
-            "--worker", worker.path, "--model", model.path, "--stdio-confirm"])
+        guard worker.isFileURL, model.isFileURL else { throw ServiceError.notReady }
+        return try await prepareOperation(profile: profile, worker: worker, model: model, repair: repair)
+    }
+
+    func prepareDownload(profile: String, repair: Bool) async throws -> DecisionInstallOffer {
+        try await prepareOperation(profile: profile, worker: nil, model: nil, repair: repair)
+    }
+
+    private func prepareOperation(profile: String, worker: URL?, model: URL?, repair: Bool) async throws -> DecisionInstallOffer {
+        guard child == nil, Self.profileID(profile) else { throw ServiceError.notReady }
+        let downloading = worker == nil && model == nil
+        var arguments = ["decision", downloading ? "download" : (repair ? "repair" : "import"), profile]
+        if downloading { if repair { arguments += ["--repair"] } }
+        else {
+            guard let worker, let model else { throw ServiceError.notReady }
+            arguments += ["--worker", worker.path, "--model", model.path]
+        }
+        arguments += ["--stdio-confirm"]
+        let process = try DecisionInstallChild(helper: helper(), arguments: arguments)
         child = process
         do {
             let data = try await bounded(process, seconds: 20) { try process.readFrame() }
             let offer = try Self.decode(DecisionInstallOffer.self, data)
             guard child === process else { throw ServiceError.notReady }
             guard offer.schemaVersion == 1, offer.type == "plan", Self.digest(offer.consentSha256),
-                  offer.plan.profile == profile, offer.plan.worker.source == worker.path,
-                  offer.plan.model.source == model.path, offer.plan.delivery.components.count <= 64,
+                  offer.plan.profile == profile, offer.plan.isDownload == downloading,
+                  downloading || (offer.plan.worker.source == worker?.path && offer.plan.model.source == model?.path),
+                  offer.plan.delivery.components.count <= 64,
                   offer.plan.operation == (repair ? "repair" : "import") else { throw ServiceError.correlation }
+            if downloading { try Self.validateDownloadOffer(offer) }
             if repair {
                 guard let backup = offer.plan.replacement?.backupDestination,
                       backup.utf8.count <= 4096, backup.hasPrefix("/"),
@@ -78,9 +97,32 @@ actor PackagedDecisionInstallClient: DecisionInstallTransport {
                       URL(fileURLWithPath: backup).deletingLastPathComponent() == URL(fileURLWithPath: offer.plan.destination).deletingLastPathComponent(),
                       URL(fileURLWithPath: backup).lastPathComponent.hasPrefix(".recovery-") else { throw ServiceError.schema }
             } else if offer.plan.replacement != nil { throw ServiceError.schema }
+            completionTimeout = downloading ? (offer.plan.transactionTimeoutSeconds ?? 0) + 300 : 300
             consent = offer.consentSha256
             return offer
         } catch { process.stop(); if child === process { child = nil; consent = nil }; throw error }
+    }
+
+    static func validateDownloadOffer(_ offer: DecisionInstallOffer) throws {
+        let p = offer.plan
+        let (size, overflow) = p.worker.bytes.addingReportingOverflow(p.model.bytes)
+        let (copies, copiesOverflow) = size.multipliedReportingOverflow(by: 2)
+        let (required, reserveOverflow) = copies.addingReportingOverflow(p.copyReserveBytes)
+        guard !overflow, !copiesOverflow, !reserveOverflow, p.worker.bytes > 0, p.model.bytes > 0,
+              p.worker.bytes <= 128 * 1024 * 1024, p.model.bytes <= 64 * 1024 * 1024 * 1024,
+              p.transferBytes == size, p.installedBytes == size, p.diskRequiredBytes == required,
+              p.transactionTimeoutSeconds == 7200,
+              digest(p.worker.sha256), digest(p.model.sha256), let sources = p.delivery.downloads else { throw ServiceError.schema }
+        for source in [sources.worker, sources.model] {
+            guard downloadURL(source.url, limit: 2048), source.redirectOrigins.count <= 16,
+                  source.redirectOrigins.allSatisfy({ downloadURL($0, limit: 512) && URLComponents(string: $0)?.path == "" }) else { throw ServiceError.schema }
+        }
+    }
+    private static func downloadURL(_ value: String, limit: Int) -> Bool {
+        guard value.utf8.count <= limit, !value.contains("\\"), !value.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0) }),
+              let url = URLComponents(string: value), url.scheme == "https", url.host?.isEmpty == false,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil else { return false }
+        return true
     }
 
     func confirm(consent: String, approved: Bool) async throws -> DecisionInstallOutcome {
@@ -90,7 +132,7 @@ actor PackagedDecisionInstallClient: DecisionInstallTransport {
         let data = try JSONSerialization.data(withJSONObject: ["schema_version": 1, "consent_sha256": consent,
             "decision": approved ? "approve" : "cancel"])
         try process.send(data + Data([10]))
-        let response = try await bounded(process, seconds: 300) { try process.readCompletion() }
+        let response = try await bounded(process, seconds: completionTimeout) { try process.readCompletion() }
         guard child === process else { throw ServiceError.notReady }
         struct Completion: Decodable { let schemaVersion: Int; let type: String; let status: String; let consentSha256: String }
         let value = try Self.decode(Completion.self, response)

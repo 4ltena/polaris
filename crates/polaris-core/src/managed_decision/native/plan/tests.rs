@@ -222,3 +222,25 @@ fn repair_consent_binds_the_operation_existing_identity_and_backup_destination()
     );
     assert!(prepare().consent_sha256().unwrap() != repaired_consent);
 }
+
+#[test]
+fn an_offline_plan_refuses_secret_bearing_optional_download_metadata_before_display() {
+    let (_root, bytes, home, sources) = fixture();
+    let mut lock: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    lock["profiles"][0]["delivery"]["downloads"] = serde_json::json!({
+        "worker":{"url":"https://example.invalid/worker", "redirect_origins":[]},
+        "model":{"url":"https://example.invalid/model?token=dummy", "redirect_origins":[]}
+    });
+    assert!(matches!(
+        make(
+            &serde_json::to_vec(&lock).unwrap(),
+            "fixture-cpu-v1",
+            &home,
+            &sources.join("worker"),
+            &sources.join("model.gguf"),
+            "txn"
+        ),
+        Err(ManagedDecisionError::MissingDownloadMetadata)
+    ));
+    assert!(!home.join(".polaris").exists());
+}

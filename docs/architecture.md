@@ -23,6 +23,7 @@ graph TD
   cli --> tools
   cli --> tui
   core --> auth
+  core --> http
   core --> desktop-protocol
   core --> provider
   core --> memory
@@ -55,7 +56,7 @@ graph TD
   tui --> skills
 ```
 
-crate 13件、依存 41件。名前の`polaris-`は省いた。開発用の依存は、製品の組み立てを表さないため含めない。
+crate 13件、依存 42件。名前の`polaris-`は省いた。開発用の依存は、製品の組み立てを表さないため含めない。
 
 ## 外部との接続点
 
@@ -105,11 +106,12 @@ crate 13件、依存 41件。名前の`polaris-`は省いた。開発用の依�
 
 実装: `crates/polaris-http/src/lib.rs`、`crates/polaris-http/src/artifact.rs`
 
-呼び出し側 33件。
+呼び出し側 34件。
 
 - `crates/polaris-auth/src/quota/usage.rs:172`
 - `crates/polaris-auth/src/quota/usage.rs:176`
 - `crates/polaris-auth/src/token.rs:216`
+- `crates/polaris-core/src/managed_decision/native/download.rs:101`
 - `crates/polaris-provider/src/codex.rs:283`
 - `crates/polaris-provider/src/codex.rs:681`
 - `crates/polaris-provider/src/codex.rs:685`

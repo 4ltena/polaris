@@ -31,6 +31,22 @@ enum Command {
         #[arg(long)]
         repair: bool,
     },
+    /// 固定配布元から取得する計画を表示。通信・copyなし。
+    PlanDownload {
+        profile: String,
+        #[arg(long)]
+        repair: bool,
+    },
+    /// 固定配布元から明示取得し、SHA検証後に導入。推論なし。
+    Download {
+        profile: String,
+        #[arg(long)]
+        repair: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, hide = true, conflicts_with = "yes")]
+        stdio_confirm: bool,
+    },
     /// 確認した固定artifactをcopy。backend設定や推論は開始しない。
     Import {
         #[command(flatten)]
@@ -91,6 +107,13 @@ async fn perform(args: Args) -> Result<(), String> {
             profile,
             stdio_result,
         } => return verify(profile, stdio_result).await,
+        Command::PlanDownload { profile, repair } => return download(profile, repair, None).await,
+        Command::Download {
+            profile,
+            repair,
+            yes,
+            stdio_confirm,
+        } => return download(profile, repair, Some((yes, stdio_confirm))).await,
         Command::Plan { sources, repair } => (sources, None, repair),
         Command::Import {
             sources,
@@ -114,57 +137,15 @@ async fn perform(args: Args) -> Result<(), String> {
     let frame =
         serde_json::json!({"schema_version":1,"type":"plan","consent_sha256":consent,"plan":&plan});
     let stdio = import.is_some_and(|(_, stdio)| stdio);
-    println!(
-        "{}",
-        if stdio {
-            serde_json::to_string(&frame)
-        } else {
-            serde_json::to_string_pretty(&frame)
-        }
-        .map_err(|e| e.to_string())?
-    );
-    io::stdout().flush().map_err(|e| e.to_string())?;
-    let Some((yes, stdio)) = import else {
+    if !approve(
+        &frame,
+        &consent,
+        import,
+        if repair { "修復" } else { "導入" },
+    )
+    .await?
+    {
         return Ok(());
-    };
-    if stdio {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let expected = consent.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(decode_confirmation(io::stdin().lock(), &expected));
-        });
-        let approved = tokio::task::spawn_blocking(move || {
-            receiver.recv_timeout(std::time::Duration::from_secs(120))
-        })
-        .await
-        .map_err(|_| "導入確認の待機を終了できませんでした")?
-        .map_err(|_| "導入確認が期限内に届きませんでした。変更していません。")??;
-        if !approved {
-            println!(
-                "{}",
-                serde_json::json!({"schema_version":1,"type":"complete","status":"cancelled","consent_sha256":consent})
-            );
-            return Ok(());
-        }
-    } else if !yes {
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return Err("導入確認には対話端末、または今回の選択への明示的な --yes が必要です。変更していません。".into());
-        }
-        eprint!(
-            "表示した計画で{}しますか？ [y/n]: ",
-            if repair { "修復" } else { "導入" }
-        );
-        io::stderr().flush().map_err(|e| e.to_string())?;
-        let mut answer = String::new();
-        io::stdin()
-            .lock()
-            .take(16)
-            .read_line(&mut answer)
-            .map_err(|e| e.to_string())?;
-        if answer.trim() != "y" {
-            eprintln!("Clef導入を取り消しました。変更していません。");
-            return Ok(());
-        }
     }
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = cancelled.clone();
@@ -195,6 +176,121 @@ async fn perform(args: Args) -> Result<(), String> {
         println!(
             "Clef generationを{}しました。backendの選択・有効化は変更していません。",
             if repair { "修復" } else { "導入" }
+        );
+        if let Some(backup) = backup {
+            println!("旧generationの保持先: {}", backup.display());
+        }
+    }
+    Ok(())
+}
+
+async fn approve(
+    frame: &serde_json::Value,
+    consent: &str,
+    execution: Option<(bool, bool)>,
+    action: &str,
+) -> Result<bool, String> {
+    let stdio = execution.is_some_and(|(_, stdio)| stdio);
+    println!(
+        "{}",
+        if stdio {
+            serde_json::to_string(&frame)
+        } else {
+            serde_json::to_string_pretty(&frame)
+        }
+        .map_err(|e| e.to_string())?
+    );
+    io::stdout().flush().map_err(|e| e.to_string())?;
+    let Some((yes, stdio)) = execution else {
+        return Ok(false);
+    };
+    if stdio {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let expected = consent.to_owned();
+        std::thread::spawn(move || {
+            let _ = sender.send(decode_confirmation(io::stdin().lock(), &expected));
+        });
+        let approved = tokio::task::spawn_blocking(move || {
+            receiver.recv_timeout(std::time::Duration::from_secs(120))
+        })
+        .await
+        .map_err(|_| "導入確認の待機を終了できませんでした")?
+        .map_err(|_| "導入確認が期限内に届きませんでした。変更していません。")??;
+        if !approved {
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"type":"complete","status":"cancelled","consent_sha256":consent})
+            );
+            return Ok(false);
+        }
+    } else if !yes {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err("導入確認には対話端末、または今回の選択への明示的な --yes が必要です。変更していません。".into());
+        }
+        eprint!("表示した計画で{}しますか？ [y/n]: ", action);
+        io::stderr().flush().map_err(|e| e.to_string())?;
+        let mut answer = String::new();
+        io::stdin()
+            .lock()
+            .take(16)
+            .read_line(&mut answer)
+            .map_err(|e| e.to_string())?;
+        if answer.trim() != "y" {
+            eprintln!("Clef導入を取り消しました。変更していません。");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn download(
+    profile: String,
+    repair: bool,
+    execution: Option<(bool, bool)>,
+) -> Result<(), String> {
+    let plan = managed_decision::plan_download(&profile, repair).map_err(|e| e.to_string())?;
+    let consent = plan.consent_sha256().map_err(|e| e.to_string())?;
+    let backup = plan.recovery_backup().map(|p| p.to_owned());
+    let frame =
+        serde_json::json!({"schema_version":1,"type":"plan","consent_sha256":consent,"plan":&plan});
+    if !approve(
+        &frame,
+        &consent,
+        execution,
+        if repair {
+            "取得・修復"
+        } else {
+            "取得・導入"
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut task = std::pin::pin!(managed_decision::download_local(
+        plan,
+        &consent,
+        flag.clone()
+    ));
+    let result = tokio::select! {
+        result = &mut task => result,
+        signal = tokio::signal::ctrl_c() => {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            let result = task.await;
+            signal.map_err(|e| e.to_string())?;
+            result
+        }
+    };
+    result.map_err(|e| e.to_string())?;
+    if execution.is_some_and(|(_, stdio)| stdio) {
+        println!(
+            "{}",
+            serde_json::json!({"schema_version":1,"type":"complete","status":"installed","consent_sha256":consent})
+        );
+    } else {
+        println!(
+            "固定artifactを取得・検証し、generationを導入しました。backendの選択・有効化は変更していません。"
         );
         if let Some(backup) = backup {
             println!("旧generationの保持先: {}", backup.display());

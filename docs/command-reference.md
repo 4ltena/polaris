@@ -220,12 +220,18 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `polaris decision verify <profile>` | 導入済み固定generationを読み取り専用で検証する。 | worker/modelの全size・SHA、受入subjectのrevision・量子化・generationをJSON表示。未受入・未導入・破損・非対応は失敗。copy・有効化・推論なし。読み取り後の状態や実行可否の保証ではない。 |
 | `polaris decision plan <profile> --worker <絶対path> --model <絶対path>` | 固定artifactの導入内容を確認する。 | 新しいtransactionの計画JSONと`consent_sha256`。取得元、license/NOTICE、component、size/SHA、導入先。copyなし。未受入・配布情報不足なら理由を表示して終了。 |
 | `polaris decision import <profile> --worker <絶対path> --model <絶対path> [--yes]` | 今回の計画を確認後、固定artifactを新generationへcopyする。 | 計画JSON、`y/n`、導入または取消/失敗の通知。非対話は明示`--yes`が必要。network・backend有効化・推論なし。既存generationを上書きしない。 |
+| `polaris decision plan <profile> --worker <絶対path> --model <絶対path> --repair` | 既存generationを保持する修復計画を確認する。 | 通常の計画に加え、旧generationの識別情報と`.recovery-*`の保持先を表示。copyなし。 |
+| `polaris decision repair <profile> --worker <絶対path> --model <絶対path> [--yes]` | 検証したartifactで修復する。 | 計画JSON、確認、修復結果と旧generationの保持先。旧treeは追加ファイルを含めて保持し、選択・有効化は変更しない。 |
+| `polaris decision plan-download <profile> [--repair]` | 固定配布元からの取得・導入計画を確認する。 | 取得URLと転送許可先、size/SHA、用途、license/NOTICE、導入先、取得容量と必要ディスク空き。通信・copyなし。固定download情報がない場合は失敗。 |
+| `polaris decision download <profile> [--repair] [--yes]` | 今回の計画を確認後、artifactを取得・検証して導入する。 | 計画JSON、`y/n`、導入または取消/失敗の通知。HTTPSの固定配布先だけに接続し、一時保存した両ファイルのsize/SHAを照合する。既存generationがあれば`--repair`なしでは拒否し、修復時は旧treeを保持する。選択・有効化・推論なし。 |
 | `polaris common-tests <plan.json\|->` | JSONで指定したブラックボックス試験をsandbox内で実行する。 | JSONの`result: passed / failed / unavailable`、試験対象、各case、fallbackの要否等。指定プログラムの実行と一時領域の使用を伴う。 |
 | `polaris completion <shell>` | シェル補完scriptを生成する。 | script本文をstdoutへ出す。対応はbash/zsh/fish/elvish/powershell。導入は別操作。 |
 | `polaris --help`、`polaris help [command]` | CLIの構文を調べる。 | コマンド・引数・説明。`polaris mcp configure --help`のように絞れる。 |
 | `polaris --version`、`polaris -V` | バージョンを見る。 | `polaris 0.12.0`。TUIに`/version`はない。 |
 
 一般的な成功は終了コード0、操作失敗は1、構文誤りは2。`sandbox`は子の終了コードを返す。`doctor`の終了コード0は、モデル等への実接続成功を示さない。
+
+判断器の管理コマンドは2026-10-21の実装を反映している。現在の受入済みprofileは0件のため、Clefの取得・導入はまだ利用できない。`download`の確認はその場で作る計画に対して行い、`plan-download`の表示を後から承認する方式ではない。必要ディスク空きは取得用と導入用の一時領域・予備を含む。取得・検証・導入全体の期限は2時間で、期限後は取消を伝えて処理の終了を待つ。終了状態を確定できない場合は`decision verify`で再確認する。通常起動や初回判断で自動取得は行わない。
 
 ### よく使う起動オプション
 

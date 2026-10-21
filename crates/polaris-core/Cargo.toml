@@ -12,6 +12,7 @@ mcp-test-support = []
 
 [dependencies]
 polaris-auth = { path = "../polaris-auth" }
+polaris-http = { path = "../polaris-http" }
 polaris-desktop-protocol = { path = "../polaris-desktop-protocol" }
 polaris-provider = { path = "../polaris-provider" }
 polaris-memory = { path = "../polaris-memory" }

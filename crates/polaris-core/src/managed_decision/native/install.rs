@@ -329,7 +329,10 @@ fn open_replacement(
     Ok(file)
 }
 
-fn create_child(chain: &mut Vec<(PathBuf, File)>, name: &str) -> Result<(), ManagedDecisionError> {
+pub(super) fn create_child(
+    chain: &mut Vec<(PathBuf, File)>,
+    name: &str,
+) -> Result<(), ManagedDecisionError> {
     let parent = &chain.last().ok_or(ManagedDecisionError::Integrity)?.1;
     let component = CString::new(name).map_err(|_| ManagedDecisionError::Integrity)?;
     if unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o700) } != 0
@@ -343,7 +346,7 @@ fn create_child(chain: &mut Vec<(PathBuf, File)>, name: &str) -> Result<(), Mana
     descend(chain, name)
 }
 
-fn verify_chain(chain: &[(PathBuf, File)]) -> Result<(), ManagedDecisionError> {
+pub(super) fn verify_chain(chain: &[(PathBuf, File)]) -> Result<(), ManagedDecisionError> {
     for (index, (path, file)) in chain.iter().enumerate() {
         let observed = path
             .symlink_metadata()
@@ -364,7 +367,11 @@ fn verify_chain(chain: &[(PathBuf, File)]) -> Result<(), ManagedDecisionError> {
     Ok(())
 }
 
-fn same_directory(parent: &File, name: &str, expected: &File) -> Result<(), ManagedDecisionError> {
+pub(super) fn same_directory(
+    parent: &File,
+    name: &str,
+    expected: &File,
+) -> Result<(), ManagedDecisionError> {
     let opened = polaris_tools::path_policy::tree_admission::open_at(
         parent,
         name.as_ref(),

@@ -4,7 +4,7 @@ import Foundation
 import PolarisSettings
 @testable import PolarisDesktop
 
-private func offerData(repair: Bool = false) throws -> Data {
+private func offerData(repair: Bool = false, download: Bool = false) throws -> Data {
     let data = try JSONSerialization.data(withJSONObject: [
         "schema_version": 1, "type": "plan", "consent_sha256": String(repeating: "a", count: 64),
         "plan": [
@@ -21,11 +21,19 @@ private func offerData(repair: Bool = false) throws -> Data {
                 "notice_source": "https://example.invalid/notice", "components": []],
         ],
     ])
-    guard repair else { return data }
     var frame = try JSONSerialization.jsonObject(with: data) as! [String: Any]
     var plan = frame["plan"] as! [String: Any]
-    plan["operation"] = "repair"
-    plan["replacement"] = ["backup_destination": "/synthetic/.recovery-" + String(repeating: "a", count: 32)]
+    if repair {
+        plan["operation"] = "repair"
+        plan["replacement"] = ["backup_destination": "/synthetic/.recovery-" + String(repeating: "a", count: 32)]
+    }
+    if download {
+        plan["transfer_bytes"] = 10; plan["disk_required_bytes"] = 21; plan["transaction_timeout_seconds"] = 7200
+        var delivery = plan["delivery"] as! [String: Any]
+        delivery["downloads"] = ["worker": ["url": "https://example.invalid/worker", "redirect_origins": []],
+            "model": ["url": "https://example.invalid/model", "redirect_origins": ["https://cdn.example.invalid"]]]
+        plan["delivery"] = delivery
+    }
     frame["plan"] = plan
     return try JSONSerialization.data(withJSONObject: frame)
 }
@@ -63,6 +71,10 @@ private actor FixtureDecisionTransport: DecisionInstallTransport {
     func prepare(profile: String, worker: URL, model: URL, repair: Bool) throws -> DecisionInstallOffer {
         prepared += 1
         return try PackagedDecisionInstallClient.decode(DecisionInstallOffer.self, offerData(repair: repair))
+    }
+    func prepareDownload(profile: String, repair: Bool) throws -> DecisionInstallOffer {
+        prepared += 1
+        return try PackagedDecisionInstallClient.decode(DecisionInstallOffer.self, offerData(repair: repair, download: true))
     }
     func confirm(consent: String, approved: Bool) throws -> DecisionInstallOutcome {
         guard consent == String(repeating: "a", count: 64) else { throw ServiceError.correlation }
@@ -168,6 +180,69 @@ final class DecisionInstallTests: XCTestCase {
         counts = await transport.counts(); XCTAssertEqual(counts.1, [false, true])
         XCTAssertTrue(model.message.contains("旧generation"))
         XCTAssertNotNil(model.recoveryBackup)
+    }
+
+    @MainActor func testExplicitDownloadNeedsNoLocalFilesAndCannotApproveAnotherMode() async throws {
+        let transport = FixtureDecisionTransport()
+        let model = DecisionInstallModel(transport: transport)
+        model.refresh(); try await settle(model)
+        XCTAssertFalse(model.canPrepare)
+        model.download = true
+        XCTAssertTrue(model.canPrepare)
+        model.prepare(); try await settle(model)
+        XCTAssertEqual(model.offer?.plan.transferBytes, 10)
+        XCTAssertEqual(model.offer?.plan.diskRequiredBytes, 21)
+        var counts = await transport.counts(); XCTAssertEqual(counts.1, [])
+        model.confirm(false); try await settle(model)
+        model.prepare(); try await settle(model)
+        model.download = false; model.confirm(true); try await settle(model)
+        counts = await transport.counts(); XCTAssertEqual(counts.1, [false]); XCTAssertEqual(counts.2, 1)
+        model.download = true; model.repair = true
+        model.prepare(); try await settle(model); model.confirm(true); try await settle(model)
+        counts = await transport.counts(); XCTAssertEqual(counts.1, [false, true])
+        XCTAssertNotNil(model.recoveryBackup)
+        XCTAssertTrue(model.message.contains("有効化は変更していません"))
+    }
+
+    func testDownloadPlanValidatesFixedURLsHashesAndDiskRequirements() throws {
+        let valid = try offerData(download: true)
+        let decode: (Data) throws -> DecisionInstallOffer = { try PackagedDecisionInstallClient.decode(DecisionInstallOffer.self, $0) }
+        try PackagedDecisionInstallClient.validateDownloadOffer(decode(valid))
+        for key in ["transfer_bytes", "disk_required_bytes", "transaction_timeout_seconds"] {
+            var frame = try JSONSerialization.jsonObject(with: valid) as! [String: Any]
+            var plan = frame["plan"] as! [String: Any]; plan[key] = 0; frame["plan"] = plan
+            XCTAssertThrowsError(try PackagedDecisionInstallClient.validateDownloadOffer(decode(JSONSerialization.data(withJSONObject: frame))))
+        }
+        for url in ["http://example.invalid/model", "https://dummy@example.invalid/model", "https://example.invalid/model?token=dummy"] {
+            var frame = try JSONSerialization.jsonObject(with: valid) as! [String: Any]
+            var plan = frame["plan"] as! [String: Any]; var delivery = plan["delivery"] as! [String: Any]
+            var downloads = delivery["downloads"] as! [String: Any]
+            downloads["model"] = ["url": url, "redirect_origins": []]
+            delivery["downloads"] = downloads; plan["delivery"] = delivery; frame["plan"] = plan
+            XCTAssertThrowsError(try PackagedDecisionInstallClient.validateDownloadOffer(decode(JSONSerialization.data(withJSONObject: frame))))
+        }
+    }
+
+    func testOwnedDownloadProcessWaitsForTheBoundConfirmationWithoutLocalSourceArguments() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("decision-download-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("fixture-helper")
+        let frame = String(data: try offerData(repair: true, download: true), encoding: .utf8)!
+        let script = """
+        #!/bin/sh
+        test "$#" = 5 && test "$1" = decision && test "$2" = download && test "$3" = fixture-v1 && test "$4" = --repair && test "$5" = --stdio-confirm || exit 2
+        printf '%s\\n' '\(frame)'
+        IFS= read -r answer || exit 3
+        printf '{"schema_version":1,"type":"complete","consent_sha256":"\(String(repeating: "a", count: 64))","status":"cancelled"}\\n'
+        """
+        try Data(script.utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        let client = PackagedDecisionInstallClient(helper: { helper })
+        let offer = try await client.prepareDownload(profile: "fixture-v1", repair: true)
+        XCTAssertTrue(offer.plan.isDownload)
+        let result = try await client.confirm(consent: offer.consentSha256, approved: false)
+        if case .cancelled = result {} else { XCTFail("download cancel was not preserved") }
     }
 
     func testOwnedRepairProcessReceivesRepairArgumentsAndPreservesTheBoundPlan() async throws {

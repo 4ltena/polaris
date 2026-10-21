@@ -14,6 +14,75 @@ pub struct DeliveryMetadata {
     pub license_source: String,
     pub notice_source: String,
     pub components: Vec<DeliveryComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloads: Option<DownloadMetadata>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadMetadata {
+    pub worker: DownloadSource,
+    pub model: DownloadSource,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadSource {
+    pub url: String,
+    pub redirect_origins: Vec<String>,
+}
+
+/// A one-use download transaction, bound to the package and private staging.
+#[derive(Serialize)]
+pub struct DownloadPlan {
+    #[serde(flatten)]
+    import: ImportPlan,
+    transfer_bytes: u64,
+    disk_required_bytes: u64,
+    transaction_timeout_seconds: u64,
+}
+
+impl DownloadPlan {
+    pub fn recovery_backup(&self) -> Option<&std::path::Path> {
+        self.import.recovery_backup()
+    }
+
+    pub fn consent_sha256(&self) -> Result<String, ManagedDecisionError> {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(self).map_err(|_| ManagedDecisionError::Integrity)?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+/// Read-only: does not create staging or contact a distribution service.
+pub fn plan_download(profile: &str, repair: bool) -> Result<DownloadPlan, ManagedDecisionError> {
+    #[cfg(target_os = "macos")]
+    {
+        native::download::prepare(profile, repair)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (profile, repair);
+        Err(ManagedDecisionError::UnsupportedPlatform)
+    }
+}
+
+/// Explicit download only after the caller confirms the fresh plan. Does not
+/// activate a backend or start inference. Cancellation cleans only owned staging.
+pub async fn download_local(
+    plan: DownloadPlan,
+    consent: &str,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), ManagedDecisionError> {
+    #[cfg(target_os = "macos")]
+    {
+        native::download::execute(plan, consent, cancelled).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (plan, consent, cancelled);
+        Err(ManagedDecisionError::UnsupportedPlatform)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -150,6 +219,12 @@ pub enum ManagedDecisionError {
     InsufficientSpace,
     #[error("Clef profileの取得元・license・NOTICE・component情報が未登録です")]
     MissingDeliveryMetadata,
+    #[error("Clef profileの固定download情報が未登録または不正です")]
+    MissingDownloadMetadata,
+    #[error("Clef artifactを取得できませんでした。固定generationは変更していません")]
+    Download,
+    #[error("Clef取得・導入の期限に達しました。固定generationの状態を再検証してください")]
+    DownloadTimeout,
     #[error("Clef導入計画と確認済み内容が一致しません。計画を作り直してください")]
     PlanChanged,
 }

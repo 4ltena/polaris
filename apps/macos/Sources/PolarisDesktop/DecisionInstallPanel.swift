@@ -61,11 +61,15 @@ struct DecisionInstallPanel: View {
                             Text("照合容量: \(bytes(generation.verifiedBytes))\nworker SHA-256: \(generation.workerSha256)\nmodel SHA-256: \(generation.modelSha256)").textSelection(.enabled)
                         }.font(.caption)
                     }
-                    sourceRow("worker", url: model.worker) { model.worker = $0 }
-                    sourceRow("model", url: model.model) { model.model = $0 }
+                    Toggle("固定配布元からダウンロードする", isOn: $model.download)
+                        .disabled(model.busy || model.offer != nil)
+                    if !model.download {
+                        sourceRow("worker", url: model.worker) { model.worker = $0 }
+                        sourceRow("model", url: model.model) { model.model = $0 }
+                    }
                     Toggle("既存generationを保持して修復する", isOn: $model.repair)
                         .disabled(model.busy || model.offer != nil)
-                    Button("導入計画を確認") { model.prepare() }.disabled(!model.canPrepare)
+                    Button(model.download ? "取得・導入計画を確認" : "導入計画を確認") { model.prepare() }.disabled(!model.canPrepare)
                 }
             }
             if let offer = model.offer {
@@ -75,6 +79,12 @@ struct DecisionInstallPanel: View {
                         Text("\(plan.profile) / \(plan.quantization) / \(plan.device)").font(.headline)
                         Text(plan.delivery.purpose)
                         Text("配置容量: \(bytes(plan.installedBytes))、copy予備: \(bytes(plan.copyReserveBytes))")
+                        if let transfer = plan.transferBytes, let required = plan.diskRequiredBytes, let sources = plan.delivery.downloads {
+                            Text("取得容量: \(bytes(transfer))、必要ディスク空き: \(bytes(required))（取得用・導入用の一時領域と予備を含む）")
+                            Text("worker URL: \(sources.worker.url)\nmodel URL: \(sources.model.url)").textSelection(.enabled)
+                            Text("追加の転送許可先: \((sources.worker.redirectOrigins + sources.model.redirectOrigins).joined(separator: ", "))").textSelection(.enabled)
+                            Text("確認後に取得します。取得・検証・導入全体の期限は2時間です。期限後は停止を要求します。通常起動時の自動取得は行いません。")
+                        }
                         Text("導入先: \(plan.destination)").textSelection(.enabled)
                         if let replacement = plan.replacement {
                             Text("旧generationの保持先: \(replacement.backupDestination)\n旧資源は削除しません。ownerを終了してから修復し、完了後は起動し直してください。")
@@ -89,7 +99,7 @@ struct DecisionInstallPanel: View {
                             ForEach(Array(plan.delivery.components.enumerated()), id: \.offset) { _, c in Text("\(c.name) \(c.version) / \(c.license)\n\(c.source)") }
                         }
                         HStack {
-                            Button(offer.plan.operation == "repair" ? "この計画で修復" : "この計画で導入") { model.confirm(true) }
+                            Button(plan.isDownload ? (plan.operation == "repair" ? "この計画で取得・修復" : "この計画で取得・導入") : (offer.plan.operation == "repair" ? "この計画で修復" : "この計画で導入")) { model.confirm(true) }
                             Button("取り消す", role: .cancel) { model.confirm(false) }
                         }
                     }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)

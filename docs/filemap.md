@@ -628,10 +628,16 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/managed_decision/native`
 
+- `download.rs` — Confirmed package downloads feed verified private files into atomic import.
 - `install.rs` — Explicit offline import and lossless repair of fixed decision generations.
 - `plan.rs` — Fresh consent plans bind the package, sources, destination and inventory.
 - `tests.rs` — Package-lock and private-generation fixtures; no real model is executed.
 - `verification.rs` — Explicit full-digest check of an existing pinned generation; no mutation or launch.
+
+## `crates/polaris-core/src/managed_decision/native/download`
+
+- `staging.rs` — Descriptor-pinned download staging; cleanup touches only this transaction.
+- `tests.rs` — Dummy transfer and private filesystem fixtures; no external model downloads.
 
 ## `crates/polaris-core/src/managed_decision/native/install`
 

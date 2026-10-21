@@ -48,7 +48,7 @@ const BOUNDARIES: &[Boundary] = &[
     Boundary {
         title: "HTTP",
         risk: "外部へ要求が出る",
-        patterns: &["reqwest::"],
+        patterns: &["reqwest::", "artifact::fetch("],
         exclude: &[],
         implementations: &[
             "crates/polaris-http/src/lib.rs",

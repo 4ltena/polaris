@@ -136,6 +136,71 @@ fn decision_management_help_exposes_explicit_import_sources_and_confirmation() {
     assert!(!home.path().join(".polaris").exists());
 }
 
+#[test]
+fn decision_download_has_explicit_confirmation_and_no_arbitrary_source_override() {
+    let root = tempfile::tempdir().unwrap();
+    let help = product_binary::command()
+        .env("HOME", root.path())
+        .current_dir(root.path())
+        .args(["decision", "download", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    for field in ["<PROFILE>", "--yes", "--repair"] {
+        assert!(help.contains(field), "{help}");
+    }
+    assert!(!help.contains("--worker"));
+    for arguments in [
+        vec!["decision", "download", "fixture", "--worker", "/arbitrary"],
+        vec![
+            "decision",
+            "download",
+            "fixture",
+            "--yes",
+            "--stdio-confirm",
+        ],
+    ] {
+        let output = product_binary::command()
+            .env("HOME", root.path())
+            .current_dir(root.path())
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
+    assert!(!root.path().join(".polaris").exists());
+}
+
+#[test]
+fn decision_download_never_uses_unaccepted_sources_even_with_explicit_yes() {
+    for arguments in [
+        vec!["decision", "plan-download", "unregistered-profile"],
+        vec!["decision", "download", "unregistered-profile", "--yes"],
+        vec![
+            "decision",
+            "download",
+            "unregistered-profile",
+            "--repair",
+            "--stdio-confirm",
+        ],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = product_binary::command()
+            .env("HOME", root.path())
+            .env("POLARIS_PROVIDER", "must-not-start-a-provider")
+            .current_dir(root.path())
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("受入登録が未完了") || error.contains("このplatform"));
+        assert!(!root.path().join(".polaris").exists());
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn decision_management_pipe_requires_its_own_confirmation_and_cannot_bypass_acceptance() {

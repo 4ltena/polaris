@@ -17,6 +17,7 @@ const LOCK: &[u8] = include_bytes!(
     "../../../../apps/macos/Sources/PolarisDesktop/Resources/decision-runtime-lock-v1.json"
 );
 
+pub(super) mod download;
 pub(super) mod install;
 pub(super) mod plan;
 pub(super) mod verification;

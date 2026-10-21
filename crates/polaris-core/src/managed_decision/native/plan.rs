@@ -52,7 +52,7 @@ fn prepare_operation(
     make_operation(LOCK, profile, &home, worker, model, &nonce, operation)
 }
 
-fn make_operation(
+pub(super) fn make_operation(
     bytes: &[u8],
     profile: &str,
     home: &Path,
@@ -187,6 +187,14 @@ fn execute_with(
 }
 
 fn validate_delivery(d: &DeliveryMetadata) -> Result<(), ManagedDecisionError> {
+    // Offline plans display the same delivery metadata. Validate optional
+    // download URLs there too, before any secret-bearing URL could be printed.
+    if let Some(downloads) = &d.downloads {
+        for source in [&downloads.worker, &downloads.model] {
+            polaris_http::artifact::ArtifactSource::new(&source.url, &source.redirect_origins, 1)
+                .map_err(|_| ManagedDecisionError::MissingDownloadMetadata)?;
+        }
+    }
     let url = |s: &str| {
         if s.len() > 2048 || s.chars().any(char::is_control) {
             return false;

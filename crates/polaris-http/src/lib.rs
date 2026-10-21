@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+pub mod artifact;
+
 /// Builds a reqwest client builder with any explicitly supplied CA bundle.
 ///
 /// When `SSL_CERT_FILE` is absent, reqwest's normal trust configuration is

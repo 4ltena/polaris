@@ -50,7 +50,10 @@ const BOUNDARIES: &[Boundary] = &[
         risk: "外部へ要求が出る",
         patterns: &["reqwest::"],
         exclude: &[],
-        implementations: &["crates/polaris-http/src/lib.rs"],
+        implementations: &[
+            "crates/polaris-http/src/lib.rs",
+            "crates/polaris-http/src/artifact.rs",
+        ],
     },
     Boundary {
         title: "隔離実行",

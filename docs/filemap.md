@@ -1240,7 +1240,12 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-http/src`
 
+- `artifact.rs` — Explicit, credential-free artifact transfers with pinned redirect origins.
 - `lib.rs` — Shared HTTP client setup.
+
+## `crates/polaris-http/src/artifact`
+
+- `tests.rs` — Local TLS fixtures only; no models, user credentials or external services.
 
 ## `crates/polaris-http/src/fixtures`
 

@@ -103,7 +103,7 @@ crate 13件、依存 41件。名前の`polaris-`は省いた。開発用の依�
 
 外部へ要求が出る。
 
-実装: `crates/polaris-http/src/lib.rs`
+実装: `crates/polaris-http/src/lib.rs`、`crates/polaris-http/src/artifact.rs`
 
 呼び出し側 33件。
 

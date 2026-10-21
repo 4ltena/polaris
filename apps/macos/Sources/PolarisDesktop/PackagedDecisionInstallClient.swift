@@ -1,0 +1,179 @@
+import Foundation
+import CryptoKit
+import Darwin
+
+/// One owned CLI process retains the opaque Rust plan until confirmation.
+actor PackagedDecisionInstallClient: DecisionInstallTransport {
+    private let helper: @Sendable () throws -> URL
+    private var child: DecisionInstallChild?
+    private var consent: String?
+    init(helper: @escaping @Sendable () throws -> URL = { try PackagedDecisionInstallClient.packagedCLI() }) { self.helper = helper }
+
+    func catalog() async throws -> DecisionInstallCatalog {
+        guard child == nil else { throw ServiceError.notReady }
+        let process = try DecisionInstallChild(helper: helper(), arguments: ["decision", "list"])
+        child = process
+        defer { process.stop(); if child === process { child = nil } }
+        let data = try await bounded(process, seconds: 15) { try process.readAll() }
+        guard child === process else { throw ServiceError.notReady }
+        let value = try Self.decode(DecisionInstallCatalog.self, data)
+        guard value.schemaVersion == 1, value.registeredProfiles.count <= 64,
+              Set(value.registeredProfiles).count == value.registeredProfiles.count,
+              value.registeredProfiles.allSatisfy(Self.profileID), value.capacity.count <= 32,
+              value.capacity.allSatisfy({ $0.utf8.count <= 4096 }), value.note.utf8.count <= 4096 else { throw ServiceError.schema }
+        return value
+    }
+
+    func prepare(profile: String, worker: URL, model: URL) async throws -> DecisionInstallOffer {
+        guard child == nil, Self.profileID(profile), worker.isFileURL, model.isFileURL else { throw ServiceError.notReady }
+        let process = try DecisionInstallChild(helper: helper(), arguments: ["decision", "import", profile,
+            "--worker", worker.path, "--model", model.path, "--stdio-confirm"])
+        child = process
+        do {
+            let data = try await bounded(process, seconds: 20) { try process.readFrame() }
+            let offer = try Self.decode(DecisionInstallOffer.self, data)
+            guard child === process else { throw ServiceError.notReady }
+            guard offer.schemaVersion == 1, offer.type == "plan", Self.digest(offer.consentSha256),
+                  offer.plan.profile == profile, offer.plan.worker.source == worker.path,
+                  offer.plan.model.source == model.path, offer.plan.delivery.components.count <= 64 else { throw ServiceError.correlation }
+            consent = offer.consentSha256
+            return offer
+        } catch { process.stop(); if child === process { child = nil; consent = nil }; throw error }
+    }
+
+    func confirm(consent: String, approved: Bool) async throws -> DecisionInstallOutcome {
+        guard let process = child, self.consent == consent else { throw ServiceError.correlation }
+        self.consent = nil
+        defer { process.stop(); if child === process { child = nil } }
+        let data = try JSONSerialization.data(withJSONObject: ["schema_version": 1, "consent_sha256": consent,
+            "decision": approved ? "approve" : "cancel"])
+        try process.send(data + Data([10]))
+        let response = try await bounded(process, seconds: 300) { try process.readCompletion() }
+        guard child === process else { throw ServiceError.notReady }
+        struct Completion: Decodable { let schemaVersion: Int; let type: String; let status: String; let consentSha256: String }
+        let value = try Self.decode(Completion.self, response)
+        guard value.schemaVersion == 1, value.type == "complete", value.consentSha256 == consent else { throw ServiceError.correlation }
+        switch value.status {
+        case "installed" where approved: return .installed
+        case "cancelled" where !approved: return .cancelled
+        default: throw ServiceError.schema
+        }
+    }
+
+    func cancel() { child?.stop(); child = nil; consent = nil }
+
+    private func bounded<T: Sendable>(_ process: DecisionInstallChild, seconds: UInt64,
+                                     _ operation: @escaping @Sendable () throws -> T) async throws -> T {
+        let timer = Task {
+            do { try await Task.sleep(nanoseconds: seconds * 1_000_000_000) }
+            catch { return }
+            process.stop()
+        }
+        defer { timer.cancel() }
+        return try await withTaskCancellationHandler {
+            let result = try await Task.detached(priority: .userInitiated, operation: operation).value
+            try Task.checkCancellation()
+            return result
+        } onCancel: { process.stop() }
+    }
+
+    static func decode<T: Decodable>(_ type: T.Type, _ data: Data) throws -> T {
+        guard !data.isEmpty, data.count <= 256 * 1024 else { throw ServiceError.capacity }
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(type, from: data)
+    }
+    private static func digest(_ value: String) -> Bool { value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
+    private static func profileID(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 96 && value.utf8.first.map { (48...57).contains($0) || (97...122).contains($0) } == true
+            && value.utf8.allSatisfy { (48...57).contains($0) || (97...122).contains($0) || [45, 46, 95].contains($0) }
+    }
+
+    /// Fixed bundled paths only; never PATH, user settings or project tools.
+    nonisolated static func packagedCLI(bundle: URL = Bundle.main.bundleURL) throws -> URL {
+        struct Manifest: Decodable { let schemaVersion: Int; let relativePath: String; let architectures: [String]; let sha256: String }
+        let candidates = [bundle, bundle.appendingPathComponent("Contents/Resources/Polaris.app")]
+        for app in candidates {
+            let helper = app.appendingPathComponent("Contents/Helpers/polaris")
+            guard FileManager.default.fileExists(atPath: helper.path) else { continue }
+            let manifest = app.appendingPathComponent("Contents/Resources/polaris-cli.json")
+            for file in [helper, manifest] {
+                var info = stat()
+                guard lstat(file.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+                      info.st_nlink == 1, info.st_mode & 0o22 == 0 else { throw ServiceError.invalidHelper }
+            }
+            let data = try Data(contentsOf: manifest)
+            guard data.count <= 8192 else { throw ServiceError.capacity }
+            let lock = try decode(Manifest.self, data)
+            #if arch(arm64)
+            let architecture = "arm64"
+            #else
+            let architecture = "x86_64"
+            #endif
+            guard lock.schemaVersion == 1, lock.relativePath == "Contents/Helpers/polaris",
+                  lock.architectures.contains(architecture), digest(lock.sha256),
+                  FileManager.default.isExecutableFile(atPath: helper.path) else { throw ServiceError.invalidHelper }
+            let file = try FileHandle(forReadingFrom: helper); defer { try? file.close() }
+            var hash = SHA256()
+            while let bytes = try file.read(upToCount: 1024 * 1024), !bytes.isEmpty { hash.update(data: bytes) }
+            guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == lock.sha256 else { throw ServiceError.invalidHelper }
+            return helper
+        }
+        throw ServiceError.invalidHelper
+    }
+}
+
+/// I/O is used by one read operation at a time; stop/write are synchronized.
+private final class DecisionInstallChild: @unchecked Sendable {
+    private let process = Process()
+    private let input = Pipe()
+    private let output = Pipe()
+    private let lock = NSLock()
+    private var stopping = false
+    init(helper: URL, arguments: [String]) throws {
+        process.executableURL = helper; process.arguments = arguments
+        process.environment = [:]; process.currentDirectoryURL = helper.deletingLastPathComponent()
+        process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
+        try process.run()
+    }
+    deinit { stop() }
+    func send(_ data: Data) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopping, process.isRunning else { throw ServiceError.launch }
+        try input.fileHandleForWriting.write(contentsOf: data)
+    }
+    func readFrame() throws -> Data {
+        var data = Data()
+        while data.count <= 256 * 1024 {
+            guard let byte = try output.fileHandleForReading.read(upToCount: 1), !byte.isEmpty else { throw ServiceError.launch }
+            if byte == Data([10]) { return data }
+            data.append(byte)
+        }
+        throw ServiceError.capacity
+    }
+    func readCompletion() throws -> Data {
+        let data = try readFrame()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else { throw ServiceError.launch }
+        return data
+    }
+    func readAll() throws -> Data {
+        var data = Data()
+        while let bytes = try output.fileHandleForReading.read(upToCount: 4096), !bytes.isEmpty {
+            guard data.count + bytes.count <= 256 * 1024 else { throw ServiceError.capacity }
+            data.append(bytes)
+        }
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else { throw ServiceError.launch }
+        return data
+    }
+    func stop() {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopping else { return }; stopping = true
+        try? input.fileHandleForWriting.close()
+        if process.isRunning {
+            process.interrupt()
+            let process = process
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { if process.isRunning { process.terminate() } }
+        }
+    }
+}

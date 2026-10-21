@@ -83,6 +83,40 @@ fn decision_management_help_exposes_explicit_import_sources_and_confirmation() {
     assert!(!home.path().join(".polaris").exists());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn decision_management_pipe_requires_its_own_confirmation_and_cannot_bypass_acceptance() {
+    for yes in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut command = product_binary::command();
+        command
+            .env("HOME", home.path())
+            .current_dir(project.path())
+            .args([
+                "decision",
+                "import",
+                "clef-flash-q4-cpu-v1",
+                "--worker",
+                "/absent/worker",
+                "--model",
+                "/absent/model",
+                "--stdio-confirm",
+            ]);
+        if yes {
+            command.arg("--yes");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(if yes { 2 } else { 1 }));
+        if !yes {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("受入登録が未完了"));
+        }
+        assert!(output.stdout.is_empty());
+        assert!(!home.path().join(".polaris").exists());
+        assert!(!project.path().join(".polaris").exists());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn mcp_configure_exposes_the_fixed_preset_and_rejects_unconfirmed_non_tty_without_state() {

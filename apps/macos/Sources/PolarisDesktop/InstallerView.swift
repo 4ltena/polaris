@@ -382,6 +382,9 @@ struct InstallerRootView: View {
                     }
                 }
             }
+            installerSection("Clef判断器の導入（任意）") {
+                DecisionInstallPanel()
+            }
             installerSection("端末内モデル") {
                 VStack(alignment: .leading, spacing: 10) {
                     Picker("利用方法", selection: Binding(

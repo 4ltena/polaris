@@ -757,3 +757,34 @@ fn native_decision_selection_overrides_shareable_config_only_for_exact_values() 
     assert!(decision.enabled);
     assert!(apply_native_decision_selection(&mut decision, Ok("true".into())).is_err());
 }
+
+#[test]
+fn native_jev_toggle_neither_disables_nor_activates_another_backend() {
+    use polaris_core::config::{DecisionBackend, DecisionConfig};
+    for backend in [
+        DecisionBackend::Clef,
+        DecisionBackend::SemIf,
+        DecisionBackend::SystemOne,
+    ] {
+        for enabled in [false, true] {
+            for selected in ["0", "1"] {
+                let mut decision = DecisionConfig {
+                    enabled,
+                    backend,
+                    model: Some("explicit-model".into()),
+                    local_only: true,
+                    ..Default::default()
+                };
+                let before = decision.clone();
+                apply_native_decision_selection(&mut decision, Ok(selected.into())).unwrap();
+                assert_eq!(decision, before, "{backend:?} / Jev toggle {selected}");
+            }
+        }
+        let mut decision = DecisionConfig {
+            backend,
+            ..Default::default()
+        };
+        assert!(apply_native_decision_selection(&mut decision, Ok("true".into())).is_err());
+        assert!(!decision.enabled);
+    }
+}

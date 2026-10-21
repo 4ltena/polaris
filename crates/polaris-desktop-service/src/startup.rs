@@ -249,11 +249,18 @@ fn apply_native_decision_selection(
     decision: &mut polaris_core::config::DecisionConfig,
     selected: Result<String, std::env::VarError>,
 ) -> Result<(), StartupError> {
-    match selected.as_deref() {
-        Ok("1") => decision.enabled = true,
-        Ok("0") => decision.enabled = false,
-        Err(std::env::VarError::NotPresent) => {}
+    let enabled = match selected.as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        Err(std::env::VarError::NotPresent) => None,
         _ => return Err(StartupError::Generic),
+    };
+    // The native Jev toggle is not a selection or activation grant for a
+    // different backend. Preserve its explicit configuration either way.
+    if decision.backend == polaris_core::config::DecisionBackend::Jev
+        && let Some(enabled) = enabled
+    {
+        decision.enabled = enabled;
     }
     Ok(())
 }
@@ -603,8 +610,9 @@ fn start_at(
         Some(&args.confirmed_source_path.join(".polaris/config.toml")),
     )
     .unwrap_or_default();
-    // The native setup selection is explicit and overrides the shareable TOML
-    // for this owner. The key itself remains outside every config and argv.
+    // Native setup overrides Jev's activation for this owner only. Other
+    // backends retain their explicit configuration, including enabled=false.
+    // The key itself remains outside every config and argv.
     apply_native_decision_selection(&mut decision, std::env::var("POLARIS_JEV_ENABLED"))?;
     if decision.enabled
         && let Some(fallback) = &decision.fallback

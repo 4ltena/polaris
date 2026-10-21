@@ -60,6 +60,8 @@ review = ["user:review-rules"]
 
 `[decision]`は通常の会話モデルとは別の判断器を選ぶ設定で、既定は無効である。既存のJevとSemIfは引き続き選択できる。モデルやhelperが見つかっただけでは有効にならない。
 
+macOS desktopのJevスイッチは、選択中のbackendが`jev`の場合だけ有効・無効を上書きする。`clef`・`semif`・`system-one`を選んでいる場合は、`[decision]`の`enabled`を維持する。Jevスイッチで他backendを有効にすることも、無効にすることもない。
+
 | `backend` | 指定する資源 | 現在の扱い |
 | --- | --- | --- |
 | `jev` | 任意の`model`・`base_url`と、環境変数`POLARIS_JEV_API_KEY` | 既存のHTTP経路。明示的に有効にした場合だけ使用する。 |

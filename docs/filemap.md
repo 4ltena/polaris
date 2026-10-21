@@ -207,6 +207,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `conversation_state.rs` — Versioned session storage, separate from the legacy Message-only JSONL reader.
 - `decision_bands.rs` — The band rule, in one place.
 - `decision_capacity.rs` — Memory recommendations and conservative admission for a trusted model profile.
+- `decision_policy.rs` — Local-only admission for judgments and auxiliary generative arbitration.
 - `decisions.rs` — What this project has already settled, so it is not settled twice.
 - `desktop_approval.rs` — Bounded approval mailbox. The controller owns the pending request and
 - `desktop_events.rs` — Desktopキューだけを有界にする。provider/tool内のbufferは対象外。
@@ -362,6 +363,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `observation.rs` — Read-only host memory hints. Missing GPU/availability readings stay unknown.
 - `tests.rs` — Synthetic capacity edges and domain separation; no model or GPU is started.
+
+## `crates/polaris-core/src/decision_policy`
+
+- `tests.rs` — Synthetic dispatch probes for opt-in local-only admission and wrappers.
 
 ## `crates/polaris-core/src/decisions`
 

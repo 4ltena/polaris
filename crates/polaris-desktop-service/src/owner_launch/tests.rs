@@ -159,6 +159,7 @@ impl Fixture {
             },
             input_preparation: Default::default(),
             decider: None,
+            decision_local_only: false,
             answer_finalizer: None,
         };
         let directory = File::open(&recovery).unwrap();

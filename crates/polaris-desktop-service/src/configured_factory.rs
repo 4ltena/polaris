@@ -66,6 +66,7 @@ struct BoundProviders {
 }
 
 pub struct TrustedFactoryResources {
+    pub decision_local_only: bool,
     pub always_on: AlwaysOn,
     pub audit: Arc<tokio::sync::Mutex<AuditLog>>,
     pub skills: Vec<Skill>,
@@ -179,6 +180,17 @@ pub struct ConfiguredRunFactory {
     recipe: Option<WorkspacePreparationRecipe>,
 }
 impl ConfiguredRunFactory {
+    fn account_models(&self) -> Vec<&str> {
+        let mut models = vec![self.bootstrap.model()];
+        if self.summary_provider.is_some() {
+            models.push("gpt-6-astra");
+        }
+        if self.selection_provider.is_some() {
+            models.push(MCP_SELECTION_MODEL);
+        }
+        models
+    }
+
     pub fn new(
         bootstrap: ValidatedOwnerBootstrap,
         grant: ConfirmedSourceGrant,
@@ -303,6 +315,10 @@ impl ConfiguredRunFactory {
             }
             _ => None,
         };
+        let selection_provider = polaris_core::decision_policy::restrict_arbiter(
+            resources.decision_local_only,
+            selection_provider,
+        );
         let accounts = match &backend {
             TrustedBackend::Codex { accounts, .. }
                 if document.provider == BootstrapProvider::Codex =>
@@ -772,13 +788,7 @@ impl TrustedRunFactory for ConfiguredRunFactory {
             return Ok(None);
         };
         // Every model this run may send to must be covered by the binding.
-        let mut models = vec![self.bootstrap.model()];
-        if self.summary_provider.is_some() {
-            models.push("gpt-6-astra");
-        }
-        if self.selection_provider.is_some() {
-            models.push(MCP_SELECTION_MODEL);
-        }
+        let models = self.account_models();
         let (registration_id, generation) = owner
             .bind(&models, None)
             .map_err(|_| ServiceError::Options)?;
@@ -871,10 +881,13 @@ impl TrustedRunFactory for ConfiguredRunFactory {
                 .clone()
                 .map(|config| crate::TrustedMcpResources {
                     config,
-                    selection_provider: bound
-                        .selection
-                        .clone()
-                        .or_else(|| self.selection_provider.clone()),
+                    selection_provider: polaris_core::decision_policy::restrict_arbiter(
+                        self.resources.decision_local_only,
+                        bound
+                            .selection
+                            .clone()
+                            .or_else(|| self.selection_provider.clone()),
+                    ),
                 }),
             external_ceiling: polaris_core::mcp::operation::ExternalCeiling::desktop_tier(
                 self.grant.tier,

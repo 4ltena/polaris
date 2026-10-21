@@ -5,6 +5,42 @@ use polaris_provider::decision::{Answer, Decision};
 struct Stub(Vec<f64>);
 
 #[test]
+fn local_only_refuses_remote_or_unconfined_judges_before_credentials_or_spawn() {
+    use crate::config::{DecisionBackend, DecisionConfig};
+    let unused = || panic!("local-only looked up a remote key");
+    let config = DecisionConfig {
+        enabled: true,
+        local_only: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        build_with_key(&config, DecisionUse::Routing, unused),
+        Err(DecisionBuildError::LocalOnlyUnavailable)
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let helper = dir.path().join("helper");
+    std::fs::write(&helper, b"synthetic helper never executed").unwrap();
+    let local = DecisionConfig {
+        backend: DecisionBackend::SemIf,
+        helper: Some(helper),
+        ..config
+    };
+    assert!(matches!(
+        build_with_key(&local, DecisionUse::Routing, unused),
+        Err(DecisionBuildError::LocalOnlyUnavailable)
+    ));
+    let disabled = DecisionConfig {
+        enabled: false,
+        ..local
+    };
+    assert!(
+        build_with_key(&disabled, DecisionUse::Routing, unused)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn the_shared_factory_preserves_an_explicit_semif_selection() {
     let dir = tempfile::tempdir().unwrap();
     let helper = dir.path().join("semif-helper");

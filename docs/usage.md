@@ -70,6 +70,12 @@ Clef/Clef-flashはモデル、量子化、runtime、device、割当contextごと
 
 `polaris doctor`の容量帯と候補順は推薦の目安で、実行可能という判定ではない。管理対象CPU workerの起動直前には、空いている物理メモリから保守的な予算を求め、profileのpeakと予備量を確認する。CPUの使用量をGPUへ換算せず、Metalのdevice別容量観測が未対応の間は、そのprofileを実行しない。
 
+8GB程度・16GB程度・24GB以上という容量帯で、利用できるbackendを固定しない。Clef/Clef-flash、SemIf、Jevは、利用者の選択と各backendの実行条件に従って使用する。
+
+判断と補助モデルによる候補選択を端末内に限定したい場合は、`[decision]`に`local_only = true`を指定する。既定は`false`である。`true`の場合は通信制限を確認できる判断器と補助モデルだけを許可し、判断失敗後も外部の補助モデルへ送信しない。loopbackの接続先やローカルhelperというだけでは、外部通信しない保証にはならない。現在のJev HTTP経路と、通信を制限していないSemIf helperは、この指定時には使用できない。管理対象Clefも、受入・導入・容量の条件を別途満たす必要がある。
+
+利用者設定の`local_only = true`は、project設定の`false`では解除できない。この設定が制限するのは判断と補助的な候補選択であり、通常の会話モデルやMCPツール自体の通信許可は別に設定する。
+
 `polaris decision list`は登録済みprofile IDと容量の推薦をJSONで表示する。現在の登録は0件である。登録は導入や実行可否の確認ではなく、この操作でJev/SemIfの設定は変わらない。
 
 受入済みprofileと配布情報が登録された後は、手元の固定artifactを次の管理コマンドで導入できる。`PROFILE_ID`と2つの絶対pathを対象に置き換える。

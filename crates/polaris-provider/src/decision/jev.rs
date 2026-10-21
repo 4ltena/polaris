@@ -229,6 +229,7 @@ impl Decider for JevDecider {
                 .is_some_and(|ip| ip.is_loopback())
         });
         DecisionCapabilities {
+            network: crate::NetworkBoundary::RemoteAllowed,
             location: if loopback {
                 DecisionLocation::LoopbackHttp
             } else {

@@ -226,6 +226,8 @@ pub enum DecisionUse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionBuildError {
+    #[error("local-only: 判断器の外部通信禁止境界を確認できません")]
+    LocalOnlyUnavailable,
     #[error("POLARIS_JEV_API_KEY がありません")]
     MissingJevKey,
     #[error("helperが実在する絶対pathではありません")]
@@ -305,6 +307,9 @@ fn build_with_sources(
             )
         }
         DecisionBackend::Jev => {
+            if config.local_only {
+                return Err(DecisionBuildError::LocalOnlyUnavailable);
+            }
             let key = key().ok_or(DecisionBuildError::MissingJevKey)?;
             let base = config
                 .base_url
@@ -319,7 +324,9 @@ fn build_with_sources(
             std::sync::Arc::new(client)
         }
     };
-    Ok(Some(decider))
+    crate::decision_policy::restrict_decider(config.local_only, decider)
+        .map(Some)
+        .map_err(|_| DecisionBuildError::LocalOnlyUnavailable)
 }
 
 /// Optional routing for surfaces that already report unavailable capability

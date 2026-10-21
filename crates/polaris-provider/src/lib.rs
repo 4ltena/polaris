@@ -456,6 +456,9 @@ where
     P: std::ops::Deref + Send + Sync,
     P::Target: Provider,
 {
+    fn network_boundary(&self) -> NetworkBoundary {
+        self.provider.network_boundary()
+    }
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         self.complete_metered(req, None, None).await
     }
@@ -657,8 +660,22 @@ impl ProviderError {
     }
 }
 
+/// Enforced/attested boundary, separate from a loopback address or model name.
+/// Unknown never grants local-only admission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkBoundary {
+    #[default]
+    Unknown,
+    LocalOnly,
+    RemoteAllowed,
+}
+
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
+    fn network_boundary(&self) -> NetworkBoundary {
+        NetworkBoundary::Unknown
+    }
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
 
     /// Completes a request that belongs to one logical user turn. Providers
@@ -747,6 +764,9 @@ macro_rules! delegate_provider {
     ($pointer:ty) => {
         #[async_trait::async_trait]
         impl<T: Provider + ?Sized> Provider for $pointer {
+            fn network_boundary(&self) -> NetworkBoundary {
+                (**self).network_boundary()
+            }
             async fn complete(
                 &self,
                 req: CompletionRequest,

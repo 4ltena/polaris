@@ -205,6 +205,24 @@ const THREE: &[(&str, &str)] = &[
 ];
 
 #[test]
+fn local_only_blocks_generative_fallback_after_typed_failure_or_middle_band() {
+    for judge in [
+        Fake::failing(DecisionError::Unavailable),
+        Fake::new(&[(0, 0.6)]),
+    ] {
+        let arbiter = std::sync::Arc::new(Arbiter::choosing(r#"{"tools":[0]}"#));
+        let permitted = crate::decision_policy::restrict_arbiter(true, Some(arbiter.clone()));
+        let result = decided_with(&judge, permitted.as_deref(), THREE, "検索");
+        assert!(arbiter.seen.lock().unwrap().is_empty());
+        assert!(result.picks.is_empty());
+        // The same provider is usable when local-only is not requested.
+        let permitted = crate::decision_policy::restrict_arbiter(false, Some(arbiter.clone()));
+        let _ = decided_with(&judge, permitted.as_deref(), THREE, "検索");
+        assert!(!arbiter.seen.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn the_confident_are_taken_on_the_typed_answer_alone() {
     // The whole point of asking independently: several tools can each be
     // useful, and each is judged on its own.

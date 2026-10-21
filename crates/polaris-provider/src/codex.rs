@@ -764,6 +764,9 @@ impl CodexProvider {
 
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
+    fn network_boundary(&self) -> crate::NetworkBoundary {
+        crate::NetworkBoundary::RemoteAllowed
+    }
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         self.validate_optional_contracts()?;
         let logical = self

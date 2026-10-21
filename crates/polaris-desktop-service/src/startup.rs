@@ -672,6 +672,7 @@ fn start_at(
         finalizer_decider,
     )?;
     let resources = TrustedFactoryResources {
+        decision_local_only: decision.local_only,
         always_on,
         audit: Arc::new(tokio::sync::Mutex::new(private_audit(&recovery)?)),
         skills: skills.skills,

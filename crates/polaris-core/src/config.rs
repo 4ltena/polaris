@@ -208,6 +208,9 @@ impl AnswerFinalizerConfig {
 /// committed and shared; a credential read from the environment is not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DecisionConfig {
+    /// Restricts typed judgments and auxiliary arbitration, not main chat.
+    /// Project layers may tighten but not undo a user's restriction.
+    pub local_only: bool,
     /// Off unless asked for. Every path that consults the judge works
     /// without one, so enabling it is a choice to spend a round trip.
     pub enabled: bool,
@@ -615,6 +618,8 @@ fn parse_size(written: &str) -> Option<u64> {
 #[serde(deny_unknown_fields)]
 struct RawDecision {
     #[serde(default)]
+    local_only: Option<bool>,
+    #[serde(default)]
     enabled: Option<bool>,
     #[serde(default)]
     backend: Option<String>,
@@ -635,6 +640,7 @@ struct RawSidechat {
 
 impl RawDecision {
     fn apply_to(self, merged: &mut DecisionConfig) -> Result<(), ConfigError> {
+        merged.local_only |= self.local_only.unwrap_or(false);
         if let Some(enabled) = self.enabled {
             merged.enabled = enabled;
         }
@@ -1780,6 +1786,45 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn decision_local_only_is_opt_in_and_project_cannot_weaken_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        for (user, local, expected) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            std::fs::write(&global, format!("[decision]\nlocal_only = {user}\n")).unwrap();
+            std::fs::write(&project, format!("[decision]\nlocal_only = {local}\n")).unwrap();
+            assert_eq!(
+                try_load_from(Some(&global), Some(&project))
+                    .unwrap()
+                    .decision
+                    .local_only,
+                expected
+            );
+            assert_eq!(
+                try_load_decision_from(Some(&global), Some(&project))
+                    .unwrap()
+                    .local_only,
+                expected
+            );
+        }
+        assert!(!try_load_from(None, None).unwrap().decision.local_only);
+        std::fs::write(&global, "[decision]\nlocal_only = false\n").unwrap();
+        assert!(
+            !try_load_decision_from(Some(&global), None)
+                .unwrap()
+                .local_only
+        );
+        std::fs::write(&project, "[decision]\nlocal_only = 'true'\n").unwrap();
+        assert!(try_load_from(None, Some(&project)).is_err());
+        assert!(try_load_decision_from(None, Some(&project)).is_err());
     }
 
     /// The judge is named, never inferred. Every shape that would leave

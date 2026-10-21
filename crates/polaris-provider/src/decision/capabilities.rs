@@ -70,6 +70,7 @@ impl DecisionShapes {
 /// borrowed by an unrelated model, quantization or helper implementation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct DecisionCapabilities {
+    pub network: crate::NetworkBoundary,
     pub location: DecisionLocation,
     pub protocol: Option<&'static str>,
     pub shapes: Option<DecisionShapes>,

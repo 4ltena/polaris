@@ -189,6 +189,7 @@ impl Fixture {
                 ..Default::default()
             },
             input_preparation: Default::default(),
+            decision_local_only: false,
             decider: None,
             answer_finalizer: None,
         }
@@ -286,54 +287,67 @@ fn mcp_configuration_preserves_project_and_external_ceiling_before_capability_co
             ExternalCeiling::Allowed,
         ),
     ] {
-        let mut f = Fixture::new();
-        let mut grant = f.grant();
-        grant.tier = tier;
-        let mut resources = f.resources();
-        resources.mcp = Some(
-            RuntimeConfig::new(
-                polaris_mcp::registration::Registry {
-                    schema_version: 1,
-                    revision: 1,
-                    servers: vec![],
+        for local_only in [false, true] {
+            let mut f = Fixture::new();
+            let mut grant = f.grant();
+            grant.tier = tier;
+            let mut resources = f.resources();
+            resources.decision_local_only = local_only;
+            resources.mcp = Some(
+                RuntimeConfig::new(
+                    polaris_mcp::registration::Registry {
+                        schema_version: 1,
+                        revision: 1,
+                        servers: vec![],
+                    },
+                    "p".into(),
+                    Arc::new(polaris_mcp::store::Secrets::new(1, Default::default()).unwrap()),
+                    Default::default(),
+                )
+                .unwrap(),
+            );
+            let factory = ConfiguredRunFactory::new(
+                f.bootstrap_with_tier(tier),
+                grant,
+                TrustedBackend::Codex {
+                    accounts: None,
+                    tokens: f.tokens.clone(),
                 },
-                "p".into(),
-                Arc::new(polaris_mcp::store::Secrets::new(1, Default::default()).unwrap()),
-                Default::default(),
+                resources,
             )
-            .unwrap(),
-        );
-        let factory = ConfiguredRunFactory::new(
-            f.bootstrap_with_tier(tier),
-            grant,
-            TrustedBackend::Codex {
-                accounts: None,
-                tokens: f.tokens.clone(),
-            },
-            resources,
-        )
-        .unwrap();
-        let target = f.accept();
-        factory.stage_workspace(f.workspace()).unwrap();
-        let input = factory
-            .prepare(&target, &f.writer.snapshot().unwrap())
             .unwrap();
-        assert_eq!(input.external_ceiling, ceiling);
-        let mcp = input.mcp.unwrap();
-        assert_eq!(mcp.config.project_id(), "p");
-        assert!(
-            mcp.selection_provider.is_some(),
-            "Codex runs get the fixed light selector"
-        );
-        if tier != BootstrapTier::ReadCreate {
-            assert!(matches!(
+            let target = f.accept();
+            assert_eq!(
+                factory.account_models().contains(&MCP_SELECTION_MODEL),
+                !local_only
+            );
+            assert!(
+                factory
+                    .account_models()
+                    .contains(&factory.bootstrap.model())
+            );
+            factory.stage_workspace(f.workspace()).unwrap();
+            let input = factory
+                .prepare(&target, &f.writer.snapshot().unwrap())
+                .unwrap();
+            assert_eq!(input.external_ceiling, ceiling);
+            let mcp = input.mcp.unwrap();
+            assert_eq!(mcp.config.project_id(), "p");
+            assert_eq!(
+                mcp.selection_provider.is_some(),
+                !local_only,
+                "only explicit local-only suppresses the remote auxiliary selector"
+            );
+            if tier != BootstrapTier::ReadCreate {
+                assert!(matches!(
                 input.execution_capability,
                 Some(
                     polaris_core::desktop_execution::ConfirmedExecutionCapability::ConfinedCode { .. }
                 )
             ));
+            }
+            assert_eq!(f.tokens.0.load(Ordering::SeqCst), 0);
         }
-        assert_eq!(f.tokens.0.load(Ordering::SeqCst), 0);
     }
 }
 

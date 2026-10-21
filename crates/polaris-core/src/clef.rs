@@ -139,6 +139,7 @@ impl Decider for ClefDecider {
             DecisionUsageReporting,
         };
         DecisionCapabilities {
+            network: polaris_provider::NetworkBoundary::LocalOnly,
             location: DecisionLocation::LocalProcess,
             protocol: Some("clef-stdio-v1"),
             shapes: Some(DecisionShapes::ALL),

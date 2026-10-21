@@ -239,6 +239,9 @@ pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) ->
 
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
+    fn network_boundary(&self) -> crate::NetworkBoundary {
+        crate::NetworkBoundary::RemoteAllowed
+    }
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let logical = self
             .attempt_ledger

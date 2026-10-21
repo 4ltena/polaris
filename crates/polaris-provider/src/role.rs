@@ -56,6 +56,9 @@ impl RoleProvider {
 
 #[async_trait::async_trait]
 impl Provider for RoleProvider {
+    fn network_boundary(&self) -> crate::NetworkBoundary {
+        self.parent.network_boundary()
+    }
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         self.parent.complete(req).await
     }

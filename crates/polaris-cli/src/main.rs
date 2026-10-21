@@ -2760,7 +2760,10 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     };
     let provider_name = prepared_providers.provider_name.clone();
     let model_name = prepared_providers.model_name.clone();
-    let mcp_selection_provider = prepared_providers.mcp_selection_provider.clone();
+    let mcp_selection_provider = polaris_core::decision_policy::restrict_arbiter(
+        config.decision.local_only,
+        prepared_providers.mcp_selection_provider.clone(),
+    );
     let tier_weights = prepared_providers.tier_weights.clone();
     let provider = prepared_providers.provider.clone();
     let decision_meter = polaris_provider::decision::DecisionMeter::default();

@@ -585,7 +585,12 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/managed_decision/native`
 
+- `install.rs` — Explicit offline import into a new, immutable decision generation.
 - `tests.rs` — Package-lock and private-generation fixtures; no real model is executed.
+
+## `crates/polaris-core/src/managed_decision/native/install`
+
+- `tests.rs` — Offline import transactions use synthetic bytes and never execute a worker.
 
 ## `crates/polaris-core/src/management_effect`
 

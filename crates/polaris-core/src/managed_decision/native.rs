@@ -17,6 +17,8 @@ const LOCK: &[u8] = include_bytes!(
     "../../../../apps/macos/Sources/PolarisDesktop/Resources/decision-runtime-lock-v1.json"
 );
 
+pub(super) mod install;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovedLock {

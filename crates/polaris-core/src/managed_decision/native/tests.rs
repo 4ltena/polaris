@@ -2,7 +2,7 @@
 use super::*;
 use std::{fs, os::unix::fs::PermissionsExt};
 
-fn fixture() -> (tempfile::TempDir, Subject) {
+pub(super) fn fixture() -> (tempfile::TempDir, Subject) {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().canonicalize().unwrap();
     let generation = home.join(".polaris/decision-runtime/generations/fixture-v1");

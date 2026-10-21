@@ -606,6 +606,13 @@ fn start_at(
     // The native setup selection is explicit and overrides the shareable TOML
     // for this owner. The key itself remains outside every config and argv.
     apply_native_decision_selection(&mut decision, std::env::var("POLARIS_JEV_ENABLED"))?;
+    if decision.enabled
+        && let Some(fallback) = &decision.fallback
+    {
+        for line in fallback.disclosure(&decision) {
+            eprintln!("{line}");
+        }
+    }
     let decider = polaris_core::decision_bands::from_configuration(&decision);
     let finalizer_decider = finalizer_decider_from_configuration(&decision);
     if workflow.enabled && runtime_workflow.begin_turn(&skills.skills).is_err() {

@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use polaris_provider::decision::{BandCalibration, Decider, DecisionError, Question, checked};
+mod fallback;
 
 /// The two edges of the middle band. Above `ADOPT` a candidate is taken on
 /// the typed answer alone; at or below `EXCLUDE` it is dropped; between
@@ -152,7 +153,7 @@ pub async fn judge_with(
 
     tokio::pin!(cancelled);
     let calibration = decider.capabilities().band_calibration;
-    if calibration == BandCalibration::Unmeasured {
+    if !decider.may_return_calibrated_bands() {
         // These thresholds cannot turn an uncalibrated probability into a
         // decision. Leave every candidate for the existing arbiter/context
         // budget; no pointless model request is sent for a discarded score.
@@ -170,10 +171,18 @@ pub async fn judge_with(
     let answered = tokio::select! {
         biased;
         _ = &mut cancelled => return Err(Refused::Cancelled),
-        held = decider.decide(state, &questions) => held,
+        held = decider.observe(state, &questions) => held,
     };
-    let answered = answered.map_err(Refused::from)?;
+    let calibration = answered.capabilities.band_calibration;
+    let answered = answered.result.map_err(Refused::from)?;
     checked(&answered, &questions).map_err(Refused::from)?;
+    if calibration == BandCalibration::Unmeasured {
+        return Ok(Bands {
+            middle: (0..count).collect(),
+            calibration,
+            ..Default::default()
+        });
+    }
 
     // Every candidate must come back answered. A reply that skips one is
     // not a narrower answer, it is an answer to a different question set.
@@ -254,12 +263,29 @@ pub fn build_configured(
 fn build_with_key(
     config: &crate::config::DecisionConfig,
     purpose: DecisionUse,
-    key: impl FnOnce() -> Option<String>,
+    key: impl FnMut() -> Option<String>,
 ) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
     build_with_sources(config, purpose, key, crate::managed_decision::build)
 }
 
 fn build_with_sources(
+    config: &crate::config::DecisionConfig,
+    purpose: DecisionUse,
+    mut key: impl FnMut() -> Option<String>,
+    mut clef: impl FnMut(
+        &str,
+    ) -> Result<
+        std::sync::Arc<dyn Decider>,
+        crate::managed_decision::ManagedDecisionError,
+    >,
+) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
+    if config.enabled && purpose == DecisionUse::Routing && config.fallback.is_some() {
+        return fallback::build(config, &mut key, &mut clef).map(Some);
+    }
+    build_one_with_sources(config, purpose, key, clef, false)
+}
+
+fn build_one_with_sources(
     config: &crate::config::DecisionConfig,
     purpose: DecisionUse,
     key: impl FnOnce() -> Option<String>,
@@ -269,6 +295,7 @@ fn build_with_sources(
         std::sync::Arc<dyn Decider>,
         crate::managed_decision::ManagedDecisionError,
     >,
+    single_attempt: bool,
 ) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
     use crate::config::DecisionBackend;
     use polaris_provider::decision::{jev::JevDecider, semif::SemIfDecider};
@@ -317,12 +344,20 @@ fn build_with_sources(
                 .unwrap_or("https://api.typesafe.ai/v1");
             let model = config.model.clone().unwrap_or_else(|| "jev-latest".into());
             let client = match purpose {
+                DecisionUse::Routing if single_attempt => {
+                    JevDecider::new_single_attempt(base, key, model)
+                }
                 DecisionUse::Routing => JevDecider::new(base, key, model),
                 DecisionUse::Finalization => JevDecider::new_finalizer(base, key, model),
             }
             .map_err(DecisionBuildError::InvalidSettings)?;
             std::sync::Arc::new(client)
         }
+    };
+    let decider = if config.backend == DecisionBackend::Clef {
+        fallback::identify(config, decider)
+    } else {
+        decider
     };
     crate::decision_policy::restrict_decider(config.local_only, decider)
         .map(Some)

@@ -239,6 +239,72 @@ mod achieved_tests {
         .await
     }
 
+    struct Unknown(std::sync::Arc<Stub>);
+    #[async_trait::async_trait]
+    impl Decider for Unknown {
+        async fn decide(
+            &self,
+            state: &serde_json::Value,
+            questions: &BTreeMap<String, Question>,
+        ) -> Result<Typed, DecisionError> {
+            self.0.decide(state, questions).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_unmeasured_answers_never_inherit_goal_completion_thresholds() {
+        use polaris_provider::decision::fallback::{FallbackDecider, FallbackPolicy};
+        for probability in [0.99, 0.01] {
+            let primary = std::sync::Arc::new(Stub::new(None));
+            let fallback = std::sync::Arc::new(Stub::new(Some(probability)));
+            let chain = FallbackDecider::new(
+                vec![
+                    primary.clone(),
+                    std::sync::Arc::new(Unknown(fallback.clone())),
+                ],
+                FallbackPolicy {
+                    max_attempts: 2,
+                    attempt_timeout: std::time::Duration::from_secs(1),
+                    total_timeout: std::time::Duration::from_secs(2),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                judge(&chain, "goal", "evidence", std::future::pending()).await,
+                None
+            );
+            assert_eq!(primary.seen.lock().unwrap().len(), 1);
+            assert_eq!(fallback.seen.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_calibrated_answers_remain_reachable_from_unmeasured_primary() {
+        use polaris_provider::decision::fallback::{FallbackDecider, FallbackPolicy};
+        for (probability, expected) in [(0.99, true), (0.01, false)] {
+            let primary = std::sync::Arc::new(Stub::new(None));
+            let fallback = std::sync::Arc::new(Stub::new(Some(probability)));
+            let chain = FallbackDecider::new(
+                vec![
+                    std::sync::Arc::new(Unknown(primary.clone())),
+                    fallback.clone(),
+                ],
+                FallbackPolicy {
+                    max_attempts: 2,
+                    attempt_timeout: std::time::Duration::from_secs(1),
+                    total_timeout: std::time::Duration::from_secs(2),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                judge(&chain, "goal", "evidence", std::future::pending()).await,
+                Some(expected)
+            );
+            assert_eq!(primary.seen.lock().unwrap().len(), 1);
+            assert_eq!(fallback.seen.lock().unwrap().len(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn only_a_confident_answer_is_a_judgement() {
         assert_eq!(asked(Some(0.95)).await, Some(true));

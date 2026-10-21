@@ -309,6 +309,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `macos.rs` — The accessibility driver for macOS, through System Events.
 
+## `crates/polaris-core/src/config`
+
+- `decision_fallback.rs` — User-owned typed-routing failover configuration; project files cannot add destinations.
+
+## `crates/polaris-core/src/config/decision_fallback`
+
+- `tests.rs` — User-only routing policy, destination validation and secret-free preflight display.
+
 ## `crates/polaris-core/src/constitution`
 
 - `refresh.rs` — Request-boundary reads of two owner-selected files. No polling or model paths.
@@ -357,7 +365,12 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/decision_bands`
 
+- `fallback.rs` — Build only an explicitly configured routing chain; finalizers never use it.
 - `tests.rs` — A local stub stands in for the service. No real endpoint is contacted.
+
+## `crates/polaris-core/src/decision_bands/fallback`
+
+- `tests.rs` — Factory failover uses synthetic owners and loopback HTTP, never real models or credentials.
 
 ## `crates/polaris-core/src/decision_capacity`
 
@@ -1006,6 +1019,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `store.rs` — Private immutable verification records.
 - `tests.rs` — Regression tests for verification selection, execution, evidence, and convergence.
 
+## `crates/polaris-core/src/verification/pipeline/tests`
+
+- `provenance.rs` — Persist the effective typed source after failover, not the configured primary.
+
 ## `crates/polaris-core/src/verification/store`
 
 - `windows_tests.rs` — Windows verification store refusal tests that preserve roots and existing records.
@@ -1384,9 +1401,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-provider/src/decision`
 
 - `capabilities.rs` — Adapter contracts, not evidence of a running model or current calibration.
+- `fallback.rs` — Ordered typed failover with one request-local deadline and no background retries.
 - `jev.rs` — J-4: the HTTP client for a System One decider.
+- `observation.rs` — Per-request provenance; no prompt, answer text, credential or shared last-backend slot.
 - `semif.rs` — The local typed decider, over a pinned SemIf helper.
 - `tests.rs` — Types and checking only; nothing is sent.
+
+## `crates/polaris-provider/src/decision/fallback`
+
+- `tests.rs` — Synthetic failover, cancellation and per-request provenance; no model or endpoint.
 
 ## `crates/polaris-provider/src/decision/jev`
 

@@ -124,6 +124,12 @@ impl Drop for DecisionFinished {
 
 #[async_trait::async_trait]
 impl polaris_provider::decision::Decider for ObservedDecider {
+    fn may_return_calibrated_bands(&self) -> bool {
+        self.inner.may_return_calibrated_bands()
+    }
+    fn identity(&self) -> polaris_provider::decision::DecisionIdentity {
+        self.inner.identity()
+    }
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -138,11 +144,27 @@ impl polaris_provider::decision::Decider for ObservedDecider {
         questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
     ) -> Result<polaris_provider::decision::Decision, polaris_provider::decision::DecisionError>
     {
-        self.events
-            .send(AgentEvent::DecisionStarted)
-            .map_err(|_| polaris_provider::decision::DecisionError::Cancelled)?;
+        self.observe(state, questions).await.result
+    }
+
+    async fn observe(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+    ) -> polaris_provider::decision::DecisionObservation {
+        if self.events.send(AgentEvent::DecisionStarted).is_err() {
+            let mut observation = polaris_provider::decision::DecisionObservation::single(
+                self.identity(),
+                self.capabilities(),
+                Err(polaris_provider::decision::DecisionError::Cancelled),
+                std::time::Duration::ZERO,
+            );
+            observation.attempts[0].invoked = false;
+            observation.attempts[0].reason = Some("event_sink_closed".into());
+            return observation;
+        }
         let _finished = DecisionFinished(self.events.clone());
-        self.inner.decide(state, questions).await
+        self.inner.observe(state, questions).await
     }
 }
 impl From<mpsc::UnboundedSender<AgentEvent>> for EventSink {
@@ -575,6 +597,7 @@ mod tests {
                 polaris_provider::decision::DecisionCapabilities {
                     location: polaris_provider::decision::DecisionLocation::LocalProcess,
                     max_context_tokens: Some(1024),
+                    band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
                     ..Default::default()
                 }
             }
@@ -593,6 +616,29 @@ mod tests {
                     output_tokens: None,
                 })
             }
+            async fn observe(
+                &self,
+                state: &serde_json::Value,
+                questions: &std::collections::BTreeMap<
+                    String,
+                    polaris_provider::decision::Question,
+                >,
+            ) -> polaris_provider::decision::DecisionObservation {
+                polaris_provider::decision::DecisionObservation::single(
+                    polaris_provider::decision::DecisionIdentity {
+                        backend: "effective".into(),
+                        model: Some("fixture-profile".into()),
+                        revision: None,
+                        quantization: None,
+                    },
+                    polaris_provider::decision::DecisionCapabilities {
+                        max_context_tokens: Some(256),
+                        ..Default::default()
+                    },
+                    self.decide(state, questions).await,
+                    std::time::Duration::ZERO,
+                )
+            }
         }
         let (sink, mut receiver, control) =
             DesktopEventSink::channel(RunId::new("judging").unwrap());
@@ -602,10 +648,16 @@ mod tests {
             observed.capabilities(),
             polaris_provider::decision::Decider::capabilities(&Judge)
         );
-        observed
-            .decide(&serde_json::json!({}), &Default::default())
-            .await
-            .unwrap();
+        let result = observed
+            .observe(&serde_json::json!({}), &Default::default())
+            .await;
+        assert!(result.result.is_ok());
+        assert_eq!(result.identity.backend, "effective");
+        assert_eq!(result.capabilities.max_context_tokens, Some(256));
+        assert_eq!(
+            result.capabilities.band_calibration,
+            polaris_provider::decision::BandCalibration::Unmeasured
+        );
         assert!(matches!(
             receiver.try_recv().unwrap().event,
             AgentEvent::DecisionStarted

@@ -96,6 +96,15 @@ impl JevDecider {
         api_key: String,
         model: String,
     ) -> Result<Self, DecisionError> {
+        Self::new_single_attempt(base_url, api_key, model)
+    }
+
+    /// A bounded typed chain owns the retry budget across all backends.
+    pub fn new_single_attempt(
+        base_url: &str,
+        api_key: String,
+        model: String,
+    ) -> Result<Self, DecisionError> {
         let mut decider = Self::new(base_url, api_key, model)?;
         decider.max_attempts = 1;
         Ok(decider)
@@ -205,6 +214,14 @@ fn outcome(result: &Result<Decision, DecisionError>) -> &'static str {
 
 #[async_trait::async_trait]
 impl Decider for JevDecider {
+    fn identity(&self) -> super::DecisionIdentity {
+        super::DecisionIdentity {
+            backend: "jev".into(),
+            model: Some(self.model.clone()),
+            revision: None,
+            quantization: None,
+        }
+    }
     fn name(&self) -> &str {
         "jev"
     }

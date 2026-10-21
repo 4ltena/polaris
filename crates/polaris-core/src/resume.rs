@@ -136,9 +136,7 @@ pub mod achieved {
         if goal.trim().is_empty() {
             return None;
         }
-        if decider.capabilities().band_calibration
-            != polaris_provider::decision::BandCalibration::LegacyJev
-        {
+        if !decider.may_return_calibrated_bands() {
             return None;
         }
         let mut questions = BTreeMap::new();
@@ -156,9 +154,14 @@ pub mod achieved {
         let answered = tokio::select! {
             biased;
             _ = &mut cancelled => return None,
-            held = decider.decide(&state, &questions) => held,
+            held = decider.observe(&state, &questions) => held,
         };
-        let answer = answered.ok()?;
+        if answered.capabilities.band_calibration
+            != polaris_provider::decision::BandCalibration::LegacyJev
+        {
+            return None;
+        }
+        let answer = answered.result.ok()?;
         polaris_provider::decision::checked(&answer, &questions).ok()?;
         let question = questions.get("achieved")?;
         let held = answer.answers.get("achieved")?;

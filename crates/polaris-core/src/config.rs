@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+mod decision_fallback;
+pub use decision_fallback::DecisionFallback;
 
 /// The merged configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +210,8 @@ impl AnswerFinalizerConfig {
 /// committed and shared; a credential read from the environment is not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DecisionConfig {
+    /// Explicit user-owned typed-routing destinations and limits. None never switches.
+    pub fallback: Option<DecisionFallback>,
     /// Restricts typed judgments and auxiliary arbitration, not main chat.
     /// Project layers may tighten but not undo a user's restriction.
     pub local_only: bool,
@@ -617,6 +621,7 @@ fn parse_size(written: &str) -> Option<u64> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDecision {
+    fallback: Option<decision_fallback::RawFallback>,
     #[serde(default)]
     local_only: Option<bool>,
     #[serde(default)]
@@ -640,6 +645,9 @@ struct RawSidechat {
 
 impl RawDecision {
     fn apply_to(self, merged: &mut DecisionConfig) -> Result<(), ConfigError> {
+        if let Some(fallback) = self.fallback {
+            merged.fallback = Some(fallback.resolve()?);
+        }
         merged.local_only |= self.local_only.unwrap_or(false);
         if let Some(enabled) = self.enabled {
             merged.enabled = enabled;
@@ -678,6 +686,14 @@ impl RawDecision {
     /// Checked after every layer has been applied, because the conflict is
     /// between the final values and not between one file's lines.
     fn settled(merged: &DecisionConfig) -> Result<(), ConfigError> {
+        Self::settled_target(merged)?;
+        if let Some(fallback) = &merged.fallback {
+            fallback.validate(merged)?;
+        }
+        Ok(())
+    }
+
+    fn settled_target(merged: &DecisionConfig) -> Result<(), ConfigError> {
         match (merged.backend, merged.helper.is_some()) {
             // A half-written pin: the backend that needs a helper, without
             // one. Refused rather than started and found wanting later.
@@ -770,6 +786,12 @@ struct RawSpawn {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("[decision.fallback]は利用者のconfigにだけ設定できます")]
+    UserOnlyDecisionFallback,
+    #[error(
+        "[decision.fallback]にはpurposes=[\"routing\"]、1〜3件のtargets、1〜target数+1のmax_attempts、1〜300000ms内の時間上限が必要です"
+    )]
+    InvalidDecisionFallback,
     #[error("cannot read {path}: {source}")]
     Io {
         path: String,
@@ -887,6 +909,9 @@ fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
     for (index, path) in paths.iter().copied().enumerate() {
         let Some(path) = path else { continue };
         if let Some(raw) = read_one::<RawConfig>(path)? {
+            if raw.decision.fallback.is_some() && Some(index) != user_index {
+                return Err(ConfigError::UserOnlyDecisionFallback);
+            }
             let has_user_only = raw.presentation.is_some() || raw.answer_finalizer.is_some();
             if has_user_only && Some(index) != user_index {
                 return Err(ConfigError::UserOnlyFinalizerSetting);
@@ -1024,8 +1049,12 @@ pub fn try_load_decision_from(
         decision: RawDecision,
     }
     let mut merged = Config::default().decision;
-    for path in [global, project].into_iter().flatten() {
+    for (path, is_user) in [(global, true), (project, false)] {
+        let Some(path) = path else { continue };
         if let Some(raw) = read_one::<DecisionOnly>(path)? {
+            if raw.decision.fallback.is_some() && !is_user {
+                return Err(ConfigError::UserOnlyDecisionFallback);
+            }
             raw.decision.apply_to(&mut merged)?;
         }
     }

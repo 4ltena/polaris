@@ -60,6 +60,12 @@ impl Provider for LocalArbiter {
 struct LocalDecider(Arc<dyn Decider>);
 #[async_trait::async_trait]
 impl Decider for LocalDecider {
+    fn may_return_calibrated_bands(&self) -> bool {
+        self.0.may_return_calibrated_bands()
+    }
+    fn identity(&self) -> polaris_provider::decision::DecisionIdentity {
+        self.0.identity()
+    }
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -71,10 +77,25 @@ impl Decider for LocalDecider {
         state: &serde_json::Value,
         questions: &BTreeMap<String, Question>,
     ) -> Result<Decision, DecisionError> {
+        self.observe(state, questions).await.result
+    }
+    async fn observe(
+        &self,
+        state: &serde_json::Value,
+        questions: &BTreeMap<String, Question>,
+    ) -> polaris_provider::decision::DecisionObservation {
         if self.0.capabilities().network != NetworkBoundary::LocalOnly {
-            return Err(DecisionError::Unavailable);
+            let mut observation = polaris_provider::decision::DecisionObservation::single(
+                self.identity(),
+                self.capabilities(),
+                Err(DecisionError::Unavailable),
+                std::time::Duration::ZERO,
+            );
+            observation.attempts[0].invoked = false;
+            observation.attempts[0].reason = Some("local_only".into());
+            return observation;
         }
-        self.0.decide(state, questions).await
+        self.0.observe(state, questions).await
     }
 }
 

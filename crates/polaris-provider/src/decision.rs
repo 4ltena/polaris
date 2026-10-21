@@ -8,10 +8,13 @@
 use serde::{Deserialize, Serialize};
 
 mod capabilities;
+pub mod fallback;
+mod observation;
 pub use capabilities::{
     BandCalibration, DecisionCancellation, DecisionCapabilities, DecisionLocation, DecisionShapes,
     DecisionUsageReporting,
 };
+pub use observation::{DecisionAttempt, DecisionIdentity, DecisionObservation, DecisionTrace};
 
 /// The most options one choice may hold, and the most state one request may
 /// carry. Both are checked before sending rather than after being refused.
@@ -85,7 +88,8 @@ pub struct Decision {
     pub output_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionError {
     /// The state or a question is larger than one request may carry.
     TooLarge,
@@ -109,6 +113,33 @@ pub trait Decider: Send + Sync {
         state: &serde_json::Value,
         questions: &std::collections::BTreeMap<String, Question>,
     ) -> Result<Decision, DecisionError>;
+
+    /// Observe one request without changing the legacy typed-answer API.
+    async fn observe(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<String, Question>,
+    ) -> DecisionObservation {
+        let identity = self.identity();
+        let capabilities = self.capabilities();
+        let started = std::time::Instant::now();
+        let result = self.decide(state, questions).await;
+        DecisionObservation::single(identity, capabilities, result, started.elapsed())
+    }
+
+    fn identity(&self) -> DecisionIdentity {
+        DecisionIdentity {
+            backend: self.name().into(),
+            model: None,
+            revision: None,
+            quantization: None,
+        }
+    }
+
+    /// Eligibility to ask for bands, not a guarantee about the eventual answer.
+    fn may_return_calibrated_bands(&self) -> bool {
+        self.capabilities().band_calibration == BandCalibration::LegacyJev
+    }
 
     /// What answered, for the record.
     ///
@@ -152,9 +183,21 @@ pub struct DecisionUsage {
 /// Shared observation of a judge's consumption, the counterpart of
 /// [`crate::UsageMeter`] for the model side.
 #[derive(Clone, Default)]
-pub struct DecisionMeter(std::sync::Arc<std::sync::Mutex<DecisionUsage>>);
+pub struct DecisionMeter(
+    std::sync::Arc<std::sync::Mutex<DecisionUsage>>,
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<DecisionTrace>>>,
+);
 
 impl DecisionMeter {
+    /// At most 32 recent typed-stage traces; no state or answer content.
+    pub fn recent(&self) -> Vec<DecisionTrace> {
+        self.1
+            .lock()
+            .expect("decision trace poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
     pub fn snapshot(&self) -> DecisionUsage {
         *self.0.lock().expect("decision meter poisoned")
     }
@@ -175,6 +218,12 @@ struct MeteredDecider {
 
 #[async_trait::async_trait]
 impl Decider for MeteredDecider {
+    fn may_return_calibrated_bands(&self) -> bool {
+        self.decider.may_return_calibrated_bands()
+    }
+    fn identity(&self) -> DecisionIdentity {
+        self.decider.identity()
+    }
     fn name(&self) -> &str {
         self.decider.name()
     }
@@ -188,28 +237,53 @@ impl Decider for MeteredDecider {
         state: &serde_json::Value,
         questions: &std::collections::BTreeMap<String, Question>,
     ) -> Result<Decision, DecisionError> {
-        let result = self.decider.decide(state, questions).await;
+        self.observe(state, questions).await.result
+    }
+
+    async fn observe(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<String, Question>,
+    ) -> DecisionObservation {
+        let observation = self.decider.observe(state, questions).await;
         let mut held = self.meter.0.lock().expect("decision meter poisoned");
-        match &result {
-            Ok(decision) => match (decision.input_tokens, decision.output_tokens) {
-                (Some(input), Some(output)) => {
-                    held.reported = held.reported.saturating_add(1);
-                    held.input_tokens = held.input_tokens.saturating_add(input);
-                    held.output_tokens = held.output_tokens.saturating_add(output);
-                }
-                (input, output) => {
-                    held.missing = held.missing.saturating_add(1);
-                    if let Some(input) = input {
+        for attempt in &observation.attempts {
+            match &attempt.error {
+                None => match (attempt.input_tokens, attempt.output_tokens) {
+                    (Some(input), Some(output)) => {
+                        held.reported = held.reported.saturating_add(1);
                         held.input_tokens = held.input_tokens.saturating_add(input);
-                    }
-                    if let Some(output) = output {
                         held.output_tokens = held.output_tokens.saturating_add(output);
                     }
-                }
-            },
-            Err(_) => held.failed = held.failed.saturating_add(1),
+                    (input, output) => {
+                        held.missing = held.missing.saturating_add(1);
+                        if let Some(input) = input {
+                            held.input_tokens = held.input_tokens.saturating_add(input);
+                        }
+                        if let Some(output) = output {
+                            held.output_tokens = held.output_tokens.saturating_add(output);
+                        }
+                    }
+                },
+                Some(_) => held.failed = held.failed.saturating_add(1),
+            }
         }
-        result
+        drop(held);
+        let trace = DecisionTrace {
+            configured: self.decider.identity(),
+            effective: observation.identity.clone(),
+            capabilities: observation.capabilities,
+            error: observation.result.as_ref().err().cloned(),
+            attempts: observation.attempts.clone(),
+        };
+        if serde_json::to_vec(&trace).is_ok_and(|bytes| bytes.len() <= 16 * 1024) {
+            let mut traces = self.meter.1.lock().expect("decision trace poisoned");
+            if traces.len() == 32 {
+                traces.pop_front();
+            }
+            traces.push_back(trace);
+        }
+        observation
     }
 }
 
@@ -218,6 +292,20 @@ impl Decider for MeteredDecider {
 /// wherever the trait is expected, without each caller unwrapping it.
 #[async_trait::async_trait]
 impl<T: Decider + ?Sized> Decider for std::sync::Arc<T> {
+    fn may_return_calibrated_bands(&self) -> bool {
+        (**self).may_return_calibrated_bands()
+    }
+    fn identity(&self) -> DecisionIdentity {
+        (**self).identity()
+    }
+
+    async fn observe(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<String, Question>,
+    ) -> DecisionObservation {
+        (**self).observe(state, questions).await
+    }
     fn name(&self) -> &str {
         (**self).name()
     }

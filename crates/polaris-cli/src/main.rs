@@ -2767,6 +2767,13 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     let tier_weights = prepared_providers.tier_weights.clone();
     let provider = prepared_providers.provider.clone();
     let decision_meter = polaris_provider::decision::DecisionMeter::default();
+    if config.decision.enabled
+        && let Some(fallback) = &config.decision.fallback
+    {
+        for line in fallback.disclosure(&config.decision) {
+            eprintln!("{line}");
+        }
+    }
     let decider = build_decider(&config.decision).map(|decider| decision_meter.wrap(decider));
     // The same judge weighs delegated tasks. One registration, because both
     // ask the same service the same kind of question.

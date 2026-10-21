@@ -375,7 +375,8 @@ pub async fn classify(
         return TurnIntentV1::unavailable(turn, "classifier_unavailable");
     };
     let asked = questions();
-    let decision = match decider.decide(state, &asked).await {
+    let observation = decider.observe(state, &asked).await;
+    let decision = match observation.result {
         Ok(decision) => decision,
         Err(DecisionError::TooLarge) => {
             return TurnIntentV1::unavailable(turn, "classifier_input_too_large");
@@ -417,7 +418,7 @@ pub async fn classify(
         effort: Some(effort),
         route: Some(route_for(utterance, work, clarity, relation, approach)),
         probabilities,
-        decider: Some(decider.name().to_owned()),
+        decider: Some(observation.identity.backend),
         physical_attempts: None,
         unavailable: None,
     }
@@ -485,6 +486,48 @@ mod tests {
             (Approach::KEY.to_owned(), values[4].to_owned()),
             (Effort::KEY.to_owned(), "medium".to_owned()),
         ]))
+    }
+
+    #[tokio::test]
+    async fn fallback_classification_records_the_effective_backend() {
+        struct Observed(Fixed);
+        #[async_trait::async_trait]
+        impl Decider for Observed {
+            fn name(&self) -> &str {
+                "configured"
+            }
+            async fn decide(
+                &self,
+                state: &serde_json::Value,
+                questions: &BTreeMap<String, Question>,
+            ) -> Result<Decision, DecisionError> {
+                self.0.decide(state, questions).await
+            }
+            async fn observe(
+                &self,
+                state: &serde_json::Value,
+                questions: &BTreeMap<String, Question>,
+            ) -> polaris_provider::decision::DecisionObservation {
+                let mut observed = polaris_provider::decision::DecisionObservation::single(
+                    self.identity(),
+                    self.capabilities(),
+                    self.decide(state, questions).await,
+                    std::time::Duration::ZERO,
+                );
+                observed.identity.backend = "effective".into();
+                observed
+            }
+        }
+        let judge = Observed(answers([
+            "instruction",
+            "bug_fix",
+            "clear",
+            "continue",
+            "execute_now",
+        ]));
+        let intent = classify(Some(&judge), &serde_json::Value::Null, 1).await;
+        assert!(intent.classified());
+        assert_eq!(intent.decider.as_deref(), Some("effective"));
     }
 
     async fn route(values: [&str; 5]) -> Route {

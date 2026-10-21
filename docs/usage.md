@@ -76,6 +76,34 @@ Clef/Clef-flashはモデル、量子化、runtime、device、割当contextごと
 
 利用者設定の`local_only = true`は、project設定の`false`では解除できない。この設定が制限するのは判断と補助的な候補選択であり、通常の会話モデルやMCPツール自体の通信許可は別に設定する。
 
+### 型付きbackendの切替
+
+型付きbackend間の切替は、利用者の`~/.polaris/config.toml`に明示した場合だけ行う。project設定から切替先を追加することはできない。次は登録済みClef profileを主に使い、未導入・利用不能などの場合にJevへ切り替える設定例である。`REGISTERED_PROFILE_ID`は実際の登録IDへ置き換える。本番の受入済みClef profileが0件である点は、この設定でも変わらない。
+
+```toml
+[decision]
+enabled = true
+backend = "clef"
+model = "REGISTERED_PROFILE_ID"
+
+[decision.fallback]
+purposes = ["routing"]
+max_attempts = 2
+attempt_timeout_ms = 60000
+total_timeout_ms = 120000
+
+[[decision.fallback.targets]]
+backend = "jev"
+model = "jev-latest"
+base_url = "https://api.typesafe.ai/v1"
+```
+
+`targets`は1〜3件を順番に指定する。`max_attempts`は主backendを含めた試行数で、1から候補総数まで。各試行と全体の時間上限を必須とし、合計は最大300000msである。切替設定時のJevは、backend内で追加の再試行を行わない。起動時に候補の接続先・モデル・用途・上限を表示する。各接続先にはstateと質問を送り、依頼・会話やファイル由来の内容・候補の説明等が含まれる場合がある。
+
+用途は`routing`（候補選択・委任先・継続判定等の通常の型付き判断）だけに対応し、単発のanswer finalizerには適用しない。利用不能・入力超過・時間切れは次候補へ進めるが、認証失敗・設定不正・不正回答・取消では進めない。`local_only = true`と併用する場合は、全候補で通信制限を確認できる必要があり、現在のJev/SemIfを含む切替設定では型付き判断器を有効にしない。fallback設定がなければ、他の型付きbackendへ自動で切り替えない。
+
+切替先へ主backendの校正を流用しない。未校正モデルによる候補絞込みは候補を維持し、判断の呼出自体を省く場合がある。既存の生成モデルによる候補選択は、型付きbackend間の切替とは別の段階である。
+
 `polaris decision list`は登録済みprofile IDと容量の推薦をJSONで表示する。現在の登録は0件である。登録は導入や実行可否の確認ではなく、この操作でJev/SemIfの設定は変わらない。
 
 受入済みprofileと配布情報が登録された後は、手元の固定artifactを次の管理コマンドで導入できる。`PROFILE_ID`と2つの絶対pathを対象に置き換える。

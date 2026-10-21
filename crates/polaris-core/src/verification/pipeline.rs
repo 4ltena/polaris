@@ -244,11 +244,9 @@ pub async fn select_verification_route(
     let (state, questions, question_hash) = build_route_choice(need, candidates)
         .ok_or("verification route candidates are invalid or empty")?;
     let decision = match decider {
-        Some(decider) => decider
-            .decide(&state, &questions)
-            .await
-            .ok()
-            .and_then(|reply| {
+        Some(decider) => {
+            let observation = decider.observe(&state, &questions).await;
+            observation.result.ok().and_then(|reply| {
                 let answer = reply.answers.get("route")?;
                 if answer
                     .confidence
@@ -267,8 +265,12 @@ pub async fn select_verification_route(
                             &stable_id_hash(&[question_hash.clone(), binding.diff_hash.clone()])
                                 [..16]
                         ),
-                        provider: decider.name().into(),
-                        model: "typed-decider".into(),
+                        provider: observation.identity.backend.clone(),
+                        model: observation
+                            .identity
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "typed-decider".into()),
                         question_hash: question_hash.clone(),
                         diff_hash: binding.diff_hash.clone(),
                         candidate_hash: route_candidate_hash(candidates),
@@ -282,7 +284,8 @@ pub async fn select_verification_route(
                                 || reply.output_tokens.is_none(),
                         },
                     })
-            }),
+            })
+        }
         None => None,
     };
     let decision_ref = decision
@@ -401,20 +404,19 @@ pub async fn select_with_advisory_jev(
     let (state, questions, question_hash) = build_jev_batch(need, inventory, candidates)
         .unwrap_or_else(|| (json!({}), BTreeMap::new(), String::new()));
     let decision = match decider {
-        Some(decider) if !questions.is_empty() && !question_hash.is_empty() => decider
-            .decide(&state, &questions)
-            .await
-            .ok()
-            .and_then(|reply| {
+        Some(decider) if !questions.is_empty() && !question_hash.is_empty() => {
+            let observation = decider.observe(&state, &questions).await;
+            observation.result.ok().and_then(|reply| {
                 decision_record(
-                    decider,
+                    &observation.identity,
                     binding,
                     inventory,
                     candidates,
                     &question_hash,
                     reply,
                 )
-            }),
+            })
+        }
         _ => None,
     };
     let decision_ref = decision.as_ref().and_then(|record| {
@@ -515,7 +517,7 @@ fn question_key(candidate_id: &str) -> String {
 }
 
 fn decision_record(
-    decider: &dyn Decider,
+    identity: &polaris_provider::decision::DecisionIdentity,
     binding: &VerificationBindingV1,
     inventory: &TestInventoryV1,
     candidates: &CandidateSetV1,
@@ -555,8 +557,11 @@ fn decision_record(
             "jev-{}",
             &stable_id_hash(&[question_hash.into(), binding.diff_hash.clone()])[..16]
         ),
-        provider: decider.name().into(),
-        model: "typed-decider".into(),
+        provider: identity.backend.clone(),
+        model: identity
+            .model
+            .clone()
+            .unwrap_or_else(|| "typed-decider".into()),
         question_hash: question_hash.into(),
         diff_hash: binding.diff_hash.clone(),
         inventory_hash: inventory.inventory_hash.clone(),
@@ -846,6 +851,7 @@ fn evidence_record_id(kind: &str, criterion_id: &str, source: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod provenance;
     use super::*;
     use crate::{
         common_tests::{RunIdentityV1, RunReport},

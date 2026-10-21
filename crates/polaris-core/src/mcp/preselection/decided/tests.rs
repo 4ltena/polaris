@@ -45,6 +45,14 @@ impl Fake {
 
 #[async_trait::async_trait]
 impl Decider for Fake {
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        // This synthetic fixture exercises the historical numerical policy.
+        polaris_provider::decision::DecisionCapabilities {
+            band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,

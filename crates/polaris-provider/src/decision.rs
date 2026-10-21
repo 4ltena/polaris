@@ -1,10 +1,17 @@
 //! A model that answers typed questions instead of writing text. It takes a
 //! block of state and a set of questions, and returns one typed answer per
-//! question with a calibrated probability. Nothing here generates prose, so
+//! question with probabilities whose calibration is recorded separately.
+//! Nothing here generates prose, so
 //! it is deliberately not the conversational `Provider`: putting a typed
 //! answer into that type's `text` would claim the model wrote it, and into
 //! its `tool_calls` would claim the model asked to run something.
 use serde::{Deserialize, Serialize};
+
+mod capabilities;
+pub use capabilities::{
+    BandCalibration, DecisionCancellation, DecisionCapabilities, DecisionLocation, DecisionShapes,
+    DecisionUsageReporting,
+};
 
 /// The most options one choice may hold, and the most state one request may
 /// carry. Both are checked before sending rather than after being refused.
@@ -112,6 +119,12 @@ pub trait Decider: Send + Sync {
     fn name(&self) -> &str {
         "unknown"
     }
+
+    /// The adapter's own contract. Defaults never claim calibration, locality
+    /// or a model limit merely because an implementation supports this trait.
+    fn capabilities(&self) -> DecisionCapabilities {
+        DecisionCapabilities::default()
+    }
 }
 
 /// What a run's judge consumed, and how often it was asked.
@@ -166,6 +179,10 @@ impl Decider for MeteredDecider {
         self.decider.name()
     }
 
+    fn capabilities(&self) -> DecisionCapabilities {
+        self.decider.capabilities()
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,
@@ -203,6 +220,10 @@ impl Decider for MeteredDecider {
 impl<T: Decider + ?Sized> Decider for std::sync::Arc<T> {
     fn name(&self) -> &str {
         (**self).name()
+    }
+
+    fn capabilities(&self) -> DecisionCapabilities {
+        (**self).capabilities()
     }
 
     async fn decide(

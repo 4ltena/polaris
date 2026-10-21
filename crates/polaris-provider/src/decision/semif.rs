@@ -95,6 +95,17 @@ impl Decider for SemIfDecider {
         "semif"
     }
 
+    fn capabilities(&self) -> super::DecisionCapabilities {
+        super::DecisionCapabilities {
+            location: super::DecisionLocation::LocalProcess,
+            protocol: Some("semif-ndjson-v1"),
+            shapes: Some(super::DecisionShapes::ALL),
+            cancellation: super::DecisionCancellation::CallerFuture,
+            usage: super::DecisionUsageReporting::Optional,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,
@@ -138,6 +149,22 @@ impl Decider for SemIfDecider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_capabilities_do_not_invent_model_limits_or_calibration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helper");
+        std::fs::write(&path, b"never executed").unwrap();
+        let held = SemIfDecider::available(Some(&path)).unwrap().capabilities();
+        assert_eq!(held.location, super::super::DecisionLocation::LocalProcess);
+        assert_eq!(
+            held.band_calibration,
+            super::super::BandCalibration::Unmeasured
+        );
+        assert_eq!(held.max_context_tokens, None);
+        assert_eq!(held.max_options, None);
+        assert_eq!(held.max_questions, None);
+    }
 
     fn questions() -> BTreeMap<String, Question> {
         BTreeMap::from([

@@ -20,7 +20,7 @@
 //! the requests this exists to serve — the same failure
 //! `mcp::preselection::fitting` documents for tools.
 
-use crate::decision_bands::{Bands, Refused};
+use crate::decision_bands::Refused;
 
 /// The heading the routed files are put under.
 ///
@@ -203,9 +203,14 @@ pub async fn route<'a>(
         )
         .await
         {
-            Ok(Bands { adopted: taken, .. }) => {
+            Ok(bands) => {
                 answered += 1;
-                adopted.extend(taken.into_iter().filter_map(|index| chunk.get(index)));
+                adopted.extend(
+                    bands
+                        .context_candidates()
+                        .into_iter()
+                        .filter_map(|index| chunk.get(index)),
+                );
             }
             // A stop is the person's, and is not partial progress.
             Err(Refused::Cancelled) => return Err(Refused::Cancelled),

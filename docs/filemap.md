@@ -1352,6 +1352,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-provider/src/decision`
 
+- `capabilities.rs` — Adapter contracts, not evidence of a running model or current calibration.
 - `jev.rs` — J-4: the HTTP client for a System One decider.
 - `semif.rs` — The local typed decider, over a pinned SemIf helper.
 - `tests.rs` — Types and checking only; nothing is sent.

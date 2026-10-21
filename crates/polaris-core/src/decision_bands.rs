@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 
-use polaris_provider::decision::{Decider, DecisionError, Question};
+use polaris_provider::decision::{BandCalibration, Decider, DecisionError, Question, checked};
 
 /// The two edges of the middle band. Above `ADOPT` a candidate is taken on
 /// the typed answer alone; at or below `EXCLUDE` it is dropped; between
@@ -50,6 +50,8 @@ pub fn question(query: &str, kind: &str, name: &str, description: &str) -> Quest
 /// candidates arrived in, so the result never depends on sort details.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Bands {
+    /// Historical policy or an explicitly unmeasured conservative result.
+    pub calibration: BandCalibration,
     /// Taken on the typed answer alone.
     pub adopted: Vec<usize>,
     /// Neither taken nor dropped. Only these are worth a light model's
@@ -59,6 +61,18 @@ pub struct Bands {
     /// band takes is what the calibration measures; the candidates
     /// themselves are not needed again.
     pub excluded: usize,
+}
+
+impl Bands {
+    /// Context-only callers have no arbiter stage. Keep unmeasured candidates
+    /// eligible instead of treating an empty adopted band as an empty result.
+    pub(crate) fn context_candidates(self) -> Vec<usize> {
+        let mut held = self.adopted;
+        if self.calibration == BandCalibration::Unmeasured {
+            held.extend(self.middle);
+        }
+        held
+    }
 }
 
 /// Why a judgement produced nothing. Callers map this onto whatever their
@@ -137,12 +151,29 @@ pub async fn judge_with(
     let count = questions.len();
 
     tokio::pin!(cancelled);
+    let calibration = decider.capabilities().band_calibration;
+    if calibration == BandCalibration::Unmeasured {
+        // These thresholds cannot turn an uncalibrated probability into a
+        // decision. Leave every candidate for the existing arbiter/context
+        // budget; no pointless model request is sent for a discarded score.
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => return Err(Refused::Cancelled),
+            _ = std::future::ready(()) => {}
+        }
+        return Ok(Bands {
+            middle: (0..count).collect(),
+            calibration,
+            ..Default::default()
+        });
+    }
     let answered = tokio::select! {
         biased;
         _ = &mut cancelled => return Err(Refused::Cancelled),
         held = decider.decide(state, &questions) => held,
     };
     let answered = answered.map_err(Refused::from)?;
+    checked(&answered, &questions).map_err(Refused::from)?;
 
     // Every candidate must come back answered. A reply that skips one is
     // not a narrower answer, it is an answer to a different question set.
@@ -171,6 +202,7 @@ pub async fn judge_with(
             .then(left.0.cmp(&right.0))
     });
     let mut bands = Bands {
+        calibration,
         excluded,
         ..Default::default()
     };

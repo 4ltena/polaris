@@ -170,6 +170,14 @@ mod achieved_tests {
     }
     #[async_trait::async_trait]
     impl Decider for Stub {
+        fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+            // This synthetic fixture exercises the historical numerical policy.
+            polaris_provider::decision::DecisionCapabilities {
+                band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+                ..Default::default()
+            }
+        }
+
         async fn decide(
             &self,
             _: &serde_json::Value,
@@ -200,6 +208,25 @@ mod achieved_tests {
                 output_tokens: Some(0),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn unmeasured_probabilities_never_decide_goal_completion() {
+        struct Unknown;
+        #[async_trait::async_trait]
+        impl Decider for Unknown {
+            async fn decide(
+                &self,
+                _: &serde_json::Value,
+                _: &BTreeMap<String, Question>,
+            ) -> Result<Typed, DecisionError> {
+                panic!("unmeasured backend must not inherit goal-completion thresholds")
+            }
+        }
+        assert_eq!(
+            judge(&Unknown, "goal", "evidence", std::future::pending()).await,
+            None
+        );
     }
 
     async fn asked(yes: Option<f64>) -> Option<bool> {

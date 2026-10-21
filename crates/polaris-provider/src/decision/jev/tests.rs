@@ -229,3 +229,55 @@ fn the_endpoint_is_built_from_the_versioned_root() {
         .expect("the client builds");
     assert_eq!(held.endpoint, "https://api.example.invalid/v1/systemone");
 }
+
+#[test]
+fn capability_policy_is_not_inherited_by_compatible_endpoints_or_other_models() {
+    use crate::decision::{BandCalibration, DecisionLocation};
+    let build = |base: &str, model: &str| {
+        JevDecider::new(base, "synthetic-only".into(), model.into())
+            .unwrap()
+            .capabilities()
+    };
+    let historical = build("https://api.typesafe.ai/v1", "jev-latest");
+    assert_eq!(historical.band_calibration, BandCalibration::LegacyJev);
+    assert_eq!(historical.max_state_tokens, Some(32_000));
+    assert_eq!(historical.max_options, Some(255));
+    for (base, model, location) in [
+        (
+            "https://api.typesafe.ai/v1",
+            "another-model",
+            DecisionLocation::Remote,
+        ),
+        (
+            "https://example.invalid/v1",
+            "jev-latest",
+            DecisionLocation::Remote,
+        ),
+        (
+            "http://127.0.0.1:1234/v1",
+            "jev-latest",
+            DecisionLocation::LoopbackHttp,
+        ),
+        (
+            "http://[::1]:1234/v1",
+            "jev-latest",
+            DecisionLocation::LoopbackHttp,
+        ),
+        (
+            "http://localhost:1234/v1",
+            "jev-latest",
+            DecisionLocation::Remote,
+        ),
+        (
+            "http://127.0.0.1.example.invalid/v1",
+            "jev-latest",
+            DecisionLocation::Remote,
+        ),
+    ] {
+        let held = build(base, model);
+        assert_eq!(held.location, location, "{base}");
+        assert_eq!(held.band_calibration, BandCalibration::Unmeasured);
+        assert_eq!(held.max_state_tokens, None);
+        assert_eq!(held.max_options, None);
+    }
+}

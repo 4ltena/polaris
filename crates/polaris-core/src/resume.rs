@@ -136,6 +136,11 @@ pub mod achieved {
         if goal.trim().is_empty() {
             return None;
         }
+        if decider.capabilities().band_calibration
+            != polaris_provider::decision::BandCalibration::LegacyJev
+        {
+            return None;
+        }
         let mut questions = BTreeMap::new();
         questions.insert(
             "achieved".to_owned(),
@@ -154,6 +159,7 @@ pub mod achieved {
             held = decider.decide(&state, &questions) => held,
         };
         let answer = answered.ok()?;
+        polaris_provider::decision::checked(&answer, &questions).ok()?;
         let question = questions.get("achieved")?;
         let held = answer.answers.get("achieved")?;
         let yes = held.answers(question).then_some(held.noul).flatten()?;

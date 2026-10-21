@@ -73,7 +73,29 @@ fn response() -> serde_json::Value {
 #[test]
 fn construction_is_lazy_and_refuses_unpinned_or_aliased_resources() {
     let (_dir, c) = config();
-    assert!(ClefDecider::new(c.clone()).is_ok());
+    let decider = ClefDecider::new(c.clone()).unwrap();
+    let held = decider.capabilities();
+    assert_eq!(
+        held.location,
+        polaris_provider::decision::DecisionLocation::LocalProcess
+    );
+    assert_eq!(
+        held.band_calibration,
+        polaris_provider::decision::BandCalibration::Unmeasured
+    );
+    assert_eq!(held.max_context_tokens, Some(1024));
+    assert_eq!(held.max_state_tokens, None);
+    assert_eq!(held.max_questions, Some(64));
+    assert_eq!(held.max_options, Some(255));
+    assert_eq!(held.max_frame_bytes, Some(wire::MAX_FRAME));
+    assert_eq!(
+        held.usage,
+        polaris_provider::decision::DecisionUsageReporting::Required
+    );
+    assert_eq!(
+        held.cancellation,
+        polaris_provider::decision::DecisionCancellation::OwnedProcess
+    );
     assert_eq!(fs::read_dir(&c.private_root).unwrap().count(), 2);
     for bad in [
         ClefConfig {

@@ -99,6 +99,14 @@ struct Picks {
 
 #[async_trait::async_trait]
 impl Decider for Picks {
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        // This synthetic fixture exercises the historical numerical policy.
+        polaris_provider::decision::DecisionCapabilities {
+            band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         _state: &serde_json::Value,
@@ -220,4 +228,26 @@ async fn an_empty_request_or_an_empty_ledger_asks_nothing() {
             .is_empty()
     );
     assert!(judge.asked.lock().unwrap().is_empty());
+}
+
+struct Unmeasured;
+#[async_trait::async_trait]
+impl Decider for Unmeasured {
+    async fn decide(
+        &self,
+        _: &serde_json::Value,
+        _: &BTreeMap<String, Question>,
+    ) -> Result<Decision, DecisionError> {
+        panic!("unmeasured probabilities must not be requested for numerical bands")
+    }
+}
+
+#[tokio::test]
+async fn an_unmeasured_backend_retains_context_candidates_in_original_order() {
+    let entries = vec![entry("2026-10-20", "first"), entry("2026-10-21", "second")];
+    let picked = route(&Unmeasured, &entries, "query").await.unwrap();
+    assert_eq!(
+        picked.iter().map(|entry| &entry.what).collect::<Vec<_>>(),
+        entries.iter().map(|entry| &entry.what).collect::<Vec<_>>()
+    );
 }

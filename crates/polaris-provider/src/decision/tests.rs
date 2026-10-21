@@ -301,6 +301,14 @@ async fn shared_and_metered_judges_retain_the_backend_identity() {
             "synthetic-backend"
         }
 
+        fn capabilities(&self) -> DecisionCapabilities {
+            DecisionCapabilities {
+                location: DecisionLocation::LocalProcess,
+                max_context_tokens: Some(1024),
+                ..Default::default()
+            }
+        }
+
         async fn decide(
             &self,
             _: &serde_json::Value,
@@ -315,11 +323,14 @@ async fn shared_and_metered_judges_retain_the_backend_identity() {
     }
     let shared: std::sync::Arc<dyn Decider> = std::sync::Arc::new(Named);
     assert_eq!(shared.name(), "synthetic-backend");
+    assert_eq!(shared.capabilities(), Named.capabilities());
     let meter = DecisionMeter::default();
     let metered = meter.wrap(shared);
     assert_eq!(metered.name(), "synthetic-backend");
+    assert_eq!(metered.capabilities(), Named.capabilities());
     let nested = std::sync::Arc::new(metered);
     assert_eq!(nested.name(), "synthetic-backend");
+    assert_eq!(nested.capabilities(), Named.capabilities());
     nested
         .decide(&serde_json::Value::Null, &Default::default())
         .await
@@ -379,4 +390,19 @@ async fn the_judges_own_consumption_is_counted() {
     assert_eq!(held.reported, 2);
     assert_eq!(held.missing, 3, "使用量が全て揃わなかった回答");
     assert_eq!(held.failed, 1, "答えなかった分");
+}
+
+#[test]
+fn unknown_capabilities_never_claim_locality_limits_or_calibration() {
+    let held = DecisionCapabilities::default();
+    assert!(!held.location.is_local());
+    assert_eq!(held.band_calibration, BandCalibration::Unmeasured);
+    assert_eq!(held.shapes, None);
+    assert_eq!(held.max_state_tokens, None);
+    assert_eq!(held.max_context_tokens, None);
+    assert_eq!(held.max_questions, None);
+    assert_eq!(held.max_options, None);
+    assert_eq!(held.max_frame_bytes, None);
+    assert_eq!(held.cancellation, DecisionCancellation::Unknown);
+    assert_eq!(held.usage, DecisionUsageReporting::Unknown);
 }

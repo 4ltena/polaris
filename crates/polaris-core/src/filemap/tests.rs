@@ -165,6 +165,14 @@ fn yes() -> Answer {
 
 #[async_trait::async_trait]
 impl Decider for Everything {
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        // This synthetic fixture exercises the historical numerical policy.
+        polaris_provider::decision::DecisionCapabilities {
+            band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         _state: &serde_json::Value,
@@ -232,6 +240,14 @@ struct FailsOnce {
 
 #[async_trait::async_trait]
 impl Decider for FailsOnce {
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        // This synthetic fixture exercises the historical numerical policy.
+        polaris_provider::decision::DecisionCapabilities {
+            band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         _state: &serde_json::Value,
@@ -279,6 +295,10 @@ async fn a_judge_that_never_answers_refuses_rather_than_reporting_no_match() {
     struct Never;
     #[async_trait::async_trait]
     impl Decider for Never {
+        fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+            Everything::new().capabilities()
+        }
+
         async fn decide(
             &self,
             _state: &serde_json::Value,
@@ -331,4 +351,28 @@ fn the_repositorys_own_map_parses() {
             entry.path
         );
     }
+}
+
+struct Unmeasured;
+#[async_trait::async_trait]
+impl Decider for Unmeasured {
+    async fn decide(
+        &self,
+        _: &serde_json::Value,
+        _: &BTreeMap<String, Question>,
+    ) -> Result<Decision, DecisionError> {
+        panic!("unmeasured probabilities must not be requested for numerical bands")
+    }
+}
+
+#[tokio::test]
+async fn an_unmeasured_backend_retains_context_candidates_in_original_order() {
+    let entries = vec![entry("first.rs", "first"), entry("second.rs", "second")];
+    let picked = route(&Unmeasured, &entries, "query", "implement")
+        .await
+        .unwrap();
+    assert_eq!(
+        picked.iter().map(|entry| &entry.path).collect::<Vec<_>>(),
+        entries.iter().map(|entry| &entry.path).collect::<Vec<_>>()
+    );
 }

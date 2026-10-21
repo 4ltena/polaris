@@ -133,6 +133,14 @@ async fn the_shared_finalizer_factory_does_not_retry_a_failed_observation() {
 
 #[async_trait::async_trait]
 impl Decider for Stub {
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        // This synthetic fixture exercises the historical numerical policy.
+        polaris_provider::decision::DecisionCapabilities {
+            band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         _: &serde_json::Value,
@@ -226,6 +234,14 @@ async fn not_getting_an_answer_is_never_read_as_nothing_fits() {
     struct Failing(DecisionError);
     #[async_trait::async_trait]
     impl Decider for Failing {
+        fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+            // This synthetic fixture exercises the historical numerical policy.
+            polaris_provider::decision::DecisionCapabilities {
+                band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+                ..Default::default()
+            }
+        }
+
         async fn decide(
             &self,
             _: &serde_json::Value,
@@ -253,4 +269,99 @@ async fn not_getting_an_answer_is_never_read_as_nothing_fits() {
         .await;
         assert_eq!(held, Err(expected), "{error:?}");
     }
+}
+
+struct Unmeasured;
+#[async_trait::async_trait]
+impl Decider for Unmeasured {
+    async fn decide(
+        &self,
+        _: &serde_json::Value,
+        _: &BTreeMap<String, Question>,
+    ) -> Result<Decision, DecisionError> {
+        panic!("unmeasured probabilities must not be requested for numerical bands")
+    }
+}
+
+#[tokio::test]
+async fn an_unmeasured_backend_retains_all_candidates_without_inference() {
+    let bands = judge(
+        &Unmeasured,
+        &serde_json::json!({}),
+        "query",
+        "skill",
+        &candidates(),
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bands.calibration,
+        polaris_provider::decision::BandCalibration::Unmeasured
+    );
+    assert!(bands.adopted.is_empty());
+    assert_eq!(bands.middle, vec![0, 1, 2]);
+    assert_eq!(bands.excluded, 0);
+    assert_eq!(bands.context_candidates(), vec![0, 1, 2]);
+    assert_eq!(
+        judge(
+            &Unmeasured,
+            &serde_json::json!({}),
+            "query",
+            "skill",
+            &candidates(),
+            std::future::ready(())
+        )
+        .await,
+        Err(Refused::Cancelled)
+    );
+}
+
+#[test]
+fn historical_context_selection_does_not_adopt_the_middle_band() {
+    let bands = Bands {
+        calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+        adopted: vec![2],
+        middle: vec![0],
+        excluded: 1,
+    };
+    assert_eq!(bands.context_candidates(), vec![2]);
+}
+
+#[tokio::test]
+async fn a_legacy_reply_with_unrequested_answers_is_refused() {
+    struct Extra;
+    #[async_trait::async_trait]
+    impl Decider for Extra {
+        fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+            Stub(vec![]).capabilities()
+        }
+        async fn decide(
+            &self,
+            state: &serde_json::Value,
+            asked: &BTreeMap<String, Question>,
+        ) -> Result<Decision, DecisionError> {
+            let mut held = Stub(vec![0.9; asked.len()]).decide(state, asked).await?;
+            held.answers.insert(
+                "unrequested".into(),
+                Answer {
+                    noul: Some(0.9),
+                    ..Default::default()
+                },
+            );
+            Ok(held)
+        }
+    }
+    assert_eq!(
+        judge(
+            &Extra,
+            &serde_json::json!({}),
+            "query",
+            "skill",
+            &candidates(),
+            std::future::pending()
+        )
+        .await,
+        Err(Refused::InvalidOutput)
+    );
 }

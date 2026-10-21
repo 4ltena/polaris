@@ -374,9 +374,14 @@ pub async fn route<'a>(
     let mut refusal = None;
     for chunk in entries.chunks(size) {
         match judge(decider, &state, query, chunk).await {
-            Ok(Bands { adopted, .. }) => {
+            Ok(bands) => {
                 answered += 1;
-                matched.extend(adopted.into_iter().filter_map(|index| chunk.get(index)));
+                matched.extend(
+                    bands
+                        .context_candidates()
+                        .into_iter()
+                        .filter_map(|index| chunk.get(index)),
+                );
             }
             Err(Refused::Cancelled) => return Err(Refused::Cancelled),
             Err(failure) => refusal = Some(failure),

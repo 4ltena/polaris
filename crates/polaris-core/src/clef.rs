@@ -122,6 +122,25 @@ impl Decider for ClefDecider {
         "clef"
     }
 
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        use polaris_provider::decision::{
+            DecisionCancellation, DecisionCapabilities, DecisionLocation, DecisionShapes,
+            DecisionUsageReporting,
+        };
+        DecisionCapabilities {
+            location: DecisionLocation::LocalProcess,
+            protocol: Some("clef-stdio-v1"),
+            shapes: Some(DecisionShapes::ALL),
+            max_context_tokens: Some(self.config.context_tokens as usize),
+            max_questions: Some(64),
+            max_options: Some(255),
+            max_frame_bytes: Some(wire::MAX_FRAME),
+            cancellation: DecisionCancellation::OwnedProcess,
+            usage: DecisionUsageReporting::Required,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,

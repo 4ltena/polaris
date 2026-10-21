@@ -174,6 +174,14 @@ struct Judge {
 
 #[async_trait::async_trait]
 impl polaris_provider::decision::Decider for Judge {
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        // This synthetic fixture exercises the historical numerical policy.
+        polaris_provider::decision::DecisionCapabilities {
+            band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         _state: &serde_json::Value,

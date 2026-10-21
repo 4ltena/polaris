@@ -66,6 +66,14 @@ struct CountingDecider(AtomicUsize);
 
 #[async_trait::async_trait]
 impl Decider for CountingDecider {
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        // This fixture checks dispatch through the historical band policy.
+        polaris_provider::decision::DecisionCapabilities {
+            band_calibration: polaris_provider::decision::BandCalibration::LegacyJev,
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         _: &serde_json::Value,

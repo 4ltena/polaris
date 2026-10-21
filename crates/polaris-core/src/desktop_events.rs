@@ -124,6 +124,14 @@ impl Drop for DecisionFinished {
 
 #[async_trait::async_trait]
 impl polaris_provider::decision::Decider for ObservedDecider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+        self.inner.capabilities()
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,
@@ -560,6 +568,17 @@ mod tests {
         struct Judge;
         #[async_trait::async_trait]
         impl polaris_provider::decision::Decider for Judge {
+            fn name(&self) -> &str {
+                "synthetic"
+            }
+            fn capabilities(&self) -> polaris_provider::decision::DecisionCapabilities {
+                polaris_provider::decision::DecisionCapabilities {
+                    location: polaris_provider::decision::DecisionLocation::LocalProcess,
+                    max_context_tokens: Some(1024),
+                    ..Default::default()
+                }
+            }
+
             async fn decide(
                 &self,
                 _: &serde_json::Value,
@@ -578,6 +597,11 @@ mod tests {
         let (sink, mut receiver, control) =
             DesktopEventSink::channel(RunId::new("judging").unwrap());
         let observed = sink.observe_decider(Arc::new(Judge));
+        assert_eq!(observed.name(), "synthetic");
+        assert_eq!(
+            observed.capabilities(),
+            polaris_provider::decision::Decider::capabilities(&Judge)
+        );
         observed
             .decide(&serde_json::json!({}), &Default::default())
             .await

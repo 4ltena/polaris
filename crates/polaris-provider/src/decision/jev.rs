@@ -209,6 +209,46 @@ impl Decider for JevDecider {
         "jev"
     }
 
+    fn capabilities(&self) -> super::DecisionCapabilities {
+        use super::{
+            BandCalibration, DecisionCancellation, DecisionCapabilities, DecisionLocation,
+            DecisionShapes, DecisionUsageReporting, MAX_OPTIONS, MAX_STATE_TOKENS,
+        };
+        // Preserve the historical policy only for its existing service/model.
+        // A configured compatible endpoint or another model is not calibrated
+        // merely because it speaks the same wire format.
+        let legacy =
+            self.endpoint == "https://api.typesafe.ai/v1/systemone" && self.model == "jev-latest";
+        let loopback = reqwest::Url::parse(&self.endpoint).ok().is_some_and(|url| {
+            url.host_str()
+                .and_then(|host| {
+                    host.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                })
+                .is_some_and(|ip| ip.is_loopback())
+        });
+        DecisionCapabilities {
+            location: if loopback {
+                DecisionLocation::LoopbackHttp
+            } else {
+                DecisionLocation::Remote
+            },
+            protocol: Some("systemone-http-v1"),
+            shapes: Some(DecisionShapes::ALL),
+            max_state_tokens: legacy.then_some(MAX_STATE_TOKENS),
+            max_options: legacy.then_some(MAX_OPTIONS),
+            cancellation: DecisionCancellation::CallerFuture,
+            usage: DecisionUsageReporting::Optional,
+            band_calibration: if legacy {
+                BandCalibration::LegacyJev
+            } else {
+                BandCalibration::Unmeasured
+            },
+            ..Default::default()
+        }
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,

@@ -3178,8 +3178,10 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
             let provider: std::sync::Arc<dyn polaris_provider::Provider> =
                 std::sync::Arc::new(usage_meter.wrap(provider.clone()));
             let mcp_selection_provider = mcp_selection_provider.map(|provider| {
-                std::sync::Arc::new(usage_meter.wrap(provider))
-                    as std::sync::Arc<dyn polaris_provider::Provider>
+                std::sync::Arc::new(usage_meter.wrap(polaris_core::audit::observe_arbitration(
+                    provider,
+                    audit.clone(),
+                ))) as std::sync::Arc<dyn polaris_provider::Provider>
             });
             let mut session = Session::new();
             session.input_preparation = input_preparation;

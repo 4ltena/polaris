@@ -299,7 +299,12 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/audit`
 
+- `arbitration.rs` — Metadata-only observation of existing generative selection calls.
 - `decision.rs` — Metadata-only typed-stage audit. An unmatched start has unknown completion/usage.
+
+## `crates/polaris-core/src/audit/arbitration`
+
+- `tests.rs` — Generative receipts preserve calls, missing usage and unknown cancellation.
 
 ## `crates/polaris-core/src/audit/decision`
 

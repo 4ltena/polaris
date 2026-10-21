@@ -654,3 +654,64 @@ fn a_refused_reply_leaves_nothing_behind() {
         "only what the typed stage settled survives; nothing from the refused reply"
     );
 }
+
+#[test]
+fn generative_arbitration_audit_preserves_existing_triggers_and_selection_results() {
+    for scenario in 0..6 {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("audit");
+        let reply = if scenario == 3 {
+            "invalid output"
+        } else {
+            r#"{"tools":[0]}"#
+        };
+        let baseline = Arbiter::choosing(reply);
+        let observed = std::sync::Arc::new(Arbiter::choosing(reply));
+        let provider = crate::audit::observe_arbitration(
+            observed.clone(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::audit::AuditLog::open(&log).unwrap(),
+            )),
+        );
+        let fake = match scenario {
+            1 => Fake::new(&[(0, 0.95), (1, 0.9), (2, 0.85)]),
+            2 => Fake::failing(DecisionError::Unavailable),
+            4 => Fake::failing(DecisionError::Cancelled),
+            _ => Fake::new(&[(0, 0.95), (1, 0.6), (2, 0.1)]),
+        };
+        let run = |arbiter: &dyn polaris_provider::Provider| {
+            if scenario == 5 {
+                let index = index(THREE);
+                runtime().block_on(select(
+                    Some(arbiter),
+                    Ok(Some(&index)),
+                    "ファイルを扱いたい",
+                    "implement",
+                    std::future::pending(),
+                ))
+            } else {
+                let held = decided_with(&fake, Some(arbiter), THREE, "ファイルを扱いたい");
+                (held.picks, held.status)
+            }
+        };
+        let (plain_picks, plain_status) = run(&baseline);
+        let (audited_picks, audited_status) = run(provider.as_ref());
+        assert_eq!(plain_status, audited_status);
+        assert_eq!(
+            plain_picks.iter().map(|pick| &pick.key).collect::<Vec<_>>(),
+            audited_picks
+                .iter()
+                .map(|pick| &pick.key)
+                .collect::<Vec<_>>()
+        );
+        let calls = baseline.seen.lock().unwrap().len();
+        assert_eq!(calls, if scenario == 1 || scenario == 4 { 0 } else { 1 });
+        assert_eq!(observed.seen.lock().unwrap().len(), calls);
+        if calls > 0 {
+            assert_eq!(baseline.shown(), observed.shown());
+        }
+        let saved = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(saved.lines().count(), calls * 2);
+        assert!(!saved.contains("ファイルを扱いたい"));
+    }
+}

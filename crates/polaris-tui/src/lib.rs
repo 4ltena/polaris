@@ -3235,6 +3235,9 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
     if let Some(meter) = args.decider.as_ref().and_then(|held| held.telemetry()) {
         polaris_core::audit::install_decision_observer(&meter, audit.clone());
     }
+    args.mcp_selection_provider = args
+        .mcp_selection_provider
+        .map(|provider| polaris_core::audit::observe_arbitration(provider, audit.clone()));
 
     #[cfg(target_os = "linux")]
     let mut source_frontend = source_apply::Frontend::open(&args, audit.clone());

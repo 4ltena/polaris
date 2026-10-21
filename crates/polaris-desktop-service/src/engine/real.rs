@@ -1326,7 +1326,12 @@ impl Engine {
                                         #[cfg(target_os = "linux")]
                                         let index = Ok(None);
                                         let selector = mcp.selection_provider.map(|provider| {
-                                            Arc::new(active.usage.wrap(provider))
+                                            Arc::new(active.usage.wrap(
+                                                polaris_core::audit::observe_arbitration(
+                                                    provider,
+                                                    inputs.audit.clone(),
+                                                ),
+                                            ))
                                                 as Arc<dyn Provider>
                                         });
                                         DesktopRequestContext::Mcp {

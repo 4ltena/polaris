@@ -8,6 +8,8 @@ use std::path::Path;
 
 mod decision;
 pub use decision::install_decision_observer;
+mod arbitration;
+pub use arbitration::observe_arbitration;
 
 use crate::secret_screen::{FilterResult, screen_text};
 

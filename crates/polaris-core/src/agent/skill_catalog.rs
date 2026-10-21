@@ -386,11 +386,19 @@ mod tests {
     #[tokio::test]
     async fn only_the_undecided_are_shown_to_the_light_model() {
         let mut catalog = Catalog::new(three(), "作業".into());
-        let arbiter = Arbiter::new(r#"{"skills":[0]}"#);
+        let arbiter = std::sync::Arc::new(Arbiter::new(r#"{"skills":[0]}"#));
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("audit");
+        let observed = crate::audit::observe_arbitration(
+            arbiter.clone(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::audit::AuditLog::open(&log).unwrap(),
+            )),
+        );
         catalog
             .narrow(
                 &Judge(vec![0.95, 0.6, 0.1]),
-                Some(&arbiter),
+                Some(observed.as_ref()),
                 std::future::pending(),
             )
             .await;
@@ -402,6 +410,10 @@ mod tests {
         let projected = catalog.project(&[]);
         assert!(projected.text.contains("校正") && projected.text.contains("整形"));
         assert!(!projected.text.contains("配備"));
+        let saved = std::fs::read_to_string(log).unwrap();
+        assert_eq!(saved.lines().count(), 2);
+        assert!(saved.contains("generative_arbitration"));
+        assert!(!saved.contains("作業"));
     }
 
     #[tokio::test]

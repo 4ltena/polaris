@@ -112,6 +112,8 @@ Clefの容量判定には、主会話・補助selector・委譲先が今後追�
 
 実行ownerは、同居予定量を既存の予備量へ加え、要求に紐付いた容量判定・budget・必要量・拒否理由をstatus/auditへ返す。判定はメモリ予約ではない。warm時も検証済みの全peakを保守的な上限として使い、未検証の常駐RSSを差し引かない。strict履歴のembeddingなど、まだ容量を束縛できない追加資源が有効な場合や、desktopで実行provider群が未確定の呼出では、Clefは同居容量未確認として拒否する。Jev/SemIfの選択経路は維持する。
 
+MCP・skill選択の既存の生成仲裁は、typed判断のauditとは別の`generative_arbitration` stageへ開始・応答・経過時間・使用量/欠測を記録する。設定されたProviderの要求model名は記録するが、実backend/modelの確認として扱わない。本文・回答・エラー本文は保存しない。応答受信は選択結果の採用ではなく、従来の回答検証を続ける。取消などで開始だけが残った記録は完了・消費不明。監査開始を書けなければdispatchせず、完了を書けなければ回答を採用せず、再送しない。既知の消費量は保持する。仲裁のobserverには監査完了後の最終textだけを通知する。
+
 macOS desktopのV2 snapshotにも同じ型付き判断の診断を表示する。対象は起動中のservice owner全体で、会話別の使用量や再起動前の実績ではない。設定済みbackendと観測結果、構築不可・未観測・容量拒否を区別し、snapshot取得時の値として表示する。取得は判断器や接続確認を起動しない。旧V1 snapshotには追加しない。
 
 `polaris decision list`は登録済みprofile IDと容量の推薦をJSONで表示する。現在の登録は0件である。登録は導入や実行可否の確認ではなく、この操作でJev/SemIfの設定は変わらない。

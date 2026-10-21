@@ -170,7 +170,26 @@ polaris decision repair PROFILE_ID --worker /absolute/path/worker --model /absol
 
 GUIにも「既存generationを保持して修復する」を用意し、保持先を含む修復計画を同じCLI childへ確認する。導入計画の確認を修復へ流用できず、対象・操作を変更したら計画を作り直す。保持先表示は計画値であり、処理を中断した場合に配置済みという証明にはならない。
 
-macOSインストーラの「モデル」ページにも「Clef判断器の導入と選択（任意）」がある。「登録profileを確認」で同梱CLIの登録と容量推薦を読み、登録がある場合だけprofileと手元のworker/modelファイルを選べる。表示された取得元、license/NOTICE、component、size/SHA、導入先を確認して「この計画で導入」を押す。GUIが起動した同じCLIプロセスへ今回の計画hashを返すため、別の計画への確認流用は行わない。確認待ちは120秒で、対象を変えた場合や期限切れ時は計画を作り直す。現在の登録は0件であり、導入ボタンは提供されない。 登録profileを選んだ後は、worker/modelの元ファイルを選ばずに「導入済みgenerationを検証」を実行できる。固定hashの照合結果、未導入、受入未完了、整合性不明、非対応、取消を表示する。profileを変更したときや操作を取り消したときは以前の検証結果を消す。検証成功だけではbackendを選択・有効化せず、現在の空登録では検証ボタンも表示しない。
+### 固定配布元からの取得
+
+固定download情報まで登録されたprofileでは、手元にworker/modelを用意する代わりに、次の管理コマンドで取得できる。現在は受入済みprofileが0件のため、この経路もまだ利用できない。
+
+```sh
+polaris decision list
+polaris decision plan-download PROFILE_ID
+polaris decision download PROFILE_ID
+polaris decision verify PROFILE_ID
+```
+
+`plan-download`は取得URL・転送許可先・size/SHA・用途・license/NOTICE・導入先・取得容量・必要ディスク空き・全体期限を表示するだけで、通信しない。`download`は新しい計画を表示して、その場で確認を求める。非対話実行は`--yes`が必要で、以前の計画への承認は再利用しない。表示した配布先以外へ自由に接続せず、認証情報を付けずにHTTPSで取得する。通常起動・初回判断・agent実行中の自動取得は行わない。
+
+必要ディスク空きには、取得用の一時領域、導入用copy、予備を含む。両ファイルのサイズとSHAを照合してから導入し、成功してもbackendを選択・有効化しない。取得・検証・導入全体の期限は2時間で、期限後は取消を伝えて処理の終了を待つ。Ctrl-Cでも停止を要求できる。結果が確定しなかった場合は、再取得を繰り返す前に`decision verify`で状態を確認する。
+
+既存generationがある場合、通常の`download`は取得前に拒否する。取得した固定artifactで修復する場合はownerを終了してから、`plan-download`と`download`へそれぞれ`--repair`を付ける。旧generationは、手元のartifactによる修復と同じく計画に示した`.recovery-*`先へ保持する。
+
+macOSインストーラの「モデル」ページにも「Clef判断器の導入と選択（任意）」がある。「登録profileを確認」で同梱CLIの登録と容量推薦を読み、登録がある場合だけprofileを選べる。手元のworker/modelを使う場合は2ファイルを選び、取得する場合は「固定配布元からダウンロードする」を選ぶ。表示された取得元、容量、用途、license/NOTICE、size/SHA、導入先を確認して、今回の計画へ承認を返す。確認待ちは120秒で、対象・取得方式を変えた場合や期限切れ時は計画を作り直す。通常PATHのコマンドやproject指定の実行物は起動しない。
+
+登録profileを選んだ後は、元ファイルを選ばずに「導入済みgenerationを検証」を実行できる。固定hashの照合結果、未導入、受入未完了、整合性不明、非対応、取消を表示する。profileの変更や取消で以前の検証結果を消す。現在の登録は0件であり、導入・検証ボタンは表示しない。GUIのbuildと合成試験は、実GUIでの操作や実モデル受入の証明ではない。
 
 ## ChatGPT認証
 

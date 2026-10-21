@@ -59,6 +59,7 @@ The API-key `openai` provider currently uses Chat Completions and does not suppo
 - **Conversation continuity:** Separate unrelated work into Sidechats; resume, fork, or rewind a conversation and its workspace files from the TUI.
 - **Tools and delegation:** Use files, Git, MCP, and subagents through a shared execution core with connection and permission checks.
 - **Memory and retrieval:** Preserve source material while retrieving older relevant context and large tool results when needed.
+- **Selectable typed decision backends:** Retain Jev and SemIf while adding fixed Clef/Clef-flash profiles and explicit System One compatible connections under one decision contract. Disabled by default. Capacity tiers are recommendations and never change the selected backend automatically. No Clef profile has production acceptance yet, so normal Clef execution is not available. See [configuration and current limits](docs/usage.md#型付き判断器の設定) (Japanese).
 
 The macOS CLI preview package contains no optional resources. The GUI installer has a manifest-verified download path for llama.cpp, the embedding runtime, and multilingual-e5-small/base under `~/.polaris`; Rust is optional. Qwen3.5-4B is a candidate for the SemIf classifier, but its pinned distribution artifacts and acceptance checks are incomplete, so it is not automatically downloaded. Signed distribution assets and real-device acceptance are still missing. See the [macOS guide](apps/macos/README.md) for the verified scope.
 

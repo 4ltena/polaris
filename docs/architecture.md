@@ -80,7 +80,7 @@ crate 13件、依存 41件。名前の`polaris-`は省いた。開発用の依�
 - `crates/polaris-core/src/audit/arbitration.rs:197`
 - `crates/polaris-core/src/compaction.rs:241`
 - `crates/polaris-core/src/decision_policy.rs:60`
-- `crates/polaris-core/src/local_execution.rs:153`
+- `crates/polaris-core/src/local_execution.rs:162`
 - `crates/polaris-core/src/mcp/preselection.rs:346`
 - `crates/polaris-core/src/session_switch.rs:274`
 - `crates/polaris-core/src/session_switch.rs:378`

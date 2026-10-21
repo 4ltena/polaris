@@ -2281,11 +2281,12 @@ impl Engine {
         {
             return Ok(());
         }
+        let published = self.store.snapshot().map_err(store_error)?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let decider = self
             .trusted_runs
             .as_ref()
-            .and_then(|runs| runs.factory.decider());
+            .and_then(|runs| runs.factory.outside_run_decider(&published));
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let decider: Option<Arc<dyn polaris_provider::decision::Decider>> = None;
         let Some(decider) = decider else {
@@ -2296,7 +2297,7 @@ impl Engine {
                 .map_err(store_error)?;
             return Ok(());
         };
-        let context = self.routing_context()?;
+        let context = self.routing_context(&published)?;
         let current_input = self
             .admission
             .as_ref()
@@ -2335,8 +2336,8 @@ impl Engine {
 
     fn routing_context(
         &self,
+        published: &polaris_core::desktop_store::Published,
     ) -> Result<polaris_core::session_manager::RoutingContextV1, ProtocolError> {
-        let published = self.store.snapshot().map_err(store_error)?;
         let goal = published
             .state
             .goal

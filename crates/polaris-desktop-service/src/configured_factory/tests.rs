@@ -1136,3 +1136,178 @@ async fn decision_status_preserves_unavailable_configuration_and_observed_capaci
     assert_eq!(meter.recent().len(), 1);
     assert_eq!(fixture.tokens.0.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn outside_run_decider_binds_startup_resources_without_masking_prepared_run_context() {
+    use polaris_provider::decision::{
+        Decider, Decision, DecisionContext, DecisionError, DecisionObservation, Question,
+    };
+    struct ContextJudge(Mutex<Vec<Option<u64>>>);
+    #[async_trait::async_trait]
+    impl Decider for ContextJudge {
+        async fn decide(
+            &self,
+            _: &serde_json::Value,
+            _: &std::collections::BTreeMap<String, Question>,
+        ) -> Result<Decision, DecisionError> {
+            panic!("unbound context path")
+        }
+        async fn observe_with_context(
+            &self,
+            _: &serde_json::Value,
+            _: &std::collections::BTreeMap<String, Question>,
+            context: DecisionContext,
+        ) -> DecisionObservation {
+            self.0
+                .lock()
+                .unwrap()
+                .push(context.planned_local_model_bytes);
+            DecisionObservation::single(
+                self.identity(),
+                self.capabilities(),
+                Err(DecisionError::Unavailable),
+                std::time::Duration::ZERO,
+            )
+        }
+    }
+    struct Model(Option<u64>);
+    #[async_trait::async_trait]
+    impl Provider for Model {
+        fn planned_local_model_bytes(&self) -> Option<u64> {
+            self.0
+        }
+        async fn complete(
+            &self,
+            _: polaris_provider::CompletionRequest,
+        ) -> Result<polaris_provider::CompletionResponse, ProviderError> {
+            panic!("capacity snapshot dispatched a provider")
+        }
+    }
+    let mut fixture = Fixture::new();
+    let mut factory = fixture.factory();
+    let published = fixture.writer.snapshot().unwrap();
+    let judge = Arc::new(ContextJudge(Mutex::new(Vec::new())));
+    factory.resources.decider = Some(judge.clone());
+    let ask = |bytes| DecisionContext {
+        planned_local_model_bytes: bytes,
+    };
+    factory
+        .outside_run_decider(&published)
+        .unwrap()
+        .observe_with_context(
+            &serde_json::Value::Null,
+            &Default::default(),
+            ask(Some(999)),
+        )
+        .await;
+    assert_eq!(judge.0.lock().unwrap().last(), Some(&Some(0)));
+    factory.selection_provider = Some(Arc::new(Model(Some(7))));
+    factory
+        .outside_run_decider(&published)
+        .unwrap()
+        .observe(&serde_json::Value::Null, &Default::default())
+        .await;
+    assert_eq!(judge.0.lock().unwrap().last(), Some(&Some(7)));
+    use polaris_core::desktop_store::{
+        SavedRoleBinding, SavedRoleBindings, SavedRuntime, ToolSupport,
+    };
+    let roles = |runtime| {
+        SavedRoleBindings::new(vec![SavedRoleBinding {
+            role: "child".into(),
+            runtime,
+            endpoint: if runtime == SavedRuntime::Account {
+                None
+            } else {
+                Some("http://127.0.0.1:11434".into())
+            },
+            model: "fixture".into(),
+            effort: None,
+            observed_tool_support: ToolSupport::Supported,
+        }])
+        .unwrap()
+    };
+    let mut role_snapshot = published.clone();
+    role_snapshot.state.role_bindings = Some(roles(SavedRuntime::Account));
+    factory
+        .outside_run_decider(&role_snapshot)
+        .unwrap()
+        .observe(&serde_json::Value::Null, &Default::default())
+        .await;
+    assert_eq!(judge.0.lock().unwrap().last(), Some(&Some(7)));
+    role_snapshot.state.role_bindings = Some(roles(SavedRuntime::Ollama));
+    factory
+        .outside_run_decider(&role_snapshot)
+        .unwrap()
+        .observe(&serde_json::Value::Null, &Default::default())
+        .await;
+    assert_eq!(
+        judge.0.lock().unwrap().last(),
+        Some(&None),
+        "planned local role was treated as zero"
+    );
+    fixture.accept();
+    let mut past = fixture.writer.snapshot().unwrap();
+    past.state.runs[0].role_bindings = Some(roles(SavedRuntime::Ollama));
+    factory
+        .outside_run_decider(&past)
+        .unwrap()
+        .observe(&serde_json::Value::Null, &Default::default())
+        .await;
+    assert_eq!(
+        judge.0.lock().unwrap().last(),
+        Some(&None),
+        "past local role was assumed unloaded"
+    );
+    let mut changed = published.clone();
+    changed.state.configuration.model = "different".into();
+    assert!(factory.outside_run_decider(&changed).is_none());
+    factory.resources.history = Some(TrustedMemoryIndex {
+        embedder: polaris_core::conversation_memory::LocalStdioEmbedder::new(
+            fixture.base.join("unused-python"),
+            fixture.base.join("unused-helper"),
+            fixture.base.join("unused-model"),
+            fixture.base.join("unused-runtime"),
+            "fixture-revision".into(),
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap(),
+        database: fixture.base.join("unused-index.sqlite3"),
+        identity: polaris_core::desktop_store::MemoryResources {
+            embedding_model: "intfloat/multilingual-e5-small".into(),
+            embedding_revision: "fixture-revision".into(),
+            embedding_dimension: 384,
+            fingerprint: "a".repeat(64),
+        },
+    });
+    factory
+        .outside_run_decider(&published)
+        .unwrap()
+        .observe(&serde_json::Value::Null, &Default::default())
+        .await;
+    assert_eq!(
+        judge.0.lock().unwrap().last(),
+        Some(&None),
+        "unknown embedding peak was treated as zero"
+    );
+    assert!(!fixture.base.join("unused-runtime").exists());
+    factory.resources.history = None;
+    factory.primary_provider = Arc::new(Model(None));
+    factory
+        .outside_run_decider(&published)
+        .unwrap()
+        .observe(&serde_json::Value::Null, &Default::default())
+        .await;
+    assert_eq!(judge.0.lock().unwrap().last(), Some(&None));
+    factory
+        .decider()
+        .unwrap()
+        .observe_with_context(&serde_json::Value::Null, &Default::default(), ask(Some(37)))
+        .await;
+    assert_eq!(
+        judge.0.lock().unwrap().last(),
+        Some(&Some(37)),
+        "outside-run sources replaced the prepared run plan"
+    );
+    assert_eq!(fixture.tokens.0.load(Ordering::SeqCst), 0);
+}

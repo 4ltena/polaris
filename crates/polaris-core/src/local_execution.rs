@@ -30,6 +30,15 @@ impl LocalRouter {
             max_pending: max_pending_per_endpoint.min(1024),
         }
     }
+    /// A bound server may retain weights even when idle or after bindings drop.
+    /// This is not an allocation measurement or permission to probe the server.
+    pub fn has_bound_endpoints(&self) -> bool {
+        !self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
     pub fn bind(&self, selection: ModelSelection) -> Result<Arc<LocalBinding>, ProviderError> {
         let provider = Arc::new(LocalInferenceProvider::new(selection.clone())?);
         Ok(Arc::new(LocalBinding {

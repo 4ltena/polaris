@@ -69,7 +69,7 @@ review = ["user:review-rules"]
 
 Clef/Clef-flashはモデル、量子化、runtime、device、割当contextごとに受入記録を持つ。**現在の本番lockには受入済みprofileがないため、Clefはまだ通常実行に使えない。** IDを設定するだけで受入済みにはならず、起動時にweightsを自動取得することもない。未導入・未検証のClefを選んだ場合は理由を表示し、Jevへ勝手に変更しない。Clefのanswer finalizerも未対応である。
 
-`polaris doctor`の容量帯と候補順は推薦の目安で、実行可能という判定ではない。管理対象CPU workerの起動直前には、空いている物理メモリから保守的な予算を求め、profileのpeakと予備量を確認する。CPUの使用量をGPUへ換算せず、Metalのdevice別容量観測が未対応の間は、そのprofileを実行しない。
+`polaris doctor`の容量帯と候補順は推薦の目安で、実行可能という判定ではない。管理対象CPU workerの起動直前には、空いている物理メモリから保守的な予算を求め、profileのpeakと予備量を確認する。CPUの使用量をGPUへ換算せず、Metalのdevice別容量観測が未対応の間は、そのprofileを実行しない。 desktopの入力分類・goal確認には、構築済み主接続・要約・selectorの資源契約を渡す。通常runでは準備済みprovider群を別に使い、早期判断の情報で上書きしない。embedding等の実行時peakが分からない場合は、file容量や接続先がローカルであることから0を推定しない。
 
 8GB程度・16GB程度・24GB以上という容量帯で、利用できるbackendを固定しない。Clef/Clef-flash、SemIf、Jevは、利用者の選択と各backendの実行条件に従って使用する。
 

@@ -533,7 +533,7 @@ impl ConfiguredRunFactory {
         }
         Ok(())
     }
-    fn check_saved(&self, target: &RunTarget, published: &Published) -> Result<(), FactoryError> {
+    fn check_configuration(&self, published: &Published) -> Result<(), FactoryError> {
         let doc = self.bootstrap.document();
         let configuration = &published.state.configuration;
         if published.marker.deleted
@@ -548,6 +548,13 @@ impl ConfiguredRunFactory {
         {
             return Err(FactoryError::Binding);
         }
+        Ok(())
+    }
+
+    fn check_saved(&self, target: &RunTarget, published: &Published) -> Result<(), FactoryError> {
+        self.check_configuration(published)?;
+        let doc = self.bootstrap.document();
+        let configuration = &published.state.configuration;
         let run = published
             .state
             .runs
@@ -767,6 +774,43 @@ impl TrustedRunFactory for ConfiguredRunFactory {
 
     fn decider(&self) -> Option<Arc<dyn polaris_provider::decision::Decider>> {
         self.resources.decider.clone()
+    }
+
+    fn outside_run_decider(
+        &self,
+        published: &Published,
+    ) -> Option<Arc<dyn polaris_provider::decision::Decider>> {
+        self.check_configuration(published).ok()?;
+        let decider = self.resources.decider.clone()?;
+        let mut providers = vec![self.primary_provider.clone()];
+        providers.extend(self.summary_provider.iter().cloned());
+        providers.extend(self.selection_provider.iter().cloned());
+        let sources =
+            polaris_core::decision_capacity::colocation::ColocationSources::new(Vec::new());
+        // Embedding/backend resource peaks have not been attested. Their disk
+        // sizes and endpoint locality cannot become a zero-byte allowance.
+        let local_roles = std::iter::once(published.state.role_bindings.as_ref())
+            .chain(
+                published
+                    .state
+                    .runs
+                    .iter()
+                    .map(|run| run.role_bindings.as_ref()),
+            )
+            .flatten()
+            .any(|roles| {
+                roles.bindings.iter().any(|binding| {
+                    binding.runtime != polaris_core::desktop_store::SavedRuntime::Account
+                })
+            });
+        sources.replace(
+            providers,
+            self.resources.history.is_some()
+                || self.resources.tool_memory.is_some()
+                || local_roles
+                || self.local_router.has_bound_endpoints(),
+        );
+        Some(sources.bind(decider))
     }
 
     fn decision_status(&self) -> Option<Vec<String>> {

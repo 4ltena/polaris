@@ -220,6 +220,16 @@ pub trait TrustedRunFactory: Send + Sync {
         None
     }
 
+    /// Input classification and goal checks have no prepared run yet. A
+    /// configured owner may bind its startup resources here; the ordinary
+    /// run judge remains available for the actual prepared provider plan.
+    fn outside_run_decider(
+        &self,
+        _published: &Published,
+    ) -> Option<std::sync::Arc<dyn polaris_provider::decision::Decider>> {
+        self.decider()
+    }
+
     /// Metadata only; no dispatch or connection probe. Scoped to this owner,
     /// not the selected session. Absent when the factory has no diagnostics.
     fn decision_status(&self) -> Option<Vec<String>> {
@@ -1781,12 +1791,12 @@ impl Engine {
     /// not confident. The caller leaves the run alone on `None`.
     fn judge_goal(&self, goal: &str) -> Option<bool> {
         let factory = self.trusted_runs.as_ref()?.factory.clone();
-        let decider = factory.decider()?;
+        let saved = self.store.snapshot().ok()?;
+        let decider = factory.outside_run_decider(&saved)?;
         // The tasks and what each one was accepted on. This is the state
         // the owner already keeps as the record of what was done, so the
         // question is asked against the same evidence a person would read
         // — not against the transcript, which is long and mostly working.
-        let saved = self.store.snapshot().ok()?;
         let evidence = saved
             .state
             .tasks

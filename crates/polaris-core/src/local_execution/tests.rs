@@ -183,3 +183,13 @@ async fn role_parent_and_child_share_local_slot_and_outer_meter() {
     assert_eq!(meter.snapshot().missing_responses, 2);
     assert_eq!(meter.snapshot().failed_requests, 0);
 }
+
+#[test]
+fn bound_endpoint_history_does_not_claim_that_dropped_bindings_unloaded_weights() {
+    let router = LocalRouter::new(1);
+    assert!(!router.has_bound_endpoints());
+    let held = binding(&router, "http://127.0.0.1:11434", fake("unused", false));
+    assert!(router.has_bound_endpoints());
+    drop(held);
+    assert!(router.has_bound_endpoints());
+}

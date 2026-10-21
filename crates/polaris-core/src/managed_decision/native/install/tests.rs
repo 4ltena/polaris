@@ -64,12 +64,12 @@ fn import_publishes_a_complete_private_generation_and_preserves_older_versions()
 #[test]
 fn unaccepted_production_profile_cannot_import_or_even_consult_source_paths() {
     assert_eq!(
-        install(
+        super::super::plan::prepare(
             "clef-flash-q4-cpu-v1",
             Path::new("/absent/worker"),
             Path::new("/absent/model"),
-            || panic!("unaccepted profile began importing")
-        ),
+        )
+        .map(|_| ()),
         Err(ManagedDecisionError::UnverifiedProfile)
     );
 }

@@ -1,7 +1,72 @@
 //! Package-approved local decision generations. Project configuration selects
 //! an ID only; it cannot supply a worker path, digest or acceptance record.
 use polaris_provider::decision::Decider;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryMetadata {
+    pub purpose: String,
+    pub worker_source: String,
+    pub model_source: String,
+    pub license: String,
+    pub license_source: String,
+    pub notice_source: String,
+    pub components: Vec<DeliveryComponent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryComponent {
+    pub name: String,
+    pub version: String,
+    pub license: String,
+    pub source: String,
+}
+
+/// A fresh, non-deserializable transaction. Only plan_local can construct it;
+/// install_local consumes it so consent is not a reusable persisted receipt.
+#[derive(Serialize)]
+pub struct ImportPlan {
+    transaction_id: String,
+    app_version: String,
+    manifest_sha256: String,
+    subject_sha256: String,
+    profile: String,
+    generation: String,
+    platform: String,
+    architecture: String,
+    model_repository: String,
+    model_revision: String,
+    quantization: String,
+    runtime_revision: String,
+    device: String,
+    context_tokens: u32,
+    peak_bytes: u64,
+    reserve_bytes: u64,
+    worker: ImportFile,
+    model: ImportFile,
+    destination: std::path::PathBuf,
+    installed_bytes: u64,
+    copy_reserve_bytes: u64,
+    delivery: DeliveryMetadata,
+}
+
+#[derive(Serialize)]
+struct ImportFile {
+    source: std::path::PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+impl ImportPlan {
+    pub fn consent_sha256(&self) -> Result<String, ManagedDecisionError> {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(self).map_err(|_| ManagedDecisionError::Integrity)?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ManagedDecisionError {
@@ -23,24 +88,56 @@ pub enum ManagedDecisionError {
     Install,
     #[error("Clef generationのcopyと予備領域に必要な空き容量がありません")]
     InsufficientSpace,
+    #[error("Clef profileの取得元・license・NOTICE・component情報が未登録です")]
+    MissingDeliveryMetadata,
+    #[error("Clef導入計画と確認済み内容が一致しません。計画を作り直してください")]
+    PlanChanged,
+}
+
+/// Read-only preparation; does not download, create directories or infer.
+pub fn plan_local(
+    profile: &str,
+    worker: &std::path::Path,
+    model: &std::path::Path,
+) -> Result<ImportPlan, ManagedDecisionError> {
+    #[cfg(target_os = "macos")]
+    {
+        native::plan::prepare(profile, worker, model)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (profile, worker, model);
+        Err(ManagedDecisionError::UnsupportedPlatform)
+    }
+}
+
+/// Registration is not installation, capacity admission or model readiness.
+pub fn registered_profiles() -> Result<Vec<String>, ManagedDecisionError> {
+    #[cfg(target_os = "macos")]
+    {
+        native::plan::registered_profiles()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(Vec::new())
+    }
 }
 
 /// Explicit management operation only. Copies package-approved bytes into a
 /// new generation; never changes the selected backend or starts inference.
 /// Callers must obtain consent for the selected artifacts before calling.
 pub fn install_local(
-    profile: &str,
-    worker: &std::path::Path,
-    model: &std::path::Path,
+    plan: ImportPlan,
+    consent_sha256: &str,
     cancelled: impl FnMut() -> bool,
 ) -> Result<(), ManagedDecisionError> {
     #[cfg(target_os = "macos")]
     {
-        native::install::install(profile, worker, model, cancelled)
+        native::plan::execute(plan, consent_sha256, cancelled)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (profile, worker, model, cancelled);
+        let _ = (plan, consent_sha256, cancelled);
         Err(ManagedDecisionError::UnsupportedPlatform)
     }
 }

@@ -61,7 +61,7 @@ pub(super) fn fixture() -> (tempfile::TempDir, Subject) {
     (root, subject)
 }
 
-fn lock(subject: &Subject) -> Vec<u8> {
+pub(super) fn lock(subject: &Subject) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({"schema_version":1,"profiles":[{
         "subject": subject,
         "acceptance": {"subject_sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(subject).unwrap())), "evidence_sha256": format!("{:x}", Sha256::digest(b"synthetic acceptance"))}

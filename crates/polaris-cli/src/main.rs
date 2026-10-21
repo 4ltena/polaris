@@ -30,6 +30,7 @@ mod admission;
 mod benchmark_report;
 mod compare;
 mod decided;
+mod decision;
 mod handoff;
 mod mcp;
 mod memory;
@@ -1229,6 +1230,8 @@ impl Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// 型付き判断器の候補・固定profile・明示的なローカル導入。
+    Decision(decision::Args),
     /// 複数アカウントの登録・再認証・解除・表示名。
     Account(account::Args),
     /// 複数端末での共有：参加・状態・送受信・離脱。
@@ -2572,6 +2575,7 @@ async fn main_with_args(mut args: Args) -> ExitCode {
             };
         }
         Some(Command::Doctor) => return run_doctor().await,
+        Some(Command::Decision(args)) => return decision::run(args).await,
         Some(Command::CommonTests { plan }) => {
             return run_common_tests(&plan, args.sandbox.into());
         }

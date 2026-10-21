@@ -70,6 +70,19 @@ Clef/Clef-flashはモデル、量子化、runtime、device、割当contextごと
 
 `polaris doctor`の容量帯と候補順は推薦の目安で、実行可能という判定ではない。管理対象CPU workerの起動直前には、空いている物理メモリから保守的な予算を求め、profileのpeakと予備量を確認する。CPUの使用量をGPUへ換算せず、Metalのdevice別容量観測が未対応の間は、そのprofileを実行しない。
 
+`polaris decision list`は登録済みprofile IDと容量の推薦をJSONで表示する。現在の登録は0件である。登録は導入や実行可否の確認ではなく、この操作でJev/SemIfの設定は変わらない。
+
+受入済みprofileと配布情報が登録された後は、手元の固定artifactを次の管理コマンドで導入できる。`PROFILE_ID`と2つの絶対pathを対象に置き換える。
+
+```sh
+polaris decision plan PROFILE_ID --worker /absolute/path/worker --model /absolute/path/model.gguf
+polaris decision import PROFILE_ID --worker /absolute/path/worker --model /absolute/path/model.gguf
+```
+
+`plan`は取得元、license/NOTICE、component一覧、size/SHA、導入先、必要なcopy領域を表示するだけで、ファイルを取得・配置しない。`import`は新しい計画を表示して`y/n`を求める。非対話実行では、その選択を明示承認する`--yes`が必要である。以前の計画や確認記録を再利用せず、導入直前にも固定lockと導入先を照合する。配布情報が不足するprofileは導入できない。
+
+導入はnetworkを使わず、指定ファイルの全size/SHAを照合して新しいgenerationへcopyする。取消・破損・競合時は既存generationを残す。成功してもbackendの選択・有効化や推論は開始しない。現在の空lockで`plan`・`import`を実行しても、受入未完了の案内で終了する。
+
 ## ChatGPT認証
 
 ```sh

@@ -216,6 +216,9 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `polaris exec [<指示>\|-]` | `-p`と同じ非対話実行。省略または`-`ならstdin全文を読む。 | 上と同じ。 |
 | `polaris sandbox -- <実行物> [引数...]` | エージェントを介さず、指定プログラムをsandbox内で実行する。 | 子のstdout/stderrと終了コード。失敗時はsandboxエラー。 |
 | `polaris doctor` | インストールとローカル設定を診断する。 | `Decision capacity (read-only):`で物理メモリの観測、容量帯の候補順、実行可否が未検証であることを表示。統合メモリは専用VRAMと区別する。続いて`Credentials:`、`Provider resolution:`、`Sandbox:`、`State:`、巻き戻し候補、AGENTS到達量等。接続成功の確認ではない。 |
+| `polaris decision list` | package登録済み判断profileと容量の推薦を表示する。 | JSONの`registered_profiles`・`capacity`・注意書き。現在の登録は0件。導入・接続・推論・backend変更なし。 |
+| `polaris decision plan <profile> --worker <絶対path> --model <絶対path>` | 固定artifactの導入内容を確認する。 | 新しいtransactionの計画JSONと`consent_sha256`。取得元、license/NOTICE、component、size/SHA、導入先。copyなし。未受入・配布情報不足なら理由を表示して終了。 |
+| `polaris decision import <profile> --worker <絶対path> --model <絶対path> [--yes]` | 今回の計画を確認後、固定artifactを新generationへcopyする。 | 計画JSON、`y/n`、導入または取消/失敗の通知。非対話は明示`--yes`が必要。network・backend有効化・推論なし。既存generationを上書きしない。 |
 | `polaris common-tests <plan.json\|->` | JSONで指定したブラックボックス試験をsandbox内で実行する。 | JSONの`result: passed / failed / unavailable`、試験対象、各case、fallbackの要否等。指定プログラムの実行と一時領域の使用を伴う。 |
 | `polaris completion <shell>` | シェル補完scriptを生成する。 | script本文をstdoutへ出す。対応はbash/zsh/fish/elvish/powershell。導入は別操作。 |
 | `polaris --help`、`polaris help [command]` | CLIの構文を調べる。 | コマンド・引数・説明。`polaris mcp configure --help`のように絞れる。 |

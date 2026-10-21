@@ -11,6 +11,78 @@
 #[path = "support/product_binary.rs"]
 mod product_binary;
 
+#[test]
+fn decision_management_lists_without_provider_startup_or_resource_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let output = product_binary::command()
+        .env("HOME", home.path())
+        .env("POLARIS_PROVIDER", "must-not-start-a-provider")
+        .current_dir(project.path())
+        .args(["decision", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["registered_profiles"], serde_json::json!([]));
+    assert!(!home.path().join(".polaris").exists());
+    assert!(!project.path().join(".polaris").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn decision_management_never_imports_an_unaccepted_profile_even_with_yes() {
+    for operation in ["plan", "import"] {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut command = product_binary::command();
+        command
+            .env("HOME", home.path())
+            .env("POLARIS_PROVIDER", "must-not-start-a-provider")
+            .current_dir(project.path())
+            .args([
+                "decision",
+                operation,
+                "clef-flash-q4-cpu-v1",
+                "--worker",
+                "/absent/worker",
+                "--model",
+                "/absent/model",
+            ]);
+        if operation == "import" {
+            command.arg("--yes");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("受入登録が未完了"));
+        assert!(output.stdout.is_empty());
+        assert!(!home.path().join(".polaris").exists());
+        assert!(!project.path().join(".polaris").exists());
+    }
+}
+
+#[test]
+fn decision_management_help_exposes_explicit_import_sources_and_confirmation() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let output = product_binary::command()
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .args(["decision", "import", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for field in ["<PROFILE>", "--worker", "--model", "--yes"] {
+        assert!(help.contains(field), "{help}");
+    }
+    assert!(!home.path().join(".polaris").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn mcp_configure_exposes_the_fixed_preset_and_rejects_unconfirmed_non_tty_without_state() {

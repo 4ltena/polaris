@@ -11,20 +11,7 @@ use std::{
     path::Path,
 };
 
-pub(in crate::managed_decision) fn install(
-    profile: &str,
-    worker: &Path,
-    model: &Path,
-    cancelled: impl FnMut() -> bool,
-) -> Result<(), ManagedDecisionError> {
-    // An unaccepted profile must have no filesystem effects, even if a caller
-    // supplies plausible local bytes or a project-authored acceptance file.
-    let subject = select(LOCK, profile)?;
-    let home = crate::os_home::trusted_user_home().map_err(|_| ManagedDecisionError::Install)?;
-    import(&subject, &home, worker, model, cancelled, || Ok(()))
-}
-
-fn import(
+pub(super) fn import(
     subject: &Subject,
     home: &Path,
     worker: &Path,

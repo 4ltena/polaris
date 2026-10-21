@@ -18,6 +18,7 @@ const LOCK: &[u8] = include_bytes!(
 );
 
 pub(super) mod install;
+pub(super) mod plan;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +32,7 @@ struct ApprovedLock {
 struct ApprovedProfile {
     subject: Subject,
     acceptance: Acceptance,
+    delivery: Option<super::DeliveryMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +107,10 @@ fn text(value: &str) -> bool {
 }
 
 fn select(bytes: &[u8], id: &str) -> Result<Subject, ManagedDecisionError> {
+    select_profile(bytes, id).map(|p| p.subject)
+}
+
+fn select_profile(bytes: &[u8], id: &str) -> Result<ApprovedProfile, ManagedDecisionError> {
     use ManagedDecisionError::Integrity;
     if bytes.len() > 128 * 1024 || !valid_profile_id(id) {
         return Err(Integrity);
@@ -116,7 +122,7 @@ fn select(bytes: &[u8], id: &str) -> Result<Subject, ManagedDecisionError> {
     let mut seen = BTreeSet::new();
     let mut selected = None;
     for profile in lock.profiles {
-        let s = profile.subject;
+        let s = &profile.subject;
         if !valid_profile_id(&s.id)
             || !valid_profile_id(&s.generation)
             || !seen.insert((s.id.clone(), s.platform.clone(), s.architecture.clone()))
@@ -124,7 +130,7 @@ fn select(bytes: &[u8], id: &str) -> Result<Subject, ManagedDecisionError> {
             || !digest(&profile.acceptance.subject_sha256)
             || format!(
                 "{:x}",
-                Sha256::digest(serde_json::to_vec(&s).map_err(|_| Integrity)?)
+                Sha256::digest(serde_json::to_vec(s).map_err(|_| Integrity)?)
             ) != profile.acceptance.subject_sha256
             || !text(&s.model_repository)
             || !text(&s.quantization)
@@ -155,7 +161,7 @@ fn select(bytes: &[u8], id: &str) -> Result<Subject, ManagedDecisionError> {
             "x86_64"
         };
         if s.id == id && s.platform == "macos" && s.architecture == architecture {
-            selected = Some(s);
+            selected = Some(profile);
         }
     }
     selected.ok_or(ManagedDecisionError::UnverifiedProfile)

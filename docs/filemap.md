@@ -143,6 +143,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `benchmark_report.rs` — Opt-in, machine-readable observations for the offline comparison harness.
 - `compare.rs` — フォルダ同士がどれだけ似ているかを示す。名前とサイズだけを読み、
 - `decided.rs` — `polaris decided` — the ledger of questions this project has settled.
+- `decision.rs` — Explicit local decision management, separate from agent/provider startup.
 - `handoff.rs` — 実装が終わったことを、実機で試せる人へ渡す文面にする。
 - `main.rs` — Entry point for the `polaris` binary. Decides the endpoint from environment
 - `mcp.rs` — MCP registrations, secrets, catalog checks and setup from the terminal.
@@ -586,11 +587,16 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/managed_decision/native`
 
 - `install.rs` — Explicit offline import into a new, immutable decision generation.
+- `plan.rs` — Fresh consent plans bind the package, sources, destination and inventory.
 - `tests.rs` — Package-lock and private-generation fixtures; no real model is executed.
 
 ## `crates/polaris-core/src/managed_decision/native/install`
 
 - `tests.rs` — Offline import transactions use synthetic bytes and never execute a worker.
+
+## `crates/polaris-core/src/managed_decision/native/plan`
+
+- `tests.rs` — Consent and inventory fixtures; no downloads, credentials or real weights.
 
 ## `crates/polaris-core/src/management_effect`
 

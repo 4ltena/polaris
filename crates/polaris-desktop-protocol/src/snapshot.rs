@@ -289,6 +289,10 @@ pub struct Snapshot {
     pub orchestration: Option<crate::orchestration::OrchestrationSummaryV2>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
     pub memory: Option<MemoryStatus>,
+    /// V2 read-only, bounded diagnostics for the service owner's lifetime.
+    /// These observations are not a per-conversation usage ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::present")]
+    pub decision_status: Option<Vec<String>>,
     pub role_bindings: Vec<crate::role_bindings::RoleBinding>,
     pub role_catalog: Vec<crate::role_bindings::RoleDescriptor>,
     pub tasks: Vec<Task>,

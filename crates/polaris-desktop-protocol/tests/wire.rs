@@ -564,3 +564,21 @@ fn optional_resume_is_atomic_and_page_limit_is_bounded() {
         assert_wire::<Request>(&wire);
     }
 }
+
+#[test]
+fn decision_status_is_optional_and_rejects_null_or_non_text() {
+    let mut wire: Value = serde_json::from_str(include_str!("fixtures/snapshot.json")).unwrap();
+    assert!(read::<Snapshot>(&wire).decision_status.is_none());
+    wire["decision_status"] = json!(["configured=clef", "capacity=unverified"]);
+    assert_eq!(
+        assert_wire::<Snapshot>(&wire)
+            .decision_status
+            .unwrap()
+            .len(),
+        2
+    );
+    for invalid in [json!(null), json!([7]), json!({"text":"not an array"})] {
+        wire["decision_status"] = invalid;
+        assert!(serde_json::from_value::<Snapshot>(wire.clone()).is_err());
+    }
+}

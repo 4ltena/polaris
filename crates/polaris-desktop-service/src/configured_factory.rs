@@ -66,6 +66,7 @@ struct BoundProviders {
 }
 
 pub struct TrustedFactoryResources {
+    pub decision_config: polaris_core::config::DecisionConfig,
     pub decision_local_only: bool,
     pub always_on: AlwaysOn,
     pub audit: Arc<tokio::sync::Mutex<AuditLog>>,
@@ -766,6 +767,15 @@ impl TrustedRunFactory for ConfiguredRunFactory {
 
     fn decider(&self) -> Option<Arc<dyn polaris_provider::decision::Decider>> {
         self.resources.decider.clone()
+    }
+
+    fn decision_status(&self) -> Option<Vec<String>> {
+        let mut lines = vec!["このservice owner全体の観測（会話別の使用量ではありません）".into()];
+        lines.extend(polaris_core::decision_diagnostics::display(
+            &self.resources.decision_config,
+            self.resources.decider.as_deref(),
+        ));
+        Some(lines)
     }
 
     fn answer_finalizer(&self) -> Option<Arc<crate::shadow_finalizer::ShadowFinalizerOwner>> {

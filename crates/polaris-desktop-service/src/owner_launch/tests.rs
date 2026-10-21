@@ -141,6 +141,7 @@ impl Fixture {
         fs::write(&helper_path, helper_body).unwrap();
         fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700)).unwrap();
         let resources = TrustedFactoryResources {
+            decision_config: Default::default(),
             always_on: polaris_core::prompt::assemble_always_on("", "", &[]),
             audit: Arc::new(tokio::sync::Mutex::new(
                 polaris_core::audit::AuditLog::open(&base.join("audit")).unwrap(),

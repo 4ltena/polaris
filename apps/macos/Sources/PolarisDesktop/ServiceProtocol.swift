@@ -568,7 +568,8 @@ indirect enum ServiceSchema: Sendable {
     "runs": .array(run),
     "children": .array(child), "child_attempt_count": .decimal,
     "unresolved_approvals": .array(approval),
-  ], ["memory": memory, "workflow": workflow, "orchestration": orchestration])
+  ], ["memory": memory, "workflow": workflow, "orchestration": orchestration,
+      "decision_status": .array(.text)])
   static func result(_ type: String) throws -> Self {
     switch type {
     case "workspace.read": .object([

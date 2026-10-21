@@ -683,6 +683,7 @@ fn start_at(
     polaris_core::audit::install_decision_observer(&meter, audit.clone());
     let decider = decider.map(|decider| meter.wrap(decider));
     let resources = TrustedFactoryResources {
+        decision_config: decision.clone(),
         decision_local_only: decision.local_only,
         always_on,
         audit,

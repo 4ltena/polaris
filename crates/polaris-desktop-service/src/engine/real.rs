@@ -220,6 +220,12 @@ pub trait TrustedRunFactory: Send + Sync {
         None
     }
 
+    /// Metadata only; no dispatch or connection probe. Scoped to this owner,
+    /// not the selected session. Absent when the factory has no diagnostics.
+    fn decision_status(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// Startup-owned shadow finalizer. Wire and project data cannot provide it.
     fn answer_finalizer(
         &self,

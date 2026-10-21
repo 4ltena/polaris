@@ -32,6 +32,9 @@ impl Decider for Judge {
 
 struct JudgedFactory(Arc<dyn TrustedRunFactory>);
 impl TrustedRunFactory for JudgedFactory {
+    fn decision_status(&self) -> Option<Vec<String>> {
+        Some(vec!["x".repeat(3000); 40])
+    }
     fn decider(&self) -> Option<Arc<dyn Decider>> {
         Some(Arc::new(Judge))
     }
@@ -93,4 +96,19 @@ fn owner_judge_reaches_root_filemap_and_decisions_without_mcp() {
             .content,
         "strict raw completion"
     );
+}
+
+#[test]
+fn decision_status_snapshot_is_v2_only_and_bounded_without_dispatch() {
+    let mut fixture = fixture(Behavior::Complete, false);
+    let engine = fixture.service.engine.as_mut().unwrap();
+    let trusted = engine.trusted_runs.as_mut().unwrap();
+    trusted.factory = Arc::new(JudgedFactory(trusted.factory.clone()));
+    engine.wire_version = Some(ProtocolVersion::V1);
+    assert!(engine.snapshot(false).unwrap().decision_status.is_none());
+    engine.wire_version = Some(ProtocolVersion::V2);
+    let status = engine.snapshot(false).unwrap().decision_status.unwrap();
+    assert_eq!(status.len(), 32);
+    assert!(status.iter().all(|line| line.chars().count() == 2048));
+    assert!(engine.active.is_none());
 }

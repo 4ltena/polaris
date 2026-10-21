@@ -484,6 +484,15 @@ private struct NativeConversationView: View {
                             runDetailsView(run)
                         }
                     }
+                    if !service.decisionStatus.isEmpty {
+                        DisclosureGroup("型付き判断の状態（snapshot取得時）") {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(Array(service.decisionStatus.enumerated()), id: \.offset) { _, line in
+                                    Text(line).font(.caption).textSelection(.enabled)
+                                }
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                     if let memory = service.memoryStatus {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("記憶の準備：\(memory.phaseTitle) · 実ターン \(memory.recentRawTurns) · 出典 \(memory.retrievalSources.count)件 · 参照 \(memory.referenceTokens) tokens").font(.caption)

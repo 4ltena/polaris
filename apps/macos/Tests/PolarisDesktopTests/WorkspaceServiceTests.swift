@@ -87,6 +87,16 @@ final class WorkspaceServiceTests: XCTestCase {
     fields["draft"] = .object(["draft_revision": .string(draftRevision), "text": .string(text), "attachment_ids": .array([])])
     return .object(fields)
   }
+  func testDecisionStatusSnapshotAcceptsOldAndMetadataAndRejectsInvalidValues() throws {
+    guard case .object(var fields) = try snapshot() else { return XCTFail("fixture") }
+    XCTAssertNoThrow(try ServiceSchema.snapshot.check(.object(fields)))
+    fields["decision_status"] = .array([.string("configured=clef"), .string("capacity=unverified")])
+    XCTAssertNoThrow(try ServiceSchema.snapshot.check(.object(fields)))
+    fields["decision_status"] = .array([.number("7")])
+    XCTAssertThrowsError(try ServiceSchema.snapshot.check(.object(fields)))
+    XCTAssertThrowsError(try ServiceCodec.json(Data(#"{"decision_status":null}"#.utf8)))
+  }
+
   private func page(id: String = "snap", revision: String = "10", messageID: String = "m1",
                     role: String = "tool", text: String = "日本語", next: String? = nil) -> ServiceValue {
     var fields: [String: ServiceValue] = [

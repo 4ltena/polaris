@@ -1017,6 +1017,12 @@ final class WorkspaceServiceModel: ObservableObject {
   var observedRoleBindings: [LocalRoleBinding] {
     ((try? array(snapshot?["role_bindings"])) ?? []).compactMap { try? LocalRoleBinding(service: $0) }
   }
+  var decisionStatus: [String] {
+    ((try? array(snapshot?["decision_status"])) ?? []).compactMap { value in
+      guard case let .string(line) = value else { return nil }
+      return line
+    }
+  }
   var observedRoleCatalog: [LocalRoleDescriptor] {
     ((try? array(snapshot?["role_catalog"])) ?? []).compactMap { try? LocalRoleDescriptor($0) }
   }

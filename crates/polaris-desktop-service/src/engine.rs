@@ -3104,6 +3104,28 @@ impl Engine {
         }
     }
 
+    fn decision_status(&self) -> Option<Vec<String>> {
+        if self.wire_version != Some(ProtocolVersion::V2) {
+            return None;
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.trusted_runs
+                .as_ref()?
+                .factory
+                .decision_status()
+                .map(|lines| {
+                    lines
+                        .into_iter()
+                        .take(32)
+                        .map(|line| line.chars().take(2048).collect())
+                        .collect()
+                })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        None
+    }
+
     fn snapshot(&mut self, subscribe: bool) -> Result<Snapshot, ProtocolError> {
         let published = self.store.snapshot().map_err(store_error)?;
         let id = SnapshotId::new(self.id("snapshot")).unwrap();
@@ -3142,6 +3164,7 @@ impl Engine {
                 )
             }),
             memory: state.runs.last().and_then(|r| r.memory.clone()),
+            decision_status: self.decision_status(),
             role_bindings: role_bindings::to_wire(state.role_bindings.as_ref()),
             role_catalog: self.role_catalog_wire(),
             tasks: state.tasks.clone(),

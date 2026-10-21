@@ -158,6 +158,7 @@ impl Fixture {
     }
     fn resources(&self) -> TrustedFactoryResources {
         TrustedFactoryResources {
+            decision_config: Default::default(),
             always_on: polaris_core::prompt::assemble_always_on("", "", &[]),
             audit: Arc::new(tokio::sync::Mutex::new(
                 AuditLog::open(&self.base.join("audit")).unwrap(),
@@ -1072,4 +1073,66 @@ fn a_type_that_needs_tools_is_not_bound_to_a_model_nobody_saw_supporting_them() 
         );
     }
     assert!(prepared(ToolSupport::Supported).is_ok());
+}
+
+#[tokio::test]
+async fn decision_status_preserves_unavailable_configuration_and_observed_capacity_without_auth() {
+    use polaris_provider::decision::{
+        Decider, Decision, DecisionError, DecisionMeter, DecisionObservation, Question,
+    };
+    struct CapacityJudge;
+    #[async_trait::async_trait]
+    impl Decider for CapacityJudge {
+        async fn decide(
+            &self,
+            _: &serde_json::Value,
+            _: &std::collections::BTreeMap<String, Question>,
+        ) -> Result<Decision, DecisionError> {
+            Err(DecisionError::Unavailable)
+        }
+        async fn observe(
+            &self,
+            _: &serde_json::Value,
+            _: &std::collections::BTreeMap<String, Question>,
+        ) -> DecisionObservation {
+            let mut observed = DecisionObservation::single(
+                self.identity(),
+                self.capabilities(),
+                Err(DecisionError::Unavailable),
+                std::time::Duration::ZERO,
+            );
+            observed.attempts[0].invoked = false;
+            observed.attempts[0].capacity = Some(polaris_provider::decision::DecisionCapacity {
+                status: "unverified",
+                reason: Some("ColocatedModels".into()),
+                budget_bytes: None,
+                required_bytes: None,
+                colocated_bytes: None,
+            });
+            observed
+        }
+    }
+    let fixture = Fixture::new();
+    let mut factory = fixture.factory();
+    factory.resources.decision_config.enabled = true;
+    factory.resources.decision_config.backend = polaris_core::config::DecisionBackend::Clef;
+    factory.resources.decision_config.model = Some("synthetic-uninstalled-profile".into());
+    let unavailable = factory.decision_status().unwrap().join("\n");
+    assert!(unavailable.contains("synthetic-uninstalled-profile"));
+    assert!(unavailable.contains("構築不可"));
+    let meter = DecisionMeter::default();
+    let judge = meter.wrap(Arc::new(CapacityJudge));
+    factory.resources.decider = Some(judge.clone());
+    let before = factory.decision_status().unwrap().join("\n");
+    assert!(before.contains("観測なし"));
+    assert!(meter.recent().is_empty());
+    judge
+        .observe(&serde_json::Value::Null, &Default::default())
+        .await;
+    let after = factory.decision_status().unwrap().join("\n");
+    assert!(after.contains("会話別の使用量ではありません"));
+    assert!(after.contains("ColocatedModels"));
+    assert!(after.contains("呼出=false"));
+    assert_eq!(meter.recent().len(), 1);
+    assert_eq!(fixture.tokens.0.load(Ordering::SeqCst), 0);
 }

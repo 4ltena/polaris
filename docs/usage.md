@@ -159,7 +159,18 @@ polaris decision import PROFILE_ID --worker /absolute/path/worker --model /absol
 
 導入はnetworkを使わず、指定ファイルの全size/SHAを照合して新しいgenerationへcopyする。取消・破損・競合時は既存generationを残す。成功してもbackendの選択・有効化や推論は開始しない。現在の空lockで`plan`・`import`を実行しても、受入未完了の案内で終了する。
 
-macOSインストーラの「モデル」ページにも「Clef判断器の導入（任意）」がある。「登録profileを確認」で同梱CLIの登録と容量推薦を読み、登録がある場合だけprofileと手元のworker/modelファイルを選べる。表示された取得元、license/NOTICE、component、size/SHA、導入先を確認して「この計画で導入」を押す。GUIが起動した同じCLIプロセスへ今回の計画hashを返すため、別の計画への確認流用は行わない。確認待ちは120秒で、対象を変えた場合や期限切れ時は計画を作り直す。現在の登録は0件であり、導入ボタンは提供されない。 登録profileを選んだ後は、worker/modelの元ファイルを選ばずに「導入済みgenerationを検証」を実行できる。固定hashの照合結果、未導入、受入未完了、整合性不明、非対応、取消を表示する。profileを変更したときや操作を取り消したときは以前の検証結果を消す。検証成功だけではbackendを選択・有効化せず、現在の空登録では検証ボタンも表示しない。
+既存generationを修復する場合は、ownerを終了し、同じ固定artifactを手元に用意して次を実行する。
+
+```sh
+polaris decision plan PROFILE_ID --repair --worker /absolute/path/worker --model /absolute/path/model.gguf
+polaris decision repair PROFILE_ID --worker /absolute/path/worker --model /absolute/path/model.gguf
+```
+
+修復は別の確認を求め、非対話実行では`--yes`が必要である。新しいcopyの全SHAを照合した後にatomicに交換し、旧generationを計画に表示する`.recovery-…`へ丸ごと残す。旧内容や追加ファイルを削除せず、設定・有効化は変更しない。既存directoryの置換・管理操作の競合・切替前の取消やcopy失敗では切り替えない。切替後の中断や保存結果不明では、新旧両方を保持するため、再実行前に`decision verify`と表示された保持先を確認する。保持先を自動で有効化したり、以前の確認を再利用したりはしない。受入未完了、非対応、aliasや保護条件を満たさない既存directoryは修復しない。
+
+GUIにも「既存generationを保持して修復する」を用意し、保持先を含む修復計画を同じCLI childへ確認する。導入計画の確認を修復へ流用できず、対象・操作を変更したら計画を作り直す。保持先表示は計画値であり、処理を中断した場合に配置済みという証明にはならない。
+
+macOSインストーラの「モデル」ページにも「Clef判断器の導入と選択（任意）」がある。「登録profileを確認」で同梱CLIの登録と容量推薦を読み、登録がある場合だけprofileと手元のworker/modelファイルを選べる。表示された取得元、license/NOTICE、component、size/SHA、導入先を確認して「この計画で導入」を押す。GUIが起動した同じCLIプロセスへ今回の計画hashを返すため、別の計画への確認流用は行わない。確認待ちは120秒で、対象を変えた場合や期限切れ時は計画を作り直す。現在の登録は0件であり、導入ボタンは提供されない。 登録profileを選んだ後は、worker/modelの元ファイルを選ばずに「導入済みgenerationを検証」を実行できる。固定hashの照合結果、未導入、受入未完了、整合性不明、非対応、取消を表示する。profileを変更したときや操作を取り消したときは以前の検証結果を消す。検証成功だけではbackendを選択・有効化せず、現在の空登録では検証ボタンも表示しない。
 
 ## ChatGPT認証
 

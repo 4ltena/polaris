@@ -4,10 +4,11 @@ import Foundation
 import PolarisSettings
 @testable import PolarisDesktop
 
-private func offerData() throws -> Data {
-    try JSONSerialization.data(withJSONObject: [
+private func offerData(repair: Bool = false) throws -> Data {
+    let data = try JSONSerialization.data(withJSONObject: [
         "schema_version": 1, "type": "plan", "consent_sha256": String(repeating: "a", count: 64),
         "plan": [
+            "operation": "import",
             "transaction_id": "synthetic", "profile": "fixture-v1", "generation": "fixture-generation",
             "model_repository": "synthetic/model", "model_revision": "dummy", "quantization": "synthetic",
             "runtime_revision": "synthetic-runtime", "platform": "macos", "architecture": "arm64", "device": "cpu",
@@ -20,6 +21,13 @@ private func offerData() throws -> Data {
                 "notice_source": "https://example.invalid/notice", "components": []],
         ],
     ])
+    guard repair else { return data }
+    var frame = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    var plan = frame["plan"] as! [String: Any]
+    plan["operation"] = "repair"
+    plan["replacement"] = ["backup_destination": "/synthetic/.recovery-" + String(repeating: "a", count: 32)]
+    frame["plan"] = plan
+    return try JSONSerialization.data(withJSONObject: frame)
 }
 
 private func verificationData(profile: String = "fixture-v1", status: String = "verified") throws -> Data {
@@ -52,9 +60,9 @@ private actor FixtureDecisionTransport: DecisionInstallTransport {
     func catalog() -> DecisionInstallCatalog {
         DecisionInstallCatalog(schemaVersion: 1, registeredProfiles: profiles, capacity: ["synthetic"], note: "not readiness")
     }
-    func prepare(profile: String, worker: URL, model: URL) throws -> DecisionInstallOffer {
+    func prepare(profile: String, worker: URL, model: URL, repair: Bool) throws -> DecisionInstallOffer {
         prepared += 1
-        return try PackagedDecisionInstallClient.decode(DecisionInstallOffer.self, offerData())
+        return try PackagedDecisionInstallClient.decode(DecisionInstallOffer.self, offerData(repair: repair))
     }
     func confirm(consent: String, approved: Bool) throws -> DecisionInstallOutcome {
         guard consent == String(repeating: "a", count: 64) else { throw ServiceError.correlation }
@@ -139,6 +147,49 @@ final class DecisionInstallTests: XCTestCase {
         let counts = await transport.counts()
         XCTAssertEqual(counts.0, 1); XCTAssertEqual(counts.1, [true])
         XCTAssertNil(model.offer); XCTAssertTrue(model.message.contains("有効化は変更していません"))
+    }
+
+    @MainActor func testRepairRequiresItsOwnPlanAndKeepsTheBackupLocationVisible() async throws {
+        let transport = FixtureDecisionTransport()
+        let model = DecisionInstallModel(transport: transport)
+        model.refresh(); try await settle(model)
+        model.worker = URL(fileURLWithPath: "/synthetic/worker"); model.model = URL(fileURLWithPath: "/synthetic/model")
+        model.repair = true
+        model.prepare(); try await settle(model)
+        XCTAssertEqual(model.offer?.plan.operation, "repair")
+        XCTAssertTrue(model.recoveryBackup!.contains(".recovery-"))
+        model.confirm(false); try await settle(model)
+        model.prepare(); try await settle(model)
+        model.repair = false
+        model.confirm(true); try await settle(model)
+        var counts = await transport.counts(); XCTAssertEqual(counts.1, [false])
+        model.repair = true
+        model.prepare(); try await settle(model); model.confirm(true); try await settle(model)
+        counts = await transport.counts(); XCTAssertEqual(counts.1, [false, true])
+        XCTAssertTrue(model.message.contains("旧generation"))
+        XCTAssertNotNil(model.recoveryBackup)
+    }
+
+    func testOwnedRepairProcessReceivesRepairArgumentsAndPreservesTheBoundPlan() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("decision-repair-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("fixture-helper")
+        let frame = String(data: try offerData(repair: true), encoding: .utf8)!
+        let script = """
+        #!/bin/sh
+        test "$1" = decision && test "$2" = repair && test "$3" = fixture-v1 || exit 2
+        printf '%s\\n' '\(frame)'
+        IFS= read -r answer || exit 3
+        printf '{"schema_version":1,"type":"complete","consent_sha256":"\(String(repeating: "a", count: 64))","status":"cancelled"}\\n'
+        """
+        try Data(script.utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        let client = PackagedDecisionInstallClient(helper: { helper })
+        let offer = try await client.prepare(profile: "fixture-v1", worker: URL(fileURLWithPath: "/synthetic/worker"), model: URL(fileURLWithPath: "/synthetic/model"), repair: true)
+        XCTAssertEqual(offer.plan.operation, "repair")
+        let result = try await client.confirm(consent: offer.consentSha256, approved: false)
+        if case .cancelled = result {} else { XCTFail("repair cancel was not preserved") }
     }
 
     @MainActor func testChangedSelectionCannotApproveTheOldOfferAndCancellationIsSeparate() async throws {

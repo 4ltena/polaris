@@ -81,7 +81,12 @@ fn decision_verify_gui_frame_reports_failure_without_claiming_verification() {
 #[cfg(target_os = "macos")]
 #[test]
 fn decision_management_never_imports_an_unaccepted_profile_even_with_yes() {
-    for operation in ["plan", "import"] {
+    for (operation, repair_plan) in [
+        ("plan", false),
+        ("plan", true),
+        ("import", false),
+        ("repair", false),
+    ] {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let mut command = product_binary::command();
@@ -98,8 +103,11 @@ fn decision_management_never_imports_an_unaccepted_profile_even_with_yes() {
                 "--model",
                 "/absent/model",
             ]);
-        if operation == "import" {
+        if operation != "plan" {
             command.arg("--yes");
+        }
+        if repair_plan {
+            command.arg("--repair");
         }
         let output = command.output().unwrap();
         assert!(!output.status.success());

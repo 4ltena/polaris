@@ -59,6 +59,8 @@ pub fn verify_installed(
 /// install_local consumes it so consent is not a reusable persisted receipt.
 #[derive(Serialize)]
 pub struct ImportPlan {
+    operation: ImportOperation,
+    replacement: Option<ReplacementPlan>,
     transaction_id: String,
     app_version: String,
     manifest_sha256: String,
@@ -83,6 +85,29 @@ pub struct ImportPlan {
     delivery: DeliveryMetadata,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ImportOperation {
+    Import,
+    Repair,
+}
+
+#[derive(Serialize)]
+struct ReplacementPlan {
+    backup_destination: std::path::PathBuf,
+    identity: GenerationIdentity,
+}
+
+#[derive(PartialEq, Eq, Serialize)]
+struct GenerationIdentity {
+    device: u64,
+    inode: u64,
+    modified_seconds: i64,
+    modified_nanos: i64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+}
+
 #[derive(Serialize)]
 struct ImportFile {
     source: std::path::PathBuf,
@@ -91,6 +116,11 @@ struct ImportFile {
 }
 
 impl ImportPlan {
+    pub fn recovery_backup(&self) -> Option<&std::path::Path> {
+        self.replacement
+            .as_ref()
+            .map(|p| p.backup_destination.as_path())
+    }
     pub fn consent_sha256(&self) -> Result<String, ManagedDecisionError> {
         use sha2::{Digest, Sha256};
         let bytes = serde_json::to_vec(self).map_err(|_| ManagedDecisionError::Integrity)?;
@@ -133,6 +163,23 @@ pub fn plan_local(
     #[cfg(target_os = "macos")]
     {
         native::plan::prepare(profile, worker, model)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (profile, worker, model);
+        Err(ManagedDecisionError::UnsupportedPlatform)
+    }
+}
+
+/// Plan an explicit repair; the previous generation is preserved, not removed.
+pub fn plan_repair_local(
+    profile: &str,
+    worker: &std::path::Path,
+    model: &std::path::Path,
+) -> Result<ImportPlan, ManagedDecisionError> {
+    #[cfg(target_os = "macos")]
+    {
+        native::plan::prepare_repair(profile, worker, model)
     }
     #[cfg(not(target_os = "macos"))]
     {

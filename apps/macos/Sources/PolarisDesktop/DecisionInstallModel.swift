@@ -11,6 +11,9 @@ struct DecisionInstallCatalog: Decodable, Sendable {
 
 struct DecisionInstallOffer: Decodable, Sendable {
     struct Plan: Decodable, Sendable {
+        struct Replacement: Decodable, Sendable { let backupDestination: String }
+        let operation: String
+        let replacement: Replacement?
         struct Artifact: Decodable, Sendable { let source: String; let bytes: UInt64; let sha256: String }
         struct Delivery: Decodable, Sendable {
             struct Component: Decodable, Sendable { let name: String; let version: String; let license: String; let source: String }
@@ -47,7 +50,7 @@ enum DecisionInstallOutcome: Sendable { case installed, cancelled }
 protocol DecisionInstallTransport: Sendable {
     func verify(profile: String) async throws -> DecisionGenerationVerification
     func catalog() async throws -> DecisionInstallCatalog
-    func prepare(profile: String, worker: URL, model: URL) async throws -> DecisionInstallOffer
+    func prepare(profile: String, worker: URL, model: URL, repair: Bool) async throws -> DecisionInstallOffer
     func confirm(consent: String, approved: Bool) async throws -> DecisionInstallOutcome
     func cancel() async
 }
@@ -69,6 +72,8 @@ final class DecisionInstallModel: ObservableObject {
     }
     @Published var worker: URL?
     @Published var model: URL?
+    @Published var repair = false
+    @Published private(set) var recoveryBackup: String?
     private let transport: any DecisionInstallTransport
     private var task: Task<Void, Never>?
     private var operationID = UUID()
@@ -149,12 +154,15 @@ final class DecisionInstallModel: ObservableObject {
     func prepare() {
         guard canPrepare, let worker, let model else { return }
         let selected = profile
+        let repairing = repair
         verification = nil
         start {
-            let offer = try await self.transport.prepare(profile: selected, worker: worker, model: model)
+            let offer = try await self.transport.prepare(profile: selected, worker: worker, model: model, repair: repairing)
             guard !Task.isCancelled else { return }
             guard offer.plan.profile == selected, offer.plan.worker.source == worker.path,
-                  offer.plan.model.source == model.path else { throw ServiceError.correlation }
+                  offer.plan.model.source == model.path, self.repair == repairing,
+                  offer.plan.operation == (repairing ? "repair" : "import") else { throw ServiceError.correlation }
+            self.recoveryBackup = offer.plan.replacement?.backupDestination
             self.offer = offer
             self.message = "この計画で導入するか確認してください。確認は120秒以内に行います。"
         }
@@ -162,7 +170,7 @@ final class DecisionInstallModel: ObservableObject {
 
     func confirm(_ approved: Bool) {
         guard !busy, let offer else { return }
-        if approved && (profile != offer.plan.profile || worker?.path != offer.plan.worker.source || model?.path != offer.plan.model.source) {
+        if approved && (profile != offer.plan.profile || worker?.path != offer.plan.worker.source || model?.path != offer.plan.model.source || (repair ? "repair" : "import") != offer.plan.operation) {
             cancel()
             message = "対象が変わりました。新しい計画を確認してください。"
             return
@@ -173,7 +181,9 @@ final class DecisionInstallModel: ObservableObject {
             let result = try await self.transport.confirm(consent: offer.consentSha256, approved: approved)
             guard !Task.isCancelled else { return }
             switch result {
-            case .installed: self.message = "generationを導入しました。判断器の選択・有効化は変更していません。"
+            case .installed: self.message = offer.plan.operation == "repair"
+                ? "generationを修復しました。旧generationは保持先に残しています。選択・有効化は変更していません。"
+                : "generationを導入しました。判断器の選択・有効化は変更していません。"
             case .cancelled: self.message = "導入を取り消しました。既存generationは保持しています。"
             }
         }

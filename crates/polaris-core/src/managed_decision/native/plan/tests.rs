@@ -165,3 +165,60 @@ fn cancellation_and_relative_sources_have_no_import_effects() {
     assert!(!home.join(".polaris").exists());
     assert!(registered_profiles().unwrap().is_empty());
 }
+
+#[test]
+fn repair_consent_binds_the_operation_existing_identity_and_backup_destination() {
+    let (_root, bytes, home, sources) = fixture();
+    let initial = plan(&bytes, &home, &sources);
+    let consent = initial.consent_sha256().unwrap();
+    execute_with(&bytes, initial, &consent, || false, || Ok(home.clone())).unwrap();
+    let prepare = || {
+        make_operation(
+            &bytes,
+            "fixture-cpu-v1",
+            &home,
+            &sources.join("worker"),
+            &sources.join("model.gguf"),
+            &"d".repeat(32),
+            ImportOperation::Repair,
+        )
+        .unwrap()
+    };
+    let repair = prepare();
+    let visible = serde_json::to_value(&repair).unwrap();
+    assert_eq!(visible["operation"], "repair");
+    assert!(
+        visible["replacement"]["backup_destination"]
+            .as_str()
+            .unwrap()
+            .contains(".recovery-")
+    );
+    let repaired_consent = repair.consent_sha256().unwrap();
+    assert_ne!(repaired_consent, consent);
+    assert_eq!(
+        execute_with(
+            &bytes,
+            repair,
+            &consent,
+            || false,
+            || panic!("wrong consent consulted home")
+        ),
+        Err(ManagedDecisionError::PlanChanged)
+    );
+    let repair = prepare();
+    let backup = repair.recovery_backup().unwrap().to_owned();
+    execute_with(
+        &bytes,
+        repair,
+        &repaired_consent,
+        || false,
+        || Ok(home.clone()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(backup.join("model.gguf")).unwrap(), b"dummy");
+    assert_eq!(
+        fs::read(home.join(".polaris/decision-runtime/generations/fixture-v1/model.gguf")).unwrap(),
+        b"dummy"
+    );
+    assert!(prepare().consent_sha256().unwrap() != repaired_consent);
+}

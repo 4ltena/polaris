@@ -628,7 +628,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/managed_decision/native`
 
-- `install.rs` — Explicit offline import into a new, immutable decision generation.
+- `install.rs` — Explicit offline import and lossless repair of fixed decision generations.
 - `plan.rs` — Fresh consent plans bind the package, sources, destination and inventory.
 - `tests.rs` — Package-lock and private-generation fixtures; no real model is executed.
 - `verification.rs` — Explicit full-digest check of an existing pinned generation; no mutation or launch.

@@ -58,9 +58,9 @@ actor PackagedDecisionInstallClient: DecisionInstallTransport {
         !value.isEmpty && value.utf8.count <= 256 && value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
     }
 
-    func prepare(profile: String, worker: URL, model: URL) async throws -> DecisionInstallOffer {
+    func prepare(profile: String, worker: URL, model: URL, repair: Bool = false) async throws -> DecisionInstallOffer {
         guard child == nil, Self.profileID(profile), worker.isFileURL, model.isFileURL else { throw ServiceError.notReady }
-        let process = try DecisionInstallChild(helper: helper(), arguments: ["decision", "import", profile,
+        let process = try DecisionInstallChild(helper: helper(), arguments: ["decision", repair ? "repair" : "import", profile,
             "--worker", worker.path, "--model", model.path, "--stdio-confirm"])
         child = process
         do {
@@ -69,7 +69,15 @@ actor PackagedDecisionInstallClient: DecisionInstallTransport {
             guard child === process else { throw ServiceError.notReady }
             guard offer.schemaVersion == 1, offer.type == "plan", Self.digest(offer.consentSha256),
                   offer.plan.profile == profile, offer.plan.worker.source == worker.path,
-                  offer.plan.model.source == model.path, offer.plan.delivery.components.count <= 64 else { throw ServiceError.correlation }
+                  offer.plan.model.source == model.path, offer.plan.delivery.components.count <= 64,
+                  offer.plan.operation == (repair ? "repair" : "import") else { throw ServiceError.correlation }
+            if repair {
+                guard let backup = offer.plan.replacement?.backupDestination,
+                      backup.utf8.count <= 4096, backup.hasPrefix("/"),
+                      !backup.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+                      URL(fileURLWithPath: backup).deletingLastPathComponent() == URL(fileURLWithPath: offer.plan.destination).deletingLastPathComponent(),
+                      URL(fileURLWithPath: backup).lastPathComponent.hasPrefix(".recovery-") else { throw ServiceError.schema }
+            } else if offer.plan.replacement != nil { throw ServiceError.schema }
             consent = offer.consentSha256
             return offer
         } catch { process.stop(); if child === process { child = nil; consent = nil }; throw error }

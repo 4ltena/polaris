@@ -14,6 +14,10 @@ struct DecisionInstallPanel: View {
                 if model.busy { ProgressView().controlSize(.small) }
             }
             Text(model.message).font(.caption).textSelection(.enabled)
+            if let backup = model.recoveryBackup {
+                Text("修復用保持先（計画値。完了未確認の場合は配置結果を確認）: \(backup)")
+                    .font(.caption).textSelection(.enabled)
+            }
             GroupBox("次回owner起動用の選択") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(selection.map { "\($0.profile) / \($0.enabled ? "有効化を選択" : "無効")" } ?? "設定ファイルとJevスイッチの選択を使用")
@@ -59,17 +63,23 @@ struct DecisionInstallPanel: View {
                     }
                     sourceRow("worker", url: model.worker) { model.worker = $0 }
                     sourceRow("model", url: model.model) { model.model = $0 }
+                    Toggle("既存generationを保持して修復する", isOn: $model.repair)
+                        .disabled(model.busy || model.offer != nil)
                     Button("導入計画を確認") { model.prepare() }.disabled(!model.canPrepare)
                 }
             }
             if let offer = model.offer {
                 let plan = offer.plan
-                GroupBox("今回の導入計画") {
+                GroupBox(offer.plan.operation == "repair" ? "今回の修復計画" : "今回の導入計画") {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("\(plan.profile) / \(plan.quantization) / \(plan.device)").font(.headline)
                         Text(plan.delivery.purpose)
                         Text("配置容量: \(bytes(plan.installedBytes))、copy予備: \(bytes(plan.copyReserveBytes))")
                         Text("導入先: \(plan.destination)").textSelection(.enabled)
+                        if let replacement = plan.replacement {
+                            Text("旧generationの保持先: \(replacement.backupDestination)\n旧資源は削除しません。ownerを終了してから修復し、完了後は起動し直してください。")
+                                .textSelection(.enabled)
+                        }
                         Text("model取得元: \(plan.delivery.modelSource)").textSelection(.enabled)
                         Text("worker取得元: \(plan.delivery.workerSource)").textSelection(.enabled)
                         Text("license: \(plan.delivery.license)\n\(plan.delivery.licenseSource)\nNOTICE: \(plan.delivery.noticeSource)").textSelection(.enabled)
@@ -79,7 +89,7 @@ struct DecisionInstallPanel: View {
                             ForEach(Array(plan.delivery.components.enumerated()), id: \.offset) { _, c in Text("\(c.name) \(c.version) / \(c.license)\n\(c.source)") }
                         }
                         HStack {
-                            Button("この計画で導入") { model.confirm(true) }
+                            Button(offer.plan.operation == "repair" ? "この計画で修復" : "この計画で導入") { model.confirm(true) }
                             Button("取り消す", role: .cancel) { model.confirm(false) }
                         }
                     }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)

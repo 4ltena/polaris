@@ -1,6 +1,6 @@
 //! Offline import transactions use synthetic bytes and never execute a worker.
 use super::*;
-use std::fs;
+use std::{fs, os::unix::fs::PermissionsExt};
 
 fn fixture() -> (tempfile::TempDir, Subject, PathBuf) {
     let (root, subject) = super::super::tests::fixture();
@@ -24,6 +24,7 @@ fn run(s: &Subject, home: &Path, inputs: &Path) -> Result<(), ManagedDecisionErr
         home,
         &inputs.join("worker"),
         &inputs.join("model.gguf"),
+        None,
         || false,
         || Ok(()),
     )
@@ -114,6 +115,7 @@ fn cancellation_after_copying_worker_is_clean_and_a_fresh_import_can_succeed() {
         &home,
         &inputs.join("worker"),
         &inputs.join("model.gguf"),
+        None,
         || {
             checks += 1;
             checks == 4
@@ -135,6 +137,7 @@ fn a_concurrent_destination_is_never_overwritten() {
         &home,
         &inputs.join("worker"),
         &inputs.join("model.gguf"),
+        None,
         || false,
         || {
             fs::create_dir(&target).unwrap();
@@ -161,6 +164,7 @@ fn a_swapped_parent_is_not_followed_for_publication_or_cleanup() {
         &home,
         &inputs.join("worker"),
         &inputs.join("model.gguf"),
+        None,
         || false,
         || {
             fs::rename(generations(&home), &old).unwrap();
@@ -172,4 +176,140 @@ fn a_swapped_parent_is_not_followed_for_publication_or_cleanup() {
     assert_eq!(fs::read_dir(old).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
     assert_eq!(fs::read(outside.join("keep")).unwrap(), b"unrelated");
+}
+
+#[test]
+fn repair_atomically_exchanges_verified_bytes_and_preserves_the_previous_tree() {
+    let (root, s, inputs) = fixture();
+    let home = root.path().canonicalize().unwrap();
+    run(&s, &home, &inputs).unwrap();
+    let target = generations(&home).join(&s.generation);
+    fs::set_permissions(target.join("model.gguf"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(target.join("model.gguf"), b"broken").unwrap();
+    fs::write(target.join("keep-extra"), b"never delete this").unwrap();
+    let expected = replacement(&home, &s.generation, &"a".repeat(32)).unwrap();
+    import(
+        &s,
+        &home,
+        &inputs.join("worker"),
+        &inputs.join("model.gguf"),
+        Some(&expected),
+        || false,
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(target.join("model.gguf")).unwrap(), b"dummy");
+    assert_eq!(
+        fs::read(expected.backup_destination.join("model.gguf")).unwrap(),
+        b"broken"
+    );
+    assert_eq!(
+        fs::read(expected.backup_destination.join("keep-extra")).unwrap(),
+        b"never delete this"
+    );
+    assert_eq!(
+        fs::metadata(target.join("model.gguf")).unwrap().mode() & 0o777,
+        0o400
+    );
+    assert_eq!(fs::read_dir(generations(&home)).unwrap().count(), 2);
+    assert!(!home.join(".polaris/config.toml").exists());
+}
+
+#[test]
+fn repair_cancellation_and_bad_sources_leave_the_previous_generation_in_place() {
+    for cancelled in [false, true] {
+        let (root, s, inputs) = fixture();
+        let home = root.path().canonicalize().unwrap();
+        run(&s, &home, &inputs).unwrap();
+        let expected = replacement(&home, &s.generation, &"b".repeat(32)).unwrap();
+        if !cancelled {
+            fs::write(inputs.join("model.gguf"), b"wrong").unwrap();
+        }
+        let mut checks = 0;
+        let result = import(
+            &s,
+            &home,
+            &inputs.join("worker"),
+            &inputs.join("model.gguf"),
+            Some(&expected),
+            || {
+                checks += 1;
+                cancelled && checks == 4
+            },
+            || Ok(()),
+        );
+        assert_eq!(
+            result,
+            Err(if cancelled {
+                ManagedDecisionError::Cancelled
+            } else {
+                ManagedDecisionError::Integrity
+            })
+        );
+        assert_eq!(
+            fs::read(generations(&home).join(&s.generation).join("model.gguf")).unwrap(),
+            b"dummy"
+        );
+        assert!(!expected.backup_destination.exists());
+        assert_eq!(fs::read_dir(generations(&home)).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn changed_generation_and_busy_management_are_not_replaced_or_retried() {
+    let (root, s, inputs) = fixture();
+    let home = root.path().canonicalize().unwrap();
+    run(&s, &home, &inputs).unwrap();
+    let runtime = File::open(home.join(".polaris/decision-runtime")).unwrap();
+    let held = management_lock(&runtime).unwrap();
+    assert_eq!(run(&s, &home, &inputs), Err(ManagedDecisionError::Conflict));
+    drop(held);
+    let expected = replacement(&home, &s.generation, &"c".repeat(32)).unwrap();
+    let target = generations(&home).join(&s.generation);
+    let other = generations(&home).join("concurrent-generation");
+    let result = import(
+        &s,
+        &home,
+        &inputs.join("worker"),
+        &inputs.join("model.gguf"),
+        Some(&expected),
+        || false,
+        || {
+            fs::rename(&target, &other).unwrap();
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(target.join("other-install"), b"keep").unwrap();
+            Ok(())
+        },
+    );
+    assert_eq!(result, Err(ManagedDecisionError::PlanChanged));
+    assert_eq!(fs::read(target.join("other-install")).unwrap(), b"keep");
+    assert_eq!(fs::read(other.join("model.gguf")).unwrap(), b"dummy");
+    assert!(!expected.backup_destination.exists());
+}
+
+#[test]
+fn weakened_parent_permissions_before_swap_preserve_the_original_generation() {
+    let (root, s, inputs) = fixture();
+    let home = root.path().canonicalize().unwrap();
+    run(&s, &home, &inputs).unwrap();
+    let expected = replacement(&home, &s.generation, &"e".repeat(32)).unwrap();
+    let result = import(
+        &s,
+        &home,
+        &inputs.join("worker"),
+        &inputs.join("model.gguf"),
+        Some(&expected),
+        || false,
+        || {
+            fs::set_permissions(generations(&home), fs::Permissions::from_mode(0o777)).unwrap();
+            Ok(())
+        },
+    );
+    assert_eq!(result, Err(ManagedDecisionError::Integrity));
+    assert_eq!(
+        fs::read(generations(&home).join(&s.generation).join("model.gguf")).unwrap(),
+        b"dummy"
+    );
+    assert!(!expected.backup_destination.exists());
 }

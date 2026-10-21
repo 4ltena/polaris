@@ -24,7 +24,13 @@ enum Command {
         stdio_result: bool,
     },
     /// 明示導入の内容をJSONで表示。ファイルの取得・copyなし。
-    Plan(Sources),
+    Plan {
+        #[command(flatten)]
+        sources: Sources,
+        /// 既存generationを保持して修復する計画を表示。
+        #[arg(long)]
+        repair: bool,
+    },
     /// 確認した固定artifactをcopy。backend設定や推論は開始しない。
     Import {
         #[command(flatten)]
@@ -33,6 +39,15 @@ enum Command {
         #[arg(long)]
         yes: bool,
         /// Internal same-process confirmation channel for the packaged GUI.
+        #[arg(long, hide = true, conflicts_with = "yes")]
+        stdio_confirm: bool,
+    },
+    /// 固定artifactで修復。旧generationは表示した復旧先に保持する。
+    Repair {
+        #[command(flatten)]
+        sources: Sources,
+        #[arg(long)]
+        yes: bool,
         #[arg(long, hide = true, conflicts_with = "yes")]
         stdio_confirm: bool,
     },
@@ -60,7 +75,7 @@ pub async fn run(args: Args) -> ExitCode {
 }
 
 async fn perform(args: Args) -> Result<(), String> {
-    let (sources, import) = match args.command {
+    let (sources, import, repair) = match args.command {
         Command::List => {
             let registered = managed_decision::registered_profiles().map_err(|e| e.to_string())?;
             let observation = polaris_core::decision_capacity::observation::host_memory();
@@ -76,15 +91,25 @@ async fn perform(args: Args) -> Result<(), String> {
             profile,
             stdio_result,
         } => return verify(profile, stdio_result).await,
-        Command::Plan(sources) => (sources, None),
+        Command::Plan { sources, repair } => (sources, None, repair),
         Command::Import {
             sources,
             yes,
             stdio_confirm,
-        } => (sources, Some((yes, stdio_confirm))),
+        } => (sources, Some((yes, stdio_confirm)), false),
+        Command::Repair {
+            sources,
+            yes,
+            stdio_confirm,
+        } => (sources, Some((yes, stdio_confirm)), true),
     };
-    let plan = managed_decision::plan_local(&sources.profile, &sources.worker, &sources.model)
-        .map_err(|e| e.to_string())?;
+    let plan = if repair {
+        managed_decision::plan_repair_local(&sources.profile, &sources.worker, &sources.model)
+    } else {
+        managed_decision::plan_local(&sources.profile, &sources.worker, &sources.model)
+    }
+    .map_err(|e| e.to_string())?;
+    let backup = plan.recovery_backup().map(|p| p.to_owned());
     let consent = plan.consent_sha256().map_err(|e| e.to_string())?;
     let frame =
         serde_json::json!({"schema_version":1,"type":"plan","consent_sha256":consent,"plan":&plan});
@@ -125,7 +150,10 @@ async fn perform(args: Args) -> Result<(), String> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err("導入確認には対話端末、または今回の選択への明示的な --yes が必要です。変更していません。".into());
         }
-        eprint!("表示した計画で導入しますか？ [y/n]: ");
+        eprint!(
+            "表示した計画で{}しますか？ [y/n]: ",
+            if repair { "修復" } else { "導入" }
+        );
         io::stderr().flush().map_err(|e| e.to_string())?;
         let mut answer = String::new();
         io::stdin()
@@ -164,7 +192,13 @@ async fn perform(args: Args) -> Result<(), String> {
             serde_json::json!({"schema_version":1,"type":"complete","status":"installed","consent_sha256":consent})
         );
     } else {
-        println!("Clef generationを導入しました。backendの選択・有効化は変更していません。");
+        println!(
+            "Clef generationを{}しました。backendの選択・有効化は変更していません。",
+            if repair { "修復" } else { "導入" }
+        );
+        if let Some(backup) = backup {
+            println!("旧generationの保持先: {}", backup.display());
+        }
     }
     Ok(())
 }

@@ -27,12 +27,46 @@ pub(in crate::managed_decision) fn prepare(
     worker: &Path,
     model: &Path,
 ) -> Result<ImportPlan, ManagedDecisionError> {
+    prepare_operation(profile, worker, model, ImportOperation::Import)
+}
+
+pub(in crate::managed_decision) fn prepare_repair(
+    profile: &str,
+    worker: &Path,
+    model: &Path,
+) -> Result<ImportPlan, ManagedDecisionError> {
+    prepare_operation(profile, worker, model, ImportOperation::Repair)
+}
+
+fn prepare_operation(
+    profile: &str,
+    worker: &Path,
+    model: &Path,
+    operation: ImportOperation,
+) -> Result<ImportPlan, ManagedDecisionError> {
     select_profile(LOCK, profile)?;
     let home = crate::os_home::trusted_user_home().map_err(|_| ManagedDecisionError::Install)?;
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).map_err(|_| ManagedDecisionError::Install)?;
     let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    make(LOCK, profile, &home, worker, model, &nonce)
+    make_operation(LOCK, profile, &home, worker, model, &nonce, operation)
+}
+
+fn make_operation(
+    bytes: &[u8],
+    profile: &str,
+    home: &Path,
+    worker: &Path,
+    model: &Path,
+    nonce: &str,
+    operation: ImportOperation,
+) -> Result<ImportPlan, ManagedDecisionError> {
+    let mut plan = make(bytes, profile, home, worker, model, nonce)?;
+    plan.operation = operation;
+    if operation == ImportOperation::Repair {
+        plan.replacement = Some(super::install::replacement(home, &plan.generation, nonce)?);
+    }
+    Ok(plan)
 }
 
 fn make(
@@ -70,6 +104,8 @@ fn make(
         .checked_add(s.model.bytes)
         .ok_or(ManagedDecisionError::Integrity)?;
     Ok(ImportPlan {
+        operation: ImportOperation::Import,
+        replacement: None,
         transaction_id: nonce.into(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         manifest_sha256: format!("{:x}", Sha256::digest(bytes)),
@@ -126,13 +162,14 @@ fn execute_with(
         return Err(ManagedDecisionError::PlanChanged);
     }
     let home = home()?;
-    let fresh = make(
+    let fresh = make_operation(
         bytes,
         &plan.profile,
         &home,
         &plan.worker.source,
         &plan.model.source,
         &plan.transaction_id,
+        plan.operation,
     )?;
     if fresh.consent_sha256()? != consent {
         return Err(ManagedDecisionError::PlanChanged);
@@ -143,6 +180,7 @@ fn execute_with(
         &home,
         &plan.worker.source,
         &plan.model.source,
+        plan.replacement.as_ref(),
         cancelled,
         || Ok(()),
     )

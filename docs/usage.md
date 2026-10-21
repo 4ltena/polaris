@@ -140,6 +140,8 @@ macOS desktopのV2 snapshotにも同じ型付き判断の診断を表示する�
 
 `polaris decision list`は登録済みprofile IDと容量の推薦をJSONで表示する。現在の登録は0件である。登録は導入や実行可否の確認ではなく、この操作でJev/SemIfの設定は変わらない。
 
+導入済みの固定generationを再利用する前には、`polaris decision verify PROFILE_ID`でworker/modelの全size・SHAを読み取り専用で照合できる。成功時はprofile・generation・モデルrevision・量子化・照合したhashとバイト数をJSONで表示する。未受入・未導入・破損・非対応の場合は理由を表示して失敗し、Ctrl-Cで取消できる。copy・削除・backend選択・有効化・推論は行わない。結果は読み取り時点の確認であり、その後の置換、実行時の容量、モデルの応答品質を保証しない。既存generationがある場合に再importで上書きする必要はなく、固定profileを選んだ通常起動でも実使用前の照合を行う。
+
 受入済みprofileと配布情報が登録された後は、手元の固定artifactを次の管理コマンドで導入できる。`PROFILE_ID`と2つの絶対pathを対象に置き換える。
 
 ```sh

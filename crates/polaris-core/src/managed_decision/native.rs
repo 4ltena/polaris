@@ -19,6 +19,7 @@ const LOCK: &[u8] = include_bytes!(
 
 pub(super) mod install;
 pub(super) mod plan;
+pub(super) mod verification;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +173,15 @@ fn prepare(
     id: &str,
     home: impl FnOnce() -> Result<PathBuf, ManagedDecisionError>,
 ) -> Result<ClefConfig, ManagedDecisionError> {
+    prepare_with_inspection(bytes, id, home, |_, _, _| Ok(()))
+}
+
+fn prepare_with_inspection(
+    bytes: &[u8],
+    id: &str,
+    home: impl FnOnce() -> Result<PathBuf, ManagedDecisionError>,
+    mut inspect: impl FnMut(&File, &std::path::Path, &LockedFile) -> Result<(), ManagedDecisionError>,
+) -> Result<ClefConfig, ManagedDecisionError> {
     use ManagedDecisionError::Integrity;
     let s = select(bytes, id)?;
     // Metal is selectable only after its per-device observation exists. Never
@@ -199,6 +209,7 @@ fn prepare(
     let (generation, directory) = held.last().ok_or(Integrity)?;
     let worker = generation.join("worker");
     let model = generation.join("model.gguf");
+    let mut held_files = Vec::new();
     for (path, name, expected, executable) in [
         (&worker, "worker", &s.worker, true),
         (&model, "model.gguf", &s.model, false),
@@ -222,6 +233,8 @@ fn prepare(
         {
             return Err(Integrity);
         }
+        inspect(&file, path, expected)?;
+        held_files.push((path.clone(), file, metadata));
         // The existing worker snapshot/native model FD checks validate full
         // hashes before use. Avoid hashing gigabytes during ordinary startup.
     }
@@ -229,6 +242,15 @@ fn prepare(
     let runs = crate::project_mutation::open_directory_nofollow(&root).map_err(io_error)?;
     private(&runs)?;
     held.push((root.clone(), runs));
+    // Keep both descriptors pinned until every digest is complete. A later
+    // inspection may not replace an earlier leaf and still produce a report.
+    for (path, file, before) in &held_files {
+        let after = file.metadata().map_err(|_| Integrity)?;
+        let current = path.symlink_metadata().map_err(|_| Integrity)?;
+        if !same_file_metadata(before, &after) || !same_file_metadata(&after, &current) {
+            return Err(Integrity);
+        }
+    }
     for (path, file) in &held {
         let current = path.symlink_metadata().map_err(|_| Integrity)?;
         let pinned = file.metadata().map_err(|_| Integrity)?;
@@ -284,6 +306,24 @@ fn prepare(
             },
         }),
     })
+}
+
+fn same_file_metadata(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    let stamp = |m: &std::fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mode(),
+            m.uid(),
+            m.nlink(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    stamp(a) == stamp(b)
 }
 
 fn io_error(error: std::io::Error) -> ManagedDecisionError {

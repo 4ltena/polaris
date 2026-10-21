@@ -33,6 +33,24 @@ fn decision_management_lists_without_provider_startup_or_resource_mutation() {
     assert!(!project.path().join(".polaris").exists());
 }
 
+#[test]
+fn decision_verify_refuses_unaccepted_profiles_without_provider_or_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = product_binary::command()
+        .env("HOME", dir.path())
+        .env("POLARIS_DATA_DIR", dir.path().join("data"))
+        .env("POLARIS_PROVIDER", "must-not-start-a-provider")
+        .current_dir(dir.path())
+        .args(["decision", "verify", "unregistered-profile"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("受入登録が未完了") || error.contains("このplatform"));
+    assert!(!dir.path().join(".polaris").exists());
+    assert!(!error.contains("API_KEY"));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn decision_management_never_imports_an_unaccepted_profile_even_with_yes() {

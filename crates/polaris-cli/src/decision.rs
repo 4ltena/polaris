@@ -16,6 +16,8 @@ pub struct Args {
 enum Command {
     /// 登録profileと容量の推薦を表示。導入・認証・通信・推論なし。
     List,
+    /// 導入済み固定generationの全SHAを検証。起動・有効化・copyなし。
+    Verify { profile: String },
     /// 明示導入の内容をJSONで表示。ファイルの取得・copyなし。
     Plan(Sources),
     /// 確認した固定artifactをcopy。backend設定や推論は開始しない。
@@ -65,6 +67,7 @@ async fn perform(args: Args) -> Result<(), String> {
             })).map_err(|e| e.to_string())?);
             return Ok(());
         }
+        Command::Verify { profile } => return verify(profile).await,
         Command::Plan(sources) => (sources, None),
         Command::Import {
             sources,
@@ -155,6 +158,30 @@ async fn perform(args: Args) -> Result<(), String> {
     } else {
         println!("Clef generationを導入しました。backendの選択・有効化は変更していません。");
     }
+    Ok(())
+}
+
+async fn verify(profile: String) -> Result<(), String> {
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = cancelled.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        managed_decision::verify_installed(&profile, || {
+            flag.load(std::sync::atomic::Ordering::Acquire)
+        })
+    });
+    let result = tokio::select! {
+        result=&mut task => result,
+        signal=tokio::signal::ctrl_c() => {
+            cancelled.store(true,std::sync::atomic::Ordering::Release);
+            let result=task.await;
+            signal.map_err(|error| error.to_string())?;
+            result
+        }
+    };
+    let verified = result
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    println!("{}",serde_json::to_string_pretty(&serde_json::json!({"schema_version":1,"type":"verified","generation":verified,"note":"読み取り時点の固定SHAを照合しました。backend選択・有効化・推論・容量判定は行っていません。将来の置換や実行可否は保証しません。"})).map_err(|error|error.to_string())?);
     Ok(())
 }
 

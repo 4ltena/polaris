@@ -25,6 +25,36 @@ pub struct DeliveryComponent {
     pub source: String,
 }
 
+/// Read-only, point-in-time digest verification; never an activation receipt.
+#[derive(Debug, Serialize)]
+pub struct VerifiedGeneration {
+    pub profile: String,
+    pub generation: String,
+    pub model_repository: String,
+    pub model_revision: String,
+    pub quantization: String,
+    pub runtime_revision: String,
+    pub worker_sha256: String,
+    pub model_sha256: String,
+    pub verified_bytes: u64,
+}
+
+/// Check an existing fixed generation without copying or starting a worker.
+pub fn verify_installed(
+    profile: &str,
+    cancelled: impl FnMut() -> bool,
+) -> Result<VerifiedGeneration, ManagedDecisionError> {
+    #[cfg(target_os = "macos")]
+    {
+        native::verification::verify(profile, cancelled)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (profile, cancelled);
+        Err(ManagedDecisionError::UnsupportedPlatform)
+    }
+}
+
 /// A fresh, non-deserializable transaction. Only plan_local can construct it;
 /// install_local consumes it so consent is not a reusable persisted receipt.
 #[derive(Serialize)]

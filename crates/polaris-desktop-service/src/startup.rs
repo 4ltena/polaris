@@ -678,10 +678,14 @@ fn start_at(
         executable,
         finalizer_decider,
     )?;
+    let audit = Arc::new(tokio::sync::Mutex::new(private_audit(&recovery)?));
+    let meter = polaris_provider::decision::DecisionMeter::default();
+    polaris_core::audit::install_decision_observer(&meter, audit.clone());
+    let decider = decider.map(|decider| meter.wrap(decider));
     let resources = TrustedFactoryResources {
         decision_local_only: decision.local_only,
         always_on,
-        audit: Arc::new(tokio::sync::Mutex::new(private_audit(&recovery)?)),
+        audit,
         skills: skills.skills,
         agent_types: agents.agent_types,
         max_turns: 64,

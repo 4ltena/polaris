@@ -249,7 +249,7 @@ async fn metered_traces_are_bounded_and_never_store_request_content() {
     let traces = meter.recent();
     assert_eq!(traces.len(), 32);
     assert_eq!(traces[0].configured.backend, "primary");
-    assert_eq!(traces[0].effective.backend, "secondary");
+    assert_eq!(traces[0].effective.as_ref().unwrap().backend, "secondary");
     assert_eq!(meter.snapshot().failed, 40);
     assert_eq!(meter.snapshot().reported, 40);
     assert!(

@@ -119,11 +119,18 @@ class Profile:
                 raise ValueError(f'incomplete {name} observation')
             if counts['missing'] or counts['failed']:
                 raise ValueError(f'{name} has missing or failed requests')
-        if (decision.get('accounting_scope') != 'completed_logical_decisions'
+        scope = decision.get('accounting_scope')
+        if (scope not in ('completed_logical_decisions', 'settled_typed_adapter_observations')
                 or decision.get('physical_attempts_known') is not False
                 or any(type(decision.get(k)) is not int or decision[k] < 0
                        for k in ('input_tokens', 'output_tokens'))):
             raise ValueError('unknown decision accounting contract')
+        for name in ('abandoned_stages', 'observer_failures'):
+            # Legacy receipts omitted these fields. New observations must state
+            # them; an unsettled stage cannot be read as a zero-consumption run.
+            value = decision.get(name, 0 if scope == 'completed_logical_decisions' else None)
+            if type(value) is not int or value != 0:
+                raise ValueError('decision has unsettled stages or failed observation writes')
         return {'configured': configured, 'completed': completed,
                 'decision_state': 'observed' if decision['reported'] else 'not_exercised',
                 'all_classifier_paths_verified': False, 'total_usd': None}

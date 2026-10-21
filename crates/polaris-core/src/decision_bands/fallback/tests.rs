@@ -123,7 +123,10 @@ async fn fallback_factory_and_meter_preserve_actual_profile_and_each_attempt() {
     );
     let traces = meter.recent();
     assert_eq!(traces[0].configured.model.as_deref(), Some("first"));
-    assert_eq!(traces[0].effective.model.as_deref(), Some("second"));
+    assert_eq!(
+        traces[0].effective.as_ref().unwrap().model.as_deref(),
+        Some("second")
+    );
     assert_eq!(first.calls.load(Ordering::SeqCst), 1);
     assert_eq!(second.calls.load(Ordering::SeqCst), 1);
 }

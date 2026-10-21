@@ -124,6 +124,10 @@ impl Drop for DecisionFinished {
 
 #[async_trait::async_trait]
 impl polaris_provider::decision::Decider for ObservedDecider {
+    fn telemetry(&self) -> Option<polaris_provider::decision::DecisionMeter> {
+        self.inner.telemetry()
+    }
+
     fn may_return_calibrated_bands(&self) -> bool {
         self.inner.may_return_calibrated_bands()
     }

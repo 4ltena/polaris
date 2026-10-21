@@ -648,6 +648,7 @@ pub struct RunArgs<'a> {
     /// The same typed judge and tier selector used by one-shot runs. TUI
     /// sessions retain them across `/new`, `/fork`, and `/resume`.
     pub decider: Option<Arc<dyn polaris_provider::decision::Decider>>,
+    pub decision_configuration: polaris_core::config::DecisionConfig,
     pub tier_decider: Option<Arc<dyn polaris_core::tier::TierDecider>>,
     /// Non-authoritative final-answer observer. It runs only after the
     /// canonical assistant message is durable and can never replace output.
@@ -3230,6 +3231,10 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
         }
     };
 
+    if let Some(meter) = args.decider.as_ref().and_then(|held| held.telemetry()) {
+        polaris_core::audit::install_decision_observer(&meter, audit.clone());
+    }
+
     #[cfg(target_os = "linux")]
     let mut source_frontend = source_apply::Frontend::open(&args, audit.clone());
 
@@ -4420,6 +4425,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                                 #[cfg(unix)]
                                 recovery_issue: workflow_recovery_issue.as_deref(),
                             }));
+                            local_lines.extend(
+                                polaris_core::decision_diagnostics::display(
+                                    &args.decision_configuration,
+                                    args.decider.as_deref(),
+                                )
+                                .into_iter()
+                                .map(ratatui::text::Line::from),
+                            );
                             status = Status::Notice("状態を表示しました".into());
                             continue;
                         }
@@ -5399,6 +5412,14 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
                         #[cfg(unix)]
                         recovery_issue: workflow_recovery_issue.as_deref(),
                     }));
+                    local_lines.extend(
+                        polaris_core::decision_diagnostics::display(
+                            &args.decision_configuration,
+                            args.decider.as_deref(),
+                        )
+                        .into_iter()
+                        .map(ratatui::text::Line::from),
+                    );
                     status = Status::Notice("状態を表示しました".into());
                     continue;
                 }

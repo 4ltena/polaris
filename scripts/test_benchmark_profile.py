@@ -78,6 +78,21 @@ class ProfileTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     p.observe(broken)
 
+    def test_typed_attempt_scope_requires_explicit_settled_observation_counts(self):
+        p = self.profile()
+        legacy = self.events(p)
+        self.assertEqual(p.observe(legacy)["decision_state"], "observed")
+        fresh = legacy.replace('"completed_logical_decisions"', '"settled_typed_adapter_observations"')
+        fresh = fresh.replace('"physical_attempts_known": false',
+                              '"physical_attempts_known": false, "abandoned_stages": 0, "observer_failures": 0')
+        self.assertEqual(p.observe(fresh)["decision_state"], "observed")
+        for broken in (fresh.replace('"abandoned_stages": 0', '"abandoned_stages": 1'),
+                       fresh.replace('"observer_failures": 0', '"observer_failures": 1'),
+                       fresh.replace('"abandoned_stages": 0, ', ''),
+                       fresh.replace('"observer_failures": 0', '"observer_failures": false')):
+            with self.assertRaises(ValueError):
+                p.observe(broken)
+
     def test_manifest_contains_no_key_and_pins_exact_configuration(self):
         p = self.profile()
         manifest = p.manifest()

@@ -60,6 +60,10 @@ impl Provider for LocalArbiter {
 struct LocalDecider(Arc<dyn Decider>);
 #[async_trait::async_trait]
 impl Decider for LocalDecider {
+    fn telemetry(&self) -> Option<polaris_provider::decision::DecisionMeter> {
+        self.0.telemetry()
+    }
+
     fn may_return_calibrated_bands(&self) -> bool {
         self.0.may_return_calibrated_bands()
     }

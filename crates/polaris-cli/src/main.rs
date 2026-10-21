@@ -3149,6 +3149,19 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
 
     match args.prompt.clone() {
         Some(prompt) => {
+            // Exactly one handle, shared with whatever subagents `spawn`
+            // starts — see `agent::run`'s docs. The root never holds the
+            // lock across a turn; `run_loop` takes it per audit record.
+            let audit = match AuditLog::open(&audit_path) {
+                Ok(a) => std::sync::Arc::new(tokio::sync::Mutex::new(a)),
+                Err(e) => {
+                    eprintln!("Can't open the audit log: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Some(meter) = decider.as_ref().and_then(|held| held.telemetry()) {
+                polaris_core::audit::install_decision_observer(&meter, audit.clone());
+            }
             let usage_meter = polaris_provider::UsageMeter::default();
             let provider: std::sync::Arc<dyn polaris_provider::Provider> =
                 std::sync::Arc::new(usage_meter.wrap(provider.clone()));
@@ -3730,16 +3743,6 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
                 }
             }
 
-            // Exactly one handle, shared with whatever subagents `spawn`
-            // starts — see `agent::run`'s docs. The root never holds the
-            // lock across a turn; `run_loop` takes it per audit record.
-            let audit = match AuditLog::open(&audit_path) {
-                Ok(a) => std::sync::Arc::new(tokio::sync::Mutex::new(a)),
-                Err(e) => {
-                    eprintln!("Can't open the audit log: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
             let mut stop = StopTracker::new(args.max_turns);
             let mut gate = Gate::new(approval_policy);
             let mut approver = TerminalApprover;
@@ -3841,6 +3844,12 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
                             usage.total_tokens,
                         );
                     }
+                    for line in polaris_core::decision_diagnostics::display(
+                        &config.decision,
+                        decider.as_deref(),
+                    ) {
+                        eprintln!("{line}");
+                    }
                     let judged = decision_meter.snapshot();
                     if judged.reported + judged.missing + judged.failed > 0 {
                         eprintln!(
@@ -3909,6 +3918,7 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
                 provider: provider.clone(),
                 mcp_selection_provider,
                 decider: decider.clone(),
+                decision_configuration: config.decision.clone(),
                 tier_decider: tier_decider.clone(),
                 answer_finalizer,
                 sidechat_auto: config.sidechat_auto,

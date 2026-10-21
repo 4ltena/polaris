@@ -36,8 +36,11 @@ pub struct DecisionObservation {
 #[derive(Debug, Clone, Serialize)]
 pub struct DecisionTrace {
     pub configured: DecisionIdentity,
-    pub effective: DecisionIdentity,
-    pub capabilities: DecisionCapabilities,
+    pub request_id: String,
+    pub abandoned: bool,
+    pub elapsed_ms: u64,
+    pub effective: Option<DecisionIdentity>,
+    pub capabilities: Option<DecisionCapabilities>,
     pub error: Option<DecisionError>,
     pub attempts: Vec<DecisionAttempt>,
 }

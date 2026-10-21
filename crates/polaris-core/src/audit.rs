@@ -6,6 +6,9 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+mod decision;
+pub use decision::install_decision_observer;
+
 use crate::secret_screen::{FilterResult, screen_text};
 
 pub struct AuditLog {

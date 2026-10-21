@@ -207,6 +207,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `conversation_state.rs` — Versioned session storage, separate from the legacy Message-only JSONL reader.
 - `decision_bands.rs` — The band rule, in one place.
 - `decision_capacity.rs` — Memory recommendations and conservative admission for a trusted model profile.
+- `decision_diagnostics.rs` — Read-only typed-stage diagnostics shared by CLI and TUI; no connection probes.
 - `decision_policy.rs` — Local-only admission for judgments and auxiliary generative arbitration.
 - `decisions.rs` — What this project has already settled, so it is not settled twice.
 - `desktop_approval.rs` — Bounded approval mailbox. The controller owns the pending request and
@@ -295,6 +296,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `protected.rs` — Deterministic protected-span extraction and restoration.
 - `shadow.rs` — Host-owned shadow finalization journal and bounded worker.
 - `tests.rs` — Regression tests for answer finalization identities, evidence, and delivery policy.
+
+## `crates/polaris-core/src/audit`
+
+- `decision.rs` — Metadata-only typed-stage audit. An unmatched start has unknown completion/usage.
+
+## `crates/polaris-core/src/audit/decision`
+
+- `tests.rs` — Written start precedes dispatch; raw prompts never enter typed audit records.
 
 ## `crates/polaris-core/src/build_cache`
 
@@ -1405,6 +1414,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `jev.rs` — J-4: the HTTP client for a System One decider.
 - `observation.rs` — Per-request provenance; no prompt, answer text, credential or shared last-backend slot.
 - `semif.rs` — The local typed decider, over a pinned SemIf helper.
+- `telemetry.rs` — Request-local lifecycle observations, including dropped stages with unknown usage.
 - `tests.rs` — Types and checking only; nothing is sent.
 
 ## `crates/polaris-provider/src/decision/fallback`
@@ -1416,6 +1426,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `metrics.rs` — Opt-in physical Jev attempts, with a durable start before network dispatch.
 - `metrics_tests.rs` — Physical attempts survive invalid answers and cancellation without payloads.
 - `tests.rs` — A local stub stands in for the service. No real endpoint is contacted
+
+## `crates/polaris-provider/src/decision/telemetry`
+
+- `tests.rs` — Lifecycle checks use a pending fake adapter and metadata-only observer.
 
 ## `crates/polaris-provider/src/local`
 

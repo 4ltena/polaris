@@ -86,9 +86,11 @@ fn completed_event(
             "reported": decision.reported,
             "missing": decision.missing,
             "failed": decision.failed,
+            "abandoned_stages": decision.abandoned,
+            "observer_failures": decision.observer_failures,
             "input_tokens": decision.input_tokens,
             "output_tokens": decision.output_tokens,
-            "accounting_scope": "completed_logical_decisions",
+            "accounting_scope": "settled_typed_adapter_observations",
             "physical_attempts_known": false,
         },
         "model_usage": model_usage,
@@ -215,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_event_declares_logical_decision_accounting_scope() {
+    fn completed_event_declares_typed_observation_accounting_scope() {
         let payload = completed_event(
             false,
             polaris_provider::decision::DecisionUsage {
@@ -224,6 +226,7 @@ mod tests {
                 reported: 1,
                 missing: 2,
                 failed: 3,
+                ..Default::default()
             },
             Default::default(),
             Default::default(),
@@ -231,7 +234,7 @@ mod tests {
         assert_eq!(payload["event"], "completed");
         assert_eq!(
             payload["decision"]["accounting_scope"],
-            "completed_logical_decisions"
+            "settled_typed_adapter_observations"
         );
         assert_eq!(payload["decision"]["physical_attempts_known"], false);
         assert_eq!(payload["decision"]["input_tokens"], 40);

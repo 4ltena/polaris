@@ -1,11 +1,11 @@
 //! Strict, bounded native worker protocol. No upstream diagnostics escape it.
 use super::*;
-use polaris_provider::decision::{Answer, checked};
-use serde::{
-    Deserialize, Deserializer,
-    de::{Error, MapAccess, Visitor},
+use polaris_provider::decision::{
+    checked,
+    wire::{WireAnswer as NativeAnswer, unique_map},
 };
-use std::{fmt, io::Write};
+use serde::Deserialize;
+use std::io::Write;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub(super) const MAX_FRAME: usize = 1024 * 1024;
@@ -206,52 +206,6 @@ struct Usage {
     output_tokens: u64,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum NativeAnswer {
-    Noul {
-        noul: f64,
-    },
-    Choice {
-        choice: String,
-        #[serde(deserialize_with = "unique_map")]
-        probabilities: BTreeMap<String, f64>,
-        confidence: Option<f64>,
-    },
-    Score {
-        score: f64,
-        #[serde(deserialize_with = "unique_map")]
-        probabilities: BTreeMap<String, f64>,
-        #[serde(deserialize_with = "unique_map")]
-        legend: BTreeMap<String, String>,
-        confidence: Option<f64>,
-    },
-}
-
-fn unique_map<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct Unique<T>(std::marker::PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for Unique<T> {
-        type Value = BTreeMap<String, T>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("unique named values")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut result = BTreeMap::new();
-            while let Some((k, v)) = map.next_entry::<String, T>()? {
-                if result.insert(k, v).is_some() {
-                    return Err(A::Error::custom("duplicate key"));
-                }
-            }
-            Ok(result)
-        }
-    }
-    deserializer.deserialize_map(Unique(std::marker::PhantomData))
-}
-
 pub(super) fn decision(
     line: &[u8],
     owner: &str,
@@ -287,59 +241,7 @@ pub(super) fn decision(
     let mut answers = BTreeMap::new();
     for (key, value) in native.answers {
         let question = questions.get(&key).ok_or(DecisionError::InvalidAnswer)?;
-        let answer = match (value, question) {
-            (NativeAnswer::Noul { noul }, Question::Noul { .. }) => Answer {
-                noul: Some(noul),
-                ..Default::default()
-            },
-            (
-                NativeAnswer::Choice {
-                    choice,
-                    probabilities,
-                    confidence,
-                },
-                Question::Choice { .. },
-            ) => Answer {
-                choice: Some(choice),
-                probabilities,
-                confidence,
-                ..Default::default()
-            },
-            (
-                NativeAnswer::Score {
-                    score,
-                    probabilities,
-                    legend,
-                    confidence,
-                },
-                Question::Score { criteria, .. },
-            ) => {
-                if legend
-                    != criteria
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| (i.to_string(), s.clone()))
-                        .collect()
-                    || (score
-                        - probabilities
-                            .iter()
-                            .map(|(k, p)| k.parse::<usize>().map_or(f64::NAN, |i| i as f64 * p))
-                            .sum::<f64>())
-                    .abs()
-                        > 0.01
-                {
-                    return Err(DecisionError::InvalidAnswer);
-                }
-                Answer {
-                    score: Some(score),
-                    probabilities,
-                    legend,
-                    confidence,
-                    ..Default::default()
-                }
-            }
-            _ => return Err(DecisionError::InvalidAnswer),
-        };
+        let answer = value.checked_for(question)?;
         answers.insert(key, answer);
     }
     let result = Decision {

@@ -62,7 +62,7 @@ pub fn display(
         usage.input_tokens, usage.output_tokens
     ));
     lines.push(format!(
-        "  試行: 使用量あり {} / 欠測 {} / 失敗 {}",
+        "  試行: 成功・使用量あり {} / 成功・欠測 {} / 失敗 {}",
         usage.reported, usage.missing, usage.failed
     ));
     lines.push(format!(
@@ -92,6 +92,13 @@ pub fn display(
             ));
         }
         for (index, attempt) in trace.attempts.iter().enumerate() {
+            if let Some(endpoint) = &attempt.endpoint_origin {
+                lines.push(format!(
+                    "  接続先origin（試行{}）: {}",
+                    index + 1,
+                    text(endpoint)
+                ));
+            }
             if let Some(capacity) = &attempt.capacity {
                 lines.push(format!("  容量（試行{}）: {} / 理由={} / budget={:?} / required={:?} / 同居予定={:?} bytes", index+1, capacity.status, capacity.reason.as_deref().map(text).unwrap_or_else(|| "なし".into()), capacity.budget_bytes, capacity.required_bytes, capacity.colocated_bytes));
             }

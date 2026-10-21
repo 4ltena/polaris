@@ -31,6 +31,8 @@ pub struct DecisionAttempt {
     /// Adapter invocation, not proof of a network request or completed inference.
     pub invoked: bool,
     pub capacity: Option<DecisionCapacity>,
+    /// Credential-bound origin only; URL paths/queries may carry private data.
+    pub endpoint_origin: Option<String>,
     pub reason: Option<String>,
     pub elapsed_ms: u64,
     pub error: Option<DecisionError>,
@@ -71,6 +73,7 @@ impl DecisionObservation {
             identity: identity.clone(),
             invoked: true,
             capacity: None,
+            endpoint_origin: None,
             reason: None,
             elapsed_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
             error: result.as_ref().err().cloned(),

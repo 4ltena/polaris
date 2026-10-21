@@ -1425,8 +1425,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `jev.rs` — J-4: the HTTP client for a System One decider.
 - `observation.rs` — Per-request provenance; no prompt, answer text, credential or shared last-backend slot.
 - `semif.rs` — The local typed decider, over a pinned SemIf helper.
+- `system_one.rs` — Explicit System One HTTP compatibility contract; never inferred from a name.
 - `telemetry.rs` — Request-local lifecycle observations, including dropped stages with unknown usage.
 - `tests.rs` — Types and checking only; nothing is sent.
+- `wire.rs` — Strict tagged answers and duplicate-key refusal shared by typed protocols.
 
 ## `crates/polaris-provider/src/decision/fallback`
 
@@ -1437,6 +1439,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `metrics.rs` — Opt-in physical Jev attempts, with a durable start before network dispatch.
 - `metrics_tests.rs` — Physical attempts survive invalid answers and cancellation without payloads.
 - `tests.rs` — A local stub stands in for the service. No real endpoint is contacted
+
+## `crates/polaris-provider/src/decision/system_one`
+
+- `tests.rs` — Synthetic loopback protocol tests; no real service or credential.
 
 ## `crates/polaris-provider/src/decision/telemetry`
 

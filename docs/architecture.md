@@ -105,7 +105,7 @@ crate 13件、依存 41件。名前の`polaris-`は省いた。開発用の依�
 
 実装: `crates/polaris-http/src/lib.rs`
 
-呼び出し側 23件。
+呼び出し側 33件。
 
 - `crates/polaris-auth/src/quota/usage.rs:172`
 - `crates/polaris-auth/src/quota/usage.rs:176`
@@ -117,6 +117,16 @@ crate 13件、依存 41件。名前の`polaris-`は省いた。開発用の依�
 - `crates/polaris-provider/src/decision/jev.rs:33`
 - `crates/polaris-provider/src/decision/jev.rs:71`
 - `crates/polaris-provider/src/decision/jev.rs:239`
+- `crates/polaris-provider/src/decision/system_one.rs:22`
+- `crates/polaris-provider/src/decision/system_one.rs:46`
+- `crates/polaris-provider/src/decision/system_one.rs:87`
+- `crates/polaris-provider/src/decision/system_one.rs:94`
+- `crates/polaris-provider/src/decision/system_one.rs:122`
+- `crates/polaris-provider/src/decision/system_one.rs:123`
+- `crates/polaris-provider/src/decision/system_one.rs:145`
+- `crates/polaris-provider/src/decision/system_one.rs:146`
+- `crates/polaris-provider/src/decision/system_one.rs:217`
+- `crates/polaris-provider/src/decision/system_one.rs:218`
 - `crates/polaris-provider/src/lib.rs:105`
 - `crates/polaris-provider/src/lib.rs:607`
 - `crates/polaris-provider/src/local.rs:6`

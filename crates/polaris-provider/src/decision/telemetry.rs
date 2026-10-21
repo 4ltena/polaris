@@ -119,20 +119,20 @@ impl Stage {
         trace.attempts = observation.attempts.clone();
         let mut usage = self.meter.usage.lock().expect("decision meter poisoned");
         for attempt in &observation.attempts {
+            // Failure and consumption are independent: a refused response
+            // may still carry known service-reported token usage.
+            if let Some(input) = attempt.input_tokens {
+                usage.input_tokens = usage.input_tokens.saturating_add(input);
+            }
+            if let Some(output) = attempt.output_tokens {
+                usage.output_tokens = usage.output_tokens.saturating_add(output);
+            }
             if attempt.error.is_some() {
                 usage.failed = usage.failed.saturating_add(1);
+            } else if attempt.input_tokens.is_some() && attempt.output_tokens.is_some() {
+                usage.reported = usage.reported.saturating_add(1);
             } else {
-                if let Some(input) = attempt.input_tokens {
-                    usage.input_tokens = usage.input_tokens.saturating_add(input);
-                }
-                if let Some(output) = attempt.output_tokens {
-                    usage.output_tokens = usage.output_tokens.saturating_add(output);
-                }
-                if attempt.input_tokens.is_some() && attempt.output_tokens.is_some() {
-                    usage.reported = usage.reported.saturating_add(1);
-                } else {
-                    usage.missing = usage.missing.saturating_add(1);
-                }
+                usage.missing = usage.missing.saturating_add(1);
             }
         }
         drop(usage);

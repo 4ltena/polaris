@@ -195,8 +195,8 @@ pub struct DecisionUsage {
     /// Answered requests whose reply omitted either usage figure. Known
     /// token subtotals remain recorded; the response's total is incomplete.
     pub missing: u64,
-    /// Requests that did not answer. Consumption unknown; the service may
-    /// have done work before refusing.
+    /// Requests without an accepted answer. Totals retain any service-reported
+    /// usage; absent figures stay unknown because work may precede refusal.
     pub failed: u64,
     /// Logical stages dropped before observation settled. Physical usage and
     /// which attempts reached a runtime remain unknown; never counted as zero.
@@ -351,6 +351,9 @@ pub fn checked(
 
 pub mod jev;
 pub mod semif;
+pub mod system_one;
+#[doc(hidden)]
+pub mod wire;
 
 #[cfg(test)]
 mod tests;

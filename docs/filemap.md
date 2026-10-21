@@ -229,6 +229,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `linux_l04_parent.rs` — Read-only validation of an empty disposable restart fixture parent.
 - `llama_server.rs` — Supervising the bundled `llama-server`.
 - `local_execution.rs` — Fixed local selections with endpoint-wide physical inference admission.
+- `managed_decision.rs` — Package-approved local decision generations. Project configuration selects
 - `managed_runtime.rs` — Package-trusted, read-only Python runtime image.
 - `management_effect.rs` — Durable, typed lifecycle records for management side effects.
 - `mcp.rs` — Run-owned MCP connections, request context and local result retention.
@@ -577,6 +578,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/local_execution`
 
 - `tests.rs` — Local endpoint capacity, bounded waiters, cancellation, and quarantine tests.
+
+## `crates/polaris-core/src/managed_decision`
+
+- `native.rs` — Bind a package-approved subject to fixed private generation paths, lazily.
+
+## `crates/polaris-core/src/managed_decision/native`
+
+- `tests.rs` — Package-lock and private-generation fixtures; no real model is executed.
 
 ## `crates/polaris-core/src/management_effect`
 

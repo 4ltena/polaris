@@ -232,6 +232,10 @@ pub enum DecisionBuildError {
     MissingSemIfHelper,
     #[error("判断器を構築できません ({0:?})")]
     InvalidSettings(DecisionError),
+    #[error("Clefでは固定model profile IDだけを指定できます")]
+    InvalidClefSettings,
+    #[error("{0}")]
+    Clef(#[from] crate::managed_decision::ManagedDecisionError),
 }
 
 /// One factory for CLI and desktop. Looking up a remote credential is lazy:
@@ -250,6 +254,20 @@ fn build_with_key(
     purpose: DecisionUse,
     key: impl FnOnce() -> Option<String>,
 ) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
+    build_with_sources(config, purpose, key, crate::managed_decision::build)
+}
+
+fn build_with_sources(
+    config: &crate::config::DecisionConfig,
+    purpose: DecisionUse,
+    key: impl FnOnce() -> Option<String>,
+    clef: impl FnOnce(
+        &str,
+    ) -> Result<
+        std::sync::Arc<dyn Decider>,
+        crate::managed_decision::ManagedDecisionError,
+    >,
+) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
     use crate::config::DecisionBackend;
     use polaris_provider::decision::{jev::JevDecider, semif::SemIfDecider};
 
@@ -257,6 +275,24 @@ fn build_with_key(
         return Ok(None);
     }
     let decider: std::sync::Arc<dyn Decider> = match config.backend {
+        DecisionBackend::Clef => {
+            // Finalizer activation needs its own accepted profile/receipt;
+            // never substitute the remote judge or infer that acceptance.
+            if purpose == DecisionUse::Finalization {
+                return Ok(None);
+            }
+            let profile = config
+                .model
+                .as_deref()
+                .ok_or(DecisionBuildError::InvalidClefSettings)?;
+            if config.helper.is_some()
+                || config.base_url.is_some()
+                || !crate::managed_decision::valid_profile_id(profile)
+            {
+                return Err(DecisionBuildError::InvalidClefSettings);
+            }
+            clef(profile)?
+        }
         DecisionBackend::SemIf => {
             // SemIf has no finalizer activation contract yet. Preserve its
             // routing support without silently substituting a remote judge.

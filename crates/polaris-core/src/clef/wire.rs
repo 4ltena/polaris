@@ -9,7 +9,7 @@ use std::{fmt, io::Write};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub(super) const MAX_FRAME: usize = 1024 * 1024;
-const RUNTIME: &str = "620d2225cc436ab0b001e3200e590e3b286ef9ab+polaris-fileptr-v1";
+const RUNTIME: &str = super::RUNTIME_REVISION;
 
 pub(super) fn identifier(value: &str) -> bool {
     !value.is_empty()

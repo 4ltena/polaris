@@ -6532,6 +6532,18 @@ mod tool_memory_settings_tests {
             Some("jev".to_owned())
         );
 
+        let clef = DecisionConfig {
+            enabled: true,
+            backend: DecisionBackend::Clef,
+            model: Some("clef-flash-q4-cpu-v1".into()),
+            ..Default::default()
+        };
+        assert!(
+            build_decider(&clef).is_none(),
+            "an unverified Clef profile was answered by the remote judge"
+        );
+        assert!(build_finalizer_decider(&clef).is_none());
+
         let off = DecisionConfig {
             enabled: false,
             ..semif

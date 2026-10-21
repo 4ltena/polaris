@@ -365,3 +365,93 @@ async fn a_legacy_reply_with_unrequested_answers_is_refused() {
         Err(Refused::InvalidOutput)
     );
 }
+
+#[test]
+fn clef_factory_is_local_lazy_and_never_substitutes_a_remote_backend() {
+    use crate::{
+        config::{DecisionBackend, DecisionConfig},
+        managed_decision::ManagedDecisionError,
+    };
+    struct Local;
+    #[async_trait::async_trait]
+    impl Decider for Local {
+        fn name(&self) -> &str {
+            "clef"
+        }
+        async fn decide(
+            &self,
+            _: &serde_json::Value,
+            _: &BTreeMap<String, Question>,
+        ) -> Result<Decision, DecisionError> {
+            panic!("factory construction must not run inference")
+        }
+    }
+    let configured = DecisionConfig {
+        enabled: true,
+        backend: DecisionBackend::Clef,
+        model: Some("flash-cpu-v1".into()),
+        ..Default::default()
+    };
+    let unused_key = || panic!("a local selection read a remote key");
+    let local = build_with_sources(&configured, DecisionUse::Routing, unused_key, |id| {
+        assert_eq!(id, "flash-cpu-v1");
+        Ok(std::sync::Arc::new(Local))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(local.name(), "clef");
+    assert!(matches!(
+        build_with_sources(&configured, DecisionUse::Routing, unused_key, |_| Err(
+            ManagedDecisionError::UnverifiedProfile
+        )),
+        Err(DecisionBuildError::Clef(
+            ManagedDecisionError::UnverifiedProfile
+        ))
+    ));
+    assert!(
+        build_with_sources(
+            &configured,
+            DecisionUse::Finalization,
+            unused_key,
+            |_| panic!("unsupported finalizer read a generation")
+        )
+        .unwrap()
+        .is_none()
+    );
+    let disabled = DecisionConfig {
+        enabled: false,
+        ..configured.clone()
+    };
+    assert!(
+        build_with_sources(&disabled, DecisionUse::Routing, unused_key, |_| panic!(
+            "disabled decider read a generation"
+        ))
+        .unwrap()
+        .is_none()
+    );
+    let invalid = DecisionConfig {
+        helper: Some("/tmp/arbitrary".into()),
+        ..configured.clone()
+    };
+    assert!(matches!(
+        build_with_sources(&invalid, DecisionUse::Routing, unused_key, |_| panic!(
+            "invalid settings read a generation"
+        )),
+        Err(DecisionBuildError::InvalidClefSettings)
+    ));
+    let unverified = build_with_key(&configured, DecisionUse::Routing, unused_key);
+    #[cfg(target_os = "macos")]
+    assert!(matches!(
+        unverified,
+        Err(DecisionBuildError::Clef(
+            ManagedDecisionError::UnverifiedProfile
+        ))
+    ));
+    #[cfg(not(target_os = "macos"))]
+    assert!(matches!(
+        unverified,
+        Err(DecisionBuildError::Clef(
+            ManagedDecisionError::UnsupportedPlatform
+        ))
+    ));
+}

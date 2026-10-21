@@ -40,6 +40,7 @@ pub mod filemap;
 mod files_md;
 mod gitignore;
 pub mod input_preparation;
+pub mod managed_decision;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod managed_runtime;
 pub mod measurement;

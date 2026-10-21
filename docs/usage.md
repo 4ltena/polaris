@@ -56,6 +56,20 @@ review = ["user:review-rules"]
 
 `--tool-memory`の既定は`off`である。`history`は直近2組の完了済みツール往復を保持し、それ以前の8KiB以上のread・bash結果を保存して短い参照へ置き換える。`retrieval`は大きな完了結果を初回送信前から参照と小抜粋へ置き換える。保存失敗時は全文を維持する。圧縮前履歴を保存する`--remember`とは独立している。保存、検索URI、埋め込み、ベンチマーク手順は[コンテキスト効率化](context-efficiency.md)にある。
 
+## 型付き判断器の設定
+
+`[decision]`は通常の会話モデルとは別の判断器を選ぶ設定で、既定は無効である。既存のJevとSemIfは引き続き選択できる。モデルやhelperが見つかっただけでは有効にならない。
+
+| `backend` | 指定する資源 | 現在の扱い |
+| --- | --- | --- |
+| `jev` | 任意の`model`・`base_url`と、環境変数`POLARIS_JEV_API_KEY` | 既存のHTTP経路。明示的に有効にした場合だけ使用する。 |
+| `semif` | `helper`への絶対path | 既存のローカルhelper経路。Clefの導入状態にかかわらず維持する。 |
+| `clef` | `model`にpackage登録済みの固定profile ID | macOSの管理対象generationを使う。`helper`・`base_url`や任意の実行ファイルpathは指定できない。 |
+
+Clef/Clef-flashはモデル、量子化、runtime、device、割当contextごとに受入記録を持つ。**現在の本番lockには受入済みprofileがないため、Clefはまだ通常実行に使えない。** IDを設定するだけで受入済みにはならず、起動時にweightsを自動取得することもない。未導入・未検証のClefを選んだ場合は理由を表示し、Jevへ勝手に変更しない。Clefのanswer finalizerも未対応である。
+
+`polaris doctor`の容量帯と候補順は推薦の目安で、実行可能という判定ではない。管理対象CPU workerの起動直前には、空いている物理メモリから保守的な予算を求め、profileのpeakと予備量を確認する。CPUの使用量をGPUへ換算せず、Metalのdevice別容量観測が未対応の間は、そのprofileを実行しない。
+
 ## ChatGPT認証
 
 ```sh

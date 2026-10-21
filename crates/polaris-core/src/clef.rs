@@ -18,6 +18,14 @@ use tokio::{
 
 mod wire;
 
+pub const RUNTIME_REVISION: &str = "620d2225cc436ab0b001e3200e590e3b286ef9ab+polaris-fileptr-v1";
+
+#[derive(Clone)]
+pub struct CapacityAdmission {
+    pub profile: crate::decision_capacity::ProfileMemory,
+    pub policy: crate::decision_capacity::CapacityPolicy,
+}
+
 /// Supplied by the trusted installation owner, not inferred from a project or
 /// whichever executable happens to be on PATH. Acceptance of a model/profile
 /// and its capacity budget remains the activation owner's responsibility.
@@ -35,6 +43,9 @@ pub struct ClefConfig {
     pub load_timeout_ms: u64,
     /// Existing host-owned private directory for disposable per-run scratch.
     pub private_root: PathBuf,
+    /// Normal managed activation supplies this. Low-level synthetic/benchmark
+    /// owners may keep their separate, explicit admission contract.
+    pub admission: Option<CapacityAdmission>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +232,28 @@ impl Session {
     fn start(config: ClefConfig, authorized: impl FnMut() -> bool) -> Result<Self, DecisionError> {
         use std::{fs, os::unix::fs::PermissionsExt};
         config.validate()?;
+        if let Some(admission) = &config.admission {
+            use crate::decision_capacity::{CapacityAssessment, RunFootprint, assess};
+            if config.device != ClefDevice::Cpu {
+                return Err(DecisionError::Unavailable);
+            }
+            let observed = crate::decision_capacity::observation::cpu_budget();
+            if !matches!(
+                assess(
+                    &admission.profile,
+                    &observed,
+                    RunFootprint {
+                        context_tokens: config.context_tokens,
+                        parallel: 1
+                    },
+                    admission.policy,
+                    std::time::Instant::now()
+                ),
+                CapacityAssessment::Fits { .. }
+            ) {
+                return Err(DecisionError::Unavailable);
+            }
+        }
         let private = tempfile::Builder::new()
             .prefix("clef-")
             .tempdir_in(&config.private_root)

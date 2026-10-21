@@ -52,6 +52,7 @@ fn config() -> (tempfile::TempDir, ClefConfig) {
         request_timeout_ms: 1000,
         load_timeout_ms: 1000,
         private_root: root,
+        admission: None,
     };
     (dir, config)
 }
@@ -387,4 +388,40 @@ async fn cancelled_or_invalid_work_is_terminal_without_restart() {
             "no silent restart"
         );
     }
+}
+
+#[tokio::test]
+async fn a_refused_managed_capacity_profile_never_starts_the_worker() {
+    use crate::decision_capacity::{CapacityPolicy, ProfileMemory};
+    let (_root, mut c) = config();
+    let directory = c.private_root.clone();
+    c.admission = Some(CapacityAdmission {
+        profile: ProfileMemory {
+            accepted: false,
+            target: crate::decision_capacity::observation::host_memory().target,
+            max_context_tokens: 1024,
+            max_parallel: 1,
+            peak: None,
+        },
+        policy: CapacityPolicy {
+            reserve_bytes: 0,
+            colocated_bytes: 0,
+            budget_limit_bytes: None,
+            max_age: Duration::from_secs(15),
+        },
+    });
+    let decider = ClefDecider::new(c).unwrap();
+    assert_eq!(
+        decider.decide(&serde_json::json!({}), &questions()).await,
+        Err(DecisionError::Unavailable)
+    );
+    assert_eq!(
+        fs::read_dir(&directory).unwrap().count(),
+        2,
+        "a refused capacity profile created runtime scratch"
+    );
+    assert_eq!(
+        decider.decide(&serde_json::json!({}), &questions()).await,
+        Err(DecisionError::Unavailable)
+    );
 }

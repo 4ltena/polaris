@@ -311,3 +311,13 @@ fn the_native_hint_never_fills_in_an_unobserved_available_budget() {
     assert_eq!(observed.target.compute, ComputeKind::Cpu);
     assert!(observed.total_bytes.is_none_or(|bytes| bytes > 0));
 }
+
+#[test]
+fn a_cpu_budget_is_not_a_gpu_measurement_or_an_unbounded_ram_claim() {
+    let observed = observation::cpu_budget();
+    assert_eq!(observed.target.compute, ComputeKind::Cpu);
+    assert_eq!(observed.working_set_limit_bytes, None);
+    if let Some(free) = observed.available_bytes {
+        assert!(observed.total_bytes.is_some_and(|total| free <= total));
+    }
+}

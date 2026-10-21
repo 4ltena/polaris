@@ -223,13 +223,14 @@ pub struct DecisionConfig {
     pub helper: Option<PathBuf>,
 }
 
-/// The two judges. Unknown spellings are refused at load, so a typo stops
+/// Named judges. Unknown spellings are refused at load, so a typo stops
 /// the run instead of silently selecting the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DecisionBackend {
     #[default]
     Jev,
     SemIf,
+    Clef,
 }
 
 impl DecisionBackend {
@@ -237,6 +238,7 @@ impl DecisionBackend {
         match self {
             Self::Jev => "jev",
             Self::SemIf => "semif",
+            Self::Clef => "clef",
         }
     }
 }
@@ -640,6 +642,7 @@ impl RawDecision {
             merged.backend = match backend.trim() {
                 "jev" => DecisionBackend::Jev,
                 "semif" => DecisionBackend::SemIf,
+                "clef" => DecisionBackend::Clef,
                 _ => return Err(ConfigError::UnknownDecisionBackend(backend)),
             };
         }
@@ -672,12 +675,27 @@ impl RawDecision {
         match (merged.backend, merged.helper.is_some()) {
             // A half-written pin: the backend that needs a helper, without
             // one. Refused rather than started and found wanting later.
-            (DecisionBackend::SemIf, false) => Err(ConfigError::MissingDecisionHelper),
+            (DecisionBackend::SemIf, false) => return Err(ConfigError::MissingDecisionHelper),
             // A helper under the remote backend names a local program this
             // run will never start. Ambiguous, so it stops.
-            (DecisionBackend::Jev, true) => Err(ConfigError::UnusedDecisionHelper),
-            _ => Ok(()),
+            (DecisionBackend::Jev | DecisionBackend::Clef, true) => {
+                return Err(ConfigError::UnusedDecisionHelper);
+            }
+            _ => {}
+        };
+        if merged.backend == DecisionBackend::Clef {
+            if merged.base_url.is_some() {
+                return Err(ConfigError::UnusedClefEndpoint);
+            }
+            let profile = merged
+                .model
+                .as_deref()
+                .ok_or(ConfigError::MissingClefProfile)?;
+            if !crate::managed_decision::valid_profile_id(profile) {
+                return Err(ConfigError::InvalidClefProfile);
+            }
         }
+        Ok(())
     }
 }
 
@@ -758,7 +776,7 @@ pub enum ConfigError {
     },
     #[error("[tier] のmodelとeffortに空の値は書けません")]
     EmptyTierValue,
-    #[error("[decision] backend は jev か semif のどちらかです（{0} は不明）")]
+    #[error("[decision] backend は jev・semif・clef のいずれかです（{0} は不明）")]
     UnknownDecisionBackend(String),
     #[error("[decision] backend = \"semif\" には helper への絶対pathが必要です")]
     MissingDecisionHelper,
@@ -768,6 +786,12 @@ pub enum ConfigError {
     RelativeDecisionHelper(PathBuf),
     #[error("[decision] のbase_urlとmodelに空の値は書けません")]
     EmptyDecisionValue,
+    #[error("[decision] backend = \"clef\" には model に固定profile IDが必要です")]
+    MissingClefProfile,
+    #[error("[decision] Clef model はpathではなく固定profile IDで指定してください")]
+    InvalidClefProfile,
+    #[error("[decision] Clefではbase_urlを指定できません")]
+    UnusedClefEndpoint,
     #[error("[build_cache] のmax_bytesを読めません。80GiB・500MB・バイト数のいずれかで書きます")]
     BuildCacheSize,
     #[error("[build_cache] のmax_percentは1から100までです")]
@@ -1809,6 +1833,43 @@ mod tests {
                     | ("relative", ConfigError::RelativeDecisionHelper(_))
             );
             assert!(matched, "{body} gave {error:?}, wanted {expected}");
+        }
+    }
+
+    #[test]
+    fn clef_selects_only_a_profile_id_without_endpoint_or_program_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let good =
+            "[decision]\nenabled = true\nbackend = \"clef\"\nmodel = \"clef-flash-q4-cpu-v1\"\n";
+        let path = write(dir.path(), good);
+        let held = try_load_from(None, Some(&path)).unwrap();
+        assert_eq!(held.decision.backend, DecisionBackend::Clef);
+        assert_eq!(held.decision.model.as_deref(), Some("clef-flash-q4-cpu-v1"));
+        assert_eq!(
+            try_load_decision_from(None, Some(&path)).unwrap(),
+            held.decision
+        );
+        for (extra, expected) in [
+            ("", "missing"),
+            ("model = \"../../worker\"\n", "profile"),
+            (
+                "model = \"valid-id\"\nbase_url = \"https://example.invalid\"\n",
+                "endpoint",
+            ),
+            ("model = \"valid-id\"\nhelper = \"/tmp/worker\"\n", "helper"),
+        ] {
+            let path = write(
+                dir.path(),
+                &format!("[decision]\nbackend = \"clef\"\n{extra}"),
+            );
+            let error = try_load_from(None, Some(&path)).unwrap_err();
+            assert!(matches!(
+                (expected, error),
+                ("missing", ConfigError::MissingClefProfile)
+                    | ("profile", ConfigError::InvalidClefProfile)
+                    | ("endpoint", ConfigError::UnusedClefEndpoint)
+                    | ("helper", ConfigError::UnusedDecisionHelper)
+            ));
         }
     }
 

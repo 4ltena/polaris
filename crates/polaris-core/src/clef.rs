@@ -74,7 +74,9 @@ enum Job {
     Decide {
         state: serde_json::Value,
         questions: BTreeMap<String, Question>,
-        reply: oneshot::Sender<Result<Decision, DecisionError>>,
+        reply: oneshot::Sender<polaris_provider::decision::DecisionObservation>,
+        context: polaris_provider::decision::DecisionContext,
+        capabilities: polaris_provider::decision::DecisionCapabilities,
         _permit: tokio::sync::OwnedSemaphorePermit,
     },
     Shutdown(oneshot::Sender<Result<(), DecisionError>>),
@@ -158,22 +160,54 @@ impl Decider for ClefDecider {
         state: &serde_json::Value,
         questions: &BTreeMap<String, Question>,
     ) -> Result<Decision, DecisionError> {
-        let permit = self
-            .capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| DecisionError::Unavailable)?;
-        wire::validate_request(state, questions)?;
-        let (reply, received) = oneshot::channel();
-        self.sender()?
-            .try_send(Job::Decide {
-                state: state.clone(),
-                questions: questions.clone(),
-                reply,
-                _permit: permit,
-            })
-            .map_err(|_| DecisionError::Unavailable)?;
-        received.await.map_err(|_| DecisionError::Unavailable)?
+        self.observe_with_context(state, questions, Default::default())
+            .await
+            .result
+    }
+    async fn observe(
+        &self,
+        state: &serde_json::Value,
+        questions: &BTreeMap<String, Question>,
+    ) -> polaris_provider::decision::DecisionObservation {
+        self.observe_with_context(state, questions, Default::default())
+            .await
+    }
+    async fn observe_with_context(
+        &self,
+        state: &serde_json::Value,
+        questions: &BTreeMap<String, Question>,
+        context: polaris_provider::decision::DecisionContext,
+    ) -> polaris_provider::decision::DecisionObservation {
+        let started = std::time::Instant::now();
+        let result = async {
+            let permit = self
+                .capacity
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| DecisionError::Unavailable)?;
+            wire::validate_request(state, questions)?;
+            let (reply, received) = oneshot::channel();
+            self.sender()?
+                .try_send(Job::Decide {
+                    state: state.clone(),
+                    questions: questions.clone(),
+                    reply,
+                    context,
+                    capabilities: self.capabilities(),
+                    _permit: permit,
+                })
+                .map_err(|_| DecisionError::Unavailable)?;
+            received.await.map_err(|_| DecisionError::Unavailable)
+        }
+        .await;
+        result.unwrap_or_else(|error| {
+            polaris_provider::decision::DecisionObservation::single(
+                self.identity(),
+                self.capabilities(),
+                Err(error),
+                started.elapsed(),
+            )
+        })
     }
 }
 
@@ -233,28 +267,6 @@ impl Session {
     fn start(config: ClefConfig, authorized: impl FnMut() -> bool) -> Result<Self, DecisionError> {
         use std::{fs, os::unix::fs::PermissionsExt};
         config.validate()?;
-        if let Some(admission) = &config.admission {
-            use crate::decision_capacity::{CapacityAssessment, RunFootprint, assess};
-            if config.device != ClefDevice::Cpu {
-                return Err(DecisionError::Unavailable);
-            }
-            let observed = crate::decision_capacity::observation::cpu_budget();
-            if !matches!(
-                assess(
-                    &admission.profile,
-                    &observed,
-                    RunFootprint {
-                        context_tokens: config.context_tokens,
-                        parallel: 1
-                    },
-                    admission.policy,
-                    std::time::Instant::now()
-                ),
-                CapacityAssessment::Fits { .. }
-            ) {
-                return Err(DecisionError::Unavailable);
-            }
-        }
         let private = tempfile::Builder::new()
             .prefix("clef-")
             .tempdir_in(&config.private_root)
@@ -297,7 +309,13 @@ impl Session {
             &BTreeMap::new(),
             authorized,
         )
-        .map_err(|_| DecisionError::Unavailable)?
+        .map_err(|error| {
+            #[cfg(test)]
+            eprintln!("synthetic Clef worker launch failed: {error}");
+            #[cfg(not(test))]
+            let _ = error;
+            DecisionError::Unavailable
+        })?
         .ok_or(DecisionError::Cancelled)?;
         let stdin = tokio::process::ChildStdin::from_std(pipes.stdin)
             .map_err(|_| DecisionError::Unavailable)?;
@@ -497,6 +515,71 @@ fn snapshot_worker(config: &ClefConfig, target: &std::path::Path) -> Result<(), 
     Ok(())
 }
 
+fn capacity_report(
+    config: &ClefConfig,
+    context: polaris_provider::decision::DecisionContext,
+    observed: crate::decision_capacity::CapacityObservation,
+) -> Option<polaris_provider::decision::DecisionCapacity> {
+    use crate::decision_capacity::{CapacityAssessment, RunFootprint, UnverifiedCapacity, assess};
+    let admission = config.admission.as_ref()?;
+    let colocated = context
+        .planned_local_model_bytes
+        .and_then(|bytes| admission.policy.colocated_bytes.checked_add(bytes));
+    let assessment = match (context.planned_local_model_bytes, colocated) {
+        (None, _) => CapacityAssessment::Unverified {
+            reason: UnverifiedCapacity::ColocatedModels,
+        },
+        (Some(_), None) => CapacityAssessment::Unverified {
+            reason: UnverifiedCapacity::Arithmetic,
+        },
+        (Some(_), Some(bytes)) if config.device == ClefDevice::Cpu => {
+            let mut policy = admission.policy;
+            policy.colocated_bytes = bytes;
+            // Full validated peak remains a conservative bound even when warm;
+            // no unverified resident-RSS subtraction or VRAM conversion is used.
+            assess(
+                &admission.profile,
+                &observed,
+                RunFootprint {
+                    context_tokens: config.context_tokens,
+                    parallel: 1,
+                },
+                policy,
+                std::time::Instant::now(),
+            )
+        }
+        (Some(_), Some(_)) => CapacityAssessment::Unverified {
+            reason: UnverifiedCapacity::Target,
+        },
+    };
+    let (status, reason, budget_bytes, required_bytes) = match assessment {
+        CapacityAssessment::Fits {
+            budget_bytes,
+            required_bytes,
+            ..
+        } => ("fits", None, Some(budget_bytes), Some(required_bytes)),
+        CapacityAssessment::Insufficient {
+            budget_bytes,
+            required_bytes,
+        } => (
+            "insufficient",
+            None,
+            Some(budget_bytes),
+            Some(required_bytes),
+        ),
+        CapacityAssessment::Unverified { reason } => {
+            ("unverified", Some(format!("{reason:?}")), None, None)
+        }
+    };
+    Some(polaris_provider::decision::DecisionCapacity {
+        status,
+        reason,
+        budget_bytes,
+        required_bytes,
+        colocated_bytes: colocated,
+    })
+}
+
 async fn run(config: ClefConfig, mut jobs: mpsc::Receiver<Job>) {
     let mut session: Option<Session> = None;
     loop {
@@ -517,9 +600,39 @@ async fn run(config: ClefConfig, mut jobs: mpsc::Receiver<Job>) {
                 state,
                 questions,
                 mut reply,
+                context,
+                capabilities,
                 _permit,
             }) => {
                 if reply.is_closed() {
+                    continue;
+                }
+                let started_at = std::time::Instant::now();
+                let identity = polaris_provider::decision::DecisionIdentity {
+                    backend: "clef".into(),
+                    model: None,
+                    revision: None,
+                    quantization: None,
+                };
+                let capacity = capacity_report(
+                    &config,
+                    context,
+                    crate::decision_capacity::observation::cpu_budget(),
+                );
+                if capacity
+                    .as_ref()
+                    .is_some_and(|report| report.status != "fits")
+                {
+                    let mut observation = polaris_provider::decision::DecisionObservation::single(
+                        identity,
+                        capabilities,
+                        Err(DecisionError::Unavailable),
+                        started_at.elapsed(),
+                    );
+                    observation.attempts[0].invoked = false;
+                    observation.attempts[0].reason = Some("capacity_refused".into());
+                    observation.attempts[0].capacity = capacity;
+                    let _ = reply.send(observation);
                     continue;
                 }
                 let starting = session.is_none();
@@ -527,7 +640,15 @@ async fn run(config: ClefConfig, mut jobs: mpsc::Receiver<Job>) {
                     match Session::start(config.clone(), || !reply.is_closed()) {
                         Ok(held) => session = Some(held),
                         Err(error) => {
-                            let _ = reply.send(Err(error));
+                            let mut observation =
+                                polaris_provider::decision::DecisionObservation::single(
+                                    identity,
+                                    capabilities,
+                                    Err(error),
+                                    started_at.elapsed(),
+                                );
+                            observation.attempts[0].capacity = capacity;
+                            let _ = reply.send(observation);
                             break;
                         }
                     }
@@ -548,7 +669,14 @@ async fn run(config: ClefConfig, mut jobs: mpsc::Receiver<Job>) {
                 if failed && let Some(held) = session.as_mut() {
                     let _ = held.close(false).await;
                 }
-                let _ = reply.send(result);
+                let mut observation = polaris_provider::decision::DecisionObservation::single(
+                    identity,
+                    capabilities,
+                    result,
+                    started_at.elapsed(),
+                );
+                observation.attempts[0].capacity = capacity;
+                let _ = reply.send(observation);
                 if failed {
                     return;
                 }

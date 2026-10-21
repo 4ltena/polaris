@@ -764,6 +764,9 @@ impl CodexProvider {
 
 #[async_trait::async_trait]
 impl Provider for CodexProvider {
+    fn planned_local_model_bytes(&self) -> Option<u64> {
+        crate::model_memory::cloud_allocation(&self.base, "chatgpt.com")
+    }
     fn network_boundary(&self) -> crate::NetworkBoundary {
         crate::NetworkBoundary::RemoteAllowed
     }

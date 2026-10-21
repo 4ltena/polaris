@@ -81,6 +81,19 @@ impl Decider for FallbackDecider {
         state: &serde_json::Value,
         questions: &BTreeMap<String, Question>,
     ) -> DecisionObservation {
+        self.observe_with_context(
+            state,
+            questions,
+            crate::decision::DecisionContext::default(),
+        )
+        .await
+    }
+    async fn observe_with_context(
+        &self,
+        state: &serde_json::Value,
+        questions: &BTreeMap<String, Question>,
+        context: crate::decision::DecisionContext,
+    ) -> crate::decision::DecisionObservation {
         let deadline = tokio::time::Instant::now() + self.policy.total_timeout;
         let mut attempts = Vec::new();
         let mut previous: Option<DecisionObservation> = None;
@@ -105,20 +118,24 @@ impl Decider for FallbackDecider {
             // call never reaches the next iteration; explicit Cancelled is terminal.
             let started = tokio::time::Instant::now();
             let until = deadline.min(started + self.policy.attempt_timeout);
-            let mut observation =
-                match tokio::time::timeout_at(until, backend.observe(state, questions)).await {
-                    Ok(observation) => observation,
-                    Err(_) => {
-                        let mut observation = DecisionObservation::single(
-                            backend.identity(),
-                            backend.capabilities(),
-                            Err(DecisionError::Unavailable),
-                            started.elapsed(),
-                        );
-                        observation.attempts[0].timed_out = true;
-                        observation
-                    }
-                };
+            let mut observation = match tokio::time::timeout_at(
+                until,
+                backend.observe_with_context(state, questions, context),
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(_) => {
+                    let mut observation = DecisionObservation::single(
+                        backend.identity(),
+                        backend.capabilities(),
+                        Err(DecisionError::Unavailable),
+                        started.elapsed(),
+                    );
+                    observation.attempts[0].timed_out = true;
+                    observation
+                }
+            };
             if let Ok(decision) = &observation.result
                 && let Err(error) = checked(decision, questions)
             {

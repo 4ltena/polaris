@@ -8,6 +8,8 @@ mod codex_ws;
 pub mod decision;
 pub mod local;
 pub mod local_inference;
+mod model_memory;
+pub use model_memory::planned_local_model_total;
 pub mod openai;
 pub mod role;
 pub mod sse;
@@ -456,6 +458,9 @@ where
     P: std::ops::Deref + Send + Sync,
     P::Target: Provider,
 {
+    fn planned_local_model_bytes(&self) -> Option<u64> {
+        self.provider.planned_local_model_bytes()
+    }
     fn network_boundary(&self) -> NetworkBoundary {
         self.provider.network_boundary()
     }
@@ -673,6 +678,13 @@ pub enum NetworkBoundary {
 
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
+    /// Additional local model allocations that may occur after a fresh host
+    /// observation, including configured children. None means unknown, never 0.
+    /// A known bound includes context/work buffers; a file size is not a bound.
+    fn planned_local_model_bytes(&self) -> Option<u64> {
+        None
+    }
+
     fn network_boundary(&self) -> NetworkBoundary {
         NetworkBoundary::Unknown
     }
@@ -764,6 +776,9 @@ macro_rules! delegate_provider {
     ($pointer:ty) => {
         #[async_trait::async_trait]
         impl<T: Provider + ?Sized> Provider for $pointer {
+            fn planned_local_model_bytes(&self) -> Option<u64> {
+                (**self).planned_local_model_bytes()
+            }
             fn network_boundary(&self) -> NetworkBoundary {
                 (**self).network_boundary()
             }

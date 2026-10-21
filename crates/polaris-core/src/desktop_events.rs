@@ -156,6 +156,19 @@ impl polaris_provider::decision::Decider for ObservedDecider {
         state: &serde_json::Value,
         questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
     ) -> polaris_provider::decision::DecisionObservation {
+        self.observe_with_context(
+            state,
+            questions,
+            polaris_provider::decision::DecisionContext::default(),
+        )
+        .await
+    }
+    async fn observe_with_context(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<String, polaris_provider::decision::Question>,
+        context: polaris_provider::decision::DecisionContext,
+    ) -> polaris_provider::decision::DecisionObservation {
         if self.events.send(AgentEvent::DecisionStarted).is_err() {
             let mut observation = polaris_provider::decision::DecisionObservation::single(
                 self.identity(),
@@ -168,7 +181,9 @@ impl polaris_provider::decision::Decider for ObservedDecider {
             return observation;
         }
         let _finished = DecisionFinished(self.events.clone());
-        self.inner.observe(state, questions).await
+        self.inner
+            .observe_with_context(state, questions, context)
+            .await
     }
 }
 impl From<mpsc::UnboundedSender<AgentEvent>> for EventSink {

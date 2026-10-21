@@ -15,7 +15,10 @@ pub use capabilities::{
     BandCalibration, DecisionCancellation, DecisionCapabilities, DecisionLocation, DecisionShapes,
     DecisionUsageReporting,
 };
-pub use observation::{DecisionAttempt, DecisionIdentity, DecisionObservation, DecisionTrace};
+pub use observation::{
+    DecisionAttempt, DecisionCapacity, DecisionContext, DecisionIdentity, DecisionObservation,
+    DecisionTrace,
+};
 pub use telemetry::{DecisionMeter, DecisionObserver};
 
 /// The most options one choice may hold, and the most state one request may
@@ -110,6 +113,16 @@ pub enum DecisionError {
 
 #[async_trait::async_trait]
 pub trait Decider: Send + Sync {
+    /// Host-bound per-call context. Ordinary Jev/SemIf adapters preserve their path.
+    async fn observe_with_context(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<String, Question>,
+        _context: DecisionContext,
+    ) -> DecisionObservation {
+        self.observe(state, questions).await
+    }
+
     async fn decide(
         &self,
         state: &serde_json::Value,
@@ -197,6 +210,17 @@ pub struct DecisionUsage {
 /// wherever the trait is expected, without each caller unwrapping it.
 #[async_trait::async_trait]
 impl<T: Decider + ?Sized> Decider for std::sync::Arc<T> {
+    async fn observe_with_context(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<String, Question>,
+        context: DecisionContext,
+    ) -> DecisionObservation {
+        (**self)
+            .observe_with_context(state, questions, context)
+            .await
+    }
+
     fn telemetry(&self) -> Option<DecisionMeter> {
         (**self).telemetry()
     }

@@ -38,6 +38,10 @@ pub(crate) fn restrict_decider(
 struct LocalArbiter(Arc<dyn Provider>);
 #[async_trait::async_trait]
 impl Provider for LocalArbiter {
+    fn planned_local_model_bytes(&self) -> Option<u64> {
+        self.0.planned_local_model_bytes()
+    }
+
     fn network_boundary(&self) -> NetworkBoundary {
         self.0.network_boundary()
     }
@@ -88,6 +92,19 @@ impl Decider for LocalDecider {
         state: &serde_json::Value,
         questions: &BTreeMap<String, Question>,
     ) -> polaris_provider::decision::DecisionObservation {
+        self.observe_with_context(
+            state,
+            questions,
+            polaris_provider::decision::DecisionContext::default(),
+        )
+        .await
+    }
+    async fn observe_with_context(
+        &self,
+        state: &serde_json::Value,
+        questions: &BTreeMap<String, Question>,
+        context: polaris_provider::decision::DecisionContext,
+    ) -> polaris_provider::decision::DecisionObservation {
         if self.0.capabilities().network != NetworkBoundary::LocalOnly {
             let mut observation = polaris_provider::decision::DecisionObservation::single(
                 self.identity(),
@@ -99,7 +116,7 @@ impl Decider for LocalDecider {
             observation.attempts[0].reason = Some("local_only".into());
             return observation;
         }
-        self.0.observe(state, questions).await
+        self.0.observe_with_context(state, questions, context).await
     }
 }
 

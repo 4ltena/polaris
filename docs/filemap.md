@@ -383,8 +383,13 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 ## `crates/polaris-core/src/decision_capacity`
 
+- `colocation.rs` — Host-owned provider plans captured per typed request, not a shared last-budget slot.
 - `observation.rs` — Read-only host memory hints. Missing GPU/availability readings stay unknown.
 - `tests.rs` — Synthetic capacity edges and domain separation; no model or GPU is started.
+
+## `crates/polaris-core/src/decision_capacity/colocation`
+
+- `tests.rs` — Host plans are request-local snapshots; unknown children and overflow never mean zero.
 
 ## `crates/polaris-core/src/decision_policy`
 
@@ -1393,6 +1398,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `lib.rs` — Provider abstraction. Transport-dependent parts live in each
 - `local.rs` — Bounded, metadata-only discovery of explicitly configured local runtimes.
 - `local_inference.rs` — Inference through an explicitly selected loopback runtime.
+- `model_memory.rs` — Planned additional local model allocations, never inferred from weight file size.
 - `openai.rs` — OpenAI-compatible chat completions. Swap out `base_url` and you can hit
 - `role.rs` — Immutable routing for catalog-validated child roles. No implicit fallback.
 - `sse.rs` — Incrementally decodes SSE (text/event-stream). Pushing a byte chunk

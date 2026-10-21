@@ -56,6 +56,14 @@ impl RoleProvider {
 
 #[async_trait::async_trait]
 impl Provider for RoleProvider {
+    fn planned_local_model_bytes(&self) -> Option<u64> {
+        crate::planned_local_model_total(
+            std::iter::once(&self.parent)
+                .chain(self.roles.iter().flat_map(|roles| roles.values()))
+                .chain(self.tiers.values()),
+        )
+    }
+
     fn network_boundary(&self) -> crate::NetworkBoundary {
         self.parent.network_boundary()
     }

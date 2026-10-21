@@ -158,6 +158,31 @@ struct Identified {
 }
 #[async_trait::async_trait]
 impl Decider for Identified {
+    async fn observe(
+        &self,
+        state: &serde_json::Value,
+        questions: &BTreeMap<String, Question>,
+    ) -> polaris_provider::decision::DecisionObservation {
+        self.observe_with_context(state, questions, Default::default())
+            .await
+    }
+    async fn observe_with_context(
+        &self,
+        state: &serde_json::Value,
+        questions: &BTreeMap<String, Question>,
+        context: polaris_provider::decision::DecisionContext,
+    ) -> polaris_provider::decision::DecisionObservation {
+        let mut observation = self
+            .inner
+            .observe_with_context(state, questions, context)
+            .await;
+        observation.identity = self.identity();
+        for attempt in &mut observation.attempts {
+            attempt.identity = self.identity();
+        }
+        observation
+    }
+
     fn may_return_calibrated_bands(&self) -> bool {
         self.inner.may_return_calibrated_bands()
     }
@@ -175,7 +200,7 @@ impl Decider for Identified {
         state: &serde_json::Value,
         questions: &BTreeMap<String, Question>,
     ) -> Result<Decision, DecisionError> {
-        self.inner.decide(state, questions).await
+        self.observe(state, questions).await.result
     }
 }
 

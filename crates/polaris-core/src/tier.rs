@@ -111,6 +111,10 @@ impl PinnedTier {
 
 #[async_trait::async_trait]
 impl polaris_provider::Provider for PinnedTier {
+    fn planned_local_model_bytes(&self) -> Option<u64> {
+        self.inner.planned_local_model_bytes()
+    }
+
     async fn complete(
         &self,
         request: polaris_provider::CompletionRequest,

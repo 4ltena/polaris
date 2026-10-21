@@ -3,6 +3,8 @@
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
+pub mod colocation;
+
 pub const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -124,6 +126,7 @@ pub enum UnverifiedCapacity {
     AvailableMemory,
     WorkingSet,
     Arithmetic,
+    ColocatedModels,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

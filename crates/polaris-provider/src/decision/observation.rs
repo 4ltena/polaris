@@ -3,6 +3,20 @@ use super::{Decision, DecisionCapabilities, DecisionError};
 use serde::Serialize;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecisionContext {
+    pub planned_local_model_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DecisionCapacity {
+    pub status: &'static str,
+    pub reason: Option<String>,
+    pub budget_bytes: Option<u64>,
+    pub required_bytes: Option<u64>,
+    pub colocated_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DecisionIdentity {
     pub backend: String,
@@ -16,6 +30,7 @@ pub struct DecisionAttempt {
     pub identity: DecisionIdentity,
     /// Adapter invocation, not proof of a network request or completed inference.
     pub invoked: bool,
+    pub capacity: Option<DecisionCapacity>,
     pub reason: Option<String>,
     pub elapsed_ms: u64,
     pub error: Option<DecisionError>,
@@ -55,6 +70,7 @@ impl DecisionObservation {
         let attempt = DecisionAttempt {
             identity: identity.clone(),
             invoked: true,
+            capacity: None,
             reason: None,
             elapsed_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
             error: result.as_ref().err().cloned(),

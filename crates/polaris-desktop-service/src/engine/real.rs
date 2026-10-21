@@ -1238,6 +1238,27 @@ impl Engine {
                         real.outcome = Some(Observation::Cancelled);
                         active.execution.cancel();
                     } else {
+                        let sources =
+                            polaris_core::decision_capacity::colocation::ColocationSources::new(
+                                Vec::new(),
+                            );
+                        let mut colocated =
+                            vec![inputs.provider.clone(), inputs.provider_pool.clone()];
+                        if let Some(history) = &inputs.history {
+                            colocated.push(history.summary_provider.clone());
+                        }
+                        if let Some(selection) = inputs
+                            .mcp
+                            .as_ref()
+                            .and_then(|mcp| mcp.selection_provider.clone())
+                        {
+                            colocated.push(selection);
+                        }
+                        sources.replace(
+                            colocated,
+                            inputs.history.is_some() || inputs.tool_memory.is_some(),
+                        );
+                        let judge = judge.clone().map(|decider| sources.bind(decider));
                         let (event_sink, event_receiver, _event_control) =
                             DesktopEventSink::channel(active.target.run_id.clone());
                         let observed_judge = judge

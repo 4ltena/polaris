@@ -121,6 +121,10 @@ pub(super) struct MemoryActivation {
 }
 
 impl MemoryActivation {
+    pub(super) fn unverified_model_allocation(&self) -> bool {
+        self.tool_mode.is_some() && self.embedding.is_some()
+    }
+
     #[cfg(unix)]
     pub(super) fn from_saved(settings: &SavedSessionSettingsV1) -> Self {
         let tool_mode = match settings.tool_memory {

@@ -239,6 +239,9 @@ pub fn build_body(model: &str, req: &CompletionRequest, effort: Option<&str>) ->
 
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
+    fn planned_local_model_bytes(&self) -> Option<u64> {
+        crate::model_memory::cloud_allocation(&self.base_url, "api.openai.com")
+    }
     fn network_boundary(&self) -> crate::NetworkBoundary {
         crate::NetworkBoundary::RemoteAllowed
     }

@@ -92,6 +92,10 @@ pub fn display(
             ));
         }
         for (index, attempt) in trace.attempts.iter().enumerate() {
+            if let Some(capacity) = &attempt.capacity {
+                lines.push(format!("  容量（試行{}）: {} / 理由={} / budget={:?} / required={:?} / 同居予定={:?} bytes", index+1, capacity.status, capacity.reason.as_deref().map(text).unwrap_or_else(|| "なし".into()), capacity.budget_bytes, capacity.required_bytes, capacity.colocated_bytes));
+            }
+
             lines.push(format!(
                 "  試行{}: {} / 呼出={} / {}ms / {:?} / 理由={}",
                 index + 1,

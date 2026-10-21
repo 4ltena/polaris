@@ -425,3 +425,78 @@ async fn a_refused_managed_capacity_profile_never_starts_the_worker() {
         Err(DecisionError::Unavailable)
     );
 }
+
+fn admitted_capacity_config() -> (
+    tempfile::TempDir,
+    ClefConfig,
+    crate::decision_capacity::CapacityObservation,
+) {
+    use crate::decision_capacity::*;
+    let (root, mut config) = config();
+    let mut observed = observation::host_memory();
+    observed.total_bytes = Some(16);
+    observed.available_bytes = Some(16);
+    config.admission = Some(CapacityAdmission {
+        profile: ProfileMemory {
+            accepted: true,
+            target: observed.target.clone(),
+            max_context_tokens: 1024,
+            max_parallel: 1,
+            peak: Some(MemoryPeak {
+                bytes: 4,
+                evidence: PeakEvidence::Measured,
+            }),
+        },
+        policy: CapacityPolicy {
+            reserve_bytes: 1,
+            colocated_bytes: 2,
+            budget_limit_bytes: None,
+            max_age: Duration::from_secs(15),
+        },
+    });
+    (root, config, observed)
+}
+#[test]
+fn capacity_colocation_distinguishes_unknown_zero_known_and_overflow() {
+    use polaris_provider::decision::DecisionContext;
+    let (_root, config, observed) = admitted_capacity_config();
+    let check = |bytes| {
+        capacity_report(
+            &config,
+            DecisionContext {
+                planned_local_model_bytes: bytes,
+            },
+            observed.clone(),
+        )
+        .unwrap()
+    };
+    assert_eq!(check(None).reason.as_deref(), Some("ColocatedModels"));
+    let zero = check(Some(0));
+    assert_eq!(zero.status, "fits");
+    assert_eq!(zero.required_bytes, Some(7));
+    let known = check(Some(3));
+    assert_eq!(known.status, "fits");
+    assert_eq!(known.required_bytes, Some(10));
+    assert_eq!(known.colocated_bytes, Some(5));
+    assert_eq!(check(Some(10)).status, "insufficient");
+    assert_eq!(check(Some(u64::MAX)).reason.as_deref(), Some("Arithmetic"));
+}
+#[tokio::test]
+async fn unknown_colocation_is_observed_without_spawning_a_managed_worker() {
+    let (root, config, _) = admitted_capacity_config();
+    let judge = ClefDecider::new(config).unwrap();
+    let observed = judge.observe(&serde_json::Value::Null, &questions()).await;
+    assert_eq!(observed.result, Err(DecisionError::Unavailable));
+    assert!(!observed.attempts[0].invoked);
+    assert_eq!(
+        observed.attempts[0]
+            .capacity
+            .as_ref()
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("ColocatedModels")
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    judge.shutdown().await.unwrap();
+}

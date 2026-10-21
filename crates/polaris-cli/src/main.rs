@@ -2777,11 +2777,6 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     let decider = build_decider(&config.decision).map(|decider| decision_meter.wrap(decider));
     // The same judge weighs delegated tasks. One registration, because both
     // ask the same service the same kind of question.
-    let tier_decider: Option<std::sync::Arc<dyn polaris_core::tier::TierDecider>> =
-        decider.clone().map(|decider| {
-            std::sync::Arc::new(polaris_core::tier::typed::TypedTierDecider::new(decider))
-                as std::sync::Arc<dyn polaris_core::tier::TierDecider>
-        });
 
     // A judge that routes delegations by weight, over four weights that
     // all resolve to the same provider, changes nothing and says nothing.
@@ -2791,7 +2786,7 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     // differ. Say it once; do not invent model names as defaults, because
     // which model each weight buys is the project's decision and a wrong
     // guess here spends its money.
-    if tier_decider.is_some() && config.tiers.is_empty() {
+    if decider.is_some() && config.tiers.is_empty() {
         eprintln!(
             "警告: 判定器は委譲を4段へ振り分けますが、`[tier.*]` に model も effort も書かれていないため、4段すべてが同じproviderへ解決されます。段ごとの設定を書くまで、振り分けは費用にも能力にも効きません。"
         );
@@ -2808,6 +2803,17 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
             tier_weights,
         ))
     };
+
+    let mut colocated = vec![provider.clone()];
+    colocated.extend(mcp_selection_provider.iter().cloned());
+    let decision_colocation =
+        polaris_core::decision_capacity::colocation::ColocationSources::new(colocated);
+    let decider = decider.map(|decider| decision_colocation.bind(decider));
+    let tier_decider: Option<std::sync::Arc<dyn polaris_core::tier::TierDecider>> =
+        decider.clone().map(|decider| {
+            std::sync::Arc::new(polaris_core::tier::typed::TypedTierDecider::new(decider))
+                as std::sync::Arc<dyn polaris_core::tier::TierDecider>
+        });
 
     let state_dir = match polaris_core::project::state_dir(&cwd) {
         Ok(directory) => directory,
@@ -3012,6 +3018,12 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
     } else {
         None
     };
+    let mut colocated = vec![provider.clone()];
+    colocated.extend(mcp_selection_provider.iter().cloned());
+    decision_colocation.replace(
+        colocated,
+        configured_strict.is_some() || tool_memory_embedding.is_some(),
+    );
     let continuation = match resolved_continuation {
         Some(resolved) => {
             #[cfg(unix)]
@@ -3919,6 +3931,7 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
                 mcp_selection_provider,
                 decider: decider.clone(),
                 decision_configuration: config.decision.clone(),
+                decision_colocation,
                 tier_decider: tier_decider.clone(),
                 answer_finalizer,
                 sidechat_auto: config.sidechat_auto,

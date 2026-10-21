@@ -192,6 +192,19 @@ impl Decider for MeteredDecider {
         state: &serde_json::Value,
         questions: &BTreeMap<String, Question>,
     ) -> DecisionObservation {
+        self.observe_with_context(
+            state,
+            questions,
+            crate::decision::DecisionContext::default(),
+        )
+        .await
+    }
+    async fn observe_with_context(
+        &self,
+        state: &serde_json::Value,
+        questions: &BTreeMap<String, Question>,
+        context: crate::decision::DecisionContext,
+    ) -> crate::decision::DecisionObservation {
         let observer = self
             .meter
             .observer
@@ -215,7 +228,10 @@ impl Decider for MeteredDecider {
                 return refused;
             }
         }
-        let observation = self.decider.observe(state, questions).await;
+        let observation = self
+            .decider
+            .observe_with_context(state, questions, context)
+            .await;
         let trace = stage.finish(&observation);
         if let Some(observer) = observer
             && !observer.settled(&trace).await

@@ -649,6 +649,7 @@ pub struct RunArgs<'a> {
     /// sessions retain them across `/new`, `/fork`, and `/resume`.
     pub decider: Option<Arc<dyn polaris_provider::decision::Decider>>,
     pub decision_configuration: polaris_core::config::DecisionConfig,
+    pub decision_colocation: polaris_core::decision_capacity::colocation::ColocationSources,
     pub tier_decider: Option<Arc<dyn polaris_core::tier::TierDecider>>,
     /// Non-authoritative final-answer observer. It runs only after the
     /// canonical assistant message is durable and can never replace output.
@@ -3716,6 +3717,13 @@ pub async fn run(mut args: RunArgs<'_>) -> ExitCode {
             fatal_message = Some(error);
             break 'outer ExitCode::FAILURE;
         }
+        let mut colocated = vec![args.provider.clone()];
+        colocated.extend(args.mcp_selection_provider.iter().cloned());
+        let unknown_resources = session.strict_history.is_some();
+        args.decision_colocation.replace(
+            colocated,
+            unknown_resources || memory_activation.unverified_model_allocation(),
+        );
         // Recomputed every draw from the live buffer, so the popup tracks
         // each keystroke — not just the moment `/` was first typed.
         #[cfg(unix)]

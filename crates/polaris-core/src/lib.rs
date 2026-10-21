@@ -21,6 +21,7 @@ pub mod constitution;
 pub mod conversation_memory;
 pub mod conversation_state;
 pub mod decision_bands;
+pub mod decision_capacity;
 pub mod decisions;
 pub mod desktop_approval;
 pub mod desktop_events;

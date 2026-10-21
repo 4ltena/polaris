@@ -4251,6 +4251,13 @@ async fn run_doctor() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     println!("polaris doctor\n");
 
+    println!("Decision capacity (read-only):");
+    let capacity = polaris_core::decision_capacity::observation::host_memory();
+    for line in polaris_core::decision_capacity::observation::diagnostic_lines(&capacity) {
+        println!("  {line}");
+    }
+    println!();
+
     println!("Credentials:");
     match polaris_auth::store::default_path() {
         Ok(p) => {

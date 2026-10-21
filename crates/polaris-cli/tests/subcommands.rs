@@ -725,6 +725,20 @@ fn doctor_runs_successfully_with_no_credentials() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Decision capacity (read-only):"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Execution fit: not verified here"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Hosted Jev/remote System One"), "{stdout}");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    assert!(
+        stdout.contains("unified memory (not dedicated VRAM)"),
+        "{stdout}"
+    );
     #[cfg(not(windows))]
     assert!(
         stdout.contains("not found"),

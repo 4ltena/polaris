@@ -215,7 +215,7 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `polaris -p "<指示>"` | 指示を1回実行して終了する。 | stdoutへ回答本文。stderrへworkflow・ツール診断、`tokens: in ... / out ... / cache ... / total ...`等。モデル接続・ツール実行・監査保存を伴う。 |
 | `polaris exec [<指示>\|-]` | `-p`と同じ非対話実行。省略または`-`ならstdin全文を読む。 | 上と同じ。 |
 | `polaris sandbox -- <実行物> [引数...]` | エージェントを介さず、指定プログラムをsandbox内で実行する。 | 子のstdout/stderrと終了コード。失敗時はsandboxエラー。 |
-| `polaris doctor` | インストールとローカル設定を診断する。 | `Credentials:`、`Provider resolution:`、`Sandbox:`、`State:`、巻き戻し候補、AGENTS到達量等。接続成功の確認ではない。 |
+| `polaris doctor` | インストールとローカル設定を診断する。 | `Decision capacity (read-only):`で物理メモリの観測、容量帯の候補順、実行可否が未検証であることを表示。統合メモリは専用VRAMと区別する。続いて`Credentials:`、`Provider resolution:`、`Sandbox:`、`State:`、巻き戻し候補、AGENTS到達量等。接続成功の確認ではない。 |
 | `polaris common-tests <plan.json\|->` | JSONで指定したブラックボックス試験をsandbox内で実行する。 | JSONの`result: passed / failed / unavailable`、試験対象、各case、fallbackの要否等。指定プログラムの実行と一時領域の使用を伴う。 |
 | `polaris completion <shell>` | シェル補完scriptを生成する。 | script本文をstdoutへ出す。対応はbash/zsh/fish/elvish/powershell。導入は別操作。 |
 | `polaris --help`、`polaris help [command]` | CLIの構文を調べる。 | コマンド・引数・説明。`polaris mcp configure --help`のように絞れる。 |

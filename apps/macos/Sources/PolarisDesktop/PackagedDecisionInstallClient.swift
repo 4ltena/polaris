@@ -24,6 +24,40 @@ actor PackagedDecisionInstallClient: DecisionInstallTransport {
         return value
     }
 
+    func verify(profile: String) async throws -> DecisionGenerationVerification {
+        guard child == nil, Self.profileID(profile) else { throw ServiceError.notReady }
+        let process = try DecisionInstallChild(helper: helper(), arguments: ["decision", "verify", profile, "--stdio-result"])
+        child = process
+        defer { process.stop(); if child === process { child = nil } }
+        let data = try await bounded(process, seconds: 300) { try process.readAll() }
+        guard child === process else { throw ServiceError.notReady }
+        return try Self.decodeVerification(data, profile: profile)
+    }
+
+    static func decodeVerification(_ data: Data, profile: String) throws -> DecisionGenerationVerification {
+        let value = try decode(DecisionGenerationVerification.self, data)
+        guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(raw.keys).isSubset(of: ["schema_version", "type", "profile", "status", "generation"]) else { throw ServiceError.schema }
+        if let generation = raw["generation"] as? [String: Any] {
+            guard Set(generation.keys) == ["profile", "generation", "model_repository", "model_revision", "quantization", "runtime_revision", "worker_sha256", "model_sha256", "verified_bytes"] else { throw ServiceError.schema }
+        }
+        guard value.schemaVersion == 1, value.type == "verification", value.profile == profile,
+              profileID(profile) else { throw ServiceError.correlation }
+        if value.status == "verified" {
+            guard let g = value.generation, g.profile == profile, profileID(g.generation),
+                  text(g.modelRepository), text(g.quantization), text(g.runtimeRevision),
+                  g.modelRevision.utf8.count == 40, g.modelRevision.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+                  digest(g.workerSha256), digest(g.modelSha256), g.verifiedBytes > 0,
+                  g.verifiedBytes <= 64 * 1024 * 1024 * 1024 + 128 * 1024 * 1024 else { throw ServiceError.schema }
+        } else {
+            guard value.generation == nil, ["not_installed", "unverified_profile", "integrity", "unsupported_platform", "unsupported_device", "cancelled", "unavailable"].contains(value.status) else { throw ServiceError.schema }
+        }
+        return value
+    }
+    private static func text(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 256 && value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+    }
+
     func prepare(profile: String, worker: URL, model: URL) async throws -> DecisionInstallOffer {
         guard child == nil, Self.profileID(profile), worker.isFileURL, model.isFileURL else { throw ServiceError.notReady }
         let process = try DecisionInstallChild(helper: helper(), arguments: ["decision", "import", profile,

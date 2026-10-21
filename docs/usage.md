@@ -153,7 +153,7 @@ polaris decision import PROFILE_ID --worker /absolute/path/worker --model /absol
 
 導入はnetworkを使わず、指定ファイルの全size/SHAを照合して新しいgenerationへcopyする。取消・破損・競合時は既存generationを残す。成功してもbackendの選択・有効化や推論は開始しない。現在の空lockで`plan`・`import`を実行しても、受入未完了の案内で終了する。
 
-macOSインストーラの「モデル」ページにも「Clef判断器の導入（任意）」がある。「登録profileを確認」で同梱CLIの登録と容量推薦を読み、登録がある場合だけprofileと手元のworker/modelファイルを選べる。表示された取得元、license/NOTICE、component、size/SHA、導入先を確認して「この計画で導入」を押す。GUIが起動した同じCLIプロセスへ今回の計画hashを返すため、別の計画への確認流用は行わない。確認待ちは120秒で、対象を変えた場合や期限切れ時は計画を作り直す。現在の登録は0件であり、導入ボタンは提供されない。
+macOSインストーラの「モデル」ページにも「Clef判断器の導入（任意）」がある。「登録profileを確認」で同梱CLIの登録と容量推薦を読み、登録がある場合だけprofileと手元のworker/modelファイルを選べる。表示された取得元、license/NOTICE、component、size/SHA、導入先を確認して「この計画で導入」を押す。GUIが起動した同じCLIプロセスへ今回の計画hashを返すため、別の計画への確認流用は行わない。確認待ちは120秒で、対象を変えた場合や期限切れ時は計画を作り直す。現在の登録は0件であり、導入ボタンは提供されない。 登録profileを選んだ後は、worker/modelの元ファイルを選ばずに「導入済みgenerationを検証」を実行できる。固定hashの照合結果、未導入、受入未完了、整合性不明、非対応、取消を表示する。profileを変更したときや操作を取り消したときは以前の検証結果を消す。検証成功だけではbackendを選択・有効化せず、現在の空登録では検証ボタンも表示しない。
 
 ## ChatGPT認証
 

@@ -51,6 +51,33 @@ fn decision_verify_refuses_unaccepted_profiles_without_provider_or_mutation() {
     assert!(!error.contains("API_KEY"));
 }
 
+#[test]
+fn decision_verify_gui_frame_reports_failure_without_claiming_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = product_binary::command()
+        .env("HOME", dir.path())
+        .env("POLARIS_PROVIDER", "must-not-start-a-provider")
+        .current_dir(dir.path())
+        .args([
+            "decision",
+            "verify",
+            "unregistered-profile",
+            "--stdio-result",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let frame: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(frame["type"], "verification");
+    assert_eq!(frame["profile"], "unregistered-profile");
+    assert!(matches!(
+        frame["status"].as_str(),
+        Some("unverified_profile" | "unsupported_platform")
+    ));
+    assert!(frame["generation"].is_null());
+    assert!(!dir.path().join(".polaris").exists());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn decision_management_never_imports_an_unaccepted_profile_even_with_yes() {

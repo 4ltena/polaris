@@ -17,7 +17,12 @@ enum Command {
     /// 登録profileと容量の推薦を表示。導入・認証・通信・推論なし。
     List,
     /// 導入済み固定generationの全SHAを検証。起動・有効化・copyなし。
-    Verify { profile: String },
+    Verify {
+        profile: String,
+        /// Internal result channel for the packaged GUI; status is in the frame.
+        #[arg(long, hide = true)]
+        stdio_result: bool,
+    },
     /// 明示導入の内容をJSONで表示。ファイルの取得・copyなし。
     Plan(Sources),
     /// 確認した固定artifactをcopy。backend設定や推論は開始しない。
@@ -67,7 +72,10 @@ async fn perform(args: Args) -> Result<(), String> {
             })).map_err(|e| e.to_string())?);
             return Ok(());
         }
-        Command::Verify { profile } => return verify(profile).await,
+        Command::Verify {
+            profile,
+            stdio_result,
+        } => return verify(profile, stdio_result).await,
         Command::Plan(sources) => (sources, None),
         Command::Import {
             sources,
@@ -161,7 +169,8 @@ async fn perform(args: Args) -> Result<(), String> {
     Ok(())
 }
 
-async fn verify(profile: String) -> Result<(), String> {
+async fn verify(profile: String, stdio_result: bool) -> Result<(), String> {
+    let selected = profile.clone();
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = cancelled.clone();
     let mut task = tokio::task::spawn_blocking(move || {
@@ -178,11 +187,31 @@ async fn verify(profile: String) -> Result<(), String> {
             result
         }
     };
-    let verified = result
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())?;
-    println!("{}",serde_json::to_string_pretty(&serde_json::json!({"schema_version":1,"type":"verified","generation":verified,"note":"読み取り時点の固定SHAを照合しました。backend選択・有効化・推論・容量判定は行っていません。将来の置換や実行可否は保証しません。"})).map_err(|error|error.to_string())?);
+    let result = result.map_err(|error| error.to_string())?;
+    if stdio_result {
+        let (status, generation) = match result {
+            Ok(generation) => ("verified", Some(generation)),
+            Err(error) => (verification_failure_status(error), None),
+        };
+        println!("{}",serde_json::to_string(&serde_json::json!({"schema_version":1,"type":"verification","profile":selected,"status":status,"generation":generation})).map_err(|error|error.to_string())?);
+    } else {
+        let verified = result.map_err(|error| error.to_string())?;
+        println!("{}",serde_json::to_string_pretty(&serde_json::json!({"schema_version":1,"type":"verified","generation":verified,"note":"読み取り時点の固定SHAを照合しました。backend選択・有効化・推論・容量判定は行っていません。将来の置換や実行可否は保証しません。"})).map_err(|error|error.to_string())?);
+    }
     Ok(())
+}
+
+fn verification_failure_status(error: managed_decision::ManagedDecisionError) -> &'static str {
+    use managed_decision::ManagedDecisionError::*;
+    match error {
+        NotInstalled => "not_installed",
+        UnverifiedProfile => "unverified_profile",
+        Integrity => "integrity",
+        UnsupportedPlatform => "unsupported_platform",
+        UnsupportedDevice => "unsupported_device",
+        Cancelled => "cancelled",
+        _ => "unavailable",
+    }
 }
 
 fn decode_confirmation(reader: impl Read, expected: &str) -> Result<bool, String> {

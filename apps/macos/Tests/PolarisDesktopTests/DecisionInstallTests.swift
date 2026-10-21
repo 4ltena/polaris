@@ -21,12 +21,33 @@ private func offerData() throws -> Data {
     ])
 }
 
+private func verificationData(profile: String = "fixture-v1", status: String = "verified") throws -> Data {
+    var frame: [String: Any] = ["schema_version": 1, "type": "verification", "profile": profile, "status": status]
+    if status == "verified" {
+        frame["generation"] = ["profile": profile, "generation": "fixture-generation", "model_repository": "synthetic/model",
+            "model_revision": String(repeating: "a", count: 40), "quantization": "synthetic-q4", "runtime_revision": "synthetic-runtime",
+            "worker_sha256": String(repeating: "b", count: 64), "model_sha256": String(repeating: "c", count: 64), "verified_bytes": 10]
+    }
+    return try JSONSerialization.data(withJSONObject: frame)
+}
+
 private actor FixtureDecisionTransport: DecisionInstallTransport {
     let profiles: [String]
     var confirmations: [Bool] = []
     var prepared = 0
     var cancelled = 0
-    init(profiles: [String] = ["fixture-v1"]) { self.profiles = profiles }
+    var verified = 0
+    let verificationStatus: String
+    let verificationDelay: UInt64
+    init(profiles: [String] = ["fixture-v1"], verificationStatus: String = "verified", verificationDelay: UInt64 = 0) {
+        self.profiles = profiles; self.verificationStatus = verificationStatus; self.verificationDelay = verificationDelay
+    }
+    func verify(profile: String) async throws -> DecisionGenerationVerification {
+        verified += 1
+        if verificationDelay > 0 { try await Task.sleep(nanoseconds: verificationDelay) }
+        return try PackagedDecisionInstallClient.decodeVerification(verificationData(profile: profile, status: verificationStatus), profile: profile)
+    }
+    func verificationCount() -> Int { verified }
     func catalog() -> DecisionInstallCatalog {
         DecisionInstallCatalog(schemaVersion: 1, registeredProfiles: profiles, capacity: ["synthetic"], note: "not readiness")
     }
@@ -92,6 +113,81 @@ final class DecisionInstallTests: XCTestCase {
         model.confirm(false); try await settle(model)
         counts = await transport.counts()
         XCTAssertEqual(counts.1, [false]); XCTAssertTrue(model.message.contains("取り消しました"))
+    }
+
+    @MainActor func testVerificationNeedsOnlyARegisteredProfileAndClearsOnSelectionChange() async throws {
+        let transport = FixtureDecisionTransport(profiles: ["fixture-v1", "other-v1"])
+        let model = DecisionInstallModel(transport: transport)
+        model.refresh(); try await settle(model)
+        XCTAssertNil(model.worker); XCTAssertTrue(model.canVerify)
+        model.verify(); try await settle(model)
+        XCTAssertEqual(model.verification?.generation?.profile, "fixture-v1")
+        XCTAssertTrue(model.message.contains("有効化・推論・容量判定は行っていません"))
+        let counts = await transport.counts(); XCTAssertEqual(counts.0, 0); XCTAssertEqual(counts.1, [])
+        model.profile = "other-v1"; XCTAssertNil(model.verification)
+        XCTAssertTrue(model.message.contains("まだ検証していません")); XCTAssertFalse(model.message.contains("照合しました"))
+    }
+
+    @MainActor func testVerificationFailureDoesNotBecomeAnInstalledOrVerifiedResult() async throws {
+        for status in ["not_installed", "integrity", "unverified_profile", "unsupported_platform", "cancelled"] {
+            let model = DecisionInstallModel(transport: FixtureDecisionTransport(verificationStatus: status))
+            model.refresh(); try await settle(model); model.verify(); try await settle(model)
+            XCTAssertEqual(model.verification?.status, status); XCTAssertNil(model.verification?.generation)
+            XCTAssertNil(model.offer)
+        }
+        let empty = FixtureDecisionTransport(profiles: [])
+        let model = DecisionInstallModel(transport: empty)
+        model.refresh(); try await settle(model); XCTAssertFalse(model.canVerify)
+        model.verify(); let count = await empty.verificationCount(); XCTAssertEqual(count, 0)
+    }
+
+    @MainActor func testCancelledOrChangedVerificationCannotPublishTheOldResult() async throws {
+        for cancel in [false, true] {
+            let model = DecisionInstallModel(transport: FixtureDecisionTransport(profiles: ["fixture-v1", "other-v1"], verificationDelay: 20_000_000))
+            model.refresh(); try await settle(model); model.verify()
+            if cancel { model.cancel() } else { model.profile = "other-v1" }
+            try await settle(model); try await Task.sleep(nanoseconds: 30_000_000)
+            XCTAssertNil(model.verification); XCTAssertFalse(model.busy)
+        }
+    }
+
+    func testVerificationDecoderRequiresTheSelectedProfileAndBoundedCompleteEvidence() throws {
+        let valid = try verificationData()
+        XCTAssertEqual(try PackagedDecisionInstallClient.decodeVerification(valid, profile: "fixture-v1").generation?.verifiedBytes, 10)
+        XCTAssertThrowsError(try PackagedDecisionInstallClient.decodeVerification(valid, profile: "other-v1"))
+        for (key, value) in [("status", "other"), ("type", "plan"), ("unexpected", "other")] {
+            var frame = try JSONSerialization.jsonObject(with: valid) as! [String: Any]; frame[key] = value
+            XCTAssertThrowsError(try PackagedDecisionInstallClient.decodeVerification(JSONSerialization.data(withJSONObject: frame), profile: "fixture-v1"))
+        }
+        for key in ["worker_sha256", "model_revision", "profile"] {
+            var frame = try JSONSerialization.jsonObject(with: valid) as! [String: Any]
+            var generation = frame["generation"] as! [String: Any]; generation[key] = "wrong"; frame["generation"] = generation
+            XCTAssertThrowsError(try PackagedDecisionInstallClient.decodeVerification(JSONSerialization.data(withJSONObject: frame), profile: "fixture-v1"))
+        }
+        var frame = try JSONSerialization.jsonObject(with: valid) as! [String: Any]; frame["status"] = "not_installed"
+        XCTAssertThrowsError(try PackagedDecisionInstallClient.decodeVerification(JSONSerialization.data(withJSONObject: frame), profile: "fixture-v1"))
+        for status in ["not_installed", "unverified_profile", "integrity", "unsupported_platform", "unsupported_device", "cancelled", "unavailable"] {
+            XCTAssertNil(try PackagedDecisionInstallClient.decodeVerification(verificationData(status: status), profile: "fixture-v1").generation)
+        }
+    }
+
+    func testOwnedVerificationProcessUsesExplicitReadOnlyArgumentsAndNoImport() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("decision-verify-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("fixture-helper")
+        let frame = String(data: try verificationData(), encoding: .utf8)!
+        let script = """
+        #!/bin/sh
+        test "$1" = decision && test "$2" = verify && test "$3" = fixture-v1 && test "$4" = --stdio-result || exit 2
+        printf '%s\\n' '\(frame)'
+        """
+        try Data(script.utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        let client = PackagedDecisionInstallClient(helper: { helper })
+        let value = try await client.verify(profile: "fixture-v1")
+        XCTAssertEqual(value.status, "verified")
+        XCTAssertEqual(value.generation?.modelRepository, "synthetic/model")
     }
 
     func testPackagedCLIRequiresTheFixedPathHashAndArchitecture() throws {

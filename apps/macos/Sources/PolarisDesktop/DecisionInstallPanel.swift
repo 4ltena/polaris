@@ -20,6 +20,13 @@ struct DecisionInstallPanel: View {
                     Picker("profile", selection: $model.profile) {
                         ForEach(catalog.registeredProfiles, id: \.self) { Text($0).tag($0) }
                     }.disabled(model.busy || model.offer != nil)
+                    Button("導入済みgenerationを検証") { model.verify() }.disabled(!model.canVerify)
+                    if let generation = model.verification?.generation {
+                        DisclosureGroup("照合した固定内容（有効化・容量判定なし）") {
+                            Text("\(generation.profile) / \(generation.generation)\n\(generation.modelRepository) @ \(generation.modelRevision)\n\(generation.quantization) / \(generation.runtimeRevision)")
+                            Text("照合容量: \(bytes(generation.verifiedBytes))\nworker SHA-256: \(generation.workerSha256)\nmodel SHA-256: \(generation.modelSha256)").textSelection(.enabled)
+                        }.font(.caption)
+                    }
                     sourceRow("worker", url: model.worker) { model.worker = $0 }
                     sourceRow("model", url: model.model) { model.model = $0 }
                     Button("導入計画を確認") { model.prepare() }.disabled(!model.canPrepare)

@@ -52,13 +52,22 @@ impl DecisionFallback {
                 endpoint(target)
                     .map(|url| url.origin().ascii_serialization())
                     .unwrap_or_else(|_| "invalid endpoint".into())
+            } else if target.backend == DecisionBackend::SystemOne {
+                target
+                    .system_one
+                    .as_ref()
+                    .and_then(|profile| profile.origin())
+                    .unwrap_or_else(|| "invalid endpoint".into())
             } else {
                 "local process".into()
             };
             let model = serde_json::to_string(
                 &target
-                    .model
-                    .as_deref()
+                    .system_one
+                    .as_ref()
+                    .filter(|_| target.backend == DecisionBackend::SystemOne)
+                    .map(|profile| profile.model.as_str())
+                    .or(target.model.as_deref())
                     .or((target.backend == DecisionBackend::Jev).then_some("jev-latest")),
             )
             .unwrap_or_else(|_| "null".into());
@@ -119,6 +128,7 @@ struct RawTarget {
     base_url: Option<String>,
     model: Option<String>,
     helper: Option<String>,
+    system_one: Option<super::SystemOneConfig>,
 }
 
 impl RawFallback {
@@ -143,6 +153,7 @@ impl RawFallback {
                     base_url: target.base_url,
                     model: target.model,
                     helper: target.helper,
+                    system_one: target.system_one,
                     ..Default::default()
                 };
                 let mut config = DecisionConfig {

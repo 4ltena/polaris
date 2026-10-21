@@ -491,3 +491,77 @@ fn clef_factory_is_local_lazy_and_never_substitutes_a_remote_backend() {
         ))
     ));
 }
+
+#[test]
+fn system_one_factory_resolves_only_selected_user_reference_after_policy_checks() {
+    use crate::config::{DecisionBackend, DecisionConfig, SystemOneConfig};
+    let configured = DecisionConfig {
+        enabled: true,
+        backend: DecisionBackend::SystemOne,
+        system_one: Some(SystemOneConfig {
+            endpoint: "https://example.invalid/private-path".into(),
+            model: "fixture-model".into(),
+            credential_env: "POLARIS_SYSTEM_ONE_FIXTURE".into(),
+            allow_loopback_http: false,
+        }),
+        ..Default::default()
+    };
+    let build = |config: &DecisionConfig, purpose, key: &mut dyn FnMut(&str) -> Option<String>| {
+        build_with_credentials(config, purpose, key, |_| {
+            panic!("compatible factory spawned Clef")
+        })
+    };
+    let mut reads = Vec::new();
+    let decider = build(&configured, DecisionUse::Routing, &mut |name| {
+        reads.push(name.to_owned());
+        Some("dummy-key".into())
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(reads, ["POLARIS_SYSTEM_ONE_FIXTURE"]);
+    assert_eq!(decider.name(), "system-one-compatible");
+    assert_eq!(decider.identity().model.as_deref(), Some("fixture-model"));
+    for config in [
+        DecisionConfig {
+            enabled: false,
+            ..configured.clone()
+        },
+        DecisionConfig {
+            local_only: true,
+            ..configured.clone()
+        },
+        DecisionConfig {
+            base_url: Some("https://replacement.invalid".into()),
+            ..configured.clone()
+        },
+    ] {
+        let _ = build(&config, DecisionUse::Routing, &mut |_| {
+            panic!("refused path read credentials")
+        });
+    }
+    assert!(
+        build(&configured, DecisionUse::Finalization, &mut |_| panic!(
+            "unaccepted finalizer read credentials"
+        ))
+        .unwrap()
+        .is_none()
+    );
+    assert!(matches!(
+        build(&configured, DecisionUse::Routing, &mut |_| None),
+        Err(DecisionBuildError::MissingSystemOneKey)
+    ));
+    let mut chained = configured.clone();
+    chained.fallback = Some(crate::config::DecisionFallback {
+        targets: vec![configured],
+        max_attempts: 1,
+        attempt_timeout_ms: 100,
+        total_timeout_ms: 100,
+    });
+    let mut count = 0;
+    build(&chained, DecisionUse::Routing, &mut |_| {
+        count += 1;
+        Some("dummy-key".into())
+    })
+    .unwrap();
+    assert_eq!(count, 1, "unreachable fallback target read its credential");
+}

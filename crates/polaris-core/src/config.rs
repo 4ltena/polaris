@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 mod decision_fallback;
+mod decision_system_one;
 pub use decision_fallback::DecisionFallback;
+pub use decision_system_one::SystemOneConfig;
 
 /// The merged configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +212,8 @@ impl AnswerFinalizerConfig {
 /// committed and shared; a credential read from the environment is not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DecisionConfig {
+    /// Complete, user-owned endpoint/model/credential-reference association.
+    pub system_one: Option<SystemOneConfig>,
     /// Explicit user-owned typed-routing destinations and limits. None never switches.
     pub fallback: Option<DecisionFallback>,
     /// Restricts typed judgments and auxiliary arbitration, not main chat.
@@ -238,6 +242,7 @@ pub enum DecisionBackend {
     Jev,
     SemIf,
     Clef,
+    SystemOne,
 }
 
 impl DecisionBackend {
@@ -246,6 +251,7 @@ impl DecisionBackend {
             Self::Jev => "jev",
             Self::SemIf => "semif",
             Self::Clef => "clef",
+            Self::SystemOne => "system-one",
         }
     }
 }
@@ -621,6 +627,7 @@ fn parse_size(written: &str) -> Option<u64> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDecision {
+    system_one: Option<SystemOneConfig>,
     fallback: Option<decision_fallback::RawFallback>,
     #[serde(default)]
     local_only: Option<bool>,
@@ -648,6 +655,10 @@ impl RawDecision {
         if let Some(fallback) = self.fallback {
             merged.fallback = Some(fallback.resolve()?);
         }
+        if let Some(profile) = self.system_one {
+            profile.validate()?;
+            merged.system_one = Some(profile);
+        }
         merged.local_only |= self.local_only.unwrap_or(false);
         if let Some(enabled) = self.enabled {
             merged.enabled = enabled;
@@ -657,6 +668,7 @@ impl RawDecision {
                 "jev" => DecisionBackend::Jev,
                 "semif" => DecisionBackend::SemIf,
                 "clef" => DecisionBackend::Clef,
+                "system-one" => DecisionBackend::SystemOne,
                 _ => return Err(ConfigError::UnknownDecisionBackend(backend)),
             };
         }
@@ -700,11 +712,21 @@ impl RawDecision {
             (DecisionBackend::SemIf, false) => return Err(ConfigError::MissingDecisionHelper),
             // A helper under the remote backend names a local program this
             // run will never start. Ambiguous, so it stops.
-            (DecisionBackend::Jev | DecisionBackend::Clef, true) => {
+            (DecisionBackend::Jev | DecisionBackend::Clef | DecisionBackend::SystemOne, true) => {
                 return Err(ConfigError::UnusedDecisionHelper);
             }
             _ => {}
         };
+        if merged.backend == DecisionBackend::SystemOne {
+            if merged.base_url.is_some() || merged.model.is_some() || merged.helper.is_some() {
+                return Err(ConfigError::InvalidSystemOne);
+            }
+            merged
+                .system_one
+                .as_ref()
+                .ok_or(ConfigError::InvalidSystemOne)?
+                .validate()?;
+        }
         if merged.backend == DecisionBackend::Clef {
             if merged.base_url.is_some() {
                 return Err(ConfigError::UnusedClefEndpoint);
@@ -786,6 +808,12 @@ struct RawSpawn {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("[decision.system_one]は利用者のconfigにだけ設定できます")]
+    UserOnlySystemOne,
+    #[error(
+        "System Oneには専用設定のendpoint・model・credential_envが必要です。base_url/model/helperとの併用はできません"
+    )]
+    InvalidSystemOne,
     #[error("[decision.fallback]は利用者のconfigにだけ設定できます")]
     UserOnlyDecisionFallback,
     #[error(
@@ -804,7 +832,7 @@ pub enum ConfigError {
     },
     #[error("[tier] のmodelとeffortに空の値は書けません")]
     EmptyTierValue,
-    #[error("[decision] backend は jev・semif・clef のいずれかです（{0} は不明）")]
+    #[error("[decision] backend は jev・semif・clef・system-one のいずれかです（{0} は不明）")]
     UnknownDecisionBackend(String),
     #[error("[decision] backend = \"semif\" には helper への絶対pathが必要です")]
     MissingDecisionHelper,
@@ -909,6 +937,9 @@ fn try_load_layers(paths: &[Option<&Path>]) -> Result<Config, ConfigError> {
     for (index, path) in paths.iter().copied().enumerate() {
         let Some(path) = path else { continue };
         if let Some(raw) = read_one::<RawConfig>(path)? {
+            if raw.decision.system_one.is_some() && Some(index) != user_index {
+                return Err(ConfigError::UserOnlySystemOne);
+            }
             if raw.decision.fallback.is_some() && Some(index) != user_index {
                 return Err(ConfigError::UserOnlyDecisionFallback);
             }
@@ -1052,6 +1083,9 @@ pub fn try_load_decision_from(
     for (path, is_user) in [(global, true), (project, false)] {
         let Some(path) = path else { continue };
         if let Some(raw) = read_one::<DecisionOnly>(path)? {
+            if raw.decision.system_one.is_some() && !is_user {
+                return Err(ConfigError::UserOnlySystemOne);
+            }
             if raw.decision.fallback.is_some() && !is_user {
                 return Err(ConfigError::UserOnlyDecisionFallback);
             }

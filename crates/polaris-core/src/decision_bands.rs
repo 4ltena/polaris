@@ -237,6 +237,8 @@ pub enum DecisionUse {
 pub enum DecisionBuildError {
     #[error("local-only: 判断器の外部通信禁止境界を確認できません")]
     LocalOnlyUnavailable,
+    #[error("System Oneの認証参照を解決できません")]
+    MissingSystemOneKey,
     #[error("POLARIS_JEV_API_KEY がありません")]
     MissingJevKey,
     #[error("helperが実在する絶対pathではありません")]
@@ -255,11 +257,15 @@ pub fn build_configured(
     config: &crate::config::DecisionConfig,
     purpose: DecisionUse,
 ) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
-    build_with_key(config, purpose, || {
-        std::env::var("POLARIS_JEV_API_KEY").ok()
-    })
+    build_with_credentials(
+        config,
+        purpose,
+        |name| std::env::var(name).ok(),
+        crate::managed_decision::build,
+    )
 }
 
+#[cfg(test)]
 fn build_with_key(
     config: &crate::config::DecisionConfig,
     purpose: DecisionUse,
@@ -268,10 +274,25 @@ fn build_with_key(
     build_with_sources(config, purpose, key, crate::managed_decision::build)
 }
 
+#[cfg(test)]
 fn build_with_sources(
     config: &crate::config::DecisionConfig,
     purpose: DecisionUse,
     mut key: impl FnMut() -> Option<String>,
+    clef: impl FnMut(
+        &str,
+    ) -> Result<
+        std::sync::Arc<dyn Decider>,
+        crate::managed_decision::ManagedDecisionError,
+    >,
+) -> Result<Option<std::sync::Arc<dyn Decider>>, DecisionBuildError> {
+    build_with_credentials(config, purpose, |_| key(), clef)
+}
+
+fn build_with_credentials(
+    config: &crate::config::DecisionConfig,
+    purpose: DecisionUse,
+    mut key: impl FnMut(&str) -> Option<String>,
     mut clef: impl FnMut(
         &str,
     ) -> Result<
@@ -288,7 +309,7 @@ fn build_with_sources(
 fn build_one_with_sources(
     config: &crate::config::DecisionConfig,
     purpose: DecisionUse,
-    key: impl FnOnce() -> Option<String>,
+    mut key: impl FnMut(&str) -> Option<String>,
     clef: impl FnOnce(
         &str,
     ) -> Result<
@@ -333,11 +354,52 @@ fn build_one_with_sources(
                     .ok_or(DecisionBuildError::MissingSemIfHelper)?,
             )
         }
+        DecisionBackend::SystemOne => {
+            // No finalizer acceptance contract is inferred from HTTP compatibility.
+            if purpose == DecisionUse::Finalization {
+                return Ok(None);
+            }
+            if config.local_only {
+                return Err(DecisionBuildError::LocalOnlyUnavailable);
+            }
+            let profile = config
+                .system_one
+                .as_ref()
+                .ok_or(DecisionBuildError::InvalidSettings(
+                    DecisionError::Malformed,
+                ))?;
+            if config.base_url.is_some() || config.model.is_some() || config.helper.is_some() {
+                return Err(DecisionBuildError::InvalidSettings(
+                    DecisionError::Malformed,
+                ));
+            }
+            profile
+                .validate()
+                .map_err(|_| DecisionBuildError::InvalidSettings(DecisionError::Malformed))?;
+            let target = profile
+                .target()
+                .map_err(DecisionBuildError::InvalidSettings)?;
+            let binding = target.binding();
+            // User-owned metadata is validated before the credential reference is read.
+            let secret =
+                key(&profile.credential_env).ok_or(DecisionBuildError::MissingSystemOneKey)?;
+            let credential =
+                polaris_provider::decision::system_one::BoundCredential::new(binding, secret)
+                    .map_err(DecisionBuildError::InvalidSettings)?;
+            std::sync::Arc::new(
+                polaris_provider::decision::system_one::SystemOneDecider::new(
+                    target,
+                    credential,
+                    profile.limits(),
+                )
+                .map_err(DecisionBuildError::InvalidSettings)?,
+            )
+        }
         DecisionBackend::Jev => {
             if config.local_only {
                 return Err(DecisionBuildError::LocalOnlyUnavailable);
             }
-            let key = key().ok_or(DecisionBuildError::MissingJevKey)?;
+            let key = key("POLARIS_JEV_API_KEY").ok_or(DecisionBuildError::MissingJevKey)?;
             let base = config
                 .base_url
                 .as_deref()

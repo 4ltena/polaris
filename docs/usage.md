@@ -63,6 +63,7 @@ review = ["user:review-rules"]
 | `backend` | 指定する資源 | 現在の扱い |
 | --- | --- | --- |
 | `jev` | 任意の`model`・`base_url`と、環境変数`POLARIS_JEV_API_KEY` | 既存のHTTP経路。明示的に有効にした場合だけ使用する。 |
+| `system-one` | 利用者configの`[decision.system_one]` | 明示したSystem One HTTP互換契約。接続先・モデル・認証参照をまとめて登録する。 |
 | `semif` | `helper`への絶対path | 既存のローカルhelper経路。Clefの導入状態にかかわらず維持する。 |
 | `clef` | `model`にpackage登録済みの固定profile ID | macOSの管理対象generationを使う。`helper`・`base_url`や任意の実行ファイルpathは指定できない。 |
 
@@ -75,6 +76,27 @@ Clef/Clef-flashはモデル、量子化、runtime、device、割当contextごと
 判断と補助モデルによる候補選択を端末内に限定したい場合は、`[decision]`に`local_only = true`を指定する。既定は`false`である。`true`の場合は通信制限を確認できる判断器と補助モデルだけを許可し、判断失敗後も外部の補助モデルへ送信しない。loopbackの接続先やローカルhelperというだけでは、外部通信しない保証にはならない。現在のJev HTTP経路と、通信を制限していないSemIf helperは、この指定時には使用できない。管理対象Clefも、受入・導入・容量の条件を別途満たす必要がある。
 
 利用者設定の`local_only = true`は、project設定の`false`では解除できない。この設定が制限するのは判断と補助的な候補選択であり、通常の会話モデルやMCPツール自体の通信許可は別に設定する。
+
+### System One互換接続
+
+`system-one`は、`systemone-http-v1`の型付き要求・応答に対応する接続先を明示する設定である。通常のchat APIや、モデル名が似ているサービスの互換性を保証するものではない。次は利用者の`~/.polaris/config.toml`に置く設定例で、接続先とモデルは実際のサービスの値に置き換える。
+
+```toml
+[decision]
+enabled = true
+backend = "system-one"
+
+[decision.system_one]
+endpoint = "https://example.invalid/systemone"
+model = "REGISTERED_MODEL"
+credential_env = "POLARIS_SYSTEM_ONE_KEY"
+```
+
+`endpoint`はPOST先の完全なURLで、`base_url`や外側の`model`・`helper`とは併用しない。認証値はconfigへ書かず、`credential_env`で指定した環境変数をPolarisの起動環境へ用意する。変数名は`POLARIS_SYSTEM_ONE_`で始まり、続く部分を含めて大文字英数字と`_`の128文字以内とする。この設定全体は利用者configだけから読み、project configから接続先・モデル・認証参照を書き換えることはできない。無効時、`local_only = true`、未到達のfallback先では認証値を参照しない。
+
+HTTPSを既定とし、HTTPは`allow_loopback_http = true`とliteral loopback IPを両方指定した場合だけ許可する。URLのuserinfo・query・fragment、redirect、通信層の自動再試行は拒否する。要求・応答は各1MiB、質問・選択肢は各256件、通信の上限は30秒である。これは通信層の上限であり、モデルのcontextや容量を測定した値ではない。接続先にはstateと質問が送られる。診断・監査に記録するURLはorigin（scheme・host・port）までで、pathと認証値は含めない。
+
+応答のモデル名と型付き回答を検証するが、実weightsのrevision・量子化を証明するものではない。現在は未校正として候補を維持し、answer finalizerには使わない。loopback HTTPも通信の隔離を保証しないため、`local_only = true`では拒否する。明示fallbackの候補にする場合は、該当する`[[decision.fallback.targets]]`に`backend = "system-one"`を置き、その直後の`[decision.fallback.targets.system_one]`へ同じ設定項目を指定する。
 
 ### 型付きbackendの切替
 

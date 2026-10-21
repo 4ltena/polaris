@@ -35,7 +35,14 @@ pub fn display(
         "  設定: {} / enabled={}",
         identity(&DecisionIdentity {
             backend: config.backend.as_str().into(),
-            model: config.model.clone(),
+            model: if config.backend == crate::config::DecisionBackend::SystemOne {
+                config
+                    .system_one
+                    .as_ref()
+                    .map(|profile| profile.model.clone())
+            } else {
+                config.model.clone()
+            },
             revision: None,
             quantization: None,
         }),

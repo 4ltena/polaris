@@ -326,10 +326,15 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/config`
 
 - `decision_fallback.rs` — User-owned typed-routing failover configuration; project files cannot add destinations.
+- `decision_system_one.rs` — User-owned System One endpoint/model/environment reference; no secret value.
 
 ## `crates/polaris-core/src/config/decision_fallback`
 
 - `tests.rs` — User-only routing policy, destination validation and secret-free preflight display.
+
+## `crates/polaris-core/src/config/decision_system_one`
+
+- `tests.rs` — Configuration provenance and strict compatible target boundaries.
 
 ## `crates/polaris-core/src/constitution`
 

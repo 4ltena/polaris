@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 
 pub(super) fn build(
     config: &DecisionConfig,
-    mut key: impl FnMut() -> Option<String>,
+    mut key: impl FnMut(&str) -> Option<String>,
     mut clef: impl FnMut(&str) -> Result<Arc<dyn Decider>, ManagedDecisionError>,
 ) -> Result<Arc<dyn Decider>, DecisionBuildError> {
     let fallback = config.fallback.as_ref().expect("caller selected a chain");
@@ -73,7 +73,9 @@ pub(super) fn build(
                             _ => "unsupported_device",
                         },
                     ),
-                    DecisionBuildError::MissingJevKey if index > 0 => {
+                    DecisionBuildError::MissingJevKey | DecisionBuildError::MissingSystemOneKey
+                        if index > 0 =>
+                    {
                         (DecisionError::Auth, "missing_credential")
                     }
                     DecisionBuildError::InvalidSettings(DecisionError::Auth) if index > 0 => {
@@ -84,7 +86,14 @@ pub(super) fn build(
                 Arc::new(Unavailable {
                     identity: DecisionIdentity {
                         backend: target.backend.as_str().into(),
-                        model: target.model.clone(),
+                        model: if target.backend == DecisionBackend::SystemOne {
+                            target
+                                .system_one
+                                .as_ref()
+                                .map(|profile| profile.model.clone())
+                        } else {
+                            target.model.clone()
+                        },
                         revision: None,
                         quantization: None,
                     },

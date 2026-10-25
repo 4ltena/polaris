@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <strong>v1.0.0 開発中 · 配布前</strong> · <a href="CHANGELOG.md">変更履歴</a>
+  <strong>暫定v1.0.0 · macOS TUI限定 · 公開準備中</strong> · <a href="CHANGELOG.md">変更履歴</a>
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
 
 Polarisは、作業に必要な文脈を選んでモデルへ渡すRust製のコーディングエージェントである。CLIとTUIを主な操作経路とし、macOS向けの作業画面も備える。workflowの段階を状態として保存し、その段階に必要な指示・skillを組み立てる。
 
-このcheckoutではv1.0.0を実装中である。通常会話、Sidechatへの自動振分け、MCP、subagent、会話・作業ファイルの巻き戻しなどをTUIへ接続している。一部の管理操作、MCPとSidechatを併用する場合の復旧、実端末での受入は未完了であり、配布版としての公開も行っていない。[現在の利用方法](docs/usage.md)と[macOSアプリの組立て](apps/macos/README.md)を参照。
+暫定v1.0.0はmacOS arm64のTUIを配布対象とする。GUI・他OSのソースは保持するが、この版の配布対象には含めない。会話・巻戻し・MCP・subagentの操作は[利用ガイド](docs/usage.md)と[コマンド参照](docs/command-reference.md)、構成と今回の提供範囲は[システム構成図](docs/system-overview.md)と[リリース資料](docs/releases/v1.0.0.md)を参照。現在は公開準備中である。
 
 ## v0.12.0での純正Codexとの比較
 
@@ -31,9 +31,9 @@ Polarisは、作業に必要な文脈を選んでモデルへ渡すRust製のコ
 
 総トークンはキャッシュ済み入力を含む入力と出力の合計。費用は測定仕様で固定したAPI単価による参考額で、Codexの実請求額ではない。この15組ではPolarisの所要時間は23.5%長かった。短い合成課題による逐次測定であり、一般の実装作業や長期対話へは外挿しない。[測定条件・品質評価・時間・制約](docs/preimplementation-evaluation.md#v0120とcodex-01540の途中結果)を参照。
 
-## 開発中の利用方法
+## 暫定版の利用方法
 
-macOS arm64では、ビルド済みCLIを同梱したローカル検証用パッケージを作成できる。パッケージを取得した後の導入は`sudo installer -pkg polaris-cli-preview-0.12.0-arm64.pkg -target /`の1コマンドで、以後は`polaris`で起動する。利用者側にRustは不要。現時点では未署名・未公開であり、実機へのインストール受入も未完了。組立て方法と検証範囲は[macOSの説明](apps/macos/README.md)を参照。
+macOS arm64では、ビルド済みCLIを同梱したローカル検証用パッケージを作成できる。パッケージを取得した後の導入は`sudo installer -pkg polaris-cli-preview-1.0.0-arm64.pkg -target /`の1コマンドで、以後は`polaris`で起動する。利用者側にRustは不要。現時点では未署名・未公開であり、実機へのインストール受入も未完了。組立て方法と検証範囲は[macOSの説明](apps/macos/README.md)を参照。
 
 このcheckoutをソースから実行する場合はRust 1.96.0を用意する。ChatGPT認証を使う例は次のとおり。
 
@@ -43,7 +43,7 @@ target/release/polaris login
 POLARIS_PROVIDER=codex target/release/polaris
 ```
 
-引数を省略すると対話TUI、`-p`を指定すると一発実行になる。既定のプロバイダは`openai`でAPIキーを必要とするため、ChatGPT認証を使う場合は例のように`POLARIS_PROVIDER=codex`を指定する。この端末の`polaris`コマンドは開発用ラッパーであり、一般向けインストーラにはまだ含まれない。
+引数を省略すると対話TUI、`-p`を指定すると一発実行になる。既定のプロバイダは`openai`でAPIキーを必要とするため、ChatGPT認証を使う場合は例のように`POLARIS_PROVIDER=codex`を指定する。ソースから試す場合は`target/release/polaris`を指定し、導入済みの別版と区別する。
 
 段階を指定して始める場合は、`--phase`を使う。
 

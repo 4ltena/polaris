@@ -2,6 +2,27 @@
 
 [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) と [Semantic Versioning](https://semver.org/lang/ja/) に従う。
 
+## [1.0.0] — 未リリース（macOS TUI暫定版）
+
+macOS arm64のTUIを配布対象として準備する。GUIと他OSのソースは保持する。公開日・タグ・署名済み配布物が確定したことを示すものではない。
+
+### 追加・変更
+
+- 会話の再開・分岐・巻戻し、原文参照、workflowとskill、MCP・subagentをTUIから扱える。
+- working中の補完と子タスク照会、入力受理ID、整理したstatus表示を提供する。
+- 判断backendの共通化と明示選択を追加し、Jev/SemIfを保持する。Clefは本番profile未登録のため通常利用できない。
+- 実装の流れと配布範囲を示すシステム構成図、コマンド参照、暫定リリース資料を整備する。
+
+### 修正
+
+- 入力履歴の上下移動、working中の補完、session管理、directory読取、MCP catalog検索引数を修正した。
+- 日本語入力後の入力欄背景と、管理コマンドの実行経路を整理した。
+
+### 検証・備考
+
+- 最終候補の結果と未検証範囲は[暫定v1.0.0リリース資料](docs/releases/v1.0.0.md)に記録する。
+- macOS TUI以外、署名・公証、全MCP・モデルの実接続、Clef実受入を完了としない。
+
 ## [0.12.0] — 未リリース "Alrescha"
 
 2026-09-11に実装を完了。macOSの作業画面と、保存・隔離実行・ローカルモデル・会話記憶の接続を追加した。利用者の指示により承認が必要な追加検証を省略した。RC化・公開済みリリースを示すものではない。

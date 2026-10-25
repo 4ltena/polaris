@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <strong>v1.0.0 in development · not yet distributed</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
+  <strong>Provisional v1.0.0 · macOS TUI only · preparing publication</strong> · <a href="CHANGELOG.md">Changelog (Japanese)</a>
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
 
 Polaris is a Rust coding agent that selects the context needed for the current task. Its main interfaces are a CLI and TUI, with a separate macOS workspace app. It stores workflow state and assembles instructions and skills for the active phase.
 
-This checkout contains the in-progress v1.0.0 implementation. The TUI connects ordinary conversations, automatic Sidechat routing, MCP, subagents, and conversation/workspace rewind. Some management operations, recovery when MCP prompts and Sidechat routing interact, and real-terminal acceptance remain unfinished. No v1.0.0 distribution has been published. See the [usage guide](docs/usage.md) and [macOS build guide](apps/macos/README.md).
+Provisional v1.0.0 distributes the macOS arm64 TUI only. GUI and other-platform sources remain in the repository. See the [system overview](docs/system-overview.md), [release scope](docs/releases/v1.0.0.md), and [command reference](docs/command-reference.md) (Japanese). No v1.0.0 tag or release has been published for this candidate.
 
 ## v0.12.0 comparison with stock Codex
 
@@ -33,7 +33,7 @@ Total tokens include input and output; cached input is already part of input. Co
 
 ## Using this development checkout
 
-On macOS arm64, a local preview package can be assembled with a compiled Polaris CLI. Once obtained, install it with one command, `sudo installer -pkg polaris-cli-preview-0.12.0-arm64.pkg -target /`, then launch the TUI with `polaris`. Rust is not needed on the user's machine. This package is currently unsigned and unpublished; a real-machine installation check is still pending. See the [macOS guide](apps/macos/README.md) for assembly and verification details.
+On macOS arm64, a local preview package can be assembled with a compiled Polaris CLI. Once obtained, install it with one command, `sudo installer -pkg polaris-cli-preview-1.0.0-arm64.pkg -target /`, then launch the TUI with `polaris`. Rust is not needed on the user's machine. This package is currently unsigned and unpublished; a real-machine installation check is still pending. See the [macOS guide](apps/macos/README.md) for assembly and verification details.
 
 Building from source requires Rust 1.96.0. To use ChatGPT authentication:
 
@@ -43,7 +43,7 @@ target/release/polaris login
 POLARIS_PROVIDER=codex target/release/polaris
 ```
 
-With no prompt argument, Polaris starts the interactive TUI; `-p` runs one prompt. The default provider is `openai` and requires an API key, so set `POLARIS_PROVIDER=codex` for ChatGPT authentication as shown. The `polaris` command on the developer's machine is a local source-building wrapper, not a distributed installer.
+With no prompt argument, Polaris starts the interactive TUI; `-p` runs one prompt. The default provider is `openai` and requires an API key, so set `POLARIS_PROVIDER=codex` for ChatGPT authentication as shown. Use `target/release/polaris` when testing from source to distinguish it from another installed version.
 
 Use `--phase` to choose the starting phase:
 

@@ -1567,7 +1567,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "polaris-auth"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "core-foundation",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-cli"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-core"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-desktop-protocol"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-desktop-service"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -1681,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-http"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "reqwest 0.12.28",
  "rustls",
@@ -1693,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-mcp"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-memory"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "polaris-auth",
  "rusqlite",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-provider"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-sandbox"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "landlock",
  "libc",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-skills"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tools"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "jsonschema",
  "libc",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tui"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

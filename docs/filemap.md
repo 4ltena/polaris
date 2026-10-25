@@ -1683,9 +1683,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `sadalmelik-validation.md` — v0.11.0の検証状況
 - `skill-scaling-benchmark.md` — skill/pluginを大量に含めた比較
 - `subagents.md` — subagent
+- `system-overview.md` — システム構成図
 - `testing.md` — テスト
 - `tool-preselection.md` — ツールの事前選定
 - `usage.md` — 利用ガイド
+
+## `docs/releases`
+
+- `v1.0.0.md` — Polaris 暫定v1.0.0 — macOS TUI
 
 ## `scripts/fixtures/tui-parity-ledger`
 

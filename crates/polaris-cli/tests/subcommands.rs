@@ -773,6 +773,120 @@ fn tui_mode_with_no_key_anywhere_reaches_onboarding() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn logged_out_codex_tui_reaches_onboarding_without_a_provider_override() {
+    let home = tempfile::tempdir().unwrap();
+    let output = product_binary::command()
+        .env("HOME", home.path().canonicalize().unwrap())
+        .env("POLARIS_PROVIDER", "codex")
+        .env_remove("POLARIS_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to start onboarding"));
+}
+
+#[cfg(unix)]
+#[test]
+fn registered_startup_distinguishes_logout_ready_reauth_and_in_progress() {
+    const CHILD: &str = "POLARIS_REGISTERED_STARTUP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "registered_startup_distinguishes_logout_ready_reauth_and_in_progress",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path().canonicalize().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use polaris_auth::accounts::store::{AccountState, AccountStore};
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    polaris_auth::protection::use_trusted_home(&home).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = AccountStore::open().unwrap();
+    let reservation = store.begin_registration(None).unwrap();
+    store.cancel_registration(&reservation, false).unwrap();
+    let run = |provider: Option<&str>, args: &[&str]| {
+        let mut command = product_binary::command();
+        command
+            .current_dir(workspace.path())
+            .env("HOME", &home)
+            .env_remove("POLARIS_API_KEY")
+            .env_remove("POLARIS_PROVIDER")
+            .args(args);
+        if let Some(provider) = provider {
+            command.env("POLARIS_PROVIDER", provider);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        String::from_utf8(output.stderr).unwrap()
+    };
+    for provider in [None, Some("codex")] {
+        assert!(run(provider, &[]).contains("refusing to start onboarding"));
+    }
+    assert!(run(Some("codex"), &["-p", "synthetic"]).contains("使用できる登録がありません"));
+    assert!(
+        !run(Some("codex"), &["--account", &reservation.registration_id]).contains("onboarding")
+    );
+    assert_eq!(
+        store.snapshot().unwrap().accounts[0].state,
+        AccountState::Disconnected
+    );
+    assert!(!home.join(".polaris/auth.json").exists());
+
+    let reservation = store.begin_registration(None).unwrap();
+    store.mark_exchange_pending(&reservation).unwrap();
+    let (generation, _) = store
+        .complete_registration(
+            &reservation,
+            polaris_auth::Credentials {
+                access_token: "synthetic-only".into(),
+                refresh_token: "synthetic-only".into(),
+                account_id: "synthetic-account".into(),
+                expires_at: Some(u64::MAX),
+            },
+        )
+        .unwrap();
+    assert!(run(None, &[]).contains("refusing to start the TUI"));
+    store
+        .begin_reauthentication(&reservation.registration_id, generation)
+        .unwrap();
+    let in_progress = run(None, &[]);
+    assert!(!in_progress.contains("onboarding"));
+    // With no live owner lease, a new process settles the abandoned reservation.
+    let generation = store.snapshot().unwrap().accounts[0].generation;
+    let reauth = store
+        .begin_reauthentication(&reservation.registration_id, generation)
+        .unwrap();
+    store.mark_exchange_pending(&reauth).unwrap();
+    store.cancel_registration(&reauth, true).unwrap();
+    let message = run(None, &[]);
+    assert!(
+        message.contains(&format!(
+            "polaris account reauth {}",
+            reservation.registration_id
+        )),
+        "{message}"
+    );
+    assert!(!message.contains("onboarding"));
+    assert_eq!(
+        store.snapshot().unwrap().accounts[0].state,
+        AccountState::ReauthRequired
+    );
+}
+
 /// A user who already signed in with ChatGPT (via `polaris login` or
 /// onboarding's own ChatGPT option) must not be sent back to onboarding on
 /// the next launch just because `POLARIS_PROVIDER` isn't set. TUI mode

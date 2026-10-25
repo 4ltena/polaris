@@ -423,13 +423,75 @@ impl Drop for OnboardingTerminal {
     }
 }
 
+enum LoginMode<'a> {
+    Legacy(&'a Path),
+    Registered(std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>),
+}
+
+pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
+    run_mode(LoginMode::Legacy(auth_store_path), api_key_path).await
+}
+
+/// Reconnect logged-out registrations without falling back to the legacy store.
+pub async fn run_registered(
+    owner: std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>,
+    api_key_path: &Path,
+) -> Result<Outcome, OnboardingError> {
+    if cfg!(not(unix)) {
+        return Err(OnboardingError::Auth(
+            "protected account storage is unavailable".into(),
+        ));
+    }
+    run_mode(LoginMode::Registered(owner), api_key_path).await
+}
+
+fn render_registered_wait(frame: &mut Frame) {
+    frame.render_widget(
+        Paragraph::new("ブラウザで認可してください。Esc / Ctrl-Cで取消。").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("polaris login"),
+        ),
+        frame.area(),
+    );
+}
+
+#[cfg(unix)]
+async fn register(
+    owner: &std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>,
+) -> Result<Outcome, OnboardingError> {
+    owner
+        .register(
+            None,
+            crate::account::browser_callback,
+            crate::account::browser_cancel(),
+        )
+        .await
+        .map(|_| Outcome::CodexLoggedIn)
+        .map_err(|error| match error {
+            polaris_auth::AuthError::Denied(reason) if reason == "cancelled" => {
+                OnboardingError::Cancelled
+            }
+            other => OnboardingError::Auth(other.to_string()),
+        })
+}
+
+#[cfg(not(unix))]
+async fn register(
+    _owner: &std::sync::Arc<polaris_auth::accounts::owner::AccountOwner>,
+) -> Result<Outcome, OnboardingError> {
+    Err(OnboardingError::Auth(
+        "protected account storage is unavailable".into(),
+    ))
+}
+
 /// Shows the onboarding screen and drives it to completion. Owns the
 /// terminal for its own lifetime (enters/leaves the alternate screen
 /// through an owned guard), independent of
 /// whatever the caller does with the terminal afterward — the chat loop's
 /// own `run()` re-inits the terminal fresh once this returns.
 #[cfg(target_os = "linux")]
-pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
+async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
     let mut terminal = enter_onboarding_terminal_with(shutdown_requested, || {
         if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
             return Err(OnboardingError::NonInteractive);
@@ -471,6 +533,21 @@ pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome,
 
         match selected {
             Choice::ChatGpt => {
+                let LoginMode::Legacy(auth_store_path) = &mode else {
+                    let LoginMode::Registered(owner) = &mode else {
+                        unreachable!()
+                    };
+                    if terminal
+                        .terminal_mut()
+                        .draw(render_registered_wait)
+                        .is_err()
+                    {
+                        break 'outer Err(OnboardingError::Auth(
+                            "failed to draw the terminal".into(),
+                        ));
+                    }
+                    break 'outer register(owner).await;
+                };
                 // Leave the alternate screen before calling into the
                 // existing OAuth flow: `login::run` prints the
                 // authorize-in-your-browser URL via `eprintln!` and opens
@@ -572,7 +649,7 @@ pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome,
 
 /// Preserve the existing non-Linux onboarding behavior.
 #[cfg(not(target_os = "linux"))]
-pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
+async fn run_mode(mode: LoginMode<'_>, api_key_path: &Path) -> Result<Outcome, OnboardingError> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(OnboardingError::NonInteractive);
     }
@@ -609,6 +686,17 @@ pub async fn run(auth_store_path: &Path, api_key_path: &Path) -> Result<Outcome,
 
         match selected {
             Choice::ChatGpt => {
+                let LoginMode::Legacy(auth_store_path) = &mode else {
+                    let LoginMode::Registered(owner) = &mode else {
+                        unreachable!()
+                    };
+                    if terminal.draw(render_registered_wait).is_err() {
+                        break 'outer Err(OnboardingError::Auth(
+                            "failed to draw the terminal".into(),
+                        ));
+                    }
+                    break 'outer register(owner).await;
+                };
                 // Leave the alternate screen before calling into the
                 // existing OAuth flow: `login::run` prints the
                 // authorize-in-your-browser URL via `eprintln!` and opens

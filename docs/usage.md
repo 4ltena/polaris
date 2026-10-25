@@ -14,7 +14,7 @@ cargo build --release
 
 | 変数 | 既定値 | 意味 |
 | --- | --- | --- |
-| `POLARIS_PROVIDER` | `openai` | `openai`または`codex`。`codex`は`polaris login`で得たChatGPT認証を使う。 |
+| `POLARIS_PROVIDER` | 自動選択 | API keyがあれば`openai`、なければ保存済みChatGPT認証・登録があるとき`codex`、いずれも無ければログイン画面へ進む。明示指定は`openai`・`codex`・`llamacpp`。 |
 | `POLARIS_API_KEY` | なし | `POLARIS_PROVIDER=openai`で必要なOpenAI互換エンドポイントのAPIキー。 |
 | `POLARIS_BASE_URL` | `https://api.openai.com/v1` | `openai`プロバイダのベースURL。 |
 | `POLARIS_MODEL` | `gpt-6-astra` | 両プロバイダ共通の既定モデル。明示した`--model`が優先する。 |
@@ -197,6 +197,8 @@ macOSインストーラの「モデル」ページにも「Clef判断器の導�
 polaris login
 POLARIS_PROVIDER=codex polaris -p "Cargo.toml は何行か"
 ```
+
+認証がない状態で`polaris`を対話端末から起動すると、ChatGPTまたはAPI keyを選ぶログイン専用画面が開く。全登録が解除済みの場合も同じ画面からログインできる。登録済みアカウントの認証待機中はEsc・Ctrl-Cで取り消せる。再認証が必要な登録は、表示された`polaris account reauth <登録ID>`で再認証する。非対話実行や明示`--account`の不正指定ではログイン画面を開かない。
 
 `polaris login`はブラウザを開き、`http://localhost:1455/auth/callback`で認可を受け取る。資格情報は`~/.polaris/auth.json`に0600で保管し、`~/.codex/`には読み書きしない。`polaris logout`はPolarisが保存した資格情報を削除する。`ls -l ~/.polaris/auth.json`で`-rw-------`であることを確認できる。
 

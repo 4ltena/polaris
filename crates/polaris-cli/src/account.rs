@@ -127,6 +127,43 @@ fn registered_owner() -> Result<Option<Arc<AccountOwner>>, String> {
         .map_err(|error| format!("アカウントを開けません: {error}"))
 }
 
+pub(super) enum StartupAccounts {
+    Legacy,
+    LoggedOut(Arc<AccountOwner>),
+    Registered,
+}
+
+fn all_disconnected(states: &[AccountState]) -> bool {
+    !states.is_empty()
+        && states
+            .iter()
+            .all(|state| *state == AccountState::Disconnected)
+}
+
+pub(super) fn has_registrations() -> Result<bool, String> {
+    registered_owner().map(|owner| owner.is_some())
+}
+
+/// 解除済みの登録だけを新しいログインへ案内する。再認証や処理中は混同しない。
+pub(super) fn startup() -> Result<StartupAccounts, String> {
+    let Some(owner) = registered_owner()? else {
+        return Ok(StartupAccounts::Legacy);
+    };
+    let snapshot = owner
+        .snapshot()
+        .map_err(|error| format!("一覧を取得できません: {error}"))?;
+    let states: Vec<_> = snapshot
+        .accounts
+        .iter()
+        .map(|account| account.state)
+        .collect();
+    Ok(if all_disconnected(&states) {
+        StartupAccounts::LoggedOut(owner)
+    } else {
+        StartupAccounts::Registered
+    })
+}
+
 fn state_label(state: AccountState) -> &'static str {
     match state {
         AccountState::Registering => "登録中",
@@ -271,8 +308,20 @@ pub fn bind(model: &str, explicit: Option<&str>) -> Result<(), String> {
         owner.bind(&models, explicit).map_err(|error| {
             match error {
         AuthError::NotLoggedIn => {
-            "使用できる登録がありません。`polaris account list`で状態を確認してください。"
-                .to_string()
+            match owner.snapshot() {
+                Ok(snapshot) => {
+                    let reauth: Vec<_> = snapshot.accounts.iter()
+                        .filter(|account| account.state == AccountState::ReauthRequired)
+                        .map(|account| format!("polaris account reauth {}", account.registration_id))
+                        .collect();
+                    if reauth.is_empty() {
+                        "使用できる登録がありません。`polaris account list`で状態を確認してください。".into()
+                    } else {
+                        format!("再認証が必要です。次を端末から実行してください:\n{}", reauth.join("\n"))
+                    }
+                }
+                Err(error) => format!("アカウントを確認できません: {error}"),
+            }
         }
         AuthError::Denied(reason) if reason == "no_selectable_account" => {
             "利用枠が確認できないため自動選択できません。`--account <登録ID>`で指定してください。"
@@ -289,6 +338,30 @@ pub fn bind(model: &str, explicit: Option<&str>) -> Result<(), String> {
         ))),
     }));
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn only_disconnected_registrations_reenter_login() {
+        assert!(all_disconnected(&[AccountState::Disconnected]));
+        assert!(all_disconnected(&[
+            AccountState::Disconnected,
+            AccountState::Disconnected
+        ]));
+        assert!(!all_disconnected(&[]));
+        for state in [
+            AccountState::Ready,
+            AccountState::Registering,
+            AccountState::RefreshPending,
+            AccountState::ReauthRequired,
+        ] {
+            assert!(!all_disconnected(&[state]));
+            assert!(!all_disconnected(&[AccountState::Disconnected, state]));
+        }
+    }
 }
 
 /// 送信経路のtoken source。登録済みなのに束縛前だと、単一認証へ落ちる代わりに

@@ -21,6 +21,36 @@ pub(super) struct PreparedProviders {
     _llama_server: Option<polaris_core::llama_server::LlamaServer>,
 }
 
+async fn onboard(
+    store: &Path,
+    accounts: account::StartupAccounts,
+) -> Result<polaris_tui::onboarding::Outcome, ExitCode> {
+    let api_key_path = polaris_auth::api_key::default_path().map_err(|error| {
+        eprintln!("Can't determine where to store the API key: {error}");
+        ExitCode::FAILURE
+    })?;
+    let outcome = match accounts {
+        account::StartupAccounts::LoggedOut(owner) => {
+            polaris_tui::onboarding::run_registered(owner, &api_key_path).await
+        }
+        _ => polaris_tui::onboarding::run(store, &api_key_path).await,
+    };
+    outcome.map_err(|error| match error {
+        polaris_tui::onboarding::OnboardingError::Cancelled => ExitCode::SUCCESS,
+        other => {
+            eprintln!("{other}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
+fn startup_accounts() -> Result<account::StartupAccounts, ExitCode> {
+    account::startup().map_err(|error| {
+        eprintln!("{error}");
+        ExitCode::FAILURE
+    })
+}
+
 /// Construct the primary, selector, and tier providers after preflight.
 ///
 /// Errors are reported at the existing provider boundary so callers preserve
@@ -39,6 +69,12 @@ pub(super) async fn prepare(
     let (provider, mcp_selection_provider, tier_weights): (Shared, Option<Shared>, TierWeights) = loop {
         match provider_name.as_str() {
             "openai" => {
+                if args.account.is_some() {
+                    eprintln!(
+                        "--accountはcodexのみで使えます。POLARIS_PROVIDER=codexを指定してください。"
+                    );
+                    return Err(ExitCode::FAILURE);
+                }
                 let base = std::env::var("POLARIS_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
                 let key = std::env::var("POLARIS_API_KEY").ok().or_else(|| {
@@ -62,26 +98,13 @@ pub(super) async fn prepare(
                                 return Err(ExitCode::FAILURE);
                             }
                         };
-                        let api_key_path = match polaris_auth::api_key::default_path() {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("Can't determine where to store the API key: {e}");
-                                return Err(ExitCode::FAILURE);
-                            }
-                        };
-                        match polaris_tui::onboarding::run(&auth_store_path, &api_key_path).await {
+                        match onboard(&auth_store_path, startup_accounts()?).await {
                             Ok(polaris_tui::onboarding::Outcome::ApiKeySaved) => continue,
                             Ok(polaris_tui::onboarding::Outcome::CodexLoggedIn) => {
                                 provider_name = "codex".to_string();
                                 continue;
                             }
-                            Err(polaris_tui::onboarding::OnboardingError::Cancelled) => {
-                                return Err(ExitCode::SUCCESS);
-                            }
-                            Err(e) => {
-                                eprintln!("{e}");
-                                return Err(ExitCode::FAILURE);
-                            }
+                            Err(status) => return Err(status),
                         }
                     }
                     None => {
@@ -89,12 +112,6 @@ pub(super) async fn prepare(
                         return Err(ExitCode::FAILURE);
                     }
                 };
-                if args.account.is_some() {
-                    eprintln!(
-                        "--accountはcodexのみで使えます。POLARIS_PROVIDER=codexを指定してください。"
-                    );
-                    return Err(ExitCode::FAILURE);
-                }
                 model_name = model.clone();
                 let selector = OpenAiProvider::new(
                     base.clone(),
@@ -139,6 +156,28 @@ pub(super) async fn prepare(
                         return Err(ExitCode::FAILURE);
                     }
                 };
+                if args.prompt.is_none() && args.account.is_none() {
+                    let accounts = startup_accounts()?;
+                    let needs_login = match &accounts {
+                        account::StartupAccounts::LoggedOut(_) => true,
+                        account::StartupAccounts::Legacy => polaris_auth::store::load_from(&store)
+                            .map_err(|error| {
+                                eprintln!("Can't read credentials: {error}");
+                                ExitCode::FAILURE
+                            })?
+                            .is_none(),
+                        account::StartupAccounts::Registered => false,
+                    };
+                    if needs_login {
+                        match onboard(&store, accounts).await? {
+                            polaris_tui::onboarding::Outcome::ApiKeySaved => {
+                                provider_name = "openai".into();
+                            }
+                            polaris_tui::onboarding::Outcome::CodexLoggedIn => {}
+                        }
+                        continue;
+                    }
+                }
                 model_name = model.clone();
                 if let Err(message) = account::bind(&model, args.account.as_deref()) {
                     eprintln!("{message}");

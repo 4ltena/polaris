@@ -229,7 +229,10 @@ where
     })])
 }
 
-async fn browser_callback(url: String, state: String) -> Result<String, polaris_auth::AuthError> {
+pub(crate) async fn browser_callback(
+    url: String,
+    state: String,
+) -> Result<String, polaris_auth::AuthError> {
     let listener = polaris_auth::login::bind_callback().await?;
     let command = if cfg!(target_os = "macos") {
         "/usr/bin/open"
@@ -255,25 +258,43 @@ async fn browser_callback(url: String, state: String) -> Result<String, polaris_
     polaris_auth::login::wait_for_callback(listener, &state, Duration::from_secs(300)).await
 }
 
-async fn browser_cancel() {
-    use ratatui::crossterm::event::{self, Event, KeyCode};
+fn cancel_key(key: ratatui::crossterm::event::KeyEvent) -> bool {
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    key.kind != KeyEventKind::Release
+        && (key.code == KeyCode::Esc
+            || (matches!(key.code, KeyCode::Char('c' | 'C'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)))
+}
+
+async fn browser_cancel_with(
+    mut read: impl FnMut() -> std::io::Result<Option<ratatui::crossterm::event::KeyEvent>>,
+) {
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         #[cfg(target_os = "linux")]
         if crate::signal::pending_linux_process_shutdown().is_some() {
             return;
         }
-        if match event::poll(Duration::ZERO) {
-            Ok(ready) => ready,
+        match read() {
+            Ok(Some(key)) if cancel_key(key) => return,
             Err(_) => return,
-        } {
-            match event::read() {
-                Ok(Event::Key(key)) if key.code == KeyCode::Esc => return,
-                Err(_) => return,
-                _ => {}
-            }
+            _ => {}
         }
     }
+}
+
+pub(crate) async fn browser_cancel() {
+    use ratatui::crossterm::event::{self, Event};
+    browser_cancel_with(|| {
+        if !event::poll(Duration::ZERO)? {
+            return Ok(None);
+        }
+        Ok(match event::read()? {
+            Event::Key(key) => Some(key),
+            _ => None,
+        })
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -281,6 +302,139 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, crossterm::event::KeyCode};
     use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn browser_wait_cancels_on_escape_and_control_c_key_events() {
+        use ratatui::crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers};
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut keys = VecDeque::from([
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release),
+                key,
+            ]);
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                browser_cancel_with(|| Ok(keys.pop_front())),
+            )
+            .await
+            .expect("the real cancellation future must observe the cancel key");
+            assert!(keys.is_empty(), "ordinary and release keys must not cancel");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_cancel_keys_release_registration_during_wait_and_exchange() {
+        const CHILD: &str = "POLARIS_CANCEL_KEYS_CHILD";
+        const TEST: &str =
+            "account::tests::browser_cancel_keys_release_registration_during_wait_and_exchange";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HOME", home.path().canonicalize().unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use base64::Engine;
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        polaris_auth::protection::use_trusted_home(&home).unwrap();
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let owner =
+                polaris_auth::accounts::owner::AccountOwner::open("http://127.0.0.1:1").unwrap();
+            let result = owner
+                .register(
+                    None,
+                    |_, _| std::future::pending::<Result<String, polaris_auth::AuthError>>(),
+                    browser_cancel_with(|| Ok(Some(key))),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(polaris_auth::AuthError::Denied(reason)) if reason == "cancelled")
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = polaris_auth::accounts::owner::AccountOwner::open(&format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let posted = Arc::new(AtomicBool::new(false));
+            let observed = posted.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut input = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    input.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = input.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&input[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if input.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                observed.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic"}})).unwrap());
+                let body = serde_json::json!({"access_token":"synthetic", "refresh_token":"synthetic", "expires_in":3600,
+                    "id_token":format!("header.{payload}.signature")}).to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            });
+            let result = owner
+                .register(
+                    None,
+                    |_, _| async { Ok("synthetic-code".into()) },
+                    browser_cancel_with(|| Ok(posted.load(Ordering::SeqCst).then_some(key))),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(polaris_auth::AuthError::Denied(reason)) if reason == "cancelled")
+            );
+            server.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                owner
+                    .snapshot()
+                    .unwrap()
+                    .accounts
+                    .iter()
+                    .all(|a| a.state == polaris_auth::accounts::store::AccountState::Disconnected)
+            );
+        }
+    }
 
     #[tokio::test]
     async fn m3b_tui_binding_confirmation_keeps_the_current_account_on_denial() {

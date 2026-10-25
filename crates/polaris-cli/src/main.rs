@@ -2730,18 +2730,29 @@ async fn run_native_turn(args: Args, tool_memory_embedding: Option<(String, Stri
             kind: polaris_provider::attempts::AttemptKind::Completion,
         },
     );
-    let provider_name = std::env::var("POLARIS_PROVIDER").unwrap_or_else(|_| {
-        let has_openai_key = std::env::var("POLARIS_API_KEY").is_ok()
-            || polaris_auth::api_key::default_path()
+    let provider_name = match std::env::var("POLARIS_PROVIDER") {
+        Ok(name) => name,
+        Err(_) => {
+            let has_openai_key = std::env::var("POLARIS_API_KEY").is_ok()
+                || polaris_auth::api_key::default_path()
+                    .ok()
+                    .and_then(|p| polaris_auth::api_key::load_from(&p).ok().flatten())
+                    .is_some();
+            let has_saved_codex_credentials = polaris_auth::store::default_path()
                 .ok()
-                .and_then(|p| polaris_auth::api_key::load_from(&p).ok().flatten())
-                .is_some();
-        let has_saved_codex_credentials = polaris_auth::store::default_path()
-            .ok()
-            .map(|p| p.exists())
-            .unwrap_or(false);
-        default_provider_name(has_openai_key, has_saved_codex_credentials).to_string()
-    });
+                .map(|p| p.exists())
+                .unwrap_or(false)
+                || (!has_openai_key
+                    && match account::has_registrations() {
+                        Ok(registered) => registered,
+                        Err(error) => {
+                            eprintln!("{error}");
+                            return ExitCode::FAILURE;
+                        }
+                    });
+            default_provider_name(has_openai_key, has_saved_codex_credentials).to_string()
+        }
+    };
     // Provider setup happens only after continuation preflight. The returned
     // holder remains in scope for the whole turn so a local llama server stays alive.
     let prepared_providers = match provider_startup::prepare(
@@ -4554,7 +4565,8 @@ mod doctor_rewind_candidate_tests {
 /// first. Prefers `openai` if a key is available (env var or the saved
 /// `api_key.json`), since that's the arm onboarding itself lives on. If no
 /// openai key exists but the user already signed in with ChatGPT (saved
-/// `~/.polaris/auth.json`, from `polaris login` or onboarding), prefer
+/// `~/.polaris/auth.json`, from `polaris login` or onboarding, or a registered
+/// account), prefer
 /// `codex` instead of re-triggering onboarding from scratch. With neither
 /// credential present, default to `openai` so onboarding fires.
 fn default_provider_name(has_openai_key: bool, has_saved_codex_credentials: bool) -> &'static str {

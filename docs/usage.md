@@ -17,17 +17,37 @@ cargo build --release
 | `POLARIS_PROVIDER` | 自動選択 | API keyがあれば`openai`、なければ保存済みChatGPT認証・登録があるとき`codex`、いずれも無ければログイン画面へ進む。明示指定は`openai`・`codex`・`llamacpp`。 |
 | `POLARIS_API_KEY` | なし | `POLARIS_PROVIDER=openai`で必要なOpenAI互換エンドポイントのAPIキー。 |
 | `POLARIS_BASE_URL` | `https://api.openai.com/v1` | `openai`プロバイダのベースURL。 |
-| `POLARIS_MODEL` | `gpt-6-astra` | 両プロバイダ共通の既定モデル。明示した`--model`が優先する。 |
+| `POLARIS_MODEL` | TUI: `gpt-6.1-sol` / 単発: `gpt-6-astra` | 対話画面の推奨はSol。明示した`--model`が優先し、次にこの環境変数を使う。 |
 
 `POLARIS_CACHE_PACING`の既定は`off`。`on`は同じCodex providerのモデル要求開始を最低5秒間隔にする実験設定で、完了までの時間が伸びる場合がある。[比較条件と結果](gpt6-cache-pacing-results.md)を参照。
 
 `--web-search`は`disabled`、`cached`、`live`を受け付けるが、現在のChatGPT認証先はResponses形式の上限契約を確認していない。既定の`disabled`だけが利用でき、`cached`と`live`は明示しても開始前に拒否される。`cached`もローカルのオフライン検索を意味しない。動作するlive用コマンドはまだ案内しない。
+
+TUIの`/web-search`・`/models`・`/browse`・`/attachment`・`/recipe`・`/handoff`・`/remember`・`/account`は提供しない。モデル選択は`/model`、履歴の記憶設定は`/memory configure on/off`を使う。認証は`/login`・`/logout`、保存されたログイン状態・対話ID・使用トークンの確認は`/status`へ集約している。CLIの`polaris account`は保持している。
+
+macOSでは会話に表示された実在ファイル名をクリックすると、Finderで所在を表示する。会話のドラッグは範囲選択になる。ファイルを端末へD&Dすると、入力欄にファイル名のリンクブロックを挿入し、直後のBackspaceで一括削除できる。ファイル本文は自動で読み込まない。内部のWeb検索経路と上記の提供条件は維持している。
 
 one-shot実行の推論強度は、省略時に`xhigh`を使う。対話TUIでは省略時に自動判定し、`--effort`で明示した値が優先される。APIにはモデル名と推論強度を別々に渡す。CLIが受け付ける値は`low`・`medium`・`high`・`xhigh`・`max`の5つである。`max`はResponses API限定だが、主経路が`/responses`なので使える。この設定はroot実行自身の強度であり、委譲先の強度は`[tier.*]`が決める。
 
 現行の`openai`プロバイダは`/chat/completions`を使う。公式仕様ではAstraのtool callingにResponses APIが必要なため、この経路でのAstraのツール実行は非対応である。`codex`プロバイダは別のResponses形式の実装であり、APIキー用のResponses対応とは区別する。[Astra移行ガイド](https://developers.openai.com/api/docs/guides/latest-model)
 
 `polaris sandbox -- <コマンド...>`はエージェントループを介さず、選択中のサンドボックスポリシーでコマンドを実行し、終了コードと標準出力・標準エラーを返す。`polaris doctor`は保存済み資格情報、既定プロバイダ、サンドボックスの可否を読み取り専用で診断し、鍵の中身は表示しない。`polaris completion <bash|zsh|fish|elvish|powershell>`は補完スクリプトを標準出力へ生成する。
+
+## 固定profileによる環境構築
+
+macOS arm64では、例えば空の対象directoryで次を実行する。
+
+```sh
+polaris env set nextjs --path /absolute/path/to/project
+```
+
+対象・対応版・固定資源・作成先を1回確認し、専用runtimeとcacheを使ってoffline導入・build/smoke・記録まで進む。対応profileは`polaris env status`で確認する。モデルへの問い合わせは行わず、認証がない状態でもCLIから使える。TUIでは`/env set nextjs`または完全一致の`env set nextjs`を使う。
+
+既存manifest/lock/sourceと既存の導入先は保持する。安全に対応できない依存や版は理由を表示して停止し、online modeや別package managerへ暗黙に切り替えない。globalなNode/Python/Rust/Goやshell設定は変更しない。版やruntimeの参照先は完了時のreceiptを参照する。
+
+`polaris env plan`は取得前の計画を保存する。停止時は表示されたretained rootを保持し、`polaris env status --operation <retained-root>`で確認する。復旧は保存物の照合を行い、通信・script・publishを繰り返さない。[全構文と提供範囲](command-reference.md#環境構築)を参照。
+
+自然文の環境構築には任意の`builtin:envkit` skillとroot専用のtyped `environment` toolを用意している。skillを読むこと自体は実行権限を与えず、hostによる計画承認が必要である。旧`polaris setting nextjs`は提供しない。`setting git`はGit補助として保持する。
 
 ## workflowと厳密履歴
 

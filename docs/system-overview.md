@@ -14,6 +14,15 @@ flowchart TB
   provider --> cloud[Codex / OpenAI互換 endpoint]
   provider --> local[Ollama / LM Studio / llama.cpp]
   provider --> http[polaris-http：HTTP境界]
+  cli --> envowner[core environment owner：C43・project lease・計画承認]
+  tui --> envowner
+  core --> envowner
+  envowner --> envkit[polaris-envkit：固定profile・互換候補・private runtime]
+  envkit --> artifacts[credential-free HTTPS：固定size/hash・verified-chain鍵拒否]
+  envkit --> offline[offline process：有限時間・出力・disk上限]
+  offline --> inventory[postimage inventory・create-only CAS・path receipt]
+  inventory --> workspace
+  envowner --> store
   cli --> auth[polaris-auth：アカウント・認証保存]
   provider --> auth
   core --> tools[polaris-tools：read / write / edit / bash / skill / spawn]
@@ -75,6 +84,7 @@ sequenceDiagram
 | 起動とprovider準備 | `crates/polaris-cli/src/main.rs`、`provider_startup.rs` | 引数・環境設定、認証選択、local serverの寿命、TUI起動 |
 | TUI | `crates/polaris-tui/src/lib.rs`、`slash.rs` | 入力編集・補完、working表示、管理コマンド、確認画面 |
 | agentと文脈 | `crates/polaris-core/src/agent.rs`、`prompt.rs`、`workflow.rs` | モデルとtoolの往復、段階・skill・履歴の組立 |
+| 環境構築 | `crates/polaris-core/src/environment/`、`crates/polaris-envkit/` | CLI/TUI/tool共通の計画・固定取得・offline実行・非上書きpublish・照合復旧 |
 | モデル接続 | `crates/polaris-provider/src/`、`crates/polaris-http/src/` | Codex・OpenAI互換・ローカル推論、通信とusage |
 | 認証と保存 | `crates/polaris-auth/src/`、coreの`session*`・`desktop_store/` | アカウント、会話・世代・保存結果の照合 |
 | toolと隔離 | `crates/polaris-tools/src/`、`crates/polaris-sandbox/src/` | ファイル・shell操作、実行helper、承認境界 |

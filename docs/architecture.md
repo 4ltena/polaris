@@ -16,6 +16,7 @@ graph TD
   cli --> memory
   cli --> auth
   cli --> core
+  cli --> envkit
   cli --> mcp
   cli --> provider
   cli --> sandbox
@@ -24,6 +25,7 @@ graph TD
   cli --> tui
   core --> auth
   core --> http
+  core --> envkit
   core --> desktop-protocol
   core --> provider
   core --> memory
@@ -39,6 +41,8 @@ graph TD
   desktop-service --> core
   desktop-service --> provider
   desktop-service --> desktop-protocol
+  envkit --> http
+  envkit --> sandbox
   mcp --> tools
   mcp --> auth
   mcp --> sandbox
@@ -50,13 +54,14 @@ graph TD
   tui --> memory
   tui --> auth
   tui --> core
+  tui --> envkit
   tui --> mcp
   tui --> provider
   tui --> sandbox
   tui --> skills
 ```
 
-crate 13件、依存 42件。名前の`polaris-`は省いた。開発用の依存は、製品の組み立てを表さないため含めない。
+crate 14件、依存 47件。名前の`polaris-`は省いた。開発用の依存は、製品の組み立てを表さないため含めない。
 
 ## 外部との接続点
 
@@ -70,9 +75,9 @@ crate 13件、依存 42件。名前の`polaris-`は省いた。開発用の依�
 
 呼び出し側 29件。
 
-- `crates/polaris-core/src/agent.rs:1705`
-- `crates/polaris-core/src/agent.rs:1739`
-- `crates/polaris-core/src/agent.rs:1742`
+- `crates/polaris-core/src/agent.rs:1713`
+- `crates/polaris-core/src/agent.rs:1747`
+- `crates/polaris-core/src/agent.rs:1750`
 - `crates/polaris-core/src/agent/skill_catalog.rs:45`
 - `crates/polaris-core/src/audit/arbitration.rs:76`
 - `crates/polaris-core/src/audit/arbitration.rs:77`
@@ -83,22 +88,22 @@ crate 13件、依存 42件。名前の`polaris-`は省いた。開発用の依�
 - `crates/polaris-core/src/decision_policy.rs:60`
 - `crates/polaris-core/src/local_execution.rs:162`
 - `crates/polaris-core/src/mcp/preselection.rs:346`
-- `crates/polaris-core/src/session_switch.rs:274`
-- `crates/polaris-core/src/session_switch.rs:378`
-- `crates/polaris-core/src/strict_provider.rs:76`
+- `crates/polaris-core/src/session_switch.rs:281`
+- `crates/polaris-core/src/session_switch.rs:387`
+- `crates/polaris-core/src/strict_provider.rs:78`
 - `crates/polaris-core/src/tier.rs:122`
 - `crates/polaris-core/src/tier.rs:125`
 - `crates/polaris-core/src/tier.rs:130`
 - `crates/polaris-core/src/tier.rs:133`
 - `crates/polaris-core/src/tier.rs:140`
-- `crates/polaris-core/src/tier/chat.rs:62`
+- `crates/polaris-core/src/tier/chat.rs:59`
 - `crates/polaris-tui/src/mcp_commands/operations.rs:205`
 - `crates/polaris-tui/src/mcp_commands/operations.rs:212`
-- `crates/polaris-tui/src/mcp_commands/operations.rs:416`
-- `crates/polaris-tui/src/mcp_commands/operations.rs:511`
-- `crates/polaris-tui/src/mcp_commands/secret.rs:161`
-- `crates/polaris-tui/src/mcp_commands/secret.rs:217`
-- `crates/polaris-tui/src/mcp_commands/secret.rs:239`
+- `crates/polaris-tui/src/mcp_commands/operations.rs:419`
+- `crates/polaris-tui/src/mcp_commands/operations.rs:515`
+- `crates/polaris-tui/src/mcp_commands/secret.rs:169`
+- `crates/polaris-tui/src/mcp_commands/secret.rs:227`
+- `crates/polaris-tui/src/mcp_commands/secret.rs:249`
 
 ### HTTP
 
@@ -106,16 +111,18 @@ crate 13件、依存 42件。名前の`polaris-`は省いた。開発用の依�
 
 実装: `crates/polaris-http/src/lib.rs`、`crates/polaris-http/src/artifact.rs`
 
-呼び出し側 34件。
+呼び出し側 36件。
 
 - `crates/polaris-auth/src/quota/usage.rs:172`
 - `crates/polaris-auth/src/quota/usage.rs:176`
 - `crates/polaris-auth/src/token.rs:216`
 - `crates/polaris-core/src/managed_decision/native/download.rs:101`
+- `crates/polaris-http/src/distrust.rs:174`
+- `crates/polaris-http/src/distrust.rs:178`
 - `crates/polaris-provider/src/codex.rs:283`
 - `crates/polaris-provider/src/codex.rs:681`
 - `crates/polaris-provider/src/codex.rs:685`
-- `crates/polaris-provider/src/codex_metrics.rs:139`
+- `crates/polaris-provider/src/codex_metrics.rs:137`
 - `crates/polaris-provider/src/decision/jev.rs:33`
 - `crates/polaris-provider/src/decision/jev.rs:71`
 - `crates/polaris-provider/src/decision/jev.rs:239`
@@ -149,17 +156,19 @@ processが動く。
 
 実装: `crates/polaris-sandbox/src/lib.rs`、`crates/polaris-sandbox/src/controlled.rs`
 
-呼び出し側 42件。
+呼び出し側 44件。
 
-- `crates/polaris-cli/src/main.rs:2558`
-- `crates/polaris-cli/src/main.rs:2609`
-- `crates/polaris-cli/src/main.rs:2612`
-- `crates/polaris-cli/src/main.rs:3997`
-- `crates/polaris-cli/src/main.rs:4007`
+- `crates/polaris-cli/src/main.rs:2580`
+- `crates/polaris-cli/src/main.rs:2633`
+- `crates/polaris-cli/src/main.rs:2636`
+- `crates/polaris-cli/src/main.rs:4045`
+- `crates/polaris-cli/src/main.rs:4055`
 - `crates/polaris-core/src/desktop_execution.rs:5`
+- `crates/polaris-core/src/environment/native.rs:249`
 - `crates/polaris-core/src/execution_owner.rs:442`
-- `crates/polaris-core/src/sandbox_command.rs:319`
+- `crates/polaris-core/src/sandbox_command.rs:322`
 - `crates/polaris-core/src/verification/checkpoint.rs:786`
+- `crates/polaris-envkit/src/process.rs:241`
 - `crates/polaris-sandbox/src/broker.rs:480`
 - `crates/polaris-sandbox/src/child_fds.rs:241`
 - `crates/polaris-sandbox/src/child_fds.rs:253`
@@ -198,24 +207,24 @@ processが動く。
 
 残留・port占有・回収漏れ。
 
-呼び出し側 37件。
+呼び出し側 38件。
 
 - `crates/polaris-auth/src/accounts/directory.rs:1352`
 - `crates/polaris-auth/src/accounts/directory.rs:1405`
 - `crates/polaris-auth/src/accounts/directory.rs:1416`
 - `crates/polaris-auth/src/git_credentials.rs:857`
 - `crates/polaris-auth/src/login.rs:207`
-- `crates/polaris-cli/src/account.rs:250`
-- `crates/polaris-cli/src/account.rs:477`
-- `crates/polaris-cli/src/decided.rs:111`
-- `crates/polaris-cli/src/main.rs:916`
+- `crates/polaris-cli/src/account.rs:255`
+- `crates/polaris-cli/src/account.rs:479`
+- `crates/polaris-cli/src/decided.rs:112`
+- `crates/polaris-cli/src/main.rs:918`
 - `crates/polaris-core/src/computer/macos.rs:45`
-- `crates/polaris-core/src/conversation_memory/strict_history.rs:1116`
-- `crates/polaris-core/src/llama_server.rs:112`
+- `crates/polaris-core/src/conversation_memory/strict_history.rs:1124`
+- `crates/polaris-core/src/llama_server.rs:114`
 - `crates/polaris-core/src/managed_runtime.rs:180`
 - `crates/polaris-core/src/managed_runtime.rs:222`
 - `crates/polaris-core/src/mcp/setup/launcher.rs:386`
-- `crates/polaris-core/src/mcp/setup/launcher.rs:514`
+- `crates/polaris-core/src/mcp/setup/launcher.rs:509`
 - `crates/polaris-core/src/project_git.rs:52`
 - `crates/polaris-core/src/sync/repository.rs:50`
 - `crates/polaris-core/src/translation.rs:772`
@@ -235,8 +244,9 @@ processが動く。
 - `crates/polaris-sandbox/src/confine.rs:953`
 - `crates/polaris-sandbox/src/confine.rs:991`
 - `crates/polaris-sandbox/src/confine.rs:1027`
-- `crates/polaris-tui/src/account.rs:242`
+- `crates/polaris-tui/src/account.rs:245`
 - `crates/polaris-tui/src/clipboard.rs:67`
+- `crates/polaris-tui/src/file_reveal.rs:226`
 
 ### gitの呼出し
 
@@ -247,7 +257,7 @@ processが動く。
 - `crates/polaris-cli/src/handoff.rs:10`
 - `crates/polaris-cli/src/handoff.rs:51`
 - `crates/polaris-cli/src/handoff.rs:78`
-- `crates/polaris-cli/src/setting.rs:205`
+- `crates/polaris-cli/src/setting.rs:97`
 - `crates/polaris-core/src/management_effect/workspace_change.rs:57`
 - `crates/polaris-core/src/project_git.rs:42`
 - `crates/polaris-core/src/recipe/git.rs:9`
@@ -255,5 +265,5 @@ processが動く。
 - `crates/polaris-core/src/sync/repository.rs:49`
 - `crates/polaris-core/src/sync/repository.rs:50`
 - `crates/polaris-core/src/sync/repository/c10.rs:1551`
-- `crates/polaris-desktop-service/src/workspace_view.rs:467`
-- `crates/polaris-tui/src/lib.rs:12355`
+- `crates/polaris-desktop-service/src/workspace_view.rs:470`
+- `crates/polaris-tui/src/lib.rs:12662`

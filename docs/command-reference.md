@@ -1,6 +1,6 @@
 # コマンドの役割と出力
 
-2026-10-20時点の実装（`8451f2a`）を基にした一覧。主な対象はmacOSの対話TUIとCLIである。出力例の`<ID>`・`<path>`・数値は説明用で、実際の実行結果ではない。設定や保存状態によって、確認画面やエラーが先に出る場合がある。
+2026-10-26時点のソースを基にした一覧。生成するhelp・ログ・エラーは英語で表示する。主な対象はmacOSの対話TUIとCLIである。出力例の`<ID>`・`<path>`・数値は説明用で、実際の実行結果ではない。表中の日本語は表示内容の説明であり、生成する実際の文言は英語である。設定や保存状態によって、確認画面やエラーが先に出る場合がある。
 
 - [TUIコマンド一覧](#tuiコマンド一覧)
 - [シェルで使うCLI](#シェルで使うcli)
@@ -22,17 +22,31 @@ TUIでは`/`で候補を出し、入力で絞り込み、↑↓とEnterで選ぶ
 
 ## TUIコマンド一覧
 
+### 環境構築（macOS arm64）
+
+| コマンド | 役割 | 主な出力 |
+| --- | --- | --- |
+| `/env set <profile> [--version <constraint>] [--path <directory>]` | 1回の計画承認から固定資源の取得、private runtime、offline導入、検証まで進める。モデル呼出なし。 | 対象・版・資源数/bytes・SHA-256・作成先・保存先の確認。完了時に`Environment verified`とreceipt。 |
+| `env set <profile> ...` | 入力全文が同じ構文に一致する場合だけ、上記の直接操作として扱う。 | 上と同じ。自然文や引用中の部分一致は実行しない。 |
+| `/env plan <profile> ...` | 対象を読み取り、固定計画をprivate領域へ保存する。取得・導入はしない。 | 計画の概要、SHA-256、plan/definitionの保存先。 |
+| `/env status` | 固定profileと対応版を列挙する。 | `available`と、実行ごとのreceiptで検証を区別する案内。 |
+| `/env status --operation <retained-root>` | 保存済み操作を読み取り照合する。 | stage・outcome・一致/競合・未完了のJSON。 |
+| `/env recover --operation <retained-root>` | 検証済みreceiptに基づき、欠けた最終管理記録だけを補う。 | 照合結果。通信・process・publishは繰り返さない。 |
+
+profileは`node`・`nextjs`・`react`・`vue`・`svelte`・`astro`・`nuxt`・`angular`・`python`・`rust`・`go`。対応外の版・OS・CPUは拒否する。相対pathと省略時の対象は起動時cwdを基準にする。既存manifest/lock/sourceは保持し、既存の依存treeを削除・上書きしない。安全に対応できる固定依存に限定し、更新や再生成が必要なら停止する。
+
+実行中はEscまたはCtrl-Cで停止を要求できる。停止・失敗時のprivate資源と部分反映は保持し、未検証を成功と表示しない。常駐dev serverやglobal設定の変更は行わない。
+
 ### 状態・ヘルプ・表示
 
 | コマンド | 役割 | 主な出力 |
 | --- | --- | --- |
 | `/help`、`/` | 利用できるコマンドを調べる。 | `commands:`に続くコマンド名と説明の一覧。 |
-| `/status` | 現在の設定、利用条件、使用量、workflow、管理状態を確認する。モデルへの送信や接続確認は行わない。 | 「Polaris 状態」「利用条件」「観測・workflow」「可用性」「管理・診断」の5区分。provider/model/effort、承認・sandbox、tokens、phase/skills、未確認事項、audit、CAT等。 |
+| `/status` | 現在の設定、利用条件、使用量、workflow、管理状態を確認する。モデルへの送信や接続確認は行わない。 | アカウント・利用条件・usage/workflow・可用性・管理診断を項目ごとに表示。対話ID、保存済みログイン状態・使用登録、provider/model/effort、承認・sandbox、tokens、phase/skills、未確認事項、audit、CAT等。 |
 | `/doctor` | ローカルの認証設定の有無、保存先、sandbox、指示ファイル、復旧状態を診断する。 | 認証ファイル・環境キーの存在、provider/model、状態保存先、AGENTS到達量、MCP・CAT・巻き戻し・管理診断。認証値は表示しない。 |
 | `/pwd` | 現在のproject rootを確認する。 | 作業ディレクトリの絶対パス。 |
 | `/diff` | 未コミットの変更を見る。 | `diff:`に続く未stage・stage済みの差分。未追跡ファイルは`?? <path>`で名前だけを表示。最大200行、変更なしなら`(no changes)`。 |
 | `/skills` | 検出されたskillを閲覧する。 | 名前・説明・探索元を一覧表示。↑↓で選び、Enter/Escで閉じる。選択による有効化は行わない。 |
-| `/web-search [status\|disabled]` | Web検索の提供状況を見る。 | `Web検索: disabled。cached/liveは接続先の上限契約が未確認のため利用できません。送信は行っていません。`。現状、ほかのmodeは拒否する。 |
 
 `/status`のtokensは観測済みの使用量であり、アカウントの残り利用枠ではない。認証・モデル・MCPの接続や、capacityの空きを確認済みという意味でもない。
 
@@ -41,7 +55,6 @@ TUIでは`/`で候補を出し、入力で絞り込み、↑↓とEnterで選ぶ
 | コマンド | 役割 | 主な出力・反映時期 |
 | --- | --- | --- |
 | `/model` | 次のターンで使うモデルを選ぶ。 | `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6-luna`、`Local model`の選択画面。成功時`model set to <model>`。 |
-| `/models [list]` | macOSでは`/model`と同じ選択画面を開く。 | 上と同じ。Linuxではモデル在庫の照会を行う別経路。 |
 | `/permissions` | 起動時に許された範囲で承認方針を選ぶ。 | Never / OnRequest / Alwaysの選択画面と`permissions set to <policy>`。起動時の境界を超える選択は拒否し、再起動用の引数を案内する。 |
 | `/sandbox [status]` | 起動時に固定されたsandboxと承認方針を確認する。 | `sandbox: ...`、`approval: OnRequest`等。sandboxの変更は新しい起動に適用する。 |
 
@@ -62,7 +75,7 @@ TUIでは`/`で候補を出し、入力で絞り込み、↑↓とEnterで選ぶ
 | `/fork` | 現在の履歴を別の会話IDへ複製する。 | `v2セッションへ分岐しました: <ID>`。 |
 | `/session`、`/session current` | 会話IDと現在・保存済みの設定を確認する。 | `会話: <ID> / 世代 <n>`、`現在provider: ... / model: ...`、保存provider/model/effort、履歴・remember・tool-memory・compact等。 |
 | `/history [offset]` | 保存した原文履歴を読む。offsetはmessage単位の整数。 | `原文履歴 <開始>..<終了> / <総数> messages`とrole/turn/本文。1回最大20messages・64KiB。 |
-| `/clear` | 確認後、会話の現在の区間（epoch）を消去する。 | `T08 完了`。過去の証拠は保持されるため、全履歴ファイルの削除とは異なる。 |
+| `/clear` | 確認後、会話の現在の区間（epoch）を消去する。 | `T08 complete`。過去の証拠は保持されるため、全履歴ファイルの削除とは異なる。 |
 | `/compact` | 確認後、モデルに古い会話を要約させる。原文は保持する。 | `compacting...`→`compacted <前> messages → <後> (<前tok> tok → <後tok> tok)`。短い会話なら`nothing old enough to compact yet`。 |
 | `/review [追加指示]` | 現在の未コミット変更のレビューをモデルへ依頼する。 | 通常のモデル応答とツールの実行状況。追加指示をレビューpromptに含める。 |
 | `/export [path]` | 確認後、会話原文のeventをMarkdownへ新規保存する。 | `T17 完了: <path>`。省略時は`polaris-export-<時刻>.md`。既存ファイルは上書きせず、上限16MiB。 |
@@ -72,22 +85,34 @@ TUIでは`/`で候補を出し、入力で絞り込み、↑↓とEnterで選ぶ
 
 `/resume`で会話を開いても、現在の作業ファイルと保存状態が一致しない場合は閲覧のみになる。`/new`・`/fork`・`/resume`は別の操作であり、IDは`/session current`で確認できる。
 
+会話の範囲選択は、実行が終わった状態でドラッグを離すと選択した本文だけを直接clipboardへコピーする。追加の確認画面は表示しない。
+
+macOSでは、会話に表示された実在するファイル名やローカルパスを宛先とするMarkdownリンクをクリックすると、Finderでそのファイルの所在を表示する。ファイル自体は開かない。相対パスはproject rootから解決し、`src/main.rs:12:3`のような行・列指定にも対応する。日本語・折り返されたパス、インラインコードで示された空白入りのファイル名も対象になる。ドラッグ操作は範囲選択として扱う。Webリンクや存在しないファイルはFinderで開かない。
+
+### ファイルのD&Dと入力リンク
+
+macOSの端末へファイルをD&Dすると、入力欄に`[ファイル名]`のリンクブロックを挿入する。複数ファイルはそれぞれ別のブロックになる。ファイル本文は自動では読み込まず、Enterまでモデルへ送信しない。
+
+左右キーはブロックをまたいで移動し、直後でBackspaceを押すとブロック全体を削除する。下書きの復元や入力履歴の呼び出し後も同じように編集できる。通常の文章は文字単位で編集する。
+
+端末がD&Dをパス文字列として渡す場合は、入力が途切れた後に実在する絶対パスをリンク化する。同じ形で手動入力したパスも対象になる。存在しないファイルやフォルダ、Web URLはファイルブロックへ変換しない。入力・下書きの既存上限を超える貼り付けは、途中まで挿入せず拒否する。
+
 ### 会話設定・goal
 
-設定の変更は確認後に保存される。成功表示は`F06 を保存しました（会話世代 <n>）。`のような操作種別と世代で、取消時は`セッション設定の変更を取り消しました`。
+設定の変更は確認後に保存される。成功表示は`F06 を保存しました（会話世代 <n>）。`のような操作種別と世代で、取消時は`Session settings change cancelled`。
 
 | コマンド | 役割 | 主な出力・条件 |
 | --- | --- | --- |
 | `/session configure <provider> <model> [effort]` | 現在と同じproviderで、保存会話のモデル設定を変更する。 | 設定の確認とD18の保存結果。異なるproviderの指定は拒否し、再起動を案内する。新しい固定effortへの変更も拒否する。modelは確認済みのものに限る。 |
 | `/session history` | 履歴方式を見る。 | 現在のlegacy/strict10/structured10。 |
 | `/session history legacy\|strict10\|structured10` | 空会話の履歴方式を変更する。 | F16の保存結果。既存履歴のある会話は変更不可。 |
-| `/remember on\|off`、`/memory configure on\|off` | 圧縮前履歴の記憶設定を変更する。 | F06の保存結果。 |
+| `/memory configure on\|off` | 圧縮前履歴の記憶設定を変更する。 | F06の保存結果。 |
 | `/memory configure legacy\|strict10\|structured10` | 履歴方式の変更別名。 | `/session history <方式>`と同じ。 |
 | `/tool-memory off\|history\|retrieval` | ツール結果の保存・参照方式を変更する。 | F07の保存結果。 |
 | `/tool-memory endpoint off`、`/tool-memory endpoint <URL> <MODEL>` | ツール記憶の埋め込み接続を無効化、または接続先とモデルを保存する。 | F08の保存結果。 |
 | `/tool-memory model <MODEL>` | 設定済みの埋め込みモデルを変更する。 | F09の保存結果。先にendpoint設定が必要。 |
 | `/compact threshold off\|<整数>` | 自動圧縮の閾値を変更する。 | F10の保存結果。整数は1000以上。 |
-| `/goal`、`/goal current` | 保存したgoalを見る。 | `goal revision <n> / 有効 on / 停止 off`と本文。未設定なら`保存されたgoalはありません`。 |
+| `/goal`、`/goal current` | 保存したgoalを見る。 | `goal revision <n> / 有効 on / 停止 off`と本文。未設定なら`No saved goal`。 |
 | `/goal set <文章>`、`/goal clear` | goalを設定、または消去する。 | 確認後、D20の保存結果とgoal表示。 |
 | `/goal stop`、`/goal resume` | 保存goalを停止、または再開する。 | 確認後、D20の保存結果と停止状態。 |
 
@@ -102,7 +127,7 @@ goalの保存本文や過去の記録は、それ自体では実行権限や承�
 | `/instruction send <文章>` | 次のrunへ適用する指示を保存する。実行中にも受け付ける。 | `指示受理ID: <ID>。次のrun境界で適用します`。 |
 | `/subagents`、`/subagents list` | 現在runの子を一覧表示する。 | `run=<ID> attempt=<ID> revision=<n>`、続いて`<child-ID> / <attempt-ID>: running role=... tier=... model=... effort=...`。 |
 | `/subagents wait <child-ID> <attempt-ID>` | 指定attemptの状態を最大2秒の範囲で取得する。完了まで待ち続ける操作ではない。 | `revision=<n> cursor=<n>`と対象の状態行。停止後などは`outcome_unknown`の場合がある。 |
-| `/subagents cancel <child-ID> <attempt-ID>` | 対象を確認後、そのattemptへ停止要求を出す。 | `停止要求 revision=<n>`、`このattemptへ停止要求を届けました。終了状態は /subagents wait で確認してください`。 |
+| `/subagents cancel <child-ID> <attempt-ID>` | 対象を確認後、そのattemptへ停止要求を出す。 | `停止要求 revision=<n>`、`Stop request delivered to this attempt. Check its terminal state with /subagents wait`。 |
 | `/roles [list]` | 現在のrole定義を表示する。 | `<名前>: tier=<最小>..<最大> access=... turns=<n> wall=<n>s`等。bindingは変更しない。 |
 | `/run`、`/run settings` | 次のrunのturn上限を見る。 | `次のrun: max-turns=<n>（起動時上限=<n>）`。 |
 | `/run settings max-turns <n>` | 次のrunの上限を変更する。 | 上と同じ。指定は1以上、起動時上限以下。 |
@@ -116,21 +141,21 @@ child.example.1 / child.example.1.attempt.1: running role=file-reader ...
 /subagents wait child.example.1 child.example.1.attempt.1
 ```
 
-親runのownerが終了した後は、そのrunのwait/cancelは使えない。ownerがなければ`現在のrunにsubagent ownerはありません`と表示する。
+親runのownerが終了した後は、そのrunのwait/cancelは使えない。ownerがなければ`The current run has no subagent owner`と表示する。
 
 ### 認証・アカウント
 
 | コマンド | 役割 | 主な出力・反映時期 |
 | --- | --- | --- |
-| `/account [list]` | 登録ID、状態、表示名、利用枠の観測、現在の使用登録を確認する。 | `登録アカウント: <n>件`、登録一覧、`使用登録: <ID>（世代 <n>）`。未登録なら単一認証の案内。 |
-| `/login [表示名]`、`/account login [表示名]` | ブラウザ認可でアカウントを登録する。 | 認可の案内と登録完了・登録ID。登録だけでは現在のbindingを変更しない。 |
-| `/account reauth <ID>` | 指定登録を再認証する。 | ブラウザ認可と再認証完了・登録ID。 |
-| `/account unlink <ID>` | 指定登録の認証を解除する。 | 対象確認と解除完了・登録ID。 |
-| `/account label <ID> <表示名>` | 登録の表示名を変更する。 | 変更完了・登録ID。 |
-| `/account bind <ID>` | 次の送信から使う登録を切り替える。 | `使用アカウントを切り替えました: <ID>`。 |
-| `/logout`、`/account logout` | 使用中の登録の認証を解除するか、旧単一認証を削除する。 | 対象確認と解除・削除の結果。 |
+| `/status` | 保存されたログイン状態、現在の使用登録、対話ID、使用トークンを確認する。 | 登録ID・表示名・状態、使用登録の世代、対話ID、入力・出力・cache・総tokens。認証更新や接続確認は行わない。 |
+| `/login`、`/login new [表示名]` | ブラウザ認可でアカウントを登録する。 | 認可の案内と登録完了・登録ID。登録だけでは現在の使用登録を変更しない。 |
+| `/login reauth <ID>` | 指定登録を再認証する。 | ブラウザ認可と再認証完了・登録ID。 |
+| `/login use <ID>` | 次の送信から使う登録を切り替える。 | `使用アカウントを切り替えました: <ID>`。 |
+| `/login label <ID> <表示名>` | 登録の表示名を変更する。 | 変更完了・登録ID。 |
+| `/logout` | 使用中の登録の認証を解除するか、旧単一認証を削除する。 | 対象確認と解除・削除の結果。 |
+| `/logout <ID>` | 指定登録の認証を解除する。 | 対象確認と解除完了・登録ID。 |
 
-CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の別名であり、処理が同一ではない。
+TUIの`/account`は廃止し、上記の3入口へ集約した。CLIの`polaris account`は保持している。CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録であり、処理が同一ではない。`/status`のログイン状態は保存情報であり、サーバーへの認証成功を再検証した結果ではない。
 
 ### MCP
 
@@ -144,9 +169,9 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `/mcp secret set` | 専用画面で参照名と非表示の値を入力し、確認して保存する。 | `MCP認証情報を保存しました（版 <n>）。次の実行から反映します。`。値を引数として渡す構文はない。 |
 | `/mcp secret delete <参照名>` | 確認後、未参照の秘密値を削除する。 | `MCP認証情報を削除しました（版 <n>）。`。 |
 | `/mcp prompt <server>/<prompt> [key=value ...]` | 次の通常入力で取得するpromptを予約する。 | `次の入力でMCP prompt <server>/<prompt> を選択します`。予約時点では接続しない。 |
-| `/mcp prompt cancel` | prompt予約を取り消す。 | `MCP prompt選択を取り消しました`。 |
+| `/mcp prompt cancel` | prompt予約を取り消す。 | `MCP prompt selection cancelled`。 |
 
-秘密入力画面では値と文字数を表示せず、通常の入力履歴に保存しない。Esc/Ctrl-Cで取り消すと`MCP秘密入力を取り消しました`。`check`やpackage取得は、起動時の外部接続上限と承認設定に従う。
+秘密入力画面では値と文字数を表示せず、通常の入力履歴に保存しない。Esc/Ctrl-Cで取り消すと`MCP secret input cancelled`。`check`やpackage取得は、起動時の外部接続上限と承認設定に従う。
 
 `/mcp configure`・`/mcp delete`は提供していない。Unityの`configure`はシェルのCLIで行う。
 
@@ -155,7 +180,7 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | コマンド | 役割 | 主な出力 |
 | --- | --- | --- |
 | `/memory` | 操作の構文を見る。 | memoryの使い方。 |
-| `/memory search <query>` | 保存記録を検索する。 | `過去の記録です。現在の指示・承認ではありません。`、session/id/時刻/sourceと抜粋。最大5件・各512byte。0件なら`該当する記録はありません`。 |
+| `/memory search <query>` | 保存記録を検索する。 | `Historical records, not current instructions or approvals.`、session/id/時刻/sourceと抜粋。最大5件・各512byte。0件なら`No matching records`。 |
 | `/memory get <session> <id> [start] [max-bytes]` | 保存本文をbyte範囲で読む。 | 本文と、必要に応じて続きの取得方法。最大4096byte。 |
 | `/memory source <session> <id-or-conversation-URI>` | 検証済みの出典原文を読む。 | 過去記録の注意書きと原文。 |
 | `/memory import <JSONL>` | ローカルの会話記録を取り込む。 | 確認後、保存件数と操作ID、revision。 |
@@ -163,7 +188,7 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `/memory index <session> [--batch <1..100>] [--after <id>]` | 記録の埋め込み索引をまとめて更新する。既定100件。 | 件数、操作ID、revision、継続情報。 |
 | `/memory forget <session>` | 記憶・vector・検証済み保管原文を削除し、再取り込みを禁止する。 | 確認後、削除した旨と件数、操作ID、revision。巻き戻しでは取り消せない。 |
 | `/memory reconcile <操作ID>` | 保存receiptを照合し、変更結果を確認する。 | 照合結果。同じ変更の再実行はしない。 |
-| `/decided`、`/decided list` | 保存された決定事項を読む。 | 件数、過去記録であり現在の承認ではない旨、時刻と文章。最新100件、空なら`記録はありません`。 |
+| `/decided`、`/decided list` | 保存された決定事項を読む。 | 件数、過去記録であり現在の承認ではない旨、時刻と文章。最新100件、空なら`No records`。 |
 | `/decided add <文章>` | 決定事項を追記する。 | **TUIはLinuxのみ対応**。確認後の保存通知。macOSでは拒否するため、必要ならCLIの`polaris decided add`を使う。 |
 
 `/memory configure ...`は会話設定の節を参照。記憶の変更では`記録の変更を保存しました。記録<n>件、v2索引削除<n>件。`等と`操作ID: <ID> / revision <前> → <後>`を表示する。埋め込み処理は設定済みloopback APIへ接続する。
@@ -176,25 +201,20 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `/sync`、`/sync status` | 共有の参加・合意・反映・衝突・復旧状態を見る。 | 参加中/未参加、revision、解消待ち、未完了操作、復旧用控え等。 |
 | `/sync join <remote> <share-ID> <invite-ID> <expires-UNIX秒> [除外名...]` | TUIから共有への参加を要求する入口。 | **現状のTUI経路は未完成で、参加を確定できない**。結果を確定できない旨と`/sync`での確認案内。CLIのC08経路とは別。 |
 | `/sync pull` | 既存の参加情報を使いremoteから受信・統合する。 | `受け取りました: <n>件、解消待ち<m>件。sourceへは未反映です。`。 |
-| `/sync leave` | この端末の参加を解除する。 | `この端末の参加を解除しました`。 |
+| `/sync leave` | この端末の参加を解除する。 | `This device left the share`。 |
 | `/sync apply` | 確認後、同期内容をsourceへ書き込む。 | `<n>件を反映しました。復旧用の控え: <path>`。 |
 | `/sync recover <64桁hex-key>` | source適用の保存証拠を照合する。 | 管理操作の照合結果。sourceの再適用はしない。 |
 | `/sync push` | 共有内容を送信する。macOS Keychainが前提。 | `C10送信完了: operation=<ID> commit=<hash>`、または共有内容が一致する旨。 |
 | `/sync recover <32桁C10-ID>` | 送信結果を照合・復旧する。remote照会を伴う場合がある。 | C10結果。結果未確定なら再送せず照合する案内。 |
-| `/sync abandon <32桁C10-ID>` | 確認後、C10操作を照合して中止する。 | 中止通知と`未送信の証明ではありません`。 |
+| `/sync abandon <32桁C10-ID>` | 確認後、C10操作を照合して中止する。 | 中止通知と`does not prove that nothing was sent`。 |
 
 ### Linux限定のTUI操作
 
-次の5項目はmacOSでも候補に出るが、実行handlerは接続されていない。macOSでは`この操作には有効な端末と保存ownerが必要です`と表示する。CLIに同名の機能がある場合も、TUI側の対応とは別である。
+`/setting`はmacOSでも候補に出るが、実行handlerは接続されていない。macOSでは`This operation requires an active terminal and storage owner`と表示する。CLIに同名の機能がある場合も、TUI側の対応とは別である。
 
 | コマンド | Linuxでの役割 | 主な出力 |
 | --- | --- | --- |
-| `/browse [list]`、`/browse read <相対path>` | フォルダ一覧やUTF-8本文をローカル閲覧する。 | 読み取り専用・モデルへ未送信の注意と一覧/本文。最大256件・本文64KiB。 |
-| `/attachment [read] <path>` | 文章ファイルを添付前に確認する。 | `添付プレビュー: <名前>（未送信・会話には保存しません）`と本文。 |
-| `/recipe [list]` | 組み込みrecipeの定義を読む。 | 定義一覧。インストール・設定・検証は行わない旨。 |
-| `/setting nextjs` | Next.jsの検出と計画を行う。 | 導入・設定・起動確認は未実装という案内と計画。 |
-| `/setting git` | `.gitignore`追加規則を確認し、保存する。 | 候補の確認と`追加済み: <規則>`。 |
-| `/handoff <概要> \| <確認項目> [\| ...]` | 実機確認の依頼文を生成する。 | 定型文。ファイル作成や人への送信は行わない。 |
+| `/setting git` | `.gitignore`追加規則を確認し、保存する。 | 候補の確認と`Already added: <rule>`。 |
 
 `/apply`はLinuxだけの候補で、macOSでは候補にも出ない。
 
@@ -206,6 +226,19 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `/apply resolve <ID> allow\|deny` | 確認後、適用への承認または拒否を返す。 | 承認応答の受付と、保存済み結果を`/apply list`で確認する案内。受付だけでは適用成功を意味しない。 |
 
 ## シェルで使うCLI
+
+### 環境構築
+
+| コマンド | 役割 | 主な出力 |
+| --- | --- | --- |
+| `polaris env set <profile> [--path <directory>] [--version <constraint>]` | TUIと同じownerで環境構築する。モデル認証は不要。 | 計画、`Execute this exact plan? [y/N]`、検証結果とreceipt/private runtimeの場所。 |
+| `polaris env plan <profile> ...` | 取得前の固定計画を確認・保存する。 | 対応版、資源、変更先、SHA-256と保存先。対象の構築はしない。 |
+| `polaris env set <profile> ... --plan-directory <retained-root> --approve-plan <SHA-256>` | まだ開始していない保存計画を、同じ対象・版・SHA-256への明示承認で実行する。 | 通常setと同じ。入力変更や開始済み計画は拒否する。 |
+| `polaris env status` | 定義と版を列挙する。 | 各profileの`available`と、組合せごとの検証状態についての案内。 |
+| `polaris env status --operation <retained-root> [--path <project>]` | 保存計画と生成物・runtimeを照合する。 | stage、一致/競合/未完了、receipt hashのJSON。通信・process・publishを繰り返さない。 |
+| `polaris env recover --operation <retained-root> [--path <project>]` | 検証済みreceiptの最終管理記録だけが欠けた場合に照合して補う。 | 照合結果。途中のpublishや内容不一致は未完了のまま保持する。 |
+
+`--path`はset/planでは導入対象、status/recoverでは操作を所有するprojectの場所。全profileはmacOS arm64向けである。`available`は固定資源が定義済みであることを示し、取得・導入・動作が今回検証済みという意味ではない。検証結果はprofile・adapter・実行binary・OS・対象・必要なnative toolchainを束縛したlocal receiptで確認する。
 
 ### 起動・診断・補完
 
@@ -227,7 +260,7 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `polaris common-tests <plan.json\|->` | JSONで指定したブラックボックス試験をsandbox内で実行する。 | JSONの`result: passed / failed / unavailable`、試験対象、各case、fallbackの要否等。指定プログラムの実行と一時領域の使用を伴う。 |
 | `polaris completion <shell>` | シェル補完scriptを生成する。 | script本文をstdoutへ出す。対応はbash/zsh/fish/elvish/powershell。導入は別操作。 |
 | `polaris --help`、`polaris help [command]` | CLIの構文を調べる。 | コマンド・引数・説明。`polaris mcp configure --help`のように絞れる。 |
-| `polaris --version`、`polaris -V` | バージョンを見る。 | `polaris 0.12.0`。TUIに`/version`はない。 |
+| `polaris --version`、`polaris -V` | バージョンを見る。 | `polaris 1.0.0`。TUIに`/version`はない。 |
 
 一般的な成功は終了コード0、操作失敗は1、構文誤りは2。`sandbox`は子の終了コードを返す。`doctor`の終了コード0は、モデル等への実接続成功を示さない。
 
@@ -299,7 +332,7 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | `polaris memory search <query> [--session <ID>] [--limit <1..20>]` | 保存した会話を検索する。埋め込み設定時はqueryをローカルserverへ送りhybrid検索。 | JSONの`kind: historical_evidence`、過去記録というnotice、`results`。hitはsession/id/role/source/excerpt/score等。 |
 | `polaris memory get <session> <id> [--start <byte>] [--max-bytes <byte>]` | 保存本文を取得する。 | JSONの`record`。範囲指定時は`range.start/end/total_bytes`。範囲取得は既定512、上限4096byte、UTF-8境界を検証する。 |
 | `polaris memory source --session <UUID> <source-ID> [--start <byte> --end <byte>]` | v2要約の出典IDを照合し、原文を取得する。 | 検証済みの原文テキスト。start/endは組で指定する。 |
-| `polaris memory embed <session> <id> --embedding-url <URL> --embedding-model <ID>` | 指定本文をローカルserverで埋め込み、vectorを保存する。 | `埋め込みを保存しました`。 |
+| `polaris memory embed <session> <id> --embedding-url <URL> --embedding-model <ID>` | 指定本文をローカルserverで埋め込み、vectorを保存する。 | `Embedding saved`。 |
 | `polaris memory index <session> [--batch <1..100>] [--after <ID>] --embedding-url <URL> --embedding-model <ID>` | 会話をまとめて埋め込む。既定100件。 | `<n>件の埋め込みを保存しました。続きの開始ID: <ID>`。 |
 | `polaris memory forget <session>` | 本文・vector・保管原文を削除し、その会話の再取り込みを禁止する。 | 削除件数、v2索引件数、再取り込みを禁止する旨。巻き戻しでは取り消せない。 |
 
@@ -312,10 +345,10 @@ CLIの`polaris login`は単一認証、TUIの`/login`はアカウント登録の
 | コマンド | 役割 | 主な出力・確認 |
 | --- | --- | --- |
 | `polaris sync status` | 参加と同期の状態を見る。 | `共有:`、`最後に合意した内容:`、`手元の記録:`、`解消待ち:`。保存領域を準備する場合がある。 |
-| `polaris sync join --remote <HTTPS> --share-id <ID> --invitation-id <ID> --expires <UNIX秒> --account <Keychain名> [--exclude <名前>...] [--yes]` | 招待された共有に参加し、資格情報を束縛する。 | C08操作IDと確認card→`資格情報を束縛して共有へ参加しました。`。 |
-| `polaris sync join --rebind-credential --account <Keychain名> [--credential-choice <識別prefix>] [--yes]` | 共有資格情報を再束縛する。 | C08確認→`資格情報の再束縛を確定しました。`。 |
-| `polaris sync join --recover <操作ID> [--yes]` | C08の未完了操作を照合する。 | `資格情報の再束縛を照合して完了しました。`等。 |
-| `polaris sync join --abandon <操作ID> [再照合用引数] [--yes]` | C08操作を明示的に中止する。 | `資格情報の再束縛を中止しました。`。必要な引数は`--help`で確認する。 |
+| `polaris sync join --remote <HTTPS> --share-id <ID> --invitation-id <ID> --expires <UNIX秒> --account <Keychain名> [--exclude <名前>...] [--yes]` | 招待された共有に参加し、資格情報を束縛する。 | C08操作IDと確認card→`Credentials bound and share joined.`。 |
+| `polaris sync join --rebind-credential --account <Keychain名> [--credential-choice <識別prefix>] [--yes]` | 共有資格情報を再束縛する。 | C08確認→`Credential rebinding confirmed.`。 |
+| `polaris sync join --recover <操作ID> [--yes]` | C08の未完了操作を照合する。 | `Credential rebinding reconciled and completed.`等。 |
+| `polaris sync join --abandon <操作ID> [再照合用引数] [--yes]` | C08操作を明示的に中止する。 | `Credential rebinding abandoned.`。必要な引数は`--help`で確認する。 |
 | `polaris sync push [--yes]` | 対象を記録し、remoteへ送信する。 | C10確認card→`C10送信完了: operation=<ID> commit=<hash>`、または共有内容が一致している旨。 |
 | `polaris sync recover <操作ID>` | C10の結果を、再送せず照合する。 | 完了・結果未確定などのC10結果。 |
 | `polaris sync abandon <操作ID> [--yes]` | C10を再確認して中止する。 | `C10操作を照合して中止しました: ...（未送信の証明ではありません）`。 |
@@ -330,7 +363,6 @@ C08/C10の確定は端末での確認、または`--yes`を必要とする。結
 
 | コマンド | 役割 | 主な出力・現在の制限 |
 | --- | --- | --- |
-| `polaris setting nextjs [--project <dir>] [--install]` | Next.js・package manager・lockfileを検出し、手順を計画する。 | 管理ツール、工程、command、未実行/充足済み/未達、設定雛形。**現在は`--install`でもpackageの導入・起動確認を実行しない。** |
 | `polaris setting git [--project <dir>]` | Git配置を検出し、不足する`.gitignore`規則を追加する。 | Gitの検出結果と、追加した規則または追加不要の通知。対象は`.next/`・`node_modules/`・`coverage/`。Git init/commitは行わない。 |
 | `polaris compare <folderA> <folderB> [folder...]` | 名前とサイズからフォルダの類似性を調べる。 | フォルダの組、類似度、共通件数、提案と理由。本文の読取、移動、削除は行わない。 |
 | `polaris handoff --summary "<概要>" --check "<確認>"... [--project <dir>] [--run <世代>] [--attempt <ID>]` | 変更ファイルを基に、実機確認を頼む文面を生成する。 | 対象、変更一覧、概要、確認手順、結果の依頼。変更がなければ生成しない。人へは送信しない。 |
@@ -358,7 +390,7 @@ C08/C10の確定は端末での確認、または`--yes`を必要とする。結
 | `mcp_catalog` | MCP候補の検索・選択、resourceや保存chunkの読取。 | 候補、部分取得の有無、選択状態、出典付き本文、次offset等のJSON。 |
 | `mcp_<hash>` | 選択済みの外部MCPツールを呼ぶ。 | 出典付きのtext/structured/resource等。大きい結果はhandleと抜粋。名前はcatalog identityから生成する。 |
 | `mcp_setup` | MCP候補の検出と、承認した候補の登録。 | 候補JSONまたは登録結果。外部接続上限と承認に従う。root専用。 |
-| `setting` | Next.js/Gitの計画、許可された整理。 | 計画やwritten/reason等のJSON。package導入は行わない。 |
+| `setting` | 内部の環境構築計画と、許可されたGit除外規則の整理。 | 計画やwritten/reason等のJSON。package導入は行わない。 |
 | `computer` | macOS appのaccessibility候補を読み、操作可否を示す。 | app名・候補件数・目標・候補text。**現状は操作selector未接続で、実操作は行わない。** |
 | `state` | workflow状態・差分を読み、revision付きで遷移する。 | phase/revision/承認・検証状態等のJSON。 |
 | `workflow_artifact` | routine変更契約の提案や、不変artifactの読取。 | artifact参照や本文、workflow revision等のJSON。採否・ID・hash・公開はhostが管理する。 |
@@ -370,11 +402,13 @@ C08/C10の確定は端末での確認、または`--yes`を必要とする。結
 ## 現在の提供状況で注意する点
 
 - バージョンはシェルで`polaris --version`。TUIの`/version`・`/usage`・`/effort`は存在しない。
+- `/web-search`・`/models`・`/browse`・`/attachment`・`/recipe`・`/handoff`・`/remember`・`/account`は削除した。モデル選択は`/model`、macOSでのファイル所在の表示は会話中のファイル名クリックを使う。エージェント内部のWeb検索経路と提供条件は維持している。
+- `polaris setting nextjs`と`/setting nextjs`は廃止した。環境構築は`polaris env set <profile>`／`/env set <profile>`へ移した。旧コマンドの別名ではなく、固定計画の確認と専用runtimeによる導入を行う。
 - `read`や`skill`はツール名で、`/read`・`/skill`というコマンドではない。
 - `/model`で変更するのはモデル。推論強度の固定指定は起動時の`--effort`で行う。
 - `/subagents cancel`は停止要求の受付。終了状態は同じchild/attemptに対する`wait`で確認する。`outcome_unknown`は結果未確定を表す。
 - 巻き戻しは空の入力欄で待機中にEscを2回押す。正常完了して保存された対象を選び、変更予定を確認し、`r`で確定する。中断したturnは候補に含まれない。
-- `--web-search cached/live`は現在利用できない。`setting nextjs --install`と`spare`も、名前から想定される一連の作業はまだ実行しない。
+- `--web-search cached/live`は現在利用できない。`spare`も、名前から想定される一連の作業はまだ実行しない。
 - この一覧の確認では、認証・MCP・モデルへの実接続や、状態を変更するコマンドの再実行は行っていない。
 
 ## 実装の参照先

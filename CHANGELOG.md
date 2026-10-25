@@ -8,6 +8,10 @@ macOS arm64のTUIを配布対象として準備する。GUIと他OSのソース�
 
 ### 追加・変更
 
+- `env plan`・`env set`・`env status`をCLI/TUIへ追加し、Node、Next.js、React/Vite、Vue/Vite、SvelteKit、Astro、Nuxt、Angular、Python、Rust、Goの固定プロファイルを用意する。取得計画の確認、専用runtime、offline導入、既存ファイルの保持を共通の実行経路で扱う。
+- TUIの既定・推奨モデルをGPT-6.1 Solへ変更し、起動ヘッダにバージョンを表示する。
+- ファイルのD&Dをまとめて削除できる入力リンクとして扱い、出力されたファイルのクリックからFinderで保存場所を表示する。範囲選択した文章は追加の確認画面なしでコピーする。
+- help・ログ・エラーを英語へ統一する。TUIのアカウント操作は`/login`・`/logout`・`/status`へ、remember設定は`/memory configure`へ集約する。CLIの`polaris account`は保持する。
 - 会話の再開・分岐・巻戻し、原文参照、workflowとskill、MCP・subagentをTUIから扱える。
 - working中の補完と子タスク照会、入力受理ID、整理したstatus表示を提供する。
 - 判断backendの共通化と明示選択を追加し、Jev/SemIfを保持する。Clefは本番profile未登録のため通常利用できない。

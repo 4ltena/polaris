@@ -144,6 +144,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `compare.rs` — フォルダ同士がどれだけ似ているかを示す。名前とサイズだけを読み、
 - `decided.rs` — `polaris decided` — the ledger of questions this project has settled.
 - `decision.rs` — Explicit local decision management, separate from agent/provider startup.
+- `env.rs` — Direct environment setup: parsing and presentation only. No model is used.
 - `handoff.rs` — 実装が終わったことを、実機で試せる人へ渡す文面にする。
 - `main.rs` — Entry point for the `polaris` binary. Decides the endpoint from environment
 - `mcp.rs` — MCP registrations, secrets, catalog checks and setup from the terminal.
@@ -164,6 +165,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `cli.rs` — Integration tests for the CLI binary. Launches the real process to verify behavior.
 - `confined_helper.rs` — Integration test that launches the real `polaris` binary as a helper
 - `entry_points.rs` — The three commands that had no caller until now: comparing folders,
+- `env.rs` — Direct management stays independent of model credentials and preserves the
 - `input_preparation.rs` — Real CLI input preparation with an isolated home and a synthetic loopback model.
 - `linux_signal_cleanup.rs` — Real Linux PTY evidence for interactive shutdown. Every child is the
 - `mcp.rs` — `polaris mcp` against a synthetic home; no server or model is contacted.
@@ -218,6 +220,7 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `desktop_run.rs` — Owned real-core worker for the trusted desktop engine (macOS only).
 - `desktop_workflow.rs` — Durable workflow checkpoint port. The single desktop owner writes state;
 - `dir_watch.rs` — `bash`/`write`/`edit` 呼び出しの前後でファイルシステムを比較し、新規
+- `environment.rs` — Host environment setup. Source admission uses the same protected,
 - `error_region.rs` — Which part of a long tool result is worth quoting back.
 - `events.rs` — ターン実行中にツール呼び出し・subagent活動をTUIへリアルタイム通知する
 - `execution_owner.rs` — 共通のrun専用有界実行所有者。保存スレッドではcommandを実行しない。
@@ -561,6 +564,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-core/src/desktop_store/writer/recipe`
 
 - `tests.rs` — Records only; nothing is executed and no file is read.
+
+## `crates/polaris-core/src/environment`
+
+- `capture.rs` — Admit project sources and dependency inventories under protected-path checks.
+- `native.rs` — Read-only discovery of the existing Apple toolchain. No SDK or compiler is
+- `owner.rs` — Shared project-bound host owner for CLI, TUI and the typed environment tool.
+- `recovery.rs` — Reconcile retained evidence without transferring, spawning or publishing.
+- `tool.rs` — Root-only typed port. The live turn host lends its existing activity lease;
 
 ## `crates/polaris-core/src/error_region`
 
@@ -1240,6 +1251,39 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `persistence.rs` — Production storage IPC across OS children; all roots/content are disposable dummy fixtures.
 - `subprocess.rs` — helper自身の新規TempDirで実OS子プロセスのstdin/stdoutと終了を検証する。
 
+## `crates/polaris-envkit`
+
+- `Cargo.toml` — manifest for the polaris-envkit crate
+
+## `crates/polaris-envkit/src`
+
+- `acquisition.rs` — Shared schema-2 transfer capability. The management owner persists Started
+- `adapter.rs` — Pure adapter resolution. Every operation references approved resources or
+- `archive.rs` — Bounded extraction into a fresh private staging directory. Never use tar's
+- `bundled.rs` — Fixed resource registry. No project-supplied file or plugin can replace a
+- `catalog.rs` — Cheap catalog metadata. A name in this table is not an installation or
+- `definition.rs` — Version-2 profile data. These definitions are loaded from bundled resources,
+- `invocation.rs` — Render only revalidated compiled recipes. This module performs no I/O and
+- `journal.rs` — Small append-only receipts inside one retained private operation directory.
+- `lib.rs` — Fixed environment profiles shared by the CLI, TUI and typed host tool.
+- `plan.rs` — Physical directory identity used by plan-bound host owners.
+- `process.rs` — Offline compiled recipe execution on an existing controlled-process owner. Call on the
+- `profile.rs` — Bundled reviewed bytes. Callers cannot substitute project/user profiles.
+- `publication.rs` — Frozen postimages and create-only publication. The host retains the project
+- `recipes.rs` — Compiled recipes; profiles cannot supply raw commands. Expanded program,
+- `request.rs` — Typed host input, deliberately without executable, command or URL fields.
+- `runner.rs` — The common bounded runner. Hosts own consent, the project lease and C43;
+- `transfer.rs` — Plan-scoped, credential-free host transfers. The effect owner must persist
+- `version.rs` — Profile-specific, bounded release selectors. Parsing has no I/O: channel
+
+## `crates/polaris-envkit/src/adapter`
+
+- `tests.rs` — Verify fixed plans, profile bindings and compatibility-only fallback.
+
+## `crates/polaris-envkit/src/publication`
+
+- `walk.rs` — Descriptor-anchored inventory. Child paths never follow an intermediate
+
 ## `crates/polaris-http`
 
 - `Cargo.toml` — manifest for the polaris-http crate
@@ -1247,11 +1291,17 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 ## `crates/polaris-http/src`
 
 - `artifact.rs` — Explicit, credential-free artifact transfers with pinned redirect origins.
+- `distrust.rs` — Mandatory CA-key rejection for credential-free environment artifacts.
 - `lib.rs` — Shared HTTP client setup.
 
 ## `crates/polaris-http/src/artifact`
 
 - `tests.rs` — Local TLS fixtures only; no models, user credentials or external services.
+
+## `crates/polaris-http/src/distrust`
+
+- `keys.rs` — Pinned compromised certificate and public-key fingerprints.
+- `tests.rs` — Verify actual-path certificate distrust and rejection before HTTP bytes.
 
 ## `crates/polaris-http/src/fixtures`
 
@@ -1520,6 +1570,10 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 
 - `SKILL.md` — 文書を書く
 
+## `crates/polaris-skills/resources/skills/envkit`
+
+- `SKILL.md` — SKILL.md
+
 ## `crates/polaris-skills/resources/skills/smallest-change`
 
 - `SKILL.md` — 最小の変更を選ぶ
@@ -1615,11 +1669,14 @@ UPDATE_FILEMAP=1 cargo test -p polaris-core --test filemap
 - `continuation_tests.rs` — Shared continuation recovery through real raw/receipt owners and fake backends.
 - `conversation_view.rs` — 会話のtranscript表示だけを所有する。
 - `draft.rs` — An unsent draft belongs to its conversation and never enters raw history.
+- `environment_commands.rs` — Direct local management commands. Work stays on a retained host worker;
+- `file_input.rs` — File links remain ordinary Markdown in admission, drafts, and history.
+- `file_reveal.rs` — Reveal an explicitly clicked local file in Finder. No file body is opened.
 - `input.rs` — Pure keystroke-to-action mapping for the input box. Kept separate from
 - `input_preparation_tests.rs` — TUI initialization and cloned run ownership preserve request-only input preparation.
 - `instruction_commands.rs` — Durable next-run instructions in the existing TUI admission family.
 - `lib.rs` — The polaris interactive TUI. Entered by `polaris-cli` when `--prompt`
-- `local_actions.rs` — Confirmed local actions share the project lease and management journal.
+- `local_actions.rs` — User-triggered local actions share the project lease and management journal.
 - `mcp_commands.rs` — MCP controls change next-run admission; they never replace a running runtime.
 - `memory.rs` — Explicitly enabled project memory and pre-compaction archival.
 - `memory_commands.rs` — Explicit host memory commands. Confirmation and results stay in the TUI;

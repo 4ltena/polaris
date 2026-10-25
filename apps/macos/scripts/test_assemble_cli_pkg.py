@@ -26,7 +26,7 @@ class CLIPackageAssemblyTests(unittest.TestCase):
             binary = root / "polaris"
             binary.write_bytes(b"preview CLI")
             binary.chmod(0o755)
-            package = root / "polaris-preview.pkg"
+            package = root / f"polaris-cli-preview-{WORKSPACE_VERSION}-arm64.pkg"
             with patch.object(assembly, "architecture", return_value="arm64"), \
                  patch.object(assembly, "binary_version", return_value=f"polaris {WORKSPACE_VERSION}"):
                 assembly.build_package(binary, package, REPOSITORY)
@@ -80,7 +80,7 @@ class CLIPackageAssemblyTests(unittest.TestCase):
                 f"#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'polaris {WORKSPACE_VERSION}'; "
                 "else echo help; fi\n", encoding="utf-8")
             binary.chmod(0o755)
-            package = root / "polaris-preview.pkg"
+            package = root / f"polaris-cli-preview-{WORKSPACE_VERSION}-arm64.pkg"
             with patch.object(assembly, "architecture", return_value="arm64"):
                 assembly.build_package(binary, package, REPOSITORY)
             self.assertEqual(verification.verify(package, binary),
@@ -94,6 +94,19 @@ class CLIPackageAssemblyTests(unittest.TestCase):
         self.assertTrue(verification.allowed_payload_path("./usr/local/bin/._polaris"))
         self.assertFalse(verification.allowed_payload_path("./usr/local/bin/../other"))
         self.assertFalse(verification.allowed_payload_path("./usr/local/bin/unrelated"))
+
+    def test_rejects_intel_binary_with_arm64_package_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "polaris"
+            binary.write_bytes(b"Intel CLI")
+            binary.chmod(0o755)
+            package = root / f"polaris-cli-preview-{WORKSPACE_VERSION}-arm64.pkg"
+            with patch.object(assembly, "architecture", return_value="x86_64"), \
+                 patch.object(assembly, "binary_version", return_value=f"polaris {WORKSPACE_VERSION}"):
+                with self.assertRaisesRegex(ValueError, "filename must match"):
+                    assembly.build_package(binary, package, REPOSITORY)
+            self.assertFalse(package.exists())
 
 
 if __name__ == "__main__":

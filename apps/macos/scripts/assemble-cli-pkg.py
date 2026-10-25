@@ -44,6 +44,9 @@ def build_package(binary: Path, output: Path, repository: Path) -> Path:
         raise ValueError("workspace package version is missing")
     if binary_version(binary) != f"polaris {version}":
         raise ValueError("CLI version does not match the workspace package version")
+    expected_name = f"polaris-cli-preview-{version}-{arch}.pkg"
+    if output.name != expected_name:
+        raise ValueError(f"package filename must match version and architecture: {expected_name}")
     if output.exists():
         raise FileExistsError(f"refusing to replace existing package: {output}")
     if not output.parent.is_dir():

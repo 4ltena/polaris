@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
-"""AGENTS.md をコードの実測値に合わせ、切り詰めで消える行を検出する。
+"""Align AGENTS.md derived values with code and detect truncated lines.
 
-`AGENTS.md` の `## Always on` 節だけがモデルへ届く。`constitution::cap` は
-先頭から行単位で積み、上限を超えた行を**警告なく捨てる**。2026-09-19 に、
-4 行のうち後半 2 行が半月のあいだ一度も届いていなかったことが分かった。
-本文には「150 トークンで切り詰められる」と書いてあり、実際の上限は 100
-だった。数字が古いまま信じられたのが原因である。
+Only the ## Always on section reaches the model. constitution::cap adds
+whole lines from the start and silently drops lines above the limit. On
+2026-09-19, the final two of four rules were found not to have reached the
+model for half a month: the text claimed a 150-token limit, but code used 100.
 
-そこでこのスクリプトは 2 つを行う。
+The default check measures the delivered lines and returns 1 if any are lost.
+--write updates only numeric values derived from code and the document itself.
+No new values or rules are invented.
 
-- **検査**（既定）。実際の tokenizer で Always on 節を積み直し、どの行が
-  届きどの行が消えるかを出す。1 行でも消えるなら終了コード 1。
-- **書き換え**（`--write`）。本文に埋まっている派生値を、コードとファイル
-  自身から測り直した値へ置き換える。
-
-派生値の出どころは全てコードであり、このスクリプトは何も発明しない。
-
-    python3 scripts/sync_agents_md.py            # 検査のみ
-    python3 scripts/sync_agents_md.py --write    # 派生値を更新
-    python3 scripts/sync_agents_md.py --self-check
+    python3 scripts/sync_agents_md.py            # inspect only
+    python3 scripts/sync_agents_md.py --write    # update derived values
 """
 
 from __future__ import annotations
@@ -31,7 +24,7 @@ from pathlib import Path
 try:
     import tiktoken
 except ImportError:  # pragma: no cover - 環境の問題であって規則の問題ではない
-    sys.exit("tiktoken が要る: pip install tiktoken")
+    sys.exit("tiktoken is required: pip install tiktoken")
 
 ROOT = Path(__file__).resolve().parent.parent
 ENCODING = "o200k_base"
@@ -60,7 +53,7 @@ def rust_const(path: Path, name: str) -> int:
     source = path.read_text(encoding="utf-8")
     found = re.search(rf"const {re.escape(name)}: usize = ([\d_]+)", source)
     if not found:
-        raise LookupError(f"{name} が {path} に無い")
+        raise LookupError(f"{name} not found in {path}")
     return int(found.group(1).replace("_", ""))
 
 
@@ -73,10 +66,10 @@ def pinned(path: Path, test_name: str) -> int:
     source = path.read_text(encoding="utf-8")
     at = source.find(f"fn {test_name}(")
     if at < 0:
-        raise LookupError(f"{test_name} が {path} に無い")
+        raise LookupError(f"{test_name} not found in {path}")
     found = re.search(r"const PINNED: usize = ([\d_]+)", source[at:])
     if not found:
-        raise LookupError(f"{test_name} の中に PINNED が無い")
+        raise LookupError(f"PINNED not found in {test_name}")
     return int(found.group(1).replace("_", ""))
 
 
@@ -145,7 +138,7 @@ def apply(markdown: str, values: dict[str, int]) -> tuple[str, list[str]]:
 
         markdown, hits = re.subn(pattern, swap, markdown)
         if hits == 0:
-            changed.append(f"{key}: 本文に見つからない（書き換えていない）")
+            changed.append(f"{key}: not found in the document (unchanged)")
     return markdown, changed
 
 
@@ -171,7 +164,7 @@ def report(agents: Path, global_agents: Path | None) -> int:
     limit = rust_const(ROOT / "crates/polaris-core/src/constitution.rs", "CONSTITUTION_LIMIT")
     block = always_on_block(text)
     if not block:
-        print("## Always on 節が無い。モデルへ届く規則はゼロ。")
+        print("No ## Always on section. No rules reach the model.")
         return 1
 
     global_block = ""
@@ -181,30 +174,30 @@ def report(agents: Path, global_agents: Path | None) -> int:
     if global_block:
         g_kept, g_dropped = cap_lines(global_block, limit // 2)
         print(
-            f"グローバル {global_agents}: {len(g_kept)}行が届く"
-            f"（{count(global_capped)}トークン、上限 {limit // 2}）"
+            f"Global {global_agents}: {len(g_kept)} lines delivered "
+            f"({count(global_capped)} tokens, limit {limit // 2})"
         )
         for line in g_dropped:
-            print(f"  ★消える {line}")
-        print(f"→ project の枠は {limit} ではなく {effective}")
+            print(f"  ★truncated {line}")
+        print(f"→ project budget: configured {limit}, effective {effective}")
 
     kept, dropped = cap_lines(block, effective)
     total, reaching = count(block), count("\n".join(kept))
-    print(f"上限 {effective} / 節全体 {total} / 届く {reaching} / 余白 {effective - reaching}")
+    print(f"Limit {effective} / section {total} / delivered {reaching} / remaining {effective - reaching}")
     for line in kept:
-        print(f"  届く   {line}")
+        print(f"  delivered {line}")
     for line in dropped:
-        print(f"  ★消える {line}")
+        print(f"  ★truncated {line}")
 
     stale = [c for c in apply(text, measured(agents))[1]]
     for entry in stale:
-        print(f"  古い値 {entry}")
+        print(f"  stale value {entry}")
 
     if dropped:
-        print("\n切り詰めで消える行がある。順序を変えるか、重複を削る。")
+        print("\nSome lines are truncated. Reorder them or remove duplicates.")
         return 1
     if stale:
-        print("\n本文の派生値が古い。--write で更新する。")
+        print("\nDerived values in the document are stale. Update with --write.")
         return 1
     return 0
 
@@ -235,13 +228,13 @@ def self_check() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--write", action="store_true", help="派生値を更新する")
-    parser.add_argument("--self-check", action="store_true", help="この道具自身を検査する")
+    parser.add_argument("--write", action="store_true", help="Update derived values")
+    parser.add_argument("--self-check", action="store_true", help="Check this tool itself")
     parser.add_argument("--path", default=str(ROOT / "AGENTS.md"))
     parser.add_argument(
         "--global-path",
         default=str(Path.home() / ".polaris/AGENTS.md"),
-        help="グローバル側。--global-path= で空にすると project 単独で測る",
+        help="Global rules; use --global-path= to measure the project alone",
     )
     args = parser.parse_args()
 
@@ -250,7 +243,7 @@ def main() -> int:
 
     agents = Path(args.path)
     if not agents.exists():
-        print(f"{agents} が無い")
+        print(f"{agents} not found")
         return 1
 
     if args.write:
@@ -258,9 +251,9 @@ def main() -> int:
         if changed:
             agents.write_text(text, encoding="utf-8")
             for entry in changed:
-                print(f"更新 {entry}")
+                print(f"Updated {entry}")
         else:
-            print("派生値は既に一致している")
+            print("Derived values already match")
     global_agents = Path(args.global_path) if args.global_path else None
     return report(agents, global_agents)
 

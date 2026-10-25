@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""停止した Algedi 測定を、保存済みの行を再評価してから限定再開する。"""
+"""Resume a stopped Algedi measurement only after reevaluating saved rows."""
 import argparse
 import hashlib
 import json
@@ -23,16 +23,16 @@ def sha256(path):
 
 
 def fail(message):
-    raise SystemExit(f'再開を停止しました: {message}')
+    raise SystemExit(f'Resume stopped: {message}')
 
 
 def rows(path):
     try:
         parsed = [json.loads(line) for line in path.read_text().splitlines()]
     except (OSError, ValueError) as error:
-        fail(f'結果を読めません: {path} ({type(error).__name__})')
+        fail(f'Cannot read results: {path} ({type(error).__name__})')
     if not parsed or not all(isinstance(row, dict) for row in parsed):
-        fail(f'結果が空または不正です: {path}')
+        fail(f'Results are empty or invalid: {path}')
     return parsed
 
 
@@ -51,41 +51,41 @@ def expected_fixture(task):
 def validate_saved_row(directory, row, baseline, candidate, condition, expected_task, changed_paths, unassessed_reason):
     task, repeat = row.get('task'), row.get('repeat')
     if task != expected_task or repeat != 1:
-        fail('保存済み行の課題または反復回数が一致しません')
+        fail('Saved row tasks or repetition counts do not match')
     if (row.get('quality_pass') is not False or row.get('quality_assessment') != 'unassessed'
             or row.get('quality_unassessed_reason') != unassessed_reason):
-        fail('この限定再開器が扱える未評価形状と一致しません')
+        fail('Unevaluated row shape is unsupported by this bounded resumer')
     metadata_path = directory / 'metadata.json'
     try:
         metadata = json.loads(metadata_path.read_text())
     except (OSError, ValueError) as error:
-        fail(f'メタデータを読めません: {type(error).__name__}')
+        fail(f'Cannot read metadata: {type(error).__name__}')
     if not isinstance(metadata, dict) or metadata.get('label') != condition:
-        fail('保存済み行の条件ラベルが一致しません')
+        fail('Saved row condition labels do not match')
     original = Path(metadata.get('baseline_binary', '')).expanduser()
     if not original.is_file() or original.is_symlink():
-        fail('記録済み比較元バイナリを安全に検証できません')
+        fail('Cannot safely verify the recorded baseline binary')
     baseline_hash, candidate_hash = sha256(baseline), sha256(candidate)
     expected_binary_hash = baseline_hash if condition == 'baseline-retrieval' else candidate_hash
     if (sha256(original) != metadata.get('baseline_sha256')
             or metadata.get('binary_sha256') != expected_binary_hash
             or metadata.get('baseline_sha256') != baseline_hash
             or candidate_hash == baseline_hash):
-        fail('記録済みバイナリの SHA256 が現在の指定値と一致しません')
+        fail('Recorded binary SHA256 does not match the current selection')
     if metadata.get('model') != 'gpt-6-astra' or metadata.get('effort') != 'medium' or metadata.get('tool_memory') != 'retrieval':
-        fail('初回行の固定条件が一致しません')
+        fail('Initial row fixed conditions do not match')
 
     fixture = directory / f'{task}-{repeat}.fixture'
     if fixture.is_symlink() or not fixture.is_dir():
-        fail('保存済み fixture が通常ディレクトリではありません')
+        fail('Saved fixture is not a physical directory')
     before, after = expected_fixture(task), benchmark.snapshot(fixture)
     if any(kind == 'link' for kind, _ in after.values()):
-        fail('保存済み fixture に symlink があります')
+        fail('Saved fixture contains a symlink')
     changed = sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
     unchanged = [name for name in before if name not in changed and after.get(name) != before[name]]
     if (after.keys() != before.keys() or unchanged or any(after.get(name, ('',))[0] != 'file' for name in changed_paths)
             or changed != row.get('changed_paths') or changed != changed_paths):
-        fail('保存済み fixture の範囲または変更記録が一致しません')
+        fail('Saved fixture scope or change record does not match')
 
     stdout = (directory / f'{task}-{repeat}.out').read_text()
     stderr = (directory / f'{task}-{repeat}.err').read_text()
@@ -95,13 +95,13 @@ def validate_saved_row(directory, row, baseline, candidate, condition, expected_
         directory / f'{task}-{repeat}.metrics.jsonl', stderr)
     assessment, reason = benchmark.quality_result(task, stdout, fixture)
     if assessment != 'pass' or reason is not None:
-        fail(f'保存済み行を再評価できません: {assessment} {reason or ""}'.strip())
+        fail(f'Cannot reevaluate the saved row: {assessment} {reason or ""}'.strip())
     if (row.get('exit_code') != 0 or row.get('usage') != totals
             or row.get('embedding_usage') != embedding or row.get('recorded_model_match') != model_match
             or row.get('cli_coverage') != coverage or row.get('metrics_recorded') != bool(traces)
             or row.get('measurement_complete') is not True or not complete
             or row.get('scope_pass') is not True or totals is None or totals.get('total', 0) <= 0):
-        fail('保存済み行の使用量、完全性、終了状態または範囲が一致しません')
+        fail('Saved row usage, completeness, exit status, or scope does not match')
     reassessed = dict(row)
     reassessed.update(original_quality_pass=row.get('quality_pass'),
                        original_quality_assessment=row.get('quality_assessment'),
@@ -116,7 +116,7 @@ def validate_saved_row(directory, row, baseline, candidate, condition, expected_
 def validate_completed_row(directory, row, baseline, candidate, condition, task):
     if (row.get('quality_pass') is not True or row.get('quality_assessment') != 'pass'
             or row.get('quality_unassessed_reason') is not None or row.get('comparison_status') != 'complete'):
-        fail('保存済み完了行の品質状態が一致しません')
+        fail('Saved completed row quality status does not match')
     expected_changes = {'singlefile_repair': ['rates.py'], 'multifile_repair': ['pricing.py', 'receipt.py']}.get(task, [])
     probe = dict(row, quality_pass=False, quality_assessment='unassessed',
                  quality_unassessed_reason='completed_prefix_probe')
@@ -127,15 +127,15 @@ def validate_completed_row(directory, row, baseline, candidate, condition, task)
 
 def validate_initial_layout(output):
     if output.is_symlink() or not output.is_dir():
-        fail('出力先は既存の通常ディレクトリでなければなりません')
+        fail('Output must be an existing physical directory')
     names = {path.name for path in output.iterdir()}
     if OLD_DIRECTORY not in names or any(not (name == OLD_DIRECTORY or name.startswith('resume-')) for name in names):
-        fail('限定再開の対象外の既存 artifact または未完了 artifact があります')
+        fail('Existing or incomplete artifacts are outside this bounded resume scope')
     directory = output / OLD_DIRECTORY
     required = {'metadata.json', 'results.jsonl', f'{FIRST_TASK}-1.fixture',
                 f'{FIRST_TASK}-1.out', f'{FIRST_TASK}-1.err', f'{FIRST_TASK}-1.metrics.jsonl'}
     if {path.name for path in directory.iterdir()} != required | {f'{FIRST_TASK}-1.audit.jsonl'}:
-        fail('初回ディレクトリに想定外または不足 artifact があります')
+        fail('Initial directory has unexpected or missing artifacts')
     return directory
 
 
@@ -154,7 +154,7 @@ def directory_key(path):
         prefix = f'round-{number}-{condition}'
         if path.name == prefix or path.name == prefix + '-remaining':
             return number, condition
-    fail(f'保存済み再開の round 名が予定表と一致しません: {path.name}')
+    fail(f'Saved resume round name does not match the schedule: {path.name}')
 
 
 def validate_existing_resume(output, old, baseline, candidate):
@@ -162,23 +162,23 @@ def validate_existing_resume(output, old, baseline, candidate):
     if not resumes:
         return None, []
     if len(resumes) != 1 or resumes[0].is_symlink() or not resumes[0].is_dir():
-        fail('既存の再開 artifact を一意かつ安全に検証できません')
+        fail('Cannot uniquely and safely verify the existing resume artifacts')
     continuation = resumes[0]
     fixed = {'reassessment.jsonl', 'resume-metadata.json'}
     names = {path.name for path in continuation.iterdir()}
     if not fixed <= names or any(name not in fixed and not name.startswith('round-') for name in names):
-        fail('既存の再開 artifact に想定外または不足 artifact があります')
+        fail('Existing resume has unexpected or missing artifacts')
     reassessment = rows(continuation / 'reassessment.jsonl')
     if reassessment != [{key: value for key, value in old.items() if key != 'round'}]:
-        fail('既存の再評価行が元の検証結果と一致しません')
+        fail('Existing reevaluated row does not match the original verification')
     try:
         metadata = json.loads((continuation / 'resume-metadata.json').read_text())
     except (OSError, ValueError) as error:
-        fail(f'既存の再開メタデータを読めません: {type(error).__name__}')
+        fail(f'Cannot read existing resume metadata: {type(error).__name__}')
     if metadata != {'baseline': str(baseline), 'baseline_sha256': sha256(baseline),
                     'candidate': str(candidate), 'candidate_sha256': sha256(candidate),
                     'source_results': str(output), 'repeats': 3, 'pending_task_invocations': 29}:
-        fail('既存の再開メタデータまたは SHA256 が一致しません')
+        fail('Existing resume metadata or SHA256 does not match')
     directories = sorted((path for path in continuation.iterdir() if path.name.startswith('round-')),
                          key=lambda path: (plan().index(directory_key(path)), path.name.endswith('-remaining')))
     recorded = []
@@ -197,11 +197,11 @@ def validate_existing_resume(output, old, baseline, candidate):
             else:
                 recorded.append(dict(validate_completed_row(directory, row, baseline, candidate, condition, task), round=number))
         if {path.name for path in directory.iterdir()} != expected_names:
-            fail(f'保存済み再開の artifact 集合が一致しません: {directory.name}')
+            fail(f'Saved resume artifact set does not match: {directory.name}')
     prefix = [(row['round'], row['condition'], row['task']) for row in [old, *recorded]]
     expected_prefix = planned_rows()
     if prefix != expected_prefix[:len(prefix)]:
-        fail('保存済み再開行は予定表の連続した完了プレフィックスではありません')
+        fail('Saved resumed rows are not a contiguous completed schedule prefix')
     return continuation, recorded
 
 
@@ -209,7 +209,7 @@ def schedule(baseline, candidate, continuation, timeout, reused):
     completed = [(row['round'], row['condition'], row['task']) for row in reused]
     expected = planned_rows()
     if completed != expected[:len(completed)]:
-        fail('再利用行は予定表の連続した完了プレフィックスではありません')
+        fail('Reused rows are not a contiguous completed schedule prefix')
     pending = planned_rows()[len(completed):]
     rounds = []
     for number, condition in plan():
@@ -225,7 +225,7 @@ def schedule(baseline, candidate, continuation, timeout, reused):
             if (continuation / directory_name).exists():
                 directory_name += '-remaining'
                 if (continuation / directory_name).exists():
-                    fail(f'継続出力先が既にあります: {directory_name}')
+                    fail(f'Continuation output already exists: {directory_name}')
             commands.append([sys.executable, str(BENCHMARK), '--binary', str(binary), '--baseline', str(baseline),
                              '--output', str(continuation / directory_name), '--label', label,
                              '--repeats', '1', '--timeout', str(timeout), '--tool-memory', 'retrieval', '--tasks', *tasks])
@@ -240,13 +240,13 @@ def validate_new_rows(continuation, commands):
         requested = command[command.index('--tasks') + 1:]
         result = rows(directory / 'results.jsonl')
         if len(result) != len(requested) or {row.get('task') for row in result} != set(requested):
-            fail(f'継続結果の課題集合が一致しません: {directory.name}')
+            fail(f'Continuation result task set does not match: {directory.name}')
         for row in result:
             if (row.get('exit_code') != 0 or row.get('quality_pass') is not True
                     or row.get('scope_pass') is not True or row.get('measurement_complete') is not True
                     or row.get('comparison_status') != 'complete' or row.get('usage') is None
                     or row['usage'].get('total', 0) <= 0):
-                fail(f'継続結果が完全ではありません: {directory.name}/{row.get("task")}')
+                fail(f'Continuation results are incomplete: {directory.name}/{row.get("task")}')
             combined.append(dict(row, condition=label, source='continuation'))
     return combined
 
@@ -262,7 +262,7 @@ def summarize(rows_to_summarize):
         for task in benchmark.TASKS:
             selected = [row for row in rows_to_summarize if row['condition'] == condition and row['task'] == task]
             if len(selected) != 3:
-                fail(f'{condition}:{task} の件数が 3 ではありません')
+                fail(f'{condition}:{task} does not have exactly 3 rows')
             summary.append({'condition': condition, 'task': task, 'runs': len(selected),
                             'quality_passes': sum(row['quality_pass'] for row in selected),
                             'scope_passes': sum(row['scope_pass'] for row in selected),
@@ -281,7 +281,7 @@ def summarize(rows_to_summarize):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', '--source-results', dest='source_results', type=Path, required=True,
-                        help='再評価する既存の results-* ルート')
+                        help='Existing results-* root to reevaluate')
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--candidate', type=Path, required=True)
     parser.add_argument('--repeats', type=int, default=3)
@@ -289,23 +289,23 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     if args.repeats != 3 or not 1 <= args.timeout <= 600:
-        parser.error('この限定再開器は repeats=3、timeout=1〜600秒だけを受け付けます')
+        parser.error('This bounded resumer accepts only repeats=3 and timeout=1–600 seconds')
     if any(path.is_symlink() for path in (args.source_results, args.baseline, args.candidate)):
-        fail('source-results とバイナリに symlink は使えません')
+        fail('source-results and binaries must not be symlinks')
     output, baseline, candidate = args.source_results.resolve(strict=True), args.baseline.resolve(strict=True), args.candidate.resolve(strict=True)
     if any(path.is_symlink() or not path.is_file() for path in (baseline, candidate)):
-        fail('バイナリは通常ファイルでなければなりません')
+        fail('Binaries must be regular files')
     old_directory = validate_initial_layout(output)
     old_rows = rows(old_directory / 'results.jsonl')
     if len(old_rows) != 1:
-        fail('この限定再開器は保存済みの初回一行だけを扱います')
+        fail('This bounded resumer accepts only the single saved initial row')
     old = dict(validate_saved_row(old_directory, old_rows[0], baseline, candidate,
                                   'baseline-retrieval', FIRST_TASK, ['rates.py'], 'unsupported_syntax'), round=1)
     continuation, resumed = validate_existing_resume(output, old, baseline, candidate)
     reused = [old, *resumed]
     continuation = continuation or output / f'resume-{uuid.uuid4().hex}'
     commands = schedule(baseline, candidate, continuation, args.timeout, reused)
-    print(f'保存済み {len(reused)} 行: 再評価 pass、使用量・fixture・SHA256 を確認済み')
+    print(f'Reused {len(reused)} rows: reevaluation passed; usage, fixtures, and SHA256 verified')
     for command in commands:
         print(shlex.join(command))
     if args.dry_run:
@@ -322,7 +322,7 @@ def main():
         for command in commands:
             subprocess.run(command, check=True)
     except subprocess.CalledProcessError as error:
-        fail(f'継続測定が失敗しました: {Path(error.cmd[error.cmd.index("--output") + 1]).name} (exit {error.returncode})')
+        fail(f'Continuation measurement failed: {Path(error.cmd[error.cmd.index("--output") + 1]).name} (exit {error.returncode})')
     new_rows = validate_new_rows(continuation, commands)
     all_rows = [dict(row, source='reassessed-original' if row is old else 'reassessed-resume') for row in reused] + new_rows
     summary = summarize(all_rows)

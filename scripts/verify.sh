@@ -22,18 +22,18 @@ fresh_test_failure=0
 
 say() { printf '\n=== %s\n' "$1"; }
 
-say "AGENTS.md の派生値と切り詰め"
+say "AGENTS.md derived values and truncation"
 python3 scripts/sync_agents_md.py --write || fail=1
 
 say "fmt"
 cargo fmt --all
 cargo fmt --all -- --check || fail=1
 
-say "生成物の再生成"
+say "Regenerate snapshots"
 UPDATE_ARCHITECTURE=1 cargo test -q -p polaris-core --test architecture >/dev/null 2>&1 \
-  || { echo "architecture の再生成に失敗"; fail=1; }
+  || { echo "architecture regeneration failed"; fail=1; }
 UPDATE_FILEMAP=1 cargo test -q -p polaris-core --test filemap >/dev/null 2>&1 \
-  || { echo "filemap の再生成に失敗"; fail=1; }
+  || { echo "filemap regeneration failed"; fail=1; }
 git --no-pager diff --stat docs/architecture.md docs/filemap.md
 
 say "clippy"
@@ -65,14 +65,14 @@ known = {
 }
 fresh = [n for n in names if n not in known]
 for n in names:
-    print(("  既知 " if n in known else "  新規 ") + n)
+    print(("  known " if n in known else "  new ") + n)
 sys.exit(1 if fresh else 0)
 PY
 [ $? -ne 0 ] && { fail=1; fresh_test_failure=1; }
 rm -f "$out"
 
-say "結果"
-[ "$fresh_test_failure" -eq 0 ] && echo "試験: 新規failureなし" || echo "試験: 新規failureあり"
-[ "$clippy_failed" -eq 0 ] || echo "clippy: エラーあり"
-[ "$fail" -eq 0 ] && echo "全段通過" || echo "落ちた段がある"
+say "Results"
+[ "$fresh_test_failure" -eq 0 ] && echo "Tests: no new failures" || echo "Tests: new failures"
+[ "$clippy_failed" -eq 0 ] || echo "clippy: errors"
+[ "$fail" -eq 0 ] && echo "All stages passed" || echo "Some stages failed"
 exit "$fail"

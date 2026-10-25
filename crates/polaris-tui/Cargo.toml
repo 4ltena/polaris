@@ -9,6 +9,7 @@ license.workspace = true
 polaris-memory = { path = "../polaris-memory" }
 polaris-auth = { path = "../polaris-auth" }
 polaris-core = { path = "../polaris-core" }
+polaris-envkit = { path = "../polaris-envkit" }
 polaris-mcp = { path = "../polaris-mcp" }
 polaris-provider = { path = "../polaris-provider" }
 polaris-sandbox = { path = "../polaris-sandbox" }

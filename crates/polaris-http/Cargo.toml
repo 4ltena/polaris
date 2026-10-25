@@ -9,6 +9,10 @@ license.workspace = true
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+sha2 = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -114,6 +114,18 @@ pub async fn fetch(
     fetch_with_client(&client, source, sink, cancelled).await
 }
 
+/// Credential-free transfers with mandatory rejection of compromised CA keys
+/// on the actual verified path. Unlike the compatibility client, this does not
+/// load process-provided CA bundles. The caller still verifies artifact digests.
+pub async fn fetch_verified(
+    source: &ArtifactSource,
+    sink: impl FnMut(&[u8]) -> Result<(), ()> + Send,
+    cancelled: impl FnMut() -> bool + Send,
+) -> Result<(), Error> {
+    let client = client(crate::distrust::client_builder().map_err(|_| Error::Transport)?)?;
+    fetch_with_client(&client, source, sink, cancelled).await
+}
+
 async fn wait<T>(
     future: impl Future<Output = Result<T, reqwest::Error>>,
     cancelled: &mut (impl FnMut() -> bool + Send),

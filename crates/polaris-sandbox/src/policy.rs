@@ -207,10 +207,12 @@ pub struct IsolatedEnvironment {
     private_container: Option<PathBuf>,
     // Trusted, copied runtime directories only; never inherited host PATH text.
     pub(crate) runtime_bin_dirs: Vec<PathBuf>,
+    pub(crate) fixed_values: std::collections::BTreeMap<String, String>,
 }
 
 impl IsolatedEnvironment {
     pub(crate) fn validate(&self, workspace: &Path) -> Result<(), SandboxError> {
+        validate_fixed_values(&self.fixed_values)?;
         #[cfg(not(unix))]
         if self.private_container.is_some() {
             return Err(SandboxError::NotEnforced(
@@ -272,6 +274,54 @@ impl IsolatedEnvironment {
         }
         Ok(())
     }
+}
+
+fn validate_fixed_values(
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<(), SandboxError> {
+    if values.len() > 32 {
+        return Err(SandboxError::NotEnforced(
+            "too many fixed environment values".into(),
+        ));
+    }
+    for (name, value) in values {
+        let allowed = match name.as_str() {
+            "CI"
+            | "NEXT_TELEMETRY_DISABLED"
+            | "NUXT_TELEMETRY_DISABLED"
+            | "ASTRO_TELEMETRY_DISABLED"
+            | "PYTHONNOUSERSITE"
+            | "PIP_NO_INDEX"
+            | "PIP_DISABLE_PIP_VERSION_CHECK" => value == "1",
+            "PIP_CONFIG_FILE" => value == "/dev/null",
+            "CARGO_NET_OFFLINE" => value == "true",
+            "GOTOOLCHAIN" => value == "local",
+            "GOPROXY" | "GOSUMDB" | "GOENV" | "GOWORK" => value == "off",
+            "CGO_ENABLED" => value == "0",
+            "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" => value.is_empty(),
+            "CARGO_HOME"
+            | "GOPATH"
+            | "GOCACHE"
+            | "NEXT_PRIVATE_OUTPUT_TRACE_ROOT"
+            | "DEVELOPER_DIR"
+            | "SDKROOT"
+            | "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER" => {
+                Path::new(value).is_absolute() && !value.chars().any(char::is_control)
+            }
+            // Values come from a revalidated compiled recipe, not from model,
+            // project config or inherited environment. US is Cargo's delimiter.
+            "CARGO_ENCODED_RUSTFLAGS" => {
+                !value.is_empty() && !value.chars().any(|c| c.is_control() && c != '\u{1f}')
+            }
+            _ => false,
+        };
+        if !allowed || value.len() > 16 * 1024 || value.as_bytes().contains(&0) {
+            return Err(SandboxError::NotEnforced(
+                "invalid fixed environment value".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 const MAX_ISOLATED_READABLE_FILES: usize = 16;
@@ -565,6 +615,7 @@ impl SandboxPolicy {
             private_siblings: false,
             private_container: None,
             runtime_bin_dirs: Vec::new(),
+            fixed_values: std::collections::BTreeMap::new(),
         };
         environment.validate(&boundary.workspace)?;
         validate_isolated_readable_files(
@@ -592,6 +643,7 @@ impl SandboxPolicy {
             private_siblings: true,
             private_container: None,
             runtime_bin_dirs: Vec::new(),
+            fixed_values: std::collections::BTreeMap::new(),
         };
         if environment.home.parent() != boundary.workspace.parent()
             || environment.tmpdir.parent() != boundary.workspace.parent()
@@ -628,6 +680,7 @@ impl SandboxPolicy {
             private_siblings: false,
             private_container: Some(container.into()),
             runtime_bin_dirs: Vec::new(),
+            fixed_values: std::collections::BTreeMap::new(),
         };
         environment.validate(&boundary.workspace)?;
         validate_isolated_readable_files(
@@ -684,6 +737,24 @@ impl SandboxPolicy {
             }
         }
         environment.runtime_bin_dirs = bins.to_vec();
+        Ok(self)
+    }
+
+    /// Trusted-owner only: apply a finite, recipe-bound environment after
+    /// env_clear. This cannot set PATH, HOME, proxies, auth or loader overrides.
+    pub fn with_isolated_fixed_values(
+        mut self,
+        values: std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, SandboxError> {
+        validate_fixed_values(&values)?;
+        let environment = self
+            .isolated
+            .as_mut()
+            .and_then(|boundary| boundary.environment.as_mut())
+            .ok_or_else(|| {
+                SandboxError::NotEnforced("fixed values require an isolated environment".into())
+            })?;
+        environment.fixed_values = values;
         Ok(self)
     }
 
@@ -835,6 +906,7 @@ mod tests {
             private_siblings: false,
             private_container: None,
             runtime_bin_dirs: vec![runtime],
+            fixed_values: std::collections::BTreeMap::new(),
         };
         assert!(ordinary.validate(&workspace).is_ok());
         for container in [
@@ -1147,6 +1219,44 @@ mod tests {
         assert!(!configured.contains(&bin));
         std::fs::remove_dir(&bin).unwrap();
         assert!(configured.restrict(SandboxMode::ReadOnly, &[]).is_err());
+    }
+
+    #[test]
+    fn fixed_recipe_environment_cannot_replace_identity_or_inherit_credentials() {
+        use std::collections::BTreeMap;
+        let fixed = BTreeMap::from([
+            ("CARGO_NET_OFFLINE".into(), "true".into()),
+            ("CARGO_HOME".into(), "/private/tmp/envkit/home/cargo".into()),
+            ("RUSTC_WRAPPER".into(), String::new()),
+            (
+                "CARGO_ENCODED_RUSTFLAGS".into(),
+                "-C\u{1f}link-arg=-fuse-ld=/native/ld".into(),
+            ),
+        ]);
+        assert!(validate_fixed_values(&fixed).is_ok());
+        for key in [
+            "HOME",
+            "PATH",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "DYLD_INSERT_LIBRARIES",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(
+                validate_fixed_values(&BTreeMap::from([(key.into(), "value".into())])).is_err()
+            );
+        }
+        for (key, value) in [
+            ("GOPROXY", "https://proxy.example"),
+            ("SDKROOT", "relative"),
+            ("CARGO_HOME", "/tmp/a\nb"),
+            ("RUSTC_WRAPPER", "/tmp/wrapper"),
+            ("CARGO_ENCODED_RUSTFLAGS", "-C\nflag"),
+        ] {
+            assert!(validate_fixed_values(&BTreeMap::from([(key.into(), value.into())])).is_err());
+        }
     }
 
     #[test]

@@ -95,6 +95,7 @@ fn apply_policy_with(
             .env("TERM", "dumb")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command.envs(&environment.fixed_values);
     } else {
         apply_with(command, lookup);
         // The isolated branch above pins a writable TMPDIR and takes git's

@@ -1,0 +1,272 @@
+{
+  "schema": 2,
+  "revision": 1,
+  "profile": "python",
+  "adapter": "python",
+  "adapter_revision": 1,
+  "platform": "darwin-arm64",
+  "origins": [
+    "https://github.com"
+  ],
+  "redirect_origins": [
+    "https://release-assets.githubusercontent.com"
+  ],
+  "limits": {
+    "artifact_bytes": 536870912,
+    "closure_bytes": 2147483648,
+    "unpacked_bytes": 8589934592,
+    "archive_entries": 100000,
+    "processes": 128,
+    "seconds_per_process": 300,
+    "output_bytes_per_stream": 262144,
+    "disk_bytes": 1073741824
+  },
+  "candidates": [
+    {
+      "version": "3.15.1",
+      "artifacts": {
+        "1a4eb4d5aa82400de6eeb94e6fc6d870f5fabc97eb1d801f7eeba8072117b11c": {
+          "name": "cpython",
+          "version": "3.15.1",
+          "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.15.1%2B20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+          "bytes": 27764269,
+          "sha256": "1a4eb4d5aa82400de6eeb94e6fc6d870f5fabc97eb1d801f7eeba8072117b11c"
+        }
+      },
+      "runtime": [
+        {
+          "artifact": "1a4eb4d5aa82400de6eeb94e6fc6d870f5fabc97eb1d801f7eeba8072117b11c",
+          "directory": "python",
+          "archive": "tar_gzip",
+          "strip_prefix": "python"
+        }
+      ],
+      "programs": {
+        "python": {
+          "artifact": "1a4eb4d5aa82400de6eeb94e6fc6d870f5fabc97eb1d801f7eeba8072117b11c",
+          "runtime": "python",
+          "relative": "bin/python3.15",
+          "version": "3.15.1"
+        }
+      },
+      "templates": {
+        "main": {
+          "path": "main",
+          "publish": "main",
+          "relative": "main.py",
+          "content": "print('envkit ready')\n",
+          "preserved_input": null
+        },
+        "requirements": {
+          "path": "requirements",
+          "publish": "requirements",
+          "relative": "requirements.lock",
+          "content": "# No third-party dependencies.\n",
+          "preserved_input": "requirements"
+        }
+      },
+      "installation_roots": {
+        "venv": ".venv"
+      },
+      "dependency_closure_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "build_outputs": {}
+    },
+    {
+      "version": "3.14.9",
+      "artifacts": {
+        "9f8c3480b8f0db553c270db548e8a21ae8e39df412e5661d66e8050c5c6ed2a8": {
+          "name": "cpython",
+          "version": "3.14.9",
+          "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.14.9%2B20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+          "bytes": 26705294,
+          "sha256": "9f8c3480b8f0db553c270db548e8a21ae8e39df412e5661d66e8050c5c6ed2a8"
+        }
+      },
+      "runtime": [
+        {
+          "artifact": "9f8c3480b8f0db553c270db548e8a21ae8e39df412e5661d66e8050c5c6ed2a8",
+          "directory": "python",
+          "archive": "tar_gzip",
+          "strip_prefix": "python"
+        }
+      ],
+      "programs": {
+        "python": {
+          "artifact": "9f8c3480b8f0db553c270db548e8a21ae8e39df412e5661d66e8050c5c6ed2a8",
+          "runtime": "python",
+          "relative": "bin/python3.14",
+          "version": "3.14.9"
+        }
+      },
+      "templates": {
+        "main": {
+          "path": "main",
+          "publish": "main",
+          "relative": "main.py",
+          "content": "print('envkit ready')\n",
+          "preserved_input": null
+        },
+        "requirements": {
+          "path": "requirements",
+          "publish": "requirements",
+          "relative": "requirements.lock",
+          "content": "# No third-party dependencies.\n",
+          "preserved_input": "requirements"
+        }
+      },
+      "installation_roots": {
+        "venv": ".venv"
+      },
+      "dependency_closure_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "build_outputs": {}
+    },
+    {
+      "version": "3.13.17",
+      "artifacts": {
+        "8dc60610a82f1e73be7faf964383e02520f95f6e39592a5c37c3809f5a7b798e": {
+          "name": "cpython",
+          "version": "3.13.17",
+          "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.13.17%2B20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+          "bytes": 25286365,
+          "sha256": "8dc60610a82f1e73be7faf964383e02520f95f6e39592a5c37c3809f5a7b798e"
+        }
+      },
+      "runtime": [
+        {
+          "artifact": "8dc60610a82f1e73be7faf964383e02520f95f6e39592a5c37c3809f5a7b798e",
+          "directory": "python",
+          "archive": "tar_gzip",
+          "strip_prefix": "python"
+        }
+      ],
+      "programs": {
+        "python": {
+          "artifact": "8dc60610a82f1e73be7faf964383e02520f95f6e39592a5c37c3809f5a7b798e",
+          "runtime": "python",
+          "relative": "bin/python3.13",
+          "version": "3.13.17"
+        }
+      },
+      "templates": {
+        "main": {
+          "path": "main",
+          "publish": "main",
+          "relative": "main.py",
+          "content": "print('envkit ready')\n",
+          "preserved_input": null
+        },
+        "requirements": {
+          "path": "requirements",
+          "publish": "requirements",
+          "relative": "requirements.lock",
+          "content": "# No third-party dependencies.\n",
+          "preserved_input": "requirements"
+        }
+      },
+      "installation_roots": {
+        "venv": ".venv"
+      },
+      "dependency_closure_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "build_outputs": {}
+    },
+    {
+      "version": "3.12.15",
+      "artifacts": {
+        "7b8d00b751db21cea87dc551a8f8165147c5fbc5251d5537d7e5497dde00a219": {
+          "name": "cpython",
+          "version": "3.12.15",
+          "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+          "bytes": 25017408,
+          "sha256": "7b8d00b751db21cea87dc551a8f8165147c5fbc5251d5537d7e5497dde00a219"
+        }
+      },
+      "runtime": [
+        {
+          "artifact": "7b8d00b751db21cea87dc551a8f8165147c5fbc5251d5537d7e5497dde00a219",
+          "directory": "python",
+          "archive": "tar_gzip",
+          "strip_prefix": "python"
+        }
+      ],
+      "programs": {
+        "python": {
+          "artifact": "7b8d00b751db21cea87dc551a8f8165147c5fbc5251d5537d7e5497dde00a219",
+          "runtime": "python",
+          "relative": "bin/python3.12",
+          "version": "3.12.15"
+        }
+      },
+      "templates": {
+        "main": {
+          "path": "main",
+          "publish": "main",
+          "relative": "main.py",
+          "content": "print('envkit ready')\n",
+          "preserved_input": null
+        },
+        "requirements": {
+          "path": "requirements",
+          "publish": "requirements",
+          "relative": "requirements.lock",
+          "content": "# No third-party dependencies.\n",
+          "preserved_input": "requirements"
+        }
+      },
+      "installation_roots": {
+        "venv": ".venv"
+      },
+      "dependency_closure_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "build_outputs": {}
+    },
+    {
+      "version": "3.11.17",
+      "artifacts": {
+        "1d1335d9d526bc37061af3fe72b0edd88056d7e7d9488eb631946b10b4ab97bb": {
+          "name": "cpython",
+          "version": "3.11.17",
+          "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.11.17%2B20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+          "bytes": 26761038,
+          "sha256": "1d1335d9d526bc37061af3fe72b0edd88056d7e7d9488eb631946b10b4ab97bb"
+        }
+      },
+      "runtime": [
+        {
+          "artifact": "1d1335d9d526bc37061af3fe72b0edd88056d7e7d9488eb631946b10b4ab97bb",
+          "directory": "python",
+          "archive": "tar_gzip",
+          "strip_prefix": "python"
+        }
+      ],
+      "programs": {
+        "python": {
+          "artifact": "1d1335d9d526bc37061af3fe72b0edd88056d7e7d9488eb631946b10b4ab97bb",
+          "runtime": "python",
+          "relative": "bin/python3.11",
+          "version": "3.11.17"
+        }
+      },
+      "templates": {
+        "main": {
+          "path": "main",
+          "publish": "main",
+          "relative": "main.py",
+          "content": "print('envkit ready')\n",
+          "preserved_input": null
+        },
+        "requirements": {
+          "path": "requirements",
+          "publish": "requirements",
+          "relative": "requirements.lock",
+          "content": "# No third-party dependencies.\n",
+          "preserved_input": "requirements"
+        }
+      },
+      "installation_roots": {
+        "venv": ".venv"
+      },
+      "dependency_closure_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "build_outputs": {}
+    }
+  ],
+  "required_host": []
+}
